@@ -1,0 +1,366 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Iceberg Index Layer Topology</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --ink: #17212b;
+      --muted: #607080;
+      --line: #c6d0d8;
+      --soft-line: #e6ebef;
+      --paper: #f5f7f8;
+      --surface: #ffffff;
+      --existing: #eef3f6;
+      --implemented: #eaf5ef;
+      --planned: #fff5dc;
+      --accent: #176b61;
+      --accent-2: #285a8f;
+      --warning: #9a6812;
+      --shadow: 0 14px 38px rgba(23, 33, 43, 0.08);
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+      margin: 0;
+      color: var(--ink);
+      background: var(--paper);
+      font: 15px/1.65 -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC",
+        "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+    }
+
+    .page {
+      width: min(1240px, calc(100% - 40px));
+      margin: 0 auto;
+      padding: 44px 0 72px;
+    }
+
+    header {
+      display: grid;
+      grid-template-columns: 1fr minmax(260px, 360px);
+      gap: 36px;
+      align-items: end;
+      padding-bottom: 28px;
+      border-bottom: 1px solid var(--line);
+    }
+
+    .eyebrow {
+      margin: 0 0 10px;
+      color: var(--accent);
+      font-size: 12px;
+      font-weight: 750;
+      letter-spacing: 0.12em;
+      text-transform: uppercase;
+    }
+
+    h1, h2, h3 { margin: 0; line-height: 1.2; letter-spacing: 0; }
+    h1 { max-width: 720px; font-size: clamp(30px, 4vw, 50px); }
+    h2 { margin-bottom: 14px; font-size: 25px; }
+    h3 { margin-bottom: 8px; font-size: 17px; }
+
+    .lede {
+      margin: 16px 0 0;
+      max-width: 760px;
+      color: var(--muted);
+      font-size: 17px;
+    }
+
+    .meta {
+      padding-left: 22px;
+      border-left: 3px solid var(--accent);
+      color: var(--muted);
+    }
+
+    .meta strong { display: block; color: var(--ink); }
+    .meta span { display: block; margin-top: 4px; }
+
+    main { display: grid; gap: 42px; padding-top: 34px; }
+
+    .section-intro {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) minmax(260px, 0.45fr);
+      gap: 32px;
+      align-items: start;
+    }
+
+    .section-intro p { margin: 0; color: var(--muted); }
+
+    .callout {
+      padding: 18px 20px;
+      border-left: 4px solid var(--accent);
+      background: var(--surface);
+      box-shadow: var(--shadow);
+    }
+
+    .callout strong { display: block; margin-bottom: 4px; }
+    .callout p { color: var(--ink); }
+
+    .legend {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px 18px;
+      margin: 18px 0 12px;
+      color: var(--muted);
+      font-size: 13px;
+    }
+
+    .legend-item { display: inline-flex; gap: 7px; align-items: center; }
+    .swatch { width: 13px; height: 13px; border: 1px solid var(--line); }
+    .swatch.existing { background: var(--existing); }
+    .swatch.implemented { background: var(--implemented); border-color: #9bc8ad; }
+    .swatch.planned { background: var(--planned); border-color: #dec37d; }
+    .swatch.boundary { background: transparent; border: 1px dashed var(--warning); }
+
+    .diagram-frame {
+      overflow-x: auto;
+      padding: 18px;
+      border: 1px solid var(--soft-line);
+      background: var(--surface);
+      box-shadow: var(--shadow);
+    }
+
+    .diagram-frame svg { display: block; min-width: 960px; width: 100%; height: auto; }
+    .diagram-frame.wide svg { min-width: 1180px; }
+
+    .diagram-caption {
+      margin: 12px 2px 0;
+      color: var(--muted);
+      font-size: 13px;
+    }
+
+    .uml .node rect { stroke-width: 1.3; rx: 3; }
+    .uml .node.existing rect { fill: var(--existing); stroke: #8ca0ad; }
+    .uml .node.implemented rect { fill: var(--implemented); stroke: #6aa684; }
+    .uml .node.planned rect { fill: var(--planned); stroke: #c6973b; }
+    .uml .node.boundary rect { fill: #fffdf7; stroke: var(--warning); stroke-dasharray: 6 4; }
+    .uml .node .title { fill: var(--ink); font-size: 15px; font-weight: 750; }
+    .uml .node .body { fill: #435360; font-size: 12px; }
+    .uml .edge { fill: none; stroke: #70808b; stroke-width: 1.35; }
+    .uml .edge.dashed { stroke: var(--warning); stroke-dasharray: 7 5; }
+    .uml .edge.planned { stroke: var(--accent-2); stroke-dasharray: 5 4; }
+    .uml .edge-label { fill: #61727d; font-size: 11px; }
+    .uml .group-label { fill: #536671; font-size: 12px; font-weight: 750; letter-spacing: 0.08em; }
+
+    .table-wrap { overflow-x: auto; border: 1px solid var(--soft-line); background: var(--surface); box-shadow: var(--shadow); }
+    table { width: 100%; min-width: 820px; border-collapse: collapse; }
+    th, td { padding: 14px 16px; border-bottom: 1px solid var(--soft-line); text-align: left; vertical-align: top; }
+    th { color: #435360; background: #f8fafb; font-size: 12px; letter-spacing: 0.06em; text-transform: uppercase; }
+    tr:last-child td { border-bottom: 0; }
+    td:first-child { width: 17%; color: var(--ink); font-weight: 750; }
+    code { padding: 1px 5px; border: 1px solid #dbe2e7; border-radius: 3px; background: #f5f7f8; color: #214b63; font-size: 0.92em; }
+
+    .flow {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 0;
+      border: 1px solid var(--soft-line);
+      background: var(--surface);
+      box-shadow: var(--shadow);
+    }
+
+    .flow-step { position: relative; min-height: 142px; padding: 20px 22px; border-right: 1px solid var(--soft-line); }
+    .flow-step:last-child { border-right: 0; }
+    .flow-step:not(:last-child)::after { content: ""; position: absolute; z-index: 2; top: 61px; right: -7px; width: 12px; height: 12px; border-top: 1px solid var(--accent-2); border-right: 1px solid var(--accent-2); background: var(--surface); transform: rotate(45deg); }
+    .step-no { display: block; margin-bottom: 10px; color: var(--accent); font-size: 12px; font-weight: 800; }
+    .flow-step p { margin: 0; color: var(--muted); font-size: 13px; }
+
+    footer { padding-top: 26px; border-top: 1px solid var(--line); color: var(--muted); font-size: 13px; }
+    footer p { margin: 0 0 8px; }
+
+    @media (max-width: 760px) {
+      .page { width: min(100% - 24px, 1240px); padding-top: 28px; }
+      header, .section-intro { grid-template-columns: 1fr; gap: 20px; }
+      .meta { padding: 14px 0 0; border-top: 3px solid var(--accent); border-left: 0; }
+      .lede { font-size: 16px; }
+      .flow { grid-template-columns: 1fr; }
+      .flow-step { min-height: 0; border-right: 0; border-bottom: 1px solid var(--soft-line); }
+      .flow-step:last-child { border-bottom: 0; }
+      .flow-step:not(:last-child)::after { top: auto; right: auto; bottom: -7px; left: calc(50% - 6px); transform: rotate(135deg); }
+    }
+  </style>
+</head>
+<body>
+  <div class="page">
+    <header>
+      <div>
+        <p class="eyebrow">Apache Iceberg · Index Layer</p>
+        <h1>当前概念拓扑与目标拓扑</h1>
+        <p class="lede">这份图把当前工作区已经落地的向量索引纵向切片，与下一步需要补齐的通用 Iceberg index layer 分开表达。</p>
+      </div>
+      <div class="meta">
+        <strong>判定口径</strong>
+        <span>已实现：当前源码中存在并有测试覆盖的概念。</span>
+        <span>目标拓扑：下一阶段的通用契约、生命周期与 Iceberg 集成边界。</span>
+        <span>2026-09-18 修订：第一节的 vector MVP 已重构为通用 index 层 + vector adapter（见 <code>index-data-model.html</code>），本节保留作历史记录。</span>
+        <span>更新时间：2026-09-18</span>
+      </div>
+    </header>
+
+    <main>
+      <section>
+        <div class="section-intro">
+          <div>
+            <h2>结论先看</h2>
+            <p>当前不是“通用 index 层已经完成后再接 vector”，而是先完成了一个 vector-specific vertical slice。它已经验证了索引 snapshot、tracking/leaf 文件、源表行定位和 exact top-k 的基本语义，但还没有形成可以承载 scalar、text、vector 等多种索引的公共或内部抽象。</p>
+          </div>
+          <div class="callout">
+            <strong>当前状态（2026-09-18 修订）</strong>
+            <p>通用 index layer + vector adapter：已实现——泛化模型、静态 registry、Puffin 容器、parser、reader，11 个测试全绿（D1–D8 见 <code>index-data-model.html</code>）。<br>Catalog / builder / refresher / planner / 生命周期 / 引擎 adapter：待新增。<br>第一节的 vector MVP 类图保留作演进起点的历史记录。</p>
+          </div>
+        </div>
+      </section>
+
+      <section>
+        <h2>一、演进起点：最初的 vector MVP（已被重构，历史记录）</h2>
+        <div class="legend" aria-label="图例">
+          <span class="legend-item"><i class="swatch existing"></i>已有 Iceberg 核心概念</span>
+          <span class="legend-item"><i class="swatch implemented"></i>本轮已实现的 vector 概念</span>
+          <span class="legend-item"><i class="swatch boundary"></i>当前只有 ID / 路径关联</span>
+        </div>
+        <div class="diagram-frame">
+          <svg class="uml" viewBox="0 0 1180 720" role="img" aria-labelledby="current-title current-desc">
+            <title id="current-title">Current Iceberg vector index topology</title>
+            <desc id="current-desc">Existing Iceberg table snapshot chain on top and implemented vector index chain below. Dashed edges show associations represented by IDs or file paths rather than integrated Java object references.</desc>
+            <defs>
+              <marker id="arrow-current" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 Z" fill="#70808b"></path></marker>
+              <marker id="arrow-current-dashed" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 Z" fill="#9a6812"></path></marker>
+            </defs>
+            <text class="group-label" x="40" y="35">ICEBERG TABLE AUTHORITY</text>
+            <g class="node existing" transform="translate(40 55)
+              "><rect width="210" height="100"></rect><text class="title" x="16" y="27">TableMetadata</text><text class="body" x="16" y="51">table UUID</text><text class="body" x="16" y="70">current / historical snapshots</text><text class="body" x="16" y="89">metadata location</text></g>
+            <g class="node existing" transform="translate(310 55)"><rect width="210" height="100"></rect><text class="title" x="16" y="27">Snapshot</text><text class="body" x="16" y="51">snapshot-id</text><text class="body" x="16" y="70">manifest-list</text><text class="body" x="16" y="89">table state at a point in time</text></g>
+            <g class="node existing" transform="translate(580 55)"><rect width="210" height="100"></rect><text class="title" x="16" y="27">ManifestList / Manifest</text><text class="body" x="16" y="51">data-file entries</text><text class="body" x="16" y="70">delete-file entries</text><text class="body" x="16" y="89">file-level metrics</text></g>
+            <g class="node existing" transform="translate(850 55)"><rect width="210" height="100"></rect><text class="title" x="16" y="27">DataFile</text><text class="body" x="16" y="51">file path</text><text class="body" x="16" y="70">record count / metrics</text><text class="body" x="16" y="89">row positions are scan references</text></g>
+            <path class="edge" marker-end="url(#arrow-current)" d="M250 105 H310"></path><text class="edge-label" x="265" y="96">owns</text>
+            <path class="edge" marker-end="url(#arrow-current)" d="M520 105 H580"></path><text class="edge-label" x="535" y="96">points to</text>
+            <path class="edge" marker-end="url(#arrow-current)" d="M790 105 H850"></path><text class="edge-label" x="802" y="96">lists</text>
+
+            <text class="group-label" x="40" y="225">IMPLEMENTED VECTOR VERTICAL SLICE · org.apache.iceberg.index</text>
+            <g class="node implemented" transform="translate(40 250)"><rect width="230" height="132"></rect><text class="title" x="16" y="27">VectorIndexMetadata</text><text class="body" x="16" y="51">index-uuid / table-uuid</text><text class="body" x="16" y="70">field-id / dimension / metric</text><text class="body" x="16" y="89">properties</text><text class="body" x="16" y="108">index snapshots[]</text></g>
+            <g class="node implemented" transform="translate(330 250)"><rect width="230" height="132"></rect><text class="title" x="16" y="27">VectorIndexSnapshot</text><text class="body" x="16" y="51">snapshot-id</text><text class="body" x="16" y="70">source-table-snapshot-id</text><text class="body" x="16" y="89">timestamp-ms</text><text class="body" x="16" y="108">tracking-file path</text></g>
+            <g class="node implemented" transform="translate(620 250)"><rect width="220" height="132"></rect><text class="title" x="16" y="27">VectorIndexTrackingFile</text><text class="body" x="16" y="51">leaf file paths</text><text class="body" x="16" y="70">entry counts</text><text class="body" x="16" y="89">covered data-file paths</text><text class="body" x="16" y="108">coverage set</text></g>
+            <g class="node implemented" transform="translate(900 250)"><rect width="220" height="132"></rect><text class="title" x="16" y="27">VectorIndexLeafFile</text><text class="body" x="16" y="51">dimension / metric</text><text class="body" x="16" y="70">immutable entries[]</text><text class="body" x="16" y="89">versioned binary MVP format</text><text class="body" x="16" y="108">exact linear scan</text></g>
+            <path class="edge" marker-end="url(#arrow-current)" d="M270 316 H330"></path><text class="edge-label" x="281" y="307">contains</text>
+            <path class="edge" marker-end="url(#arrow-current)" d="M560 316 H620"></path><text class="edge-label" x="571" y="307">references</text>
+            <path class="edge" marker-end="url(#arrow-current)" d="M840 316 H900"></path><text class="edge-label" x="849" y="307">opens</text>
+            <path class="edge dashed" marker-end="url(#arrow-current-dashed)" d="M415 250 V190 H415 V155"></path><text class="edge-label" x="424" y="202">source snapshot ID</text>
+            <path class="edge dashed" marker-end="url(#arrow-current-dashed)" d="M730 250 V190 H955 V155"></path><text class="edge-label" x="790" y="181">covered file paths</text>
+
+            <g class="node implemented" transform="translate(900 470)"><rect width="220" height="128"></rect><text class="title" x="16" y="27">VectorIndexEntry</text><text class="body" x="16" y="51">data-file path</text><text class="body" x="16" y="70">row position (_pos)</text><text class="body" x="16" y="89">immutable float[] vector</text><text class="body" x="16" y="108">_file + _pos anchor</text></g>
+            <path class="edge" marker-end="url(#arrow-current)" d="M1010 382 V470"></path><text class="edge-label" x="1020" y="428">stores</text>
+            <g class="node implemented" transform="translate(40 470)"><rect width="230" height="128"></rect><text class="title" x="16" y="27">VectorIndexReader</text><text class="body" x="16" y="51">selects source snapshot</text><text class="body" x="16" y="70">loads tracking / leaf files</text><text class="body" x="16" y="89">merges exact top-k</text><text class="body" x="16" y="108">reports uncovered files</text></g>
+            <g class="node existing" transform="translate(330 470)"><rect width="230" height="128"></rect><text class="title" x="16" y="27">FileIO</text><text class="body" x="16" y="51">newInputFile(path)</text><text class="body" x="16" y="70">InputFile / OutputFile</text><text class="body" x="16" y="89">object-storage abstraction</text><text class="body" x="16" y="108">used by reader / writer</text></g>
+            <g class="node implemented" transform="translate(620 470)"><rect width="220" height="128"></rect><text class="title" x="16" y="27">VectorIndexSearchResult</text><text class="body" x="16" y="51">data-file path</text><text class="body" x="16" y="70">row position</text><text class="body" x="16" y="89">score</text><text class="body" x="16" y="108">similarity or distance</text></g>
+            <path class="edge" marker-end="url(#arrow-current)" d="M270 534 H330"></path><text class="edge-label" x="282" y="525">loads through</text>
+            <path class="edge" marker-end="url(#arrow-current)" d="M270 566 H620"></path><text class="edge-label" x="407" y="558">returns</text>
+            <path class="edge" marker-end="url(#arrow-current)" d="M155 470 V382 H155"></path><text class="edge-label" x="165" y="432">reads metadata</text>
+            <path class="edge" marker-end="url(#arrow-current)" d="M155 470 V414 H1010 V382"></path><text class="edge-label" x="477" y="405">reads leaf chain</text>
+            <text class="edge-label" x="40" y="650">实线：源码中已有直接关系。虚线：当前通过 source snapshot ID、tracking path 或 data-file path 维持的边界关系。</text>
+          </svg>
+        </div>
+        <p class="diagram-caption">历史记录（2026-09-18 之前的状态）：上面的 Iceberg 表快照链是现有权威数据模型；下面的 vector 链可以读取它的标识和文件路径，但当时没有通用 <code>Index</code> 契约，也没有 Catalog、planner 或构建生命周期。下图中的 <code>VectorIndex*</code> 类已被重构为通用 index 层 + vector adapter（<code>IndexMetadata</code> / <code>IndexSnapshot</code> / 两级 manifest / Puffin 容器 / <code>VectorIndexAdapter</code>，见 <code>index-data-model.html</code> 第六节迁移映射）；保留此图以说明演进起点。</p>
+      </section>
+
+      <section>
+        <h2>二、需要新增的通用 Iceberg index 拓扑</h2>
+        <div class="legend" aria-label="图例">
+          <span class="legend-item"><i class="swatch existing"></i>现有 Iceberg 权威对象</span>
+          <span class="legend-item"><i class="swatch planned"></i>建议新增的通用 index 对象</span>
+          <span class="legend-item"><i class="swatch implemented"></i>vector 作为第一个 adapter</span>
+          <span class="legend-item"><i class="swatch boundary"></i>需要保持的集成边界</span>
+        </div>
+        <div class="diagram-frame wide">
+          <svg class="uml" viewBox="0 0 1400 820" role="img" aria-labelledby="target-title target-desc">
+            <title id="target-title">Target generic Iceberg index layer topology</title>
+            <desc id="target-desc">A target topology with a catalog-managed generic index, metadata and snapshots, immutable index files, vector adapter, planner, builder, refresh and lifecycle components.</desc>
+            <defs>
+              <marker id="arrow-target" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 Z" fill="#70808b"></path></marker>
+              <marker id="arrow-target-planned" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 Z" fill="#285a8f"></path></marker>
+              <marker id="arrow-target-boundary" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 Z" fill="#9a6812"></path></marker>
+            </defs>
+            <text class="group-label" x="30" y="28">ICEBERG AUTHORITY</text>
+            <g class="node existing" transform="translate(30 48)"><rect width="205" height="94"></rect><text class="title" x="14" y="27">Table / TableMetadata</text><text class="body" x="14" y="51">table identifier</text><text class="body" x="14" y="70">schema / specs</text><text class="body" x="14" y="89">snapshot history</text></g>
+            <g class="node existing" transform="translate(285 48)"><rect width="205" height="94"></rect><text class="title" x="14" y="27">Table Snapshot</text><text class="body" x="14" y="51">authoritative snapshot-id</text><text class="body" x="14" y="70">manifest list</text><text class="body" x="14" y="89">live data files</text></g>
+            <g class="node existing" transform="translate(540 48)"><rect width="205" height="94"></rect><text class="title" x="14" y="27">Manifest / DataFile</text><text class="body" x="14" y="51">file identity</text><text class="body" x="14" y="70">delete files</text><text class="body" x="14" y="89">metrics and partitions</text></g>
+            <g class="node planned" transform="translate(795 48)"><rect width="205" height="94"></rect><text class="title" x="14" y="27">IndexCatalog</text><text class="body" x="14" y="51">list / load / create index</text><text class="body" x="14" y="70">drop / purge lifecycle</text><text class="body" x="14" y="89">catalog-managed object</text></g>
+            <g class="node planned" transform="translate(1050 48)"><rect width="205" height="94"></rect><text class="title" x="14" y="27">Index</text><text class="body" x="14" y="51">index identity</text><text class="body" x="14" y="70">source table reference</text><text class="body" x="14" y="89">definition + metadata</text></g>
+            <path class="edge" marker-end="url(#arrow-target)" d="M235 95 H285"></path><path class="edge" marker-end="url(#arrow-target)" d="M490 95 H540"></path><path class="edge planned" marker-end="url(#arrow-target-planned)" d="M745 95 H795"></path><path class="edge planned" marker-end="url(#arrow-target-planned)" d="M1000 95 H1050"></path>
+            <text class="edge-label" x="246" y="86">has</text><text class="edge-label" x="501" y="86">materializes</text><text class="edge-label" x="750" y="86">manages</text><text class="edge-label" x="1004" y="86">loads</text>
+
+            <text class="group-label" x="30" y="205">GENERIC INDEX CORE</text>
+            <g class="node planned" transform="translate(30 225)"><rect width="205" height="116"></rect><text class="title" x="14" y="27">IndexDefinition</text><text class="body" x="14" y="51">type / source fields</text><text class="body" x="14" y="70">dimension or key shape</text><text class="body" x="14" y="89">properties</text><text class="body" x="14" y="108">validation rules</text></g>
+            <g class="node planned" transform="translate(285 225)"><rect width="205" height="116"></rect><text class="title" x="14" y="27">IndexMetadata</text><text class="body" x="14" y="51">index UUID</text><text class="body" x="14" y="70">table UUID / location</text><text class="body" x="14" y="89">definition</text><text class="body" x="14" y="108">snapshot list</text></g>
+            <g class="node planned" transform="translate(540 225)"><rect width="205" height="116"></rect><text class="title" x="14" y="27">IndexSnapshot</text><text class="body" x="14" y="51">index snapshot-id</text><text class="body" x="14" y="70">source-table-snapshot-id</text><text class="body" x="14" y="89">published timestamp</text><text class="body" x="14" y="108">coverage / status</text></g>
+            <g class="node planned" transform="translate(795 225)"><rect width="205" height="116"></rect><text class="title" x="14" y="27">TrackingFile</text><text class="body" x="14" y="51">immutable file refs</text><text class="body" x="14" y="70">covered data files</text><text class="body" x="14" y="89">row / delete coverage</text><text class="body" x="14" y="108">format version</text></g>
+            <g class="node planned" transform="translate(1050 225)"><rect width="205" height="116"></rect><text class="title" x="14" y="27">IndexFile / LeafFile</text><text class="body" x="14" y="51">immutable payload</text><text class="body" x="14" y="70">format + checksum</text><text class="body" x="14" y="89">file-level statistics</text><text class="body" x="14" y="108">object-storage path</text></g>
+            <path class="edge planned" marker-end="url(#arrow-target-planned)" d="M235 283 H285"></path><path class="edge planned" marker-end="url(#arrow-target-planned)" d="M490 283 H540"></path><path class="edge planned" marker-end="url(#arrow-target-planned)" d="M745 283 H795"></path><path class="edge planned" marker-end="url(#arrow-target-planned)" d="M1000 283 H1050"></path>
+            <text class="edge-label" x="249" y="274">defines</text><text class="edge-label" x="501" y="274">contains</text><text class="edge-label" x="755" y="274">points to</text><text class="edge-label" x="1008" y="274">contains</text>
+            <path class="edge planned" marker-end="url(#arrow-target-planned)" d="M1152 142 V225"></path><text class="edge-label" x="1163" y="188">owns</text>
+            <path class="edge dashed" marker-end="url(#arrow-target-boundary)" d="M642 225 V170 H387 V142"></path><text class="edge-label" x="450" y="164">must match table snapshot</text>
+
+            <text class="group-label" x="30" y="405">VECTOR ADAPTER · FIRST SUPPORTED SCENARIO</text>
+            <g class="node implemented" transform="translate(30 425)"><rect width="205" height="116"></rect><text class="title" x="14" y="27">VectorIndexAdapter</text><text class="body" x="14" y="51">implements IndexDefinition</text><text class="body" x="14" y="70">COSINE / DOT / L2</text><text class="body" x="14" y="89">vector payload codec</text><text class="body" x="14" y="108">exact first, ANN later</text></g>
+            <g class="node planned" transform="translate(285 425)"><rect width="205" height="116"></rect><text class="title" x="14" y="27">IndexQuery</text><text class="body" x="14" y="51">source snapshot-id</text><text class="body" x="14" y="70">query payload</text><text class="body" x="14" y="89">top-k / filters</text><text class="body" x="14" y="108">consistency options</text></g>
+            <g class="node planned" transform="translate(540 425)"><rect width="205" height="116"></rect><text class="title" x="14" y="27">IndexReader</text><text class="body" x="14" y="51">loads generic snapshot</text><text class="body" x="14" y="70">reads files lazily</text><text class="body" x="14" y="89">returns row references</text><text class="body" x="14" y="108">metric-specific ranking</text></g>
+            <g class="node planned" transform="translate(795 425)"><rect width="205" height="116"></rect><text class="title" x="14" y="27">IndexPlanner</text><text class="body" x="14" y="51">checks snapshot match</text><text class="body" x="14" y="70">checks coverage</text><text class="body" x="14" y="89">adds residual scan</text><text class="body" x="14" y="108">produces scan plan</text></g>
+            <g class="node planned" transform="translate(1050 425)"><rect width="205" height="116"></rect><text class="title" x="14" y="27">Hybrid IndexScanPlan</text><text class="body" x="14" y="51">indexed row refs</text><text class="body" x="14" y="70">uncovered data files</text><text class="body" x="14" y="89">delete / rewrite guards</text><text class="body" x="14" y="108">engine-neutral result</text></g>
+            <path class="edge planned" marker-end="url(#arrow-target-planned)" d="M235 483 H285"></path><path class="edge planned" marker-end="url(#arrow-target-planned)" d="M490 483 H540"></path><path class="edge planned" marker-end="url(#arrow-target-planned)" d="M745 483 H795"></path><path class="edge planned" marker-end="url(#arrow-target-planned)" d="M1000 483 H1050"></path>
+            <text class="edge-label" x="248" y="474">accepts</text><text class="edge-label" x="500" y="474">executes</text><text class="edge-label" x="754" y="474">plans</text><text class="edge-label" x="1005" y="474">merges</text>
+            <path class="edge planned" marker-end="url(#arrow-target-planned)" d="M132 425 V341"></path><text class="edge-label" x="143" y="386">specializes</text>
+            <path class="edge planned" marker-end="url(#arrow-target-planned)" d="M642 425 V341 H642"></path><text class="edge-label" x="652" y="386">reads</text>
+            <path class="edge dashed" marker-end="url(#arrow-target-boundary)" d="M1152 425 V365 H642 V341"></path><text class="edge-label" x="840" y="357">source snapshot contract</text>
+
+            <text class="group-label" x="30" y="610">BUILD / REFRESH / RETIRE</text>
+            <g class="node planned" transform="translate(30 630)"><rect width="205" height="116"></rect><text class="title" x="14" y="27">IndexBuilder</text><text class="body" x="14" y="51">reads table snapshot</text><text class="body" x="14" y="70">writes attempt-scoped files</text><text class="body" x="14" y="89">validates coverage</text><text class="body" x="14" y="108">publishes atomically</text></g>
+            <g class="node planned" transform="translate(285 630)"><rect width="205" height="116"></rect><text class="title" x="14" y="27">IndexRefresher</text><text class="body" x="14" y="51">incremental snapshot diff</text><text class="body" x="14" y="70">append / rewrite handling</text><text class="body" x="14" y="89">delete correctness</text><text class="body" x="14" y="108">new IndexSnapshot</text></g>
+            <g class="node planned" transform="translate(540 630)"><rect width="205" height="116"></rect><text class="title" x="14" y="27">Engine Adapter</text><text class="body" x="14" y="51">Spark / Flink build path</text><text class="body" x="14" y="70">batch and distributed work</text><text class="body" x="14" y="89">planner integration</text><text class="body" x="14" y="108">engine-neutral core</text></g>
+            <g class="node planned" transform="translate(795 630)"><rect width="205" height="116"></rect><text class="title" x="14" y="27">IndexLifecycle</text><text class="body" x="14" y="51">create / publish</text><text class="body" x="14" y="70">drop / purge</text><text class="body" x="14" y="89">orphan file cleanup</text><text class="body" x="14" y="108">retention policy</text></g>
+            <g class="node boundary" transform="translate(1050 630)"><rect width="205" height="116"></rect><text class="title" x="14" y="27">API Visibility</text><text class="body" x="14" y="51">public from day one (final)</text><text class="body" x="14" y="70">no promotion phase</text><text class="body" x="14" y="89">core first; api for SPI later</text><text class="body" x="14" y="108">revapi: skippable locally</text></g>
+            <path class="edge planned" marker-end="url(#arrow-target-planned)" d="M235 688 H285"></path><path class="edge planned" marker-end="url(#arrow-target-planned)" d="M490 688 H540"></path><path class="edge planned" marker-end="url(#arrow-target-planned)" d="M745 688 H795"></path><path class="edge planned" marker-end="url(#arrow-target-planned)" d="M1000 688 H1050"></path>
+            <text class="edge-label" x="248" y="679">refreshes</text><text class="edge-label" x="501" y="679">runs via</text><text class="edge-label" x="753" y="679">owns</text><text class="edge-label" x="1007" y="679">controls</text>
+            <path class="edge planned" marker-end="url(#arrow-target-planned)" d="M132 630 V541"></path><text class="edge-label" x="143" y="586">produces files</text>
+            <path class="edge planned" marker-end="url(#arrow-target-planned)" d="M387 630 V541"></path><text class="edge-label" x="397" y="586">publishes snapshot</text>
+          </svg>
+        </div>
+        <p class="diagram-caption">目标图把 vector 放在通用 index core 之下：vector 负责 payload、metric 和排序；通用层负责身份、snapshot、文件引用、覆盖、查询契约、生命周期和 planner 边界。</p>
+      </section>
+
+      <section>
+        <h2>三、当前与目标的差异</h2>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>概念域</th><th>当前实现</th><th>需要新增 / 重构</th><th>边界判断</th></tr></thead>
+            <tbody>
+              <tr><td>索引身份</td><td><code>VectorIndexMetadata</code> 中有 index UUID、table UUID、location。</td><td>抽出通用 <code>Index</code> / <code>IndexMetadata</code> / <code>IndexDefinition</code>，vector 只提供具体定义。</td><td>先保持内部契约，暂不扩大 Iceberg 公共 API。</td></tr>
+              <tr><td>快照语义</td><td>有 <code>VectorIndexSnapshot</code>，通过 <code>source-table-snapshot-id</code> 选择索引版本。</td><td>通用化 <code>IndexSnapshot</code>，增加发布状态、覆盖范围和与 delete/rewrite 的一致性规则。</td><td>源表 snapshot 是权威；index 不能脱离它宣称有效。</td></tr>
+              <tr><td>文件层</td><td>有内部版本化的 tracking/leaf 二进制文件，entry 保存 <code>_file + _pos + vector</code>。</td><td>抽象通用 <code>TrackingFile</code> / <code>IndexFile</code> / <code>IndexEntry</code>，再决定 Parquet、Puffin 或标准化编码。</td><td>当前格式是 MVP 实现细节，不应直接当成协议。</td></tr>
+              <tr><td>查询</td><td><code>VectorIndexReader</code> 做 exact linear scan 和跨 leaf top-k。</td><td>增加通用 <code>IndexQuery</code>、<code>IndexReader</code>、<code>IndexPlanner</code>，支持索引结果与未覆盖文件的混合计划。</td><td>先保证 correctness，再替换 ANN 执行器。</td></tr>
+              <tr><td>构建 / refresh</td><td>只有 leaf/tracking writer，没有从 Iceberg snapshot 构建索引的 builder。</td><td><code>IndexBuilder</code>、attempt-scoped 文件、原子发布、增量 refresh、重写和删除处理。</td><td>这是从“可读原型”到“可用 index layer”的关键缺口。</td></tr>
+              <tr><td>Catalog / 生命周期</td><td>metadata 由调用方直接创建，reader 直接接收 metadata 和 FileIO。</td><td><code>IndexCatalog</code>、create/list/load/drop/purge，以及 orphan 文件和 retention 管理。</td><td>Catalog 接入应在通用模型稳定后进行。</td></tr>
+              <tr><td>引擎接入</td><td>没有 Spark/Flink planner 或构建入口。</td><td>增加 engine adapter；core 只保留 engine-agnostic 的 index 语义。</td><td>遵循 Iceberg 模块边界，不能把 Spark/Flink 依赖带进 core。</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <section>
+        <h2>四、建议的落地顺序</h2>
+        <div class="flow" aria-label="index layer implementation sequence">
+          <div class="flow-step"><span class="step-no">01 · CONTRACT · 已完成</span><h3>先定义通用契约</h3><p>身份、definition、snapshot、coverage、文件引用和 query 结果。已落地：泛化模型 + 静态 registry + parser（<code>index-data-model.html</code> D1–D8）。</p></div>
+          <div class="flow-step"><span class="step-no">02 · ADAPTER · 已完成</span><h3>把 vector 改成 adapter</h3><p>保留 COSINE、DOT_PRODUCT、EUCLIDEAN 和 exact search，vector payload 已从通用 metadata 拆入 <code>VectorIndexAdapter</code>（Puffin blob <code>iceberg-vector-entries-v1</code>）。</p></div>
+          <div class="flow-step"><span class="step-no">03 · CORRECTNESS · 下一步</span><h3>补构建与一致性</h3><p>从指定 table snapshot 构建，原子发布 manifest / index 文件，沿 parent 血缘做增量 refresh，处理 delete、rewrite、覆盖与未覆盖回退。</p></div>
+          <div class="flow-step"><span class="step-no">04 · INTEGRATION · 待定</span><h3>再接 Catalog 与引擎</h3><p>加入 IndexCatalog（sidecar 方案 A 发现）、Spark 构建与 planner；ANN 和 serving runtime 放在语义稳定之后。</p></div>
+        </div>
+      </section>
+
+      <footer>
+        <p>源码依据：<code>core/src/main/java/org/apache/iceberg/index/</code>（20 个主类）与对应测试目录（5 个测试类，11 个用例）。2026-09-18：最初未提交的 vector MVP 已重构为通用 index 层 + vector adapter；Catalog / builder / refresher / planner / 生命周期待新增。</p>
+        <p>设计依据：Iceberg 二级索引草案所强调的独立 Index、Index Snapshot、<code>source-table-snapshot-id</code>、tracking/leaf files 和 <code>_file + _pos</code> 关系；正式协议接入前仍需以目标版本规范和 POC 结果为准。</p>
+      </footer>
+    </main>
+  </div>
+</body>
+</html>
