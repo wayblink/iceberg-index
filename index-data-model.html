@@ -619,8 +619,8 @@
             <p>静态数据上构建向量索引并查询的完整通路已经跑通（Spark 4.1）。一条命令运行端到端 quickstart：本地 Spark + Hadoop catalog，无需 metastore。</p>
           </div>
           <div class="callout">
-            <strong>运行方式</strong>
-            <p><code>./gradlew :iceberg-spark:iceberg-spark-4.1_2.13:test --tests "org.apache.iceberg.spark.index.TestVectorIndexQuickstart" --info</code></p>
+            <strong>运行方式（Spark 3.5.x）</strong>
+            <p><code>./gradlew -DsparkVersions=3.5 :iceberg-spark:iceberg-spark-3.5_2.12:test --tests "org.apache.iceberg.spark.index.TestVectorIndexQuickstart" --info</code>（Spark 4.1 同样可用：去掉 <code>-DsparkVersions=3.5</code> 并改用 <code>iceberg-spark-4.1_2.13</code>）</p>
           </div>
         </div>
         <div class="table-wrap">
@@ -636,6 +636,7 @@
           </table>
         </div>
         <p class="diagram-caption">实测输出（query = (1.0, 0.0)，COSINE，top-3）：<code>rank: id=1 score=1.0000</code>、<code>rank: id=2 score=0.9939</code>、<code>rank: id=4 score=0.1047</code>，每条结果带数据文件名与行位置；发布后的 <code>IndexMetadata</code> JSON 含 definition、source-table-snapshot-id 绑定与 manifest-list 路径。该通路覆盖 D1–D8 与五条契约的主链路；正确性闭环（删除语义执行、孤儿清理、retention 协调）与通用性验证（第二类型）见正文决策状态。</p>
+        <p class="diagram-caption">注：当前为 <strong>exact 精确检索</strong>（线性扫描）；ANN 近似检索、Spark SQL 入口（<code>CALL</code> 过程 / 向量函数）与 planner 集成按 D6 明确后置。查询当前通过 Java API（<code>IndexReader.search</code>）使用。</p>
       </section>
 
       <footer>
