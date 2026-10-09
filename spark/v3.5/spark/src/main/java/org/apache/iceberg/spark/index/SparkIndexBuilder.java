@@ -161,11 +161,19 @@ public final class SparkIndexBuilder {
     Set<String> previouslyCovered = coveredDataFiles(fileIO, previous);
     Set<String> removedFiles = Sets.difference(previouslyCovered, currentFiles);
     Set<String> newFiles = Sets.difference(currentFiles, previouslyCovered);
-    if (removedFiles.isEmpty() && newFiles.isEmpty()) {
+    // data files present in both snapshots whose delete files changed must be re-indexed: the
+    // delete files of a snapshot are part of its data, so their entries changed
+    Set<String> deleteChangedFiles =
+        deleteChangedFiles(
+            table,
+            previous.sourceTableSnapshotId(),
+            sourceTableSnapshotId,
+            Sets.intersection(currentFiles, previouslyCovered));
+    if (removedFiles.isEmpty() && newFiles.isEmpty() && deleteChangedFiles.isEmpty()) {
       return currentMetadata;
     }
 
-    Set<String> staleFiles = Sets.union(removedFiles, newFiles);
+    Set<String> staleFiles = Sets.union(removedFiles, Sets.union(newFiles, deleteChangedFiles));
     List<IndexFile> carried = Lists.newArrayList();
     for (IndexFile indexFile : indexFiles(fileIO, previous)) {
       if (Sets.intersection(Sets.newHashSet(indexFile.coveredDataFiles()), staleFiles).isEmpty()) {
@@ -182,7 +190,7 @@ public final class SparkIndexBuilder {
             sourceTableSnapshotId,
             vectorColumn,
             definition,
-            newFiles);
+            Sets.union(newFiles, deleteChangedFiles));
     List<IndexFile> indexFiles = Lists.newArrayList();
     indexFiles.addAll(carried);
     indexFiles.addAll(newIndexFiles);
@@ -319,6 +327,31 @@ public final class SparkIndexBuilder {
     }
 
     return indexFiles;
+  }
+
+  /**
+   * Returns the data files that exist in both snapshots but whose set of applicable delete files
+   * changed, so their indexed entries are stale.
+   */
+  private static Set<String> deleteChangedFiles(
+      Table table, long previousSnapshotId, long currentSnapshotId, Set<String> commonDataFiles) {
+    if (commonDataFiles.isEmpty()) {
+      return Sets.newHashSet();
+    }
+
+    Map<String, Set<String>> previousDeletes =
+        VectorIndexEntries.deleteFilesByDataFile(table, previousSnapshotId);
+    Map<String, Set<String>> currentDeletes =
+        VectorIndexEntries.deleteFilesByDataFile(table, currentSnapshotId);
+    Set<String> changed = Sets.newHashSet();
+    for (String dataFile : commonDataFiles) {
+      if (!previousDeletes
+          .getOrDefault(dataFile, Sets.newHashSet())
+          .equals(currentDeletes.getOrDefault(dataFile, Sets.newHashSet()))) {
+        changed.add(dataFile);
+      }
+    }
+    return changed;
   }
 
   private static Set<String> coveredDataFiles(FileIO fileIO, IndexSnapshot snapshot) {

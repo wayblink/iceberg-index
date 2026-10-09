@@ -22,13 +22,21 @@ import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.util.Iterator;
 import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import org.apache.iceberg.DeleteFile;
+import org.apache.iceberg.FileContent;
 import org.apache.iceberg.FileScanTask;
+import org.apache.iceberg.Schema;
 import org.apache.iceberg.Table;
 import org.apache.iceberg.index.vector.VectorIndexAdapter;
 import org.apache.iceberg.index.vector.VectorIndexDefinition;
 import org.apache.iceberg.index.vector.VectorIndexDefinition.Metric;
 import org.apache.iceberg.io.CloseableIterable;
 import org.apache.iceberg.relocated.com.google.common.collect.Lists;
+import org.apache.iceberg.relocated.com.google.common.collect.Maps;
+import org.apache.iceberg.relocated.com.google.common.collect.Sets;
+import org.apache.iceberg.types.Types;
 import org.apache.spark.api.java.JavaRDD;
 import org.apache.spark.api.java.function.FlatMapFunction;
 import org.apache.spark.sql.Dataset;
@@ -40,36 +48,40 @@ import org.apache.spark.sql.types.StructType;
 import scala.Tuple2;
 
 /**
- * Reads index entries for a vector column from an Iceberg table snapshot.
+ * Reads the vector entries of a table snapshot: one entry per live row, carrying its data file, its
+ * position within that file and the encoded vector.
  *
- * <p>Row positions are computed per data file with {@code zipWithIndex}, so every entry carries the
- * {@code _file + _pos} anchor the index layer uses to resolve search hits back to table rows. The
- * vector value is encoded into the entry payload by the core vector adapter, which accepts any
- * numeric array column.
- *
- * <p>The returned DataFrame has columns {@code data_file} (string), {@code pos} (long) and {@code
- * payload} (binary), ready to be written by {@link SparkIndexBuilder}.
+ * <p>Data files are read directly as parquet and the snapshot's delete files are applied here: rows
+ * removed by position delete files and rows matching equality delete files are not indexed. The
+ * recorded position is the row's ordinal in its data file, which is what the row resolution of
+ * {@code vector_search} relies on. Together this makes an index snapshot equivalent to the table
+ * snapshot it is bound to, deletes included.
  */
 public final class VectorIndexEntries {
 
-  /** Schema of the entries DataFrame produced by {@link #entries}. */
+  public static final String DATA_FILE_COLUMN = "data_file";
+  public static final String POSITION_COLUMN = "pos";
+  public static final String VECTOR_COLUMN = "vector";
+
   public static final StructType SCHEMA =
       new StructType()
-          .add("data_file", DataTypes.StringType, false)
-          .add("pos", DataTypes.LongType, false)
-          .add("payload", DataTypes.BinaryType, false);
+          .add(DATA_FILE_COLUMN, DataTypes.StringType, false)
+          .add(POSITION_COLUMN, DataTypes.LongType, false)
+          .add(VECTOR_COLUMN, DataTypes.BinaryType, false);
 
-  /** Name of the data file column in {@link #SCHEMA}. */
-  public static final String DATA_FILE_COLUMN = "data_file";
+  private static final String DELETE_FILE_PATH_COLUMN = "file_path";
+  private static final String DELETE_POSITION_COLUMN = "pos";
+  private static final char NULL_MARKER = '\u0000';
+  private static final char VALUE_SEPARATOR = '\u0001';
 
   private VectorIndexEntries() {}
 
   /**
-   * Reads index entries for the vector column from the given table snapshot.
+   * Builds the entry dataset for the given source table snapshot.
    *
    * @param spark the Spark session
-   * @param table the Iceberg table
-   * @param snapshotId the source table snapshot to read
+   * @param table the Iceberg table to index
+   * @param snapshotId the source table snapshot to read; its delete files are applied
    * @param vectorColumn the name of the numeric array column to index
    * @param definition the vector index definition
    */
@@ -82,15 +94,34 @@ public final class VectorIndexEntries {
     int fieldId = definition.fieldId();
     int dimension = definition.dimension();
     Metric metric = definition.metric();
+    Schema tableSchema = table.schema();
 
     Dataset<Row> entries = null;
-    for (String dataFile : dataFiles(table, snapshotId)) {
-      JavaRDD<Row> fileEntries =
-          spark
-              .read()
-              .parquet(dataFile)
-              .select(vectorColumn)
-              .toJavaRDD()
+    for (FileScanTask task : scanTasks(table, snapshotId)) {
+      String dataFile = task.file().location().toString();
+      List<DeleteFile> deleteFiles = Lists.newArrayList(task.deletes());
+
+      // delete files are read on the driver so the executor-side filter is a simple lookup
+      long[] deletedPositions = readDeletedPositions(spark, positionDeletes(deleteFiles), dataFile);
+      List<String> keyColumns = equalityColumns(tableSchema, equalityDeletes(deleteFiles));
+      Set<String> equalityKeys = readEqualityKeys(spark, equalityDeletes(deleteFiles), keyColumns);
+
+      // the data read needs the vector column plus the columns referenced by equality deletes
+      Set<String> columnsToRead = Sets.newLinkedHashSet();
+      columnsToRead.add(vectorColumn);
+      columnsToRead.addAll(keyColumns);
+      List<String> readColumns = Lists.newArrayList(columnsToRead);
+      List<String> capturedKeyColumns = keyColumns;
+      long[] capturedDeletedPositions = deletedPositions;
+      Set<String> capturedEqualityKeys = equalityKeys;
+
+      Dataset<Row> data = spark.read().parquet(dataFile);
+      for (String readColumn : readColumns) {
+        data = data.select(readColumn);
+      }
+
+      JavaRDD<Row> entryRows =
+          data.toJavaRDD()
               .zipWithIndex()
               .mapPartitions(
                   (FlatMapFunction<Iterator<Tuple2<Row, Long>>, Row>)
@@ -102,19 +133,33 @@ public final class VectorIndexEntries {
                                     .dimension(dimension)
                                     .metric(metric)
                                     .build());
-                        List<Row> rows = Lists.newArrayList();
+                        List<Row> fileEntries = Lists.newArrayList();
                         while (iterator.hasNext()) {
                           Tuple2<Row, Long> tuple = iterator.next();
-                          rows.add(
+                          long position = tuple._2();
+                          if (containsPosition(capturedDeletedPositions, position)) {
+                            continue;
+                          }
+
+                          Row row = tuple._1();
+                          if (!capturedEqualityKeys.isEmpty()
+                              && capturedEqualityKeys.contains(
+                                  equalityKey(row, capturedKeyColumns))) {
+                            continue;
+                          }
+
+                          fileEntries.add(
                               RowFactory.create(
                                   dataFile,
-                                  tuple._2(),
-                                  adapter.encodeVector(toFloats(tuple._1(), vectorColumn))));
+                                  position,
+                                  adapter.encodeVector(
+                                      toFloats(row.getList(row.fieldIndex(vectorColumn))))));
                         }
-                        return rows.iterator();
+                        return fileEntries.iterator();
                       });
-      Dataset<Row> fileDataset = spark.createDataFrame(fileEntries, SCHEMA);
-      entries = entries == null ? fileDataset : entries.union(fileDataset);
+
+      Dataset<Row> fileEntries = spark.createDataFrame(entryRows, SCHEMA);
+      entries = entries == null ? fileEntries : entries.union(fileEntries);
     }
 
     return entries == null ? spark.createDataFrame(Lists.newArrayList(), SCHEMA) : entries;
@@ -122,21 +167,154 @@ public final class VectorIndexEntries {
 
   /** Lists the data file locations of the given table snapshot, on the driver. */
   public static List<String> dataFiles(Table table, long snapshotId) {
-    try (CloseableIterable<FileScanTask> tasks =
-        table.newScan().useSnapshot(snapshotId).planFiles()) {
-      List<String> dataFiles = Lists.newArrayList();
-      for (FileScanTask task : tasks) {
-        dataFiles.add(task.file().location().toString());
-      }
-      return dataFiles;
-    } catch (IOException e) {
-      throw new UncheckedIOException(
-          "Failed to list data files for snapshot " + snapshotId + " of table " + table.name(), e);
+    List<String> dataFiles = Lists.newArrayList();
+    for (FileScanTask task : scanTasks(table, snapshotId)) {
+      dataFiles.add(task.file().location().toString());
     }
+    return dataFiles;
   }
 
-  private static float[] toFloats(Row row, String vectorColumn) {
-    List<Object> values = row.getList(row.fieldIndex(vectorColumn));
+  /**
+   * Maps each data file of a snapshot to the locations of the delete files that apply to it.
+   *
+   * <p>Used by refresh to detect data files whose delete set changed: their index entries must be
+   * rebuilt from the live rows of the newer snapshot.
+   */
+  public static Map<String, Set<String>> deleteFilesByDataFile(Table table, long snapshotId) {
+    Map<String, Set<String>> deletesByFile = Maps.newHashMap();
+    for (FileScanTask task : scanTasks(table, snapshotId)) {
+      Set<String> deleteLocations = Sets.newHashSet();
+      for (DeleteFile deleteFile : task.deletes()) {
+        deleteLocations.add(deleteFile.location().toString());
+      }
+      deletesByFile.put(task.file().location().toString(), deleteLocations);
+    }
+    return deletesByFile;
+  }
+
+  private static List<FileScanTask> scanTasks(Table table, long snapshotId) {
+    List<FileScanTask> tasks = Lists.newArrayList();
+    try (CloseableIterable<FileScanTask> planned =
+        table.newScan().useSnapshot(snapshotId).planFiles()) {
+      tasks.addAll(Lists.newArrayList(planned));
+    } catch (IOException e) {
+      throw new UncheckedIOException(
+          "Failed to plan files for snapshot " + snapshotId + " of table " + table.name(), e);
+    }
+    return tasks;
+  }
+
+  private static List<DeleteFile> positionDeletes(List<DeleteFile> deleteFiles) {
+    return byContent(deleteFiles, FileContent.POSITION_DELETES);
+  }
+
+  private static List<DeleteFile> equalityDeletes(List<DeleteFile> deleteFiles) {
+    return byContent(deleteFiles, FileContent.EQUALITY_DELETES);
+  }
+
+  private static List<DeleteFile> byContent(List<DeleteFile> deleteFiles, FileContent content) {
+    List<DeleteFile> selected = Lists.newArrayList();
+    for (DeleteFile deleteFile : deleteFiles) {
+      if (deleteFile.content() == content) {
+        selected.add(deleteFile);
+      }
+    }
+    return selected;
+  }
+
+  /**
+   * Reads the positions removed from a data file by the given position delete files. Position
+   * delete files are parquet files with {@code file_path} and {@code pos} columns; only rows
+   * pointing at the given data file are collected.
+   */
+  private static long[] readDeletedPositions(
+      SparkSession spark, List<DeleteFile> positionDeletes, String dataFile) {
+    List<Long> positions = Lists.newArrayList();
+    for (DeleteFile deleteFile : positionDeletes) {
+      List<Row> rows =
+          spark
+              .read()
+              .parquet(deleteFile.location().toString())
+              .select(DELETE_FILE_PATH_COLUMN, DELETE_POSITION_COLUMN)
+              .collectAsList();
+      for (Row row : rows) {
+        if (dataFile.equals(row.getString(0))) {
+          positions.add(row.getLong(1));
+        }
+      }
+    }
+
+    long[] result = new long[positions.size()];
+    for (int i = 0; i < result.length; i++) {
+      result[i] = positions.get(i);
+    }
+    return result;
+  }
+
+  /**
+   * Reads the equality keys removed by the given equality delete files, one key per delete row. The
+   * key is the values of the equality columns in field id order, with a null marker for nulls.
+   *
+   * <p>Equality delete files contain one column per equality field id, in field id order; the
+   * column name falls back to the field id when the name is not the table's field name.
+   */
+  private static Set<String> readEqualityKeys(
+      SparkSession spark, List<DeleteFile> equalityDeletes, List<String> keyColumns) {
+    Set<String> keys = Sets.newHashSet();
+    for (DeleteFile deleteFile : equalityDeletes) {
+      List<Row> rows = spark.read().parquet(deleteFile.location().toString()).collectAsList();
+      for (Row row : rows) {
+        StringBuilder key = new StringBuilder();
+        for (int i = 0; i < keyColumns.size() && i < row.size(); i++) {
+          Object value = row.get(i);
+          key.append(encodedValue(value)).append(VALUE_SEPARATOR);
+        }
+        keys.add(key.toString());
+      }
+    }
+    return keys;
+  }
+
+  /** The table columns of the equality fields, in field id order. */
+  private static List<String> equalityColumns(Schema schema, List<DeleteFile> equalityDeletes) {
+    if (equalityDeletes.isEmpty()) {
+      return Lists.newArrayList();
+    }
+
+    List<String> columns = Lists.newArrayList();
+    for (int fieldId : equalityDeletes.get(0).equalityFieldIds()) {
+      Types.NestedField field = schema.findField(fieldId);
+      columns.add(field == null ? String.valueOf(fieldId) : field.name());
+    }
+    return columns;
+  }
+
+  /**
+   * Builds the lookup key of a data row for equality delete matching, in the same encoding as the
+   * keys read from the equality delete files.
+   */
+  private static String equalityKey(Row row, List<String> keyColumns) {
+    StringBuilder key = new StringBuilder();
+    for (String keyColumn : keyColumns) {
+      key.append(encodedValue(row.get(row.fieldIndex(keyColumn)))).append(VALUE_SEPARATOR);
+    }
+    return key.toString();
+  }
+
+  private static String encodedValue(Object value) {
+    return value == null ? String.valueOf(NULL_MARKER) : value.getClass().getName() + ":" + value;
+  }
+
+  private static boolean containsPosition(long[] positions, long position) {
+    for (long candidate : positions) {
+      if (candidate == position) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  private static float[] toFloats(List<Object> values) {
     float[] vector = new float[values.size()];
     for (int i = 0; i < values.size(); i++) {
       vector[i] = ((Number) values.get(i)).floatValue();
