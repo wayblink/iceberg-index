@@ -1255,6 +1255,49 @@ descending.
     The query vector must be passed as `array<double>`; decimal literals such as `array(0.95, 0.05)`
     are not coerced. Use double literals (`array(0.95d, 0.05d)`) or `CAST(... AS ARRAY<DOUBLE>)`.
 
+### `vector_search_batch`
+
+Searches a vector index for many queries at once and resolves the matched rows. Every hit carries
+the index of the query it belongs to (`query_id`), its row reference, score and the matched row as a
+JSON string. Rows are ordered by query and then by score.
+
+Queries are passed as an array of strings, one comma-separated list of numbers per query. Unlike
+repeated single searches, the matched rows of all queries are resolved by reading each hit data
+file once, so a batch of N queries costs one read per distinct hit data file instead of one read
+per query per hit data file (measured on SIFT data: 50 queries in ~1.3s as one batch call versus
+~15s as 50 single calls, with identical results).
+
+| Argument Name | Required? | Type          | Description                                  |
+|---------------|-----------|---------------|----------------------------------------------|
+| `table`       | ✔️        | string        | Name of the table                            |
+| `column`      | ✔️        | string        | Name of the indexed column                   |
+| `queries`     | ✔️        | array<string> | Query vectors, each a comma-separated list   |
+| `k`           | ✔️        | int           | Number of results per query                  |
+
+#### Output
+
+| Output Name | Type   | Description                                    |
+|-------------|--------|------------------------------------------------|
+| `query_id`  | int    | Index of the query in the `queries` argument   |
+| `data_file` | string | Data file of the matched row                   |
+| `pos`       | long   | Row position within the data file (`_pos`)     |
+| `score`     | double | Similarity or distance score                   |
+| `row`       | string | Matched row as a JSON object                   |
+
+#### Examples
+
+Search two queries in one call
+```sql
+CALL catalog_name.system.vector_search_batch(
+    table => 'db.documents', column => 'embedding',
+    queries => array('0.95,0.05', '0.0,0.95'), k => 10);
+```
+
+!!! note
+    Spark's `CALL` argument grammar does not accept nested array literals, so queries are passed
+    as strings rather than `array<array<double>>`. The Java entry point {@code VectorIndexSearch}
+    takes the vectors directly.
+
 #### Examples
 
 Search for the 10 rows closest to a query vector

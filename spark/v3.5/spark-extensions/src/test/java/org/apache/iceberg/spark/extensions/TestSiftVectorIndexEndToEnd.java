@@ -29,12 +29,14 @@ import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.List;
 import java.util.Locale;
+import java.util.Map;
 import java.util.PriorityQueue;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 import org.apache.iceberg.index.vector.VectorIndexTypes;
 import org.apache.iceberg.relocated.com.google.common.collect.Lists;
+import org.apache.iceberg.relocated.com.google.common.collect.Maps;
 import org.apache.spark.sql.Row;
 import org.apache.spark.sql.RowFactory;
 import org.apache.spark.sql.SparkSession;
@@ -166,6 +168,42 @@ class TestSiftVectorIndexEndToEnd {
     double hnswRecall = measureRecall("sift_hnsw");
     endStage();
 
+    // batch search: all queries in one call, one read per distinct hit data file
+    startStage("batch search EXACT index (" + QUERIES + " queries, one call)");
+    List<Object[]> batchOutput =
+        spark
+            .sql(
+                "CALL local.system.vector_search_batch(table => 'db.sift_exact', "
+                    + "column => 'embedding', queries => array("
+                    + batchQueriesLiteral()
+                    + "), k => "
+                    + TOP_K
+                    + ")")
+            .collectAsList()
+            .stream()
+            .map(row -> new Object[] {row.get(0), row.get(1), row.get(2), row.get(3), row.get(4)})
+            .collect(Collectors.toList());
+    endStage();
+
+    // the batch results must reproduce the per-query results and the brute-force reference
+    Map<Integer, List<Long>> batchIdsByQuery = Maps.newHashMap();
+    for (Object[] row : batchOutput) {
+      batchIdsByQuery
+          .computeIfAbsent(((Number) row[0]).intValue(), key -> Lists.newArrayList())
+          .add(parseId((String) row[4]));
+    }
+    assertThat(batchIdsByQuery).hasSize(QUERIES);
+    double batchRecallSum = 0.0;
+    for (int queryId = 0; queryId < QUERIES; queryId++) {
+      List<Long> ids = batchIdsByQuery.get(queryId);
+      assertThat(ids).hasSize(TOP_K);
+      int[] expected = expectedNeighbors[queryId];
+      long matches = ids.stream().filter(id -> contains(expected, id)).count();
+      batchRecallSum += (double) matches / TOP_K;
+    }
+    System.out.printf("  batch recall@%d: %.4f%n", TOP_K, batchRecallSum / QUERIES);
+    assertThat(batchRecallSum / QUERIES).isGreaterThanOrEqualTo(0.99);
+
     System.out.println();
     System.out.println(
         "SIFT recall@" + TOP_K + " over " + QUERIES + " queries on " + BASE_VECTORS + " vectors");
@@ -218,6 +256,29 @@ class TestSiftVectorIndexEndToEnd {
     System.out.printf(
         "  [%s] %.1f ms per query (sql call + collect)%n", table, searchNanos / 1e6 / QUERIES);
     return recallSum / QUERIES;
+  }
+
+  /** Builds the SQL literal of all query vectors for the batch search call. */
+  private static String batchQueriesLiteral() {
+    StringBuilder sql = new StringBuilder();
+    for (int queryId = 0; queryId < QUERIES; queryId++) {
+      if (queryId > 0) {
+        sql.append(", ");
+      }
+      sql.append("'").append(csvQuery(queryVectors[queryId])).append("'");
+    }
+    return sql.toString();
+  }
+
+  private static String csvQuery(float[] vector) {
+    StringBuilder csv = new StringBuilder();
+    for (int i = 0; i < vector.length; i++) {
+      if (i > 0) {
+        csv.append(',');
+      }
+      csv.append(vector[i]);
+    }
+    return csv.toString();
   }
 
   private static long stageStartNanos;

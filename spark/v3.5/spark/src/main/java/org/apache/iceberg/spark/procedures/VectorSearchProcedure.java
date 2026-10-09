@@ -18,22 +18,10 @@
  */
 package org.apache.iceberg.spark.procedures;
 
-import java.util.LinkedHashMap;
 import java.util.List;
-import java.util.Map;
-import java.util.Set;
-import org.apache.iceberg.index.IndexMetadata;
-import org.apache.iceberg.index.IndexQuery;
-import org.apache.iceberg.index.IndexReader;
-import org.apache.iceberg.index.IndexSearchResult;
-import org.apache.iceberg.index.IndexSnapshot;
-import org.apache.iceberg.index.vector.VectorIndexAdapter;
-import org.apache.iceberg.index.vector.VectorIndexDefinition;
 import org.apache.iceberg.relocated.com.google.common.collect.Lists;
-import org.apache.iceberg.relocated.com.google.common.collect.Maps;
-import org.apache.iceberg.relocated.com.google.common.collect.Sets;
+import org.apache.iceberg.spark.index.VectorIndexSearch;
 import org.apache.iceberg.spark.procedures.SparkProcedures.ProcedureBuilder;
-import org.apache.spark.api.java.JavaPairRDD;
 import org.apache.spark.sql.catalyst.InternalRow;
 import org.apache.spark.sql.connector.catalog.TableCatalog;
 import org.apache.spark.sql.connector.iceberg.catalog.ProcedureParameter;
@@ -42,7 +30,6 @@ import org.apache.spark.sql.types.Metadata;
 import org.apache.spark.sql.types.StructField;
 import org.apache.spark.sql.types.StructType;
 import org.apache.spark.unsafe.types.UTF8String;
-import scala.Tuple2;
 
 /**
  * Searches a vector index and resolves the matched rows.
@@ -53,7 +40,7 @@ import scala.Tuple2;
  * <pre>{@code
  * CALL spark_catalog.system.vector_search(
  *   table => 'db.documents', column => 'embedding',
- *   query => array(0.95, 0.05), k => 10);
+ *   query => array(0.95d, 0.05d), k => 10);
  * }</pre>
  */
 class VectorSearchProcedure extends BaseProcedure {
@@ -103,7 +90,6 @@ class VectorSearchProcedure extends BaseProcedure {
   public InternalRow[] call(InternalRow args) {
     VectorIndexProcedures.registerVectorIndexType();
     ProcedureInput input = new ProcedureInput(spark(), tableCatalog(), PARAMETERS, args);
-    String tableName = input.asString(TABLE_PARAM);
     String column = input.asString(COLUMN_PARAM);
     int topK = input.asInt(K_PARAM);
     double[] queryDoubles =
@@ -116,85 +102,23 @@ class VectorSearchProcedure extends BaseProcedure {
             return new InternalRow[0];
           }
 
-          IndexMetadata metadata = VectorIndexProcedures.findIndex(table, column);
-          IndexSnapshot snapshot = metadata.latestSnapshot();
-          if (snapshot == null) {
-            throw new IllegalArgumentException(
-                "Index for column " + column + " of table " + tableName + " has no snapshot");
-          }
+          List<org.apache.spark.sql.Row> hits =
+              VectorIndexSearch.search(
+                      spark(), table, column, List.of(toFloats(queryDoubles)), topK)
+                  .collectAsList();
 
-          VectorIndexDefinition definition = (VectorIndexDefinition) metadata.definition();
-          VectorIndexAdapter adapter = new VectorIndexAdapter(definition);
-          float[] query = toFloats(queryDoubles);
-          if (query.length != definition.dimension()) {
-            throw new IllegalArgumentException(
-                "Query dimension "
-                    + query.length
-                    + " does not match index dimension "
-                    + definition.dimension());
-          }
-
-          List<IndexSearchResult> results =
-              Lists.newArrayList(
-                  new IndexReader(metadata, table.io())
-                      .search(
-                          IndexQuery.of(
-                              snapshot.sourceTableSnapshotId(), adapter.encodeQuery(query), topK)));
-          // the reader sorts with the metric-aware comparator (distance ascending, similarity
-          // descending); re-sort defensively with the same comparator
-          results.sort(adapter.resultComparator());
-
-          Map<String, Map<Long, String>> rowsByFile = resolveRows(results);
-          List<InternalRow> rows = Lists.newArrayListWithCapacity(results.size());
-          for (IndexSearchResult result : results) {
-            String row =
-                rowsByFile
-                    .getOrDefault(result.dataFile(), Maps.newHashMap())
-                    .get(result.rowPosition());
+          List<InternalRow> rows = Lists.newArrayListWithCapacity(hits.size());
+          for (org.apache.spark.sql.Row hit : hits) {
             rows.add(
                 newInternalRow(
-                    UTF8String.fromString(result.dataFile()),
-                    result.rowPosition(),
-                    result.score(),
-                    row == null ? null : UTF8String.fromString(row)));
+                    UTF8String.fromString(hit.getString(1)),
+                    hit.getLong(2),
+                    hit.getDouble(3),
+                    hit.isNullAt(4) ? null : UTF8String.fromString(hit.getString(4))));
           }
 
           return rows.toArray(new InternalRow[0]);
         });
-  }
-
-  /**
-   * Reads the matched rows of each hit data file and serializes them as JSON, keyed by data file
-   * and row position.
-   */
-  private Map<String, Map<Long, String>> resolveRows(List<IndexSearchResult> results) {
-    Map<String, Set<Long>> positionsByFile = new LinkedHashMap<>();
-    for (IndexSearchResult result : results) {
-      positionsByFile
-          .computeIfAbsent(result.dataFile(), key -> Sets.newHashSet())
-          .add(result.rowPosition());
-    }
-
-    Map<String, Map<Long, String>> rowsByFile = Maps.newHashMap();
-    for (Map.Entry<String, Set<Long>> entry : positionsByFile.entrySet()) {
-      String dataFile = entry.getKey();
-      Set<Long> positions = entry.getValue();
-      JavaPairRDD<String, Long> zipped =
-          spark()
-              .read()
-              .parquet(dataFile)
-              .toJSON()
-              .toJavaRDD()
-              .zipWithIndex()
-              .filter(tuple -> positions.contains(tuple._2()));
-      Map<Long, String> rows = Maps.newHashMap();
-      for (Tuple2<String, Long> tuple : zipped.collect()) {
-        rows.put(tuple._2(), tuple._1());
-      }
-      rowsByFile.put(dataFile, rows);
-    }
-
-    return rowsByFile;
   }
 
   private static float[] toFloats(double[] values) {

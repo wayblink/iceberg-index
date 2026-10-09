@@ -18,22 +18,10 @@
  */
 package org.apache.iceberg.spark.procedures;
 
-import java.io.IOException;
-import java.io.UncheckedIOException;
-import java.util.List;
 import org.apache.iceberg.Table;
-import org.apache.iceberg.index.IndexFile;
-import org.apache.iceberg.index.IndexManifest;
-import org.apache.iceberg.index.IndexManifestList;
-import org.apache.iceberg.index.IndexManifestList.ManifestRef;
 import org.apache.iceberg.index.IndexMetadata;
-import org.apache.iceberg.index.IndexSnapshot;
 import org.apache.iceberg.index.SidecarIndexCatalog;
-import org.apache.iceberg.index.vector.VectorIndexDefinition;
-import org.apache.iceberg.index.vector.VectorIndexTypes;
-import org.apache.iceberg.io.FileIO;
-import org.apache.iceberg.relocated.com.google.common.collect.Lists;
-import org.apache.iceberg.types.Types;
+import org.apache.iceberg.spark.index.VectorIndexes;
 import org.apache.spark.sql.connector.iceberg.catalog.ProcedureParameter;
 
 /** Shared helpers for the vector index SQL procedures. */
@@ -43,60 +31,38 @@ final class VectorIndexProcedures {
 
   /** Registers the vector index type with the core index type registry. */
   static void registerVectorIndexType() {
-    VectorIndexTypes.register();
+    VectorIndexes.registerVectorIndexType();
   }
 
   /** Returns the sidecar index catalog for the given table. */
   static SidecarIndexCatalog indexCatalog(Table table) {
-    return new SidecarIndexCatalog(table.io());
+    return VectorIndexes.indexCatalog(table);
   }
 
   /** Resolves the field ID of the vector column, failing if the column does not exist. */
   static int fieldId(Table table, String column) {
-    Types.NestedField field = table.schema().findField(column);
-    if (field == null) {
-      throw new IllegalArgumentException(
-          "Column " + column + " does not exist in table " + table.name());
-    }
-    return field.fieldId();
+    return VectorIndexes.fieldId(table, column);
   }
 
   /** Resolves the column name of a field ID. */
   static String columnName(Table table, int fieldId) {
-    Types.NestedField field = table.schema().findField(fieldId);
-    return field == null ? null : field.name();
+    return VectorIndexes.columnName(table, fieldId);
   }
 
-  /**
-   * Finds the vector index of a table by the indexed column, failing if none exists.
-   *
-   * @param table the table to search
-   * @param column the vector column name
-   */
+  /** Finds the vector index of a table by the indexed column, failing if none exists. */
   static IndexMetadata findIndex(Table table, String column) {
-    int fieldId = fieldId(table, column);
-    for (IndexMetadata metadata : indexCatalog(table).listIndexes(table.location())) {
-      if (metadata.definition() instanceof VectorIndexDefinition
-          && ((VectorIndexDefinition) metadata.definition()).fieldId() == fieldId) {
-        return metadata;
-      }
-    }
-
-    throw new IllegalArgumentException(
-        "No vector index exists for column " + column + " of table " + table.name());
+    return VectorIndexes.findIndex(table, column);
   }
 
   /** Finds the vector index of a table by the indexed column, or null if none exists. */
   static IndexMetadata findIndexOrNull(Table table, String column) {
-    int fieldId = fieldId(table, column);
-    for (IndexMetadata metadata : indexCatalog(table).listIndexes(table.location())) {
-      if (metadata.definition() instanceof VectorIndexDefinition
-          && ((VectorIndexDefinition) metadata.definition()).fieldId() == fieldId) {
-        return metadata;
-      }
-    }
+    return VectorIndexes.findIndexOrNull(table, column);
+  }
 
-    return null;
+  /** Counts the index files and entries of an index snapshot. */
+  static long[] counts(
+      org.apache.iceberg.io.FileIO fileIO, org.apache.iceberg.index.IndexSnapshot snapshot) {
+    return VectorIndexes.counts(fileIO, snapshot);
   }
 
   /** Returns the positional index of a procedure parameter, matching Spark's argument order. */
@@ -108,37 +74,5 @@ final class VectorIndexProcedures {
     }
 
     throw new IllegalArgumentException("Unknown parameter " + parameter.name());
-  }
-
-  /**
-   * Counts the index files and entries of an index snapshot.
-   *
-   * @return a two-element array: index file count and entry count
-   */
-  static long[] counts(FileIO fileIO, IndexSnapshot snapshot) {
-    long indexFiles = 0;
-    long entries = 0;
-    if (snapshot == null) {
-      return new long[] {0L, 0L};
-    }
-
-    List<IndexFile> files = Lists.newArrayList();
-    try {
-      IndexManifestList manifestList =
-          IndexManifestList.read(fileIO.newInputFile(snapshot.indexManifestList()));
-      for (ManifestRef ref : manifestList.manifests()) {
-        files.addAll(IndexManifest.read(fileIO.newInputFile(ref.location())).indexFiles());
-      }
-    } catch (IOException e) {
-      throw new UncheckedIOException(
-          "Failed to read index manifests of snapshot " + snapshot.snapshotId(), e);
-    }
-
-    indexFiles = files.size();
-    for (IndexFile indexFile : files) {
-      entries += indexFile.entryCount();
-    }
-
-    return new long[] {indexFiles, entries};
   }
 }
