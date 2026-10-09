@@ -593,11 +593,11 @@
               <tr><td>D2 · 快照血缘</td><td>IndexSnapshot 增加 parent-index-snapshot-id，镜像 parent-snapshot-id</td></tr>
               <tr><td>D3 · IndexFile 建模</td><td>单类 + kind 字段；LeafFile 降级为 payload 种类（entry-bearing）</td></tr>
               <tr><td>D4 · 元数据注册位置</td><td>sidecar 采用方案 A：索引元数据树挂在表目录下（<code>&lt;table-location&gt;/indexes/&lt;index-uuid&gt;/</code>）；方案 B 作为备选记录在案</td></tr>
-              <tr><td>D5 · 类型 registry</td><td>静态 registry（core 内 <code>Map&lt;String, IndexType&gt;</code>：type → definition 工厂 / payload codec）；未知类型 fail-fast，保证前向兼容</td></tr>
+              <tr><td>D5 · 类型 registry</td><td>静态 registry（core 内 <code>Map&lt;String, IndexType&gt;</code>：type → definition 工厂 / payload codec）；未知类型 fail-fast，保证前向兼容；注册方式为<strong>显式注册</strong>：core 不自注册任何内置索引类型，core 外部模块（如 iceberg-index-vector）的消费者在使用前调用该模块的注册入口（如 <code>VectorIndexTypes.register()</code>），保证 core 对算法库零依赖</td></tr>
               <tr><td>D6 · 引擎 adapter 顺序</td><td>Spark 第一优先；first milestone = builder + 简单读路径，深度 planner 集成后置；core 不含引擎依赖</td></tr>
               <tr><td>D7 · 可见性与模块放置</td><td>全部 index 类按最终发布可见性创建（public，不做 package-private 过渡，无后期整体晋升）；模型与查询契约放 core（与 TableMetadata / Snapshot 一致）；IndexCatalog 建成时作为公共 SPI 进 api，届时契约整体移动（api 不能依赖 core），属一次性可选项</td></tr>
               <tr><td>D8 · payload 容器</td><td>IndexFile 统一采用 Puffin 容器（MVP 二进制编码原样进 blob，blob type = iceberg-vector-entries-v1）；容器做成可插拔接口，Puffin 为首选实现，元数据模型不变</td></tr>
-              <tr><td>D9 · ANN 检索</td><td>HNSW 近似检索已实现：definition 增加 <code>IndexMode</code>（EXACT / HNSW）与 M / efConstruction / efSearch 参数；HNSW 模式写 AUXILIARY index 文件（blob type <code>iceberg-vector-hnsw-v1</code>，内含序列化 HNSW 图 + id→行映射），召回后用精确 metric 重排，分数与 exact 一致；依赖 jelmerk hnswlib-core 1.1.0（纯 Java）</td></tr>
+              <tr><td>D9 · ANN 检索</td><td>HNSW 近似检索已实现：definition 增加 <code>IndexMode</code>（EXACT / HNSW）与 M / efConstruction / efSearch 参数；HNSW 模式写 AUXILIARY index 文件（blob type <code>iceberg-vector-hnsw-v1</code>，内含序列化 HNSW 图 + id→行映射），召回后用精确 metric 重排，分数与 exact 一致；依赖 jelmerk hnswlib-core 1.1.0（纯 Java）。<strong>模块归属</strong>：vector adapter（definition / type / adapter）与 hnswlib 整体放在独立模块 <code>iceberg-index-vector</code>（包 <code>org.apache.iceberg.index.vector</code>），core 只保留 generic 层，对 ANN 库零依赖；Spark adapter 依赖 iceberg-index-vector 并负责注册</td></tr>
             </tbody>
           </table>
         </div>

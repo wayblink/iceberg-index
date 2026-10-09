@@ -357,7 +357,7 @@
       </section>
 
       <footer>
-        <p>源码依据：<code>core/src/main/java/org/apache/iceberg/index/</code>（20 个主类）与对应测试目录（5 个测试类，11 个用例）。2026-09-18：最初未提交的 vector MVP 已重构为通用 index 层 + vector adapter；Catalog / builder / refresher / planner / 生命周期待新增。</p>
+        <p>源码依据：<code>core/src/main/java/org/apache/iceberg/index/</code>（20 个主类）与对应测试目录。2026-09-18：最初未提交的 vector MVP 已重构为通用 index 层 + vector adapter。2026-09-19 更新：vector adapter（含 HNSW / hnswlib）已抽到独立模块 <code>iceberg-index-vector</code>（<code>org.apache.iceberg.index.vector</code>），core 保持引擎与算法双中立（零 ANN 依赖），索引类型改为显式注册；Spark adapter 位于 <code>spark/v3.5/spark/src/.../spark/index/</code>。</p>
         <p>设计依据：Iceberg 二级索引草案所强调的独立 Index、Index Snapshot、<code>source-table-snapshot-id</code>、tracking/leaf files 和 <code>_file + _pos</code> 关系；正式协议接入前仍需以目标版本规范和 POC 结果为准。</p>
       </footer>
     </main>
