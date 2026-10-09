@@ -55,9 +55,19 @@ import org.apache.iceberg.util.JsonUtil;
  */
 public final class SidecarIndexCatalog implements IndexCatalog {
 
-  private static final String INDEXES_DIR = "indexes";
+  /** The directory, relative to the table location, that holds all index trees. */
+  public static final String INDEXES_DIR = "indexes";
+
   private static final String REGISTRY_FILE = "index-registry.json";
-  private static final String METADATA_DIR = "metadata";
+
+  /** The directory, relative to an index location, that holds index metadata roots. */
+  public static final String METADATA_DIR = "metadata";
+
+  /** The directory, relative to an index location, that holds manifest lists and manifests. */
+  public static final String SNAPSHOTS_DIR = "snapshots";
+
+  /** The directory, relative to an index location, that holds index files. */
+  public static final String DATA_DIR = "data";
   private static final String REGISTRY_FORMAT_VERSION = "format-version";
   private static final String REGISTRY_INDEX_UUIDS = "index-uuids";
   private static final int REGISTRY_VERSION = 1;

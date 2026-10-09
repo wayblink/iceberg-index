@@ -439,14 +439,26 @@
           <article class="card">
             <span class="tag">契约 ④ · 锚定</span>
             <h3>_file + _pos 回表</h3>
-            <p><code>IndexEntry</code> 持有 data-file path + row position，与 manifest entry 的锚点一致，任何引擎都能把索引结果解析回表行。删除语义读时应用（绑定快照的 delete files 已知）；重写改变文件路径 → 覆盖失效 → refresh。</p>
+            <p><code>IndexEntry</code> 持有 data-file path + row position，与 manifest entry 的锚点一致，任何引擎都能把索引结果解析回表行。重写改变文件路径 → 覆盖失效 → refresh。</p>
+          </article>
+        </div>
+        <div class="card-grid" style="margin-top: 16px;">
+          <article class="card">
+            <span class="tag">契约 ④-A · 删除语义</span>
+            <h3>index 快照 ≡ 表快照（含删除）</h3>
+            <p><strong>构建/refresh 时应用删除</strong>：position delete 文件删除的位置、equality delete 文件匹配的行，都不进索引；记录的 position 是数据文件内的原始行序号（即 <code>_pos</code>）。这样索引结果对绑定快照就是“全活行”，查询无需再应用删除。已实现：<code>VectorIndexEntries</code> 读数据文件为 parquet 并应用该快照的 delete files；refresh 除数据文件增删外，还重建“适用 delete 文件集合发生变化”的数据文件的索引。未实现（后置）：查询期兜底应用删除、delete 文件自身的过期协调。</p>
+          </article>
+          <article class="card">
+            <span class="tag">契约 ⑤-A · 孤儿清理</span>
+            <h3>只删不被存活快照引用的文件</h3>
+            <p>索引树 <code>&lt;table-location&gt;/indexes/&lt;uuid&gt;/</code> 下 <code>data/</code> 与 <code>snapshots/</code> 中不被任何<strong>存活</strong> index 快照引用的文件即孤儿：包括被 refresh 丢弃文件的旧快照过期后的文件、失败构建的残留。已实现：<code>CALL cleanup_vector_index_files</code>——先按“绑定的表快照已过期”丢弃 index 快照前缀（新首快照 parent 置空以保持血缘合法），再删除不被存活快照引用的文件，返回过期快照数 / 删除文件数 / 字节数；registry 与 metadata 文件永不受影响。清理期间不得有构建/refresh 在飞。</p>
           </article>
         </div>
         <div class="card-grid" style="margin-top: 16px;">
           <article class="card">
             <span class="tag">契约 ⑤ · 生命周期</span>
             <h3>retention 让位于表快照过期</h3>
-            <p>表快照过期后，绑定它的 index 快照应同步清理；leaf 文件只有在不被任何存活 index 快照引用时才是孤儿。判断依赖 <code>parent-index-snapshot-id</code> 链 + 各 manifest 的文件引用（见第四节）。</p>
+            <p>表快照过期后，绑定它的 index 快照应同步清理；leaf 文件只有在不被任何存活 index 快照引用时才是孤儿。判断依赖 <code>parent-index-snapshot-id</code> 链 + 各 manifest 的文件引用（见第四节）。保留策略首版：丢弃“绑定表快照已不存在”的 index 快照<strong>前缀</strong>（保持血缘连续，新首快照 parent 置空），由 <code>cleanup_vector_index_files</code> 过程执行（见契约 ⑤-A）。</p>
           </article>
         </div>
       </section>

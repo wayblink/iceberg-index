@@ -182,6 +182,18 @@ public final class IndexSnapshot {
         .toString();
   }
 
+  /** Returns a builder copy of this snapshot, for lineage edits such as truncating a parent. */
+  public Builder toBuilder() {
+    return new Builder()
+        .snapshotId(snapshotId)
+        .sourceTableSnapshotId(sourceTableSnapshotId)
+        .parentIndexSnapshotId(parentIndexSnapshotId)
+        .timestampMillis(timestampMillis)
+        .status(status)
+        .indexManifestList(indexManifestList)
+        .properties(properties);
+  }
+
   public static final class Builder {
     private Long snapshotId;
     private Long sourceTableSnapshotId;
