@@ -18,6 +18,7 @@
  */
 package org.apache.iceberg.index.text;
 
+import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import org.apache.iceberg.index.IndexDefinition;
@@ -27,16 +28,9 @@ import org.apache.iceberg.relocated.com.google.common.collect.ImmutableSet;
 /** Definition of a BM25 text index over a string column. */
 public final class TextIndexDefinition implements IndexDefinition {
 
-  private static final String TYPE = "text";
-  private static final String K1 = "k1";
-  private static final String B = "b";
-  private static final String MIN_TOKEN_LENGTH = "min-token-length";
-  private static final String LOWERCASE = "lowercase";
-  private static final String STOPWORDS = "stopwords";
-
   private final int fieldId;
   private final double k1;
-  private final double b;
+  private final double lengthNorm;
   private final int minTokenLength;
   private final boolean lowercase;
   private final Set<String> stopwords;
@@ -45,14 +39,14 @@ public final class TextIndexDefinition implements IndexDefinition {
   private TextIndexDefinition(
       int fieldId,
       double k1,
-      double b,
+      double lengthNorm,
       int minTokenLength,
       boolean lowercase,
       Set<String> stopwords,
       Map<String, String> properties) {
     this.fieldId = fieldId;
     this.k1 = k1;
-    this.b = b;
+    this.lengthNorm = lengthNorm;
     this.minTokenLength = minTokenLength;
     this.lowercase = lowercase;
     this.stopwords = ImmutableSet.copyOf(stopwords);
@@ -61,7 +55,7 @@ public final class TextIndexDefinition implements IndexDefinition {
 
   @Override
   public String type() {
-    return TYPE;
+    return TextIndexType.TYPE;
   }
 
   /** The field ID of the indexed string column. */
@@ -75,8 +69,8 @@ public final class TextIndexDefinition implements IndexDefinition {
   }
 
   /** The BM25 document length normalization parameter. */
-  public double b() {
-    return b;
+  public double lengthNorm() {
+    return lengthNorm;
   }
 
   /** Tokens shorter than this are dropped when analyzing documents and queries. */
@@ -99,6 +93,11 @@ public final class TextIndexDefinition implements IndexDefinition {
     return properties;
   }
 
+  /** Analyzes text into the tokens this index stores. */
+  public List<String> analyze(String text) {
+    return TextAnalyzer.analyze(text, lowercase, minTokenLength, stopwords);
+  }
+
   @Override
   public boolean equals(Object other) {
     if (this == other) {
@@ -110,7 +109,7 @@ public final class TextIndexDefinition implements IndexDefinition {
     TextIndexDefinition that = (TextIndexDefinition) other;
     return fieldId == that.fieldId
         && Double.compare(k1, that.k1) == 0
-        && Double.compare(b, that.b) == 0
+        && Double.compare(lengthNorm, that.lengthNorm) == 0
         && minTokenLength == that.minTokenLength
         && lowercase == that.lowercase
         && stopwords.equals(that.stopwords)
@@ -119,7 +118,8 @@ public final class TextIndexDefinition implements IndexDefinition {
 
   @Override
   public int hashCode() {
-    return java.util.Objects.hash(fieldId, k1, b, minTokenLength, lowercase, stopwords, properties);
+    return java.util.Objects.hash(
+        fieldId, k1, lengthNorm, minTokenLength, lowercase, stopwords, properties);
   }
 
   @Override
@@ -129,8 +129,8 @@ public final class TextIndexDefinition implements IndexDefinition {
         + fieldId
         + ", k1="
         + k1
-        + ", b="
-        + b
+        + ", lengthNorm="
+        + lengthNorm
         + ", minTokenLength="
         + minTokenLength
         + ", lowercase="
@@ -140,11 +140,6 @@ public final class TextIndexDefinition implements IndexDefinition {
         + '}';
   }
 
-  /** Splits text into the tokens this definition indexes. */
-  java.util.List<String> analyze(String text) {
-    return TextAnalyzer.analyze(text, lowercase, minTokenLength, stopwords);
-  }
-
   public static Builder builder() {
     return new Builder();
   }
@@ -152,7 +147,7 @@ public final class TextIndexDefinition implements IndexDefinition {
   public static final class Builder {
     private Integer fieldId;
     private double k1 = 1.2;
-    private double b = 0.75;
+    private double lengthNorm = 0.75;
     private int minTokenLength = 2;
     private boolean lowercase = true;
     private final ImmutableSet.Builder<String> stopwords = ImmutableSet.builder();
@@ -170,8 +165,8 @@ public final class TextIndexDefinition implements IndexDefinition {
       return this;
     }
 
-    public Builder b(double newB) {
-      this.b = newB;
+    public Builder lengthNorm(double newLengthNorm) {
+      this.lengthNorm = newLengthNorm;
       return this;
     }
 
@@ -207,7 +202,13 @@ public final class TextIndexDefinition implements IndexDefinition {
 
     public TextIndexDefinition build() {
       return new TextIndexDefinition(
-          fieldId, k1, b, minTokenLength, lowercase, stopwords.build(), properties.build());
+          fieldId,
+          k1,
+          lengthNorm,
+          minTokenLength,
+          lowercase,
+          stopwords.build(),
+          properties.build());
     }
   }
 }

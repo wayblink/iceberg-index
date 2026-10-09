@@ -27,7 +27,6 @@ import java.io.UncheckedIOException;
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.util.Comparator;
-import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import org.apache.iceberg.index.IndexAdapter;
@@ -40,21 +39,25 @@ import org.apache.iceberg.relocated.com.google.common.collect.Maps;
 /**
  * BM25 text index adapter.
  *
- * <p>The index is table-wide: one auxiliary index file holds the inverted index of the whole
- * snapshot, because BM25 scoring needs corpus-wide document frequency and average document length,
- * which a per-data-file index could not compute. See {@link IndexAdapter#isTableWide()}.
+ * <p>Scoring a document needs corpus-wide statistics: the document frequency of each query term and
+ * the average document length. Those are sums over the whole snapshot, so this adapter searches all
+ * index file payloads of a snapshot together ({@link #searchesAllPayloadsTogether()}). Each index
+ * file carries the <b>local</b> postings and statistics of the data files it covers, and the
+ * statistics are merged at search time, exactly like Lucene merges per-segment statistics. That
+ * keeps index files per data file, so incremental refresh, coverage, lineage and delete semantics
+ * are unchanged.
  *
- * <p>The payload format is a versioned binary blob: the BM25 parameters, corpus statistics
- * (document count and total length), the term dictionary with postings (document id and term
- * frequency), and the mapping from document id to row reference and document length.
+ * <p>Score of document d for query q: {@code Σ_t∈q idf(t) · tf(t,d)·(k1+1) / (tf(t,d) + k1·(1 − b +
+ * b·|d|/avgdl))}, with {@code idf(t) = ln(1 + (N − df(t) + 0.5)/(df(t) + 0.5))}. A query term that
+ * occurs several times contributes once per occurrence.
  */
 public final class TextIndexAdapter implements IndexAdapter {
 
   static final String ENTRY_BLOB_TYPE = "iceberg-text-entries-v1";
   static final String AUXILIARY_BLOB_TYPE = "iceberg-text-bm25-v1";
 
-  private static final byte FORMAT_VERSION = 1;
   private static final byte[] MAGIC = "ICEBM25".getBytes(StandardCharsets.US_ASCII);
+  private static final byte FORMAT_VERSION = 1;
 
   private final TextIndexDefinition definition;
 
@@ -83,7 +86,7 @@ public final class TextIndexAdapter implements IndexAdapter {
   }
 
   @Override
-  public boolean isTableWide() {
+  public boolean searchesAllPayloadsTogether() {
     return true;
   }
 
@@ -92,7 +95,7 @@ public final class TextIndexAdapter implements IndexAdapter {
     return encodeTokens(definition.analyze(text));
   }
 
-  /** Encodes a query string for {@link #searchAuxiliary(ByteBuffer, ByteBuffer, int)}. */
+  /** Encodes a query string; it is analyzed at search time with the same analyzer. */
   public ByteBuffer encodeQuery(String query) {
     return ByteBuffer.wrap(query.getBytes(StandardCharsets.UTF_8));
   }
@@ -103,31 +106,34 @@ public final class TextIndexAdapter implements IndexAdapter {
   }
 
   @Override
+  public byte[] encodeEntryValue(Object columnValue) {
+    return encodeDocument((String) columnValue);
+  }
+
+  @Override
   public ByteBuffer encodeEntries(List<IndexEntry> entries) {
     throw new UnsupportedOperationException(
-        "Text indexes write a single table-wide auxiliary file, not entry-bearing files");
+        "Text indexes write auxiliary index files, not entry-bearing files");
   }
 
   @Override
   public List<IndexEntry> decodeEntries(ByteBuffer payload) {
     throw new UnsupportedOperationException(
-        "Text indexes write a single table-wide auxiliary file, not entry-bearing files");
+        "Text indexes write auxiliary index files, not entry-bearing files");
   }
 
   @Override
   public List<IndexSearchResult> search(ByteBuffer payload, ByteBuffer query, int topK) {
     throw new UnsupportedOperationException(
-        "Text indexes write a single table-wide auxiliary file, not entry-bearing files");
+        "Text indexes search all payloads of a snapshot together; see searchAuxiliaryAll");
   }
 
   /**
-   * Builds the table-wide index payload from the analyzed documents of a snapshot.
-   *
-   * @param entries one entry per indexed row; the payload is the analyzed document
+   * Builds the payload of one index file: the local postings and local statistics of the given
+   * entries, plus the mapping from local document id to row reference and document length.
    */
   @Override
   public ByteBuffer encodeAuxiliaryPayload(List<IndexEntry> entries) {
-    // document ids are assigned in entry order; documents keep their length and row reference
     List<Document> documents = Lists.newArrayListWithCapacity(entries.size());
     Map<String, List<Posting>> postingsByTerm = Maps.newHashMap();
     long totalLength = 0;
@@ -136,6 +142,7 @@ public final class TextIndexAdapter implements IndexAdapter {
       List<String> tokens = decodeTokens(ByteBuffer.wrap(entry.payload()));
       documents.add(new Document(entry.dataFile(), entry.rowPosition(), tokens.size()));
       totalLength += tokens.size();
+
       Map<String, Integer> termFrequency = Maps.newHashMap();
       for (String token : tokens) {
         termFrequency.merge(token, 1, Integer::sum);
@@ -153,7 +160,8 @@ public final class TextIndexAdapter implements IndexAdapter {
         out.write(MAGIC);
         out.writeByte(FORMAT_VERSION);
         out.writeDouble(definition.k1());
-        out.writeDouble(definition.b());
+        out.writeDouble(definition.lengthNorm());
+        // local statistics header: merged across payloads at search time
         out.writeInt(documents.size());
         out.writeLong(totalLength);
 
@@ -162,6 +170,7 @@ public final class TextIndexAdapter implements IndexAdapter {
           byte[] termBytes = term.getKey().getBytes(StandardCharsets.UTF_8);
           out.writeShort(termBytes.length);
           out.write(termBytes);
+          // the document frequency doubles as the posting count: one posting per document
           out.writeInt(term.getValue().size());
           for (Posting posting : term.getValue()) {
             out.writeInt(posting.docId);
@@ -186,57 +195,108 @@ public final class TextIndexAdapter implements IndexAdapter {
   }
 
   @Override
-  public List<IndexSearchResult> searchAuxiliary(
-      ByteBuffer payload, ByteBuffer query, int topK) {
+  public List<IndexSearchResult> searchAuxiliary(ByteBuffer payload, ByteBuffer query, int topK) {
+    throw new UnsupportedOperationException(
+        "Text indexes search all payloads of a snapshot together; see searchAuxiliaryAll");
+  }
+
+  /**
+   * Searches all index file payloads of a snapshot: merges the local statistics into corpus-wide
+   * document frequency and average document length, then scores the candidate documents.
+   */
+  @Override
+  public List<IndexSearchResult> searchAuxiliaryAll(
+      List<ByteBuffer> payloads, ByteBuffer query, int topK) {
     List<String> queryTokens = definition.analyze(decodeQuery(query));
-    if (queryTokens.isEmpty() || topK <= 0) {
+    if (queryTokens.isEmpty() || topK <= 0 || payloads.isEmpty()) {
       return Lists.newArrayList();
     }
 
-    IndexPayload index = readPayload(payload);
+    List<FileIndex> indexes = Lists.newArrayListWithCapacity(payloads.size());
+    for (ByteBuffer payload : payloads) {
+      indexes.add(readPayload(payload));
+    }
+
+    // merge the local statistics into corpus-wide statistics, then score the candidates with them
+    CorpusStatistics statistics = mergeStatistics(indexes);
     Map<String, Integer> queryTermFrequency = Maps.newHashMap();
     for (String token : queryTokens) {
       queryTermFrequency.merge(token, 1, Integer::sum);
     }
 
-    double averageLength = index.totalDocuments == 0 ? 0.0 : (double) index.totalLength / index.totalDocuments;
-    Map<Integer, Double> scores = new HashMap<>();
-    for (Map.Entry<String, Integer> queryTerm : queryTermFrequency.entrySet()) {
-      List<Posting> postings = index.postingsByTerm.get(queryTerm.getKey());
-      if (postings == null || postings.isEmpty()) {
-        continue;
-      }
+    Map<String, Map<Long, Double>> scoresByFile =
+        scoreCandidates(indexes, queryTermFrequency, statistics);
 
-      double idf =
-          Math.log(
-              1.0
-                  + (index.totalDocuments - postings.size() + 0.5)
-                      / (postings.size() + 0.5));
-      for (Posting posting : postings) {
-        Document document = index.documents.get(posting.docId);
-        double frequency = (double) posting.termFrequency;
-        double lengthNorm =
-            averageLength == 0.0
-                ? 1.0
-                : definition.k1()
-                        * (1.0 - definition.b() + definition.b() * document.length / averageLength)
-                    + frequency;
-        double score = idf * frequency * (definition.k1() + 1.0) / lengthNorm;
-        scores.merge(posting.docId, score, Double::sum);
+    List<IndexSearchResult> results = Lists.newArrayList();
+    for (Map.Entry<String, Map<Long, Double>> fileScores : scoresByFile.entrySet()) {
+      for (Map.Entry<Long, Double> score : fileScores.getValue().entrySet()) {
+        results.add(IndexSearchResult.of(fileScores.getKey(), score.getKey(), score.getValue()));
       }
-    }
-
-    List<IndexSearchResult> results = Lists.newArrayListWithCapacity(scores.size());
-    for (Map.Entry<Integer, Double> score : scores.entrySet()) {
-      Document document = index.documents.get(score.getKey());
-      results.add(
-          IndexSearchResult.of(document.dataFile, document.rowPosition, score.getValue()));
     }
 
     results.sort(resultComparator());
-    return results.size() > topK
-        ? Lists.newArrayList(results.subList(0, topK))
-        : results;
+    return results.size() > topK ? Lists.newArrayList(results.subList(0, topK)) : results;
+  }
+
+  /** The corpus-wide statistics merged from the local statistics of every index file. */
+  private static CorpusStatistics mergeStatistics(List<FileIndex> indexes) {
+    long totalDocuments = 0;
+    long totalLength = 0;
+    Map<String, Integer> documentFrequency = Maps.newHashMap();
+    for (FileIndex index : indexes) {
+      totalDocuments += index.localDocuments;
+      totalLength += index.localTotalLength;
+      for (Map.Entry<String, Integer> term : index.localDocumentFrequency.entrySet()) {
+        documentFrequency.merge(term.getKey(), term.getValue(), Integer::sum);
+      }
+    }
+
+    return new CorpusStatistics(
+        totalDocuments,
+        totalLength == 0 || totalDocuments == 0 ? 0.0 : (double) totalLength / totalDocuments,
+        documentFrequency);
+  }
+
+  /** Scores every candidate document with the corpus-wide statistics, keyed by row reference. */
+  private Map<String, Map<Long, Double>> scoreCandidates(
+      List<FileIndex> indexes,
+      Map<String, Integer> queryTermFrequency,
+      CorpusStatistics statistics) {
+    Map<String, Map<Long, Double>> scoresByFile = Maps.newHashMap();
+    for (FileIndex index : indexes) {
+      for (Map.Entry<String, Integer> queryTerm : queryTermFrequency.entrySet()) {
+        List<Posting> postings = index.postingsByTerm.get(queryTerm.getKey());
+        if (postings == null) {
+          continue;
+        }
+
+        int frequency = statistics.documentFrequency.getOrDefault(queryTerm.getKey(), 0);
+        double idf =
+            Math.log(1.0 + (statistics.totalDocuments - frequency + 0.5) / (frequency + 0.5));
+        for (Posting posting : postings) {
+          Document document = index.documents.get(posting.docId);
+          double score =
+              queryTerm.getValue()
+                  * documentScore(
+                      idf, posting.termFrequency, document.length, statistics.averageLength);
+          scoresByFile
+              .computeIfAbsent(document.dataFile, key -> Maps.newHashMap())
+              .merge(document.rowPosition, score, Double::sum);
+        }
+      }
+    }
+
+    return scoresByFile;
+  }
+
+  private double documentScore(double idf, int termFrequency, int length, double averageLength) {
+    double frequency = termFrequency;
+    // with no corpus length to normalize against, only the saturation applies
+    double lengthNorm = averageLength == 0.0 ? 1.0 : (double) length / averageLength;
+    double normalization =
+        definition.k1() * (1.0 - definition.lengthNorm() + definition.lengthNorm() * lengthNorm)
+            + frequency;
+    return idf * frequency * (definition.k1() + 1.0) / normalization;
   }
 
   @Override
@@ -251,7 +311,7 @@ public final class TextIndexAdapter implements IndexAdapter {
     return StandardCharsets.UTF_8.decode(query.duplicate()).toString();
   }
 
-  private static IndexPayload readPayload(ByteBuffer buffer) {
+  private FileIndex readPayload(ByteBuffer buffer) {
     try {
       byte[] bytes = new byte[buffer.remaining()];
       buffer.duplicate().get(bytes);
@@ -267,16 +327,19 @@ public final class TextIndexAdapter implements IndexAdapter {
         }
         in.readDouble(); // k1, already in the definition
         in.readDouble(); // b, already in the definition
-        int totalDocuments = in.readInt();
-        long totalLength = in.readLong();
+        int localDocuments = in.readInt();
+        long localTotalLength = in.readLong();
 
         int termCount = in.readInt();
+        Map<String, Integer> localDocumentFrequency = Maps.newHashMap();
         Map<String, List<Posting>> postingsByTerm = Maps.newHashMap();
         for (int i = 0; i < termCount; i++) {
           byte[] termBytes = new byte[in.readUnsignedShort()];
           in.readFully(termBytes);
           String term = new String(termBytes, StandardCharsets.UTF_8);
+          // the document frequency doubles as the posting count: one posting per document
           int postingCount = in.readInt();
+          localDocumentFrequency.put(term, postingCount);
           List<Posting> postings = Lists.newArrayListWithCapacity(postingCount);
           for (int p = 0; p < postingCount; p++) {
             postings.add(new Posting(in.readInt(), in.readInt()));
@@ -294,7 +357,8 @@ public final class TextIndexAdapter implements IndexAdapter {
                   new String(dataFile, StandardCharsets.UTF_8), in.readLong(), in.readInt()));
         }
 
-        return new IndexPayload(totalDocuments, totalLength, postingsByTerm, documents);
+        return new FileIndex(
+            localDocuments, localTotalLength, localDocumentFrequency, postingsByTerm, documents);
       }
     } catch (IOException e) {
       throw new UncheckedIOException("Failed to read the text index payload", e);
@@ -337,7 +401,7 @@ public final class TextIndexAdapter implements IndexAdapter {
     }
   }
 
-  /** A document of the indexed snapshot: its row reference and its token count. */
+  /** A document of one index file: its row reference and its token count. */
   private static final class Document {
     private final String dataFile;
     private final long rowPosition;
@@ -350,7 +414,7 @@ public final class TextIndexAdapter implements IndexAdapter {
     }
   }
 
-  /** One term occurrence: the document id and the term frequency in that document. */
+  /** One term occurrence: the local document id and the term frequency in that document. */
   private static final class Posting {
     private final int docId;
     private final int termFrequency;
@@ -361,20 +425,37 @@ public final class TextIndexAdapter implements IndexAdapter {
     }
   }
 
-  /** The decoded table-wide index. */
-  private static final class IndexPayload {
-    private final int totalDocuments;
-    private final long totalLength;
+  /** Corpus-wide statistics merged from the local statistics of every index file. */
+  private static final class CorpusStatistics {
+    private final long totalDocuments;
+    private final double averageLength;
+    private final Map<String, Integer> documentFrequency;
+
+    private CorpusStatistics(
+        long totalDocuments, double averageLength, Map<String, Integer> documentFrequency) {
+      this.totalDocuments = totalDocuments;
+      this.averageLength = averageLength;
+      this.documentFrequency = documentFrequency;
+    }
+  }
+
+  /** The decoded content of one index file payload. */
+  private static final class FileIndex {
+    private final int localDocuments;
+    private final long localTotalLength;
+    private final Map<String, Integer> localDocumentFrequency;
     private final Map<String, List<Posting>> postingsByTerm;
     private final List<Document> documents;
 
-    private IndexPayload(
-        int totalDocuments,
-        long totalLength,
+    private FileIndex(
+        int localDocuments,
+        long localTotalLength,
+        Map<String, Integer> localDocumentFrequency,
         Map<String, List<Posting>> postingsByTerm,
         List<Document> documents) {
-      this.totalDocuments = totalDocuments;
-      this.totalLength = totalLength;
+      this.localDocuments = localDocuments;
+      this.localTotalLength = localTotalLength;
+      this.localDocumentFrequency = localDocumentFrequency;
       this.postingsByTerm = postingsByTerm;
       this.documents = documents;
     }

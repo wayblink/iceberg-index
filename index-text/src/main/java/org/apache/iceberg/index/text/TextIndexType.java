@@ -25,6 +25,7 @@ import org.apache.iceberg.index.IndexAdapter;
 import org.apache.iceberg.index.IndexDefinition;
 import org.apache.iceberg.index.IndexType;
 import org.apache.iceberg.relocated.com.google.common.base.Preconditions;
+import org.apache.iceberg.relocated.com.google.common.base.Splitter;
 import org.apache.iceberg.util.JsonUtil;
 
 /** Index type of BM25 text indexes. */
@@ -54,7 +55,7 @@ public final class TextIndexType implements IndexType {
       builder.k1(node.get(K1).asDouble());
     }
     if (node.has(B)) {
-      builder.b(node.get(B).asDouble());
+      builder.lengthNorm(node.get(B).asDouble());
     }
     if (node.has(MIN_TOKEN_LENGTH)) {
       builder.minTokenLength(JsonUtil.getInt(MIN_TOKEN_LENGTH, node));
@@ -63,7 +64,7 @@ public final class TextIndexType implements IndexType {
       builder.lowercase(JsonUtil.getBool(LOWERCASE, node));
     }
     if (node.has(STOPWORDS)) {
-      for (String stopword : JsonUtil.getString(STOPWORDS, node).split(",")) {
+      for (String stopword : Splitter.on(',').split(JsonUtil.getString(STOPWORDS, node))) {
         if (!stopword.trim().isEmpty()) {
           builder.stopword(stopword.trim());
         }
@@ -85,7 +86,7 @@ public final class TextIndexType implements IndexType {
     TextIndexDefinition textDefinition = (TextIndexDefinition) definition;
     generator.writeNumberField(FIELD_ID, textDefinition.fieldId());
     generator.writeNumberField(K1, textDefinition.k1());
-    generator.writeNumberField(B, textDefinition.b());
+    generator.writeNumberField(B, textDefinition.lengthNorm());
     generator.writeNumberField(MIN_TOKEN_LENGTH, textDefinition.minTokenLength());
     generator.writeBooleanField(LOWERCASE, textDefinition.lowercase());
     if (!textDefinition.stopwords().isEmpty()) {

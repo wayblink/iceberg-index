@@ -39,7 +39,8 @@ final class TextAnalyzer {
     String normalized = lowercase ? text.toLowerCase(java.util.Locale.ROOT) : text;
     int start = -1;
     for (int i = 0; i <= normalized.length(); i++) {
-      boolean isTokenChar = i < normalized.length() && Character.isLetterOrDigit(normalized.charAt(i));
+      boolean isTokenChar =
+          i < normalized.length() && Character.isLetterOrDigit(normalized.charAt(i));
       if (isTokenChar) {
         if (start < 0) {
           start = i;
