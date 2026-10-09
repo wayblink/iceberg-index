@@ -18,7 +18,6 @@
  */
 package org.apache.iceberg.spark.procedures;
 
-import java.util.Comparator;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -141,7 +140,9 @@ class VectorSearchProcedure extends BaseProcedure {
                       .search(
                           IndexQuery.of(
                               snapshot.sourceTableSnapshotId(), adapter.encodeQuery(query), topK)));
-          results.sort(Comparator.comparingDouble(IndexSearchResult::score).reversed());
+          // the reader sorts with the metric-aware comparator (distance ascending, similarity
+          // descending); re-sort defensively with the same comparator
+          results.sort(adapter.resultComparator());
 
           Map<String, Map<Long, String>> rowsByFile = resolveRows(results);
           List<InternalRow> rows = Lists.newArrayListWithCapacity(results.size());
