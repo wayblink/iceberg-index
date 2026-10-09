@@ -848,6 +848,27 @@ project(':iceberg-index-vector') {
   }
 }
 
+project(':iceberg-index-text') {
+  test {
+    useJUnitPlatform()
+  }
+
+  dependencies {
+    api project(':iceberg-api')
+    implementation project(path: ':iceberg-bundled-guava', configuration: 'shadow')
+    implementation project(':iceberg-core')
+
+    testImplementation project(path: ':iceberg-core', configuration: 'testArtifacts')
+    testImplementation libs.avro.avro
+    testImplementation libs.awaitility
+    testImplementation libs.assertj.core
+    testImplementation libs.junit.pioneer
+    testImplementation libs.junit.jupiter
+    testRuntimeOnly libs.junit.jupiter.engine
+    testRuntimeOnly libs.junit.platform.launcher
+  }
+}
+
 project(':iceberg-hive-metastore') {
   test {
     useJUnitPlatform()

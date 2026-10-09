@@ -22,6 +22,7 @@ import java.nio.ByteBuffer;
 import java.util.Comparator;
 import java.util.List;
 import javax.annotation.Nullable;
+import org.apache.iceberg.relocated.com.google.common.collect.Lists;
 
 /**
  * Type-specific codec and search strategy for one index.
@@ -64,6 +65,69 @@ public interface IndexAdapter {
   Comparator<IndexSearchResult> resultComparator();
 
   /**
+   * Returns true when this adapter must see all index file payloads of a snapshot together, because
+   * scoring needs statistics merged across them.
+   *
+   * <p>For example a BM25 text index scores a document with corpus-wide document frequency and
+   * average document length, which are sums over the per-file statistics of every index file. When
+   * this returns true, the reader collects the payloads of each kind and passes them to {@link
+   * #searchAll} or {@link #searchAuxiliaryAll} instead of searching file by file. Index types whose
+   * scoring is local to one file (vectors) return false and keep the per-file path.
+   */
+  default boolean searchesAllPayloadsTogether() {
+    return false;
+  }
+
+  /**
+   * Searches all entry-bearing payloads of a snapshot together.
+   *
+   * <p>The default implementation searches each payload independently and merges the results, which
+   * is what the per-file reader path does. Adapters that need merged statistics override this.
+   */
+  default List<IndexSearchResult> searchAll(List<ByteBuffer> payloads, ByteBuffer query, int topK) {
+    return searchAndMerge(payloads, payload -> search(payload, query, topK), topK);
+  }
+
+  /**
+   * Searches all auxiliary payloads of a snapshot together.
+   *
+   * <p>Like {@link #searchAll}, but for auxiliary payloads.
+   */
+  default List<IndexSearchResult> searchAuxiliaryAll(
+      List<ByteBuffer> payloads, ByteBuffer query, int topK) {
+    return searchAndMerge(payloads, payload -> searchAuxiliary(payload, query, topK), topK);
+  }
+
+  /**
+   * Encodes one column value into the payload of an index entry.
+   *
+   * <p>The value is the indexed column's value in the engine's representation: a {@code List<?
+   * extends Number>} for numeric array columns, a {@code String} for text columns. Engines use this
+   * to build entries without knowing the index type, so a new adapter needs no engine change.
+   *
+   * @throws UnsupportedOperationException when this index type does not encode raw column values
+   */
+  default byte[] encodeEntryValue(Object columnValue) {
+    throw new UnsupportedOperationException(
+        "This index type does not encode raw column values: " + definition().type());
+  }
+
+  private List<IndexSearchResult> searchAndMerge(
+      List<ByteBuffer> payloads,
+      java.util.function.Function<ByteBuffer, List<IndexSearchResult>> searchOne,
+      int topK) {
+    List<IndexSearchResult> results = Lists.newArrayList();
+    for (ByteBuffer payload : payloads) {
+      results.addAll(searchOne.apply(payload));
+    }
+    results.sort(resultComparator());
+    if (results.size() > topK) {
+      results = Lists.newArrayList(results.subList(0, topK));
+    }
+    return results;
+  }
+
+  /**
    * Returns the blob type of the auxiliary payload this adapter searches, or null when it only
    * searches entry-bearing payloads.
    *
@@ -80,6 +144,19 @@ public interface IndexAdapter {
    * new snapshot.
    */
   default boolean writesAuxiliaryFiles() {
+    return false;
+  }
+
+  /**
+   * Returns true when this index type is built and refreshed as a single table-wide index file
+   * instead of one index file per data file.
+   *
+   * <p>Index types whose scoring depends on corpus-wide statistics (for example the document
+   * frequency and average document length of a BM25 text index) cannot be split per data file: a
+   * per-file index would score with stale statistics. A table-wide index file covers all data files
+   * of the snapshot and is rebuilt as a whole whenever anything changes.
+   */
+  default boolean isTableWide() {
     return false;
   }
 

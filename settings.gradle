@@ -44,6 +44,7 @@ include 'delta-lake'
 include 'open-api'
 include 'mr'
 include 'index-vector'
+include 'index-text'
 
 project(':bom').name = 'iceberg-bom'
 project(':api').name = 'iceberg-api'
@@ -71,6 +72,7 @@ project(':delta-lake').name = 'iceberg-delta-lake'
 project(':open-api').name = 'iceberg-open-api'
 project(':mr').name = 'iceberg-mr'
 project(':index-vector').name = 'iceberg-index-vector'
+project(':index-text').name = 'iceberg-index-text'
 
 if (null != System.getProperty("allModules")) {
   System.setProperty("flinkVersions", System.getProperty("knownFlinkVersions"))

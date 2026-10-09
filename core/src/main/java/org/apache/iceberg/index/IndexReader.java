@@ -70,6 +70,10 @@ public final class IndexReader {
         IndexTypes.fromType(metadata.indexType()).createAdapter(metadata.definition());
 
     IndexManifestList manifestList = readManifestList(snapshot);
+    if (adapter.searchesAllPayloadsTogether()) {
+      return searchCorrelated(adapter, manifestList, query);
+    }
+
     String auxiliaryBlobType = adapter.auxiliaryBlobType();
     List<IndexSearchResult> results = Lists.newArrayList();
     for (IndexManifestList.ManifestRef ref : manifestList.manifests()) {
@@ -90,6 +94,48 @@ public final class IndexReader {
         }
         // other payload types are skipped for forward compatibility
       }
+    }
+
+    results.sort(adapter.resultComparator());
+    if (results.size() > query.topK()) {
+      results = Lists.newArrayList(results.subList(0, query.topK()));
+    }
+    return ImmutableList.copyOf(results);
+  }
+
+  /**
+   * Searches with an adapter that needs all payloads of the snapshot together: the payloads of each
+   * kind are collected and handed to the adapter, which merges the statistics they carry before
+   * scoring. See {@link IndexAdapter#searchesAllPayloadsTogether()}.
+   */
+  private List<IndexSearchResult> searchCorrelated(
+      IndexAdapter adapter, IndexManifestList manifestList, IndexQuery query) {
+    String auxiliaryBlobType = adapter.auxiliaryBlobType();
+    List<ByteBuffer> entryPayloads = Lists.newArrayList();
+    List<ByteBuffer> auxiliaryPayloads = Lists.newArrayList();
+    for (IndexManifestList.ManifestRef ref : manifestList.manifests()) {
+      IndexManifest manifest = readManifest(ref.location());
+      for (IndexFile indexFile : manifest.indexFiles()) {
+        if (indexFile.kind() == IndexFile.Kind.ENTRY_BEARING
+            && adapter.entryBlobType().equals(indexFile.blobType())) {
+          IndexBlob blob = readBlob(indexFile.location(), adapter.entryBlobType());
+          entryPayloads.add(ByteBuffer.wrap(blob.payload()));
+        } else if (auxiliaryBlobType != null
+            && indexFile.kind() == IndexFile.Kind.AUXILIARY
+            && auxiliaryBlobType.equals(indexFile.blobType())) {
+          IndexBlob blob = readBlob(indexFile.location(), auxiliaryBlobType);
+          auxiliaryPayloads.add(ByteBuffer.wrap(blob.payload()));
+        }
+        // other payload types are skipped for forward compatibility
+      }
+    }
+
+    List<IndexSearchResult> results = Lists.newArrayList();
+    if (!entryPayloads.isEmpty()) {
+      results.addAll(adapter.searchAll(entryPayloads, query.payload(), query.topK()));
+    }
+    if (!auxiliaryPayloads.isEmpty()) {
+      results.addAll(adapter.searchAuxiliaryAll(auxiliaryPayloads, query.payload(), query.topK()));
     }
 
     results.sort(adapter.resultComparator());

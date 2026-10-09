@@ -68,6 +68,7 @@ public final class SidecarIndexCatalog implements IndexCatalog {
 
   /** The directory, relative to an index location, that holds index files. */
   public static final String DATA_DIR = "data";
+
   private static final String REGISTRY_FORMAT_VERSION = "format-version";
   private static final String REGISTRY_INDEX_UUIDS = "index-uuids";
   private static final int REGISTRY_VERSION = 1;

@@ -1,0 +1,453 @@
+<!doctype html>
+<!--
+  Licensed to the Apache Software Foundation (ASF) under one
+  or more contributor license agreements.  See the NOTICE file
+  distributed with this work for additional information
+  regarding copyright ownership.  The ASF licenses this file
+  to you under the Apache License, Version 2.0 (the
+  "License"); you may not use this file except in compliance
+  with the License.  You may obtain a copy of the License at
+
+  http://www.apache.org/licenses/LICENSE-2.0
+
+  Unless required by applicable law or agreed to in writing,
+  software distributed under the License is distributed on an
+  "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+  KIND, either express or implied.  See the License for the
+  specific language governing permissions and limitations
+  under the License.
+-->
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <link rel="icon" href="data:,">
+  <title>Iceberg Index 层 · BM25 文本索引方案</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --ink: #17212b;
+      --muted: #607080;
+      --line: #c6d0d8;
+      --soft-line: #e6ebef;
+      --paper: #f5f7f8;
+      --surface: #ffffff;
+      --existing: #eef3f6;
+      --implemented: #eaf5ef;
+      --planned: #fff5dc;
+      --accent: #176b61;
+      --accent-2: #285a8f;
+      --warning: #9a6812;
+      --shadow: 0 14px 38px rgba(23, 33, 43, 0.08);
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+      margin: 0;
+      color: var(--ink);
+      background: var(--paper);
+      font: 15px/1.65 -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC",
+        "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+    }
+
+    .page {
+      width: min(1240px, calc(100% - 40px));
+      margin: 0 auto;
+      padding: 44px 0 72px;
+    }
+
+    header {
+      display: grid;
+      grid-template-columns: 1fr minmax(260px, 360px);
+      gap: 36px;
+      align-items: end;
+      padding-bottom: 28px;
+      border-bottom: 1px solid var(--line);
+    }
+
+    .eyebrow {
+      margin: 0 0 10px;
+      color: var(--accent);
+      font-size: 12px;
+      font-weight: 750;
+      letter-spacing: 0.12em;
+      text-transform: uppercase;
+    }
+
+    h1, h2, h3 { margin: 0; line-height: 1.2; letter-spacing: 0; }
+    h1 { max-width: 760px; font-size: clamp(30px, 4vw, 50px); }
+    h2 { margin-bottom: 14px; font-size: 25px; }
+    h3 { margin-bottom: 8px; font-size: 17px; }
+
+    .lede {
+      margin: 16px 0 0;
+      max-width: 800px;
+      color: var(--muted);
+      font-size: 17px;
+    }
+
+    .meta {
+      padding-left: 22px;
+      border-left: 3px solid var(--accent);
+      color: var(--muted);
+    }
+
+    .meta strong { display: block; color: var(--ink); }
+    .meta span { display: block; margin-top: 4px; }
+
+    main { display: grid; gap: 42px; padding-top: 34px; }
+
+    .section-intro {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) minmax(260px, 0.45fr);
+      gap: 32px;
+      align-items: start;
+    }
+
+    .section-intro p { margin: 0; color: var(--muted); }
+
+    .callout {
+      padding: 18px 20px;
+      border-left: 4px solid var(--accent);
+      background: var(--surface);
+      box-shadow: var(--shadow);
+    }
+
+    .callout strong { display: block; margin-bottom: 4px; }
+    .callout p { color: var(--ink); }
+
+    .legend {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px 18px;
+      margin: 18px 0 12px;
+      color: var(--muted);
+      font-size: 13px;
+    }
+
+    .legend-item { display: inline-flex; gap: 7px; align-items: center; }
+    .swatch { width: 13px; height: 13px; border: 1px solid var(--line); }
+    .swatch.existing { background: var(--existing); }
+    .swatch.planned { background: var(--planned); border-color: #dec37d; }
+    .swatch.boundary { background: transparent; border: 1px dashed var(--warning); }
+
+    .diagram-frame {
+      overflow-x: auto;
+      padding: 18px;
+      border: 1px solid var(--soft-line);
+      background: var(--surface);
+      box-shadow: var(--shadow);
+    }
+
+    .diagram-frame svg { display: block; min-width: 1180px; width: 100%; height: auto; }
+
+    .diagram-caption {
+      margin: 12px 2px 0;
+      color: var(--muted);
+      font-size: 13px;
+    }
+
+    .uml .node rect { stroke-width: 1.3; rx: 3; }
+    .uml .node.existing rect { fill: var(--existing); stroke: #8ca0ad; }
+    .uml .node.implemented rect { fill: var(--implemented); stroke: #6aa684; }
+    .uml .node.planned rect { fill: var(--planned); stroke: #c6973b; }
+    .uml .node.boundary rect { fill: #fffdf7; stroke: var(--warning); stroke-dasharray: 6 4; }
+    .uml .node .title { fill: var(--ink); font-size: 15px; font-weight: 750; }
+    .uml .node .body { fill: #435360; font-size: 12px; }
+    .uml .edge { fill: none; stroke: #70808b; stroke-width: 1.35; }
+    .uml .edge.dashed { stroke: var(--warning); stroke-dasharray: 7 5; }
+    .uml .edge.planned { stroke: var(--accent-2); stroke-dasharray: 5 4; }
+    .uml .edge-label { fill: #61727d; font-size: 11px; }
+    .uml .group-label { fill: #536671; font-size: 12px; font-weight: 750; letter-spacing: 0.08em; }
+
+    .table-wrap { overflow-x: auto; border: 1px solid var(--soft-line); background: var(--surface); box-shadow: var(--shadow); }
+    table { width: 100%; min-width: 820px; border-collapse: collapse; }
+    th, td { padding: 14px 16px; border-bottom: 1px solid var(--soft-line); text-align: left; vertical-align: top; }
+    th { color: #435360; background: #f8fafb; font-size: 12px; letter-spacing: 0.06em; text-transform: uppercase; }
+    tr:last-child td { border-bottom: 0; }
+    td:first-child { width: 17%; color: var(--ink); font-weight: 750; }
+    code { padding: 1px 5px; border: 1px solid #dbe2e7; border-radius: 3px; background: #f5f7f8; color: #214b63; font-size: 0.92em; }
+
+    .card-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; }
+    .card-grid.three { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+
+    .card {
+      padding: 20px 22px;
+      border: 1px solid var(--soft-line);
+      background: var(--surface);
+      box-shadow: var(--shadow);
+    }
+
+    .card .tag {
+      display: inline-block;
+      margin-bottom: 12px;
+      color: var(--accent);
+      font-size: 11px;
+      font-weight: 800;
+      letter-spacing: 0.1em;
+    }
+
+    .card p { margin: 0; color: var(--muted); }
+    .card strong { color: var(--ink); }
+
+    .file-tree {
+      margin: 0;
+      padding: 18px 22px;
+      border: 1px solid var(--soft-line);
+      background: var(--surface);
+      box-shadow: var(--shadow);
+      color: #435360;
+      font: 13px/1.7 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      overflow-x: auto;
+      white-space: pre;
+    }
+
+    .file-tree .cm { color: #8b9aa5; }
+
+    footer { padding-top: 26px; border-top: 1px solid var(--line); color: var(--muted); font-size: 13px; }
+    footer p { margin: 0 0 8px; }
+
+    @media (max-width: 820px) {
+      .page { width: min(100% - 24px, 1240px); padding-top: 28px; }
+      header, .section-intro { grid-template-columns: 1fr; gap: 20px; }
+      .meta { padding: 14px 0 0; border-top: 3px solid var(--accent); border-left: 0; }
+      .lede { font-size: 16px; }
+      .card-grid, .card-grid.three { grid-template-columns: 1fr; }
+    }
+  </style>
+
+</head>
+<body>
+  <div class="page">
+    <header>
+      <div>
+        <p class="eyebrow">Apache Iceberg · Index Layer · Adapter 2</p>
+        <h1>BM25 文本索引方案（第二个索引类型）</h1>
+        <p class="lede">在通用 index 层与 vector adapter 之上，设计第二个索引类型：BM25 全文检索索引。目的是用一类与向量<b>本质不同</b>的索引（语料级统计、字符串列、搜索需跨文件归约）验证通用模型是否需要新概念；结论是只需两个小扩展（关联搜索、行值编码），其余契约全部复用，且<b>增量刷新不受影响</b>。本文给出设计、决策、备选方案与实施计划。</p>
+      </div>
+      <div class="meta">
+        <strong>阅读口径</strong>
+        <span>复用：IndexMetadata / IndexSnapshot / IndexManifest(List) / IndexFile / IndexEntry / IndexQuery / IndexReader 全部不变。</span>
+        <span>新增：关联搜索 <code>searchesAllPayloadsTogether()</code> + <code>searchAll/searchAuxiliaryAll</code>、行值编码 <code>encodeEntryValue(Object)</code> 两个 core 扩展点。</span>
+        <span>新模块：<code>iceberg-index-text</code>（纯 Java，不引 Lucene），core 保持零算法依赖。</span>
+        <span>状态：方案待评审；已写的 index-text 代码为草稿，以本文为准。</span>
+        <span>更新时间：2026-09-20</span>
+      </div>
+    </header>
+
+    <section>
+      <h2>一、BM25 索引里到底存什么</h2>
+      <div class="section-intro">
+        <div>
+          <p>BM25 是文本相关性排序函数。对查询 q 和文档 d：</p>
+        </div>
+      </div>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>组成</th><th>内容</th><th>作用</th></tr></thead>
+          <tbody>
+            <tr><td>词项词典 + 倒排记录</td><td>term → [(docId, tf)]</td><td>查询词命中的候选文档及词频</td></tr>
+            <tr><td>文档长度表</td><td>docId → |d|（词数）</td><td>长度归一化</td></tr>
+            <tr><td>语料统计</td><td>N（文档数）、总词数 → avgdl；每 term 的 df</td><td>IDF 与长度归一化都依赖<b>全语料</b></td></tr>
+            <tr><td>行引用映射</td><td>docId → (data_file, pos)</td><td>把打分结果解析回表行（与向量索引同一锚点）</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="card-grid" style="margin-top: 16px;">
+        <article class="card">
+          <span class="tag">计分公式</span>
+          <h3>BM25</h3>
+          <p>score(q,d) = Σ<sub>t∈q</sub> IDF(t) · <code>f(t,d)·(k1+1) / (f(t,d) + k1·(1 − b + b·|d|/avgdl))</code>，其中 IDF(t) = ln(1 + (N − df(t) + 0.5)/(df(t) + 0.5))（Lucene 式，保证非负）。k1 默认 1.2 控制词频饱和，b 默认 0.75 控制长度归一化强度。</p>
+        </article>
+        <article class="card">
+          <span class="tag">分词</span>
+          <h3>MVP 分析器</h3>
+          <p>小写化 → 按非字母数字边界切分 → 丢弃短于 min-token-length（默认 2）的词 → 可选停用词表。<b>不做</b>词干化与同义词（留作后续）。查询与文档用同一分析器，保证 term 对齐。</p>
+        </article>
+      </div>
+    </section>
+
+    <section>
+      <h2>二、与向量索引的本质差异（为什么这是好测试）</h2>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>维度</th><th>vector（EXACT / HNSW）</th><th>text（BM25）</th></tr></thead>
+          <tbody>
+            <tr><td>列类型</td><td>array&lt;float&gt; / array&lt;double&gt;</td><td>string</td></tr>
+            <tr><td>查询编码</td><td>float[] 向量</td><td>文本字符串（分词在 adapter 内）</td></tr>
+            <tr><td>索引结构</td><td>每数据文件一份：entries 或 HNSW 图</td><td>每数据文件一份：<b>局部</b>倒排记录 + 局部统计头（多对一分组后同构，见 D18）</td></tr>
+            <tr><td>打分依赖</td><td>行内（两个向量的距离）</td><td><b>语料级统计</b>（df、avgdl 全局量，搜索时跨文件归约）</td></tr>
+            <tr><td>搜索输入</td><td>逐个 index 文件独立搜索后合并</td><td>需要<b>同时</b>看到全部 index 文件（先合并统计再打分）</td></tr>
+            <tr><td>增量刷新</td><td>文件级 diff，未变文件复用</td><td><b>同样文件级 diff</b>：局部统计不变，全局统计搜索时自动反映变化</td></tr>
+            <tr><td>排序方向</td><td>距离升序 / 相似度降序</td><td>相似度降序（同 COSINE/DOT）</td></tr>
+            <tr><td>索引文件 kind</td><td>ENTRY_BEARING 或 AUXILIARY</td><td>AUXILIARY（HNSW 同类）</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="diagram-caption">结论先行：除“整表粒度”与“行值编码”两点外，现有契约无需改动——这正是本方案要验证的命题。</p>
+    </section>
+
+    <section>
+      <h2>三、设计决策</h2>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>已定型</th><th>结论</th></tr></thead>
+          <tbody>
+            <tr><td>D10 · 关联搜索</td><td>core <code>IndexAdapter</code> 增加 <code>default boolean searchesAllPayloadsTogether()</code>（默认 false）与 <code>searchAll / searchAuxiliaryAll</code>（默认实现=逐文件搜索后合并，与现状等价）。text adapter 覆写为 true：reader 收集同 kind 的全部 payload 交给 adapter，adapter <b>先合并各文件的局部统计（df/N/totalLen → 全局 df/avgdl）再打分</b>。索引文件粒度保持每数据文件一个，coverage / refresh / 血缘 / 删除语义全部不变，<b>增量刷新天然成立</b></td></tr>
+            <tr><td>D11 · 行值编码</td><td>core <code>IndexAdapter</code> 增加 <code>default byte[] encodeEntryValue(Object columnValue)</code>：入参是引擎给出的列值自然表示（数值数组列 → <code>List&lt;Number&gt;</code>，文本列 → <code>String</code>）。Spark 侧只保留<b>一条</b>通用 entries 读取管线（含删除应用），不再按索引类型分派；新 adapter 零 Spark 改动</td></tr>
+            <tr><td>D12 · 查询载荷</td><td>沿用 <code>IndexQuery.payload()</code> 为 ByteBuffer：向量 = float 字节，文本 = UTF-8 字符串；分词与编码都在 adapter 内完成，core 不感知</td></tr>
+            <tr><td>D13 · 模块放置</td><td>新模块 <code>iceberg-index-text</code>（包 <code>org.apache.iceberg.index.text</code>），与 index-vector 对称；BM25 打分与分词自行实现，<b>不引 Lucene</b>，core 保持零算法依赖</td></tr>
+            <tr><td>D14 · BM25 参数</td><td>definition 参数：field-id、k1（1.2）、b（0.75）、min-token-length（2）、lowercase（true）、stopwords（可选）、properties。IDF 采用 Lucene 式 ln(1 + (N−df+0.5)/(df+0.5))</td></tr>
+            <tr><td>D15 · blob 格式</td><td>每数据文件一个版本化二进制：magic + version + k1/b + <b>局部统计头</b>（本文件 N、totalLen、各 term 的 df_local）+ 局部 term 词典与 postings（docId 用文件内行号）+ docId→(file,pos,长度) 表；blob type <code>iceberg-text-bm25-v1</code>（AUXILIARY kind）；entry-bearing blob type 名义保留 <code>iceberg-text-entries-v1</code>（不使用）</td></tr>
+            <tr><td>D16 · 刷新语义</td><td><b>与 vector 完全一致</b>：数据文件增删或适用 delete 文件变化 → 只重写受影响的 index 文件（局部 postings 与局部统计头随之更新），未变文件按父快照血缘复用；无变化 → no-op。全局统计不在索引文件里落地，而在搜索时由各文件局部统计归约得出，因此无需全量重建</td></tr>
+            <tr><td>D17 · SQL 入口</td><td>与 vector 对称新增 <code>build_text_index</code> / <code>refresh_text_index</code> / <code>text_search</code>；<code>list_vector_indexes</code> 泛化为 <code>list_indexes</code>（schema 增加 definition JSON 列，去掉 vector 专列）。泛化为 <code>build_index(type, options)</code> 的统一面留作后续</td></tr>
+            <tr><td>D18 · 索引文件分组</td><td><b>本期约束仍是一对一</b>（一个数据文件 → 一个 index 文件），但模型已支持多对一：<code>IndexFile.coveredDataFiles</code> 本就是列表，coverage/uncovered/删除语义都按集合运算。多对一（按分区 / 按大小预算 / 整表建大索引）列为后续扩展点，构建侧以分组策略承载，不做模型改动（详见第九节）</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <section>
+      <h2>四、关键决策的备选方案与取舍</h2>
+      <div class="card-grid">
+        <article class="card">
+          <span class="tag">D10 核心问题</span>
+          <h3>构建可分区，计分必须全局</h3>
+          <p>倒排记录可按数据文件（或任意范围）并行构建；df(t)=Σ 分区 df_local、avgdl=Σ totalLen / Σ N 都是可加和，可归约。唯一不可分区的是<b>计分</b>：单文档分数依赖全局 df 与 avgdl。因此设计问题是“全局统计在哪里合并”——Lucene 的答案是<b>查询时</b>按 segment 合并，本方案同此。</p>
+        </article>
+        <article class="card">
+          <span class="tag">D10 备选 A</span>
+          <h3>整表单文件（初版方案，已否决）</h3>
+          <p>构建后在驱动端合并所有 entries，写<b>一个</b>覆盖全表的 index 文件（<code>isTableWide()</code>）。否决原因：任何数据变化都使全局统计过期 → <b>增量刷新失效</b>，只能全量重建；驱动端聚合全部 entries 有内存压力；SparkIndexBuilder 需要特殊的 table-wide 分支。</p>
+        </article>
+        <article class="card">
+          <span class="tag">D10 备选 B</span>
+          <h3>每文件内嵌全局统计副本</h3>
+          <p>每个 index 文件除局部 postings 外内嵌同一份全局统计，搜索时逐文件独立打分。否决原因：与 A 一样任何变化都使全部副本过期，刷新仍要重写全部文件，却比 A 多写 N 倍、多读 N 份统计。</p>
+        </article>
+        <article class="card">
+          <span class="tag">D10 选定</span>
+          <h3>局部 postings + 查询时归约</h3>
+          <p>每个 index 文件 = 局部 postings + <b>局部统计头</b>（本文件的 N、totalLen、各 term 的 df_local）；reader 在 <code>searchesAllPayloadsTogether()=true</code> 时把全部 payload 交给 adapter，adapter 合并统计头得到全局值后打分。收益：文件级增量刷新原样可用、构建复用每文件并行管线、无驱动端聚合。代价：reader 多一个分支；该路径需同时持有全部 payload（BM25 本就需要全量 postings 找候选；vector/HNSW 走默认路径不受影响）。</p>
+        </article>
+        <article class="card">
+          <span class="tag">D11 备选</span>
+          <h3>为什么不在 Spark 侧分派</h3>
+          <p>备选：Spark 侧按 definition 类型选择 entries 读取器（VectorIndexEntries / TextIndexEntries）。<b>否</b>：每新增一个 adapter 都要改 Spark 模块，违背“engine 中立 + adapter 可插拔”的目标；Object 入参的松散性用 javadoc 约定（List&lt;Number&gt; / String）约束，是可接受的代价。</p>
+        </article>
+        <article class="card">
+          <span class="tag">D13 备选</span>
+          <h3>为什么不引 Lucene</h3>
+          <p>Lucene 的 BM25Scorer 与分析器链更完整，但依赖重、索引格式要落盘兼容。<b>否</b>：MVP 自实现计分与分词（约 300 行），blob 格式自主可控；后续如需更复杂分析（词干化、CJK）再评估。</p>
+        </article>
+      </div>
+    </section>
+
+    <section>
+      <h2>五、正确性契约的继承与变化</h2>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>契约</th><th>text 索引的继承/变化</th></tr></thead>
+          <tbody>
+            <tr><td>① 身份</td><td>不变：table-uuid + sidecar 目录</td></tr>
+            <tr><td>② 绑定</td><td>不变：绑定 source-table-snapshot-id；血缘校验（回滚后拒绝 refresh）同样适用</td></tr>
+            <tr><td>③ 覆盖</td><td>每个 index 文件覆盖它构建时读取的数据文件；全部覆盖则 uncoveredDataFiles 为空（与 vector 同）</td></tr>
+            <tr><td>④ 锚定</td><td>不变：docId → (data_file, pos)，pos 为数据文件内原始行序号</td></tr>
+            <tr><td>④-A 删除语义</td><td><b>复用同一条管线</b>：entries 读取应用该快照的 position/equality delete，被删文档不进索引、不出现在查询结果</td></tr>
+            <tr><td>⑤-A 孤儿清理</td><td>不变：整表索引刷新后旧文件被父快照引用期间保留，父快照过期后由 cleanup 过程删除</td></tr>
+            <tr><td>刷新</td><td><b>与 vector 相同</b>：文件级 diff，只重写受影响数据文件的 index 文件；全局统计不在索引内落地，故无需全量重建</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <section>
+      <h2>六、测试策略</h2>
+      <div class="card-grid">
+        <article class="card">
+          <span class="tag">单元</span>
+          <h3>index-text 模块</h3>
+          <p>分词（大小写/标点/停用词/最小长度）；BM25 打分与<b>测试内手算公式</b>逐项对齐（小语料、可手算 IDF 与 tf 归一化）；encodeAuxiliaryPayload → searchAuxiliary round-trip；definition JSON round-trip（经 IndexMetadataParser）。</p>
+        </article>
+        <article class="card">
+          <span class="tag">集成</span>
+          <h3>Spark SQL 端到端</h3>
+          <p>建表灌文本 → <code>build_text_index</code> → <code>text_search</code> 排序与参考实现一致 → DELETE 行后 refresh，被删文档不再出现 → 新文档可搜到。覆盖四种 catalog 参数化。</p>
+        </article>
+        <article class="card">
+          <span class="tag">回归</span>
+          <h3>不破坏 vector</h3>
+          <p>SIFT 端到端 recall 不变（EXACT 1.0 / HNSW 0.994）；既有 vector 过程、删除、清理、批量测试全绿；core 测试不减。</p>
+        </article>
+      </div>
+    </section>
+
+    <section>
+      <h2>七、已知限制（诚实列出）</h2>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>限制</th><th>影响</th><th>后续</th></tr></thead>
+          <tbody>
+            <tr><td>关联搜索路径需同时持有全部 index 文件 payload</td><td>超大表时 reader 端内存；vector/HNSW 走默认逐文件路径不受影响</td><td>两趟式：先读各文件统计头合并，再逐文件流式打分（需 reader 支持懒加载 payload）</td></tr>
+            <tr><td>分词简单（无词干化/CJK/同义词）</td><td>召回质量受限</td><td>分析器可配置化；评估 ICU/CJK 分词</td></tr>
+            <tr><td>查询词权重统一（无 per-term boost）</td><td>表达力受限</td><td>查询编码支持 term:weight</td></tr>
+            <tr><td>text_search 行解析逐文件读 parquet</td><td>单查询成本同 vector 优化前</td><td>复用已实现的批量解析路径（VectorIndexSearch 泛化）</td></tr>
+            <tr><td>本期一个数据文件对应一个 index 文件，数据文件多时 index 文件数膨胀、查询归约对象多</td><td>文件数与管理开销；BM25 归约对象多</td><td>多对一分组（D18，模型已就绪，仅需构建期分组策略）</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <section>
+      <h2>八、实施计划（阶段与顺序）</h2>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>阶段</th><th>内容</th><th>产出</th></tr></thead>
+          <tbody>
+            <tr><td>1 · core 扩展</td><td><code>searchesAllPayloadsTogether()</code> + <code>searchAll/searchAuxiliaryAll</code> + <code>encodeEntryValue(Object)</code> 三个 default 方法；IndexReader 增加关联搜索分支</td><td>core 测试不减；新方法有单测</td></tr>
+            <tr><td>2 · index-text 模块</td><td>definition / type / analyzer / adapter（局部 postings + 统计头 + 查询时归约）/ 注册入口 + 单元测试（含手算对齐）</td><td>模块测试全绿</td></tr>
+            <tr><td>3 · Spark 通用化</td><td>抽取删除感知的通用 entries 管线（行值经 encodeEntryValue）；SparkIndexBuilder 按 adapter 的 writesAuxiliaryFiles 走已有分支，<b>无需 table-wide 特例</b>；repartition 键与 carried 过滤按 coveredDataFiles <b>集合</b>书写（为 D18 多对一分组预留，不实现策略）；vector 路径切换到通用管线</td><td>SIFT recall 不变；删除/刷新测试不回退</td></tr>
+            <tr><td>4 · SQL 入口</td><td>build/refresh/text_search 三过程 + list_indexes 泛化 + 文档 + 集成测试</td><td>端到端测试全绿；文档更新</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="callout" style="margin-top: 16px;">
+        <strong>需要你确认的点</strong>
+        <p>① D10′ 关联搜索（每文件局部 postings + 查询时归约统计）是否认可，替代初版的整表单文件方案；② D11 的 <code>encodeEntryValue(Object)</code> Object 入参是否认可（javadoc 约定 List&lt;Number&gt; / String）；③ D17 SQL 面先做 text 专有过程（低变更，推荐）还是直接泛化 build_index(type, options)。</p>
+      </div>
+    </section>
+
+    <section>
+      <h2>九、索引文件分组：多数据文件 → 一个索引文件（本期不做，模型已就绪）</h2>
+      <div class="section-intro">
+        <div>
+          <p>对更多数据构建<b>大索引</b>往往性能更好：BM25 的 postings 越大，查询时归约的对象越少、局部性越好；HNSW 的图越大，越接近全局最近邻，可消除跨文件 top-k 合并造成的召回损失。当前“一个数据文件对应一个索引文件”只是构建期的分组策略，不是模型限制。</p>
+        </div>
+        <div class="callout">
+          <strong>模型就绪度</strong>
+          <p><code>IndexFile.coveredDataFiles</code> 从设计上就是列表，<code>IndexManifest.indexedDataFiles()</code>、覆盖差集、删除语义、血缘与孤儿清理全部按集合运算——多对一无需任何模型改动，只改构建期的分组决策。</p>
+        </div>
+      </div>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>机制</th><th>一对多（本期）</th><th>多对一（后续）</th></tr></thead>
+          <tbody>
+            <tr><td>数据模型</td><td>coveredDataFiles 单元素</td><td><b>不变</b>：列表多元素；entry 各自带自己的 data_file + pos</td></tr>
+            <tr><td>构建</td><td>repartition by data_file，每文件一个 index 文件</td><td>分组策略（按分区 / 按字节数预算 / 整表）决定哪些数据文件的 entries 进同一个 index 文件；entries 生成与删除应用不变，分组发生在其后</td></tr>
+            <tr><td>刷新</td><td>文件级 diff，只重写受影响数据文件的 index 文件</td><td><b>重建粒度变粗</b>：任一被覆盖数据文件变化 → 重写整个 index 文件（重新读取它覆盖的全部数据文件）。分组越大增量越贵，需在策略中权衡（大表可配“按分区分组 + 分区级重建”）</td></tr>
+            <tr><td>BM25 统计归约</td><td>每 index 文件一份局部统计头，搜索时跨文件合并</td><td><b>正交且兼容</b>：分组只改变每个 index 文件覆盖多少文档，归约仍是可加和；文件更少则归约对象更少</td></tr>
+            <tr><td>HNSW 图</td><td>每文件一个图，跨文件合并 top-k</td><td>更大图 → 更高召回（消除合并损失）；刷新代价同上升</td></tr>
+            <tr><td>覆盖检查</td><td>uncoveredDataFiles 差集</td><td>不变（集合运算）</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="diagram-caption">扩展点预埋：构建请求（IndexBuildRequest）后续增加分组/大小预算参数；Spark 侧把 repartition 键从 data_file 换成分组键。本期实现保持一对一，不预做策略，但所有契约按多对一兼容的方式书写。</p>
+    </section>
+
+    <footer>
+      <p>设计依据：通用 index 层数据模型（index-data-model.html）的四级文件结构与横切契约；vector adapter（index-vector）作为第一个适配器的实现经验。本文只覆盖 BM25 文本索引类型，不改变已定型的核心契约。</p>
+    </footer>
+  </div>
+</body>
+</html>
