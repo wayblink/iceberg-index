@@ -26,6 +26,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
+import org.apache.iceberg.Snapshot;
 import org.apache.iceberg.Table;
 import org.apache.iceberg.index.IndexBlob;
 import org.apache.iceberg.index.IndexEntry;
@@ -92,6 +93,8 @@ public final class SparkIndexBuilder {
       long sourceTableSnapshotId,
       String vectorColumn,
       long timestampMillis) {
+    validateSourceExists(table, sourceTableSnapshotId);
+
     VectorIndexDefinition definition = (VectorIndexDefinition) currentMetadata.definition();
     String indexLocation = currentMetadata.location();
     long snapshotId = nextSnapshotId(currentMetadata);
@@ -150,6 +153,8 @@ public final class SparkIndexBuilder {
       throw new IllegalArgumentException(
           "Cannot refresh an index without an index snapshot; build it first");
     }
+
+    validateSourceLineage(table, currentMetadata, sourceTableSnapshotId);
 
     VectorIndexDefinition definition = (VectorIndexDefinition) currentMetadata.definition();
     String indexLocation = currentMetadata.location();
@@ -327,6 +332,58 @@ public final class SparkIndexBuilder {
     }
 
     return indexFiles;
+  }
+
+  /**
+   * Validates that an index refresh stays on the table's snapshot lineage: the new source snapshot
+   * must be the same as, or a descendant of, the snapshot the newest index snapshot was built from.
+   * Refreshing from an older snapshot (for example after a rollback) would silently drop the newer
+   * entries, so it is rejected.
+   */
+  private static void validateSourceLineage(
+      Table table, IndexMetadata currentMetadata, long sourceTableSnapshotId) {
+    IndexSnapshot previous = currentMetadata.latestSnapshot();
+    if (previous == null || previous.sourceTableSnapshotId() == sourceTableSnapshotId) {
+      return;
+    }
+
+    Long ancestor = parentSnapshotId(table, sourceTableSnapshotId);
+    while (ancestor != null) {
+      if (ancestor == previous.sourceTableSnapshotId()) {
+        return;
+      }
+      ancestor = parentSnapshotId(table, ancestor);
+    }
+
+    throw new IllegalArgumentException(
+        "Cannot refresh the index of table "
+            + table.name()
+            + " from table snapshot "
+            + sourceTableSnapshotId
+            + ": it is not a descendant of table snapshot "
+            + previous.sourceTableSnapshotId()
+            + ", which the newest index snapshot was built from");
+  }
+
+  private static void validateSourceExists(Table table, long sourceTableSnapshotId) {
+    if (table.snapshot(sourceTableSnapshotId) == null) {
+      throw new IllegalArgumentException(
+          "Table snapshot "
+              + sourceTableSnapshotId
+              + " of table "
+              + table.name()
+              + " does not exist");
+    }
+  }
+
+  /** Returns the parent snapshot id of a table snapshot, or null if it is unknown or a root. */
+  private static Long parentSnapshotId(Table table, long snapshotId) {
+    for (Snapshot snapshot : table.snapshots()) {
+      if (snapshot.snapshotId() == snapshotId) {
+        return snapshot.parentId();
+      }
+    }
+    return null;
   }
 
   /**

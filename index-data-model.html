@@ -429,7 +429,7 @@
           <article class="card">
             <span class="tag">契约 ② · 绑定</span>
             <h3>只对 source-table-snapshot-id 有效</h3>
-            <p>每个 <code>IndexSnapshot</code> 绑定一个表快照。planner 第一步校验当前表快照与 index 快照绑定是否一致：不匹配则 refresh 或 fallback，绝不默认“有索引就全表安全”。发布时校验 parent 的 source 是本 source 的祖先。</p>
+            <p>每个 <code>IndexSnapshot</code> 绑定一个表快照。planner 第一步校验当前表快照与 index 快照绑定是否一致：不匹配则 refresh 或 fallback，绝不默认“有索引就全表安全”。发布时校验 parent 的 source 是本 source 的祖先——已实现：<code>SparkIndexBuilder</code> 在 refresh 时要求新 source 表快照是最新 index 快照所绑定快照的后代（表回滚后从旧快照 refresh 会静默丢数据，直接拒绝），build 时校验 source 表快照存在。</p>
           </article>
           <article class="card">
             <span class="tag">契约 ③ · 覆盖</span>

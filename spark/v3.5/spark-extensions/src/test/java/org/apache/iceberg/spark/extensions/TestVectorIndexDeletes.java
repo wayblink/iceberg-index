@@ -19,6 +19,7 @@
 package org.apache.iceberg.spark.extensions;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 import java.util.List;
 import java.util.stream.Collectors;
@@ -48,6 +49,7 @@ public class TestVectorIndexDeletes extends ExtensionsTestBase {
     sql("DROP TABLE IF EXISTS %s", tableName("vectors_deleted_rows_" + catalogName));
     sql("DROP TABLE IF EXISTS %s", tableName("vectors_new_deletes_" + catalogName));
     sql("DROP TABLE IF EXISTS %s", tableName("vectors_new_data_" + catalogName));
+    sql("DROP TABLE IF EXISTS %s", tableName("vectors_rollback_" + catalogName));
   }
 
   @TestTemplate
@@ -130,6 +132,49 @@ public class TestVectorIndexDeletes extends ExtensionsTestBase {
     assertThat(indexEntries(tableName)).isEqualTo(12L);
     assertThat(searchIds(tableName, 12))
         .containsExactly(0L, 1L, 2L, 4L, 5L, 6L, 8L, 9L, 10L, 12L, 13L, 14L);
+  }
+
+  @TestTemplate
+  public void testRefreshRejectsSourceSnapshotOutsideLineage() {
+    String tableName = tableName("vectors_rollback_" + catalogName);
+    sql("CREATE TABLE %s (id bigint, embedding array<double>) USING iceberg", tableName);
+    sql("INSERT INTO %s SELECT id, array(CAST(id AS double), 0.0) FROM range(0, 10)", tableName);
+    sql(
+        "CALL %s.system.build_vector_index("
+            + "table => '%s', column => 'embedding', dimension => 2, metric => 'euclidean')",
+        catalogName, tableName);
+
+    // a newer table snapshot, then the index refreshed onto it
+    sql("INSERT INTO %s SELECT id, array(CAST(id AS double), 0.0) FROM range(10, 20)", tableName);
+    sql(
+        "CALL %s.system.refresh_vector_index(table => '%s', column => 'embedding')",
+        catalogName, tableName);
+    assertThat(indexEntries(tableName)).isEqualTo(20L);
+
+    // roll the table back to the first snapshot: refreshing from it would silently drop the newer
+    // entries, so it must be rejected
+    long firstSnapshotId =
+        spark
+            .sql(
+                "SELECT snapshot_id FROM "
+                    + tableName
+                    + ".snapshots ORDER BY committed_at ASC LIMIT 1")
+            .collectAsList()
+            .get(0)
+            .getLong(0);
+    sql("CALL %s.system.rollback_to_snapshot('%s', %d)", catalogName, tableName, firstSnapshotId);
+
+    assertThatThrownBy(
+            () ->
+                sql(
+                    "CALL %s.system.refresh_vector_index(table => '%s', column => 'embedding')",
+                    catalogName, tableName))
+        .isInstanceOf(RuntimeException.class)
+        .hasMessageContaining("not a descendant");
+
+    // the index still covers the snapshot it was built from and stays searchable
+    assertThat(indexEntries(tableName)).isEqualTo(20L);
+    assertThat(searchIds(tableName, 2)).containsExactly(0L, 1L);
   }
 
   /** Runs a search and returns the ids parsed from the resolved row JSON, in result order. */
