@@ -82,12 +82,16 @@ class TestSiftVectorIndexEndToEnd {
     // read only the first records of each .fvecs member instead of extracting hundreds of MB
     Path baseFile = tempDir.resolve("sift_base.head.fvecs");
     Path queryFile = tempDir.resolve("sift_query.head.fvecs");
+    startStage("read sift vectors from tarball");
     headOfMember(tarball, "sift/sift_base.fvecs", BASE_VECTORS * (4 + DIMENSION * 4), baseFile);
     headOfMember(tarball, "sift/sift_query.fvecs", QUERIES * (4 + DIMENSION * 4), queryFile);
-
     baseVectors = readFvecs(baseFile);
     queryVectors = readFvecs(queryFile);
+    endStage();
+
+    startStage("brute-force ground truth (" + QUERIES + " queries x " + BASE_VECTORS + " vectors)");
     expectedNeighbors = bruteForceNearest(baseVectors, queryVectors, TOP_K);
+    endStage();
 
     VectorIndexTypes.register();
     spark =
@@ -116,15 +120,21 @@ class TestSiftVectorIndexEndToEnd {
 
   @Test
   public void buildAndSearchVectorIndexOnSiftData() {
+    startStage("load data into iceberg tables (x2)");
     loadTable("sift_exact");
     loadTable("sift_hnsw");
+    endStage();
 
+    startStage("build EXACT index (spark job + manifest)");
     spark
         .sql(
             "CALL local.system.build_vector_index("
                 + "table => 'db.sift_exact', column => 'embedding', "
                 + "dimension => 128, metric => 'euclidean')")
         .show(false);
+    endStage();
+
+    startStage("build HNSW index (spark job + graph build + manifest)");
     spark
         .sql(
             "CALL local.system.build_vector_index("
@@ -132,8 +142,10 @@ class TestSiftVectorIndexEndToEnd {
                 + "dimension => 128, metric => 'euclidean', mode => 'HNSW', "
                 + "max_m => 16, ef_construction => 200, ef_search => 64)")
         .show(false);
+    endStage();
 
     // both indexes must cover every loaded row
+    startStage("list indexes (x2)");
     for (String table : new String[] {"sift_exact", "sift_hnsw"}) {
       List<Row> indexes =
           spark
@@ -144,9 +156,15 @@ class TestSiftVectorIndexEndToEnd {
       assertThat(indexes.get(0).get(7)).isEqualTo("PUBLISHED");
       assertThat(((Number) indexes.get(0).get(9)).longValue()).isEqualTo(BASE_VECTORS);
     }
+    endStage();
 
+    startStage("search EXACT index (" + QUERIES + " queries, incl. row resolution)");
     double exactRecall = measureRecall("sift_exact");
+    endStage();
+
+    startStage("search HNSW index (" + QUERIES + " queries, incl. row resolution)");
     double hnswRecall = measureRecall("sift_hnsw");
+    endStage();
 
     System.out.println();
     System.out.println(
@@ -163,7 +181,9 @@ class TestSiftVectorIndexEndToEnd {
   /** Runs every query through the SQL procedure and returns the mean recall@TOP_K. */
   private double measureRecall(String table) {
     double recallSum = 0.0;
+    long searchNanos = 0L;
     for (int q = 0; q < QUERIES; q++) {
+      long queryStart = System.nanoTime();
       List<Row> hits =
           spark
               .sql(
@@ -177,6 +197,7 @@ class TestSiftVectorIndexEndToEnd {
                       + TOP_K
                       + ")")
               .collectAsList();
+      searchNanos += System.nanoTime() - queryStart;
 
       assertThat(hits).hasSize(TOP_K);
 
@@ -194,7 +215,21 @@ class TestSiftVectorIndexEndToEnd {
       recallSum += (double) matches / TOP_K;
     }
 
+    System.out.printf(
+        "  [%s] %.1f ms per query (sql call + collect)%n", table, searchNanos / 1e6 / QUERIES);
     return recallSum / QUERIES;
+  }
+
+  private static long stageStartNanos;
+
+  private static void startStage(String name) {
+    stageStartNanos = System.nanoTime();
+    System.out.println();
+    System.out.println(">>> " + name);
+  }
+
+  private static void endStage() {
+    System.out.printf("<<< %.2f s%n", (System.nanoTime() - stageStartNanos) / 1e9);
   }
 
   private static void loadTable(String tableName) {
