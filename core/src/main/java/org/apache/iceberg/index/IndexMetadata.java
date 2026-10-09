@@ -184,6 +184,53 @@ public final class IndexMetadata {
     return null;
   }
 
+  /**
+   * Returns the index snapshot with the highest snapshot id (the tip of the index history chain),
+   * or null when the index has no snapshots yet.
+   */
+  public IndexSnapshot latestSnapshot() {
+    IndexSnapshot latest = null;
+    for (IndexSnapshot snapshot : snapshots) {
+      if (latest == null || snapshot.snapshotId() > latest.snapshotId()) {
+        latest = snapshot;
+      }
+    }
+    return latest;
+  }
+
+  /**
+   * Returns a copy of this metadata with the given snapshot appended.
+   *
+   * <p>The snapshot must satisfy the index invariants (unique snapshot id, uncovered source table
+   * snapshot, and a parent that belongs to this index). Publishing the result is a separate,
+   * explicit step through the {@link IndexCatalog}.
+   */
+  public IndexMetadata withSnapshot(IndexSnapshot snapshot) {
+    return toBuilder().addSnapshot(snapshot).build();
+  }
+
+  /** Returns a builder pre-populated with this metadata's fields. */
+  public Builder toBuilder() {
+    Builder builder =
+        builder()
+            .indexUuid(indexUuid)
+            .tableUuid(tableUuid)
+            .location(location)
+            .indexType(indexType)
+            .definition(definition)
+            .properties(properties);
+    if (tableLocation != null) {
+      builder.tableLocation(tableLocation);
+    }
+    if (lastUpdatedMillis != null) {
+      builder.lastUpdatedMillis(lastUpdatedMillis);
+    }
+    for (IndexSnapshot snapshot : snapshots) {
+      builder.addSnapshot(snapshot);
+    }
+    return builder;
+  }
+
   @Override
   public boolean equals(Object other) {
     if (this == other) {
