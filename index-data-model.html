@@ -612,6 +612,32 @@
         <p class="diagram-caption">O1 备选记录（方案 B）：索引元数据树也可独立于表目录存放（如 <code>s3://indexes/&lt;table-uuid&gt;/&lt;index-uuid&gt;/</code>），通过表属性指针（<code>iceberg.index.&lt;name&gt;.location</code>）发现；优点是职责分离、独立 retention，代价是属性 key 成为半公开契约。当前采用方案 A，B 保留为后续可选演进。</p>
       </section>
 
+      <section>
+        <h2>附：快速开始——MVP 通路</h2>
+        <div class="section-intro">
+          <div>
+            <p>静态数据上构建向量索引并查询的完整通路已经跑通（Spark 4.1）。一条命令运行端到端 quickstart：本地 Spark + Hadoop catalog，无需 metastore。</p>
+          </div>
+          <div class="callout">
+            <strong>运行方式</strong>
+            <p><code>./gradlew :iceberg-spark:iceberg-spark-4.1_2.13:test --tests "org.apache.iceberg.spark.index.TestVectorIndexQuickstart" --info</code></p>
+          </div>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>步骤</th><th>动作</th><th>落地的契约 / 决策</th></tr></thead>
+            <tbody>
+              <tr><td>1 · 静态数据</td><td>创建 6 行 2 维向量的小表（两次 INSERT，3 个数据文件）</td><td>—</td></tr>
+              <tr><td>2 · 注册索引</td><td><code>SidecarIndexCatalog.createIndex</code>，元数据树落在 <code>&lt;table-location&gt;/indexes/&lt;index-uuid&gt;/</code></td><td>D4 方案 A、D7 public API</td></tr>
+              <tr><td>3 · 构建</td><td><code>SparkIndexBuilder.build</code>：按 data_file 分发，每文件一个 index 文件（Puffin blob <code>iceberg-vector-entries-v1</code>），写 manifest + manifest list，<code>catalog.updateIndex</code> 发布</td><td>D1 四级文件、D8 Puffin、D6 Spark adapter</td></tr>
+              <tr><td>4 · 查询</td><td><code>IndexReader.search</code>（引擎中立）：快照绑定校验 → 多 index 文件合并 top-k → 返回行引用 + 分数</td><td>契约 ② 绑定、③ 覆盖、④ 锚定</td></tr>
+              <tr><td>5 · 回表</td><td>按 <code>_file + _pos</code> 读回数据文件，解析出行 id</td><td>契约 ④ 行锚定</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p class="diagram-caption">实测输出（query = (1.0, 0.0)，COSINE，top-3）：<code>rank: id=1 score=1.0000</code>、<code>rank: id=2 score=0.9939</code>、<code>rank: id=4 score=0.1047</code>，每条结果带数据文件名与行位置；发布后的 <code>IndexMetadata</code> JSON 含 definition、source-table-snapshot-id 绑定与 manifest-list 路径。该通路覆盖 D1–D8 与五条契约的主链路；正确性闭环（删除语义执行、孤儿清理、retention 协调）与通用性验证（第二类型）见正文决策状态。</p>
+      </section>
+
       <footer>
         <p>源码依据：<code>core/src/main/java/org/apache/iceberg/index/</code> 与对应测试目录（未提交的 vector MVP）。</p>
         <p>设计依据：Iceberg Specification 的 snapshot / manifest-list / manifest / data-file 层级与 parent-snapshot-id 血缘；二级索引草案中的 source-table-snapshot-id、tracking/leaf 文件与 <code>_file + _pos</code> 关系。与 <code>index-layer-topology.html</code>（当前/目标拓扑）和 <code>iceberg-ecosystem-topology.html</code>（生态拓扑）共同构成三份系列文档；本文是其中唯一聚焦数据模型的契约定义。</p>
