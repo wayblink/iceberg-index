@@ -70,20 +70,25 @@ public final class IndexReader {
         IndexTypes.fromType(metadata.indexType()).createAdapter(metadata.definition());
 
     IndexManifestList manifestList = readManifestList(snapshot);
+    String auxiliaryBlobType = adapter.auxiliaryBlobType();
     List<IndexSearchResult> results = Lists.newArrayList();
     for (IndexManifestList.ManifestRef ref : manifestList.manifests()) {
       IndexManifest manifest = readManifest(ref.location());
       for (IndexFile indexFile : manifest.indexFiles()) {
-        if (indexFile.kind() != IndexFile.Kind.ENTRY_BEARING) {
-          continue;
+        if (indexFile.kind() == IndexFile.Kind.ENTRY_BEARING
+            && adapter.entryBlobType().equals(indexFile.blobType())) {
+          IndexBlob blob = readBlob(indexFile.location(), adapter.entryBlobType());
+          results.addAll(
+              adapter.search(ByteBuffer.wrap(blob.payload()), query.payload(), query.topK()));
+        } else if (auxiliaryBlobType != null
+            && indexFile.kind() == IndexFile.Kind.AUXILIARY
+            && auxiliaryBlobType.equals(indexFile.blobType())) {
+          IndexBlob blob = readBlob(indexFile.location(), auxiliaryBlobType);
+          results.addAll(
+              adapter.searchAuxiliary(
+                  ByteBuffer.wrap(blob.payload()), query.payload(), query.topK()));
         }
-        if (!adapter.entryBlobType().equals(indexFile.blobType())) {
-          // payload type this adapter does not understand; skip for forward compatibility
-          continue;
-        }
-        IndexBlob blob = readBlob(indexFile.location(), adapter.entryBlobType());
-        results.addAll(
-            adapter.search(ByteBuffer.wrap(blob.payload()), query.payload(), query.topK()));
+        // other payload types are skipped for forward compatibility
       }
     }
 

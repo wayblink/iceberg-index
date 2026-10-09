@@ -39,6 +39,7 @@ awssdk-s3accessgrants = "2.4.1"
 bouncycastle = "1.85"
 bson-ver = "4.11.5"
 caffeine = "3.2.4"
+hnswlib = "1.1.0"
 calcite = "1.42.0"
 datasketches = "6.2.0"
 delta-standalone = "3.3.3"
@@ -116,6 +117,7 @@ bouncycastle-bcpkix = { module = "org.bouncycastle:bcpkix-jdk18on", version.ref 
 bouncycastle-bcprov = { module = "org.bouncycastle:bcprov-jdk18on", version.ref = "bouncycastle" }
 bouncycastle-bcutil = { module = "org.bouncycastle:bcutil-jdk18on", version.ref = "bouncycastle" }
 caffeine = { module = "com.github.ben-manes.caffeine:caffeine", version.ref = "caffeine" }
+hnswlib-core = { module = "com.github.jelmerk:hnswlib-core", version.ref = "hnswlib" }
 calcite-core = { module = "org.apache.calcite:calcite-core", version.ref = "calcite" }
 calcite-druid = { module = "org.apache.calcite:calcite-druid", version.ref = "calcite" }
 datasketches = { module = "org.apache.datasketches:datasketches-java", version.ref = "datasketches" }

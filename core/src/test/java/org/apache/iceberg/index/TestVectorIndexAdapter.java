@@ -23,7 +23,9 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 import java.nio.ByteBuffer;
 import java.util.List;
+import org.apache.iceberg.index.VectorIndexDefinition.IndexMode;
 import org.apache.iceberg.index.VectorIndexDefinition.Metric;
+import org.apache.iceberg.relocated.com.google.common.collect.Lists;
 import org.junit.jupiter.api.Test;
 
 class TestVectorIndexAdapter {
@@ -33,6 +35,19 @@ class TestVectorIndexAdapter {
   private static VectorIndexAdapter adapter(Metric metric) {
     return new VectorIndexAdapter(
         VectorIndexDefinition.builder().fieldId(1).dimension(2).metric(metric).build());
+  }
+
+  private static VectorIndexAdapter hnswAdapter(Metric metric) {
+    return new VectorIndexAdapter(
+        VectorIndexDefinition.builder()
+            .fieldId(1)
+            .dimension(2)
+            .metric(metric)
+            .mode(IndexMode.HNSW)
+            .maxM(8)
+            .efConstruction(100)
+            .efSearch(64)
+            .build());
   }
 
   @Test
@@ -104,5 +119,55 @@ class TestVectorIndexAdapter {
     assertThatThrownBy(() -> cosine.encodeQuery(new float[] {Float.NaN, 0.0f}))
         .isInstanceOf(IllegalArgumentException.class)
         .hasMessageContaining("finite");
+  }
+
+  @Test
+  public void hnswAuxiliarySearchMatchesExactForAllMetrics() {
+    // 40 vectors on a circle; efSearch (64) exceeds the entry count so HNSW is exact
+    for (Metric metric : Metric.values()) {
+      VectorIndexAdapter hnsw = hnswAdapter(metric);
+      VectorIndexAdapter exact = adapter(metric);
+      List<IndexEntry> entries = circleEntries(hnsw, 40);
+      ByteBuffer auxiliary = hnsw.encodeAuxiliaryPayload(entries);
+      ByteBuffer entryPayload = exact.encodeEntries(entries);
+      ByteBuffer query = exact.encodeQuery(new float[] {0.8f, 0.6f});
+
+      assertThat(hnsw.searchAuxiliary(auxiliary, query, 5))
+          .as("metric %s", metric)
+          .isEqualTo(exact.search(entryPayload, query, 5));
+      assertThat(hnsw.searchAuxiliary(auxiliary, query, 0)).isEmpty();
+      assertThat(hnsw.auxiliaryBlobType()).isEqualTo("iceberg-vector-hnsw-v1");
+      assertThat(hnsw.writesAuxiliaryFiles()).isTrue();
+      assertThat(exact.writesAuxiliaryFiles()).isFalse();
+    }
+  }
+
+  @Test
+  public void hnswAuxiliarySearchTruncatesAndResolvesRows() {
+    VectorIndexAdapter hnsw = hnswAdapter(Metric.COSINE);
+    List<IndexEntry> entries = circleEntries(hnsw, 40);
+    ByteBuffer auxiliary = hnsw.encodeAuxiliaryPayload(entries);
+    ByteBuffer query = hnsw.encodeQuery(new float[] {0.8f, 0.6f});
+
+    List<IndexSearchResult> results = hnsw.searchAuxiliary(auxiliary, query, 3);
+    assertThat(results).hasSize(3);
+    // row references resolve back to the encoded entries; the query at ~36.9 degrees is
+    // closest to circle-4 at 36 degrees
+    assertThat(results.get(0).dataFile()).isEqualTo("circle-4.parquet");
+    assertThat(results.get(0).rowPosition()).isEqualTo(4L);
+  }
+
+  private static List<IndexEntry> circleEntries(VectorIndexAdapter adapter, int count) {
+    List<IndexEntry> entries = Lists.newArrayList();
+    for (int i = 0; i < count; i++) {
+      double angle = 2.0 * Math.PI * i / count;
+      entries.add(
+          IndexEntry.of(
+              "circle-" + i + ".parquet",
+              i,
+              adapter.encodeVector(
+                  new float[] {(float) Math.cos(angle), (float) Math.sin(angle)})));
+    }
+    return entries;
   }
 }

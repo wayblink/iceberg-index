@@ -27,12 +27,10 @@ import org.apache.iceberg.Table;
 import org.apache.iceberg.index.IndexBlob;
 import org.apache.iceberg.index.IndexEntry;
 import org.apache.iceberg.index.IndexFile;
-import org.apache.iceberg.index.IndexFile.Kind;
 import org.apache.iceberg.index.IndexFileContainer;
 import org.apache.iceberg.index.IndexMetadata;
 import org.apache.iceberg.index.IndexSnapshot;
 import org.apache.iceberg.index.IndexSnapshotWriter;
-import org.apache.iceberg.index.IndexTypes;
 import org.apache.iceberg.index.PuffinIndexFileContainer;
 import org.apache.iceberg.index.VectorIndexAdapter;
 import org.apache.iceberg.index.VectorIndexDefinition;
@@ -87,9 +85,11 @@ public final class SparkIndexBuilder {
     int fieldId = definition.fieldId();
     int dimension = definition.dimension();
     Metric metric = definition.metric();
+    boolean hnsw = definition.mode() == VectorIndexDefinition.IndexMode.HNSW;
+    int maxM = definition.maxM();
+    int efConstruction = definition.efConstruction();
+    int efSearch = definition.efSearch();
     FileIO fileIO = table.io();
-    String entryBlobType =
-        IndexTypes.fromType(definition.type()).createAdapter(definition).entryBlobType();
 
     Dataset<Row> entries =
         VectorIndexEntries.entries(spark, table, sourceTableSnapshotId, vectorColumn, definition);
@@ -108,6 +108,13 @@ public final class SparkIndexBuilder {
                                   .fieldId(fieldId)
                                   .dimension(dimension)
                                   .metric(metric)
+                                  .mode(
+                                      hnsw
+                                          ? VectorIndexDefinition.IndexMode.HNSW
+                                          : VectorIndexDefinition.IndexMode.EXACT)
+                                  .maxM(maxM)
+                                  .efConstruction(efConstruction)
+                                  .efSearch(efSearch)
                                   .build());
                       Map<String, List<IndexEntry>> entriesByFile = new LinkedHashMap<>();
                       while (iterator.hasNext()) {
@@ -130,15 +137,28 @@ public final class SparkIndexBuilder {
                                 + seq
                                 + "-"
                                 + UUID.randomUUID();
+                        String blobType;
+                        byte[] payload;
+                        IndexFile.Kind kind;
+                        if (hnsw) {
+                          blobType = adapter.auxiliaryBlobType();
+                          payload = adapter.encodeAuxiliaryPayload(group.getValue()).array();
+                          kind = IndexFile.Kind.AUXILIARY;
+                        } else {
+                          blobType = adapter.entryBlobType();
+                          payload = adapter.encodeEntries(group.getValue()).array();
+                          kind = IndexFile.Kind.ENTRY_BEARING;
+                        }
                         fileContainer.write(
                             fileIO.newOutputFile(location),
-                            List.of(
-                                IndexBlob.of(
-                                    entryBlobType,
-                                    adapter.encodeEntries(group.getValue()).array())));
+                            List.of(IndexBlob.of(blobType, payload)));
                         files.add(
                             RowFactory.create(
-                                location, (long) group.getValue().size(), List.of(group.getKey())));
+                                location,
+                                (long) group.getValue().size(),
+                                List.of(group.getKey()),
+                                kind.name(),
+                                blobType));
                         seq++;
                       }
                       return files.iterator();
@@ -150,8 +170,8 @@ public final class SparkIndexBuilder {
       indexFiles.add(
           IndexFile.builder()
               .location(row.getString(0))
-              .kind(Kind.ENTRY_BEARING)
-              .blobType(entryBlobType)
+              .kind(IndexFile.Kind.valueOf(row.getString(3)))
+              .blobType(row.getString(4))
               .entryCount(row.getLong(1))
               .coveredDataFiles(coveredDataFiles(row))
               .build());

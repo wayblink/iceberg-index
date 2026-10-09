@@ -29,8 +29,21 @@ import org.apache.iceberg.relocated.com.google.common.collect.ImmutableMap;
  *
  * <p>This is the first {@link IndexDefinition} implementation; other index types (scalar, text, and
  * so on) follow the same pattern without adding new top-level concepts.
+ *
+ * <p>The {@link IndexMode} selects the search strategy: {@link IndexMode#EXACT} stores the entries
+ * as an entry-bearing payload and scans it linearly, while {@link IndexMode#HNSW} additionally
+ * builds an HNSW graph over the entries and stores it as an auxiliary payload for approximate
+ * search.
  */
 public final class VectorIndexDefinition implements IndexDefinition {
+
+  /** Search strategies supported by the vector index. */
+  public enum IndexMode {
+    /** Exact linear scan over the entry payload. */
+    EXACT,
+    /** Approximate search over an HNSW graph stored as an auxiliary payload. */
+    HNSW
+  }
 
   /** Similarity and distance metrics supported by the vector index. */
   public enum Metric {
@@ -42,16 +55,36 @@ public final class VectorIndexDefinition implements IndexDefinition {
   private final int fieldId;
   private final int dimension;
   private final Metric metric;
+  private final IndexMode mode;
+  private final int maxM;
+  private final int efConstruction;
+  private final int efSearch;
   private final Map<String, String> properties;
 
   private VectorIndexDefinition(
-      int fieldId, int dimension, Metric metric, Map<String, String> properties) {
+      int fieldId,
+      int dimension,
+      Metric metric,
+      IndexMode mode,
+      int maxM,
+      int efConstruction,
+      int efSearch,
+      Map<String, String> properties) {
     Preconditions.checkArgument(fieldId > 0, "Invalid vector field id: %s", fieldId);
     Preconditions.checkArgument(dimension > 0, "Invalid vector dimension: %s", dimension);
     Preconditions.checkNotNull(metric, "Vector index metric is null");
+    Preconditions.checkNotNull(mode, "Vector index mode is null");
+    Preconditions.checkArgument(maxM > 0, "Invalid HNSW m: %s", maxM);
+    Preconditions.checkArgument(
+        efConstruction > 0, "Invalid HNSW efConstruction: %s", efConstruction);
+    Preconditions.checkArgument(efSearch > 0, "Invalid HNSW efSearch: %s", efSearch);
     this.fieldId = fieldId;
     this.dimension = dimension;
     this.metric = metric;
+    this.mode = mode;
+    this.maxM = maxM;
+    this.efConstruction = efConstruction;
+    this.efSearch = efSearch;
     this.properties = ImmutableMap.copyOf(properties);
   }
 
@@ -76,6 +109,26 @@ public final class VectorIndexDefinition implements IndexDefinition {
     return metric;
   }
 
+  /** Returns the search strategy selected for this index. */
+  public IndexMode mode() {
+    return mode;
+  }
+
+  /** Returns the HNSW graph degree parameter; only used in {@link IndexMode#HNSW}. */
+  public int maxM() {
+    return maxM;
+  }
+
+  /** Returns the HNSW construction ef parameter; only used in {@link IndexMode#HNSW}. */
+  public int efConstruction() {
+    return efConstruction;
+  }
+
+  /** Returns the HNSW search ef parameter; only used in {@link IndexMode#HNSW}. */
+  public int efSearch() {
+    return efSearch;
+  }
+
   public Map<String, String> properties() {
     return properties;
   }
@@ -92,6 +145,10 @@ public final class VectorIndexDefinition implements IndexDefinition {
     return fieldId == that.fieldId
         && dimension == that.dimension
         && metric == that.metric
+        && mode == that.mode
+        && maxM == that.maxM
+        && efConstruction == that.efConstruction
+        && efSearch == that.efSearch
         && properties.equals(that.properties);
   }
 
@@ -100,6 +157,10 @@ public final class VectorIndexDefinition implements IndexDefinition {
     int result = Integer.hashCode(fieldId);
     result = 31 * result + Integer.hashCode(dimension);
     result = 31 * result + metric.hashCode();
+    result = 31 * result + mode.hashCode();
+    result = 31 * result + Integer.hashCode(maxM);
+    result = 31 * result + Integer.hashCode(efConstruction);
+    result = 31 * result + Integer.hashCode(efSearch);
     result = 31 * result + properties.hashCode();
     return result;
   }
@@ -110,6 +171,10 @@ public final class VectorIndexDefinition implements IndexDefinition {
         .add("fieldId", fieldId)
         .add("dimension", dimension)
         .add("metric", metric)
+        .add("mode", mode)
+        .add("maxM", maxM)
+        .add("efConstruction", efConstruction)
+        .add("efSearch", efSearch)
         .add("properties", properties)
         .toString();
   }
@@ -118,6 +183,10 @@ public final class VectorIndexDefinition implements IndexDefinition {
     private Integer fieldId;
     private Integer dimension;
     private Metric metric;
+    private IndexMode mode = IndexMode.EXACT;
+    private int maxM = 16;
+    private int efConstruction = 200;
+    private int efSearch = 50;
     private final ImmutableMap.Builder<String, String> properties = ImmutableMap.builder();
 
     private Builder() {}
@@ -137,6 +206,30 @@ public final class VectorIndexDefinition implements IndexDefinition {
       return this;
     }
 
+    /** Sets the search strategy; defaults to {@link IndexMode#EXACT}. */
+    public Builder mode(IndexMode newMode) {
+      this.mode = newMode;
+      return this;
+    }
+
+    /** Sets the HNSW graph degree; defaults to 16. */
+    public Builder maxM(int newMaxM) {
+      this.maxM = newMaxM;
+      return this;
+    }
+
+    /** Sets the HNSW construction ef; defaults to 200. */
+    public Builder efConstruction(int newEfConstruction) {
+      this.efConstruction = newEfConstruction;
+      return this;
+    }
+
+    /** Sets the HNSW search ef; defaults to 50. */
+    public Builder efSearch(int newEfSearch) {
+      this.efSearch = newEfSearch;
+      return this;
+    }
+
     public Builder property(String key, String value) {
       properties.put(key, value);
       return this;
@@ -151,7 +244,9 @@ public final class VectorIndexDefinition implements IndexDefinition {
       Preconditions.checkNotNull(fieldId, "Vector field id is not set");
       Preconditions.checkNotNull(dimension, "Vector dimension is not set");
       Preconditions.checkNotNull(metric, "Vector index metric is not set");
-      return new VectorIndexDefinition(fieldId, dimension, metric, properties.build());
+      Preconditions.checkNotNull(mode, "Vector index mode is not set");
+      return new VectorIndexDefinition(
+          fieldId, dimension, metric, mode, maxM, efConstruction, efSearch, properties.build());
     }
   }
 }

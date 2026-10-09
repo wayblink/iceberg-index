@@ -39,6 +39,10 @@ public final class VectorIndexType implements IndexType {
   private static final String FIELD_ID = "field-id";
   private static final String DIMENSION = "dimension";
   private static final String METRIC = "metric";
+  private static final String MODE = "mode";
+  private static final String M = "m";
+  private static final String EF_CONSTRUCTION = "ef-construction";
+  private static final String EF_SEARCH = "ef-search";
   private static final String PROPERTIES = "properties";
 
   @Override
@@ -52,7 +56,11 @@ public final class VectorIndexType implements IndexType {
         VectorIndexDefinition.builder()
             .fieldId(JsonUtil.getInt(FIELD_ID, node))
             .dimension(JsonUtil.getInt(DIMENSION, node))
-            .metric(parseMetric(JsonUtil.getString(METRIC, node)));
+            .metric(parseMetric(JsonUtil.getString(METRIC, node)))
+            .mode(parseMode(JsonUtil.getString(MODE, node)))
+            .maxM(JsonUtil.getInt(M, node))
+            .efConstruction(JsonUtil.getInt(EF_CONSTRUCTION, node))
+            .efSearch(JsonUtil.getInt(EF_SEARCH, node));
     if (node.has(PROPERTIES)) {
       builder.properties(JsonUtil.getStringMap(PROPERTIES, node));
     }
@@ -70,6 +78,10 @@ public final class VectorIndexType implements IndexType {
     generator.writeNumberField(FIELD_ID, vectorDefinition.fieldId());
     generator.writeNumberField(DIMENSION, vectorDefinition.dimension());
     generator.writeStringField(METRIC, vectorDefinition.metric().name());
+    generator.writeStringField(MODE, vectorDefinition.mode().name());
+    generator.writeNumberField(M, vectorDefinition.maxM());
+    generator.writeNumberField(EF_CONSTRUCTION, vectorDefinition.efConstruction());
+    generator.writeNumberField(EF_SEARCH, vectorDefinition.efSearch());
     if (!vectorDefinition.properties().isEmpty()) {
       JsonUtil.writeStringMap(PROPERTIES, vectorDefinition.properties(), generator);
     }
@@ -89,6 +101,14 @@ public final class VectorIndexType implements IndexType {
       return VectorIndexDefinition.Metric.valueOf(value.toUpperCase(Locale.ROOT));
     } catch (IllegalArgumentException e) {
       throw new IllegalArgumentException("Unsupported vector index metric: " + value, e);
+    }
+  }
+
+  private static VectorIndexDefinition.IndexMode parseMode(String value) {
+    try {
+      return VectorIndexDefinition.IndexMode.valueOf(value.toUpperCase(Locale.ROOT));
+    } catch (IllegalArgumentException e) {
+      throw new IllegalArgumentException("Unsupported vector index mode: " + value, e);
     }
   }
 }

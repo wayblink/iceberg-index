@@ -72,6 +72,41 @@ class TestIndexMetadataParser {
   }
 
   @Test
+  public void roundTripsHnswVectorIndexMetadata() {
+    IndexMetadata metadata =
+        IndexMetadata.builder()
+            .indexUuid("index-uuid")
+            .tableUuid("table-uuid")
+            .location("s3://bucket/table/indexes/index-uuid")
+            .definition(
+                VectorIndexDefinition.builder()
+                    .fieldId(3)
+                    .dimension(4)
+                    .metric(VectorIndexDefinition.Metric.EUCLIDEAN)
+                    .mode(VectorIndexDefinition.IndexMode.HNSW)
+                    .maxM(12)
+                    .efConstruction(150)
+                    .efSearch(30)
+                    .build())
+            .addSnapshot(
+                IndexSnapshot.builder()
+                    .snapshotId(1)
+                    .sourceTableSnapshotId(10)
+                    .timestampMillis(30)
+                    .indexManifestList("s3://bucket/table/indexes/index-uuid/snapshots/iml-1.bin")
+                    .build())
+            .build();
+
+    IndexMetadata parsed = IndexMetadataParser.fromJson(IndexMetadataParser.toJson(metadata));
+    assertThat(parsed).isEqualTo(metadata);
+    VectorIndexDefinition definition = (VectorIndexDefinition) parsed.definition();
+    assertThat(definition.mode()).isEqualTo(VectorIndexDefinition.IndexMode.HNSW);
+    assertThat(definition.maxM()).isEqualTo(12);
+    assertThat(definition.efConstruction()).isEqualTo(150);
+    assertThat(definition.efSearch()).isEqualTo(30);
+  }
+
+  @Test
   public void failsOnUnknownIndexType() {
     String json =
         "{\"format-version\": 1, \"index-uuid\": \"i\", \"table-uuid\": \"t\","

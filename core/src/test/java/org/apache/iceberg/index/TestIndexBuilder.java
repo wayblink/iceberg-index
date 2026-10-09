@@ -81,6 +81,71 @@ class TestIndexBuilder {
   }
 
   @Test
+  public void buildsHnswSnapshotAndReaderCanSearchIt(@TempDir Path tempDir) throws IOException {
+    LocalFileIO fileIO = new LocalFileIO();
+    VectorIndexAdapter adapter =
+        new VectorIndexAdapter(
+            VectorIndexDefinition.builder()
+                .fieldId(1)
+                .dimension(2)
+                .metric(Metric.COSINE)
+                .mode(VectorIndexDefinition.IndexMode.HNSW)
+                .maxM(8)
+                .efConstruction(100)
+                .efSearch(64)
+                .build());
+    IndexBuilder builder = new IndexBuilder(fileIO);
+    IndexMetadata current =
+        IndexMetadata.builder()
+            .indexUuid("index-uuid")
+            .tableUuid("table-uuid")
+            .tableLocation(tempDir.resolve("table").toString())
+            .location(tempDir.resolve("indexes/index-uuid").toString())
+            .definition(
+                VectorIndexDefinition.builder()
+                    .fieldId(1)
+                    .dimension(2)
+                    .metric(Metric.COSINE)
+                    .mode(VectorIndexDefinition.IndexMode.HNSW)
+                    .maxM(8)
+                    .efConstruction(100)
+                    .efSearch(64)
+                    .build())
+            .build();
+
+    IndexMetadata updated =
+        builder.build(
+            IndexBuildRequest.builder()
+                .currentMetadata(current)
+                .sourceTableSnapshotId(10)
+                .entries(entries(adapter))
+                .timestampMillis(30)
+                .build());
+
+    IndexSnapshot snapshot = updated.snapshots().get(0);
+    IndexManifestList manifestList =
+        IndexManifestList.read(fileIO.newInputFile(snapshot.indexManifestList()));
+    IndexManifest manifest =
+        IndexManifest.read(fileIO.newInputFile(manifestList.manifests().get(0).location()));
+
+    // HNSW mode writes auxiliary index files with the HNSW blob type
+    assertThat(manifest.indexFiles()).hasSize(1);
+    assertThat(manifest.indexFiles().get(0).kind()).isEqualTo(IndexFile.Kind.AUXILIARY);
+    assertThat(manifest.indexFiles().get(0).blobType())
+        .isEqualTo(VectorIndexAdapter.AUXILIARY_BLOB_TYPE);
+    assertThat(manifest.indexedDataFiles())
+        .containsExactlyInAnyOrder("data-1.parquet", "data-2.parquet");
+
+    // the reader searches the auxiliary payload and resolves rows
+    IndexReader reader = new IndexReader(updated, fileIO);
+    assertThat(reader.search(IndexQuery.of(10, adapter.encodeQuery(new float[] {0.95f, 0.05f}), 2)))
+        .extracting(IndexSearchResult::dataFile)
+        .containsExactly("data-1.parquet", "data-2.parquet");
+    assertThat(reader.uncoveredDataFiles(10, List.of("data-1.parquet", "data-3.parquet")))
+        .containsExactly("data-3.parquet");
+  }
+
+  @Test
   public void rejectsAlreadyCoveredSourceSnapshot(@TempDir Path tempDir) {
     LocalFileIO fileIO = new LocalFileIO();
     IndexBuilder builder = new IndexBuilder(fileIO);

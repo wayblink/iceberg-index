@@ -18,6 +18,10 @@
  */
 package org.apache.iceberg.index;
 
+import com.github.jelmerk.knn.DistanceFunction;
+import com.github.jelmerk.knn.Item;
+import com.github.jelmerk.knn.SearchResult;
+import com.github.jelmerk.knn.hnsw.HnswIndex;
 import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
 import java.io.DataInputStream;
@@ -39,16 +43,23 @@ import org.apache.iceberg.relocated.com.google.common.collect.Lists;
  * entry: data file, row position, payload length, payload bytes]}. Both encodings are versioned so
  * they can evolve independently of the container and the metadata model.
  *
- * <p>Search is exact (linear scan) in this MVP; an ANN implementation can replace {@link
- * #search(ByteBuffer, ByteBuffer, int)} later without changing the encoding.
+ * <p>Search is exact (linear scan) by default. In {@link VectorIndexDefinition.IndexMode#HNSW}
+ * mode, the adapter also builds an HNSW graph over the entries and stores it as an auxiliary
+ * payload: {@code [format version][graph length][serialized graph][mapping from item id to row
+ * reference]}. Approximate search loads the graph, retrieves candidates, and re-scores them with
+ * the exact metric, so result scores are identical to exact search regardless of the graph.
  */
 public final class VectorIndexAdapter implements IndexAdapter {
 
   /** Blob type of entry-bearing vector index files. */
   public static final String ENTRY_BLOB_TYPE = "iceberg-vector-entries-v1";
 
+  /** Blob type of auxiliary HNSW index files. */
+  public static final String AUXILIARY_BLOB_TYPE = "iceberg-vector-hnsw-v1";
+
   private static final int VALUE_FORMAT_VERSION = 1;
   private static final int ENTRIES_FORMAT_VERSION = 1;
+  private static final int HNSW_PAYLOAD_FORMAT_VERSION = 1;
 
   private final VectorIndexDefinition definition;
 
@@ -64,6 +75,16 @@ public final class VectorIndexAdapter implements IndexAdapter {
   @Override
   public String entryBlobType() {
     return ENTRY_BLOB_TYPE;
+  }
+
+  @Override
+  public String auxiliaryBlobType() {
+    return AUXILIARY_BLOB_TYPE;
+  }
+
+  @Override
+  public boolean writesAuxiliaryFiles() {
+    return definition.mode() == VectorIndexDefinition.IndexMode.HNSW;
   }
 
   /** Encodes a vector value as an entry payload or query payload. */
@@ -160,6 +181,95 @@ public final class VectorIndexAdapter implements IndexAdapter {
   }
 
   @Override
+  public ByteBuffer encodeAuxiliaryPayload(List<IndexEntry> entries) {
+    Preconditions.checkNotNull(entries, "Index entries are null");
+    List<IndexEntry> materialized = Lists.newArrayList(entries);
+    HnswIndex<Long, float[], VectorItem, Float> index =
+        HnswIndex.newBuilder(definition.dimension(), distanceFunction(), materialized.size())
+            .withM(definition.maxM())
+            .withEfConstruction(definition.efConstruction())
+            .withEf(definition.efSearch())
+            .build();
+    for (int i = 0; i < materialized.size(); i++) {
+      float[] vector = decodeVector(materialized.get(i).payload(), "Entry");
+      index.add(new VectorItem((long) i, vector));
+    }
+
+    ByteArrayOutputStream graph = new ByteArrayOutputStream();
+    try {
+      index.save(graph);
+    } catch (IOException e) {
+      throw new UncheckedIOException("Failed to serialize the HNSW index", e);
+    }
+
+    ByteArrayOutputStream payload = new ByteArrayOutputStream();
+    try (DataOutputStream out = new DataOutputStream(payload)) {
+      out.writeInt(HNSW_PAYLOAD_FORMAT_VERSION);
+      byte[] graphBytes = graph.toByteArray();
+      out.writeInt(graphBytes.length);
+      out.write(graphBytes);
+      out.writeInt(materialized.size());
+      for (IndexEntry entry : materialized) {
+        out.writeUTF(entry.dataFile());
+        out.writeLong(entry.rowPosition());
+      }
+    } catch (IOException e) {
+      throw new UncheckedIOException("Failed to encode the HNSW index payload", e);
+    }
+    return ByteBuffer.wrap(payload.toByteArray());
+  }
+
+  @Override
+  public List<IndexSearchResult> searchAuxiliary(ByteBuffer payload, ByteBuffer query, int topK) {
+    Preconditions.checkArgument(topK >= 0, "Top-k must be non-negative: %s", topK);
+    float[] queryVector = decodeQuery(query);
+    if (topK == 0) {
+      return ImmutableList.of();
+    }
+
+    byte[] bytes = toBytes(payload);
+    try (DataInputStream in = new DataInputStream(new ByteArrayInputStream(bytes))) {
+      int version = in.readInt();
+      Preconditions.checkArgument(
+          version == HNSW_PAYLOAD_FORMAT_VERSION,
+          "Unsupported HNSW payload format version: %s",
+          version);
+      int graphLength = in.readInt();
+      Preconditions.checkArgument(graphLength >= 0, "Invalid HNSW graph length: %s", graphLength);
+      byte[] graph = new byte[graphLength];
+      in.readFully(graph);
+      int mappingCount = in.readInt();
+      Preconditions.checkArgument(
+          mappingCount >= 0, "Invalid HNSW mapping count: %s", mappingCount);
+      String[] dataFiles = new String[mappingCount];
+      long[] positions = new long[mappingCount];
+      for (int i = 0; i < mappingCount; i++) {
+        dataFiles[i] = in.readUTF();
+        positions[i] = in.readLong();
+      }
+
+      HnswIndex<Long, float[], VectorItem, Float> index =
+          HnswIndex.load(new ByteArrayInputStream(graph));
+      index.setEf(definition.efSearch());
+      List<SearchResult<VectorItem, Float>> nearest = index.findNearest(queryVector, topK);
+
+      List<IndexSearchResult> results = Lists.newArrayList();
+      for (SearchResult<VectorItem, Float> result : nearest) {
+        int id = Math.toIntExact(result.item().id());
+        Preconditions.checkArgument(
+            id >= 0 && id < mappingCount, "HNSW result id out of range: %s", id);
+        // re-score with the exact metric so scores match exact search
+        results.add(
+            IndexSearchResult.of(
+                dataFiles[id], positions[id], score(queryVector, result.item().vector())));
+      }
+      return results;
+    } catch (IOException e) {
+      throw new UncheckedIOException("Failed to search the HNSW index payload", e);
+    }
+  }
+
+  @Override
   public Comparator<IndexSearchResult> resultComparator() {
     Comparator<IndexSearchResult> tieBreaker =
         Comparator.comparing(IndexSearchResult::dataFile)
@@ -172,6 +282,19 @@ public final class VectorIndexAdapter implements IndexAdapter {
         return Comparator.comparingDouble(IndexSearchResult::score)
             .reversed()
             .thenComparing(tieBreaker);
+      default:
+        throw new IllegalStateException("Unknown vector index metric: " + definition.metric());
+    }
+  }
+
+  private DistanceFunction<float[], Float> distanceFunction() {
+    switch (definition.metric()) {
+      case COSINE:
+        return com.github.jelmerk.knn.DistanceFunctions.FLOAT_COSINE_DISTANCE;
+      case DOT_PRODUCT:
+        return com.github.jelmerk.knn.DistanceFunctions.FLOAT_INNER_PRODUCT;
+      case EUCLIDEAN:
+        return com.github.jelmerk.knn.DistanceFunctions.FLOAT_EUCLIDEAN_DISTANCE;
       default:
         throw new IllegalStateException("Unknown vector index metric: " + definition.metric());
     }
@@ -261,5 +384,31 @@ public final class VectorIndexAdapter implements IndexAdapter {
     byte[] bytes = new byte[buffer.remaining()];
     buffer.duplicate().get(bytes);
     return bytes;
+  }
+
+  /** A vector with a numeric id, stored inside the HNSW graph. */
+  private static final class VectorItem implements Item<Long, float[]> {
+    private final long itemId;
+    private final float[] itemVector;
+
+    private VectorItem(long itemId, float[] itemVector) {
+      this.itemId = itemId;
+      this.itemVector = itemVector;
+    }
+
+    @Override
+    public Long id() {
+      return itemId;
+    }
+
+    @Override
+    public float[] vector() {
+      return itemVector;
+    }
+
+    @Override
+    public int dimensions() {
+      return itemVector.length;
+    }
   }
 }

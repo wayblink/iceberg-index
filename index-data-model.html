@@ -597,6 +597,7 @@
               <tr><td>D6 · 引擎 adapter 顺序</td><td>Spark 第一优先；first milestone = builder + 简单读路径，深度 planner 集成后置；core 不含引擎依赖</td></tr>
               <tr><td>D7 · 可见性与模块放置</td><td>全部 index 类按最终发布可见性创建（public，不做 package-private 过渡，无后期整体晋升）；模型与查询契约放 core（与 TableMetadata / Snapshot 一致）；IndexCatalog 建成时作为公共 SPI 进 api，届时契约整体移动（api 不能依赖 core），属一次性可选项</td></tr>
               <tr><td>D8 · payload 容器</td><td>IndexFile 统一采用 Puffin 容器（MVP 二进制编码原样进 blob，blob type = iceberg-vector-entries-v1）；容器做成可插拔接口，Puffin 为首选实现，元数据模型不变</td></tr>
+              <tr><td>D9 · ANN 检索</td><td>HNSW 近似检索已实现：definition 增加 <code>IndexMode</code>（EXACT / HNSW）与 M / efConstruction / efSearch 参数；HNSW 模式写 AUXILIARY index 文件（blob type <code>iceberg-vector-hnsw-v1</code>，内含序列化 HNSW 图 + id→行映射），召回后用精确 metric 重排，分数与 exact 一致；依赖 jelmerk hnswlib-core 1.1.0（纯 Java）</td></tr>
             </tbody>
           </table>
         </div>
@@ -636,7 +637,7 @@
           </table>
         </div>
         <p class="diagram-caption">实测输出（query = (1.0, 0.0)，COSINE，top-3）：<code>rank: id=1 score=1.0000</code>、<code>rank: id=2 score=0.9939</code>、<code>rank: id=4 score=0.1047</code>，每条结果带数据文件名与行位置；发布后的 <code>IndexMetadata</code> JSON 含 definition、source-table-snapshot-id 绑定与 manifest-list 路径。该通路覆盖 D1–D8 与五条契约的主链路；正确性闭环（删除语义执行、孤儿清理、retention 协调）与通用性验证（第二类型）见正文决策状态。</p>
-        <p class="diagram-caption">注：当前为 <strong>exact 精确检索</strong>（线性扫描）；ANN 近似检索、Spark SQL 入口（<code>CALL</code> 过程 / 向量函数）与 planner 集成按 D6 明确后置。查询当前通过 Java API（<code>IndexReader.search</code>）使用。</p>
+        <p class="diagram-caption">注：exact 与 HNSW（ANN）两种模式均已实现并在 quickstart 中端到端验证（同一查询两种模式返回相同排序）；ANN 采用 jelmerk hnswlib（HNSW），索引写为 AUXILIARY index 文件，召回后精确重排。<strong>仍未实现</strong>：Spark SQL 入口（<code>CALL</code> 过程 / 向量函数）与 planner 集成（按 D6 后置）。查询当前通过 Java API（<code>IndexReader.search</code>）使用。</p>
       </section>
 
       <footer>

@@ -126,14 +126,23 @@ public final class IndexSnapshotWriter {
       List<IndexEntry> batch) {
     String location =
         indexLocation + "/" + DATA_DIR + "/index-file-" + snapshotId + "-" + seq + "-" + newId();
-    List<IndexBlob> blobs =
-        ImmutableList.of(
-            IndexBlob.of(adapter.entryBlobType(), adapter.encodeEntries(batch).array()));
-    write(location, out -> container.write(out, blobs));
+    IndexBlob blob;
+    IndexFile.Kind kind;
+    if (adapter.writesAuxiliaryFiles()) {
+      String auxiliaryBlobType = adapter.auxiliaryBlobType();
+      Preconditions.checkState(
+          auxiliaryBlobType != null, "Adapter writes auxiliary files without a blob type");
+      blob = IndexBlob.of(auxiliaryBlobType, adapter.encodeAuxiliaryPayload(batch).array());
+      kind = IndexFile.Kind.AUXILIARY;
+    } else {
+      blob = IndexBlob.of(adapter.entryBlobType(), adapter.encodeEntries(batch).array());
+      kind = IndexFile.Kind.ENTRY_BEARING;
+    }
+    write(location, out -> container.write(out, ImmutableList.of(blob)));
     return IndexFile.builder()
         .location(location)
-        .kind(IndexFile.Kind.ENTRY_BEARING)
-        .blobType(adapter.entryBlobType())
+        .kind(kind)
+        .blobType(blob.type())
         .entryCount(batch.size())
         .coveredDataFiles(coveredDataFiles(batch))
         .build();

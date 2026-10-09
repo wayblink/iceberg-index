@@ -154,6 +154,39 @@ class TestVectorIndexQuickstart {
         .isSortedAccordingTo(java.util.Comparator.reverseOrder());
     assertThat(reader.uncoveredDataFiles(snapshotId, dataFiles(table))).isEmpty();
 
+    banner("STEP 6 · build and query an HNSW (ANN) index on the same table");
+    IndexMetadata hnswMetadata =
+        indexCatalog.createIndex(
+            CreateIndexRequest.builder()
+                .tableLocation(table.location())
+                .tableUuid(table.uuid().toString())
+                .indexUuid("quickstart-vectors-hnsw")
+                .definition(
+                    VectorIndexDefinition.builder()
+                        .fieldId(2)
+                        .dimension(2)
+                        .metric(Metric.COSINE)
+                        .mode(VectorIndexDefinition.IndexMode.HNSW)
+                        .build())
+                .build());
+    IndexMetadata hnswBuilt =
+        SparkIndexBuilder.build(spark, table, hnswMetadata, snapshotId, "embedding", 2000L);
+    indexCatalog.updateIndex(hnswBuilt);
+
+    IndexReader hnswReader =
+        new IndexReader(
+            indexCatalog.loadIndex(table.location(), "quickstart-vectors-hnsw"), table.io());
+    List<IndexSearchResult> hnswResults =
+        hnswReader.search(
+            IndexQuery.of(snapshotId, adapter.encodeQuery(new float[] {1.0f, 0.0f}), 3));
+    for (IndexSearchResult result : hnswResults) {
+      long id = idAtPosition(result.dataFile(), result.rowPosition());
+      System.out.printf("ann rank: id=%d  score=%.4f%n", id, result.score());
+    }
+    assertThat(hnswResults)
+        .extracting(result -> idAtPosition(result.dataFile(), result.rowPosition()))
+        .containsExactly(1L, 2L, 4L);
+
     banner("quickstart complete: static data -> index -> query -> row resolution");
   }
 

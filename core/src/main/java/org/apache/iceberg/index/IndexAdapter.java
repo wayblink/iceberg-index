@@ -21,6 +21,7 @@ package org.apache.iceberg.index;
 import java.nio.ByteBuffer;
 import java.util.Comparator;
 import java.util.List;
+import javax.annotation.Nullable;
 
 /**
  * Type-specific codec and search strategy for one index.
@@ -61,4 +62,40 @@ public interface IndexAdapter {
    * (for example ascending distance or descending similarity) and break ties on the row reference.
    */
   Comparator<IndexSearchResult> resultComparator();
+
+  /**
+   * Returns the blob type of the auxiliary payload this adapter searches, or null when it only
+   * searches entry-bearing payloads.
+   *
+   * <p>An auxiliary payload carries everything needed to search without the entry-bearing payload,
+   * for example an HNSW graph plus the mapping from item ids to row references.
+   */
+  @Nullable
+  default String auxiliaryBlobType() {
+    return null;
+  }
+
+  /**
+   * Returns true when this adapter writes auxiliary index files instead of entry-bearing ones for a
+   * new snapshot.
+   */
+  default boolean writesAuxiliaryFiles() {
+    return false;
+  }
+
+  /** Encodes entries into the payload of an auxiliary index file. */
+  default ByteBuffer encodeAuxiliaryPayload(List<IndexEntry> entries) {
+    throw new UnsupportedOperationException("This index type does not write auxiliary payloads");
+  }
+
+  /**
+   * Returns the top-k results for an encoded query over the entries in one auxiliary payload.
+   *
+   * @param payload the encoded auxiliary content of a single index file
+   * @param query the encoded query, produced by this index type
+   * @param topK the maximum number of results
+   */
+  default List<IndexSearchResult> searchAuxiliary(ByteBuffer payload, ByteBuffer query, int topK) {
+    throw new UnsupportedOperationException("This index type does not search auxiliary payloads");
+  }
 }
