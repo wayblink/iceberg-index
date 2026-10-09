@@ -28,6 +28,7 @@ import java.util.Set;
 import java.util.UUID;
 import org.apache.iceberg.Snapshot;
 import org.apache.iceberg.Table;
+import org.apache.iceberg.index.IndexAdapter;
 import org.apache.iceberg.index.IndexBlob;
 import org.apache.iceberg.index.IndexEntry;
 import org.apache.iceberg.index.IndexFile;
@@ -38,10 +39,9 @@ import org.apache.iceberg.index.IndexManifestList.ManifestRef;
 import org.apache.iceberg.index.IndexMetadata;
 import org.apache.iceberg.index.IndexSnapshot;
 import org.apache.iceberg.index.IndexSnapshotWriter;
+import org.apache.iceberg.index.IndexTypes;
 import org.apache.iceberg.index.PuffinIndexFileContainer;
-import org.apache.iceberg.index.vector.VectorIndexAdapter;
-import org.apache.iceberg.index.vector.VectorIndexDefinition;
-import org.apache.iceberg.index.vector.VectorIndexDefinition.Metric;
+import org.apache.iceberg.index.text.TextIndexTypes;
 import org.apache.iceberg.index.vector.VectorIndexTypes;
 import org.apache.iceberg.io.FileIO;
 import org.apache.iceberg.relocated.com.google.common.collect.Lists;
@@ -56,10 +56,10 @@ import org.apache.spark.sql.functions;
 /**
  * Builds a vector index snapshot for an Iceberg table snapshot with Spark.
  *
- * <p>Entries are read by {@link VectorIndexEntries}, shuffled by data file so that all rows of a
- * data file land in one partition, and written as one index file per data file per partition. That
- * keeps source-file coverage precise: a refresh only has to drop the index files of data files that
- * were removed or rewritten.
+ * <p>Entries are read by {@link IndexEntries}, shuffled by data file so that all rows of a data
+ * file land in one partition, and written as one index file per data file per partition. That keeps
+ * source-file coverage precise: a refresh only has to drop the index files of data files that were
+ * removed or rewritten.
  *
  * <p>Like the core builder, this only writes files and returns updated metadata; publishing it
  * through the {@code IndexCatalog} is a separate step.
@@ -69,8 +69,9 @@ public final class SparkIndexBuilder {
   private static final String DATA_DIR = "data";
 
   static {
-    // the vector adapter lives in iceberg-index-vector; register it with the core registry
+    // the vector and text adapters live in their own modules; register them with the core registry
     VectorIndexTypes.register();
+    TextIndexTypes.register();
   }
 
   private SparkIndexBuilder() {}
@@ -95,7 +96,7 @@ public final class SparkIndexBuilder {
       long timestampMillis) {
     validateSourceExists(table, sourceTableSnapshotId);
 
-    VectorIndexDefinition definition = (VectorIndexDefinition) currentMetadata.definition();
+    IndexAdapter adapter = adapterFor(currentMetadata);
     String indexLocation = currentMetadata.location();
     long snapshotId = nextSnapshotId(currentMetadata);
     FileIO fileIO = table.io();
@@ -108,7 +109,7 @@ public final class SparkIndexBuilder {
             snapshotId,
             sourceTableSnapshotId,
             vectorColumn,
-            definition,
+            adapter,
             null);
 
     String manifestList =
@@ -156,13 +157,13 @@ public final class SparkIndexBuilder {
 
     validateSourceLineage(table, currentMetadata, sourceTableSnapshotId);
 
-    VectorIndexDefinition definition = (VectorIndexDefinition) currentMetadata.definition();
+    IndexAdapter adapter = adapterFor(currentMetadata);
     String indexLocation = currentMetadata.location();
     long snapshotId = previous.snapshotId() + 1;
     FileIO fileIO = table.io();
 
     Set<String> currentFiles =
-        Sets.newHashSet(VectorIndexEntries.dataFiles(table, sourceTableSnapshotId));
+        Sets.newHashSet(IndexEntries.dataFiles(table, sourceTableSnapshotId));
     Set<String> previouslyCovered = coveredDataFiles(fileIO, previous);
     Set<String> removedFiles = Sets.difference(previouslyCovered, currentFiles);
     Set<String> newFiles = Sets.difference(currentFiles, previouslyCovered);
@@ -194,7 +195,7 @@ public final class SparkIndexBuilder {
             snapshotId,
             sourceTableSnapshotId,
             vectorColumn,
-            definition,
+            adapter,
             Sets.union(newFiles, deleteChangedFiles));
     List<IndexFile> indexFiles = Lists.newArrayList();
     indexFiles.addAll(carried);
@@ -225,51 +226,30 @@ public final class SparkIndexBuilder {
       long snapshotId,
       long sourceTableSnapshotId,
       String vectorColumn,
-      VectorIndexDefinition definition,
+      IndexAdapter adapter,
       Set<String> onlyFiles) {
     if (onlyFiles != null && onlyFiles.isEmpty()) {
       return Lists.newArrayList();
     }
 
-    int fieldId = definition.fieldId();
-    int dimension = definition.dimension();
-    Metric metric = definition.metric();
-    boolean hnsw = definition.mode() == VectorIndexDefinition.IndexMode.HNSW;
-    int maxM = definition.maxM();
-    int efConstruction = definition.efConstruction();
-    int efSearch = definition.efSearch();
+    boolean writesAuxiliary = adapter.writesAuxiliaryFiles();
     FileIO fileIO = table.io();
 
     Dataset<Row> entries =
-        VectorIndexEntries.entries(spark, table, sourceTableSnapshotId, vectorColumn, definition);
+        IndexEntries.entries(spark, table, sourceTableSnapshotId, vectorColumn, adapter);
     if (onlyFiles != null) {
       entries =
-          entries.filter(
-              functions.col(VectorIndexEntries.DATA_FILE_COLUMN).isin(onlyFiles.toArray()));
+          entries.filter(functions.col(IndexEntries.DATA_FILE_COLUMN).isin(onlyFiles.toArray()));
     }
 
     List<Row> indexFileRows =
         entries
-            .repartition(functions.col(VectorIndexEntries.DATA_FILE_COLUMN))
+            .repartition(functions.col(IndexEntries.DATA_FILE_COLUMN))
             .toJavaRDD()
             .mapPartitions(
                 (FlatMapFunction<Iterator<Row>, Row>)
                     iterator -> {
                       IndexFileContainer fileContainer = new PuffinIndexFileContainer();
-                      VectorIndexAdapter adapter =
-                          new VectorIndexAdapter(
-                              VectorIndexDefinition.builder()
-                                  .fieldId(fieldId)
-                                  .dimension(dimension)
-                                  .metric(metric)
-                                  .mode(
-                                      hnsw
-                                          ? VectorIndexDefinition.IndexMode.HNSW
-                                          : VectorIndexDefinition.IndexMode.EXACT)
-                                  .maxM(maxM)
-                                  .efConstruction(efConstruction)
-                                  .efSearch(efSearch)
-                                  .build());
                       Map<String, List<IndexEntry>> entriesByFile = new LinkedHashMap<>();
                       while (iterator.hasNext()) {
                         Row row = iterator.next();
@@ -294,7 +274,7 @@ public final class SparkIndexBuilder {
                         String blobType;
                         byte[] payload;
                         IndexFile.Kind kind;
-                        if (hnsw) {
+                        if (writesAuxiliary) {
                           blobType = adapter.auxiliaryBlobType();
                           payload = adapter.encodeAuxiliaryPayload(group.getValue()).array();
                           kind = IndexFile.Kind.AUXILIARY;
@@ -397,9 +377,9 @@ public final class SparkIndexBuilder {
     }
 
     Map<String, Set<String>> previousDeletes =
-        VectorIndexEntries.deleteFilesByDataFile(table, previousSnapshotId);
+        IndexEntries.deleteFilesByDataFile(table, previousSnapshotId);
     Map<String, Set<String>> currentDeletes =
-        VectorIndexEntries.deleteFilesByDataFile(table, currentSnapshotId);
+        IndexEntries.deleteFilesByDataFile(table, currentSnapshotId);
     Set<String> changed = Sets.newHashSet();
     for (String dataFile : commonDataFiles) {
       if (!previousDeletes
@@ -437,6 +417,11 @@ public final class SparkIndexBuilder {
   @SuppressWarnings("unchecked")
   private static List<String> coveredDataFiles(Row row) {
     return (List<String>) row.getAs(2);
+  }
+
+  /** Creates the adapter for the index metadata's definition. */
+  private static IndexAdapter adapterFor(IndexMetadata metadata) {
+    return IndexTypes.fromType(metadata.indexType()).createAdapter(metadata.definition());
   }
 
   private static long nextSnapshotId(IndexMetadata metadata) {

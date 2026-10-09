@@ -38,6 +38,8 @@ import org.apache.iceberg.relocated.com.google.common.collect.ImmutableMap;
  */
 public final class VectorIndexDefinition implements IndexDefinition {
 
+  private static final long serialVersionUID = 1L;
+
   /** Search strategies supported by the vector index. */
   public enum IndexMode {
     /** Exact linear scan over the entry payload. */

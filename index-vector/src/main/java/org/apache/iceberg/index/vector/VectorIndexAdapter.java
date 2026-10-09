@@ -53,7 +53,9 @@ import org.apache.iceberg.relocated.com.google.common.collect.Lists;
  * reference]}. Approximate search loads the graph, retrieves candidates, and re-scores them with
  * the exact metric, so result scores are identical to exact search regardless of the graph.
  */
-public final class VectorIndexAdapter implements IndexAdapter {
+public final class VectorIndexAdapter implements IndexAdapter, java.io.Serializable {
+
+  private static final long serialVersionUID = 1L;
 
   /** Blob type of entry-bearing vector index files. */
   public static final String ENTRY_BLOB_TYPE = "iceberg-vector-entries-v1";
@@ -102,6 +104,24 @@ public final class VectorIndexAdapter implements IndexAdapter {
   }
 
   /** Decodes a vector value encoded by {@link #encodeVector}. */
+  /**
+   * Encodes a column value into an entry payload: the value is the engine's representation of a
+   * numeric array column, an iterable of numbers.
+   */
+  @Override
+  public byte[] encodeEntryValue(Object columnValue) {
+    List<Float> values = Lists.newArrayList();
+    for (Object value : (Iterable<?>) columnValue) {
+      values.add(((Number) value).floatValue());
+    }
+
+    float[] vector = new float[values.size()];
+    for (int i = 0; i < vector.length; i++) {
+      vector[i] = values.get(i);
+    }
+    return encodeVector(vector);
+  }
+
   public float[] decodeVector(byte[] payload) {
     return decodeVector(payload, "Vector");
   }

@@ -29,6 +29,7 @@ import org.apache.iceberg.index.IndexManifestList.ManifestRef;
 import org.apache.iceberg.index.IndexMetadata;
 import org.apache.iceberg.index.IndexSnapshot;
 import org.apache.iceberg.index.SidecarIndexCatalog;
+import org.apache.iceberg.index.text.TextIndexTypes;
 import org.apache.iceberg.index.vector.VectorIndexDefinition;
 import org.apache.iceberg.index.vector.VectorIndexTypes;
 import org.apache.iceberg.io.FileIO;
@@ -43,6 +44,11 @@ public final class VectorIndexes {
   /** Registers the vector index type with the core index type registry. */
   public static void registerVectorIndexType() {
     VectorIndexTypes.register();
+  }
+
+  /** Registers the text index type with the core index type registry. */
+  public static void registerTextIndexType() {
+    TextIndexTypes.register();
   }
 
   /** Returns the sidecar index catalog for the given table. */

@@ -34,6 +34,11 @@ final class VectorIndexProcedures {
     VectorIndexes.registerVectorIndexType();
   }
 
+  /** Registers the text index type with the core index type registry. */
+  static void registerTextIndexType() {
+    VectorIndexes.registerTextIndexType();
+  }
+
   /** Returns the sidecar index catalog for the given table. */
   static SidecarIndexCatalog indexCatalog(Table table) {
     return VectorIndexes.indexCatalog(table);

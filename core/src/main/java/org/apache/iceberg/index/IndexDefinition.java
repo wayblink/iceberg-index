@@ -25,9 +25,10 @@ package org.apache.iceberg.index;
  * <p>An index definition is the extension point of the index layer. Each index type (for example
  * {@code vector}) provides one implementation, and new index types are supported by registering a
  * new {@link IndexType} rather than by adding new top-level concepts. Definitions are immutable and
- * are serialized as part of {@link IndexMetadata}.
+ * are serialized as part of {@link IndexMetadata}. They are also Java-serializable because engines
+ * ship them to workers, where an adapter is created from them to encode entries.
  */
-public interface IndexDefinition {
+public interface IndexDefinition extends java.io.Serializable {
 
   /** Returns the index type of this definition, for example {@code "vector"}. */
   String type();

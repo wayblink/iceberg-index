@@ -51,7 +51,9 @@ import org.apache.iceberg.relocated.com.google.common.collect.Maps;
  * b·|d|/avgdl))}, with {@code idf(t) = ln(1 + (N − df(t) + 0.5)/(df(t) + 0.5))}. A query term that
  * occurs several times contributes once per occurrence.
  */
-public final class TextIndexAdapter implements IndexAdapter {
+public final class TextIndexAdapter implements IndexAdapter, java.io.Serializable {
+
+  private static final long serialVersionUID = 1L;
 
   static final String ENTRY_BLOB_TYPE = "iceberg-text-entries-v1";
   static final String AUXILIARY_BLOB_TYPE = "iceberg-text-bm25-v1";

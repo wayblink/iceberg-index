@@ -29,9 +29,7 @@ import org.apache.iceberg.FileContent;
 import org.apache.iceberg.FileScanTask;
 import org.apache.iceberg.Schema;
 import org.apache.iceberg.Table;
-import org.apache.iceberg.index.vector.VectorIndexAdapter;
-import org.apache.iceberg.index.vector.VectorIndexDefinition;
-import org.apache.iceberg.index.vector.VectorIndexDefinition.Metric;
+import org.apache.iceberg.index.IndexAdapter;
 import org.apache.iceberg.io.CloseableIterable;
 import org.apache.iceberg.relocated.com.google.common.collect.Lists;
 import org.apache.iceberg.relocated.com.google.common.collect.Maps;
@@ -53,11 +51,14 @@ import scala.Tuple2;
  *
  * <p>Data files are read directly as parquet and the snapshot's delete files are applied here: rows
  * removed by position delete files and rows matching equality delete files are not indexed. The
- * recorded position is the row's ordinal in its data file, which is what the row resolution of
- * {@code vector_search} relies on. Together this makes an index snapshot equivalent to the table
- * snapshot it is bound to, deletes included.
+ * recorded position is the row's ordinal in its data file, which is what row resolution relies on.
+ * Together this makes an index snapshot equivalent to the table snapshot it is bound to, deletes
+ * included.
+ *
+ * <p>The pipeline is index-type neutral: the column value is handed to {@link
+ * IndexAdapter#encodeEntryValue(Object)}, so any index type works without engine changes.
  */
-public final class VectorIndexEntries {
+public final class IndexEntries {
 
   public static final String DATA_FILE_COLUMN = "data_file";
   public static final String POSITION_COLUMN = "pos";
@@ -74,7 +75,7 @@ public final class VectorIndexEntries {
   private static final char NULL_MARKER = '\u0000';
   private static final char VALUE_SEPARATOR = '\u0001';
 
-  private VectorIndexEntries() {}
+  private IndexEntries() {}
 
   /**
    * Builds the entry dataset for the given source table snapshot.
@@ -82,18 +83,11 @@ public final class VectorIndexEntries {
    * @param spark the Spark session
    * @param table the Iceberg table to index
    * @param snapshotId the source table snapshot to read; its delete files are applied
-   * @param vectorColumn the name of the numeric array column to index
-   * @param definition the vector index definition
+   * @param column the name of the indexed column
+   * @param adapter the adapter that encodes column values into entry payloads
    */
   public static Dataset<Row> entries(
-      SparkSession spark,
-      Table table,
-      long snapshotId,
-      String vectorColumn,
-      VectorIndexDefinition definition) {
-    int fieldId = definition.fieldId();
-    int dimension = definition.dimension();
-    Metric metric = definition.metric();
+      SparkSession spark, Table table, long snapshotId, String column, IndexAdapter adapter) {
     Schema tableSchema = table.schema();
 
     Dataset<Row> entries = null;
@@ -106,9 +100,9 @@ public final class VectorIndexEntries {
       List<String> keyColumns = equalityColumns(tableSchema, equalityDeletes(deleteFiles));
       Set<String> equalityKeys = readEqualityKeys(spark, equalityDeletes(deleteFiles), keyColumns);
 
-      // the data read needs the vector column plus the columns referenced by equality deletes
+      // the data read needs the indexed column plus the columns referenced by equality deletes
       Set<String> columnsToRead = Sets.newLinkedHashSet();
-      columnsToRead.add(vectorColumn);
+      columnsToRead.add(column);
       columnsToRead.addAll(keyColumns);
       List<String> readColumns = Lists.newArrayList(columnsToRead);
       List<String> capturedKeyColumns = keyColumns;
@@ -126,13 +120,6 @@ public final class VectorIndexEntries {
               .mapPartitions(
                   (FlatMapFunction<Iterator<Tuple2<Row, Long>>, Row>)
                       iterator -> {
-                        VectorIndexAdapter adapter =
-                            new VectorIndexAdapter(
-                                VectorIndexDefinition.builder()
-                                    .fieldId(fieldId)
-                                    .dimension(dimension)
-                                    .metric(metric)
-                                    .build());
                         List<Row> fileEntries = Lists.newArrayList();
                         while (iterator.hasNext()) {
                           Tuple2<Row, Long> tuple = iterator.next();
@@ -152,8 +139,7 @@ public final class VectorIndexEntries {
                               RowFactory.create(
                                   dataFile,
                                   position,
-                                  adapter.encodeVector(
-                                      toFloats(row.getList(row.fieldIndex(vectorColumn))))));
+                                  adapter.encodeEntryValue(columnValue(row, column))));
                         }
                         return fileEntries.iterator();
                       });
@@ -303,6 +289,19 @@ public final class VectorIndexEntries {
 
   private static String encodedValue(Object value) {
     return value == null ? String.valueOf(NULL_MARKER) : value.getClass().getName() + ":" + value;
+  }
+
+  /**
+   * Extracts the indexed column's value in a Java representation: array columns come back from
+   * Spark rows as Scala sequences, which are converted to Java lists here so adapters do not need
+   * Scala.
+   */
+  private static Object columnValue(Row row, String column) {
+    Object value = row.get(row.fieldIndex(column));
+    if (value instanceof scala.collection.Seq) {
+      return scala.collection.JavaConverters.seqAsJavaList((scala.collection.Seq<?>) value);
+    }
+    return value;
   }
 
   private static boolean containsPosition(long[] positions, long position) {

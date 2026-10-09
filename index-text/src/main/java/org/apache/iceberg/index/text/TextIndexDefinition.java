@@ -28,6 +28,8 @@ import org.apache.iceberg.relocated.com.google.common.collect.ImmutableSet;
 /** Definition of a BM25 text index over a string column. */
 public final class TextIndexDefinition implements IndexDefinition {
 
+  private static final long serialVersionUID = 1L;
+
   private final int fieldId;
   private final double k1;
   private final double lengthNorm;
