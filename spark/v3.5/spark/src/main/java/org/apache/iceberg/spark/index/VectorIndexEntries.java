@@ -120,7 +120,8 @@ public final class VectorIndexEntries {
     return entries == null ? spark.createDataFrame(Lists.newArrayList(), SCHEMA) : entries;
   }
 
-  private static List<String> dataFiles(Table table, long snapshotId) {
+  /** Lists the data file locations of the given table snapshot, on the driver. */
+  public static List<String> dataFiles(Table table, long snapshotId) {
     try (CloseableIterable<FileScanTask> tasks =
         table.newScan().useSnapshot(snapshotId).planFiles()) {
       List<String> dataFiles = Lists.newArrayList();

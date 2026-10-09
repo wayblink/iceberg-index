@@ -1,0 +1,221 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+package org.apache.iceberg.spark.extensions;
+
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
+
+import java.util.List;
+import org.apache.iceberg.ParameterizedTestExtension;
+import org.apache.iceberg.index.vector.VectorIndexTypes;
+import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.BeforeAll;
+import org.junit.jupiter.api.TestTemplate;
+import org.junit.jupiter.api.extension.ExtendWith;
+
+@ExtendWith(ParameterizedTestExtension.class)
+public class TestVectorIndexProcedures extends ExtensionsTestBase {
+
+  @BeforeAll
+  static void registerVectorIndexType() {
+    VectorIndexTypes.register();
+  }
+
+  @AfterEach
+  public void removeTables() {
+    sql("DROP TABLE IF EXISTS %s", tableName("vectors_build_list_" + catalogName));
+    sql("DROP TABLE IF EXISTS %s", tableName("vectors_hnsw_" + catalogName));
+    sql("DROP TABLE IF EXISTS %s", tableName("vectors_refresh_" + catalogName));
+    sql("DROP TABLE IF EXISTS %s", tableName("vectors_exists_" + catalogName));
+    sql("DROP TABLE IF EXISTS %s", tableName("vectors_missing_" + catalogName));
+    sql("DROP TABLE IF EXISTS %s", tableName("vectors_dimension_" + catalogName));
+  }
+
+  @TestTemplate
+  public void testBuildListAndSearchVectorIndex() {
+    String tableName = tableName("vectors_build_list_" + catalogName);
+    sql(
+        "CREATE TABLE %s (id bigint, embedding array<double>) USING iceberg PARTITIONED BY (bucket(4, id))",
+        tableName);
+    sql(
+        "INSERT INTO %s VALUES (1, array(1.0, 0.0)), (2, array(0.9, 0.1)), (3, array(0.0, 1.0)), "
+            + "(4, array(0.1, 0.95)), (5, array(-1.0, 0.0)), (6, array(0.0, -1.0))",
+        tableName);
+
+    List<Object[]> buildOutput =
+        sql(
+            "CALL %s.system.build_vector_index(table => '%s', column => 'embedding', dimension => 2, metric => 'cosine')",
+            catalogName, tableName);
+    assertThat(buildOutput).hasSize(1);
+    String indexUuid = buildOutput.get(0)[0].toString();
+    long sourceSnapshotId = ((Number) buildOutput.get(0)[1]).longValue();
+    long indexFiles = ((Number) buildOutput.get(0)[2]).longValue();
+    long entries = ((Number) buildOutput.get(0)[3]).longValue();
+    assertThat(indexUuid).isNotBlank();
+    assertThat(sourceSnapshotId).isPositive();
+    assertThat(indexFiles).isPositive();
+    assertThat(entries).isEqualTo(6L);
+
+    List<Object[]> listOutput =
+        sql("CALL %s.system.list_vector_indexes(table => '%s')", catalogName, tableName);
+    assertThat(listOutput).hasSize(1);
+    assertThat(listOutput.get(0)[0]).isEqualTo(indexUuid);
+    assertThat(listOutput.get(0)[1]).isEqualTo("embedding");
+    assertThat(listOutput.get(0)[2]).isEqualTo("vector");
+    assertThat(listOutput.get(0)[3]).isEqualTo("EXACT");
+    assertThat(listOutput.get(0)[4]).isEqualTo("COSINE");
+    assertThat(listOutput.get(0)[5]).isEqualTo(2);
+    assertThat(listOutput.get(0)[6]).isEqualTo(sourceSnapshotId);
+    assertThat(listOutput.get(0)[7]).isEqualTo("PUBLISHED");
+
+    // a query close to (1.0, 0.0) must return id=1 first, with the resolved row attached
+    List<Object[]> searchOutput =
+        sql(
+            "CALL %s.system.vector_search(table => '%s', column => 'embedding', query => array(0.95d, 0.05d), k => 2)",
+            catalogName, tableName);
+    assertThat(searchOutput).hasSize(2);
+    assertThat(searchOutput.get(0)[0]).isInstanceOf(String.class);
+    assertThat(searchOutput.get(0)[1]).isInstanceOf(Number.class);
+    double firstScore = ((Number) searchOutput.get(0)[2]).doubleValue();
+    double secondScore = ((Number) searchOutput.get(1)[2]).doubleValue();
+    assertThat(firstScore).isGreaterThan(secondScore);
+    assertThat(searchOutput.get(0)[3].toString()).contains("\"id\":1");
+
+    // k = 0 returns no rows
+    assertThat(
+            sql(
+                "CALL %s.system.vector_search(table => '%s', column => 'embedding', query => array(0.95d, 0.05d), k => 0)",
+                catalogName, tableName))
+        .isEmpty();
+  }
+
+  @TestTemplate
+  public void testBuildVectorIndexInHnswMode() {
+    String tableName = tableName("vectors_hnsw_" + catalogName);
+    sql("CREATE TABLE %s (id bigint, embedding array<double>) USING iceberg", tableName);
+    sql("INSERT INTO %s VALUES (1, array(1.0, 0.0)), (2, array(0.0, 1.0))", tableName);
+
+    sql(
+        "CALL %s.system.build_vector_index(table => '%s', column => 'embedding', dimension => 2, metric => 'cosine', mode => 'HNSW', max_m => 8, ef_construction => 100, ef_search => 64)",
+        catalogName, tableName);
+
+    List<Object[]> listOutput =
+        sql("CALL %s.system.list_vector_indexes(table => '%s')", catalogName, tableName);
+    assertThat(listOutput).hasSize(1);
+    assertThat(listOutput.get(0)[3]).isEqualTo("HNSW");
+
+    List<Object[]> searchOutput =
+        sql(
+            "CALL %s.system.vector_search(table => '%s', column => 'embedding', query => array(0.95d, 0.05d), k => 1)",
+            catalogName, tableName);
+    assertThat(searchOutput).hasSize(1);
+    assertThat(searchOutput.get(0)[3].toString()).contains("\"id\":1");
+  }
+
+  @TestTemplate
+  public void testRefreshVectorIndexPicksUpNewData() {
+    String tableName = tableName("vectors_refresh_" + catalogName);
+    sql("CREATE TABLE %s (id bigint, embedding array<double>) USING iceberg", tableName);
+    sql("INSERT INTO %s VALUES (1, array(1.0, 0.0))", tableName);
+
+    sql(
+        "CALL %s.system.build_vector_index(table => '%s', column => 'embedding', dimension => 2)",
+        catalogName, tableName);
+
+    // refreshing without changes reports zero files and entries
+    List<Object[]> noopOutput =
+        sql(
+            "CALL %s.system.refresh_vector_index(table => '%s', column => 'embedding')",
+            catalogName, tableName);
+    assertThat(noopOutput).hasSize(1);
+    assertThat(((Number) noopOutput.get(0)[2]).longValue()).isZero();
+    assertThat(((Number) noopOutput.get(0)[3]).longValue()).isZero();
+
+    sql("INSERT INTO %s VALUES (2, array(0.0, 1.0))", tableName);
+
+    List<Object[]> refreshOutput =
+        sql(
+            "CALL %s.system.refresh_vector_index(table => '%s', column => 'embedding')",
+            catalogName, tableName);
+    assertThat(refreshOutput).hasSize(1);
+    assertThat(((Number) refreshOutput.get(0)[2]).longValue()).isEqualTo(2L);
+    assertThat(((Number) refreshOutput.get(0)[3]).longValue()).isEqualTo(2L);
+
+    // the refreshed index finds the new row
+    List<Object[]> searchOutput =
+        sql(
+            "CALL %s.system.vector_search(table => '%s', column => 'embedding', query => array(0.0d, 0.95d), k => 1)",
+            catalogName, tableName);
+    assertThat(searchOutput).hasSize(1);
+    assertThat(searchOutput.get(0)[3].toString()).contains("\"id\":2");
+  }
+
+  @TestTemplate
+  public void testBuildVectorIndexFailsWhenIndexExists() {
+    String tableName = tableName("vectors_exists_" + catalogName);
+    sql("CREATE TABLE %s (id bigint, embedding array<double>) USING iceberg", tableName);
+    sql("INSERT INTO %s VALUES (1, array(1.0, 0.0))", tableName);
+
+    sql(
+        "CALL %s.system.build_vector_index(table => '%s', column => 'embedding', dimension => 2)",
+        catalogName, tableName);
+
+    assertThatThrownBy(
+            () ->
+                sql(
+                    "CALL %s.system.build_vector_index(table => '%s', column => 'embedding', dimension => 2)",
+                    catalogName, tableName))
+        .isInstanceOf(RuntimeException.class)
+        .hasMessageContaining("already exists");
+  }
+
+  @TestTemplate
+  public void testVectorSearchWithoutIndexFails() {
+    String tableName = tableName("vectors_missing_" + catalogName);
+    sql("CREATE TABLE %s (id bigint, embedding array<double>) USING iceberg", tableName);
+    sql("INSERT INTO %s VALUES (1, array(1.0, 0.0))", tableName);
+
+    assertThatThrownBy(
+            () ->
+                sql(
+                    "CALL %s.system.vector_search(table => '%s', column => 'embedding', query => array(0.95d, 0.05d), k => 1)",
+                    catalogName, tableName))
+        .isInstanceOf(RuntimeException.class)
+        .hasMessageContaining("No vector index exists");
+  }
+
+  @TestTemplate
+  public void testVectorSearchWithWrongDimensionFails() {
+    String tableName = tableName("vectors_dimension_" + catalogName);
+    sql("CREATE TABLE %s (id bigint, embedding array<double>) USING iceberg", tableName);
+    sql("INSERT INTO %s VALUES (1, array(1.0, 0.0))", tableName);
+
+    sql(
+        "CALL %s.system.build_vector_index(table => '%s', column => 'embedding', dimension => 2)",
+        catalogName, tableName);
+
+    assertThatThrownBy(
+            () ->
+                sql(
+                    "CALL %s.system.vector_search(table => '%s', column => 'embedding', query => array(0.95d, 0.05d, 0.5d), k => 1)",
+                    catalogName, tableName))
+        .isInstanceOf(RuntimeException.class)
+        .hasMessageContaining("does not match index dimension");
+  }
+}

@@ -55,6 +55,10 @@ public class SparkProcedures {
     mapBuilder.put("migrate", MigrateTableProcedure::builder);
     mapBuilder.put("snapshot", SnapshotTableProcedure::builder);
     mapBuilder.put("add_files", AddFilesProcedure::builder);
+    mapBuilder.put("build_vector_index", BuildVectorIndexProcedure::builder);
+    mapBuilder.put("refresh_vector_index", RefreshVectorIndexProcedure::builder);
+    mapBuilder.put("list_vector_indexes", ListVectorIndexesProcedure::builder);
+    mapBuilder.put("vector_search", VectorSearchProcedure::builder);
     mapBuilder.put("ancestors_of", AncestorsOfProcedure::builder);
     mapBuilder.put("register_table", RegisterTableProcedure::builder);
     mapBuilder.put("publish_changes", PublishChangesProcedure::builder);

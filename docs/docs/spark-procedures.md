@@ -1124,3 +1124,142 @@ Lastly, the [register_table](#register_table) procedure can be used to register 
 
 !!! warning
     Iceberg tables with partition statistics files are not currently supported for path rewrite.
+
+## Vector Index
+
+Vector index procedures build, refresh, list and search vector indexes. A vector index maps each row
+of a data file to its vector, so a search returns the matched rows' file and position (`_file` +
+`_pos`) plus the row itself. Indexes are stored next to the table in a sidecar index tree
+(`<table-location>/indexes/<index-uuid>/`).
+
+### `build_vector_index`
+
+Builds a full vector index for the table's current snapshot and registers it. Fails if an index
+already exists for the column.
+
+| Argument Name    | Required? | Type   | Description                                        |
+|------------------|-----------|--------|----------------------------------------------------|
+| `table`          | ✔️        | string | Name of the table                                  |
+| `column`         | ✔️        | string | Name of the numeric array column to index          |
+| `dimension`      | ✔️        | int    | Vector dimension                                   |
+| `metric`         |           | string | `cosine` (default), `euclidean` or `dot_product`   |
+| `mode`           |           | string | `EXACT` (default) or `HNSW`                        |
+| `max_m`          |           | int    | HNSW max connections per node (default 16)         |
+| `ef_construction`|           | int    | HNSW build-time search width (default 200)         |
+| `ef_search`      |           | int    | HNSW query-time search width (default 50)          |
+
+#### Output
+
+| Output Name         | Type   | Description                                    |
+|---------------------|--------|------------------------------------------------|
+| `index_uuid`        | string | UUID of the created index                      |
+| `source_snapshot_id`| long   | Table snapshot the index was built from        |
+| `index_files`       | long   | Number of index files written                  |
+| `entries`           | long   | Number of indexed rows                         |
+
+#### Examples
+
+Build an exact cosine index on `embedding`
+```sql
+CALL catalog_name.system.build_vector_index(
+    table => 'db.documents', column => 'embedding', dimension => 768, metric => 'cosine');
+```
+
+Build an HNSW (approximate) index
+```sql
+CALL catalog_name.system.build_vector_index(
+    table => 'db.documents', column => 'embedding', dimension => 768, mode => 'HNSW',
+    max_m => 16, ef_construction => 200, ef_search => 50);
+```
+
+### `refresh_vector_index`
+
+Refreshes an existing vector index against the table's current snapshot. Index files of unchanged
+data files are carried over; files of removed or rewritten data files are dropped and new data files
+are indexed. When the current snapshot is already covered, no new index snapshot is created and
+zero files and entries are reported.
+
+| Argument Name | Required? | Type   | Description                        |
+|---------------|-----------|--------|------------------------------------|
+| `table`       | ✔️        | string | Name of the table                  |
+| `column`      | ✔️        | string | Name of the indexed column         |
+
+#### Output
+
+| Output Name         | Type   | Description                             |
+|---------------------|--------|-----------------------------------------|
+| `index_uuid`        | string | UUID of the refreshed index             |
+| `source_snapshot_id`| long   | Table snapshot the index now covers     |
+| `index_files`       | long   | Number of index files after refresh     |
+| `entries`           | long   | Number of indexed rows after refresh    |
+
+#### Examples
+
+```sql
+CALL catalog_name.system.refresh_vector_index(
+    table => 'db.documents', column => 'embedding');
+```
+
+### `list_vector_indexes`
+
+Lists the vector indexes registered for a table.
+
+| Argument Name | Required? | Type   | Description        |
+|---------------|-----------|--------|--------------------|
+| `table`       | ✔️        | string | Name of the table  |
+
+#### Output
+
+| Output Name         | Type   | Description                              |
+|---------------------|--------|------------------------------------------|
+| `index_uuid`        | string | UUID of the index                        |
+| `column`            | string | Indexed column name                      |
+| `index_type`        | string | Index type (`vector`)                    |
+| `mode`              | string | `EXACT` or `HNSW`                        |
+| `metric`            | string | Distance metric                          |
+| `dimension`         | int    | Vector dimension                         |
+| `source_snapshot_id`| long   | Table snapshot the index covers          |
+| `status`            | string | Publication status of the index snapshot |
+| `index_files`       | long   | Number of index files                    |
+| `entries`           | long   | Number of indexed rows                   |
+
+#### Examples
+
+```sql
+CALL catalog_name.system.list_vector_indexes(table => 'db.documents');
+```
+
+### `vector_search`
+
+Searches a vector index and resolves the matched rows. Returns the row reference (`_file` + `_pos`)
+of each hit with its score, plus the matched row itself as a JSON string, ordered by score
+descending.
+
+| Argument Name | Required? | Type          | Description                     |
+|---------------|-----------|---------------|---------------------------------|
+| `table`       | ✔️        | string        | Name of the table               |
+| `column`      | ✔️        | string        | Name of the indexed column      |
+| `query`       | ✔️        | array<double> | Query vector (same dimension)   |
+| `k`           | ✔️        | int           | Number of results to return     |
+
+#### Output
+
+| Output Name | Type   | Description                              |
+|-------------|--------|------------------------------------------|
+| `data_file` | string | Data file of the matched row             |
+| `pos`       | long   | Row position within the data file (`_pos`) |
+| `score`     | double | Similarity or distance score             |
+| `row`       | string | Matched row as a JSON object             |
+
+!!! note
+    The query vector must be passed as `array<double>`; decimal literals such as `array(0.95, 0.05)`
+    are not coerced. Use double literals (`array(0.95d, 0.05d)`) or `CAST(... AS ARRAY<DOUBLE>)`.
+
+#### Examples
+
+Search for the 10 rows closest to a query vector
+```sql
+CALL catalog_name.system.vector_search(
+    table => 'db.documents', column => 'embedding',
+    query => array(0.95d, 0.05d), k => 10);
+```

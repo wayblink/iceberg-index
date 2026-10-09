@@ -18,16 +18,22 @@
  */
 package org.apache.iceberg.spark.index;
 
+import java.io.IOException;
+import java.io.UncheckedIOException;
 import java.util.Iterator;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.UUID;
 import org.apache.iceberg.Table;
 import org.apache.iceberg.index.IndexBlob;
 import org.apache.iceberg.index.IndexEntry;
 import org.apache.iceberg.index.IndexFile;
 import org.apache.iceberg.index.IndexFileContainer;
+import org.apache.iceberg.index.IndexManifest;
+import org.apache.iceberg.index.IndexManifestList;
+import org.apache.iceberg.index.IndexManifestList.ManifestRef;
 import org.apache.iceberg.index.IndexMetadata;
 import org.apache.iceberg.index.IndexSnapshot;
 import org.apache.iceberg.index.IndexSnapshotWriter;
@@ -38,6 +44,7 @@ import org.apache.iceberg.index.vector.VectorIndexDefinition.Metric;
 import org.apache.iceberg.index.vector.VectorIndexTypes;
 import org.apache.iceberg.io.FileIO;
 import org.apache.iceberg.relocated.com.google.common.collect.Lists;
+import org.apache.iceberg.relocated.com.google.common.collect.Sets;
 import org.apache.spark.api.java.function.FlatMapFunction;
 import org.apache.spark.sql.Dataset;
 import org.apache.spark.sql.Row;
@@ -88,6 +95,129 @@ public final class SparkIndexBuilder {
     VectorIndexDefinition definition = (VectorIndexDefinition) currentMetadata.definition();
     String indexLocation = currentMetadata.location();
     long snapshotId = nextSnapshotId(currentMetadata);
+    FileIO fileIO = table.io();
+
+    List<IndexFile> indexFiles =
+        buildIndexFiles(
+            spark,
+            table,
+            indexLocation,
+            snapshotId,
+            sourceTableSnapshotId,
+            vectorColumn,
+            definition,
+            null);
+
+    String manifestList =
+        new IndexSnapshotWriter(fileIO).writeManifestList(indexLocation, snapshotId, indexFiles);
+
+    IndexSnapshot snapshot =
+        IndexSnapshot.builder()
+            .snapshotId(snapshotId)
+            .sourceTableSnapshotId(sourceTableSnapshotId)
+            .parentIndexSnapshotId(null)
+            .timestampMillis(timestampMillis)
+            .indexManifestList(manifestList)
+            .build();
+    return currentMetadata.withSnapshot(snapshot);
+  }
+
+  /**
+   * Refreshes an index incrementally against a newer source table snapshot.
+   *
+   * <p>Index files of data files that are still present are carried over unchanged (parent-index
+   * snapshot lineage); index files of removed or rewritten data files are dropped, and new data
+   * files are indexed. If nothing changed, the metadata is returned unchanged.
+   *
+   * @param spark the Spark session
+   * @param table the Iceberg table to index
+   * @param currentMetadata the current index metadata; it must have at least one snapshot
+   * @param sourceTableSnapshotId the newer source table snapshot to refresh from
+   * @param vectorColumn the name of the numeric array column to index
+   * @param timestampMillis the publication timestamp of the new snapshot
+   * @return updated metadata with the new snapshot appended, or the input metadata when nothing
+   *     changed
+   */
+  public static IndexMetadata refresh(
+      SparkSession spark,
+      Table table,
+      IndexMetadata currentMetadata,
+      long sourceTableSnapshotId,
+      String vectorColumn,
+      long timestampMillis) {
+    IndexSnapshot previous = currentMetadata.latestSnapshot();
+    if (previous == null) {
+      throw new IllegalArgumentException(
+          "Cannot refresh an index without an index snapshot; build it first");
+    }
+
+    VectorIndexDefinition definition = (VectorIndexDefinition) currentMetadata.definition();
+    String indexLocation = currentMetadata.location();
+    long snapshotId = previous.snapshotId() + 1;
+    FileIO fileIO = table.io();
+
+    Set<String> currentFiles =
+        Sets.newHashSet(VectorIndexEntries.dataFiles(table, sourceTableSnapshotId));
+    Set<String> previouslyCovered = coveredDataFiles(fileIO, previous);
+    Set<String> removedFiles = Sets.difference(previouslyCovered, currentFiles);
+    Set<String> newFiles = Sets.difference(currentFiles, previouslyCovered);
+    if (removedFiles.isEmpty() && newFiles.isEmpty()) {
+      return currentMetadata;
+    }
+
+    Set<String> staleFiles = Sets.union(removedFiles, newFiles);
+    List<IndexFile> carried = Lists.newArrayList();
+    for (IndexFile indexFile : indexFiles(fileIO, previous)) {
+      if (Sets.intersection(Sets.newHashSet(indexFile.coveredDataFiles()), staleFiles).isEmpty()) {
+        carried.add(indexFile);
+      }
+    }
+
+    List<IndexFile> newIndexFiles =
+        buildIndexFiles(
+            spark,
+            table,
+            indexLocation,
+            snapshotId,
+            sourceTableSnapshotId,
+            vectorColumn,
+            definition,
+            newFiles);
+    List<IndexFile> indexFiles = Lists.newArrayList();
+    indexFiles.addAll(carried);
+    indexFiles.addAll(newIndexFiles);
+
+    String manifestList =
+        new IndexSnapshotWriter(fileIO).writeManifestList(indexLocation, snapshotId, indexFiles);
+
+    IndexSnapshot snapshot =
+        IndexSnapshot.builder()
+            .snapshotId(snapshotId)
+            .sourceTableSnapshotId(sourceTableSnapshotId)
+            .parentIndexSnapshotId(previous.snapshotId())
+            .timestampMillis(timestampMillis)
+            .indexManifestList(manifestList)
+            .build();
+    return currentMetadata.withSnapshot(snapshot);
+  }
+
+  /**
+   * Writes one index file per data file (restricted to {@code onlyFiles} when non-null) and returns
+   * the index files without writing a manifest or snapshot.
+   */
+  private static List<IndexFile> buildIndexFiles(
+      SparkSession spark,
+      Table table,
+      String indexLocation,
+      long snapshotId,
+      long sourceTableSnapshotId,
+      String vectorColumn,
+      VectorIndexDefinition definition,
+      Set<String> onlyFiles) {
+    if (onlyFiles != null && onlyFiles.isEmpty()) {
+      return Lists.newArrayList();
+    }
+
     int fieldId = definition.fieldId();
     int dimension = definition.dimension();
     Metric metric = definition.metric();
@@ -99,6 +229,11 @@ public final class SparkIndexBuilder {
 
     Dataset<Row> entries =
         VectorIndexEntries.entries(spark, table, sourceTableSnapshotId, vectorColumn, definition);
+    if (onlyFiles != null) {
+      entries =
+          entries.filter(
+              functions.col(VectorIndexEntries.DATA_FILE_COLUMN).isin(onlyFiles.toArray()));
+    }
 
     List<Row> indexFileRows =
         entries
@@ -183,18 +318,30 @@ public final class SparkIndexBuilder {
               .build());
     }
 
-    String manifestList =
-        new IndexSnapshotWriter(fileIO).writeManifestList(indexLocation, snapshotId, indexFiles);
+    return indexFiles;
+  }
 
-    IndexSnapshot snapshot =
-        IndexSnapshot.builder()
-            .snapshotId(snapshotId)
-            .sourceTableSnapshotId(sourceTableSnapshotId)
-            .parentIndexSnapshotId(null)
-            .timestampMillis(timestampMillis)
-            .indexManifestList(manifestList)
-            .build();
-    return currentMetadata.withSnapshot(snapshot);
+  private static Set<String> coveredDataFiles(FileIO fileIO, IndexSnapshot snapshot) {
+    Set<String> covered = Sets.newHashSet();
+    for (IndexFile indexFile : indexFiles(fileIO, snapshot)) {
+      covered.addAll(indexFile.coveredDataFiles());
+    }
+    return covered;
+  }
+
+  private static List<IndexFile> indexFiles(FileIO fileIO, IndexSnapshot snapshot) {
+    List<IndexFile> indexFiles = Lists.newArrayList();
+    try {
+      IndexManifestList manifestList =
+          IndexManifestList.read(fileIO.newInputFile(snapshot.indexManifestList()));
+      for (ManifestRef ref : manifestList.manifests()) {
+        indexFiles.addAll(IndexManifest.read(fileIO.newInputFile(ref.location())).indexFiles());
+      }
+    } catch (IOException e) {
+      throw new UncheckedIOException(
+          "Failed to read index manifests of snapshot " + snapshot.snapshotId(), e);
+    }
+    return indexFiles;
   }
 
   @SuppressWarnings("unchecked")
