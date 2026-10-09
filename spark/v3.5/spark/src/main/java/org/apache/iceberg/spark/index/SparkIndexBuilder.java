@@ -32,9 +32,10 @@ import org.apache.iceberg.index.IndexMetadata;
 import org.apache.iceberg.index.IndexSnapshot;
 import org.apache.iceberg.index.IndexSnapshotWriter;
 import org.apache.iceberg.index.PuffinIndexFileContainer;
-import org.apache.iceberg.index.VectorIndexAdapter;
-import org.apache.iceberg.index.VectorIndexDefinition;
-import org.apache.iceberg.index.VectorIndexDefinition.Metric;
+import org.apache.iceberg.index.vector.VectorIndexAdapter;
+import org.apache.iceberg.index.vector.VectorIndexDefinition;
+import org.apache.iceberg.index.vector.VectorIndexDefinition.Metric;
+import org.apache.iceberg.index.vector.VectorIndexTypes;
 import org.apache.iceberg.io.FileIO;
 import org.apache.iceberg.relocated.com.google.common.collect.Lists;
 import org.apache.spark.api.java.function.FlatMapFunction;
@@ -58,6 +59,11 @@ import org.apache.spark.sql.functions;
 public final class SparkIndexBuilder {
 
   private static final String DATA_DIR = "data";
+
+  static {
+    // the vector adapter lives in iceberg-index-vector; register it with the core registry
+    VectorIndexTypes.register();
+  }
 
   private SparkIndexBuilder() {}
 

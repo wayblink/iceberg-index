@@ -37,7 +37,7 @@ class TestIndexManifestFiles {
         IndexFile.builder()
             .location("index-file-1.puffin")
             .kind(Kind.ENTRY_BEARING)
-            .blobType(VectorIndexAdapter.ENTRY_BLOB_TYPE)
+            .blobType(TestingIndexAdapter.BLOB_TYPE)
             .entryCount(2)
             .coveredDataFiles(List.of("data-1.parquet", "data-2.parquet"))
             .build();

@@ -22,23 +22,27 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 import java.io.IOException;
+import java.nio.ByteBuffer;
 import java.nio.file.Path;
 import java.util.List;
 import org.apache.iceberg.TestTables.LocalFileIO;
 import org.apache.iceberg.index.IndexFile.Kind;
-import org.apache.iceberg.index.VectorIndexDefinition.Metric;
+import org.apache.iceberg.index.IndexManifestList.ManifestRef;
+import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
 class TestIndexReader {
 
-  private final VectorIndexAdapter adapter =
-      new VectorIndexAdapter(
-          VectorIndexDefinition.builder().fieldId(17).dimension(2).metric(Metric.COSINE).build());
+  @BeforeAll
+  static void registerTestingIndexType() {
+    IndexTypes.register(new TestingIndexType());
+  }
 
   @Test
   public void searchesSnapshotAndReportsUncoveredFiles(@TempDir Path tempDir) throws IOException {
     LocalFileIO fileIO = new LocalFileIO();
+    TestingIndexAdapter adapter = new TestingIndexAdapter(TestingIndexDefinition.of(4));
     IndexFileContainer container = new PuffinIndexFileContainer();
 
     String firstFile = tempDir.resolve("index-file-1.puffin").toString();
@@ -55,13 +59,9 @@ class TestIndexReader {
                     .encodeEntries(
                         List.of(
                             IndexEntry.of(
-                                "data-1.parquet",
-                                0,
-                                adapter.encodeVector(new float[] {1.0f, 0.0f})),
+                                "data-1.parquet", 0, TestingIndexAdapter.valuePayload(10)),
                             IndexEntry.of(
-                                "data-2.parquet",
-                                1,
-                                adapter.encodeVector(new float[] {0.0f, 1.0f}))))
+                                "data-2.parquet", 1, TestingIndexAdapter.valuePayload(1))))
                     .array())));
     container.write(
         fileIO.newOutputFile(secondFile),
@@ -72,9 +72,7 @@ class TestIndexReader {
                     .encodeEntries(
                         List.of(
                             IndexEntry.of(
-                                "data-3.parquet",
-                                3,
-                                adapter.encodeVector(new float[] {0.7f, 0.7f}))))
+                                "data-3.parquet", 3, TestingIndexAdapter.valuePayload(8))))
                     .array())));
 
     IndexManifest.write(
@@ -95,20 +93,14 @@ class TestIndexReader {
                 .coveredDataFiles(List.of("data-3.parquet"))
                 .build()));
     IndexManifestList.write(
-        fileIO.newOutputFile(listLocation),
-        List.of(IndexManifestList.ManifestRef.of(manifestLocation, 2, 3)));
+        fileIO.newOutputFile(listLocation), List.of(ManifestRef.of(manifestLocation, 2, 3)));
 
     IndexMetadata metadata =
         IndexMetadata.builder()
             .indexUuid("index-uuid")
             .tableUuid("table-uuid")
             .location(tempDir.toString())
-            .definition(
-                VectorIndexDefinition.builder()
-                    .fieldId(17)
-                    .dimension(2)
-                    .metric(Metric.COSINE)
-                    .build())
+            .definition(TestingIndexDefinition.of(4))
             .addSnapshot(
                 IndexSnapshot.builder()
                     .snapshotId(10)
@@ -119,14 +111,11 @@ class TestIndexReader {
             .build();
 
     IndexReader reader = new IndexReader(metadata, fileIO);
-    assertThat(reader.search(IndexQuery.of(20, adapter.encodeQuery(new float[] {0.95f, 0.05f}), 2)))
+    assertThat(reader.search(IndexQuery.of(20, query(5), 2)))
         .extracting(IndexSearchResult::dataFile)
         .containsExactly("data-1.parquet", "data-3.parquet");
-    assertThat(reader.search(IndexQuery.of(20, adapter.encodeQuery(new float[] {0.95f, 0.05f}), 0)))
-        .isEmpty();
-    assertThatThrownBy(
-            () ->
-                reader.search(IndexQuery.of(999, adapter.encodeQuery(new float[] {1.0f, 0.0f}), 1)))
+    assertThat(reader.search(IndexQuery.of(20, query(5), 0))).isEmpty();
+    assertThatThrownBy(() -> reader.search(IndexQuery.of(999, query(5), 1)))
         .isInstanceOf(IllegalArgumentException.class)
         .hasMessageContaining("does not cover");
     assertThat(
@@ -134,5 +123,9 @@ class TestIndexReader {
                 20,
                 List.of("data-1.parquet", "data-2.parquet", "data-3.parquet", "data-4.parquet")))
         .containsExactly("data-4.parquet");
+  }
+
+  private static ByteBuffer query(int value) {
+    return ByteBuffer.allocate(4).putInt(value).flip();
   }
 }

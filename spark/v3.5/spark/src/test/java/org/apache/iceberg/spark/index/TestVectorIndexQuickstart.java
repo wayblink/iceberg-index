@@ -32,9 +32,10 @@ import org.apache.iceberg.index.IndexQuery;
 import org.apache.iceberg.index.IndexReader;
 import org.apache.iceberg.index.IndexSearchResult;
 import org.apache.iceberg.index.SidecarIndexCatalog;
-import org.apache.iceberg.index.VectorIndexAdapter;
-import org.apache.iceberg.index.VectorIndexDefinition;
-import org.apache.iceberg.index.VectorIndexDefinition.Metric;
+import org.apache.iceberg.index.vector.VectorIndexAdapter;
+import org.apache.iceberg.index.vector.VectorIndexDefinition;
+import org.apache.iceberg.index.vector.VectorIndexDefinition.Metric;
+import org.apache.iceberg.index.vector.VectorIndexTypes;
 import org.apache.iceberg.relocated.com.google.common.collect.Lists;
 import org.apache.spark.sql.Row;
 import org.apache.spark.sql.SparkSession;
@@ -59,6 +60,11 @@ import scala.Tuple2;
  * file tree, and the ranked query results resolved back to table rows.
  */
 class TestVectorIndexQuickstart {
+
+  @BeforeAll
+  static void registerVectorIndexType() {
+    VectorIndexTypes.register();
+  }
 
   private static SparkSession spark;
   private static Path warehouseDir;

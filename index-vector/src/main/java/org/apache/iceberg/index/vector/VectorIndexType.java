@@ -16,12 +16,16 @@
  * specific language governing permissions and limitations
  * under the License.
  */
-package org.apache.iceberg.index;
+package org.apache.iceberg.index.vector;
 
 import com.fasterxml.jackson.core.JsonGenerator;
 import com.fasterxml.jackson.databind.JsonNode;
 import java.io.IOException;
 import java.util.Locale;
+import org.apache.iceberg.index.IndexAdapter;
+import org.apache.iceberg.index.IndexDefinition;
+import org.apache.iceberg.index.IndexType;
+import org.apache.iceberg.index.IndexTypes;
 import org.apache.iceberg.relocated.com.google.common.base.Preconditions;
 import org.apache.iceberg.util.JsonUtil;
 

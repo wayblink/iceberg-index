@@ -35,9 +35,10 @@ import org.apache.iceberg.index.IndexReader;
 import org.apache.iceberg.index.IndexSearchResult;
 import org.apache.iceberg.index.IndexSnapshot;
 import org.apache.iceberg.index.SidecarIndexCatalog;
-import org.apache.iceberg.index.VectorIndexAdapter;
-import org.apache.iceberg.index.VectorIndexDefinition;
-import org.apache.iceberg.index.VectorIndexDefinition.Metric;
+import org.apache.iceberg.index.vector.VectorIndexAdapter;
+import org.apache.iceberg.index.vector.VectorIndexDefinition;
+import org.apache.iceberg.index.vector.VectorIndexDefinition.Metric;
+import org.apache.iceberg.index.vector.VectorIndexTypes;
 import org.apache.iceberg.io.CloseableIterable;
 import org.apache.iceberg.relocated.com.google.common.collect.Lists;
 import org.apache.iceberg.relocated.com.google.common.collect.Maps;
@@ -48,6 +49,11 @@ import org.junit.jupiter.api.Test;
 import scala.Tuple2;
 
 class TestSparkIndexBuilder extends TestBase {
+
+  @BeforeAll
+  static void registerVectorIndexType() {
+    VectorIndexTypes.register();
+  }
 
   private static final String TABLE_NAME = "default.vector_index_source";
 

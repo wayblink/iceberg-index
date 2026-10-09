@@ -22,20 +22,26 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 import java.io.IOException;
+import java.nio.ByteBuffer;
 import java.nio.file.Path;
 import java.util.List;
 import org.apache.iceberg.TestTables.LocalFileIO;
 import org.apache.iceberg.index.IndexFile.Kind;
-import org.apache.iceberg.index.VectorIndexDefinition.Metric;
+import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
 class TestIndexBuilder {
 
+  @BeforeAll
+  static void registerTestingIndexType() {
+    IndexTypes.register(new TestingIndexType());
+  }
+
   @Test
   public void buildsFullSnapshotAndReaderCanSearchIt(@TempDir Path tempDir) throws IOException {
     LocalFileIO fileIO = new LocalFileIO();
-    VectorIndexAdapter adapter = adapter();
+    TestingIndexAdapter adapter = new TestingIndexAdapter(TestingIndexDefinition.of(4));
     IndexBuilder builder =
         new IndexBuilder(new IndexSnapshotWriter(fileIO, new PuffinIndexFileContainer(), 2));
     IndexMetadata current = indexMetadata(tempDir, "indexes/index-uuid");
@@ -56,7 +62,7 @@ class TestIndexBuilder {
     assertThat(snapshot.parentIndexSnapshotId()).isNull();
     assertThat(snapshot.status()).isEqualTo(IndexSnapshot.Status.PUBLISHED);
 
-    // the snapshot's files describe two index files with the expected coverage
+    // the snapshot's files describe two entry-bearing index files with the expected coverage
     IndexManifestList manifestList =
         IndexManifestList.read(fileIO.newInputFile(snapshot.indexManifestList()));
     assertThat(manifestList.manifests()).hasSize(1);
@@ -73,72 +79,7 @@ class TestIndexBuilder {
 
     // the reader can search the built snapshot end to end
     IndexReader reader = new IndexReader(updated, fileIO);
-    assertThat(reader.search(IndexQuery.of(10, adapter.encodeQuery(new float[] {0.95f, 0.05f}), 2)))
-        .extracting(IndexSearchResult::dataFile)
-        .containsExactly("data-1.parquet", "data-2.parquet");
-    assertThat(reader.uncoveredDataFiles(10, List.of("data-1.parquet", "data-3.parquet")))
-        .containsExactly("data-3.parquet");
-  }
-
-  @Test
-  public void buildsHnswSnapshotAndReaderCanSearchIt(@TempDir Path tempDir) throws IOException {
-    LocalFileIO fileIO = new LocalFileIO();
-    VectorIndexAdapter adapter =
-        new VectorIndexAdapter(
-            VectorIndexDefinition.builder()
-                .fieldId(1)
-                .dimension(2)
-                .metric(Metric.COSINE)
-                .mode(VectorIndexDefinition.IndexMode.HNSW)
-                .maxM(8)
-                .efConstruction(100)
-                .efSearch(64)
-                .build());
-    IndexBuilder builder = new IndexBuilder(fileIO);
-    IndexMetadata current =
-        IndexMetadata.builder()
-            .indexUuid("index-uuid")
-            .tableUuid("table-uuid")
-            .tableLocation(tempDir.resolve("table").toString())
-            .location(tempDir.resolve("indexes/index-uuid").toString())
-            .definition(
-                VectorIndexDefinition.builder()
-                    .fieldId(1)
-                    .dimension(2)
-                    .metric(Metric.COSINE)
-                    .mode(VectorIndexDefinition.IndexMode.HNSW)
-                    .maxM(8)
-                    .efConstruction(100)
-                    .efSearch(64)
-                    .build())
-            .build();
-
-    IndexMetadata updated =
-        builder.build(
-            IndexBuildRequest.builder()
-                .currentMetadata(current)
-                .sourceTableSnapshotId(10)
-                .entries(entries(adapter))
-                .timestampMillis(30)
-                .build());
-
-    IndexSnapshot snapshot = updated.snapshots().get(0);
-    IndexManifestList manifestList =
-        IndexManifestList.read(fileIO.newInputFile(snapshot.indexManifestList()));
-    IndexManifest manifest =
-        IndexManifest.read(fileIO.newInputFile(manifestList.manifests().get(0).location()));
-
-    // HNSW mode writes auxiliary index files with the HNSW blob type
-    assertThat(manifest.indexFiles()).hasSize(1);
-    assertThat(manifest.indexFiles().get(0).kind()).isEqualTo(IndexFile.Kind.AUXILIARY);
-    assertThat(manifest.indexFiles().get(0).blobType())
-        .isEqualTo(VectorIndexAdapter.AUXILIARY_BLOB_TYPE);
-    assertThat(manifest.indexedDataFiles())
-        .containsExactlyInAnyOrder("data-1.parquet", "data-2.parquet");
-
-    // the reader searches the auxiliary payload and resolves rows
-    IndexReader reader = new IndexReader(updated, fileIO);
-    assertThat(reader.search(IndexQuery.of(10, adapter.encodeQuery(new float[] {0.95f, 0.05f}), 2)))
+    assertThat(reader.search(IndexQuery.of(10, query(5), 2)))
         .extracting(IndexSearchResult::dataFile)
         .containsExactly("data-1.parquet", "data-2.parquet");
     assertThat(reader.uncoveredDataFiles(10, List.of("data-1.parquet", "data-3.parquet")))
@@ -155,7 +96,7 @@ class TestIndexBuilder {
         IndexBuildRequest.builder()
             .currentMetadata(current)
             .sourceTableSnapshotId(10)
-            .entries(entries(adapter()))
+            .entries(entries(new TestingIndexAdapter(TestingIndexDefinition.of(4))))
             .timestampMillis(30)
             .build();
     IndexMetadata updated = builder.build(request);
@@ -164,7 +105,7 @@ class TestIndexBuilder {
         IndexBuildRequest.builder()
             .currentMetadata(updated)
             .sourceTableSnapshotId(10)
-            .entries(entries(adapter()))
+            .entries(entries(new TestingIndexAdapter(TestingIndexDefinition.of(4))))
             .timestampMillis(30)
             .build();
     assertThatThrownBy(() -> builder.build(second))
@@ -172,16 +113,15 @@ class TestIndexBuilder {
         .hasMessageContaining("already covers");
   }
 
-  private static VectorIndexAdapter adapter() {
-    return new VectorIndexAdapter(
-        VectorIndexDefinition.builder().fieldId(1).dimension(2).metric(Metric.COSINE).build());
+  private static ByteBuffer query(int value) {
+    return ByteBuffer.allocate(4).putInt(value).flip();
   }
 
-  private static List<IndexEntry> entries(VectorIndexAdapter adapter) {
+  private static List<IndexEntry> entries(TestingIndexAdapter adapter) {
     return List.of(
-        IndexEntry.of("data-1.parquet", 0, adapter.encodeVector(new float[] {1.0f, 0.0f})),
-        IndexEntry.of("data-1.parquet", 1, adapter.encodeVector(new float[] {0.0f, 1.0f})),
-        IndexEntry.of("data-2.parquet", 2, adapter.encodeVector(new float[] {0.7f, 0.7f})));
+        IndexEntry.of("data-1.parquet", 0, TestingIndexAdapter.valuePayload(10)),
+        IndexEntry.of("data-1.parquet", 1, TestingIndexAdapter.valuePayload(20)),
+        IndexEntry.of("data-2.parquet", 2, TestingIndexAdapter.valuePayload(15)));
   }
 
   private static IndexMetadata indexMetadata(Path tempDir, String indexLocation) {
@@ -190,8 +130,7 @@ class TestIndexBuilder {
         .tableUuid("table-uuid")
         .tableLocation(tempDir.resolve("table").toString())
         .location(tempDir.resolve(indexLocation).toString())
-        .definition(
-            VectorIndexDefinition.builder().fieldId(1).dimension(2).metric(Metric.COSINE).build())
+        .definition(TestingIndexDefinition.of(4))
         .build();
   }
 }

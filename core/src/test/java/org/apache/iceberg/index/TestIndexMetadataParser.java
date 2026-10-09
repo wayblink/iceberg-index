@@ -22,25 +22,25 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 import org.apache.iceberg.index.IndexSnapshot.Status;
+import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 
 class TestIndexMetadataParser {
 
+  @BeforeAll
+  static void registerTestingIndexType() {
+    IndexTypes.register(new TestingIndexType());
+  }
+
   @Test
-  public void roundTripsVectorIndexMetadata() {
+  public void roundTripsIndexMetadata() {
     IndexMetadata metadata =
         IndexMetadata.builder()
             .indexUuid("index-uuid")
             .tableUuid("table-uuid")
             .tableLocation("s3://bucket/table")
             .location("s3://bucket/table/indexes/index-uuid")
-            .definition(
-                VectorIndexDefinition.builder()
-                    .fieldId(17)
-                    .dimension(2)
-                    .metric(VectorIndexDefinition.Metric.COSINE)
-                    .property("model", "v1")
-                    .build())
+            .definition(TestingIndexDefinition.of(4))
             .lastUpdatedMillis(100L)
             .property("owner", "team")
             .addSnapshot(
@@ -64,46 +64,12 @@ class TestIndexMetadataParser {
 
     IndexMetadata parsed = IndexMetadataParser.fromJson(IndexMetadataParser.toJson(metadata));
     assertThat(parsed).isEqualTo(metadata);
-    assertThat(parsed.definition()).isInstanceOf(VectorIndexDefinition.class);
-    assertThat(parsed.indexType()).isEqualTo("vector");
+    assertThat(parsed.definition()).isInstanceOf(TestingIndexDefinition.class);
+    assertThat(parsed.indexType()).isEqualTo("testing");
+    assertThat(((TestingIndexDefinition) parsed.definition()).width()).isEqualTo(4);
     assertThat(parsed.snapshotForSourceTableSnapshot(20).parentIndexSnapshotId()).isEqualTo(1L);
     assertThat(parsed.snapshotForSourceTableSnapshot(10).parentIndexSnapshotId()).isNull();
     assertThat(parsed.snapshotForSourceTableSnapshot(20).status()).isEqualTo(Status.PUBLISHED);
-  }
-
-  @Test
-  public void roundTripsHnswVectorIndexMetadata() {
-    IndexMetadata metadata =
-        IndexMetadata.builder()
-            .indexUuid("index-uuid")
-            .tableUuid("table-uuid")
-            .location("s3://bucket/table/indexes/index-uuid")
-            .definition(
-                VectorIndexDefinition.builder()
-                    .fieldId(3)
-                    .dimension(4)
-                    .metric(VectorIndexDefinition.Metric.EUCLIDEAN)
-                    .mode(VectorIndexDefinition.IndexMode.HNSW)
-                    .maxM(12)
-                    .efConstruction(150)
-                    .efSearch(30)
-                    .build())
-            .addSnapshot(
-                IndexSnapshot.builder()
-                    .snapshotId(1)
-                    .sourceTableSnapshotId(10)
-                    .timestampMillis(30)
-                    .indexManifestList("s3://bucket/table/indexes/index-uuid/snapshots/iml-1.bin")
-                    .build())
-            .build();
-
-    IndexMetadata parsed = IndexMetadataParser.fromJson(IndexMetadataParser.toJson(metadata));
-    assertThat(parsed).isEqualTo(metadata);
-    VectorIndexDefinition definition = (VectorIndexDefinition) parsed.definition();
-    assertThat(definition.mode()).isEqualTo(VectorIndexDefinition.IndexMode.HNSW);
-    assertThat(definition.maxM()).isEqualTo(12);
-    assertThat(definition.efConstruction()).isEqualTo(150);
-    assertThat(definition.efSearch()).isEqualTo(30);
   }
 
   @Test
@@ -125,12 +91,7 @@ class TestIndexMetadataParser {
                     .indexUuid("index-uuid")
                     .tableUuid("table-uuid")
                     .location("s3://bucket/table/indexes/index-uuid")
-                    .definition(
-                        VectorIndexDefinition.builder()
-                            .fieldId(1)
-                            .dimension(2)
-                            .metric(VectorIndexDefinition.Metric.COSINE)
-                            .build())
+                    .definition(TestingIndexDefinition.of(4))
                     .addSnapshot(
                         IndexSnapshot.builder()
                             .snapshotId(1)

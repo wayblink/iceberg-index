@@ -16,34 +16,34 @@
  * specific language governing permissions and limitations
  * under the License.
  */
-package org.apache.iceberg.index;
+package org.apache.iceberg.index.vector;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 import java.nio.ByteBuffer;
 import java.util.List;
-import org.apache.iceberg.index.VectorIndexDefinition.IndexMode;
-import org.apache.iceberg.index.VectorIndexDefinition.Metric;
+import org.apache.iceberg.index.IndexEntry;
+import org.apache.iceberg.index.IndexSearchResult;
 import org.apache.iceberg.relocated.com.google.common.collect.Lists;
 import org.junit.jupiter.api.Test;
 
 class TestVectorIndexAdapter {
 
-  private final VectorIndexAdapter cosine = adapter(Metric.COSINE);
+  private final VectorIndexAdapter cosine = adapter(VectorIndexDefinition.Metric.COSINE);
 
-  private static VectorIndexAdapter adapter(Metric metric) {
+  private static VectorIndexAdapter adapter(VectorIndexDefinition.Metric metric) {
     return new VectorIndexAdapter(
         VectorIndexDefinition.builder().fieldId(1).dimension(2).metric(metric).build());
   }
 
-  private static VectorIndexAdapter hnswAdapter(Metric metric) {
+  private static VectorIndexAdapter hnswAdapter(VectorIndexDefinition.Metric metric) {
     return new VectorIndexAdapter(
         VectorIndexDefinition.builder()
             .fieldId(1)
             .dimension(2)
             .metric(metric)
-            .mode(IndexMode.HNSW)
+            .mode(VectorIndexDefinition.IndexMode.HNSW)
             .maxM(8)
             .efConstruction(100)
             .efSearch(64)
@@ -59,7 +59,7 @@ class TestVectorIndexAdapter {
 
   @Test
   public void roundTripsEntries() {
-    VectorIndexAdapter adapter = adapter(Metric.EUCLIDEAN);
+    VectorIndexAdapter adapter = adapter(VectorIndexDefinition.Metric.EUCLIDEAN);
     List<IndexEntry> entries =
         List.of(
             IndexEntry.of("data-1.parquet", 0, adapter.encodeVector(new float[] {1.0f, 0.0f})),
@@ -84,13 +84,13 @@ class TestVectorIndexAdapter {
         .containsExactly("data-a.parquet", "data-b.parquet");
 
     // DOT_PRODUCT prefers the larger magnitude
-    VectorIndexAdapter dot = adapter(Metric.DOT_PRODUCT);
+    VectorIndexAdapter dot = adapter(VectorIndexDefinition.Metric.DOT_PRODUCT);
     assertThat(dot.search(payload, query, 2))
         .extracting(IndexSearchResult::dataFile)
         .containsExactly("data-b.parquet", "data-a.parquet");
 
     // EUCLIDEAN prefers the smaller distance
-    VectorIndexAdapter euclidean = adapter(Metric.EUCLIDEAN);
+    VectorIndexAdapter euclidean = adapter(VectorIndexDefinition.Metric.EUCLIDEAN);
     assertThat(euclidean.search(payload, query, 2))
         .extracting(IndexSearchResult::dataFile)
         .containsExactly("data-a.parquet", "data-b.parquet");
@@ -124,7 +124,7 @@ class TestVectorIndexAdapter {
   @Test
   public void hnswAuxiliarySearchMatchesExactForAllMetrics() {
     // 40 vectors on a circle; efSearch (64) exceeds the entry count so HNSW is exact
-    for (Metric metric : Metric.values()) {
+    for (VectorIndexDefinition.Metric metric : VectorIndexDefinition.Metric.values()) {
       VectorIndexAdapter hnsw = hnswAdapter(metric);
       VectorIndexAdapter exact = adapter(metric);
       List<IndexEntry> entries = circleEntries(hnsw, 40);
@@ -144,7 +144,7 @@ class TestVectorIndexAdapter {
 
   @Test
   public void hnswAuxiliarySearchTruncatesAndResolvesRows() {
-    VectorIndexAdapter hnsw = hnswAdapter(Metric.COSINE);
+    VectorIndexAdapter hnsw = hnswAdapter(VectorIndexDefinition.Metric.COSINE);
     List<IndexEntry> entries = circleEntries(hnsw, 40);
     ByteBuffer auxiliary = hnsw.encodeAuxiliaryPayload(entries);
     ByteBuffer query = hnsw.encodeQuery(new float[] {0.8f, 0.6f});

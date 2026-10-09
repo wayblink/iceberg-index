@@ -27,11 +27,17 @@ import java.nio.file.Path;
 import java.util.List;
 import org.apache.iceberg.TestTables.LocalFileIO;
 import org.apache.iceberg.index.IndexFile.Kind;
-import org.apache.iceberg.index.VectorIndexDefinition.Metric;
+import org.apache.iceberg.index.IndexManifestList.ManifestRef;
+import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
 class TestSidecarIndexCatalog {
+
+  @BeforeAll
+  static void registerTestingIndexType() {
+    IndexTypes.register(new TestingIndexType());
+  }
 
   @Test
   public void createsLoadsAndListsIndexes(@TempDir Path tempDir) {
@@ -103,16 +109,15 @@ class TestSidecarIndexCatalog {
         .tableLocation(tableLocation)
         .tableUuid("table-uuid")
         .indexUuid(indexUuid)
-        .definition(
-            VectorIndexDefinition.builder().fieldId(1).dimension(2).metric(Metric.COSINE).build())
+        .definition(TestingIndexDefinition.of(4))
         .build();
   }
 
   /** Writes one entry-bearing index file, its manifest and manifest list under the index tree. */
   private static String writeSnapshot(LocalFileIO fileIO, IndexMetadata metadata)
       throws IOException {
-    VectorIndexAdapter adapter =
-        new VectorIndexAdapter((VectorIndexDefinition) metadata.definition());
+    TestingIndexAdapter adapter =
+        new TestingIndexAdapter((TestingIndexDefinition) metadata.definition());
     IndexFileContainer container = new PuffinIndexFileContainer();
 
     String indexFile = metadata.location() + "/data/index-file-1.puffin";
@@ -125,9 +130,7 @@ class TestSidecarIndexCatalog {
                     .encodeEntries(
                         List.of(
                             IndexEntry.of(
-                                "data-1.parquet",
-                                0,
-                                adapter.encodeVector(new float[] {1.0f, 0.0f}))))
+                                "data-1.parquet", 0, TestingIndexAdapter.valuePayload(10))))
                     .array())));
 
     String manifest = metadata.location() + "/snapshots/index-manifest-1.imn";
@@ -144,8 +147,7 @@ class TestSidecarIndexCatalog {
 
     String manifestList = metadata.location() + "/snapshots/index-manifest-list-1.iml";
     IndexManifestList.write(
-        fileIO.newOutputFile(manifestList),
-        List.of(IndexManifestList.ManifestRef.of(manifest, 1, 1)));
+        fileIO.newOutputFile(manifestList), List.of(ManifestRef.of(manifest, 1, 1)));
     return manifestList;
   }
 

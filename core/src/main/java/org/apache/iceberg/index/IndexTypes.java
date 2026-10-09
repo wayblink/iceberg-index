@@ -34,10 +34,6 @@ import org.apache.iceberg.relocated.com.google.common.collect.Maps;
 public final class IndexTypes {
   private static final Map<String, IndexType> REGISTRY = Maps.newConcurrentMap();
 
-  static {
-    register(new VectorIndexType());
-  }
-
   private IndexTypes() {}
 
   /**

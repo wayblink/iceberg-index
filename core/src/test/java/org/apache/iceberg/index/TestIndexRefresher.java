@@ -22,20 +22,26 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 import java.io.IOException;
+import java.nio.ByteBuffer;
 import java.nio.file.Path;
 import java.util.List;
 import java.util.Set;
 import org.apache.iceberg.TestTables.LocalFileIO;
-import org.apache.iceberg.index.VectorIndexDefinition.Metric;
+import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
 class TestIndexRefresher {
 
+  @BeforeAll
+  static void registerTestingIndexType() {
+    IndexTypes.register(new TestingIndexType());
+  }
+
   @Test
   public void reusesUnchangedIndexFiles(@TempDir Path tempDir) throws IOException {
     LocalFileIO fileIO = new LocalFileIO();
-    VectorIndexAdapter adapter = adapter();
+    TestingIndexAdapter adapter = new TestingIndexAdapter(TestingIndexDefinition.of(4));
     IndexSnapshotWriter writer = new IndexSnapshotWriter(fileIO, new PuffinIndexFileContainer(), 1);
     IndexBuilder builder = new IndexBuilder(writer);
     IndexRefresher refresher = new IndexRefresher(fileIO, writer);
@@ -46,13 +52,16 @@ class TestIndexRefresher {
             IndexBuildRequest.builder()
                 .currentMetadata(current)
                 .sourceTableSnapshotId(10)
-                .entries(entries(adapter))
+                .entries(
+                    List.of(
+                        IndexEntry.of("data-1.parquet", 0, TestingIndexAdapter.valuePayload(10)),
+                        IndexEntry.of("data-2.parquet", 1, TestingIndexAdapter.valuePayload(20))))
                 .timestampMillis(30)
                 .build());
     IndexSnapshot firstSnapshot = first.snapshots().get(0);
     String reusedLocation = indexFilesOf(fileIO, firstSnapshot).get(1).location();
 
-    // table snapshot 20: data-1 was rewritten (its entries move to data-3), data-2 unchanged
+    // table snapshot 20: data-1 was rewritten (its entry moves to data-3), data-2 unchanged
     IndexMetadata second =
         refresher.refresh(
             IndexBuildRequest.builder()
@@ -60,8 +69,7 @@ class TestIndexRefresher {
                 .sourceTableSnapshotId(20)
                 .entries(
                     List.of(
-                        IndexEntry.of(
-                            "data-3.parquet", 0, adapter.encodeVector(new float[] {0.6f, 0.8f}))))
+                        IndexEntry.of("data-3.parquet", 0, TestingIndexAdapter.valuePayload(15))))
                 .timestampMillis(40)
                 .build(),
             Set.of("data-1.parquet"));
@@ -80,9 +88,9 @@ class TestIndexRefresher {
 
     // the refreshed snapshot is searchable and reports correct coverage
     IndexReader reader = new IndexReader(second, fileIO);
-    assertThat(reader.search(IndexQuery.of(20, adapter.encodeQuery(new float[] {1.0f, 0.0f}), 1)))
+    assertThat(reader.search(IndexQuery.of(20, query(5), 1)))
         .extracting(IndexSearchResult::dataFile)
-        .containsExactly("data-3.parquet");
+        .containsExactly("data-2.parquet");
     assertThat(
             reader.uncoveredDataFiles(
                 20, List.of("data-2.parquet", "data-3.parquet", "data-4.parquet")))
@@ -114,15 +122,8 @@ class TestIndexRefresher {
         .indexFiles();
   }
 
-  private static VectorIndexAdapter adapter() {
-    return new VectorIndexAdapter(
-        VectorIndexDefinition.builder().fieldId(1).dimension(2).metric(Metric.COSINE).build());
-  }
-
-  private static List<IndexEntry> entries(VectorIndexAdapter adapter) {
-    return List.of(
-        IndexEntry.of("data-1.parquet", 0, adapter.encodeVector(new float[] {1.0f, 0.0f})),
-        IndexEntry.of("data-2.parquet", 1, adapter.encodeVector(new float[] {0.0f, 1.0f})));
+  private static ByteBuffer query(int value) {
+    return ByteBuffer.allocate(4).putInt(value).flip();
   }
 
   private static IndexMetadata indexMetadata(Path tempDir) {
@@ -131,8 +132,7 @@ class TestIndexRefresher {
         .tableUuid("table-uuid")
         .tableLocation(tempDir.resolve("table").toString())
         .location(tempDir.resolve("indexes/index-uuid").toString())
-        .definition(
-            VectorIndexDefinition.builder().fieldId(1).dimension(2).metric(Metric.COSINE).build())
+        .definition(TestingIndexDefinition.of(4))
         .build();
   }
 }

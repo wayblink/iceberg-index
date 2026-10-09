@@ -16,7 +16,7 @@
  * specific language governing permissions and limitations
  * under the License.
  */
-package org.apache.iceberg.index;
+package org.apache.iceberg.index.vector;
 
 import com.github.jelmerk.knn.DistanceFunction;
 import com.github.jelmerk.knn.Item;
@@ -31,6 +31,10 @@ import java.io.UncheckedIOException;
 import java.nio.ByteBuffer;
 import java.util.Comparator;
 import java.util.List;
+import org.apache.iceberg.index.IndexAdapter;
+import org.apache.iceberg.index.IndexDefinition;
+import org.apache.iceberg.index.IndexEntry;
+import org.apache.iceberg.index.IndexSearchResult;
 import org.apache.iceberg.relocated.com.google.common.base.Preconditions;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableList;
 import org.apache.iceberg.relocated.com.google.common.collect.Lists;
