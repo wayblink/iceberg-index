@@ -92,7 +92,7 @@ class TestVectorIndexSqlQuickstart {
         .show(false);
 
     banner("STEP 3 · list the indexes");
-    spark.sql("CALL local.system.list_vector_indexes(table => 'db.docs')").show(false);
+    spark.sql("CALL local.system.list_indexes(table => 'db.docs')").show(false);
 
     banner("STEP 4 · search the index with one CALL");
     // query close to (1.0, 0.0): the 'iceberg tables' row must come first

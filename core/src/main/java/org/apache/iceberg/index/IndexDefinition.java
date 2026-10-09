@@ -32,4 +32,7 @@ public interface IndexDefinition extends java.io.Serializable {
 
   /** Returns the index type of this definition, for example {@code "vector"}. */
   String type();
+
+  /** Returns the ID of the source field this index indexes. */
+  int fieldId();
 }

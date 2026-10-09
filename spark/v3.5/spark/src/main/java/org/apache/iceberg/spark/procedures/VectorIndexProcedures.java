@@ -54,14 +54,14 @@ final class VectorIndexProcedures {
     return VectorIndexes.columnName(table, fieldId);
   }
 
-  /** Finds the vector index of a table by the indexed column, failing if none exists. */
-  static IndexMetadata findIndex(Table table, String column) {
-    return VectorIndexes.findIndex(table, column);
+  /** Finds the index of a type for a table by the indexed column, failing if none exists. */
+  static IndexMetadata findIndex(Table table, String column, String indexType) {
+    return VectorIndexes.findIndex(table, column, indexType);
   }
 
-  /** Finds the vector index of a table by the indexed column, or null if none exists. */
-  static IndexMetadata findIndexOrNull(Table table, String column) {
-    return VectorIndexes.findIndexOrNull(table, column);
+  /** Finds any index of any type for a table by the indexed column, or null if none exists. */
+  static IndexMetadata findAnyIndexOrNull(Table table, String column) {
+    return VectorIndexes.findAnyIndexOrNull(table, column);
   }
 
   /** Counts the index files and entries of an index snapshot. */

@@ -73,16 +73,19 @@ public class TestVectorIndexProcedures extends ExtensionsTestBase {
     assertThat(entries).isEqualTo(6L);
 
     List<Object[]> listOutput =
-        sql("CALL %s.system.list_vector_indexes(table => '%s')", catalogName, tableName);
+        sql("CALL %s.system.list_indexes(table => '%s')", catalogName, tableName);
     assertThat(listOutput).hasSize(1);
     assertThat(listOutput.get(0)[0]).isEqualTo(indexUuid);
     assertThat(listOutput.get(0)[1]).isEqualTo("embedding");
     assertThat(listOutput.get(0)[2]).isEqualTo("vector");
-    assertThat(listOutput.get(0)[3]).isEqualTo("EXACT");
-    assertThat(listOutput.get(0)[4]).isEqualTo("COSINE");
-    assertThat(listOutput.get(0)[5]).isEqualTo(2);
-    assertThat(listOutput.get(0)[6]).isEqualTo(sourceSnapshotId);
-    assertThat(listOutput.get(0)[7]).isEqualTo("PUBLISHED");
+    assertThat(listOutput.get(0)[3]).isEqualTo(sourceSnapshotId);
+    assertThat(listOutput.get(0)[4]).isEqualTo("PUBLISHED");
+    assertThat(((Number) listOutput.get(0)[5]).longValue()).isPositive();
+    assertThat(((Number) listOutput.get(0)[6]).longValue()).isEqualTo(6L);
+    // type-specific parameters live in the definition JSON
+    assertThat(listOutput.get(0)[7].toString()).contains("\"mode\":\"EXACT\"");
+    assertThat(listOutput.get(0)[7].toString()).contains("\"metric\":\"COSINE\"");
+    assertThat(listOutput.get(0)[7].toString()).contains("\"dimension\":2");
 
     // a query close to (1.0, 0.0) must return id=1 first, with the resolved row attached
     List<Object[]> searchOutput =
@@ -116,9 +119,9 @@ public class TestVectorIndexProcedures extends ExtensionsTestBase {
         catalogName, tableName);
 
     List<Object[]> listOutput =
-        sql("CALL %s.system.list_vector_indexes(table => '%s')", catalogName, tableName);
+        sql("CALL %s.system.list_indexes(table => '%s')", catalogName, tableName);
     assertThat(listOutput).hasSize(1);
-    assertThat(listOutput.get(0)[3]).isEqualTo("HNSW");
+    assertThat(listOutput.get(0)[7].toString()).contains("\"mode\":\"HNSW\"");
 
     List<Object[]> searchOutput =
         sql(

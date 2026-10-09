@@ -61,6 +61,7 @@ public final class TextIndexDefinition implements IndexDefinition {
   }
 
   /** The field ID of the indexed string column. */
+  @Override
   public int fieldId() {
     return fieldId;
   }

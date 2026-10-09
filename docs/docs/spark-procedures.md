@@ -1200,9 +1200,11 @@ CALL catalog_name.system.refresh_vector_index(
     table => 'db.documents', column => 'embedding');
 ```
 
-### `list_vector_indexes`
+### `list_indexes`
 
-Lists the vector indexes registered for a table.
+Lists the indexes registered for a table. The output is index-type agnostic: parameters that are
+specific to an index type, such as the vector `mode` or the BM25 `k1`, are returned in the
+`definition` column as a JSON object.
 
 | Argument Name | Required? | Type   | Description        |
 |---------------|-----------|--------|--------------------|
@@ -1214,20 +1216,22 @@ Lists the vector indexes registered for a table.
 |---------------------|--------|------------------------------------------|
 | `index_uuid`        | string | UUID of the index                        |
 | `column`            | string | Indexed column name                      |
-| `index_type`        | string | Index type (`vector`)                    |
-| `mode`              | string | `EXACT` or `HNSW`                        |
-| `metric`            | string | Distance metric                          |
-| `dimension`         | int    | Vector dimension                         |
+| `index_type`        | string | Index type (`vector`, `text`)            |
 | `source_snapshot_id`| long   | Table snapshot the index covers          |
 | `status`            | string | Publication status of the index snapshot |
 | `index_files`       | long   | Number of index files                    |
 | `entries`           | long   | Number of indexed rows                   |
+| `definition`        | string | Index parameters as a JSON object        |
 
 #### Examples
 
 ```sql
-CALL catalog_name.system.list_vector_indexes(table => 'db.documents');
+CALL catalog_name.system.list_indexes(table => 'db.documents');
 ```
+
+For a vector index, `definition` looks like
+`{"field-id":2,"dimension":128,"metric":"COSINE","mode":"EXACT","m":16,"ef-construction":200,"ef-search":50}`;
+for a text index like `{"field-id":3,"k1":1.2,"length-norm":0.75,"min-token-length":2,"lowercase":true,"stopwords":[]}`.
 
 ### `vector_search`
 
@@ -1305,4 +1309,92 @@ Search for the 10 rows closest to a query vector
 CALL catalog_name.system.vector_search(
     table => 'db.documents', column => 'embedding',
     query => array(0.95d, 0.05d), k => 10);
+```
+
+### `build_text_index`
+
+Builds a BM25 text index over a string column, used by `text_search`. One index file is written per
+data file, each holding the local postings and statistics of that file; corpus-wide statistics are
+merged at query time, so an incremental refresh never has to rewrite the whole index.
+
+| Argument Name | Required? | Type   | Description                                            |
+|---------------|-----------|--------|--------------------------------------------------------|
+| `table`       | ✔️        | string | Name of the table                                      |
+| `column`      | ✔️        | string | Name of the string column to index                     |
+| `k1`          |           | double | BM25 term frequency saturation (default `1.2`)         |
+| `length_norm` |           | double | BM25 length normalization `b` (default `0.75`)         |
+| `min_token_length` |      | int    | Minimum token length (default `2`)                     |
+| `lowercase`   |           | boolean| Lowercase tokens before indexing (default `true`)      |
+| `stopwords`   |           | array<string> | Optional stopword list                          |
+
+#### Output
+
+| Output Name         | Type   | Description                              |
+|---------------------|--------|------------------------------------------|
+| `index_uuid`        | string | UUID of the index                        |
+| `source_snapshot_id`| long   | Table snapshot the index covers          |
+| `index_files`       | long   | Number of index files written            |
+| `entries`           | long   | Number of indexed rows                   |
+
+#### Examples
+
+```sql
+CALL catalog_name.system.build_text_index(
+    table => 'db.documents', column => 'body', k1 => 1.2, length_norm => 0.75);
+```
+
+### `refresh_text_index`
+
+Refreshes a BM25 text index from the current table snapshot, rewriting only the index files of
+data files that were added or changed.
+
+| Argument Name | Required? | Type   | Description        |
+|---------------|-----------|--------|--------------------|
+| `table`       | ✔️        | string | Name of the table  |
+| `column`      | ✔️        | string | Indexed column name |
+
+#### Output
+
+| Output Name         | Type   | Description                              |
+|---------------------|--------|------------------------------------------|
+| `index_uuid`        | string | UUID of the index                        |
+| `source_snapshot_id`| long   | Table snapshot the index covers          |
+| `index_files`       | long   | Number of index files written            |
+| `entries`           | long   | Number of indexed rows                   |
+
+#### Examples
+
+```sql
+CALL catalog_name.system.refresh_text_index(
+    table => 'db.documents', column => 'body');
+```
+
+### `text_search`
+
+Searches a BM25 text index and resolves the matched rows. Returns the row reference (`_file` +
+`_pos`) of each hit with its score, plus the matched row itself as a JSON string, ordered by score
+descending.
+
+| Argument Name | Required? | Type   | Description                       |
+|---------------|-----------|--------|-----------------------------------|
+| `table`       | ✔️        | string | Name of the table                 |
+| `column`      | ✔️        | string | Name of the indexed column        |
+| `query`       | ✔️        | string | Query text                        |
+| `k`           | ✔️        | int    | Number of results to return       |
+
+#### Output
+
+| Output Name | Type   | Description                              |
+|-------------|--------|------------------------------------------|
+| `data_file` | string | Data file of the matched row             |
+| `pos`       | long   | Row position within the data file (`_pos`) |
+| `score`     | double | BM25 score                               |
+| `row`       | string | Matched row as a JSON object             |
+
+#### Examples
+
+```sql
+CALL catalog_name.system.text_search(
+    table => 'db.documents', column => 'body',
+    query => 'iceberg table format', k => 10);
 ```

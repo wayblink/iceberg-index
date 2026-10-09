@@ -100,6 +100,7 @@ public final class VectorIndexDefinition implements IndexDefinition {
     return VectorIndexType.TYPE;
   }
 
+  @Override
   public int fieldId() {
     return fieldId;
   }

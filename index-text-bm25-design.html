@@ -231,7 +231,7 @@
         <span>复用：IndexMetadata / IndexSnapshot / IndexManifest(List) / IndexFile / IndexEntry / IndexQuery / IndexReader 全部不变。</span>
         <span>新增：关联搜索 <code>searchesAllPayloadsTogether()</code> + <code>searchAll/searchAuxiliaryAll</code>、行值编码 <code>encodeEntryValue(Object)</code> 两个 core 扩展点。</span>
         <span>新模块：<code>iceberg-index-text</code>（纯 Java，不引 Lucene），core 保持零算法依赖。</span>
-        <span>状态：方案待评审；已写的 index-text 代码为草稿，以本文为准。</span>
+        <span>状态：已实现（core 关联搜索扩展 / index-text 模块 / Spark 通用索引构建 / SQL 过程与 <code>list_indexes</code> 泛化），向量检索行为经回归验证不变。</span>
         <span>更新时间：2026-09-20</span>
       </div>
     </header>

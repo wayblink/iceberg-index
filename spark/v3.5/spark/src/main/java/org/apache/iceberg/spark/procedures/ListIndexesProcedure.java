@@ -20,8 +20,8 @@ package org.apache.iceberg.spark.procedures;
 
 import java.util.List;
 import org.apache.iceberg.index.IndexMetadata;
+import org.apache.iceberg.index.IndexMetadataParser;
 import org.apache.iceberg.index.IndexSnapshot;
-import org.apache.iceberg.index.vector.VectorIndexDefinition;
 import org.apache.iceberg.relocated.com.google.common.collect.Lists;
 import org.apache.iceberg.spark.procedures.SparkProcedures.ProcedureBuilder;
 import org.apache.spark.sql.catalyst.InternalRow;
@@ -34,13 +34,14 @@ import org.apache.spark.sql.types.StructType;
 import org.apache.spark.unsafe.types.UTF8String;
 
 /**
- * Lists the vector indexes registered for a table.
+ * Lists the indexes registered for a table, of any index type. Type-specific parameters are in the
+ * {@code definition} column as JSON.
  *
  * <pre>{@code
- * CALL spark_catalog.system.list_vector_indexes(table => 'db.documents');
+ * CALL spark_catalog.system.list_indexes(table => 'db.documents');
  * }</pre>
  */
-class ListVectorIndexesProcedure extends BaseProcedure {
+class ListIndexesProcedure extends BaseProcedure {
   private static final ProcedureParameter TABLE_PARAM =
       requiredInParameter("table", DataTypes.StringType);
   private static final ProcedureParameter[] PARAMETERS = new ProcedureParameter[] {TABLE_PARAM};
@@ -51,25 +52,23 @@ class ListVectorIndexesProcedure extends BaseProcedure {
             new StructField("index_uuid", DataTypes.StringType, false, Metadata.empty()),
             new StructField("column", DataTypes.StringType, true, Metadata.empty()),
             new StructField("index_type", DataTypes.StringType, false, Metadata.empty()),
-            new StructField("mode", DataTypes.StringType, true, Metadata.empty()),
-            new StructField("metric", DataTypes.StringType, true, Metadata.empty()),
-            new StructField("dimension", DataTypes.IntegerType, true, Metadata.empty()),
             new StructField("source_snapshot_id", DataTypes.LongType, true, Metadata.empty()),
             new StructField("status", DataTypes.StringType, true, Metadata.empty()),
             new StructField("index_files", DataTypes.LongType, false, Metadata.empty()),
-            new StructField("entries", DataTypes.LongType, false, Metadata.empty())
+            new StructField("entries", DataTypes.LongType, false, Metadata.empty()),
+            new StructField("definition", DataTypes.StringType, true, Metadata.empty())
           });
 
   public static ProcedureBuilder builder() {
-    return new BaseProcedure.Builder<ListVectorIndexesProcedure>() {
+    return new BaseProcedure.Builder<ListIndexesProcedure>() {
       @Override
-      public ListVectorIndexesProcedure doBuild() {
-        return new ListVectorIndexesProcedure(tableCatalog());
+      public ListIndexesProcedure doBuild() {
+        return new ListIndexesProcedure(tableCatalog());
       }
     };
   }
 
-  private ListVectorIndexesProcedure(TableCatalog tableCatalog) {
+  private ListIndexesProcedure(TableCatalog tableCatalog) {
     super(tableCatalog);
   }
 
@@ -95,23 +94,21 @@ class ListVectorIndexesProcedure extends BaseProcedure {
               VectorIndexProcedures.indexCatalog(table).listIndexes(table.location());
           List<InternalRow> rows = Lists.newArrayListWithCapacity(indexes.size());
           for (IndexMetadata metadata : indexes) {
-            VectorIndexDefinition definition = (VectorIndexDefinition) metadata.definition();
             IndexSnapshot snapshot = metadata.latestSnapshot();
             long[] counts = VectorIndexProcedures.counts(table.io(), snapshot);
-            String column = VectorIndexProcedures.columnName(table, definition.fieldId());
+            String column =
+                VectorIndexProcedures.columnName(table, metadata.definition().fieldId());
             String status = snapshot == null ? null : snapshot.status().name();
             rows.add(
                 newInternalRow(
                     UTF8String.fromString(metadata.indexUuid()),
                     column == null ? null : UTF8String.fromString(column),
                     UTF8String.fromString(metadata.indexType()),
-                    UTF8String.fromString(definition.mode().name()),
-                    UTF8String.fromString(definition.metric().name()),
-                    definition.dimension(),
                     snapshot == null ? null : snapshot.sourceTableSnapshotId(),
                     status == null ? null : UTF8String.fromString(status),
                     counts[0],
-                    counts[1]));
+                    counts[1],
+                    UTF8String.fromString(IndexMetadataParser.toJson(metadata.definition()))));
           }
 
           return rows.toArray(new InternalRow[0]);
@@ -120,6 +117,6 @@ class ListVectorIndexesProcedure extends BaseProcedure {
 
   @Override
   public String description() {
-    return "ListVectorIndexesProcedure";
+    return "ListIndexesProcedure";
   }
 }

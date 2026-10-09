@@ -55,6 +55,19 @@ public final class IndexMetadataParser {
 
   private IndexMetadataParser() {}
 
+  /** Serializes an index definition to JSON, for display and diagnostics. */
+  public static String toJson(IndexDefinition definition) {
+    Preconditions.checkNotNull(definition, "Index definition is null");
+    return JsonUtil.generate(
+        gen -> {
+          IndexType indexType = IndexTypes.fromType(definition.type());
+          gen.writeStartObject();
+          indexType.writeDefinition(definition, gen);
+          gen.writeEndObject();
+        },
+        false);
+  }
+
   public static String toJson(IndexMetadata metadata) {
     return toJson(metadata, false);
   }

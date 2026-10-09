@@ -129,7 +129,7 @@ class BuildVectorIndexProcedure extends BaseProcedure {
 
           int fieldId = VectorIndexProcedures.fieldId(table, column);
           SidecarIndexCatalog catalog = VectorIndexProcedures.indexCatalog(table);
-          if (VectorIndexProcedures.findIndexOrNull(table, column) != null) {
+          if (VectorIndexProcedures.findAnyIndexOrNull(table, column) != null) {
             throw new IllegalArgumentException(
                 "A vector index already exists for column " + column + " of table " + tableName);
           }

@@ -89,7 +89,7 @@ public final class VectorIndexSearch {
       return spark.createDataFrame(Lists.newArrayList(), RESULT_SCHEMA);
     }
 
-    IndexMetadata metadata = VectorIndexes.findIndex(table, vectorColumn);
+    IndexMetadata metadata = VectorIndexes.findIndex(table, vectorColumn, "vector");
     IndexSnapshot snapshot = metadata.latestSnapshot();
     if (snapshot == null) {
       throw new IllegalArgumentException(

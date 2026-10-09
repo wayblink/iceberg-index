@@ -123,11 +123,10 @@ public class TestVectorIndexCleanup extends ExtensionsTestBase {
     // the index still works and covers the current table snapshot
     List<Row> indexes =
         spark
-            .sql(
-                "CALL " + catalogName + ".system.list_vector_indexes(table => '" + tableName + "')")
+            .sql("CALL " + catalogName + ".system.list_indexes(table => '" + tableName + "')")
             .collectAsList();
     assertThat(indexes).hasSize(1);
-    assertThat(((Number) indexes.get(0).get(9)).longValue()).isEqualTo(20L);
+    assertThat(((Number) indexes.get(0).get(6)).longValue()).isEqualTo(20L);
     assertThat(searchIds(tableName, 2)).containsExactly(0L, 1L);
   }
 

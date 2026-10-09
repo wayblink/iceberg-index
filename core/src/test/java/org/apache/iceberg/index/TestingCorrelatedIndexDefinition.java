@@ -50,6 +50,11 @@ public final class TestingCorrelatedIndexDefinition implements IndexDefinition {
     return TYPE;
   }
 
+  @Override
+  public int fieldId() {
+    return 1;
+  }
+
   public int width() {
     return width;
   }

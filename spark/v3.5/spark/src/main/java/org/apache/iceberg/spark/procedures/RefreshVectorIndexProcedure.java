@@ -99,7 +99,7 @@ class RefreshVectorIndexProcedure extends BaseProcedure {
                 "Table " + tableName + " has no data: cannot refresh an index");
           }
 
-          IndexMetadata metadata = VectorIndexProcedures.findIndex(table, column);
+          IndexMetadata metadata = VectorIndexProcedures.findIndex(table, column, "vector");
           SidecarIndexCatalog catalog = VectorIndexProcedures.indexCatalog(table);
           long sourceSnapshotId = table.currentSnapshot().snapshotId();
 

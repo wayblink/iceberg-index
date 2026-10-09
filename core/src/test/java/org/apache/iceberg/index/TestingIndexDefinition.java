@@ -44,6 +44,11 @@ public final class TestingIndexDefinition implements IndexDefinition {
     return TestingIndexType.TYPE;
   }
 
+  @Override
+  public int fieldId() {
+    return 1;
+  }
+
   public int width() {
     return width;
   }

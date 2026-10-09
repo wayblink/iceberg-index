@@ -197,11 +197,10 @@ public class TestVectorIndexDeletes extends ExtensionsTestBase {
   private long indexEntries(String tableName) {
     List<Row> indexes =
         spark
-            .sql(
-                "CALL " + catalogName + ".system.list_vector_indexes(table => '" + tableName + "')")
+            .sql("CALL " + catalogName + ".system.list_indexes(table => '" + tableName + "')")
             .collectAsList();
     assertThat(indexes).hasSize(1);
-    return ((Number) indexes.get(0).get(9)).longValue();
+    return ((Number) indexes.get(0).get(6)).longValue();
   }
 
   /**

@@ -30,7 +30,6 @@ import org.apache.iceberg.index.IndexMetadata;
 import org.apache.iceberg.index.IndexSnapshot;
 import org.apache.iceberg.index.SidecarIndexCatalog;
 import org.apache.iceberg.index.text.TextIndexTypes;
-import org.apache.iceberg.index.vector.VectorIndexDefinition;
 import org.apache.iceberg.index.vector.VectorIndexTypes;
 import org.apache.iceberg.io.FileIO;
 import org.apache.iceberg.relocated.com.google.common.collect.Lists;
@@ -72,22 +71,36 @@ public final class VectorIndexes {
     return field == null ? null : field.name();
   }
 
-  /** Finds the vector index of a table by the indexed column, failing if none exists. */
-  public static IndexMetadata findIndex(Table table, String column) {
-    IndexMetadata metadata = findIndexOrNull(table, column);
+  /**
+   * Finds the index of a type for a table by the indexed column, failing if none exists.
+   *
+   * @param indexType the index type to look for, for example {@code vector} or {@code text}
+   */
+  public static IndexMetadata findIndex(Table table, String column, String indexType) {
+    IndexMetadata metadata = findIndexOrNull(table, column, indexType);
     if (metadata == null) {
       throw new IllegalArgumentException(
-          "No vector index exists for column " + column + " of table " + table.name());
+          "No " + indexType + " index exists for column " + column + " of table " + table.name());
     }
     return metadata;
   }
 
-  /** Finds the vector index of a table by the indexed column, or null if none exists. */
-  public static IndexMetadata findIndexOrNull(Table table, String column) {
+  /** Finds the index of a type for a table by the indexed column, or null if none exists. */
+  public static IndexMetadata findIndexOrNull(Table table, String column, String indexType) {
     int fieldId = fieldId(table, column);
     for (IndexMetadata metadata : indexCatalog(table).listIndexes(table.location())) {
-      if (metadata.definition() instanceof VectorIndexDefinition
-          && ((VectorIndexDefinition) metadata.definition()).fieldId() == fieldId) {
+      if (indexType.equals(metadata.indexType()) && metadata.definition().fieldId() == fieldId) {
+        return metadata;
+      }
+    }
+    return null;
+  }
+
+  /** Finds any index of any type for a table by the indexed column, or null if none exists. */
+  public static IndexMetadata findAnyIndexOrNull(Table table, String column) {
+    int fieldId = fieldId(table, column);
+    for (IndexMetadata metadata : indexCatalog(table).listIndexes(table.location())) {
+      if (metadata.definition().fieldId() == fieldId) {
         return metadata;
       }
     }

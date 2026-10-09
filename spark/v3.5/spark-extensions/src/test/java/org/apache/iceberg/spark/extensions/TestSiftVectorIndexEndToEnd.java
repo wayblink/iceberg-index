@@ -150,13 +150,12 @@ class TestSiftVectorIndexEndToEnd {
     startStage("list indexes (x2)");
     for (String table : new String[] {"sift_exact", "sift_hnsw"}) {
       List<Row> indexes =
-          spark
-              .sql("CALL local.system.list_vector_indexes(table => 'db." + table + "')")
-              .collectAsList();
+          spark.sql("CALL local.system.list_indexes(table => 'db." + table + "')").collectAsList();
       assertThat(indexes).hasSize(1);
       assertThat(indexes.get(0).get(1)).isEqualTo("embedding");
-      assertThat(indexes.get(0).get(7)).isEqualTo("PUBLISHED");
-      assertThat(((Number) indexes.get(0).get(9)).longValue()).isEqualTo(BASE_VECTORS);
+      assertThat(indexes.get(0).get(2)).isEqualTo("vector");
+      assertThat(indexes.get(0).get(4)).isEqualTo("PUBLISHED");
+      assertThat(((Number) indexes.get(0).get(6)).longValue()).isEqualTo(BASE_VECTORS);
     }
     endStage();
 
