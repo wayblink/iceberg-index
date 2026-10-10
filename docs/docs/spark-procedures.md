@@ -1326,6 +1326,7 @@ merged at query time, so an incremental refresh never has to rewrite the whole i
 | `min_token_length` |      | int    | Minimum token length (default `2`)                     |
 | `lowercase`   |           | boolean| Lowercase tokens before indexing (default `true`)      |
 | `stopwords`   |           | array<string> | Optional stopword list                          |
+| `entries_per_index_file` |   | long  | Entry budget that groups data files into index files (default 0: one index file per data file) |
 
 #### Output
 
@@ -1341,6 +1342,23 @@ merged at query time, so an incremental refresh never has to rewrite the whole i
 ```sql
 CALL catalog_name.system.build_text_index(
     table => 'db.documents', column => 'body', k1 => 1.2, length_norm => 0.75);
+```
+
+Grouping several data files into one index file is what makes an HNSW graph span more than a single
+data file, which is the reason to do it. `entries_per_index_file` sets the budget: data files are
+packed until the budget is reached, and each pack becomes one index file. Zero, the default, keeps
+one index file per data file. The budget is a property of the index, so refreshes keep it.
+
+Because an index file records every data file it covers, a refresh rewrites an index file as a whole
+when any of its data files changes, and it rebuilds every data file that file covered. A data file
+that was rewritten gets a new name, so the packing of its group can change; the index stays correct
+and complete either way.
+
+```sql
+-- two data files' worth of entries per index file
+CALL catalog_name.system.build_vector_index(
+    table => 'db.documents', column => 'embedding', dimension => 128,
+    entries_per_index_file => 20000);
 ```
 
 ### `refresh_text_index`

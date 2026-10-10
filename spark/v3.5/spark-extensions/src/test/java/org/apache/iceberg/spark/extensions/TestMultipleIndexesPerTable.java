@@ -48,6 +48,10 @@ public class TestMultipleIndexesPerTable extends ExtensionsTestBase {
   public void removeTables() {
     sql("DROP TABLE IF EXISTS %s", tableName("multi_index_coexist_" + catalogName));
     sql("DROP TABLE IF EXISTS %s", tableName("multi_index_dup_" + catalogName));
+    sql("DROP TABLE IF EXISTS %s", tableName("multi_index_group_" + catalogName));
+    sql("DROP TABLE IF EXISTS %s", tableName("multi_index_group2_" + catalogName));
+    sql("DROP TABLE IF EXISTS %s", tableName("multi_index_group3_" + catalogName));
+    sql("DROP TABLE IF EXISTS %s", tableName("multi_index_group_refresh_" + catalogName));
   }
 
   @TestTemplate
@@ -147,6 +151,113 @@ public class TestMultipleIndexesPerTable extends ExtensionsTestBase {
                 + "query => array(1.0d, 1.0d), k => 1)",
             catalogName, tableName);
     assertThat(hitIds(titleHitsAfterRefresh)).containsExactly(3L);
+  }
+
+  @TestTemplate
+  public void testGroupsDataFilesIntoOneIndexFile() {
+    // one row per statement, so each statement writes exactly one data file
+    String tableName = tableName("multi_index_group_" + catalogName);
+    sql("CREATE TABLE %s (id bigint, embedding array<double>) USING iceberg", tableName);
+    for (int id = 0; id < 4; id++) {
+      sql("INSERT INTO %s VALUES (%d, array(%d.0d, 1.0d))", tableName, id, id);
+    }
+
+    // without a budget every data file gets an index file of its own
+    sql(
+        "CALL %s.system.build_vector_index(table => '%s', column => 'embedding', dimension => 2)",
+        catalogName, tableName);
+    List<Object[]> listOutput =
+        sql("CALL %s.system.list_indexes(table => '%s')", catalogName, tableName);
+    assertThat(((Number) listOutput.get(0)[5]).longValue()).isEqualTo(4L);
+    assertThat(((Number) listOutput.get(0)[6]).longValue()).isEqualTo(4L);
+
+    // a budget of two entries packs two data files into one index file
+    String grouped = tableName("multi_index_group2_" + catalogName);
+    sql("CREATE TABLE %s (id bigint, embedding array<double>) USING iceberg", grouped);
+    for (int id = 0; id < 4; id++) {
+      sql("INSERT INTO %s VALUES (%d, array(%d.0d, 1.0d))", grouped, id, id);
+    }
+    sql(
+        "CALL %s.system.build_vector_index(table => '%s', column => 'embedding', dimension => 2, "
+            + "entries_per_index_file => 2)",
+        catalogName, grouped);
+
+    List<Object[]> groupedOutput =
+        sql("CALL %s.system.list_indexes(table => '%s')", catalogName, grouped);
+    assertThat(((Number) groupedOutput.get(0)[5]).longValue()).isEqualTo(2L);
+    assertThat(((Number) groupedOutput.get(0)[6]).longValue()).isEqualTo(4L);
+
+    // a budget of one keeps one index file per data file
+    String single = tableName("multi_index_group3_" + catalogName);
+    sql("CREATE TABLE %s (id bigint, embedding array<double>) USING iceberg", single);
+    for (int id = 0; id < 4; id++) {
+      sql("INSERT INTO %s VALUES (%d, array(%d.0d, 1.0d))", single, id, id);
+    }
+    sql(
+        "CALL %s.system.build_vector_index(table => '%s', column => 'embedding', dimension => 2, "
+            + "entries_per_index_file => 1)",
+        catalogName, single);
+    List<Object[]> singleOutput =
+        sql("CALL %s.system.list_indexes(table => '%s')", catalogName, single);
+    assertThat(((Number) singleOutput.get(0)[5]).longValue()).isEqualTo(4L);
+
+    // the grouped index answers queries the same way: every row is still reachable
+    List<Object[]> hits =
+        sql(
+            "CALL %s.system.vector_search(table => '%s', column => 'embedding', "
+                + "query => array(2.0d, 1.0d), k => 1)",
+            catalogName, grouped);
+    assertThat(hitIds(hits)).containsExactly(2L);
+  }
+
+  @TestTemplate
+  public void testRefreshRewritesTheWholeGroup() {
+    String tableName = tableName("multi_index_group_refresh_" + catalogName);
+    sql("CREATE TABLE %s (id bigint, body string) USING iceberg", tableName);
+    // one row per statement, so each statement writes exactly one data file
+    for (int id = 0; id < 4; id++) {
+      sql("INSERT INTO %s VALUES (%d, 'iceberg document word%d')", tableName, id, id);
+    }
+    // two data files per index file
+    sql(
+        "CALL %s.system.build_text_index(table => '%s', column => 'body', "
+            + "entries_per_index_file => 2)",
+        catalogName, tableName);
+
+    List<Object[]> before =
+        sql("CALL %s.system.list_indexes(table => '%s')", catalogName, tableName);
+    assertThat(((Number) before.get(0)[5]).longValue()).isEqualTo(2L);
+    assertThat(((Number) before.get(0)[6]).longValue()).isEqualTo(4L);
+
+    // deleting a row rewrites its data file, and with it the whole index file that covers the
+    // group that data file belongs to
+    sql("DELETE FROM %s WHERE id = 1", tableName);
+    sql(
+        "CALL %s.system.refresh_text_index(table => '%s', column => 'body')",
+        catalogName, tableName);
+
+    List<Object[]> after =
+        sql("CALL %s.system.list_indexes(table => '%s')", catalogName, tableName);
+    // the groups are repacked, because the rewritten data file sorts differently: the file count
+    // may move, but every remaining row is still indexed and no group is left half empty
+    long indexFiles = ((Number) after.get(0)[5]).longValue();
+    assertThat(indexFiles).isBetween(1L, 2L);
+    assertThat(((Number) after.get(0)[6]).longValue()).isEqualTo(3L);
+
+    // the deleted row is gone from the index and the others are still found
+    List<Object[]> deleted =
+        sql(
+            "CALL %s.system.text_search(table => '%s', column => 'body', "
+                + "query => 'word1', k => 5)",
+            catalogName, tableName);
+    assertThat(hitIds(deleted)).isEmpty();
+
+    List<Object[]> kept =
+        sql(
+            "CALL %s.system.text_search(table => '%s', column => 'body', "
+                + "query => 'word3', k => 1)",
+            catalogName, tableName);
+    assertThat(hitIds(kept)).containsExactly(3L);
   }
 
   @TestTemplate

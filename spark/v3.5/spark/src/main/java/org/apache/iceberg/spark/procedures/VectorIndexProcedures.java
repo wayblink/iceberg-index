@@ -45,6 +45,14 @@ final class VectorIndexProcedures {
   }
 
   /** Resolves the field ID of the vector column, failing if the column does not exist. */
+  /**
+   * Reads the entry budget that groups data files into index files from a build procedure's input.
+   * Zero, the default, keeps one index file per data file.
+   */
+  static long entriesPerIndexFile(ProcedureInput input, ProcedureParameter parameter) {
+    return input.asLong(parameter, 0L);
+  }
+
   static int fieldId(Table table, String column) {
     return VectorIndexes.fieldId(table, column);
   }

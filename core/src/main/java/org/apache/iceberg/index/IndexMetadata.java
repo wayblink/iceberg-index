@@ -44,6 +44,14 @@ public final class IndexMetadata {
 
   public static final int FORMAT_VERSION = 1;
 
+  /**
+   * Index property holding the entry budget that groups source data files into index files: data
+   * files are packed into a group until the budget is reached, and each group becomes one index
+   * file. Zero, the default, means one index file per data file. A refresh keeps the budget the
+   * index was built with.
+   */
+  public static final String ENTRIES_PER_INDEX_FILE_PROPERTY = "entries-per-index-file";
+
   private final String indexUuid;
   private final String tableUuid;
   private final String tableLocation;
@@ -164,6 +172,23 @@ public final class IndexMetadata {
 
   public Map<String, String> properties() {
     return properties;
+  }
+
+  /**
+   * Returns the entry budget that groups data files into index files, or zero when each data file
+   * gets an index file of its own. See {@link #ENTRIES_PER_INDEX_FILE_PROPERTY}.
+   */
+  public long entriesPerIndexFile() {
+    String value = properties.get(ENTRIES_PER_INDEX_FILE_PROPERTY);
+    if (value == null) {
+      return 0L;
+    }
+    try {
+      return Long.parseLong(value);
+    } catch (NumberFormatException e) {
+      throw new IllegalArgumentException(
+          "Invalid " + ENTRIES_PER_INDEX_FILE_PROPERTY + " property: " + value, e);
+    }
   }
 
   public List<IndexSnapshot> snapshots() {

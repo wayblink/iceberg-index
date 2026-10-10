@@ -21,7 +21,6 @@ package org.apache.iceberg.spark.index;
 import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.util.Iterator;
-import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -46,12 +45,16 @@ import org.apache.iceberg.index.vector.VectorIndexTypes;
 import org.apache.iceberg.io.FileIO;
 import org.apache.iceberg.relocated.com.google.common.collect.Lists;
 import org.apache.iceberg.relocated.com.google.common.collect.Sets;
+import org.apache.spark.HashPartitioner;
+import org.apache.spark.api.java.JavaSparkContext;
 import org.apache.spark.api.java.function.FlatMapFunction;
+import org.apache.spark.broadcast.Broadcast;
 import org.apache.spark.sql.Dataset;
 import org.apache.spark.sql.Row;
 import org.apache.spark.sql.RowFactory;
 import org.apache.spark.sql.SparkSession;
 import org.apache.spark.sql.functions;
+import scala.Tuple2;
 
 /**
  * Builds a vector index snapshot for an Iceberg table snapshot with Spark.
@@ -116,6 +119,7 @@ public final class SparkIndexBuilder {
               vectorColumn,
               adapter,
               null,
+              currentMetadata.entriesPerIndexFile(),
               writer);
       manifestList = writer.writeManifestList(indexLocation, snapshotId, indexFiles);
     } catch (RuntimeException e) {
@@ -193,9 +197,17 @@ public final class SparkIndexBuilder {
     }
 
     Set<String> staleFiles = Sets.union(removedFiles, Sets.union(newFiles, deleteChangedFiles));
+    // an index file can cover several data files, so a change to any of them rewrites the whole
+    // file: the rebuild set is expanded through the parent's index files, which are the record of
+    // what was grouped together. Looking at the current assignment would miss the group of a data
+    // file that was removed, because it is no longer part of the snapshot.
+    List<IndexFile> parentFiles = indexFiles(fileIO, previous);
+    Set<String> rebuildFiles = IndexGrouping.expandToGroups(parentFiles, staleFiles);
+
     List<IndexFile> carried = Lists.newArrayList();
-    for (IndexFile indexFile : indexFiles(fileIO, previous)) {
-      if (Sets.intersection(Sets.newHashSet(indexFile.coveredDataFiles()), staleFiles).isEmpty()) {
+    for (IndexFile indexFile : parentFiles) {
+      if (Sets.intersection(Sets.newHashSet(indexFile.coveredDataFiles()), rebuildFiles)
+          .isEmpty()) {
         carried.add(indexFile);
       }
     }
@@ -213,7 +225,8 @@ public final class SparkIndexBuilder {
               sourceTableSnapshotId,
               vectorColumn,
               adapter,
-              Sets.union(newFiles, deleteChangedFiles),
+              rebuildFiles,
+              currentMetadata.entriesPerIndexFile(),
               writer);
       indexFiles = Lists.newArrayList(carried);
       indexFiles.addAll(newIndexFiles);
@@ -249,6 +262,7 @@ public final class SparkIndexBuilder {
       String vectorColumn,
       IndexAdapter adapter,
       Set<String> onlyFiles,
+      long entriesPerIndexFile,
       IndexSnapshotWriter writer) {
     if (onlyFiles != null && onlyFiles.isEmpty()) {
       return Lists.newArrayList();
@@ -256,6 +270,14 @@ public final class SparkIndexBuilder {
 
     boolean writesAuxiliary = adapter.writesAuxiliaryFiles();
     FileIO fileIO = table.io();
+    // data files are packed into groups, and one index file is written per group: with the default
+    // budget of zero every group holds a single data file, which is the 1:1 layout
+    Map<String, Integer> assignment =
+        IndexGrouping.restrict(
+            IndexGrouping.assign(table, sourceTableSnapshotId, entriesPerIndexFile),
+            onlyFiles == null
+                ? Sets.newHashSet(IndexEntries.dataFiles(table, sourceTableSnapshotId))
+                : onlyFiles);
 
     Dataset<Row> entries =
         IndexEntries.entries(spark, table, sourceTableSnapshotId, vectorColumn, adapter);
@@ -264,25 +286,29 @@ public final class SparkIndexBuilder {
           entries.filter(functions.col(IndexEntries.DATA_FILE_COLUMN).isin(onlyFiles.toArray()));
     }
 
+    Broadcast<Map<String, Integer>> groups =
+        JavaSparkContext.fromSparkContext(spark.sparkContext()).broadcast(assignment);
     List<Row> indexFileRows =
         entries
-            .repartition(functions.col(IndexEntries.DATA_FILE_COLUMN))
             .toJavaRDD()
+            .mapToPair(row -> Tuple2.apply(groups.value().getOrDefault(row.getString(0), 0), row))
+            .groupByKey(new HashPartitioner(Math.max(1, assignment.size())))
             .mapPartitions(
-                (FlatMapFunction<Iterator<Row>, Row>)
+                (FlatMapFunction<Iterator<Tuple2<Integer, Iterable<Row>>>, Row>)
                     iterator -> {
                       IndexFileContainer fileContainer = new PuffinIndexFileContainer();
-                      Map<String, List<IndexEntry>> entriesByFile = new LinkedHashMap<>();
-                      while (iterator.hasNext()) {
-                        Row row = iterator.next();
-                        entriesByFile
-                            .computeIfAbsent(row.getString(0), key -> Lists.newArrayList())
-                            .add(IndexEntry.of(row.getString(0), row.getLong(1), row.getAs(2)));
-                      }
-
                       List<Row> files = Lists.newArrayList();
                       int seq = 0;
-                      for (Map.Entry<String, List<IndexEntry>> group : entriesByFile.entrySet()) {
+                      while (iterator.hasNext()) {
+                        Tuple2<Integer, Iterable<Row>> group = iterator.next();
+                        List<IndexEntry> groupEntries = Lists.newArrayList();
+                        Set<String> covered = Sets.newLinkedHashSet();
+                        for (Row row : group._2()) {
+                          covered.add(row.getString(0));
+                          groupEntries.add(
+                              IndexEntry.of(row.getString(0), row.getLong(1), row.getAs(2)));
+                        }
+
                         String location =
                             indexLocation
                                 + "/"
@@ -298,11 +324,11 @@ public final class SparkIndexBuilder {
                         IndexFile.Kind kind;
                         if (writesAuxiliary) {
                           blobType = adapter.auxiliaryBlobType();
-                          payload = adapter.encodeAuxiliaryPayload(group.getValue()).array();
+                          payload = adapter.encodeAuxiliaryPayload(groupEntries).array();
                           kind = IndexFile.Kind.AUXILIARY;
                         } else {
                           blobType = adapter.entryBlobType();
-                          payload = adapter.encodeEntries(group.getValue()).array();
+                          payload = adapter.encodeEntries(groupEntries).array();
                           kind = IndexFile.Kind.ENTRY_BEARING;
                         }
                         fileContainer.write(
@@ -311,8 +337,8 @@ public final class SparkIndexBuilder {
                         files.add(
                             RowFactory.create(
                                 location,
-                                (long) group.getValue().size(),
-                                List.of(group.getKey()),
+                                (long) groupEntries.size(),
+                                Lists.newArrayList(covered),
                                 kind.name(),
                                 blobType));
                         seq++;
@@ -337,7 +363,7 @@ public final class SparkIndexBuilder {
               .kind(IndexFile.Kind.valueOf(row.getString(3)))
               .blobType(row.getString(4))
               .entryCount(row.getLong(1))
-              .coveredDataFiles(coveredDataFiles(row))
+              .coveredDataFiles(row.getAs(2))
               .build());
     }
 
