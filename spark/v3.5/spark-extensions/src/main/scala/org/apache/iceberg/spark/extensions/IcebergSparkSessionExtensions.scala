@@ -37,7 +37,7 @@ class IcebergSparkSessionExtensions extends (SparkSessionExtensions => Unit) {
     extensions.injectParser { case (_, parser) => new IcebergSparkSqlExtensionsParser(parser) }
 
     // index table-valued functions
-    IndexTableFunctions.register(extensions)
+    org.apache.iceberg.spark.index.IndexTableFunctions.register(extensions)
 
     // analyzer extensions
     extensions.injectResolutionRule { spark => ResolveProcedures(spark) }

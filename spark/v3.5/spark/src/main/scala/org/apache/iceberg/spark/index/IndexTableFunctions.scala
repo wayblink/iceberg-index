@@ -16,7 +16,7 @@
  * specific language governing permissions and limitations
  * under the License.
  */
-package org.apache.iceberg.spark.extensions
+package org.apache.iceberg.spark.index
 
 import org.apache.iceberg.index.text.TextIndexTypes
 import org.apache.iceberg.index.vector.VectorIndexTypes
@@ -42,7 +42,7 @@ import org.apache.spark.sql.catalyst.plans.logical.LogicalPlan
  * the two always agree. The rows are computed on the driver when the query is planned, which is why
  * the result is a local relation: index files are small and there is nothing to distribute.
  */
-private[extensions] object IndexTableFunctions {
+object IndexTableFunctions {
 
   private val VECTOR_INDEX_SEARCH = "vector_index_search"
   private val VECTOR_INDEX_SEARCH_BATCH = "vector_index_search_batch"
@@ -154,7 +154,7 @@ private[extensions] object IndexTableFunctions {
   }
 
   /** Parses a comma-separated list of numbers, the form the batch functions take. */
-  private[extensions] def parseVector(text: String): Array[Float] = {
+  def parseVector(text: String): Array[Float] = {
     text.split(",").filter(_.nonEmpty).map(_.trim.toFloat)
   }
 
