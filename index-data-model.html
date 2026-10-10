@@ -591,8 +591,10 @@
   data/
     index-file-&lt;idx-snap-id&gt;-&lt;seq&gt;-&lt;uuid&gt;.puffin
   staging/
-    &lt;attempt-id&gt;/...                   <span class="cm"># attempt 作用域，失败即弃</span></div>
-        <p class="diagram-caption">协议：① 全部文件先写 staging/&lt;attempt-id&gt;/；② 完成后落最终路径；③ 写 IndexManifestList；④ 原子更新 IndexMetadata（新版本文件 + 指针切换，仿表 metadata 提交）；⑤ ④ 成功前读者不可见新快照，失败则清理 attempt 文件。</p>
+    &lt;attempt-id&gt;/f0, f1, ...          <span class="cm"># attempt 台账（写前日志），失败即弃</span>
+  metadata/
+    index-metadata-pointer-0.json           <span class="cm"># 指向当前 metadata 版本（双槽轮转）</span></div>
+        <p class="diagram-caption">协议：① 每个文件写入前先在 staging/&lt;attempt-id&gt;/ 登记一个 marker（写前日志，marker 从 0 顺序编号，无目录列表也可枚举）；② 写最终路径；③ 写 manifest / manifest-list；④ 写 complete marker，随后原子更新 IndexMetadata（新版本文件 index-metadata-v1-g&lt;N&gt;.json + 指针切换，仿表 metadata 提交）；⑤ ④ 成功前读者不可见新快照；进程内失败调 abortAttempt 精确删除台账登记的全部路径；进程被杀则台账留在原地，由 cleanup_index_files 按台账清理（executor 直接写的索引文件另有未引用文件清扫兜底）。</p>
       </section>
 
       <section>
@@ -607,6 +609,7 @@
               <tr><td>D4 · 元数据注册位置</td><td>sidecar 采用方案 A：索引元数据树挂在表目录下（<code>&lt;table-location&gt;/indexes/&lt;index-uuid&gt;/</code>）；方案 B 作为备选记录在案</td></tr>
               <tr><td>D5 · 类型 registry</td><td>静态 registry（core 内 <code>Map&lt;String, IndexType&gt;</code>：type → definition 工厂 / payload codec）；未知类型 fail-fast，保证前向兼容；注册方式为<strong>显式注册</strong>：core 不自注册任何内置索引类型，core 外部模块（如 iceberg-index-vector）的消费者在使用前调用该模块的注册入口（如 <code>VectorIndexTypes.register()</code>），保证 core 对算法库零依赖</td></tr>
               <tr><td>D6 · 引擎 adapter 顺序</td><td>Spark 第一优先；first milestone = builder + 简单读路径，深度 planner 集成后置；core 不含引擎依赖</td></tr>
+              <tr><td>D19 · 原子发布</td><td>发布点是 IndexMetadata：每次发布写新版本文件 <code>index-metadata-v1-g&lt;N&gt;.json</code>，再把指向它的指针切换到另一个槽位（双槽轮转、从不原地覆盖），读者取代次更高的槽；旧版布局（单文件无指针）仍可读，下次更新即迁移。attempt 台账采用写前日志（先登记 marker 再写文件），因 FileIO 无 rename/listing，物理 staging 目录只能带来双倍 I/O</td></tr>
               <tr><td>D7 · 可见性与模块放置</td><td>全部 index 类按最终发布可见性创建（public，不做 package-private 过渡，无后期整体晋升）；模型与查询契约放 core（与 TableMetadata / Snapshot 一致）；IndexCatalog 建成时作为公共 SPI 进 api，届时契约整体移动（api 不能依赖 core），属一次性可选项</td></tr>
               <tr><td>D8 · payload 容器</td><td>IndexFile 统一采用 Puffin 容器（MVP 二进制编码原样进 blob，blob type = iceberg-vector-entries-v1）；容器做成可插拔接口，Puffin 为首选实现，元数据模型不变</td></tr>
               <tr><td>D9 · ANN 检索</td><td>HNSW 近似检索已实现：definition 增加 <code>IndexMode</code>（EXACT / HNSW）与 M / efConstruction / efSearch 参数；HNSW 模式写 AUXILIARY index 文件（blob type <code>iceberg-vector-hnsw-v1</code>，内含序列化 HNSW 图 + id→行映射），召回后用精确 metric 重排，分数与 exact 一致；依赖 jelmerk hnswlib-core 1.1.0（纯 Java）。<strong>模块归属</strong>：vector adapter（definition / type / adapter）与 hnswlib 整体放在独立模块 <code>iceberg-index-vector</code>（包 <code>org.apache.iceberg.index.vector</code>），core 只保留 generic 层，对 ANN 库零依赖；Spark adapter 依赖 iceberg-index-vector 并负责注册</td></tr>

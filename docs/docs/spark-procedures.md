@@ -1398,3 +1398,44 @@ CALL catalog_name.system.text_search(
     table => 'db.documents', column => 'body',
     query => 'iceberg table format', k => 10);
 ```
+
+### `cleanup_index_files`
+
+Cleans up the files of the indexes of a table: files under the index tree's `data/` and `snapshots/`
+directories that no retained index snapshot references, plus the write-ahead ledgers of build
+attempts that did not complete. The registry and the metadata files are never touched.
+
+An index snapshot is bound to a source table snapshot. When that table snapshot is expired, the
+index snapshot can no longer be queried meaningfully, so it is dropped from the index metadata and
+its files become eligible for deletion. Only a prefix of stale index snapshots is dropped, and the
+new oldest snapshot becomes a root, which keeps the parent lineage of the retained snapshots intact.
+
+Every build keeps a ledger under `indexes/<uuid>/staging/<attempt-id>/` that names the files the
+attempt may have written, written before each file. An attempt that completes drops its ledger once
+the snapshot is published. An attempt that was killed mid-flight leaves one behind, and this
+procedure uses it to delete exactly the files that attempt wrote before removing the ledger. This is
+also the recovery path for index files written by executors of a job that died before the driver
+could record them: those files are unreferenced and are deleted by the same sweep.
+
+Do not run this while a build or refresh is in flight: files of in-progress writes are not yet
+referenced and would be deleted.
+
+| Argument Name | Required? | Type   | Description        |
+|---------------|-----------|--------|--------------------|
+| `table`       | ✔️        | string | Name of the table  |
+
+#### Output
+
+| Output Name          | Type   | Description                        |
+|----------------------|--------|------------------------------------|
+| `index_uuid`         | string | UUID of the index                  |
+| `expired_snapshots`  | long   | Index snapshots dropped            |
+| `deleted_files`      | long   | Files deleted                      |
+| `deleted_bytes`      | long   | Bytes deleted                      |
+| `abandoned_attempts` | long   | Build attempts cleaned up          |
+
+#### Examples
+
+```sql
+CALL catalog_name.system.cleanup_index_files(table => 'db.documents');
+```

@@ -67,6 +67,7 @@ import org.apache.spark.sql.functions;
 public final class SparkIndexBuilder {
 
   private static final String DATA_DIR = "data";
+  private static final String FILE_MARKER_PREFIX = "f";
 
   static {
     // the vector and text adapters live in their own modules; register them with the core registry
@@ -101,19 +102,31 @@ public final class SparkIndexBuilder {
     long snapshotId = nextSnapshotId(currentMetadata);
     FileIO fileIO = table.io();
 
-    List<IndexFile> indexFiles =
-        buildIndexFiles(
-            spark,
-            table,
-            indexLocation,
-            snapshotId,
-            sourceTableSnapshotId,
-            vectorColumn,
-            adapter,
-            null);
-
-    String manifestList =
-        new IndexSnapshotWriter(fileIO).writeManifestList(indexLocation, snapshotId, indexFiles);
+    IndexSnapshotWriter writer = new IndexSnapshotWriter(fileIO);
+    List<IndexFile> indexFiles;
+    String manifestList;
+    try {
+      indexFiles =
+          buildIndexFiles(
+              spark,
+              table,
+              indexLocation,
+              snapshotId,
+              sourceTableSnapshotId,
+              vectorColumn,
+              adapter,
+              null,
+              writer);
+      manifestList = writer.writeManifestList(indexLocation, snapshotId, indexFiles);
+    } catch (RuntimeException e) {
+      writer.abortAttempt(indexLocation);
+      throw e;
+    }
+    writer.completeAttempt(indexLocation);
+    // the ledger has served its purpose once the files are in place: the failure modes that remain
+    // (the publish itself failing, or the process dying) leave at most unreferenced files, which
+    // the cleanup sweep removes
+    writer.finishAttempt(indexLocation);
 
     IndexSnapshot snapshot =
         IndexSnapshot.builder()
@@ -187,22 +200,30 @@ public final class SparkIndexBuilder {
       }
     }
 
-    List<IndexFile> newIndexFiles =
-        buildIndexFiles(
-            spark,
-            table,
-            indexLocation,
-            snapshotId,
-            sourceTableSnapshotId,
-            vectorColumn,
-            adapter,
-            Sets.union(newFiles, deleteChangedFiles));
-    List<IndexFile> indexFiles = Lists.newArrayList();
-    indexFiles.addAll(carried);
-    indexFiles.addAll(newIndexFiles);
-
-    String manifestList =
-        new IndexSnapshotWriter(fileIO).writeManifestList(indexLocation, snapshotId, indexFiles);
+    IndexSnapshotWriter writer = new IndexSnapshotWriter(fileIO);
+    List<IndexFile> indexFiles;
+    String manifestList;
+    try {
+      List<IndexFile> newIndexFiles =
+          buildIndexFiles(
+              spark,
+              table,
+              indexLocation,
+              snapshotId,
+              sourceTableSnapshotId,
+              vectorColumn,
+              adapter,
+              Sets.union(newFiles, deleteChangedFiles),
+              writer);
+      indexFiles = Lists.newArrayList(carried);
+      indexFiles.addAll(newIndexFiles);
+      manifestList = writer.writeManifestList(indexLocation, snapshotId, indexFiles);
+    } catch (RuntimeException e) {
+      // carried-over files belong to the parent snapshot and must survive a failed refresh
+      writer.abortAttempt(indexLocation);
+      throw e;
+    }
+    writer.completeAttempt(indexLocation);
 
     IndexSnapshot snapshot =
         IndexSnapshot.builder()
@@ -227,7 +248,8 @@ public final class SparkIndexBuilder {
       long sourceTableSnapshotId,
       String vectorColumn,
       IndexAdapter adapter,
-      Set<String> onlyFiles) {
+      Set<String> onlyFiles,
+      IndexSnapshotWriter writer) {
     if (onlyFiles != null && onlyFiles.isEmpty()) {
       return Lists.newArrayList();
     }
@@ -298,6 +320,14 @@ public final class SparkIndexBuilder {
                       return files.iterator();
                     })
             .collect();
+
+    // the index files were written by the executors, so record them in this attempt's ledger now
+    // that the driver knows every path: a failure from here on can then be aborted precisely
+    int seq = 0;
+    for (Row row : indexFileRows) {
+      writer.record(indexLocation, FILE_MARKER_PREFIX + seq, row.getString(0));
+      seq += 1;
+    }
 
     List<IndexFile> indexFiles = Lists.newArrayListWithCapacity(indexFileRows.size());
     for (Row row : indexFileRows) {

@@ -20,6 +20,7 @@ package org.apache.iceberg.spark.procedures;
 
 import java.io.IOException;
 import java.io.UncheckedIOException;
+import java.nio.charset.StandardCharsets;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -62,15 +63,26 @@ import org.apache.spark.unsafe.types.UTF8String;
  *
  * <p>Files under the index tree's {@code data/} and {@code snapshots/} directories that are not
  * referenced by any retained index snapshot are deleted. That covers files of expired index
- * snapshots as well as leftovers of failed builds. The registry and metadata files are never
+ * snapshots as well as leftovers of failed builds, including index files written by executors of a
+ * job that died before the driver could record them. The registry and metadata files are never
  * touched. Do not run this while a build or refresh is in flight: files of in-progress writes are
  * not yet referenced and would be deleted.
  *
+ * <p>Attempt ledgers under {@code staging/} are cleaned up as well. A ledger whose attempt did not
+ * complete names the files that attempt may have written, and they are deleted; a ledger that does
+ * carry the completion marker is dropped on its own. This is what recovers a build that was killed
+ * mid-flight.
+ *
  * <pre>{@code
- * CALL spark_catalog.system.cleanup_vector_index_files(table => 'db.documents');
+ * CALL spark_catalog.system.cleanup_index_files(table => 'db.documents');
  * }</pre>
  */
-class CleanupVectorIndexFilesProcedure extends BaseProcedure {
+class CleanupIndexFilesProcedure extends BaseProcedure {
+  private static final String COMPLETE_MARKER = "complete";
+  private static final String FILE_MARKER_PREFIX = "f";
+  private static final String MANIFEST_MARKER_PREFIX = "m";
+  private static final String MANIFEST_LIST_MARKER = "ml";
+
   private static final ProcedureParameter TABLE_PARAM =
       requiredInParameter("table", DataTypes.StringType);
   private static final ProcedureParameter[] PARAMETERS = new ProcedureParameter[] {TABLE_PARAM};
@@ -81,19 +93,20 @@ class CleanupVectorIndexFilesProcedure extends BaseProcedure {
             new StructField("index_uuid", DataTypes.StringType, false, Metadata.empty()),
             new StructField("expired_snapshots", DataTypes.LongType, false, Metadata.empty()),
             new StructField("deleted_files", DataTypes.LongType, false, Metadata.empty()),
-            new StructField("deleted_bytes", DataTypes.LongType, false, Metadata.empty())
+            new StructField("deleted_bytes", DataTypes.LongType, false, Metadata.empty()),
+            new StructField("abandoned_attempts", DataTypes.LongType, false, Metadata.empty())
           });
 
   public static ProcedureBuilder builder() {
-    return new BaseProcedure.Builder<CleanupVectorIndexFilesProcedure>() {
+    return new BaseProcedure.Builder<CleanupIndexFilesProcedure>() {
       @Override
-      public CleanupVectorIndexFilesProcedure doBuild() {
-        return new CleanupVectorIndexFilesProcedure(tableCatalog());
+      public CleanupIndexFilesProcedure doBuild() {
+        return new CleanupIndexFilesProcedure(tableCatalog());
       }
     };
   }
 
-  private CleanupVectorIndexFilesProcedure(TableCatalog tableCatalog) {
+  private CleanupIndexFilesProcedure(TableCatalog tableCatalog) {
     super(tableCatalog);
   }
 
@@ -148,6 +161,10 @@ class CleanupVectorIndexFilesProcedure extends BaseProcedure {
     }
     deleteFiles(table, orphans.keySet());
 
+    // the staging sweep runs last: the orphan sweep above already deletes the files an abandoned
+    // attempt left under data/ and snapshots/, so this only has to drop the ledgers themselves
+    int abandonedAttempts = cleanupStaging(table, metadata);
+
     if (expiredSnapshots > 0) {
       catalog.updateIndex(withoutSnapshots(metadata, retained));
     }
@@ -156,7 +173,8 @@ class CleanupVectorIndexFilesProcedure extends BaseProcedure {
         UTF8String.fromString(metadata.indexUuid()),
         (long) expiredSnapshots,
         (long) orphans.size(),
-        deletedBytes);
+        deletedBytes,
+        (long) abandonedAttempts);
   }
 
   private static Set<Long> liveTableSnapshotIds(Table table) {
@@ -223,6 +241,87 @@ class CleanupVectorIndexFilesProcedure extends BaseProcedure {
           "Failed to list index files of index " + metadata.indexUuid(), e);
     }
     return orphans;
+  }
+
+  /**
+   * Cleans up the attempt ledgers of an index. An attempt that did not complete may have written
+   * files that only its ledger knows about, so they are deleted first; ledgers that do carry the
+   * completion marker are dropped on their own. Returns the number of abandoned attempts.
+   */
+  private int cleanupStaging(Table table, IndexMetadata metadata) {
+    int abandoned = 0;
+    try {
+      Configuration conf = spark().sessionState().newHadoopConf();
+      Path stagingDir = new Path(metadata.location(), SidecarIndexCatalog.STAGING_DIR);
+      FileSystem fileSystem = stagingDir.getFileSystem(conf);
+      if (!fileSystem.exists(stagingDir)) {
+        return 0;
+      }
+
+      RemoteIterator<LocatedFileStatus> attempts = fileSystem.listLocatedStatus(stagingDir);
+      while (attempts.hasNext()) {
+        LocatedFileStatus attempt = attempts.next();
+        Path attemptDir = attempt.getPath();
+        if (!attempt.isDirectory()) {
+          continue;
+        }
+
+        List<String> ledger = ledgerPaths(fileSystem, attemptDir);
+        if (!ledger.isEmpty() && !fileSystem.exists(new Path(attemptDir, COMPLETE_MARKER))) {
+          // the attempt died before completing: the files its ledger names are garbage
+          abandoned += 1;
+          for (String path : ledger) {
+            fileSystem.delete(new Path(path), false);
+          }
+        }
+        // a directory without markers is what a finished attempt leaves behind, since FileIO
+        // cannot delete a directory
+        fileSystem.delete(attemptDir, true);
+      }
+    } catch (IOException e) {
+      throw new UncheckedIOException(
+          "Failed to clean up staging of index " + metadata.indexUuid(), e);
+    }
+    return abandoned;
+  }
+
+  /** Reads the paths named by an attempt's ledger markers, which are numbered from zero. */
+  private static List<String> ledgerPaths(FileSystem fileSystem, Path attemptDir)
+      throws IOException {
+    List<String> paths = Lists.newArrayList();
+    paths.addAll(ledgerPaths(fileSystem, attemptDir, FILE_MARKER_PREFIX));
+    paths.addAll(ledgerPaths(fileSystem, attemptDir, MANIFEST_MARKER_PREFIX));
+    String manifestList = readMarker(fileSystem, attemptDir, MANIFEST_LIST_MARKER);
+    if (manifestList != null) {
+      paths.add(manifestList);
+    }
+    return paths;
+  }
+
+  private static List<String> ledgerPaths(FileSystem fileSystem, Path attemptDir, String prefix)
+      throws IOException {
+    List<String> paths = Lists.newArrayList();
+    for (int seq = 0; ; seq++) {
+      String path = readMarker(fileSystem, attemptDir, prefix + seq);
+      if (path == null) {
+        return paths;
+      }
+      paths.add(path);
+    }
+  }
+
+  private static String readMarker(FileSystem fileSystem, Path attemptDir, String marker)
+      throws IOException {
+    Path markerPath = new Path(attemptDir, marker);
+    if (!fileSystem.exists(markerPath)) {
+      return null;
+    }
+    try (java.io.BufferedReader reader =
+        new java.io.BufferedReader(
+            new java.io.InputStreamReader(fileSystem.open(markerPath), StandardCharsets.UTF_8))) {
+      String line = reader.readLine();
+      return line == null || line.isEmpty() ? null : line;
+    }
   }
 
   private void deleteFiles(Table table, Set<String> files) {

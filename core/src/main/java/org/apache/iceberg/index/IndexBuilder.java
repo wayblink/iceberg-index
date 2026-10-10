@@ -63,9 +63,24 @@ public final class IndexBuilder {
     IndexAdapter adapter = adapter(current);
     long snapshotId = nextSnapshotId(current);
 
-    List<IndexFile> indexFiles =
-        writer.writeIndexFiles(current.location(), snapshotId, adapter, request.entries());
-    String manifestList = writer.writeManifestList(current.location(), snapshotId, indexFiles);
+    List<IndexFile> indexFiles;
+    String manifestList;
+    try {
+      indexFiles =
+          writer.writeIndexFiles(current.location(), snapshotId, adapter, request.entries());
+      manifestList = writer.writeManifestList(current.location(), snapshotId, indexFiles);
+    } catch (RuntimeException e) {
+      // the attempt died: drop everything it may have written instead of leaving it behind
+      writer.abortAttempt(current.location());
+      throw e;
+    }
+    // from here on the attempt's files are all in place, so a crash leaves at most unreferenced
+    // files, which the cleanup sweep removes
+    writer.completeAttempt(current.location());
+    // the ledger has served its purpose once the files are in place: the failure modes that remain
+    // (the publish itself failing, or the process dying) leave at most unreferenced files, which
+    // the cleanup sweep removes
+    writer.finishAttempt(current.location());
 
     IndexSnapshot snapshot =
         IndexSnapshot.builder()

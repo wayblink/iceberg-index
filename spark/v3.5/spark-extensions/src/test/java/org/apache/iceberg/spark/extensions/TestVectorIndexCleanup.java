@@ -56,6 +56,8 @@ public class TestVectorIndexCleanup extends ExtensionsTestBase {
   public void removeTables() {
     sql("DROP TABLE IF EXISTS %s", tableName("vectors_cleanup_files_" + catalogName));
     sql("DROP TABLE IF EXISTS %s", tableName("vectors_cleanup_expire_" + catalogName));
+    sql("DROP TABLE IF EXISTS %s", tableName("vectors_cleanup_killed_" + catalogName));
+    sql("DROP TABLE IF EXISTS %s", tableName("vectors_cleanup_finished_" + catalogName));
   }
 
   @TestTemplate
@@ -74,7 +76,7 @@ public class TestVectorIndexCleanup extends ExtensionsTestBase {
     writeOrphanFile(tableName);
 
     List<Object[]> output =
-        sql("CALL %s.system.cleanup_vector_index_files(table => '%s')", catalogName, tableName);
+        sql("CALL %s.system.cleanup_index_files(table => '%s')", catalogName, tableName);
     assertThat(output).hasSize(1);
     assertThat(output.get(0)[0]).isInstanceOf(String.class);
     assertThat(((Number) output.get(0)[1]).longValue()).isZero();
@@ -113,7 +115,7 @@ public class TestVectorIndexCleanup extends ExtensionsTestBase {
         catalogName, tableName);
 
     List<Object[]> output =
-        sql("CALL %s.system.cleanup_vector_index_files(table => '%s')", catalogName, tableName);
+        sql("CALL %s.system.cleanup_index_files(table => '%s')", catalogName, tableName);
     assertThat(output).hasSize(1);
     assertThat(((Number) output.get(0)[1]).longValue()).isEqualTo(1L);
     // the files referenced only by the expired index snapshot are deleted
@@ -144,6 +146,104 @@ public class TestVectorIndexCleanup extends ExtensionsTestBase {
         .stream()
         .map(row -> parseId(row.getString(3)))
         .collect(Collectors.toList());
+  }
+
+  @TestTemplate
+  public void testCleansUpTheLedgerOfAKilledAttempt() throws Exception {
+    String tableName = tableName("vectors_cleanup_killed_" + catalogName);
+    sql("CREATE TABLE %s (id bigint, embedding array<double>) USING iceberg", tableName);
+    sql("INSERT INTO %s SELECT id, array(CAST(id AS double), 0.0) FROM range(0, 10)", tableName);
+    sql(
+        "CALL %s.system.build_vector_index("
+            + "table => '%s', column => 'embedding', dimension => 2, metric => 'euclidean')",
+        catalogName, tableName);
+
+    Path indexDir = indexDirectory(tableName);
+    int filesBefore = indexFilesOnDisk(tableName);
+
+    // a build that was killed mid-flight: its ledger is the only record of the files it wrote
+    Path attemptDir = new Path(indexDir, "staging/killed-attempt");
+    String indexFile = indexDir + "/data/index-file-1-0-killed.puffin";
+    String manifest = indexDir + "/snapshots/index-manifest-1-0-killed.imn";
+    String manifestList = indexDir + "/snapshots/index-manifest-list-1-killed.iml";
+    writeMarker(attemptDir, "f0", indexFile);
+    writeFile(indexFile);
+    writeMarker(attemptDir, "m0", manifest);
+    writeFile(manifest);
+    writeMarker(attemptDir, "ml", manifestList);
+    writeFile(manifestList);
+
+    List<Object[]> output =
+        sql("CALL %s.system.cleanup_index_files(table => '%s')", catalogName, tableName);
+    assertThat(output).hasSize(1);
+    // the three files named by the ledger are deleted, and the attempt is reported as abandoned
+    assertThat(((Number) output.get(0)[2]).longValue()).isEqualTo(3L);
+    assertThat(((Number) output.get(0)[4]).longValue()).isEqualTo(1L);
+
+    FileSystem fileSystem = attemptDir.getFileSystem(spark.sessionState().newHadoopConf());
+    assertThat(fileSystem.exists(new Path(indexFile))).isFalse();
+    assertThat(fileSystem.exists(new Path(manifest))).isFalse();
+    assertThat(fileSystem.exists(new Path(manifestList))).isFalse();
+    assertThat(fileSystem.exists(attemptDir)).isFalse();
+    // the files of the live index snapshot are untouched
+    assertThat(indexFilesOnDisk(tableName)).isEqualTo(filesBefore);
+    assertThat(searchIds(tableName, 3)).containsExactly(0L, 1L, 2L);
+  }
+
+  @TestTemplate
+  public void testKeepsTheFilesNamedByACompletedAttemptsLedger() throws Exception {
+    String tableName = tableName("vectors_cleanup_finished_" + catalogName);
+    sql("CREATE TABLE %s (id bigint, embedding array<double>) USING iceberg", tableName);
+    sql("INSERT INTO %s SELECT id, array(CAST(id AS double), 0.0) FROM range(0, 10)", tableName);
+    sql(
+        "CALL %s.system.build_vector_index("
+            + "table => '%s', column => 'embedding', dimension => 2, metric => 'euclidean')",
+        catalogName, tableName);
+
+    Path indexDir = indexDirectory(tableName);
+    int filesBefore = indexFilesOnDisk(tableName);
+    // the file of the published snapshot, as named by a ledger of an attempt that did complete
+    Path liveFile = firstIndexFile(indexDir);
+
+    Path attemptDir = new Path(indexDir, "staging/finished-attempt");
+    writeMarker(attemptDir, "f0", liveFile.toString());
+    writeMarker(attemptDir, "complete", "");
+
+    List<Object[]> output =
+        sql("CALL %s.system.cleanup_index_files(table => '%s')", catalogName, tableName);
+    // nothing is deleted: the ledger only says the attempt finished
+    assertThat(((Number) output.get(0)[2]).longValue()).isZero();
+    assertThat(((Number) output.get(0)[4]).longValue()).isZero();
+
+    FileSystem fileSystem = attemptDir.getFileSystem(spark.sessionState().newHadoopConf());
+    assertThat(fileSystem.exists(attemptDir)).isFalse();
+    assertThat(fileSystem.exists(liveFile)).isTrue();
+    assertThat(indexFilesOnDisk(tableName)).isEqualTo(filesBefore);
+  }
+
+  private Path firstIndexFile(Path indexDir) throws Exception {
+    Path dataDir = new Path(indexDir, "data");
+    FileSystem fileSystem = dataDir.getFileSystem(spark.sessionState().newHadoopConf());
+    RemoteIterator<LocatedFileStatus> files = fileSystem.listFiles(dataDir, false);
+    assertThat(files.hasNext()).isTrue();
+    return files.next().getPath();
+  }
+
+  private void writeMarker(Path attemptDir, String marker, String path) throws Exception {
+    FileSystem fileSystem = attemptDir.getFileSystem(spark.sessionState().newHadoopConf());
+    fileSystem.mkdirs(attemptDir);
+    try (java.io.OutputStream out = fileSystem.create(new Path(attemptDir, marker), true)) {
+      out.write(path.getBytes(java.nio.charset.StandardCharsets.UTF_8));
+    }
+  }
+
+  private void writeFile(String path) throws Exception {
+    Path file = new Path(path);
+    FileSystem fileSystem = file.getFileSystem(spark.sessionState().newHadoopConf());
+    fileSystem.mkdirs(file.getParent());
+    try (java.io.OutputStream out = fileSystem.create(file, true)) {
+      out.write("leftover of a killed build".getBytes(java.nio.charset.StandardCharsets.UTF_8));
+    }
   }
 
   private int indexFilesOnDisk(String tableName) throws Exception {

@@ -81,11 +81,24 @@ public final class IndexRefresher {
     long snapshotId = IndexBuilder.nextSnapshotId(current);
 
     List<IndexFile> carriedOver = reusableIndexFiles(parent, removedDataFiles);
-    List<IndexFile> newIndexFiles =
-        writer.writeIndexFiles(current.location(), snapshotId, adapter, request.entries());
-    List<IndexFile> indexFiles = Lists.newArrayList(carriedOver);
-    indexFiles.addAll(newIndexFiles);
-    String manifestList = writer.writeManifestList(current.location(), snapshotId, indexFiles);
+    List<IndexFile> newIndexFiles;
+    String manifestList;
+    try {
+      newIndexFiles =
+          writer.writeIndexFiles(current.location(), snapshotId, adapter, request.entries());
+      List<IndexFile> indexFiles = Lists.newArrayList(carriedOver);
+      indexFiles.addAll(newIndexFiles);
+      manifestList = writer.writeManifestList(current.location(), snapshotId, indexFiles);
+    } catch (RuntimeException e) {
+      // carried-over files belong to the parent snapshot and must survive a failed refresh
+      writer.abortAttempt(current.location());
+      throw e;
+    }
+    writer.completeAttempt(current.location());
+    // the ledger has served its purpose once the files are in place: the failure modes that remain
+    // (the publish itself failing, or the process dying) leave at most unreferenced files, which
+    // the cleanup sweep removes
+    writer.finishAttempt(current.location());
 
     IndexSnapshot snapshot =
         IndexSnapshot.builder()
