@@ -48,6 +48,7 @@ public class TestTextIndexProcedures extends ExtensionsTestBase {
     sql("DROP TABLE IF EXISTS %s", tableName("text_deletes_" + catalogName));
     sql("DROP TABLE IF EXISTS %s", tableName("text_refresh_" + catalogName));
     sql("DROP TABLE IF EXISTS %s", tableName("text_errors_" + catalogName));
+    sql("DROP TABLE IF EXISTS %s", tableName("text_batch_" + catalogName));
   }
 
   @TestTemplate
@@ -157,6 +158,55 @@ public class TestTextIndexProcedures extends ExtensionsTestBase {
   }
 
   @TestTemplate
+  public void testTextSearchBatch() {
+    String tableName = tableName("text_batch_" + catalogName);
+    sql("CREATE TABLE %s (id bigint, body string) USING iceberg", tableName);
+    sql(
+        "INSERT INTO %s VALUES "
+            + "(1, 'iceberg table format for large datasets'), "
+            + "(2, 'vector search over embeddings'), "
+            + "(3, 'iceberg snapshot isolation and manifests'), "
+            + "(4, 'parquet columnar storage engine')",
+        tableName);
+    sql("CALL %s.system.build_text_index(table => '%s', column => 'body')", catalogName, tableName);
+
+    List<Object[]> output =
+        sql(
+            "CALL %s.system.text_search_batch(table => '%s', column => 'body', "
+                + "queries => array('iceberg table', 'search engine'), k => 2)",
+            catalogName, tableName);
+    // two queries, two hits each, grouped by query id
+    assertThat(output).hasSize(4);
+    assertThat(output.stream().map(row -> ((Number) row[0]).intValue()).distinct())
+        .containsExactlyInAnyOrder(0, 1);
+    for (int queryIndex = 0; queryIndex < 2; queryIndex++) {
+      int queryId = queryIndex;
+      List<Object[]> forQuery =
+          output.stream().filter(row -> ((Number) row[0]).intValue() == queryId).toList();
+      assertThat(forQuery).hasSize(2);
+      // scores descend within a query
+      assertThat(((Number) forQuery.get(0)[3]).doubleValue())
+          .isGreaterThanOrEqualTo(((Number) forQuery.get(1)[3]).doubleValue());
+      // and the resolved rows are attached
+      assertThat(forQuery.get(0)[4]).isNotNull();
+    }
+
+    // the first query is about iceberg, so it must rank the iceberg documents first
+    List<Object[]> first =
+        output.stream().filter(row -> ((Number) row[0]).intValue() == 0).toList();
+    assertThat(searchIds(first)).containsExactly(1L, 3L);
+
+    // a query with no match contributes no hits, the other query still does
+    List<Object[]> partial =
+        sql(
+            "CALL %s.system.text_search_batch(table => '%s', column => 'body', "
+                + "queries => array('iceberg table', 'zzzznotpresent'), k => 2)",
+            catalogName, tableName);
+    assertThat(partial.stream().map(row -> ((Number) row[0]).intValue()).distinct())
+        .containsExactly(0);
+  }
+
+  @TestTemplate
   public void testTextIndexErrorPaths() {
     String tableName = tableName("text_errors_" + catalogName);
     sql("CREATE TABLE %s (id bigint, body string) USING iceberg", tableName);
@@ -193,7 +243,9 @@ public class TestTextIndexProcedures extends ExtensionsTestBase {
   }
 
   private static List<Long> searchIds(List<Object[]> output) {
-    return output.stream().map(row -> parseId((String) row[3])).collect(Collectors.toList());
+    return output.stream()
+        .map(row -> parseId((String) row[row.length == 5 ? 4 : 3]))
+        .collect(Collectors.toList());
   }
 
   private static long parseId(String rowJson) {

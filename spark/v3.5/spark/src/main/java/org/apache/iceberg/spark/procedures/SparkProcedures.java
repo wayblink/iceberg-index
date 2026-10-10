@@ -61,6 +61,7 @@ public class SparkProcedures {
     mapBuilder.put("build_text_index", BuildTextIndexProcedure::builder);
     mapBuilder.put("refresh_text_index", RefreshTextIndexProcedure::builder);
     mapBuilder.put("text_search", TextSearchProcedure::builder);
+    mapBuilder.put("text_search_batch", TextSearchBatchProcedure::builder);
     mapBuilder.put("vector_search", VectorSearchProcedure::builder);
     mapBuilder.put("vector_search_batch", VectorSearchBatchProcedure::builder);
     mapBuilder.put("cleanup_index_files", CleanupIndexFilesProcedure::builder);

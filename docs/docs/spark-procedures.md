@@ -1439,3 +1439,38 @@ referenced and would be deleted.
 ```sql
 CALL catalog_name.system.cleanup_index_files(table => 'db.documents');
 ```
+
+### `text_search_batch`
+
+Searches a BM25 text index for many queries at once and resolves the matched rows. Every hit carries
+the index of the query it belongs to (`query_id`), its row reference, score and the matched row as a
+JSON string. Rows are ordered by query and then by score.
+
+Unlike repeated single searches, the matched rows of all queries are resolved by reading each hit
+data file once, so a batch of N queries costs one read per distinct hit data file instead of one
+read per query per hit data file.
+
+| Argument Name | Required? | Type          | Description                     |
+|---------------|-----------|---------------|---------------------------------|
+| `table`       | ✔️        | string        | Name of the table               |
+| `column`      | ✔️        | string        | Name of the indexed column      |
+| `queries`     | ✔️        | array<string> | Query texts, one per query      |
+| `k`           | ✔️        | int           | Number of results per query     |
+
+#### Output
+
+| Output Name | Type   | Description                                    |
+|-------------|--------|------------------------------------------------|
+| `query_id`  | int    | Index of the query in the `queries` argument   |
+| `data_file` | string | Data file of the matched row                   |
+| `pos`       | long   | Row position within the data file (`_pos`)     |
+| `score`     | double | BM25 score                                     |
+| `row`       | string | Matched row as a JSON object                   |
+
+#### Examples
+
+```sql
+CALL catalog_name.system.text_search_batch(
+    table => 'db.documents', column => 'body',
+    queries => array('iceberg table format', 'vector search'), k => 10);
+```
