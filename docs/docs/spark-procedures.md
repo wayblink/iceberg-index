@@ -1492,3 +1492,43 @@ CALL catalog_name.system.text_search_batch(
     table => 'db.documents', column => 'body',
     queries => array('iceberg table format', 'vector search'), k => 10);
 ```
+
+## Index table-valued functions
+
+The index procedures above are statements of their own, so their result cannot be filtered, joined
+or projected further. The same searches are also available as table-valued functions, which take
+their arguments positionally and can be used in a `FROM` clause like any other table:
+
+| Function | Arguments | Output |
+|----------|-----------|--------|
+| `vector_index_search` | `(table, column, query array<double>, k int)` | `data_file, pos, score, row` |
+| `vector_index_search_batch` | `(table, column, queries array<string>, k int)` | `query_id, data_file, pos, score, row` |
+| `text_index_search` | `(table, column, query string, k int)` | `data_file, pos, score, row` |
+
+Each function returns exactly what the corresponding procedure returns, and the rows are computed on
+the driver while the query is planned, so the arguments have to be constants. The table name is
+resolved from the session's current catalog, so qualify it (`catalog.db.table`) when the current
+catalog is not an Iceberg catalog.
+
+#### Examples
+
+Filter, order and project the hits of a vector search
+```sql
+SELECT get_json_object(row, '$.id') AS id, score
+FROM vector_index_search('local.db.docs', 'embedding', array(0.95d, 0.05d), 100)
+WHERE score > 0.5
+ORDER BY score DESC
+LIMIT 5;
+```
+
+Join the hits of a text search against the table
+```sql
+SELECT d.id, h.score
+FROM text_index_search('local.db.docs', 'body', 'iceberg table format', 10) h
+JOIN local.db.docs d ON get_json_object(h.row, '$.id') = CAST(d.id AS string);
+```
+
+!!! note
+    The `row` column is a JSON string. Reading the matched rows back as typed columns is part of the
+    residual-scan work that the automatic rewrite needs; until then `get_json_object` can pick the
+    columns out.

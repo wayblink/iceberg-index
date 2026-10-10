@@ -1,0 +1,235 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>索引层 TVF 接入方案</title>
+<style>
+  :root { --ink:#1a2233; --muted:#5b6675; --line:#dde3ec; --accent:#2f6fd0; --bg:#ffffff; --soft:#f5f8fc; --warn:#d9822b; }
+  * { box-sizing:border-box; }
+  body { margin:0; padding:48px 56px 72px; background:var(--bg); color:var(--ink);
+         font:15px/1.78 -apple-system,BlinkMacSystemFont,"PingFang SC","Hiragino Sans GB","Microsoft YaHei",sans-serif; }
+  h1 { font-size:27px; margin:0 0 6px; }
+  h2 { font-size:19px; margin:46px 0 12px; padding-bottom:7px; border-bottom:2px solid var(--line); }
+  h3 { font-size:16px; margin:26px 0 8px; }
+  p,li { color:var(--ink); }
+  .sub { color:var(--muted); font-size:13.5px; margin-bottom:8px; }
+  .badge { display:inline-block; padding:2px 9px; border-radius:11px; background:#eef4ff; color:var(--accent);
+           font-size:12px; font-weight:600; margin-left:8px; vertical-align:middle; }
+  .todo { background:#fdf7ef; color:var(--warn); }
+  table { width:100%; border-collapse:collapse; margin:14px 0 6px; font-size:13.5px; }
+  th,td { border:1px solid var(--line); padding:8px 11px; text-align:left; vertical-align:top; }
+  th { background:var(--soft); font-weight:600; }
+  code { background:#f1f4f9; padding:1px 5px; border-radius:4px; font-size:12.8px;
+         font-family:ui-monospace,SFMono-Regular,Menlo,monospace; }
+  pre { background:#f7f9fc; border:1px solid var(--line); border-left:3px solid var(--accent);
+        border-radius:6px; padding:13px 16px; overflow-x:auto; font-size:12.8px; line-height:1.62; }
+  pre code { background:none; padding:0; }
+  .callout { background:var(--soft); border:1px solid var(--line); border-left:3px solid var(--accent);
+             border-radius:6px; padding:12px 16px; margin:14px 0; font-size:13.5px; }
+  .callout.warn { border-left-color:var(--warn); background:#fdf7ef; }
+  .diagram { background:#fbfcfe; border:1px solid var(--line); border-radius:6px; padding:14px 16px;
+             font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:12.4px; line-height:1.72;
+             white-space:pre; overflow-x:auto; }
+  .cap { color:var(--muted); font-size:12.5px; margin:6px 0 0; }
+  ol.dec > li { margin-bottom:10px; }
+</style>
+</head>
+<body>
+
+<h1>索引层 TVF 接入方案<span class="badge">P1 · 已确认按 A 执行</span></h1>
+<p class="sub">目标：把索引从“只能 CALL 的过程”变成“FROM 里的一张表”。本文同时回答三个问题：TVF 是什么、相关代码放在哪些模块、AT_OR_BEFORE 是什么意思。</p>
+
+<div class="callout">
+  <strong>一句话概括</strong>
+  <p>TVF（Table-Valued Function，表值函数）是<strong>返回一张表的函数</strong>，因此可以写在 <code>FROM</code> 子句里，像普通表一样被过滤、投影、join、聚合。
+  本方案新增 3 个 TVF，内部<strong>直接调用已经写好的检索代码</strong>，不新增 optimizer 规则、不改变任何现有查询的计划。</p>
+</div>
+
+<h2>一、TVF 是什么</h2>
+
+<h3>1.1 与标量函数对比</h3>
+<table>
+  <tr><th>种类</th><th>输入</th><th>输出</th><th>出现位置</th><th>例子</th></tr>
+  <tr><td>标量函数（UDF）</td><td>一行</td><td>一个值</td><td>SELECT / WHERE 表达式里</td><td><code>vec_distance(embedding, q)</code></td></tr>
+  <tr><td><strong>表值函数（TVF）</strong></td><td>一把参数</td><td><strong>一张表</strong></td><td><strong>FROM 子句</strong></td><td><code>FROM vector_index_search(...)</code></td></tr>
+  <tr><td>存储过程（CALL）</td><td>一把参数</td><td>一张表</td><td><strong>只能作为独立语句</strong></td><td><code>CALL system.vector_search(...)</code></td></tr>
+</table>
+<p>TVF 和过程都能“返回一张表”，区别在<strong>能不能嵌进查询</strong>：</p>
+<ul>
+  <li><code>CALL</code> 是独立语句，自己跑完自己输出，结果就是终点，<strong>不能再 WHERE / JOIN / 聚合</strong>；</li>
+  <li>TVF 是查询里的一个<strong>表来源</strong>，和其他表同等对待。</li>
+</ul>
+<p>Spark 内置的 TVF 其实一直在用：<code>range(10)</code>、<code>explode(arr)</code>、<code>posexplode</code>、<code>inline</code>、<code>stack</code>。</p>
+
+<h3>1.2 接入前后对比</h3>
+<pre><code>-- 现在（过程）：拿到结果就是终点，想再加工只能落临时表或自己解析 JSON 列
+CALL spark_catalog.system.vector_search(
+    table =&gt; 'db.docs', column =&gt; 'embedding',
+    query =&gt; array(0.95d, 0.05d), k =&gt; 10);
+-- 返回 data_file / pos / score / row(JSON)
+
+-- 接入后（TVF）：索引结果是查询里的一张表
+SELECT id, score
+FROM vector_index_search('db.docs', 'embedding', array(0.95d, 0.05d), 100)
+WHERE score &gt; 0.5
+ORDER BY score DESC
+LIMIT 5;
+
+-- 与业务表 join
+SELECT d.id, d.body, h.score
+FROM vector_index_search('db.docs', 'embedding', array(0.95d, 0.05d), 10) h
+JOIN db.docs d ON h.data_file = d.__file AND h.pos = d.__pos;
+
+-- 嵌进子查询再聚合
+SELECT avg(score) FROM (
+  SELECT * FROM text_index_search('db.docs', 'body', 'iceberg table', 50)
+) t;</code></pre>
+
+<h2>二、为什么先做 TVF（决策点 1 = A）</h2>
+<p>当前索引有三个缺口：<strong>不可组合</strong>（结果是扁平的 JSON 列，不能再过滤/join/取列）、<strong>不自动</strong>（必须显式 CALL）、<strong>无类型化契约</strong>（距离语义在适配器内部，planner 不知道）。</p>
+<p>TVF 以最小代价解决第一个缺口：</p>
+<table>
+  <tr><th>维度</th><th>TVF（P1）</th><th>自动改写（P2–P4）</th></tr>
+  <tr><td>用户写法</td><td><code>FROM vector_index_search(...)</code></td><td>普通 SQL：<code>ORDER BY vec_distance(...) LIMIT k</code></td></tr>
+  <tr><td>是否碰 optimizer</td><td><strong>否</strong>，无新规则、无代价模型、无统计依赖</td><td>是：距离表达式 + 规则 + 物理计划</td></tr>
+  <tr><td>正确性风险</td><td>低：只有显式写 TVF 的查询走索引，等价于今天的显式 CALL</td><td>中高：要判断“何时敢信索引”，并处理残差与回表</td></tr>
+  <tr><td>检索代码</td><td><strong>零改动</strong>，直接调 <code>VectorIndexSearch</code> / <code>IndexSearch</code></td><td>复用同一底座，外加回表与残差算子</td></tr>
+  <tr><td>工作量</td><td>小（3 个函数 + 测试）</td><td>大（分期 P2/P3/P4）</td></tr>
+</table>
+<p>而且 TVF 的检索底座正是自动改写要复用的，先做 TVF 等于给 P2 铺路，并能提前拿到真实使用反馈。</p>
+
+<h2>三、三个 TVF 的定义</h2>
+<table>
+  <tr><th>TVF</th><th>参数（位置参数）</th><th>输出列</th><th>内部调用</th></tr>
+  <tr><td><code>vector_index_search</code></td><td><code>(table string, column string, query array&lt;double&gt;, k int)</code></td><td><code>data_file string, pos long, score double, row string</code></td><td><code>VectorIndexSearch.search(...)</code></td></tr>
+  <tr><td><code>vector_index_search_batch</code></td><td><code>(table string, column string, queries array&lt;string&gt;, k int)</code>，每个元素是逗号分隔的数字</td><td><code>query_id int, data_file string, pos long, score double, row string</code></td><td><code>VectorIndexSearch.search(...)</code>（一次多查询，按命中数据文件只读一次）</td></tr>
+  <tr><td><code>text_index_search</code></td><td><code>(table string, column string, query string, k int)</code></td><td><code>data_file string, pos long, score double, row string</code></td><td><code>IndexSearch.search(..., "text", payloads, k)</code></td></tr>
+</table>
+<div class="callout warn">
+  <strong>为什么用位置参数</strong>
+  <p>位置参数（<code>'db.docs', 'embedding', array(...), 10</code>）在所有 Spark 3.5 上都可用。命名参数（<code>table =&gt; 'db.docs'</code>）对 TVF 的支持随版本而变，实现时若确认可用再开放，否则一律位置参数，行为一致。</p>
+</div>
+
+<h3>3.1 为什么批量向量查询用 <code>array&lt;string&gt;</code></h3>
+<p>Spark 的 <code>CALL</code>/TVF 参数不接受嵌套数组字面量（<code>array(array(...))</code> 解析失败），所以批量查询和现有 <code>vector_search_batch</code> 过程保持一致：每个查询是一个逗号分隔的数字字符串。</p>
+
+<h2>四、模块放置（决策点 2，附现状盘点）</h2>
+<p>顾虑是“Iceberg 会不会因此堆进太多计算/索引相关的东西”。先看现状——<strong>索引相关代码已经按职责分在四个层次，向量计算是独立的</strong>：</p>
+<div class="diagram">iceberg-api      公共接口（暂无索引类；IndexCatalog 未来作为 SPI 进这里）
+iceberg-core     org.apache.iceberg.index.*    ← 引擎无关、类型无关的索引层
+                 IndexFile / IndexManifest / IndexSnapshot / IndexMetadata
+                 IndexBuilder / IndexRefresher / IndexReader / IndexCatalog
+                 IndexTypes 注册表 / Puffin 容器 / IndexAdapter 抽象
+                 （无任何 ANN、无 BM25、无 Spark 依赖）
+
+iceberg-index-vector   org.apache.iceberg.index.vector.*   ← 向量检索的“计算”都在这里
+                 VectorIndexAdapter（EXACT / HNSW、jelmerk hnswlib、精确重排）
+                 VectorIndexDefinition / VectorIndexType / VectorIndexTypes
+                 唯一引入 hnswlib 依赖的模块
+
+iceberg-index-text     org.apache.iceberg.index.text.*     ← BM25 的“计算”都在这里
+                 TextAnalyzer / TextIndexAdapter（自实现 BM25，无 Lucene）
+                 TextIndexDefinition / TextIndexType / TextIndexTypes
+
+iceberg-spark (3.5)    org.apache.iceberg.spark.index.*    ← 引擎适配层（类型无关）
+                 IndexEntries（删除感知的通用条目流水线）
+                 SparkIndexBuilder / IndexGrouping / IndexSearch / VectorIndexes
+                 org.apache.iceberg.spark.procedures.*    ← SQL 过程外壳
+
+iceberg-spark-extensions  SparkProcedures 注册表 + 各过程测试
+                 【本方案新增】3 个 TVF</div>
+<p class="cap">依赖方向：spark → index-vector / index-text → core → api；core 不反向依赖任何适配器模块，也没有任何向量或文本计算。</p>
+<p>结论：</p>
+<ul>
+  <li><strong>向量检索相关的东西已经有专门模块</strong> <code>iceberg-index-vector</code>（HNSW 图构建、量化、距离度量、重排全在里面），core 只有抽象；BM25 同理在 <code>iceberg-index-text</code>。</li>
+  <li>Spark 侧的 <code>org.apache.iceberg.spark.index</code> 是<strong>类型无关</strong>的引擎适配（条目生成、构建、刷新、检索、行解析），不包含距离或 BM25 的计算实现。</li>
+  <li>SQL 面（过程、以及本方案的 TVF）放 <code>spark-extensions</code>：这是 Iceberg 已有的“SQL 扩展”模块，本就承载过程注册与自定义函数，不新增模块、不污染 core。</li>
+  <li>P2 的距离表达式 <code>vec_distance</code> 也放 <code>spark-extensions</code>——它的语义必须与索引的 metric 绑定（同列 COSINE 与 EUCLIDEAN 给出完全不同的距离），只有 Iceberg 侧知道该用哪个索引、哪种度量，Spark 官方 ML 函数无法感知索引。</li>
+</ul>
+
+<h2>五、AT_OR_BEFORE 是什么（决策点 3）</h2>
+
+<h3>5.1 你的理解是对的</h3>
+<p>“索引可以覆盖一部分数据时仍然可用：索引用在它覆盖的部分，没覆盖的部分走暴力扫描，最后合并。” —— 这正是 <code>AT_OR_BEFORE</code> 的语义。</p>
+
+<h3>5.2 两种一致性模式</h3>
+<table>
+  <tr><th>模式</th><th>语义</th><th>索引快照落后于读快照时</th></tr>
+  <tr><td><code>EXACT_SNAPSHOT</code>（默认）</td><td>必须存在绑定到<strong>恰好</strong>该表快照的索引快照</td><td>报错 / 回退全表扫描</td></tr>
+  <tr><td><code>AT_OR_BEFORE</code></td><td>取绑定表快照 <strong>≤</strong> 所查快照的<strong>最新</strong>索引快照</td><td>用旧索引 + 补齐差额</td></tr>
+</table>
+
+<h3>5.3 机制：差额从哪来</h3>
+<div class="diagram">读快照 S（表的最新快照）
+  │
+  ├─ 索引最新快照 I，绑定表快照 S' ≤ S
+  │
+  ├─ I 覆盖的数据文件集合 C（来自 I 的 manifest）
+  │
+  ├─ 差额 = S 的数据文件 − C
+  │     └─ IndexReader.uncoveredDataFiles(query, S 的数据文件) 直接给出这个集合
+  │
+  ├─ 已覆盖部分：driver 侧检索 I → (data_file, pos, score)
+  └─ 差额部分：普通扫描 + 同样的打分 → (data_file, pos, score)
+        │
+        └─ 合并 → 去重 → 全局 TopK</div>
+<p class="cap">纯追加场景（你举的例子）下差额就是新写入的数据文件，旧文件一条没动，索引结果完全有效，只是少了新数据——补一次暴力扫描即等价于全表。</p>
+
+<h3>5.4 一个必须注意的细节：删除</h3>
+<div class="callout warn">
+  <p>如果“落后”不只是追加，还包括<strong>对已覆盖数据文件的删除</strong>，那么索引命中就不能直接用了：</p>
+  <ul>
+    <li>位置删除（position delete）加在某个已覆盖的数据文件上 → 索引里仍留着那些位置的条目，<strong>指向已被删除的行</strong>；</li>
+    <li>等值删除 / 文件重写 → 数据文件换名，变成“新文件”，自然落入差额集合，这部分是安全的。</li>
+  </ul>
+  <p>所以 <code>AT_OR_BEFORE</code> 的正确读法必须是两步：① 差额文件暴力扫描；② <strong>索引命中还要按当前快照的删除文件过滤一遍</strong>（位置删除的 (file, pos) 检查很便宜）。这一步属于 P3 残差扫描的实现内容，本方案（P1）不涉及，但必须记在账上。</p>
+</div>
+
+<h3>5.5 为什么文本侧更保守</h3>
+<p>BM25 分数依赖全库统计量 N 与 avgdl，而索引文件里存的是<strong>本地</strong>统计、查询时才合并（D10′ 的设计）。索引落后时合并出的统计与全表真实值有偏差：<strong>排序基本仍可用，但分数绝对值不再精确</strong>，对“按分数阈值过滤”的查询会出错。因此文本侧默认只走 <code>EXACT_SNAPSHOT</code>，向量侧允许 <code>AT_OR_BEFORE</code> + 残差（向量检索本身就是近似的，且距离值与索引新旧无关）。</p>
+
+<h2>六、本方案不改变什么</h2>
+<ul>
+  <li>不新增 optimizer 规则、不改任何现有查询的物理计划（没有 TVF 的查询一行都不变）。</li>
+  <li>不改 core 的任何接口：TVF 只是换一个入口调用已有的 <code>VectorIndexSearch</code> / <code>IndexSearch</code>。</li>
+  <li>不改现有过程：<code>CALL</code> 全部保留，行为不变。</li>
+  <li>不引入新的第三方依赖。</li>
+</ul>
+
+<h2>七、已知限制（本期接受）</h2>
+<ul>
+  <li><code>row</code> 仍是 JSON 字符串列。要变成类型化的 <code>id</code>、<code>body</code> 列，需要“按 <code>_file/_pos</code> 回表取列”的物理算子，属 P3。当前可用 <code>get_json_object(row, '$.id')</code> 自行解析。</li>
+  <li>只维护 Spark 3.5（4.1 已不在维护范围）。</li>
+  <li>TVF 内部仍走“driver 侧检索 + 每命中数据文件读一次”的现成路径，未做分布式检索（索引文件小，无必要）。</li>
+</ul>
+
+<h2>八、决策记录</h2>
+<table>
+  <tr><th>编号</th><th>决策</th><th>内容</th><th>状态</th></tr>
+  <tr><td>D23</td><td>TVF 先行</td><td>P1 交付 3 个 TVF，与过程并存；不碰 optimizer；检索代码零改动。位置参数优先，命名参数视 Spark 3.5 支持情况开放</td><td>已确认</td></tr>
+  <tr><td>D24</td><td>同列多索引的选择策略</td><td><b>现在做 A</b>：按表达式/索引类型匹配；同列同类型多个索引（如两个 metric）时报错要求显式指定，绝不猜测（猜错 metric 会静默返回错误排序）。<b>C（索引命名/别名，查询里显式指定）留作 TODO</b>，等出现真实需求再做</td><td>A 已确认；C 待办</td></tr>
+  <tr><td>D25</td><td>索引未命中时的行为</td><td>A：查询形态本可用索引但因索引缺失/落后而回退全表扫描时，只打点/告警（“建议 refresh”），<b>不改变计划、不报错</b></td><td>已确认</td></tr>
+  <tr><td>D26</td><td>距离表达式归属</td><td><code>vec_distance</code> 放 spark-extensions，语义与索引 metric 绑定；不等 Spark 官方函数（其无法感知索引）</td><td>已确认（P2 实施）</td></tr>
+  <tr><td>D27</td><td>落后时的自动启用范围</td><td>向量允许 <code>AT_OR_BEFORE</code> + 残差 + 命中按当前删除过滤；文本默认仅 <code>EXACT_SNAPSHOT</code></td><td>已确认（P3 实施）</td></tr>
+</table>
+
+<h2>九、TODO（后续）</h2>
+<table>
+  <tr><th>事项</th><th>内容</th><th>所属阶段</th></tr>
+  <tr><td><span class="badge todo">TODO</span> 索引命名/别名</td><td>给索命名，查询里显式指定用哪个索引，解决同列同类型多索引的歧义（决策点 4 的 C 方案）</td><td>P2 之后</td></tr>
+  <tr><td>残差扫描 + 回表取列</td><td><code>AT_OR_BEFORE</code> 的差额扫描、索引命中按当前删除过滤、类型化列输出</td><td>P3</td></tr>
+  <tr><td>自动改写</td><td><code>vec_distance</code> 表达式 + <code>Sort/Limit</code> 规则 + 物理计划；HNSW 粗排后精确重排</td><td>P2 / P4</td></tr>
+  <tr><td>文本检索入口</td><td><code>text_score</code> 表达式与 <code>MATCH</code> 形态</td><td>P4</td></tr>
+</table>
+
+<h2>十、验收标准（P1）</h2>
+<ol>
+  <li>3 个 TVF 可注册、可查询，位置参数形式可用。</li>
+  <li>每个 TVF 的结果与对应 <code>CALL</code> 过程<strong>逐行一致</strong>（同一索引、同一参数）。</li>
+  <li>TVF 结果可用于 <code>WHERE</code> / <code>ORDER BY</code> / <code>LIMIT</code> / 子查询 / <code>JOIN</code>。</li>
+  <li>没有 TVF 的现有查询计划不变（可用 <code>explain</code> 对比断言）。</li>
+  <li>全部既有索引测试保持通过（core / index-vector / index-text / spark / spark-extensions）。</li>
+</ol>
+
+</body>
+</html>

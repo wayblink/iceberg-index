@@ -68,6 +68,16 @@ public final class IndexSearch {
   /** Column of the matched row as a JSON object. */
   public static final String ROW_COLUMN = "row";
 
+  /** Schema of one hit row of a single query, without the query id column. */
+  public static final StructType SINGLE_RESULT_SCHEMA =
+      new StructType(
+          new StructField[] {
+            new StructField(DATA_FILE_COLUMN, DataTypes.StringType, false, Metadata.empty()),
+            new StructField(POSITION_COLUMN, DataTypes.LongType, false, Metadata.empty()),
+            new StructField(SCORE_COLUMN, DataTypes.DoubleType, false, Metadata.empty()),
+            new StructField(ROW_COLUMN, DataTypes.StringType, true, Metadata.empty())
+          });
+
   /** Schema of one hit row. */
   public static final StructType RESULT_SCHEMA =
       new StructType(
@@ -137,6 +147,28 @@ public final class IndexSearch {
     }
 
     return spark.createDataFrame(rows, RESULT_SCHEMA);
+  }
+
+  /**
+   * Searches the index of the given column for one query and resolves the matched rows, without the
+   * query id column. The rows are the same the batch search returns, with the query id dropped.
+   *
+   * @param spark the Spark session
+   * @param table the table whose index is searched
+   * @param column the indexed column
+   * @param indexType the index type to search, for example {@code vector} or {@code text}
+   * @param query the encoded query payload
+   * @param topK the number of results
+   * @return one row per hit: data file, position, score and the matched row as JSON
+   */
+  public static Dataset<Row> search(
+      SparkSession spark,
+      org.apache.iceberg.Table table,
+      String column,
+      String indexType,
+      ByteBuffer query,
+      int topK) {
+    return search(spark, table, column, indexType, List.of(query), topK).drop(QUERY_ID_COLUMN);
   }
 
   /**
