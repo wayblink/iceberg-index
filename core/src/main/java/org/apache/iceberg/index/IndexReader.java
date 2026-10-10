@@ -38,9 +38,12 @@ import org.apache.iceberg.relocated.com.google.common.collect.Sets;
  * row references and scores. Callers resolve the references back to table rows themselves, which is
  * where filtering, delete semantics, and final projection happen.
  *
- * <p>Correctness rules enforced here: the index snapshot must be bound to the requested source
- * table snapshot (otherwise the query fails), and files that the index does not cover are reported
- * so callers can run a residual scan instead of assuming the index covers the whole table.
+ * <p>Correctness rules enforced here: by default the index snapshot must be bound to the requested
+ * source table snapshot (otherwise the query fails), and files that the index does not cover are
+ * reported so callers can run a residual scan instead of assuming the index covers the whole table.
+ * A query that asks for {@link IndexQuery.Consistency#AT_OR_BEFORE} is answered from the newest
+ * index snapshot at or before the requested source table snapshot, which may be stale; the coverage
+ * report then tells the caller what the index does not cover.
  */
 public final class IndexReader {
 
@@ -65,7 +68,7 @@ public final class IndexReader {
    */
   public List<IndexSearchResult> search(IndexQuery query) {
     Preconditions.checkNotNull(query, "Index query is null");
-    IndexSnapshot snapshot = snapshotForSourceTableSnapshot(query.sourceTableSnapshotId());
+    IndexSnapshot snapshot = snapshotForQuery(query);
     IndexAdapter adapter =
         IndexTypes.fromType(metadata.indexType()).createAdapter(metadata.definition());
 
@@ -153,7 +156,18 @@ public final class IndexReader {
    */
   public Set<String> uncoveredDataFiles(
       long sourceTableSnapshotId, Iterable<String> sourceDataFiles) {
-    IndexSnapshot snapshot = snapshotForSourceTableSnapshot(sourceTableSnapshotId);
+    return uncoveredDataFiles(
+        IndexQuery.of(sourceTableSnapshotId, ByteBuffer.allocate(0), 0), sourceDataFiles);
+  }
+
+  /**
+   * Returns source data files that are not covered by the index snapshot a query is answered from,
+   * which honors the query's consistency requirement.
+   */
+  public Set<String> uncoveredDataFiles(IndexQuery query, Iterable<String> sourceDataFiles) {
+    Preconditions.checkNotNull(query, "Index query is null");
+    Preconditions.checkNotNull(sourceDataFiles, "Source data files are null");
+    IndexSnapshot snapshot = snapshotForQuery(query);
     IndexManifestList manifestList = readManifestList(snapshot);
     Set<String> indexed = Sets.newLinkedHashSet();
     for (IndexManifestList.ManifestRef ref : manifestList.manifests()) {
@@ -170,11 +184,34 @@ public final class IndexReader {
     return ImmutableSet.copyOf(uncovered);
   }
 
-  private IndexSnapshot snapshotForSourceTableSnapshot(long sourceTableSnapshotId) {
-    IndexSnapshot snapshot = metadata.snapshotForSourceTableSnapshot(sourceTableSnapshotId);
+  /** Selects the index snapshot a query is answered from, honoring its consistency requirement. */
+  private IndexSnapshot snapshotForQuery(IndexQuery query) {
+    IndexSnapshot snapshot =
+        query.consistency() == IndexQuery.Consistency.EXACT_SNAPSHOT
+            ? metadata.snapshotForSourceTableSnapshot(query.sourceTableSnapshotId())
+            : latestSnapshotAtOrBefore(query.sourceTableSnapshotId());
     Preconditions.checkArgument(
-        snapshot != null, "Index does not cover source table snapshot: %s", sourceTableSnapshotId);
+        snapshot != null,
+        "No index snapshot of index %s covers source table snapshot %s with consistency %s",
+        metadata.indexUuid(),
+        query.sourceTableSnapshotId(),
+        query.consistency());
     return snapshot;
+  }
+
+  /**
+   * Returns the newest index snapshot whose source table snapshot is at or before the given one.
+   */
+  private IndexSnapshot latestSnapshotAtOrBefore(long sourceTableSnapshotId) {
+    IndexSnapshot newest = null;
+    for (IndexSnapshot snapshot : metadata.snapshots()) {
+      if (snapshot.sourceTableSnapshotId() <= sourceTableSnapshotId
+          && (newest == null
+              || snapshot.sourceTableSnapshotId() > newest.sourceTableSnapshotId())) {
+        newest = snapshot;
+      }
+    }
+    return newest;
   }
 
   private IndexManifestList readManifestList(IndexSnapshot snapshot) {
