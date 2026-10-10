@@ -21,8 +21,8 @@ package org.apache.iceberg.spark.index
 import org.apache.iceberg.index.text.TextIndexTypes
 import org.apache.iceberg.index.vector.VectorIndexTypes
 import org.apache.iceberg.spark.Spark3Util
-import org.apache.iceberg.spark.index.IndexSearch
-import org.apache.iceberg.spark.index.VectorIndexSearch
+import org.apache.iceberg.index.spark.IndexSearch
+import org.apache.iceberg.index.spark.VectorIndexSearch
 import org.apache.spark.sql.catalyst.FunctionIdentifier
 import org.apache.spark.sql.catalyst.expressions.Expression
 import org.apache.spark.sql.catalyst.util.ArrayData
@@ -134,7 +134,7 @@ object IndexTableFunctions {
       column: String,
       query: Array[Double]): java.nio.ByteBuffer = {
     val table = Spark3Util.loadIcebergTable(spark, tableName)
-    val definition = org.apache.iceberg.spark.index.VectorIndexes
+    val definition = org.apache.iceberg.index.spark.VectorIndexes
       .findIndex(table, column, "vector")
       .definition()
       .asInstanceOf[org.apache.iceberg.index.vector.VectorIndexDefinition]
@@ -147,7 +147,7 @@ object IndexTableFunctions {
       tableName: String,
       column: String): org.apache.iceberg.index.text.TextIndexDefinition = {
     val table = Spark3Util.loadIcebergTable(spark, tableName)
-    org.apache.iceberg.spark.index.VectorIndexes
+    org.apache.iceberg.index.spark.VectorIndexes
       .findIndex(table, column, "text")
       .definition()
       .asInstanceOf[org.apache.iceberg.index.text.TextIndexDefinition]

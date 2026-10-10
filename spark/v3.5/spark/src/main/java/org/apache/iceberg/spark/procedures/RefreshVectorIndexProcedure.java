@@ -20,7 +20,7 @@ package org.apache.iceberg.spark.procedures;
 
 import org.apache.iceberg.index.IndexMetadata;
 import org.apache.iceberg.index.SidecarIndexCatalog;
-import org.apache.iceberg.spark.index.SparkIndexBuilder;
+import org.apache.iceberg.index.spark.SparkIndexBuilder;
 import org.apache.iceberg.spark.procedures.SparkProcedures.ProcedureBuilder;
 import org.apache.spark.sql.catalyst.InternalRow;
 import org.apache.spark.sql.connector.catalog.TableCatalog;

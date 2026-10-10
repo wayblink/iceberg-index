@@ -21,7 +21,7 @@ package org.apache.iceberg.spark.procedures;
 import org.apache.iceberg.Table;
 import org.apache.iceberg.index.IndexMetadata;
 import org.apache.iceberg.index.SidecarIndexCatalog;
-import org.apache.iceberg.spark.index.VectorIndexes;
+import org.apache.iceberg.index.spark.VectorIndexes;
 import org.apache.spark.sql.connector.iceberg.catalog.ProcedureParameter;
 
 /** Shared helpers for the vector index SQL procedures. */

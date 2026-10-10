@@ -59,6 +59,7 @@ project(":iceberg-spark:iceberg-spark-${sparkMajorVersion}_${scalaVersion}") {
     implementation project(':iceberg-data')
     implementation project(':iceberg-index-vector')
     implementation project(':iceberg-index-text')
+    implementation project(':iceberg-index-spark')
     implementation project(':iceberg-orc')
     implementation project(':iceberg-parquet')
     implementation project(':iceberg-arrow')
@@ -151,8 +152,7 @@ project(":iceberg-spark:iceberg-spark-extensions-${sparkMajorVersion}_${scalaVer
     compileOnly project(':iceberg-api')
     compileOnly project(':iceberg-core')
     compileOnly project(':iceberg-common')
-    implementation project(':iceberg-index-vector')
-    implementation project(':iceberg-index-text')
+    implementation project(':iceberg-index-spark')
     compileOnly project(":iceberg-spark:iceberg-spark-${sparkMajorVersion}_${scalaVersion}")
     compileOnly("org.apache.spark:spark-hive_${scalaVersion}:${libs.versions.spark35.get()}") {
       exclude group: 'org.apache.avro', module: 'avro'
