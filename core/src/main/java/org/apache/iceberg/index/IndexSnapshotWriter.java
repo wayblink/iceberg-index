@@ -55,6 +55,9 @@ public final class IndexSnapshotWriter {
   /** Default number of entries per index file. */
   public static final int DEFAULT_ENTRIES_PER_FILE = 10_000;
 
+  /** Default number of index files per index manifest. */
+  public static final int DEFAULT_FILES_PER_MANIFEST = 1_000;
+
   private static final String DATA_DIR = "data";
   private static final String SNAPSHOTS_DIR = "snapshots";
   private static final String STAGING_DIR = "staging";
@@ -66,6 +69,7 @@ public final class IndexSnapshotWriter {
   private final FileIO fileIO;
   private final IndexFileContainer container;
   private final int entriesPerFile;
+  private final int filesPerManifest;
   private final String attemptId;
   private final List<String> declaredPaths = Lists.newArrayList();
 
@@ -74,15 +78,27 @@ public final class IndexSnapshotWriter {
   }
 
   public IndexSnapshotWriter(FileIO fileIO, IndexFileContainer container, int entriesPerFile) {
-    this(fileIO, container, entriesPerFile, newAttemptId());
+    this(fileIO, container, entriesPerFile, DEFAULT_FILES_PER_MANIFEST);
   }
 
   public IndexSnapshotWriter(
-      FileIO fileIO, IndexFileContainer container, int entriesPerFile, String attemptId) {
+      FileIO fileIO, IndexFileContainer container, int entriesPerFile, int filesPerManifest) {
+    this(fileIO, container, entriesPerFile, filesPerManifest, newAttemptId());
+  }
+
+  public IndexSnapshotWriter(
+      FileIO fileIO,
+      IndexFileContainer container,
+      int entriesPerFile,
+      int filesPerManifest,
+      String attemptId) {
     this.fileIO = Preconditions.checkNotNull(fileIO, "File IO is null");
     this.container = Preconditions.checkNotNull(container, "Index file container is null");
     Preconditions.checkArgument(entriesPerFile > 0, "Invalid entries per file: %s", entriesPerFile);
+    Preconditions.checkArgument(
+        filesPerManifest > 0, "Invalid files per manifest: %s", filesPerManifest);
     this.entriesPerFile = entriesPerFile;
+    this.filesPerManifest = filesPerManifest;
     this.attemptId = Preconditions.checkNotNull(attemptId, "Attempt id is null");
   }
 
@@ -184,11 +200,28 @@ public final class IndexSnapshotWriter {
   }
 
   /**
-   * Groups index files into manifests. One manifest holds them all today; grouping by a size budget
-   * keeps a single manifest from becoming a hot spot once an index covers many data files.
+   * Groups index files into manifests of at most {@code filesPerManifest} entries. One manifest per
+   * snapshot would be simpler, but it would become a single large file that has to be read and
+   * written as a whole once an index covers many data files; the manifest list has always carried
+   * several manifests, so this only fills in the writing side.
    */
-  private static List<List<IndexFile>> partition(List<IndexFile> indexFiles) {
-    return ImmutableList.of(indexFiles);
+  private List<List<IndexFile>> partition(List<IndexFile> indexFiles) {
+    if (indexFiles.size() <= filesPerManifest) {
+      return ImmutableList.of(indexFiles);
+    }
+    ImmutableList.Builder<List<IndexFile>> groups = ImmutableList.builder();
+    List<IndexFile> group = Lists.newArrayList();
+    for (IndexFile indexFile : indexFiles) {
+      group.add(indexFile);
+      if (group.size() >= filesPerManifest) {
+        groups.add(ImmutableList.copyOf(group));
+        group = Lists.newArrayList();
+      }
+    }
+    if (!group.isEmpty()) {
+      groups.add(ImmutableList.copyOf(group));
+    }
+    return groups.build();
   }
 
   private IndexFile writeIndexFile(

@@ -25,7 +25,9 @@ import java.io.File;
 import java.io.IOException;
 import java.nio.file.Path;
 import java.util.List;
+import java.util.stream.Collectors;
 import org.apache.iceberg.TestTables.LocalFileIO;
+import org.apache.iceberg.index.IndexManifestList.ManifestRef;
 import org.apache.iceberg.relocated.com.google.common.collect.Lists;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
@@ -46,7 +48,12 @@ class TestIndexSnapshotWriterAttempts {
   public void writesFilesUnderTheAttemptLedger(@TempDir Path tempDir) throws IOException {
     LocalFileIO fileIO = new LocalFileIO();
     IndexSnapshotWriter writer =
-        new IndexSnapshotWriter(fileIO, new PuffinIndexFileContainer(), 2, "attempt-1");
+        new IndexSnapshotWriter(
+            fileIO,
+            new PuffinIndexFileContainer(),
+            2,
+            IndexSnapshotWriter.DEFAULT_FILES_PER_MANIFEST,
+            "attempt-1");
     String indexLocation = tempDir.resolve("indexes/index-uuid").toString();
 
     List<IndexFile> indexFiles = writeFiles(writer, indexLocation);
@@ -77,7 +84,12 @@ class TestIndexSnapshotWriterAttempts {
   public void abortDeletesEverythingTheAttemptWrote(@TempDir Path tempDir) throws IOException {
     LocalFileIO fileIO = new LocalFileIO();
     IndexSnapshotWriter writer =
-        new IndexSnapshotWriter(fileIO, new PuffinIndexFileContainer(), 2, "attempt-1");
+        new IndexSnapshotWriter(
+            fileIO,
+            new PuffinIndexFileContainer(),
+            2,
+            IndexSnapshotWriter.DEFAULT_FILES_PER_MANIFEST,
+            "attempt-1");
     String indexLocation = tempDir.resolve("indexes/index-uuid").toString();
 
     List<IndexFile> indexFiles = writeFiles(writer, indexLocation);
@@ -103,7 +115,12 @@ class TestIndexSnapshotWriterAttempts {
   public void abortAfterAPartialWriteLeavesNothingBehind(@TempDir Path tempDir) throws IOException {
     LocalFileIO fileIO = new LocalFileIO();
     IndexSnapshotWriter writer =
-        new IndexSnapshotWriter(fileIO, new PuffinIndexFileContainer(), 2, "attempt-1");
+        new IndexSnapshotWriter(
+            fileIO,
+            new PuffinIndexFileContainer(),
+            2,
+            IndexSnapshotWriter.DEFAULT_FILES_PER_MANIFEST,
+            "attempt-1");
     String indexLocation = tempDir.resolve("indexes/index-uuid").toString();
     TestingIndexAdapter adapter = new TestingIndexAdapter(TestingIndexDefinition.of(4));
 
@@ -125,7 +142,12 @@ class TestIndexSnapshotWriterAttempts {
   public void aKilledAttemptLeavesARecoverableLedger(@TempDir Path tempDir) throws IOException {
     LocalFileIO fileIO = new LocalFileIO();
     IndexSnapshotWriter writer =
-        new IndexSnapshotWriter(fileIO, new PuffinIndexFileContainer(), 2, "attempt-1");
+        new IndexSnapshotWriter(
+            fileIO,
+            new PuffinIndexFileContainer(),
+            2,
+            IndexSnapshotWriter.DEFAULT_FILES_PER_MANIFEST,
+            "attempt-1");
     String indexLocation = tempDir.resolve("indexes/index-uuid").toString();
 
     List<IndexFile> indexFiles = writeFiles(writer, indexLocation);
@@ -148,6 +170,71 @@ class TestIndexSnapshotWriterAttempts {
     }
     assertThat(indexFiles.stream().map(IndexFile::location))
         .containsExactlyElementsOf(paths.subList(0, 2));
+  }
+
+  @Test
+  public void splitsIndexFilesIntoSeveralManifests(@TempDir Path tempDir) throws IOException {
+    LocalFileIO fileIO = new LocalFileIO();
+    // a budget of two index files per manifest
+    IndexSnapshotWriter writer =
+        new IndexSnapshotWriter(fileIO, new PuffinIndexFileContainer(), 1, 2, "attempt-1");
+    String indexLocation = tempDir.resolve("indexes/index-uuid").toString();
+
+    List<IndexFile> indexFiles =
+        writer.writeIndexFiles(
+            indexLocation,
+            1,
+            new TestingIndexAdapter(TestingIndexDefinition.of(4)),
+            List.of(
+                IndexEntry.of("data-1.parquet", 0, TestingIndexAdapter.valuePayload(10)),
+                IndexEntry.of("data-2.parquet", 1, TestingIndexAdapter.valuePayload(20)),
+                IndexEntry.of("data-3.parquet", 2, TestingIndexAdapter.valuePayload(15)),
+                IndexEntry.of("data-4.parquet", 3, TestingIndexAdapter.valuePayload(25)),
+                IndexEntry.of("data-5.parquet", 4, TestingIndexAdapter.valuePayload(5))));
+    String manifestList = writer.writeManifestList(indexLocation, 1, indexFiles);
+
+    IndexManifestList list = IndexManifestList.read(fileIO.newInputFile(manifestList));
+    // five index files at two per manifest make three manifests, and the list carries them all
+    assertThat(list.manifests()).hasSize(3);
+    assertThat(list.manifests().stream().mapToInt(ManifestRef::indexFileCount).sum()).isEqualTo(5);
+    assertThat(list.manifests().stream().mapToLong(ManifestRef::entryCount).sum()).isEqualTo(5L);
+
+    // every index file is listed by exactly one manifest, and all of them are readable
+    List<String> listed = Lists.newArrayList();
+    for (ManifestRef ref : list.manifests()) {
+      IndexManifest manifest = IndexManifest.read(fileIO.newInputFile(ref.location()));
+      assertThat(manifest.indexFiles().size()).isEqualTo(ref.indexFileCount());
+      for (IndexFile indexFile : manifest.indexFiles()) {
+        listed.add(indexFile.location());
+      }
+    }
+    assertThat(listed)
+        .containsExactlyInAnyOrderElementsOf(
+            indexFiles.stream().map(IndexFile::location).collect(Collectors.toList()));
+    // the manifests are numbered, so a ledger can name them without listing directories
+    assertThat(marker(indexLocation, "attempt-1", "m2"))
+        .isEqualTo(list.manifests().get(2).location());
+
+    writer.abortAttempt(indexLocation);
+    assertThat(new File(manifestList)).doesNotExist();
+    for (ManifestRef ref : list.manifests()) {
+      assertThat(new File(ref.location())).doesNotExist();
+    }
+  }
+
+  @Test
+  public void oneManifestHoldsEverythingBelowTheBudget(@TempDir Path tempDir) throws IOException {
+    LocalFileIO fileIO = new LocalFileIO();
+    IndexSnapshotWriter writer =
+        new IndexSnapshotWriter(fileIO, new PuffinIndexFileContainer(), 10, 2, "attempt-1");
+    String indexLocation = tempDir.resolve("indexes/index-uuid").toString();
+
+    List<IndexFile> indexFiles = writeFiles(writer, indexLocation);
+    String manifestList = writer.writeManifestList(indexLocation, 1, indexFiles);
+
+    IndexManifestList list = IndexManifestList.read(fileIO.newInputFile(manifestList));
+    assertThat(list.manifests()).hasSize(1);
+    assertThat(list.manifests().get(0).indexFileCount()).isEqualTo(indexFiles.size());
   }
 
   @Test
@@ -179,13 +266,23 @@ class TestIndexSnapshotWriterAttempts {
   public void buildAbortsOnFailure(@TempDir Path tempDir) {
     LocalFileIO fileIO = new LocalFileIO();
     IndexSnapshotWriter writer =
-        new IndexSnapshotWriter(fileIO, new PuffinIndexFileContainer(), 2, "attempt-1");
+        new IndexSnapshotWriter(
+            fileIO,
+            new PuffinIndexFileContainer(),
+            2,
+            IndexSnapshotWriter.DEFAULT_FILES_PER_MANIFEST,
+            "attempt-1");
     IndexBuilder builder = new IndexBuilder(writer);
     IndexMetadata current = indexMetadata(tempDir, "indexes/index-uuid");
 
     // an adapter that fails while encoding makes the build die after some files were written
     IndexSnapshotWriter failing =
-        new IndexSnapshotWriter(fileIO, new FailingContainer(), 2, "attempt-1");
+        new IndexSnapshotWriter(
+            fileIO,
+            new FailingContainer(),
+            2,
+            IndexSnapshotWriter.DEFAULT_FILES_PER_MANIFEST,
+            "attempt-1");
     IndexBuilder failingBuilder = new IndexBuilder(failing);
 
     assertThatThrownBy(
