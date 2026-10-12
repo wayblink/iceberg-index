@@ -1549,15 +1549,18 @@ LIMIT 10;
 ```
 
 The optimizer rewrites this into an index lookup, so only the matched rows are read instead of the
-whole table. It does so only when the index can answer the query on its own:
+whole table. It does so when the index has something to say about the query:
 
 - the column has a vector index,
-- the index snapshot is bound to exactly the snapshot the scan reads,
 - the index is in exact mode, not HNSW,
-- the index covers every data file of that snapshot.
+- at least one of the snapshot's data files is covered by the index.
 
-If any of these does not hold, the plan is left exactly as it was, and the query still returns
-correct results, just by scanning. A warning is logged when the matched rows cannot be read back.
+An index that is behind the snapshot being read is still used, together with a scan of the data
+files it does not cover, so a query does not have to wait for a refresh. Rows removed after the
+index snapshot was built are filtered out the same way the index build filters them.
+
+If none of these holds, the plan is left exactly as it was, and the query still returns correct
+results, just by scanning. A warning is logged when the matched rows cannot be read back.
 
 An approximate (HNSW) index is left alone for now: its candidates have to be re-scored first, which
 is planned work. `EXPLAIN` shows whether the rewrite happened, by the absence of the table scan:
