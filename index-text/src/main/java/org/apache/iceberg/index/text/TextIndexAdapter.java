@@ -33,6 +33,7 @@ import org.apache.iceberg.index.IndexAdapter;
 import org.apache.iceberg.index.IndexDefinition;
 import org.apache.iceberg.index.IndexEntry;
 import org.apache.iceberg.index.IndexSearchResult;
+import org.apache.iceberg.relocated.com.google.common.collect.ImmutableMap;
 import org.apache.iceberg.relocated.com.google.common.collect.Lists;
 import org.apache.iceberg.relocated.com.google.common.collect.Maps;
 
@@ -292,6 +293,72 @@ public final class TextIndexAdapter implements IndexAdapter, java.io.Serializabl
   }
 
   private double documentScore(double idf, int termFrequency, int length, double averageLength) {
+    return documentScore(definition, idf, termFrequency, length, averageLength);
+  }
+
+  @Override
+  public Object searchStatistics(List<ByteBuffer> payloads) {
+    List<FileIndex> indexes = Lists.newArrayListWithCapacity(payloads.size());
+    for (ByteBuffer payload : payloads) {
+      indexes.add(readPayload(payload));
+    }
+    return mergeStatistics(indexes);
+  }
+
+  /**
+   * Scores a document against a query the way the index does, with the corpus statistics of one
+   * snapshot. This is what a query expression uses, so that a score computed outside the index is
+   * the score the index would have given.
+   *
+   * @param definition the index definition, which carries the analyzer and the BM25 parameters
+   * @param statistics the corpus statistics of the snapshot being read
+   * @param document the text of the document
+   * @param query the query text
+   * @return the BM25 score; zero when the document shares no term with the query
+   */
+  public static double score(
+      TextIndexDefinition definition, CorpusStatistics statistics, String document, String query) {
+    List<String> documentTokens = definition.analyze(document);
+    List<String> queryTokens = definition.analyze(query);
+    if (documentTokens.isEmpty() || queryTokens.isEmpty() || statistics == null) {
+      return 0.0;
+    }
+
+    Map<String, Integer> documentTerms = termFrequency(documentTokens);
+    Map<String, Integer> queryTerms = termFrequency(queryTokens);
+    double score = 0.0;
+    for (Map.Entry<String, Integer> queryTerm : queryTerms.entrySet()) {
+      int frequency = documentTerms.getOrDefault(queryTerm.getKey(), 0);
+      if (frequency == 0) {
+        continue;
+      }
+
+      int documents = statistics.documentFrequency().getOrDefault(queryTerm.getKey(), 0);
+      double idf =
+          Math.log(1.0 + (statistics.totalDocuments() - documents + 0.5) / (documents + 0.5));
+      score +=
+          queryTerm.getValue()
+              * documentScore(
+                  definition, idf, frequency, documentTokens.size(), statistics.averageLength());
+    }
+
+    return score;
+  }
+
+  private static Map<String, Integer> termFrequency(List<String> tokens) {
+    Map<String, Integer> frequency = Maps.newHashMap();
+    for (String token : tokens) {
+      frequency.merge(token, 1, Integer::sum);
+    }
+    return frequency;
+  }
+
+  private static double documentScore(
+      TextIndexDefinition definition,
+      double idf,
+      int termFrequency,
+      int length,
+      double averageLength) {
     double frequency = termFrequency;
     // with no corpus length to normalize against, only the saturation applies
     double lengthNorm = averageLength == 0.0 ? 1.0 : (double) length / averageLength;
@@ -427,8 +494,14 @@ public final class TextIndexAdapter implements IndexAdapter, java.io.Serializabl
     }
   }
 
-  /** Corpus-wide statistics merged from the local statistics of every index file. */
-  private static final class CorpusStatistics {
+  /**
+   * Corpus-wide statistics of one index snapshot, merged from the local statistics of every index
+   * file. A BM25 score is a function of these, which is why an engine that scores rows outside the
+   * index, a query expression for instance, needs them.
+   */
+  public static final class CorpusStatistics implements java.io.Serializable {
+    private static final long serialVersionUID = 1L;
+
     private final long totalDocuments;
     private final double averageLength;
     private final Map<String, Integer> documentFrequency;
@@ -437,7 +510,29 @@ public final class TextIndexAdapter implements IndexAdapter, java.io.Serializabl
         long totalDocuments, double averageLength, Map<String, Integer> documentFrequency) {
       this.totalDocuments = totalDocuments;
       this.averageLength = averageLength;
-      this.documentFrequency = documentFrequency;
+      this.documentFrequency = ImmutableMap.copyOf(documentFrequency);
+    }
+
+    /**
+     * Statistics with nothing in them, for an expression that has not been bound to an index yet.
+     */
+    public static CorpusStatistics empty() {
+      return new CorpusStatistics(0, 0.0, Maps.newHashMap());
+    }
+
+    /** The number of documents in the snapshot the statistics were merged from. */
+    public long totalDocuments() {
+      return totalDocuments;
+    }
+
+    /** The average document length of that snapshot, in tokens. */
+    public double averageLength() {
+      return averageLength;
+    }
+
+    /** How many documents of that snapshot contain each term. */
+    public Map<String, Integer> documentFrequency() {
+      return documentFrequency;
     }
   }
 

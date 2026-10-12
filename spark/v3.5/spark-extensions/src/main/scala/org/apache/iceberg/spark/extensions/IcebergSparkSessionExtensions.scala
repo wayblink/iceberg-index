@@ -36,6 +36,8 @@ import org.apache.spark.sql.execution.datasources.v2.ExtendedDataSourceV2Strateg
 class IcebergSparkSessionExtensions extends (SparkSessionExtensions => Unit) {
 
   private val VEC_DISTANCE = "vec_distance"
+  private val TEXT_SCORE = "text_score"
+  private val TEXT_MATCH = "match"
 
   override def apply(extensions: SparkSessionExtensions): Unit = {
     // parser extensions
@@ -58,6 +60,30 @@ class IcebergSparkSessionExtensions extends (SparkSessionExtensions => Unit) {
     }
     extensions.injectOptimizerRule { spark =>
       org.apache.iceberg.spark.index.RewriteVectorSearch(spark)
+    }
+
+    // text score and match, which a rule binds to the statistics of the index it finds, for the
+    // same reason a vector distance is bound to the metric of its index
+    extensions.injectFunction {
+      (
+        new FunctionIdentifier(TEXT_SCORE),
+        new ExpressionInfo(TEXT_SCORE, "text_score(text, query): BM25 score against a query"),
+        (args: Seq[Expression]) =>
+          // the rewrite rule binds the definition and the statistics to the index it finds
+          org.apache.iceberg.spark.index.TextScoreExpression(null, null, args(0), args(1)))
+    }
+    extensions.injectFunction {
+      (
+        new FunctionIdentifier(TEXT_MATCH),
+        new ExpressionInfo(TEXT_MATCH, "match(text, query): whether a text matches a query"),
+        (args: Seq[Expression]) =>
+          org.apache.iceberg.spark.index.TextMatchExpression(
+            null,
+            null,
+            org.apache.iceberg.spark.index.TextScoreExpression(null, null, args(0), args(1))))
+    }
+    extensions.injectOptimizerRule { spark =>
+      org.apache.iceberg.spark.index.RewriteTextSearch(spark)
     }
 
     // analyzer extensions

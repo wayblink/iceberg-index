@@ -132,6 +132,45 @@ public final class IndexReader {
    */
   private List<IndexSearchResult> searchCorrelated(
       IndexAdapter adapter, IndexManifestList manifestList, IndexQuery query) {
+    Payloads payloads = readPayloads(adapter, manifestList);
+
+    List<IndexSearchResult> results = Lists.newArrayList();
+    if (!payloads.entry.isEmpty()) {
+      results.addAll(adapter.searchAll(payloads.entry, query.payload(), query.topK()));
+    }
+    if (!payloads.auxiliary.isEmpty()) {
+      results.addAll(adapter.searchAuxiliaryAll(payloads.auxiliary, query.payload(), query.topK()));
+    }
+
+    results.sort(adapter.resultComparator());
+    if (results.size() > query.topK()) {
+      results = Lists.newArrayList(results.subList(0, query.topK()));
+    }
+    return ImmutableList.copyOf(results);
+  }
+
+  /**
+   * Returns the statistics an engine needs to score rows the way the index does, for the snapshot a
+   * query is answered from. Null when the index type has no statistics to merge.
+   *
+   * @throws IllegalArgumentException if the index does not cover the source table snapshot
+   */
+  public Object searchStatistics(IndexQuery query) {
+    Preconditions.checkNotNull(query, "Index query is null");
+    IndexSnapshot snapshot = snapshotForQuery(query);
+    IndexAdapter adapter =
+        IndexTypes.fromType(metadata.indexType()).createAdapter(metadata.definition());
+
+    Payloads payloads = readPayloads(adapter, readManifestList(snapshot));
+    List<ByteBuffer> statisticsPayloads =
+        adapter.writesAuxiliaryFiles() && !payloads.auxiliary.isEmpty()
+            ? payloads.auxiliary
+            : payloads.entry;
+    return adapter.searchStatistics(statisticsPayloads);
+  }
+
+  /** The payloads of every index file of a snapshot, by kind. */
+  private Payloads readPayloads(IndexAdapter adapter, IndexManifestList manifestList) {
     String auxiliaryBlobType = adapter.auxiliaryBlobType();
     List<ByteBuffer> entryPayloads = Lists.newArrayList();
     List<ByteBuffer> auxiliaryPayloads = Lists.newArrayList();
@@ -152,19 +191,17 @@ public final class IndexReader {
       }
     }
 
-    List<IndexSearchResult> results = Lists.newArrayList();
-    if (!entryPayloads.isEmpty()) {
-      results.addAll(adapter.searchAll(entryPayloads, query.payload(), query.topK()));
-    }
-    if (!auxiliaryPayloads.isEmpty()) {
-      results.addAll(adapter.searchAuxiliaryAll(auxiliaryPayloads, query.payload(), query.topK()));
-    }
+    return new Payloads(entryPayloads, auxiliaryPayloads);
+  }
 
-    results.sort(adapter.resultComparator());
-    if (results.size() > query.topK()) {
-      results = Lists.newArrayList(results.subList(0, query.topK()));
+  private static final class Payloads {
+    private final List<ByteBuffer> entry;
+    private final List<ByteBuffer> auxiliary;
+
+    private Payloads(List<ByteBuffer> entry, List<ByteBuffer> auxiliary) {
+      this.entry = entry;
+      this.auxiliary = auxiliary;
     }
-    return ImmutableList.copyOf(results);
   }
 
   /**

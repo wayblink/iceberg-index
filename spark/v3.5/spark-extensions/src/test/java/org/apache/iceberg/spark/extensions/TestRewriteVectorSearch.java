@@ -132,27 +132,17 @@ class TestRewriteVectorSearch {
   }
 
   @Test
-  public void leavesThePlanAloneForAnApproximateIndex() {
+  public void usesAnApproximateIndexAndReRanksExactly() {
     String table = tableWithIndex("docs_hnsw", "hnsw");
 
-    // HNSW candidates have to be re-scored first, which is not part of this stage
-    assertThat(
-            planOf(
-                table,
-                String.format(
-                    "SELECT id FROM local.%s ORDER BY vec_distance(embedding, array(0.9d, 0.1d)) LIMIT 2",
-                    table)))
-        .doesNotContain("LocalRelation");
+    // an approximate index is used too: its candidates are re-scored exactly before the limit
+    assertThat(planOf(table, nearestNeighbour(table, 2))).contains("LocalRelation");
 
-    // the query still works, through the expression itself
-    List<Row> hits =
-        spark
-            .sql(
-                String.format(
-                    "SELECT id FROM local.%s ORDER BY vec_distance(embedding, array(0.9d, 0.1d)) LIMIT 1",
-                    table))
-            .collectAsList();
-    assertThat(hits.get(0).getLong(0)).isEqualTo(1L);
+    // the table is small enough for the graph to hold every vector, so the re-ranked candidates are
+    // the ones a full scan gives
+    assertThat(search(table, 2)).isEqualTo(fullScan(table, 2));
+    assertThat(search(table, 3)).isEqualTo(fullScan(table, 3));
+    assertThat(search(table, 4)).isEqualTo(fullScan(table, 4));
   }
 
   @Test

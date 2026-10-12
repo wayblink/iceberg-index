@@ -275,19 +275,29 @@ public final class VectorIndexAdapter implements IndexAdapter, java.io.Serializa
       HnswIndex<Long, float[], VectorItem, Float> index =
           HnswIndex.load(new ByteArrayInputStream(graph));
       index.setEf(definition.efSearch());
-      List<SearchResult<VectorItem, Float>> nearest = index.findNearest(queryVector, topK);
+
+      // the graph is asked for as many candidates as its search width allows, not just for the
+      // number asked for: the traversal is the same either way, and a wider candidate set gives the
+      // exact re-scoring below more true neighbours to order
+      int candidates = Math.max(topK, definition.efSearch());
+      List<SearchResult<VectorItem, Float>> nearest = index.findNearest(queryVector, candidates);
 
       List<IndexSearchResult> results = Lists.newArrayList();
       for (SearchResult<VectorItem, Float> result : nearest) {
         int id = Math.toIntExact(result.item().id());
         Preconditions.checkArgument(
             id >= 0 && id < mappingCount, "HNSW result id out of range: %s", id);
-        // re-score with the exact metric so scores match exact search
+        // re-score with the exact metric, on the stored vector, so a score is the one exact search
+        // would give
         results.add(
             IndexSearchResult.of(
                 dataFiles[id], positions[id], score(queryVector, result.item().vector())));
       }
-      return results;
+
+      // the candidates come back in the order the graph ranked them, which is not necessarily the
+      // order of the exact scores, so the re-scored results are ordered by those before truncating
+      results.sort(resultComparator());
+      return results.size() > topK ? Lists.newArrayList(results.subList(0, topK)) : results;
     } catch (IOException e) {
       throw new UncheckedIOException("Failed to search the HNSW index payload", e);
     }

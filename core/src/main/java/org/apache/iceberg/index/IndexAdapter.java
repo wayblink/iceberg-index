@@ -107,6 +107,21 @@ public interface IndexAdapter {
    *
    * @throws UnsupportedOperationException when this index type does not encode raw column values
    */
+  /**
+   * Statistics this adapter needs in order to score rows itself, merged from the payloads of one
+   * index snapshot. An engine that computes scores outside the index, a query expression for
+   * instance, asks the reader for these so that its scores are the ones the index would give.
+   *
+   * <p>Only adapters that {@link #searchesAllPayloadsTogether()} have statistics to merge; the
+   * others return null, because scoring a row needs nothing but the row and the query.
+   *
+   * @param payloads the payloads of the index files of one snapshot
+   * @return the merged statistics, or null if there are none
+   */
+  default Object searchStatistics(List<ByteBuffer> payloads) {
+    return null;
+  }
+
   default byte[] encodeEntryValue(Object columnValue) {
     throw new UnsupportedOperationException(
         "This index type does not encode raw column values: " + definition().type());

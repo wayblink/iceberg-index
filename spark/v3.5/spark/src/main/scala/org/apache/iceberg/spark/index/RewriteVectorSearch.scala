@@ -109,13 +109,13 @@ case class RewriteVectorSearch(spark: SparkSession) extends Rule[LogicalPlan] {
       node: LogicalPlan,
       k: Expression,
       distance: VectorDistanceExpression): Option[LogicalPlan] = {
-    val limit = foldableInt(k).getOrElse(return None)
+    val limit = IndexRewriteSupport.foldableInt(k).getOrElse(return None)
     if (limit <= 0) {
       return None
     }
 
-    val scan = findIcebergScan(node).getOrElse(return None)
-    val sparkTable = icebergTable(scan).getOrElse(return None)
+    val scan = IndexRewriteSupport.findIcebergScan(node).getOrElse(return None)
+    val sparkTable = IndexRewriteSupport.icebergTable(scan).getOrElse(return None)
     val table = sparkTable.table()
 
     // data files never carry the partition columns, so a partitioned table cannot be read this way
@@ -123,11 +123,7 @@ case class RewriteVectorSearch(spark: SparkSession) extends Rule[LogicalPlan] {
       return None
     }
 
-    val names = scan.output.map(attribute => attribute.name)
-    val fields = table.schema().columns().asScala.map(field => field.name()).toSet
-    if (!names.forall(name => fields.contains(name))) {
-      return None
-    }
+    val names = IndexRewriteSupport.scanColumns(scan).getOrElse(return None)
 
     val column = vectorColumn(distance).getOrElse(return None)
     val columnIndex = names.indexOf(column)
@@ -140,11 +136,8 @@ case class RewriteVectorSearch(spark: SparkSession) extends Rule[LogicalPlan] {
       return None
     }
     val definition = index.definition().asInstanceOf[VectorIndexDefinition]
-    if (definition.mode() != IndexMode.EXACT) {
-      return None
-    }
 
-    val snapshotId = scanSnapshotId(sparkTable).getOrElse {
+    val snapshotId = IndexRewriteSupport.scanSnapshotId(sparkTable).getOrElse {
       return None
     }
     // the reader resolves the index snapshot from the parent chain of the table snapshots
@@ -171,7 +164,7 @@ case class RewriteVectorSearch(spark: SparkSession) extends Rule[LogicalPlan] {
       return None
     }
 
-    val tableSchema = SparkSchemaUtil.convert(table.schema())
+    val tableSchema = IndexRewriteSupport.tableSchema(sparkTable)
     val hitRows =
       liveHitRows(reader, table, snapshotId, payload, dataFiles, limit, names, tableSchema)
         .getOrElse(return None)
@@ -199,7 +192,7 @@ case class RewriteVectorSearch(spark: SparkSession) extends Rule[LogicalPlan] {
       Sort(
         Seq(SortOrder(specialized, Ascending)),
         true,
-        LocalRelation(scan.output, internalRows(rows)))
+        LocalRelation(scan.output, IndexRewriteSupport.internalRows(spark, rows)))
     Some(node.withNewChildren(Seq(newSort)))
   }
 
@@ -295,80 +288,6 @@ case class RewriteVectorSearch(spark: SparkSession) extends Rule[LogicalPlan] {
       .toList
   }
 
-  /** The distance of a row to the query vector; a row without a usable vector sorts last. */
-  private def distanceOf(
-      row: Row,
-      columnIndex: Int,
-      query: Array[Float],
-      metric: Metric): Double = {
-    vectorOf(row, columnIndex) match {
-      case Some(vector) if vector.length == query.length =>
-        VectorDistance.distance(metric, vector, query)
-      case _ =>
-        Double.MaxValue
-    }
-  }
-
-  private def vectorOf(row: Row, columnIndex: Int): Option[Array[Float]] = {
-    row.get(columnIndex) match {
-      case values: Seq[Any] =>
-        Some(values.map(value => value.asInstanceOf[Number].floatValue()).toArray)
-      case _ =>
-        None
-    }
-  }
-
-  /** Turns rows into the internal rows a local relation holds. */
-  private def internalRows(rows: List[Row]): Seq[InternalRow] = {
-    if (rows.isEmpty) {
-      Nil
-    } else {
-      spark
-        .createDataFrame(rows.asJava, rows.head.schema)
-        .queryExecution
-        .toRdd
-        .map(row => row.copy())
-        .collect()
-        .toSeq
-    }
-  }
-
-  private def findIcebergScan(plan: LogicalPlan): Option[DataSourceV2Relation] = {
-    plan.collectFirst {
-      case relation: DataSourceV2Relation if icebergTable(relation).isDefined => relation
-    }
-  }
-
-  private def icebergTable(relation: DataSourceV2Relation): Option[SparkTable] = {
-    relation.table match {
-      case sparkTable: SparkTable => Some(sparkTable)
-      case _ => None
-    }
-  }
-
-  /** The table snapshot the scan reads: a pinned one, a branch head, or the current one. */
-  private def scanSnapshotId(sparkTable: SparkTable): Option[Long] = {
-    val pinned = sparkTable.snapshotId()
-    if (pinned != null) {
-      return Some(pinned)
-    }
-
-    val branch = sparkTable.branch()
-    if (branch != null) {
-      val branchSnapshot = SnapshotUtil.latestSnapshot(sparkTable.table(), branch)
-      if (branchSnapshot != null) {
-        return Some(branchSnapshot.snapshotId())
-      }
-    }
-
-    val current = sparkTable.table().currentSnapshot()
-    if (current != null) {
-      Some(current.snapshotId())
-    } else {
-      None
-    }
-  }
-
   private def vectorColumn(distance: VectorDistanceExpression): Option[String] = {
     distance.vector match {
       case attribute: AttributeReference => Some(attribute.name)
@@ -386,28 +305,24 @@ case class RewriteVectorSearch(spark: SparkSession) extends Rule[LogicalPlan] {
     }
   }
 
-  private def foldableInt(expression: Expression): Option[Int] = {
-    if (expression.foldable) {
-      expression.eval(EmptyRow) match {
-        case value: Int => Some(value)
-        case value: Long => Some(value.toInt)
-        case _ => None
-      }
-    } else {
-      None
-    }
-  }
-
+  /** Whether a sort order is an ascending distance, which is what a nearest-neighbour query is. */
   private def isAscendingDistance(order: SortOrder): Boolean = {
     order.direction == Ascending && order.child.isInstanceOf[VectorDistanceExpression]
   }
 
-  /**
-   * Reads the rows the index points at, with the columns the scan was asked for and in its order.
-   * Returns nothing when the rows cannot be read that way, which is the case for a partitioned
-   * table, whose data files do not carry the partition columns, and for a scan that asks for
-   * metadata columns.
-   */
-  private val EmptyRow: InternalRow = new GenericInternalRow(new Array[Any](0))
+  /** The distance of a row to the query vector; a row without a usable vector sorts last. */
+  private def distanceOf(
+      row: Row,
+      columnIndex: Int,
+      query: Array[Float],
+      metric: Metric): Double = {
+    IndexRewriteSupport.arrayValue(row, columnIndex) match {
+      case Some(vector) if vector.length == query.length =>
+        VectorDistance.distance(metric, vector, query)
+      case _ =>
+        Double.MaxValue
+    }
+  }
 
+  private val EmptyRow: InternalRow = new GenericInternalRow(new Array[Any](0))
 }
