@@ -242,7 +242,8 @@ parser / analyzer / optimizer / planner / 函数注册表的<strong>唯一入口
   <tr><th>事项</th><th>内容</th><th>所属阶段</th></tr>
   <tr><td><span class="badge todo">TODO</span> 索引命名/别名</td><td>给索命名，查询里显式指定用哪个索引，解决同列同类型多索引的歧义（决策点 4 的 C 方案）</td><td>P2 之后</td></tr>
   <tr><td>残差扫描 + 回表取列</td><td><code>AT_OR_BEFORE</code> 的差额扫描、索引命中按当前删除过滤、类型化列输出</td><td>P3</td></tr>
-  <tr><td>自动改写</td><td><code>vec_distance</code> 表达式 + <code>Sort/Limit</code> 规则 + 物理计划；HNSW 粗排后精确重排</td><td>P2 / P4</td></tr>
+  <tr><td><span class="badge done">已完成</span> 自动改写（P2）</td><td><code>vec_distance</code> 表达式 + <code>Sort/Limit</code> 规则 + 命中回表；仅当索引与读取快照严格绑定、EXACT 模式且全覆盖时改写，否则计划原样保留</td><td>P2</td></tr>
+  <tr><td><span class="badge todo">TODO</span> HNSW 粗排后精确重排</td><td>近似索引先取候选再按距离精确重排，作为 P4 的一部分</td><td>P4</td></tr>
   <tr><td>文本检索入口</td><td><code>text_score</code> 表达式与 <code>MATCH</code> 形态</td><td>P4</td></tr>
 </table>
 

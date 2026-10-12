@@ -19,6 +19,9 @@
 package org.apache.iceberg.spark.extensions
 
 import org.apache.spark.sql.SparkSessionExtensions
+import org.apache.spark.sql.catalyst.FunctionIdentifier
+import org.apache.spark.sql.catalyst.expressions.Expression
+import org.apache.spark.sql.catalyst.expressions.ExpressionInfo
 import org.apache.spark.sql.catalyst.analysis.CheckViews
 import org.apache.spark.sql.catalyst.analysis.ProcedureArgumentCoercion
 import org.apache.spark.sql.catalyst.analysis.ResolveProcedures
@@ -32,12 +35,30 @@ import org.apache.spark.sql.execution.datasources.v2.ExtendedDataSourceV2Strateg
 
 class IcebergSparkSessionExtensions extends (SparkSessionExtensions => Unit) {
 
+  private val VEC_DISTANCE = "vec_distance"
+
   override def apply(extensions: SparkSessionExtensions): Unit = {
     // parser extensions
     extensions.injectParser { case (_, parser) => new IcebergSparkSqlExtensionsParser(parser) }
 
     // index table-valued functions
     org.apache.iceberg.spark.index.IndexTableFunctions.register(extensions)
+
+    // vector distance expression and the rule that rewrites a nearest-neighbour query into an
+    // index lookup
+    extensions.injectFunction {
+      (
+        new FunctionIdentifier(VEC_DISTANCE),
+        new ExpressionInfo(VEC_DISTANCE, "vec_distance(vector, query): distance to a query vector"),
+        (args: Seq[Expression]) =>
+          org.apache.iceberg.spark.index.VectorDistanceExpression(
+            org.apache.iceberg.index.vector.VectorIndexDefinition.Metric.COSINE,
+            args(0),
+            args(1)))
+    }
+    extensions.injectOptimizerRule { spark =>
+      org.apache.iceberg.spark.index.RewriteVectorSearch(spark)
+    }
 
     // analyzer extensions
     extensions.injectResolutionRule { spark => ResolveProcedures(spark) }

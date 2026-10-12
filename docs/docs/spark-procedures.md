@@ -1532,3 +1532,37 @@ JOIN local.db.docs d ON get_json_object(h.row, '$.id') = CAST(d.id AS string);
     The `row` column is a JSON string. Reading the matched rows back as typed columns is part of the
     residual-scan work that the automatic rewrite needs; until then `get_json_object` can pick the
     columns out.
+
+## Vector distance and automatic index use
+
+`vec_distance(vector, query)` returns the distance between a vector column and a query vector, for
+which **smaller always means closer**: cosine distance is `1 - cos`, dot product distance is
+`-dot`, and euclidean distance is the L2 norm. The metric is not part of the signature; the
+expression uses cosine unless the rewrite below specializes it to the metric of the index it uses.
+
+A nearest-neighbour query written the ordinary way can be answered by a vector index:
+
+```sql
+SELECT id, body FROM local.db.docs
+ORDER BY vec_distance(embedding, array(0.95d, 0.05d))
+LIMIT 10;
+```
+
+The optimizer rewrites this into an index lookup, so only the matched rows are read instead of the
+whole table. It does so only when the index can answer the query on its own:
+
+- the column has a vector index,
+- the index snapshot is bound to exactly the snapshot the scan reads,
+- the index is in exact mode, not HNSW,
+- the index covers every data file of that snapshot.
+
+If any of these does not hold, the plan is left exactly as it was, and the query still returns
+correct results, just by scanning. A warning is logged when the matched rows cannot be read back.
+
+An approximate (HNSW) index is left alone for now: its candidates have to be re-scored first, which
+is planned work. `EXPLAIN` shows whether the rewrite happened, by the absence of the table scan:
+
+```sql
+EXPLAIN SELECT id FROM local.db.docs
+ORDER BY vec_distance(embedding, array(0.95d, 0.05d)) LIMIT 10;
+```

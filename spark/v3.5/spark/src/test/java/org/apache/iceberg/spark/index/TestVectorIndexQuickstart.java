@@ -32,6 +32,7 @@ import org.apache.iceberg.index.IndexQuery;
 import org.apache.iceberg.index.IndexReader;
 import org.apache.iceberg.index.IndexSearchResult;
 import org.apache.iceberg.index.SidecarIndexCatalog;
+import org.apache.iceberg.index.spark.SparkIndexBuilder;
 import org.apache.iceberg.index.vector.VectorIndexAdapter;
 import org.apache.iceberg.index.vector.VectorIndexDefinition;
 import org.apache.iceberg.index.vector.VectorIndexDefinition.Metric;

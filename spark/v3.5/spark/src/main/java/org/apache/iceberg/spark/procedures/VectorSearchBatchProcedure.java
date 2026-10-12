@@ -19,8 +19,8 @@
 package org.apache.iceberg.spark.procedures;
 
 import java.util.List;
+import org.apache.iceberg.index.spark.VectorIndexSearch;
 import org.apache.iceberg.relocated.com.google.common.collect.Lists;
-import org.apache.iceberg.spark.index.VectorIndexSearch;
 import org.apache.iceberg.spark.procedures.SparkProcedures.ProcedureBuilder;
 import org.apache.spark.sql.Row;
 import org.apache.spark.sql.catalyst.InternalRow;
