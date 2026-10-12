@@ -1569,3 +1569,32 @@ is planned work. `EXPLAIN` shows whether the rewrite happened, by the absence of
 EXPLAIN SELECT id FROM local.db.docs
 ORDER BY vec_distance(embedding, array(0.95d, 0.05d)) LIMIT 10;
 ```
+
+## Text search in SQL
+
+A text search can also be written the ordinary way, in a ranking form and a filter form:
+
+```sql
+-- the best matching rows, most relevant first
+SELECT id, body FROM local.db.docs
+ORDER BY text_score(body, 'iceberg table format') DESC LIMIT 10;
+
+-- the matching rows, which can be combined with other predicates
+SELECT id, body FROM local.db.docs
+WHERE match(body, 'iceberg table format') AND year > 2020;
+```
+
+`text_score` returns the BM25 score, for which **higher is more relevant**, so the ordering is
+descending. `match` is its filter form: a row matches when it shares at least one term with the
+query.
+
+Both need a text index on the column, and both are answered from an index snapshot bound to exactly
+the snapshot being read. A BM25 score depends on corpus statistics, the document frequency of the
+query terms and the average document length, so an older snapshot would give scores a full scan
+cannot reproduce, and the data files it does not cover would not be scored at all. An index that is
+behind therefore means the query scans, and a query on a column without a text index says so
+instead of returning rows in an arbitrary order.
+
+Unlike `vec_distance`, `text_score` cannot be computed without an index: the statistics it needs
+live in the index, not in the row.
+
