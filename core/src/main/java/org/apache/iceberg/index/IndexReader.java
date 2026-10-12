@@ -22,13 +22,18 @@ import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.nio.ByteBuffer;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
+import org.apache.iceberg.Snapshot;
+import org.apache.iceberg.Table;
 import org.apache.iceberg.io.FileIO;
 import org.apache.iceberg.relocated.com.google.common.base.Preconditions;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableList;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableSet;
 import org.apache.iceberg.relocated.com.google.common.collect.Lists;
+import org.apache.iceberg.relocated.com.google.common.collect.Maps;
 import org.apache.iceberg.relocated.com.google.common.collect.Sets;
+import org.apache.iceberg.util.SnapshotUtil;
 
 /**
  * Reads an index snapshot and exposes exact top-k search and coverage information.
@@ -50,6 +55,7 @@ public final class IndexReader {
   private final IndexMetadata metadata;
   private final FileIO fileIO;
   private final IndexFileContainer container;
+  private final Table sourceTable;
 
   public IndexReader(IndexMetadata metadata, FileIO fileIO) {
     this(metadata, fileIO, new PuffinIndexFileContainer());
@@ -59,6 +65,19 @@ public final class IndexReader {
     this.metadata = Preconditions.checkNotNull(metadata, "Index metadata is null");
     this.fileIO = Preconditions.checkNotNull(fileIO, "File IO is null");
     this.container = Preconditions.checkNotNull(container, "Index file container is null");
+    this.sourceTable = null;
+  }
+
+  /**
+   * A reader that can also answer a query from an index snapshot older than the requested source
+   * table snapshot. That needs the table, because the order of its snapshots comes from their
+   * parent chain: snapshot ids are not ordered.
+   */
+  public IndexReader(IndexMetadata metadata, Table sourceTable) {
+    this.metadata = Preconditions.checkNotNull(metadata, "Index metadata is null");
+    this.fileIO = Preconditions.checkNotNull(sourceTable, "Source table is null").io();
+    this.container = new PuffinIndexFileContainer();
+    this.sourceTable = sourceTable;
   }
 
   /**
@@ -200,18 +219,42 @@ public final class IndexReader {
   }
 
   /**
-   * Returns the newest index snapshot whose source table snapshot is at or before the given one.
+   * Returns the newest index snapshot that may answer a query about the given source table
+   * snapshot: the one whose source snapshot is the closest ancestor of it.
+   *
+   * <p>The order comes from the parent chain of the table's snapshots and never from snapshot ids,
+   * which are random. This is why the reader needs the source table for this mode.
    */
   private IndexSnapshot latestSnapshotAtOrBefore(long sourceTableSnapshotId) {
-    IndexSnapshot newest = null;
-    for (IndexSnapshot snapshot : metadata.snapshots()) {
-      if (snapshot.sourceTableSnapshotId() <= sourceTableSnapshotId
-          && (newest == null
-              || snapshot.sourceTableSnapshotId() > newest.sourceTableSnapshotId())) {
-        newest = snapshot;
+    Preconditions.checkState(
+        sourceTable != null,
+        "Index %s cannot answer from an older index snapshot without the source table",
+        metadata.indexUuid());
+
+    Snapshot snapshot = sourceTable.snapshot(sourceTableSnapshotId);
+    if (snapshot == null) {
+      return null;
+    }
+
+    // index snapshots built from the same source snapshot are ordered by their own id, which is
+    // sequential
+    Map<Long, IndexSnapshot> newestBySource = Maps.newHashMap();
+    for (IndexSnapshot candidate : metadata.snapshots()) {
+      IndexSnapshot known = newestBySource.get(candidate.sourceTableSnapshotId());
+      if (known == null || candidate.snapshotId() > known.snapshotId()) {
+        newestBySource.put(candidate.sourceTableSnapshotId(), candidate);
       }
     }
-    return newest;
+
+    for (Snapshot ancestor :
+        SnapshotUtil.ancestorsOf(sourceTableSnapshotId, sourceTable::snapshot)) {
+      IndexSnapshot candidate = newestBySource.get(ancestor.snapshotId());
+      if (candidate != null) {
+        return candidate;
+      }
+    }
+
+    return null;
   }
 
   private IndexManifestList readManifestList(IndexSnapshot snapshot) {

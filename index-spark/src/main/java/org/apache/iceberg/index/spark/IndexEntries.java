@@ -20,7 +20,8 @@ package org.apache.iceberg.index.spark;
 
 import java.io.IOException;
 import java.io.UncheckedIOException;
-import java.util.Iterator;
+import java.util.ArrayList;
+import java.util.Collection;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -35,13 +36,17 @@ import org.apache.iceberg.relocated.com.google.common.collect.Lists;
 import org.apache.iceberg.relocated.com.google.common.collect.Maps;
 import org.apache.iceberg.relocated.com.google.common.collect.Sets;
 import org.apache.iceberg.types.Types;
+import org.apache.spark.api.java.JavaPairRDD;
 import org.apache.spark.api.java.JavaRDD;
-import org.apache.spark.api.java.function.FlatMapFunction;
+import org.apache.spark.api.java.function.Function;
+import org.apache.spark.api.java.function.PairFunction;
 import org.apache.spark.sql.Dataset;
 import org.apache.spark.sql.Row;
 import org.apache.spark.sql.RowFactory;
 import org.apache.spark.sql.SparkSession;
+import org.apache.spark.sql.catalyst.expressions.GenericRowWithSchema;
 import org.apache.spark.sql.types.DataTypes;
+import org.apache.spark.sql.types.StructField;
 import org.apache.spark.sql.types.StructType;
 import scala.Tuple2;
 
@@ -90,65 +95,204 @@ public final class IndexEntries {
       SparkSession spark, Table table, long snapshotId, String column, IndexAdapter adapter) {
     Schema tableSchema = table.schema();
 
+    // the data read needs the indexed column plus the columns referenced by equality deletes
+    Set<String> columnsToRead = Sets.newLinkedHashSet();
+    columnsToRead.add(column);
+    for (FileScanTask task : scanTasks(table, snapshotId)) {
+      columnsToRead.addAll(
+          equalityColumns(tableSchema, equalityDeletes(Lists.newArrayList(task.deletes()))));
+    }
+    List<String> readColumns = Lists.newArrayList(columnsToRead);
+
     Dataset<Row> entries = null;
     for (FileScanTask task : scanTasks(table, snapshotId)) {
       String dataFile = task.file().location().toString();
-      List<DeleteFile> deleteFiles = Lists.newArrayList(task.deletes());
 
-      // delete files are read on the driver so the executor-side filter is a simple lookup
-      long[] deletedPositions = readDeletedPositions(spark, positionDeletes(deleteFiles), dataFile);
-      List<String> keyColumns = equalityColumns(tableSchema, equalityDeletes(deleteFiles));
-      Set<String> equalityKeys = readEqualityKeys(spark, equalityDeletes(deleteFiles), keyColumns);
-
-      // the data read needs the indexed column plus the columns referenced by equality deletes
-      Set<String> columnsToRead = Sets.newLinkedHashSet();
-      columnsToRead.add(column);
-      columnsToRead.addAll(keyColumns);
-      List<String> readColumns = Lists.newArrayList(columnsToRead);
-      List<String> capturedKeyColumns = keyColumns;
-      long[] capturedDeletedPositions = deletedPositions;
-      Set<String> capturedEqualityKeys = equalityKeys;
-
-      Dataset<Row> data = spark.read().parquet(dataFile);
-      for (String readColumn : readColumns) {
-        data = data.select(readColumn);
-      }
-
+      List<String> capturedReadColumns = readColumns;
       JavaRDD<Row> entryRows =
-          data.toJavaRDD()
-              .zipWithIndex()
-              .mapPartitions(
-                  (FlatMapFunction<Iterator<Tuple2<Row, Long>>, Row>)
-                      iterator -> {
-                        List<Row> fileEntries = Lists.newArrayList();
-                        while (iterator.hasNext()) {
-                          Tuple2<Row, Long> tuple = iterator.next();
-                          long position = tuple._2();
-                          if (containsPosition(capturedDeletedPositions, position)) {
-                            continue;
-                          }
-
-                          Row row = tuple._1();
-                          if (!capturedEqualityKeys.isEmpty()
-                              && capturedEqualityKeys.contains(
-                                  equalityKey(row, capturedKeyColumns))) {
-                            continue;
-                          }
-
-                          fileEntries.add(
+          liveRowsOf(spark, table, task, capturedReadColumns, null, null)
+              .mapToPair(
+                  (PairFunction<Tuple2<Long, Row>, Long, Row>)
+                      entry ->
+                          new Tuple2<>(
+                              entry._1(),
                               RowFactory.create(
                                   dataFile,
-                                  position,
-                                  adapter.encodeEntryValue(columnValue(row, column))));
-                        }
-                        return fileEntries.iterator();
-                      });
+                                  entry._1(),
+                                  adapter.encodeEntryValue(
+                                      columnValue(
+                                          entry._2(), capturedReadColumns.indexOf(column))))))
+              .values();
 
       Dataset<Row> fileEntries = spark.createDataFrame(entryRows, SCHEMA);
       entries = entries == null ? fileEntries : entries.union(fileEntries);
     }
 
     return entries == null ? spark.createDataFrame(Lists.newArrayList(), SCHEMA) : entries;
+  }
+
+  /**
+   * Reads the live rows of a table snapshot at the given positions, keyed by data file and then by
+   * row position. A data file that is not in the map is not read at all; the delete files of the
+   * snapshot are applied, so positions of removed rows are absent from the result.
+   *
+   * @param spark the Spark session
+   * @param table the Iceberg table to read
+   * @param snapshotId the table snapshot to read; its delete files are applied
+   * @param positionsByFile the row positions to read, per data file
+   * @param columns the columns to return, in this order
+   * @param readSchema the schema to read the data files with, or null to infer it from the files
+   */
+  public static Map<String, Map<Long, Row>> rowsAt(
+      SparkSession spark,
+      Table table,
+      long snapshotId,
+      Map<String, ? extends Collection<Long>> positionsByFile,
+      List<String> columns,
+      StructType readSchema) {
+    Map<String, Map<Long, Row>> rowsByFile = Maps.newLinkedHashMap();
+    for (FileScanTask task : scanTasks(table, snapshotId)) {
+      String dataFile = task.file().location().toString();
+      Collection<Long> positions = positionsByFile.get(dataFile);
+      if (positions == null) {
+        continue;
+      }
+
+      Map<Long, Row> rows = Maps.newLinkedHashMap();
+      for (Tuple2<Long, Row> entry :
+          liveRowsOf(spark, table, task, columns, positions, readSchema).collect()) {
+        rows.put(entry._1(), entry._2());
+      }
+      rowsByFile.put(dataFile, rows);
+    }
+
+    return rowsByFile;
+  }
+
+  /**
+   * Reads all live rows of the given data files of a table snapshot, with the snapshot's delete
+   * files applied. Used to scan the data files an index does not cover yet.
+   *
+   * @param spark the Spark session
+   * @param table the Iceberg table to read
+   * @param snapshotId the table snapshot to read; its delete files are applied
+   * @param dataFiles the data files to read
+   * @param columns the columns to return, in this order
+   * @param readSchema the schema to read the data files with
+   */
+  public static Dataset<Row> liveRows(
+      SparkSession spark,
+      Table table,
+      long snapshotId,
+      Collection<String> dataFiles,
+      List<String> columns,
+      StructType readSchema) {
+    List<JavaRDD<Row>> perFile = Lists.newArrayList();
+    for (FileScanTask task : scanTasks(table, snapshotId)) {
+      if (dataFiles.contains(task.file().location().toString())) {
+        perFile.add(liveRowsOf(spark, table, task, columns, null, readSchema).values());
+      }
+    }
+
+    if (perFile.isEmpty()) {
+      return spark.createDataFrame(new ArrayList<Row>(), schemaFor(columns, readSchema));
+    }
+
+    JavaRDD<Row> rows = perFile.get(0);
+    for (int i = 1; i < perFile.size(); i++) {
+      rows = rows.union(perFile.get(i));
+    }
+
+    return spark.createDataFrame(rows, schemaFor(columns, readSchema));
+  }
+
+  /**
+   * Reads the live rows of one data file, paired with their position, which is the row ordinal of
+   * the data file. Rows removed by the snapshot's delete files are left out. An empty position
+   * collection means every row of the file.
+   */
+  private static JavaPairRDD<Long, Row> liveRowsOf(
+      SparkSession spark,
+      Table table,
+      FileScanTask task,
+      List<String> columns,
+      Collection<Long> positions,
+      StructType readSchema) {
+    Schema tableSchema = table.schema();
+    String dataFile = task.file().location().toString();
+    List<DeleteFile> deleteFiles = Lists.newArrayList(task.deletes());
+
+    // delete files are read on the driver so the executor-side filter is a simple lookup
+    long[] deletedPositions = readDeletedPositions(spark, positionDeletes(deleteFiles), dataFile);
+    List<String> keyColumns = equalityColumns(tableSchema, equalityDeletes(deleteFiles));
+    Set<String> equalityKeys = readEqualityKeys(spark, equalityDeletes(deleteFiles), keyColumns);
+
+    Set<String> columnsToRead = Sets.newLinkedHashSet();
+    columnsToRead.addAll(columns);
+    columnsToRead.addAll(keyColumns);
+    List<String> readColumns = Lists.newArrayList(columnsToRead);
+
+    StructType readWith = readSchema == null ? null : schemaFor(readColumns, readSchema);
+    // the projection to the requested columns happens below, by name, so the read itself can take
+    // every column the file has
+    Dataset<Row> data =
+        readWith == null
+            ? spark.read().parquet(dataFile)
+            : spark.read().schema(readWith).parquet(dataFile);
+
+    List<String> capturedReadColumns = readColumns;
+    List<String> capturedColumns = columns;
+    return data.toJavaRDD()
+        .zipWithIndex()
+        .filter(
+            (Function<Tuple2<Row, Long>, Boolean>)
+                tuple -> isLive(tuple, positions, deletedPositions, equalityKeys, keyColumns))
+        .mapToPair(
+            (PairFunction<Tuple2<Row, Long>, Long, Row>)
+                tuple ->
+                    new Tuple2<>(
+                        tuple._2(),
+                        new GenericRowWithSchema(
+                            asValues(tuple._1(), capturedReadColumns, capturedColumns),
+                            schemaFor(capturedColumns, tuple._1().schema()))));
+  }
+
+  /** Whether a row of a data file survives its position and equality delete files. */
+  private static boolean isLive(
+      Tuple2<Row, Long> tuple,
+      Collection<Long> positions,
+      long[] deletedPositions,
+      Set<String> equalityKeys,
+      List<String> keyColumns) {
+    long position = tuple._2();
+    if (positions != null && !positions.isEmpty() && !positions.contains(position)) {
+      return false;
+    }
+
+    if (containsPosition(deletedPositions, position)) {
+      return false;
+    }
+
+    return equalityKeys.isEmpty() || !equalityKeys.contains(equalityKey(tuple._1(), keyColumns));
+  }
+
+  private static Object[] asValues(Row row, List<String> readColumns, List<String> columns) {
+    Object[] values = new Object[columns.size()];
+    for (int i = 0; i < values.length; i++) {
+      values[i] = row.get(row.fieldIndex(columns.get(i)));
+    }
+    return values;
+  }
+
+  /** The schema of the given columns, taken from the schema they are read with. */
+  private static StructType schemaFor(List<String> columns, StructType readSchema) {
+    StructField[] fields = new StructField[columns.size()];
+    for (int i = 0; i < fields.length; i++) {
+      StructField field = readSchema.apply(columns.get(i));
+      fields[i] =
+          new StructField(field.name(), field.dataType(), field.nullable(), field.metadata());
+    }
+    return new StructType(fields);
   }
 
   /** Lists the data file locations of the given table snapshot, on the driver. */
@@ -296,8 +440,8 @@ public final class IndexEntries {
    * Spark rows as Scala sequences, which are converted to Java lists here so adapters do not need
    * Scala.
    */
-  private static Object columnValue(Row row, String column) {
-    Object value = row.get(row.fieldIndex(column));
+  private static Object columnValue(Row row, int columnIndex) {
+    Object value = row.get(columnIndex);
     if (value instanceof scala.collection.Seq) {
       return scala.collection.JavaConverters.seqAsJavaList((scala.collection.Seq<?>) value);
     }

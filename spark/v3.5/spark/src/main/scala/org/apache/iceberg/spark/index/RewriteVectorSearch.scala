@@ -18,16 +18,23 @@
  */
 package org.apache.iceberg.spark.index
 
+import java.nio.ByteBuffer
+
 import scala.collection.JavaConverters._
+import scala.util.control.NonFatal
 
 import org.apache.iceberg.util.SnapshotUtil
 import org.apache.iceberg.index.IndexQuery
+import org.apache.iceberg.index.IndexQuery.Consistency
 import org.apache.iceberg.index.IndexReader
 import org.apache.iceberg.index.IndexSearchResult
 import org.apache.iceberg.index.vector.VectorIndexAdapter
 import org.apache.iceberg.index.vector.VectorIndexDefinition
+import org.apache.iceberg.index.vector.VectorDistance
 import org.apache.iceberg.index.vector.VectorIndexDefinition.IndexMode
+import org.apache.iceberg.index.vector.VectorIndexDefinition.Metric
 import org.apache.iceberg.index.spark.{IndexEntries, VectorIndexes}
+import org.apache.iceberg.spark.SparkSchemaUtil
 import org.apache.iceberg.spark.SparkSchemaUtil
 import org.apache.iceberg.spark.source.SparkTable
 import org.apache.spark.sql.catalyst.InternalRow
@@ -36,12 +43,15 @@ import org.apache.spark.sql.catalyst.expressions.Ascending
 import org.apache.spark.sql.catalyst.expressions.Expression
 import org.apache.spark.sql.catalyst.expressions.GenericInternalRow
 import org.apache.spark.sql.catalyst.expressions.SortOrder
+import org.apache.spark.sql.Row
+import org.apache.spark.sql.Row
 import org.apache.spark.sql.catalyst.plans.logical.GlobalLimit
 import org.apache.spark.sql.catalyst.plans.logical.LocalRelation
 import org.apache.spark.sql.catalyst.plans.logical.LogicalPlan
 import org.apache.spark.sql.catalyst.plans.logical.Sort
 import org.apache.spark.sql.catalyst.rules.Rule
 import org.apache.spark.sql.execution.datasources.v2.DataSourceV2Relation
+import org.apache.spark.sql.types.StructType
 import org.apache.spark.sql.SparkSession
 import org.slf4j.Logger
 import org.slf4j.LoggerFactory
@@ -60,13 +70,18 @@ import org.slf4j.LoggerFactory
  * and re-computes the distance. That is what keeps the output schema and the row order of the
  * original query intact.
  *
- * <p>What this deliberately does not do: an approximate (HNSW) index is left alone because its
- * candidates have to be re-scored first, and a stale index is left alone because the data files it
- * does not cover would have to be scanned as well. Both are later stages.
+ * <p>An index that is behind the snapshot being read is still used, together with a scan of the
+ * data files it does not cover, so a query does not have to wait for a refresh. Rows the index
+ * points at are read through the same delete-aware reader the index is built with, so rows removed
+ * after the index snapshot are not returned. What is deliberately left alone is an approximate
+ * (HNSW) index, whose candidates have to be re-scored first, which is later work.
  */
 case class RewriteVectorSearch(spark: SparkSession) extends Rule[LogicalPlan] {
 
   private val logger: Logger = LoggerFactory.getLogger(getClass)
+
+  /** How often more hits are asked for when delete files removed some of them. */
+  private val MaxHitRetries = 8
 
   override def apply(plan: LogicalPlan): LogicalPlan = {
     plan.transformDown {
@@ -103,7 +118,23 @@ case class RewriteVectorSearch(spark: SparkSession) extends Rule[LogicalPlan] {
     val sparkTable = icebergTable(scan).getOrElse(return None)
     val table = sparkTable.table()
 
+    // data files never carry the partition columns, so a partitioned table cannot be read this way
+    if (!table.spec().isUnpartitioned()) {
+      return None
+    }
+
+    val names = scan.output.map(attribute => attribute.name)
+    val fields = table.schema().columns().asScala.map(field => field.name()).toSet
+    if (!names.forall(name => fields.contains(name))) {
+      return None
+    }
+
     val column = vectorColumn(distance).getOrElse(return None)
+    val columnIndex = names.indexOf(column)
+    if (columnIndex < 0) {
+      return None
+    }
+
     val index = VectorIndexes.findIndexOrNull(table, column, "vector")
     if (index == null) {
       return None
@@ -116,36 +147,192 @@ case class RewriteVectorSearch(spark: SparkSession) extends Rule[LogicalPlan] {
     val snapshotId = scanSnapshotId(sparkTable).getOrElse {
       return None
     }
-    if (index.snapshotForSourceTableSnapshot(snapshotId) == null) {
-      // the index is not bound to the snapshot this scan reads
-      return None
-    }
-
+    // the reader resolves the index snapshot from the parent chain of the table snapshots
+    val reader = new IndexReader(index, table)
+    val query = queryFloats(distance)
+    val payload = new VectorIndexAdapter(definition).encodeQuery(query)
+    val metric = definition.metric()
     val dataFiles = IndexEntries.dataFiles(table, snapshotId).asScala.toSet
+
+    // an index with nothing to say about this snapshot is not an error, it just means scanning
+    val coverage = IndexQuery.of(snapshotId, payload, 0).withConsistency(Consistency.AT_OR_BEFORE)
     val uncovered =
-      new IndexReader(index, table.io()).uncoveredDataFiles(snapshotId, dataFiles.asJava)
-    if (!uncovered.isEmpty) {
-      // some data files are not in the index yet, so the answer would be incomplete
+      try {
+        reader.uncoveredDataFiles(coverage, dataFiles.asJava).asScala.toSet
+      } catch {
+        case NonFatal(e) =>
+          logger.warn(
+            "No index snapshot to answer a query about snapshot {}, scanning instead",
+            snapshotId)
+          return None
+      }
+    if (uncovered.size == dataFiles.size) {
+      // the index is so far behind that its uncovered part is the whole table
       return None
     }
 
-    val payload = new VectorIndexAdapter(definition).encodeQuery(queryFloats(distance))
-    val hits =
-      new IndexReader(index, table.io())
-        .search(IndexQuery.of(snapshotId, payload, limit))
-    if (hits.isEmpty) {
+    val tableSchema = SparkSchemaUtil.convert(table.schema())
+    val hitRows =
+      liveHitRows(reader, table, snapshotId, payload, dataFiles, limit, names, tableSchema)
+        .getOrElse(return None)
+
+    val residual =
+      residualRows(
+        table,
+        snapshotId,
+        uncovered,
+        names,
+        tableSchema,
+        limit,
+        columnIndex,
+        query,
+        metric)
+    val rows =
+      (hitRows ++ residual).sortBy(row => distanceOf(row, columnIndex, query, metric)).take(limit)
+
+    if (rows.isEmpty) {
       return None
     }
 
-    val rows = readRows(sparkTable, scan.output, hits.asScala.toList).getOrElse(return None)
-
-    val specialized = distance.copy(metric = definition.metric())
+    val specialized = distance.copy(metric = metric)
     val newSort =
-      Sort(Seq(SortOrder(specialized, Ascending)), true, LocalRelation(scan.output, rows))
+      Sort(
+        Seq(SortOrder(specialized, Ascending)),
+        true,
+        LocalRelation(scan.output, internalRows(rows)))
     Some(node.withNewChildren(Seq(newSort)))
   }
 
-  /** Returns the first Iceberg scan of the plan, which is the one the distance column belongs to. */
+  /**
+   * The rows of the index hits that still exist in the table snapshot being read.
+   *
+   * <p>The index is asked for more hits when delete files removed some of them, because the limit
+   * has to be met with live rows: a removed row leaves a hole the next hit fills.
+   */
+  private def liveHitRows(
+      reader: IndexReader,
+      table: org.apache.iceberg.Table,
+      snapshotId: Long,
+      payload: ByteBuffer,
+      dataFiles: Set[String],
+      limit: Int,
+      names: Seq[String],
+      tableSchema: StructType): Option[List[Row]] = {
+    var searchLimit = limit
+    var rows: List[Row] = Nil
+    var done = false
+    var exhausted = false
+    var retries = 0
+    while (!done && !exhausted && retries < MaxHitRetries) {
+      retries += 1
+      val searched =
+        reader
+          .search(
+            IndexQuery
+              .of(snapshotId, payload, searchLimit)
+              .withConsistency(Consistency.AT_OR_BEFORE))
+          .asScala
+          .toList
+      exhausted = searched.size < searchLimit
+
+      // hits of data files the table no longer has cannot be resolved, so they are dropped here
+      val hits =
+        searched
+          .filter(hit => dataFiles.contains(hit.dataFile))
+          .sortWith((left, right) => left.score() > right.score())
+      val positionsByFile = hits
+        .groupBy(hit => hit.dataFile())
+        .map { case (dataFile, fileHits) =>
+          dataFile -> fileHits.map(hit => java.lang.Long.valueOf(hit.rowPosition())).toSet.asJava
+        }
+      val rowsByFile =
+        IndexEntries.rowsAt(
+          spark,
+          table,
+          snapshotId,
+          positionsByFile.asJava,
+          names.toList.asJava,
+          tableSchema)
+
+      // the live hits, best first: a removed row leaves a hole the next hit fills
+      rows = hits.flatMap(hit => liveRow(rowsByFile, hit))
+      done = rows.size >= limit || exhausted
+      if (!done && !exhausted) {
+        searchLimit = searched.size + (limit - rows.size)
+      }
+    }
+
+    Some(rows.take(limit))
+  }
+
+  /** The row of a hit, or nothing when the row was removed after the index snapshot was built. */
+  private def liveRow(
+      rowsByFile: java.util.Map[String, java.util.Map[java.lang.Long, Row]],
+      hit: IndexSearchResult): Option[Row] = {
+    Option(rowsByFile.get(hit.dataFile)).flatMap(byPosition =>
+      Option(byPosition.get(hit.rowPosition())))
+  }
+
+  /** All live rows of the data files the index does not cover, closest first. */
+  private def residualRows(
+      table: org.apache.iceberg.Table,
+      snapshotId: Long,
+      uncovered: Set[String],
+      names: Seq[String],
+      tableSchema: StructType,
+      limit: Int,
+      columnIndex: Int,
+      query: Array[Float],
+      metric: Metric): List[Row] = {
+    if (uncovered.isEmpty) {
+      return Nil
+    }
+
+    IndexEntries
+      .liveRows(spark, table, snapshotId, uncovered.asJava, names.toList.asJava, tableSchema)
+      .rdd
+      .takeOrdered(limit)(Ordering.by(row => distanceOf(row, columnIndex, query, metric)))
+      .toList
+  }
+
+  /** The distance of a row to the query vector; a row without a usable vector sorts last. */
+  private def distanceOf(
+      row: Row,
+      columnIndex: Int,
+      query: Array[Float],
+      metric: Metric): Double = {
+    vectorOf(row, columnIndex) match {
+      case Some(vector) if vector.length == query.length =>
+        VectorDistance.distance(metric, vector, query)
+      case _ =>
+        Double.MaxValue
+    }
+  }
+
+  private def vectorOf(row: Row, columnIndex: Int): Option[Array[Float]] = {
+    row.get(columnIndex) match {
+      case values: Seq[Any] =>
+        Some(values.map(value => value.asInstanceOf[Number].floatValue()).toArray)
+      case _ =>
+        None
+    }
+  }
+
+  /** Turns rows into the internal rows a local relation holds. */
+  private def internalRows(rows: List[Row]): Seq[InternalRow] = {
+    if (rows.isEmpty) {
+      Nil
+    } else {
+      spark
+        .createDataFrame(rows.asJava, rows.head.schema)
+        .queryExecution
+        .toRdd
+        .map(row => row.copy())
+        .collect()
+        .toSeq
+    }
+  }
+
   private def findIcebergScan(plan: LogicalPlan): Option[DataSourceV2Relation] = {
     plan.collectFirst {
       case relation: DataSourceV2Relation if icebergTable(relation).isDefined => relation
@@ -221,45 +408,6 @@ case class RewriteVectorSearch(spark: SparkSession) extends Rule[LogicalPlan] {
    * table, whose data files do not carry the partition columns, and for a scan that asks for
    * metadata columns.
    */
-  private def readRows(
-      sparkTable: SparkTable,
-      output: Seq[AttributeReference],
-      hits: List[IndexSearchResult]): Option[Seq[InternalRow]] = {
-    val names = output.map(attribute => attribute.name)
-    val fields = sparkTable.table().schema().columns().asScala.map(field => field.name()).toSet
-    if (!names.forall(name => fields.contains(name))) {
-      return None
-    }
-
-    val positionsByFile = hits.groupBy(hit => hit.dataFile())
-    val rows = scala.collection.mutable.ArrayBuffer[InternalRow]()
-    try {
-      positionsByFile.foreach { case (dataFile, hitsForFile) =>
-        val positions = hitsForFile.map(hit => hit.rowPosition()).toSet
-        // the table schema is passed in so the rows come back with the types the scan promised,
-        // which parquet type inference does not always get right, a uuid for instance
-        val expected = SparkSchemaUtil.convert(sparkTable.table().schema().select(names: _*))
-        val data = spark.read.schema(expected).parquet(dataFile)
-        // the scan reuses one row object, so copy before numbering: otherwise every position
-        // would end up pointing at the last row of the file
-        data.queryExecution.toRdd
-          .map(row => row.copy())
-          .zipWithIndex()
-          .filter { case (_, position) => positions.contains(position) }
-          .map { case (row, _) => row }
-          .collect()
-          .foreach(row => rows += row)
-      }
-    } catch {
-      case scala.util.control.NonFatal(e) =>
-        logger.warn("Cannot read the rows a vector index points at, keeping the original plan", e)
-
-        return None
-    }
-
-    Some(rows)
-  }
-
   private val EmptyRow: InternalRow = new GenericInternalRow(new Array[Any](0))
 
 }

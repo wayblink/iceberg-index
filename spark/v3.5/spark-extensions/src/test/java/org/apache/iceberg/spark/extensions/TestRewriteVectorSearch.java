@@ -156,28 +156,60 @@ class TestRewriteVectorSearch {
   }
 
   @Test
-  public void leavesThePlanAloneForAStaleIndex() {
-    String table = tableWithIndex("docs_stale", "exact");
+  public void usesAnIndexThatIsBehindAndScansTheDifference() {
+    String table = tableWithIndex("docs_behind", "exact");
     // a row added after the index was built leaves the index behind the current snapshot
     spark.sql(String.format("INSERT INTO local.%s VALUES (5, 'echo', array(2.0d, 1.0d))", table));
 
-    assertThat(
-            planOf(
-                table,
-                String.format(
-                    "SELECT id FROM local.%s ORDER BY vec_distance(embedding, array(0.9d, 0.1d)) LIMIT 2",
-                    table)))
-        .doesNotContain("LocalRelation");
+    // the index is still used, and the data file it does not cover is scanned on the side
+    assertThat(planOf(table, nearestNeighbour(table, 2))).contains("LocalRelation");
 
-    // and the results still include the new row
-    List<Row> hits =
+    // the indexed row is the closest one, and the new row comes from the scan of the data file the
+    // index does not cover
+    List<Row> hits = search(table, 2);
+    assertThat(hits.stream().map(row -> row.getLong(0))).containsExactly(1L, 5L);
+    assertThat(hits).isEqualTo(fullScan(table, 2));
+  }
+
+  @Test
+  public void doesNotReturnRowsDeletedAfterTheIndexWasBuilt() {
+    String table = tableWithIndex("docs_deleted", "exact");
+    spark.sql(String.format("DELETE FROM local.%s WHERE id = 1", table));
+
+    assertThat(planOf(table, nearestNeighbour(table, 3))).contains("LocalRelation");
+
+    // the deleted row is the closest one to the query, so it leaves a hole the next hit fills
+    List<Row> hits = search(table, 3);
+    assertThat(hits.stream().map(row -> row.getLong(0))).containsExactly(3L, 2L, 4L);
+    assertThat(hits).isEqualTo(fullScan(table, 3));
+  }
+
+  @Test
+  public void leavesThePlanAloneWhenTheIndexKnowsNothingAboutTheSnapshot() {
+    String table = table("docs_rolled_back");
+    spark.sql(
+        String.format(
+            "INSERT INTO local.%s VALUES (5, 'echo', array(2.0d, 1.0d)), (6, 'foxtrot', array(-2.0d, -1.0d))",
+            table));
+    spark.sql(
+        String.format(
+            "CALL local.system.build_vector_index(table => '%s', column => 'embedding', dimension => 2, mode => 'exact')",
+            table));
+
+    // the index was built on the second snapshot, so it has nothing to say about the first one
+    List<Row> snapshots =
         spark
             .sql(
                 String.format(
-                    "SELECT id FROM local.%s ORDER BY vec_distance(embedding, array(0.9d, 0.4d)) LIMIT 1",
-                    table))
+                    "SELECT snapshot_id FROM local.%s.snapshots ORDER BY committed_at", table))
             .collectAsList();
-    assertThat(hits.get(0).getLong(0)).isEqualTo(5L);
+    spark.sql(
+        String.format(
+            "CALL local.system.rollback_to_snapshot(table => '%s', snapshot_id => %s)",
+            table, snapshots.get(0).getLong(0)));
+
+    assertThat(planOf(table, nearestNeighbour(table, 2))).doesNotContain("LocalRelation");
+    assertThat(search(table, 2)).isEqualTo(fullScan(table, 2));
   }
 
   @Test
@@ -219,5 +251,26 @@ class TestRewriteVectorSearch {
 
   private static String planOf(String table, String query) {
     return spark.sql(String.format(query, table)).queryExecution().optimizedPlan().toString();
+  }
+
+  private static String nearestNeighbour(String table, int limit) {
+    return String.format(
+        "SELECT id FROM local.%s ORDER BY vec_distance(embedding, array(0.9d, 0.1d)) LIMIT %d",
+        table, limit);
+  }
+
+  private static List<Row> search(String table, int limit) {
+    return spark.sql(nearestNeighbour(table, limit)).collectAsList();
+  }
+
+  private static List<Row> fullScan(String table, int limit) {
+    // the same ordering, wrapped in an addition the rewrite does not recognize, so the whole table
+    // is scanned instead
+    return spark
+        .sql(
+            String.format(
+                "SELECT id FROM local.%s ORDER BY vec_distance(embedding, array(0.9d, 0.1d)) + 0.0d LIMIT %d",
+                table, limit))
+        .collectAsList();
   }
 }

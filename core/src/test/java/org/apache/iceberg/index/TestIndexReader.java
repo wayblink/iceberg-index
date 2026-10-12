@@ -18,6 +18,7 @@
  */
 package org.apache.iceberg.index;
 
+import static org.apache.iceberg.types.Types.NestedField.required;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
@@ -25,14 +26,24 @@ import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.nio.file.Path;
 import java.util.List;
+import java.util.UUID;
+import org.apache.iceberg.DataFiles;
+import org.apache.iceberg.PartitionSpec;
+import org.apache.iceberg.Schema;
+import org.apache.iceberg.Table;
+import org.apache.iceberg.TestTables;
 import org.apache.iceberg.TestTables.LocalFileIO;
 import org.apache.iceberg.index.IndexFile.Kind;
 import org.apache.iceberg.index.IndexManifestList.ManifestRef;
+import org.apache.iceberg.relocated.com.google.common.collect.Lists;
+import org.apache.iceberg.types.Types;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
 class TestIndexReader {
+
+  private Table table;
 
   @BeforeAll
   static void registerTestingIndexType() {
@@ -132,25 +143,32 @@ class TestIndexReader {
     TestingIndexAdapter adapter = new TestingIndexAdapter(TestingIndexDefinition.of(4));
     IndexFileContainer container = new PuffinIndexFileContainer();
 
-    // one index snapshot per source table snapshot, 10 and then 20
+    // snapshot ids are random, so the order the reader needs comes from the parent chain of a real
+    // table: three snapshots, of which the first two are indexed
+    List<Long> tableSnapshots = tableSnapshots(tempDir, 3);
+    long first = tableSnapshots.get(0);
+    long second = tableSnapshots.get(1);
+    long third = tableSnapshots.get(2);
     IndexMetadata metadata =
         IndexMetadata.builder()
             .indexUuid("index-uuid")
             .tableUuid("table-uuid")
             .location(tempDir.toString())
             .definition(TestingIndexDefinition.of(4))
-            .addSnapshot(snapshot(fileIO, container, adapter, tempDir, 1, 10, "data-1.parquet", 10))
-            .addSnapshot(snapshot(fileIO, container, adapter, tempDir, 2, 20, "data-2.parquet", 20))
+            .addSnapshot(
+                snapshot(fileIO, container, adapter, tempDir, 1, first, "data-1.parquet", 10))
+            .addSnapshot(
+                snapshot(fileIO, container, adapter, tempDir, 2, second, "data-2.parquet", 20))
             .build();
 
-    IndexReader reader = new IndexReader(metadata, fileIO);
+    IndexReader reader = new IndexReader(metadata, table);
     // the exact requirement still picks the snapshot bound to the requested table snapshot
-    assertThat(reader.search(IndexQuery.of(20, query(5), 1)).get(0).score()).isEqualTo(15.0);
+    assertThat(reader.search(IndexQuery.of(second, query(5), 1)).get(0).score()).isEqualTo(15.0);
 
     // a table snapshot the index has not reached yet is answered from the newest one at or before
     // it, so the results are those of the snapshot bound to table snapshot 20
     IndexQuery stale =
-        IndexQuery.of(30, query(5), 1).withConsistency(IndexQuery.Consistency.AT_OR_BEFORE);
+        IndexQuery.of(third, query(5), 1).withConsistency(IndexQuery.Consistency.AT_OR_BEFORE);
     IndexSearchResult hit = reader.search(stale).get(0);
     assertThat(hit.dataFile()).isEqualTo("data-2.parquet");
     assertThat(hit.score()).isEqualTo(15.0);
@@ -159,9 +177,9 @@ class TestIndexReader {
         .containsExactly("data-1.parquet");
 
     // an exact query for that same table snapshot is refused instead of silently going stale
-    assertThatThrownBy(() -> reader.search(IndexQuery.of(30, query(5), 1)))
+    assertThatThrownBy(() -> reader.search(IndexQuery.of(third, query(5), 1)))
         .isInstanceOf(IllegalArgumentException.class)
-        .hasMessageContaining("covers source table snapshot 30");
+        .hasMessageContaining("covers source table snapshot " + third);
   }
 
   @Test
@@ -170,23 +188,61 @@ class TestIndexReader {
     LocalFileIO fileIO = new LocalFileIO();
     TestingIndexAdapter adapter = new TestingIndexAdapter(TestingIndexDefinition.of(4));
     IndexFileContainer container = new PuffinIndexFileContainer();
+
+    // the index is built on the second snapshot, and the query is about the first one, which is not
+    // in the index at all
+    List<Long> tableSnapshots = tableSnapshots(tempDir, 2);
     IndexMetadata metadata =
         IndexMetadata.builder()
             .indexUuid("index-uuid")
             .tableUuid("table-uuid")
             .location(tempDir.toString())
             .definition(TestingIndexDefinition.of(4))
-            .addSnapshot(snapshot(fileIO, container, adapter, tempDir, 1, 10, "data-1.parquet", 10))
+            .addSnapshot(
+                snapshot(
+                    fileIO,
+                    container,
+                    adapter,
+                    tempDir,
+                    1,
+                    tableSnapshots.get(1),
+                    "data-1.parquet",
+                    10))
             .build();
 
-    IndexReader reader = new IndexReader(metadata, fileIO);
+    IndexReader reader = new IndexReader(metadata, table);
     assertThatThrownBy(
             () ->
                 reader.search(
-                    IndexQuery.of(5, query(5), 1)
+                    IndexQuery.of(tableSnapshots.get(0), query(5), 1)
                         .withConsistency(IndexQuery.Consistency.AT_OR_BEFORE)))
         .isInstanceOf(IllegalArgumentException.class)
-        .hasMessageContaining("covers source table snapshot 5");
+        .hasMessageContaining("covers source table snapshot " + tableSnapshots.get(0));
+  }
+
+  /** Creates a table with the given number of snapshots and returns their ids, oldest first. */
+  private List<Long> tableSnapshots(Path tempDir, int count) {
+    Schema schema = new Schema(required(1, "id", Types.IntegerType.get()));
+    String name = "test-" + UUID.randomUUID();
+    table =
+        TestTables.create(
+            tempDir.resolve(name).toFile(), name, schema, PartitionSpec.unpartitioned(), 1);
+
+    List<Long> ids = Lists.newArrayList();
+    for (int i = 0; i < count; i++) {
+      table
+          .newAppend()
+          .appendFile(
+              DataFiles.builder(PartitionSpec.unpartitioned())
+                  .withPath("/path/to/data-" + i + ".parquet")
+                  .withFileSizeInBytes(10)
+                  .withRecordCount(1)
+                  .build())
+          .commit();
+      ids.add(table.currentSnapshot().snapshotId());
+    }
+
+    return ids;
   }
 
   /** Writes one index file and its manifest list, and returns a snapshot bound to the source. */

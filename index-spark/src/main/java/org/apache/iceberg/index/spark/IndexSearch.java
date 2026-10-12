@@ -31,7 +31,7 @@ import org.apache.iceberg.index.IndexSnapshot;
 import org.apache.iceberg.relocated.com.google.common.collect.Lists;
 import org.apache.iceberg.relocated.com.google.common.collect.Maps;
 import org.apache.iceberg.relocated.com.google.common.collect.Sets;
-import org.apache.spark.api.java.JavaPairRDD;
+import org.apache.iceberg.types.Types;
 import org.apache.spark.sql.Dataset;
 import org.apache.spark.sql.Row;
 import org.apache.spark.sql.RowFactory;
@@ -40,7 +40,6 @@ import org.apache.spark.sql.types.DataTypes;
 import org.apache.spark.sql.types.Metadata;
 import org.apache.spark.sql.types.StructField;
 import org.apache.spark.sql.types.StructType;
-import scala.Tuple2;
 
 /**
  * Searches an index of any type for many queries at once and resolves the matched rows.
@@ -135,7 +134,8 @@ public final class IndexSearch {
       hitsPerQuery.add(hits);
     }
 
-    Map<String, Map<Long, String>> rowsByFile = resolveRows(spark, hitsPerQuery);
+    Map<String, Map<Long, String>> rowsByFile =
+        resolveRows(spark, table, snapshot.sourceTableSnapshotId(), hitsPerQuery);
 
     List<Row> rows = Lists.newArrayList();
     for (int queryId = 0; queryId < hitsPerQuery.size(); queryId++) {
@@ -175,9 +175,16 @@ public final class IndexSearch {
    * Reads the matched rows of every hit data file once and serializes them as JSON, keyed by data
    * file and row position. Positions are the row ordinals of the data file, which is what the index
    * records.
+   *
+   * <p>The rows are read through the same delete-aware reader the index is built with, so a row
+   * removed after the index snapshot was built is not returned. Its position is then absent from
+   * the result and the hit is reported without a row.
    */
   private static Map<String, Map<Long, String>> resolveRows(
-      SparkSession spark, List<List<IndexSearchResult>> hitsPerQuery) {
+      SparkSession spark,
+      org.apache.iceberg.Table table,
+      long snapshotId,
+      List<List<IndexSearchResult>> hitsPerQuery) {
     Map<String, Set<Long>> positionsByFile = new LinkedHashMap<>();
     for (List<IndexSearchResult> hits : hitsPerQuery) {
       for (IndexSearchResult hit : hits) {
@@ -187,25 +194,31 @@ public final class IndexSearch {
       }
     }
 
-    Map<String, Map<Long, String>> rowsByFile = Maps.newHashMap();
-    for (Map.Entry<String, Set<Long>> entry : positionsByFile.entrySet()) {
-      String dataFile = entry.getKey();
-      Set<Long> positions = entry.getValue();
-      JavaPairRDD<String, Long> zipped =
-          spark
-              .read()
-              .parquet(dataFile)
-              .toJSON()
-              .toJavaRDD()
-              .zipWithIndex()
-              .filter(tuple -> positions.contains(tuple._2()));
-      Map<Long, String> rows = Maps.newHashMap();
-      for (Tuple2<String, Long> tuple : zipped.collect()) {
-        rows.put(tuple._2(), tuple._1());
-      }
-      rowsByFile.put(dataFile, rows);
+    List<String> columns = Lists.newArrayList();
+    for (Types.NestedField field : table.schema().columns()) {
+      columns.add(field.name());
     }
 
-    return rowsByFile;
+    Map<String, Map<Long, Row>> rowsByFile =
+        IndexEntries.rowsAt(spark, table, snapshotId, positionsByFile, columns, null);
+
+    Map<String, Map<Long, String>> jsonByFile = Maps.newHashMap();
+    for (Map.Entry<String, Map<Long, Row>> entry : rowsByFile.entrySet()) {
+      Map<Long, Row> rows = entry.getValue();
+      Map<Long, String> json = Maps.newLinkedHashMap();
+      if (!rows.isEmpty()) {
+        List<Row> rowList = Lists.newArrayList(rows.values());
+        List<String> serialized =
+            spark.createDataFrame(rowList, rowList.get(0).schema()).toJSON().collectAsList();
+        int index = 0;
+        for (Long position : rows.keySet()) {
+          json.put(position, serialized.get(index));
+          index += 1;
+        }
+      }
+      jsonByFile.put(entry.getKey(), json);
+    }
+
+    return jsonByFile;
   }
 }
