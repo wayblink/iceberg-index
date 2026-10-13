@@ -59,8 +59,15 @@ public interface IndexAdapter {
   List<IndexSearchResult> search(ByteBuffer payload, ByteBuffer query, int topK);
 
   /**
-   * Orders merged results from multiple index files. Implementations apply the metric direction
-   * (for example ascending distance or descending similarity) and break ties on the row reference.
+   * Orders merged results from multiple index files.
+   *
+   * <p>Implementations apply the metric direction, ascending for a distance and descending for a
+   * similarity, and break ties on the data file and then the row position. That order is a contract
+   * rather than a convenience: an engine that searches the index files in parallel, which is what
+   * makes a search scale, has to merge the per-file results in the same order, and it can only do
+   * that from the three values a result carries. It learns the direction of the score from this
+   * comparator and applies the tie breaker itself, so a result has to travel to another task as a
+   * score and a row reference rather than as an object.
    */
   Comparator<IndexSearchResult> resultComparator();
 

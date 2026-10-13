@@ -124,15 +124,14 @@ public final class IndexSearch {
             .createAdapter(metadata.definition());
     List<List<IndexSearchResult>> hitsPerQuery = Lists.newArrayList();
     for (ByteBuffer query : queries) {
-      List<IndexSearchResult> hits =
+      hitsPerQuery.add(
           Lists.newArrayList(
               DistributedIndexSearch.search(
-                  spark,
-                  metadata,
-                  table,
-                  IndexQuery.of(snapshot.sourceTableSnapshotId(), query.duplicate(), topK)));
-      hits.sort(adapter.resultComparator());
-      hitsPerQuery.add(hits);
+                      spark,
+                      metadata,
+                      table,
+                      IndexQuery.of(snapshot.sourceTableSnapshotId(), query.duplicate(), topK))
+                  .hits()));
     }
 
     Map<String, Map<Long, String>> rowsByFile =

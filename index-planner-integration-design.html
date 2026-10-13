@@ -168,14 +168,46 @@ WHERE body MATCH 'iceberg table format' LIMIT 10;   -- 或 text_score(body, '...
   <li><strong>未命中索引时是否提示</strong>：可在规则里打点/告警（“该查询形态可用索引但索引快照落后”），但不改变计划。</li>
 </ol>
 
-<h2>六、与既有设计的关系</h2>
+<h2>六、检索的分布式化（driver 不是执行点）</h2>
+
+<p>索引检索最初跑在 driver 上：规则在规划期调 <code>IndexReader.search()</code>，顺序读每个索引文件的 payload 并逐文件打分。
+三个调用点（改写规则、批量检索、各过程）全都如此。量级一大就是瓶颈——EXACT 模式 100 万条 × 768 维的单次查询约 1.5 GFLOP，
+driver 单线程跑一秒多，批量 100 个查询就是 150 秒；读取顺序、计算串行、单个 payload 常驻 driver 堆。</p>
+
+<p>现已改为 executor 侧执行（<code>DistributedIndexSearch</code>），并把归约也改成分布式：</p>
+
+<table>
+  <tr><th>阶段</th><th>在哪</th><th>做什么</th><th>driver 上的量</th></tr>
+  <tr><td>解析索引快照</td><td>driver</td><td>读 manifest list + manifests，得到索引文件位置列表（<code>IndexReader.indexFiles(query)</code>）</td><td>小：清单本身</td></tr>
+  <tr><td>本地 top-k</td><td>executor</td><td>每个索引文件整体读入（<b>文件永不拆分</b>），解 Puffin 容器，取 adapter 对应的 blob，逐文件搜索，只留该文件最好的 <code>topK+1</code> 个</td><td>0</td></tr>
+  <tr><td>全局归约</td><td>executor</td><td>树形 <code>takeOrdered</code>：各 task 的局部 top-k 逐级合并，最终只回传 <code>topK</code> 个</td><td>0（只有最终 topK 回到 driver）</td></tr>
+  <tr><td>回表</td><td>executor</td><td>按命中位置读数据行，删除感知</td><td>0</td></tr>
+</table>
+
+<p><b>分区不是字节问题，是单位问题。</b>曾用 <code>spark.read.format("binaryFile")</code> 读索引文件，
+但其分区由 <code>maxPartitionBytes</code>（默认 128MB）+ <code>openCostInBytes</code>（默认 4MB，小文件也按此计）
++ <code>minPartitionNum</code>（默认集群核数）共同决定，与索引文件的语义边界无关（<code>TestBinaryFilePartitioning</code> 钉住了这套行为，
+也钉住了 per-read 的 <code>maxPartitionBytes</code> 选项对 binaryFile 不生效）。并行度实际是
+<code>max(按大小打包的分区数, 集群核数)</code> 且不超过文件数。</p>
+
+<p><b>归约的顺序是 SPI 契约。</b>分布式归约只能在 task 间传「分数 + 行引用」三个值，
+所以 <code>IndexAdapter.resultComparator()</code> 被明确为契约：按分数排序（距离升序、相似度降序），
+平分按数据文件名再按行位置。引擎侧用两个仅分数不同的结果探测分数方向，然后自行应用平分规则。
+<code>TestDistributedIndexSearch</code> 用 12 个索引文件、跨文件平分、topK ∈ {1,3,5,12} 对齐 brute-force，
+并对「去掉平分」和「反转分数方向」两个变异均报警。</p>
+
+<p><b>还剩一件事：改写方案本身要求最终 ≤ limit 行回到 driver。</b>规则用 <code>LocalRelation</code> 替换扫描叶节点，
+这是规划期物化，所以 top-k 的最终结果必须落在 driver 上（量被 topK 限制，可接受）。
+要彻底不让 driver 沾数据，需把索引检索做成 Iceberg <code>BatchScan</code>：执行期才跑、分布式、不落 driver。列为后续。</p>
+
+<h2>七、与既有设计的关系</h2>
 <table>
   <tr><th>既有能力</th><th>在 planner 集成中的角色</th></tr>
   <tr><td><code>IndexReader</code> + <code>IndexQuery.Consistency</code></td><td>快照选取与一致性判定，规则直接复用</td></tr>
   <tr><td><code>IndexReader.uncoveredDataFiles</code></td><td>残差扫描的文件清单</td></tr>
   <tr><td><code>VectorIndexSearch</code> / <code>IndexSearch</code></td><td>driver 侧检索与批量检索，TVF 与规则的共同底座</td></tr>
   <tr><td>attempt 台账 / 原子发布</td><td>保证规则不会读到“写了一半”的索引文件</td></tr>
-  <tr><td>1:N 分组（D22）</td><td>索引文件更少更大，driver 侧检索的固定成本更低</td></tr>
+  <tr><td>1:N 分组（D22）</td><td>索引文件更少更大：并发行数更少，但单个 HNSW 图覆盖更多向量，召回更高（分片 ANN 的召回是分片级的）</td></tr>
 </table>
 
 </body>

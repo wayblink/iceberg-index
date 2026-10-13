@@ -227,7 +227,7 @@ case class RewriteVectorSearch(spark: SparkSession) extends Rule[LogicalPlan] {
     var retries = 0
     while (!done && !exhausted && retries < MaxHitRetries) {
       retries += 1
-      val searched =
+      val outcome =
         DistributedIndexSearch
           .search(
             spark,
@@ -236,9 +236,8 @@ case class RewriteVectorSearch(spark: SparkSession) extends Rule[LogicalPlan] {
             IndexQuery
               .of(snapshotId, payload, searchLimit)
               .withConsistency(Consistency.AT_OR_BEFORE))
-          .asScala
-          .toList
-      exhausted = searched.size < searchLimit
+      val searched = outcome.hits().asScala.toList
+      exhausted = !outcome.moreHits()
 
       // hits of data files the table no longer has cannot be resolved, so they are dropped here
       val hits =
