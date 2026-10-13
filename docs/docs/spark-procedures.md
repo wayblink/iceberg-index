@@ -1559,8 +1559,14 @@ An index that is behind the snapshot being read is still used, together with a s
 files it does not cover, so a query does not have to wait for a refresh. Rows removed after the
 index snapshot was built are filtered out the same way the index build filters them.
 
+An identity-partitioned table is rewritten as well: the partition column values are recovered from
+the data file paths. A table partitioned by bucket, truncation or a time transform is not, because
+those do not put the column value itself in the path, and a row read back would have a null in its
+place.
+
 If none of these holds, the plan is left exactly as it was, and the query still returns correct
-results, just by scanning. A warning is logged when the matched rows cannot be read back.
+results, just by scanning. A warning is logged when the matched rows cannot be read back, and when
+the type of an index is not registered in the session.
 
 An approximate (HNSW) index is left alone for now: its candidates have to be re-scored first, which
 is planned work. `EXPLAIN` shows whether the rewrite happened, by the absence of the table scan:
@@ -1598,3 +1604,12 @@ instead of returning rows in an arbitrary order.
 Unlike `vec_distance`, `text_score` cannot be computed without an index: the statistics it needs
 live in the index, not in the row.
 
+!!! note
+    Index files live in a sidecar tree under the table location, `<table>/indexes/`, and are
+    referenced by index metadata rather than table metadata. `remove_orphan_files` leaves that
+    directory alone, because otherwise it would report every index file as an orphan and delete it.
+    Removing index files that are no longer wanted is what `cleanup_index_files` is for.
+
+    Other file lifecycles are not affected: `expire_snapshots`, `rewrite_data_files` and
+    `rewrite_manifests` only touch files the table metadata references. Storage-level rules, an S3
+    lifecycle policy for instance, are outside Iceberg and would need to exclude that directory.
