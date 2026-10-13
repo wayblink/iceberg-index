@@ -22,8 +22,6 @@ import static org.assertj.core.api.Assertions.assertThat;
 
 import java.nio.file.Path;
 import java.util.List;
-import org.apache.spark.sql.Dataset;
-import org.apache.spark.sql.Row;
 import org.apache.spark.sql.SparkSession;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
@@ -61,30 +59,44 @@ class TestBinaryFilePartitioning {
   }
 
   @Test
-  public void smallFilesArePackedIntoSinglePartitionsByDefault(@TempDir Path tempDir)
-      throws Exception {
+  public void howFilesBecomePartitions(@TempDir Path tempDir) throws Exception {
     List<String> paths = writeFiles(tempDir, 8, 1024);
 
-    Dataset<Row> blobs = spark.read().format("binaryFile").load(paths.toArray(new String[0]));
+    // eight files of 1 KB, packed up to the default 128 MB, land in one partition
+    assertThat(partitions(paths)).isEqualTo(1);
 
-    // without a partition budget the files are packed up to the default 128 MB, so eight small
-    // files
-    // end up in one task and a distributed index search would not be distributed at all
-    assertThat(blobs.rdd().getNumPartitions()).isEqualTo(1);
+    // a budget below the size of a file puts every file in a partition of its own
+    spark.conf().set("spark.sql.files.maxPartitionBytes", "1");
+    assertThat(partitions(paths)).isEqualTo(8);
+    spark.conf().unset("spark.sql.files.maxPartitionBytes");
+
+    // a minimum partition count above what the packing produced splits the packed groups further,
+    // so the parallelism of the cluster is used even when the files are small
+    spark.conf().set("spark.sql.files.minPartitionNum", "3");
+    assertThat(partitions(paths)).isEqualTo(3);
+    spark.conf().set("spark.sql.files.minPartitionNum", "8");
+    assertThat(partitions(paths)).isEqualTo(8);
+    spark.conf().unset("spark.sql.files.minPartitionNum");
+
+    // a file never lands in two partitions, so a count above the number of files is not reached
+    spark.conf().set("spark.sql.files.minPartitionNum", "16");
+    assertThat(partitions(paths)).isEqualTo(8);
+    spark.conf().unset("spark.sql.files.minPartitionNum");
+
+    // a file counts as at least the open cost towards the budget, not as its own size: eight 1 KB
+    // files against a 2 MB budget are split, because each of them counts as the 4 MB open cost
+    spark.conf().set("spark.sql.files.maxPartitionBytes", String.valueOf(2 * 1024 * 1024));
+    assertThat(partitions(paths)).isEqualTo(8);
+    spark.conf().unset("spark.sql.files.maxPartitionBytes");
   }
 
-  @Test
-  public void aPartitionBudgetOfOneByteGivesOnePartitionPerFile(@TempDir Path tempDir)
-      throws Exception {
-    List<String> paths = writeFiles(tempDir, 8, 1024);
-
-    spark.conf().set("spark.sql.files.maxPartitionBytes", "1");
-    Dataset<Row> blobs = spark.read().format("binaryFile").load(paths.toArray(new String[0]));
-
-    // a file is never split, so a budget below the size of a file puts every file in a partition of
-    // its own, which is the unit of work an index search wants
-    assertThat(blobs.rdd().getNumPartitions()).isEqualTo(8);
-    spark.conf().unset("spark.sql.files.maxPartitionBytes");
+  private int partitions(List<String> paths) {
+    return spark
+        .read()
+        .format("binaryFile")
+        .load(paths.toArray(new String[0]))
+        .rdd()
+        .getNumPartitions();
   }
 
   private static List<String> writeFiles(Path dir, int count, int size) throws Exception {
