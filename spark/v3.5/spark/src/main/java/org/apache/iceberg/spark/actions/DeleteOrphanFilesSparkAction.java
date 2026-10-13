@@ -41,6 +41,7 @@ import org.apache.iceberg.actions.DeleteOrphanFiles;
 import org.apache.iceberg.actions.FileURI;
 import org.apache.iceberg.actions.ImmutableDeleteOrphanFiles;
 import org.apache.iceberg.exceptions.ValidationException;
+import org.apache.iceberg.index.SidecarIndexCatalog;
 import org.apache.iceberg.io.BulkDeletionFailureException;
 import org.apache.iceberg.io.SupportsBulkOperations;
 import org.apache.iceberg.io.SupportsPrefixOperations;
@@ -56,6 +57,7 @@ import org.apache.iceberg.util.Pair;
 import org.apache.iceberg.util.PropertyUtil;
 import org.apache.iceberg.util.Tasks;
 import org.apache.spark.api.java.JavaRDD;
+import org.apache.spark.api.java.function.FilterFunction;
 import org.apache.spark.api.java.function.FlatMapFunction;
 import org.apache.spark.api.java.function.MapPartitionsFunction;
 import org.apache.spark.broadcast.Broadcast;
@@ -405,11 +407,22 @@ public class DeleteOrphanFilesSparkAction extends BaseSparkAction<DeleteOrphanFi
 
   private Dataset<FileURI> actualFileIdentDS() {
     StringToFileURI toFileURI = new StringToFileURI(equalSchemes, equalAuthorities);
-    if (compareToFileList == null) {
-      return toFileURI.apply(listedFileDS());
-    } else {
-      return toFileURI.apply(filteredCompareToFileList());
-    }
+    Dataset<FileURI> actualFileIdentDS =
+        compareToFileList == null
+            ? toFileURI.apply(listedFileDS())
+            : toFileURI.apply(filteredCompareToFileList());
+
+    // index files live in a sidecar tree under the table location and are referenced by index
+    // metadata rather than table metadata, so without this they would be reported as orphans
+    String indexRoot = indexRoot();
+    return actualFileIdentDS.filter(
+        (FilterFunction<FileURI>) file -> !file.getUriAsString().startsWith(indexRoot));
+  }
+
+  /** The directory the sidecar index files of this table live in. */
+  private String indexRoot() {
+    String tableLocation = table.location().replaceAll("/+$", "");
+    return tableLocation + "/" + SidecarIndexCatalog.INDEXES_DIR + "/";
   }
 
   private Dataset<String> listedFileDS() {

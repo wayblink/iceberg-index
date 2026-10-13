@@ -220,6 +220,67 @@ class TestRewriteVectorSearch {
         .doesNotContain("LocalRelation");
   }
 
+  @Test
+  public void rewritesAQueryOnAnIdentityPartitionedTable() {
+    String table = "db.docs_partitioned";
+    spark.sql(
+        String.format(
+            "CREATE TABLE local.%s (id bigint, body string, embedding array<double>) "
+                + "USING iceberg PARTITIONED BY (id)",
+            table));
+    spark.sql(
+        String.format(
+            "INSERT INTO local.%s VALUES %s", table, VECTORS.replace("array(", "array(")));
+    spark.sql(
+        String.format(
+            "CALL local.system.build_vector_index("
+                + "table => '%s', column => 'embedding', dimension => 2, mode => 'exact')",
+            table));
+
+    // the partition column is not in the data file, its value comes from the path
+    assertThat(planOf(table, nearestNeighbour(table, 2))).contains("LocalRelation");
+    assertThat(partitionRows(table)).isEqualTo(partitionScan(table));
+  }
+
+  @Test
+  public void leavesThePlanAloneForATransformedPartition() {
+    String table = "db.docs_bucketed";
+    spark.sql(
+        String.format(
+            "CREATE TABLE local.%s (id bigint, body string, embedding array<double>) "
+                + "USING iceberg PARTITIONED BY (bucket(4, id))",
+            table));
+    spark.sql(String.format("INSERT INTO local.%s VALUES %s", table, VECTORS));
+    spark.sql(
+        String.format(
+            "CALL local.system.build_vector_index("
+                + "table => '%s', column => 'embedding', dimension => 2, mode => 'exact')",
+            table));
+
+    // the bucket number is in the path but the column value is not, so the rows cannot be read back
+    assertThat(planOf(table, nearestNeighbour(table, 2))).doesNotContain("LocalRelation");
+  }
+
+  private static List<Row> partitionRows(String table) {
+    return spark
+        .sql(
+            String.format(
+                "SELECT id, vec_distance(embedding, array(0.9d, 0.1d)) AS d FROM local.%s "
+                    + "ORDER BY d LIMIT 3",
+                table))
+        .collectAsList();
+  }
+
+  private static List<Row> partitionScan(String table) {
+    return spark
+        .sql(
+            String.format(
+                "SELECT id, vec_distance(embedding, array(0.9d, 0.1d)) + 0.0d AS d FROM local.%s "
+                    + "ORDER BY d LIMIT 3",
+                table))
+        .collectAsList();
+  }
+
   /** Creates the table without an index. */
   private static String table(String name) {
     String table = "db." + name;

@@ -151,6 +151,72 @@ public class TestRemoveOrphanFilesProcedure extends ExtensionsTestBase {
   }
 
   @TestTemplate
+  public void testRemoveOrphanFilesKeepsIndexFiles() throws IOException {
+    if (catalogName.equals("testhadoop")) {
+      sql(
+          "CREATE TABLE %s (id bigint NOT NULL, data string, embedding array<double>) USING iceberg",
+          tableName);
+    } else {
+      sql(
+          "CREATE TABLE %s (id bigint NOT NULL, data string, embedding array<double>) USING iceberg "
+              + "LOCATION '%s'",
+          tableName, java.nio.file.Files.createTempDirectory(temp, "junit"));
+    }
+    sql("INSERT INTO %s VALUES (1, 'a', array(1.0d, 0.0d))", tableName);
+    sql(
+        "CALL %s.system.build_vector_index(table => '%s', column => 'embedding', dimension => 2)",
+        catalogName, tableIdent);
+
+    Table table = validationCatalog.loadTable(tableIdent);
+    File indexDir = new File(java.net.URI.create(table.location() + "/indexes"));
+    assertThat(indexDir).as("Index files should live next to the table").exists();
+    long indexFileCount = countFiles(indexDir);
+
+    // a genuine orphan, written into the data folder of the same table
+    String dataLocation = table.location() + "/data";
+    sql("CREATE TABLE p (id bigint) USING parquet LOCATION '%s'", dataLocation);
+    sql("INSERT INTO TABLE p VALUES (1)");
+
+    // wait to ensure files are old enough
+    waitUntilAfter(System.currentTimeMillis());
+    Timestamp currentTimestamp = Timestamp.from(Instant.ofEpochMilli(System.currentTimeMillis()));
+
+    List<Object[]> output =
+        sql(
+            "CALL %s.system.remove_orphan_files("
+                + "table => '%s',"
+                + "older_than => TIMESTAMP '%s')",
+            catalogName, tableIdent, currentTimestamp);
+    assertThat(output).as("Should be the parquet file as the only orphan").hasSize(1);
+
+    // index files are referenced by index metadata rather than table metadata, so they must survive
+    assertThat(countFiles(indexDir))
+        .as("Index files should not be removed")
+        .isEqualTo(indexFileCount);
+
+    // and the index still answers queries
+    assertEquals(
+        "Should have expected rows",
+        ImmutableList.of(row(1L)),
+        sql(
+            "SELECT id FROM %s ORDER BY vec_distance(embedding, array(1.0d, 0.0d)) LIMIT 1",
+            tableName));
+  }
+
+  private static long countFiles(File dir) {
+    File[] files = dir.listFiles();
+    if (files == null) {
+      return 0;
+    }
+
+    long count = 0;
+    for (File file : files) {
+      count += file.isDirectory() ? countFiles(file) : 1;
+    }
+    return count;
+  }
+
+  @TestTemplate
   public void testRemoveOrphanFilesDryRun() throws IOException {
     if (catalogName.equals("testhadoop")) {
       sql("CREATE TABLE %s (id bigint NOT NULL, data string) USING iceberg", tableName);

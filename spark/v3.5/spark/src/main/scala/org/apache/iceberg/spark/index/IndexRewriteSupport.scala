@@ -82,6 +82,28 @@ object IndexRewriteSupport {
     }
   }
 
+  /**
+   * Whether every partition column of the table is identity-partitioned, which is what makes its
+   * value recoverable from the data file path. A bucket, truncation or time transform does not put
+   * the column value itself in the path, so the rows read back would have a null in its place.
+   */
+  def hasOnlyIdentityPartitions(table: org.apache.iceberg.Table): Boolean = {
+    table
+      .spec()
+      .fields()
+      .asScala
+      .forall(field => field.transform().isIdentity())
+  }
+
+  /**
+   * Whether the type of an index is registered in this session, which is what the reader needs to
+   * create its adapter. A session that never touched an index type has not registered it, and a
+   * query must not fail for that.
+   */
+  def isIndexTypeRegistered(index: org.apache.iceberg.index.IndexMetadata): Boolean = {
+    org.apache.iceberg.index.IndexTypes.registered().containsKey(index.indexType())
+  }
+
   /** The Spark schema of a table, which is what its rows are read with. */
   def tableSchema(sparkTable: SparkTable): StructType = {
     SparkSchemaUtil.convert(sparkTable.table().schema())

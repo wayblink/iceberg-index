@@ -118,8 +118,10 @@ case class RewriteVectorSearch(spark: SparkSession) extends Rule[LogicalPlan] {
     val sparkTable = IndexRewriteSupport.icebergTable(scan).getOrElse(return None)
     val table = sparkTable.table()
 
-    // data files never carry the partition columns, so a partitioned table cannot be read this way
-    if (!table.spec().isUnpartitioned()) {
+    // a data file does not carry the values of its partition columns, but the ones an identity
+    // partition puts in the path are recovered from it, so only the other transforms are a reason
+    // to stand aside
+    if (!IndexRewriteSupport.hasOnlyIdentityPartitions(table)) {
       return None
     }
 
@@ -133,6 +135,12 @@ case class RewriteVectorSearch(spark: SparkSession) extends Rule[LogicalPlan] {
 
     val index = VectorIndexes.findIndexOrNull(table, column, "vector")
     if (index == null) {
+      return None
+    }
+    if (!IndexRewriteSupport.isIndexTypeRegistered(index)) {
+      logger.warn(
+        "Index type {} of column {} of table {} is not registered in this session, scanning",
+        Array[Object](index.indexType(), column, table.name()): _*)
       return None
     }
     val definition = index.definition().asInstanceOf[VectorIndexDefinition]
