@@ -90,6 +90,23 @@ class TestBinaryFilePartitioning {
     spark.conf().unset("spark.sql.files.maxPartitionBytes");
   }
 
+  @Test
+  public void perReadPartitionBudgetOptionIsNotHonored(@TempDir Path tempDir) throws Exception {
+    List<String> paths = writeFiles(tempDir, 8, 1024);
+
+    // the binary file data source ignores a per-read partition budget, only the session conf has an
+    // effect, which is why a search that needs one partition per index file cannot ask for one here
+    assertThat(
+            spark
+                .read()
+                .option("maxPartitionBytes", "1")
+                .format("binaryFile")
+                .load(paths.toArray(new String[0]))
+                .rdd()
+                .getNumPartitions())
+        .isEqualTo(1);
+  }
+
   private int partitions(List<String> paths) {
     return spark
         .read()
