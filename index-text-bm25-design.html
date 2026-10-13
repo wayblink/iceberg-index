@@ -389,7 +389,7 @@
         <table>
           <thead><tr><th>限制</th><th>影响</th><th>后续</th></tr></thead>
           <tbody>
-            <tr><td>关联搜索路径需同时持有全部 index 文件 payload</td><td>超大表时 reader 端内存；vector/HNSW 走默认逐文件路径不受影响</td><td>两趟式：先读各文件统计头合并，再逐文件流式打分（需 reader 支持懒加载 payload）</td></tr>
+            <tr><td>关联搜索路径需同时持有全部 index 文件 payload</td><td>超大表时 reader 端内存；vector/HNSW 已改为 executor 侧逐文件检索（<code>DistributedIndexSearch</code>），不受影响</td><td><b>TODO · 文本检索分布式化（两趟式）</b>：第一趟每个 task 只算本文件的局部统计（N_local、totalLen_local、df_local，小对象）回传 driver 合并成语料统计；第二趟把合并后的统计广播下去，每个 task 用它给本文件打分。需要给 <code>IndexAdapter</code> 补两个钩子：<code>fileStatistics(ByteBuffer)</code>（单文件统计）与 <code>mergeSearchStatistics(List&lt;Object&gt;)</code>（统计合并），以及一个带统计的打分入口 <code>searchAuxiliaryWithStatistics(payload, query, topK, stats)</code>。注意统计合并后打分与现在 driver 侧逐文件合并的结果必须逐位一致，否则 rewrite 与全表扫描的分数会对不上</td></tr>
             <tr><td>分词简单（无词干化/CJK/同义词）</td><td>召回质量受限</td><td>分析器可配置化；评估 ICU/CJK 分词</td></tr>
             <tr><td>查询词权重统一（无 per-term boost）</td><td>表达力受限</td><td>查询编码支持 term:weight</td></tr>
             <tr><td>text_search 行解析逐文件读 parquet</td><td>单查询成本同 vector 优化前</td><td>复用已实现的批量解析路径（VectorIndexSearch 泛化）</td></tr>
