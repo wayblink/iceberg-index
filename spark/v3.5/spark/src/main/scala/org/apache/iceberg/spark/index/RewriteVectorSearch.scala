@@ -33,7 +33,7 @@ import org.apache.iceberg.index.vector.VectorIndexDefinition
 import org.apache.iceberg.index.vector.VectorDistance
 import org.apache.iceberg.index.vector.VectorIndexDefinition.IndexMode
 import org.apache.iceberg.index.vector.VectorIndexDefinition.Metric
-import org.apache.iceberg.index.spark.{IndexEntries, VectorIndexes}
+import org.apache.iceberg.index.spark.{DistributedIndexSearch, IndexEntries, VectorIndexes}
 import org.apache.iceberg.spark.SparkSchemaUtil
 import org.apache.iceberg.spark.SparkSchemaUtil
 import org.apache.iceberg.spark.source.SparkTable
@@ -174,7 +174,7 @@ case class RewriteVectorSearch(spark: SparkSession) extends Rule[LogicalPlan] {
 
     val tableSchema = IndexRewriteSupport.tableSchema(sparkTable)
     val hitRows =
-      liveHitRows(reader, table, snapshotId, payload, dataFiles, limit, names, tableSchema)
+      liveHitRows(reader, index, table, snapshotId, payload, dataFiles, limit, names, tableSchema)
         .getOrElse(return None)
 
     val residual =
@@ -212,6 +212,7 @@ case class RewriteVectorSearch(spark: SparkSession) extends Rule[LogicalPlan] {
    */
   private def liveHitRows(
       reader: IndexReader,
+      index: org.apache.iceberg.index.IndexMetadata,
       table: org.apache.iceberg.Table,
       snapshotId: Long,
       payload: ByteBuffer,
@@ -227,8 +228,11 @@ case class RewriteVectorSearch(spark: SparkSession) extends Rule[LogicalPlan] {
     while (!done && !exhausted && retries < MaxHitRetries) {
       retries += 1
       val searched =
-        reader
+        DistributedIndexSearch
           .search(
+            spark,
+            index,
+            table,
             IndexQuery
               .of(snapshotId, payload, searchLimit)
               .withConsistency(Consistency.AT_OR_BEFORE))

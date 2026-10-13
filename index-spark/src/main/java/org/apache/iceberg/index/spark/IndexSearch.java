@@ -25,7 +25,6 @@ import java.util.Map;
 import java.util.Set;
 import org.apache.iceberg.index.IndexMetadata;
 import org.apache.iceberg.index.IndexQuery;
-import org.apache.iceberg.index.IndexReader;
 import org.apache.iceberg.index.IndexSearchResult;
 import org.apache.iceberg.index.IndexSnapshot;
 import org.apache.iceberg.relocated.com.google.common.collect.Lists;
@@ -46,9 +45,10 @@ import org.apache.spark.sql.types.StructType;
  *
  * <p>Queries arrive as encoded payloads, one per query, produced by the {@link
  * org.apache.iceberg.index.IndexAdapter} of the index type: the vector adapter encodes a query
- * vector, the text adapter a query string. The index search itself runs on the driver, because
- * index files are small and there is nothing to distribute; only the row resolution is distributed,
- * and it reads each hit data file once for all queries instead of once per query.
+ * vector, the text adapter a query string. The search reads and scores the index files on the
+ * executors, one index file per task; only the row resolution and the merge of the per-file results
+ * stay on the driver, and the row resolution reads each hit data file once for all queries instead
+ * of once per query.
  */
 public final class IndexSearch {
 
@@ -122,13 +122,14 @@ public final class IndexSearch {
     org.apache.iceberg.index.IndexAdapter adapter =
         org.apache.iceberg.index.IndexTypes.fromType(metadata.indexType())
             .createAdapter(metadata.definition());
-    IndexReader reader = new IndexReader(metadata, table.io());
-
     List<List<IndexSearchResult>> hitsPerQuery = Lists.newArrayList();
     for (ByteBuffer query : queries) {
       List<IndexSearchResult> hits =
           Lists.newArrayList(
-              reader.search(
+              DistributedIndexSearch.search(
+                  spark,
+                  metadata,
+                  table,
                   IndexQuery.of(snapshot.sourceTableSnapshotId(), query.duplicate(), topK)));
       hits.sort(adapter.resultComparator());
       hitsPerQuery.add(hits);

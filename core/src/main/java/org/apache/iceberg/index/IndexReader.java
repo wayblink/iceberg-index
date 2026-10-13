@@ -150,6 +150,40 @@ public final class IndexReader {
   }
 
   /**
+   * Returns the index files of the snapshot a query is answered from, so an engine can read and
+   * search them itself, on its own executors. The manifest list and the manifests are read here, on
+   * the caller's thread, because they are small; only the payloads are left to the engine.
+   *
+   * @throws IllegalArgumentException if the index does not cover the source table snapshot
+   */
+  public List<IndexFile> indexFiles(IndexQuery query) {
+    Preconditions.checkNotNull(query, "Index query is null");
+    IndexSnapshot snapshot = snapshotForQuery(query);
+    IndexAdapter adapter =
+        IndexTypes.fromType(metadata.indexType()).createAdapter(metadata.definition());
+
+    String auxiliaryBlobType = adapter.auxiliaryBlobType();
+    List<IndexFile> files = Lists.newArrayList();
+    for (IndexManifestList.ManifestRef ref : readManifestList(snapshot).manifests()) {
+      for (IndexFile indexFile : readManifest(ref.location()).indexFiles()) {
+        boolean carriesEntries =
+            indexFile.kind() == IndexFile.Kind.ENTRY_BEARING
+                && adapter.entryBlobType().equals(indexFile.blobType());
+        boolean carriesAuxiliary =
+            auxiliaryBlobType != null
+                && indexFile.kind() == IndexFile.Kind.AUXILIARY
+                && auxiliaryBlobType.equals(indexFile.blobType());
+        if (carriesEntries || carriesAuxiliary) {
+          files.add(indexFile);
+        }
+        // other payload types are skipped for forward compatibility
+      }
+    }
+
+    return ImmutableList.copyOf(files);
+  }
+
+  /**
    * Returns the statistics an engine needs to score rows the way the index does, for the snapshot a
    * query is answered from. Null when the index type has no statistics to merge.
    *
