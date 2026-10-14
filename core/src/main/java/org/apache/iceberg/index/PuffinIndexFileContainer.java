@@ -26,6 +26,7 @@ import org.apache.iceberg.io.OutputFile;
 import org.apache.iceberg.puffin.Blob;
 import org.apache.iceberg.puffin.BlobMetadata;
 import org.apache.iceberg.puffin.Puffin;
+import org.apache.iceberg.puffin.PuffinCompressionCodec;
 import org.apache.iceberg.puffin.PuffinReader;
 import org.apache.iceberg.puffin.PuffinWriter;
 import org.apache.iceberg.relocated.com.google.common.base.Preconditions;
@@ -43,6 +44,14 @@ import org.apache.iceberg.util.Pair;
 public final class PuffinIndexFileContainer implements IndexFileContainer {
 
   private static final List<Integer> NO_INPUT_FIELDS = ImmutableList.of();
+
+  /** The codec an index blob is written with, overridable for a measurement or a rollback. */
+  public static final String INDEX_BLOB_COMPRESSION_PROPERTY =
+      "iceberg.index.blob-compression-codec";
+
+  private static final String DEFAULT_INDEX_BLOB_COMPRESSION =
+      PuffinCompressionCodec.ZSTD.codecName();
+
   private static final long NO_SNAPSHOT_ID = -1L;
   private static final long NO_SEQUENCE_NUMBER = -1L;
 
@@ -50,7 +59,19 @@ public final class PuffinIndexFileContainer implements IndexFileContainer {
   public void write(OutputFile file, List<IndexBlob> blobs) throws IOException {
     Preconditions.checkNotNull(file, "Output file is null");
     Preconditions.checkNotNull(blobs, "Blobs are null");
-    try (PuffinWriter writer = Puffin.write(file).createdBy("iceberg-index").build()) {
+    // blobs are compressed by default: an index payload is the vectors of a table plus a row
+    // reference per entry, and neither the vectors nor the references compress on their own, but
+    // together, and as a blob, they compress about as well as the column the index was built from.
+    // Reading needs no change: a Puffin reader decompresses a blob by the codec in its metadata.
+    String codecName =
+        System.getProperty(INDEX_BLOB_COMPRESSION_PROPERTY, DEFAULT_INDEX_BLOB_COMPRESSION);
+    // the uncompressed codec has no name of its own, so it is spelled out rather than looked up
+    PuffinCompressionCodec compression =
+        codecName == null || codecName.isEmpty() || "none".equalsIgnoreCase(codecName)
+            ? PuffinCompressionCodec.NONE
+            : PuffinCompressionCodec.forName(codecName);
+    try (PuffinWriter writer =
+        Puffin.write(file).createdBy("iceberg-index").compressBlobs(compression).build()) {
       for (IndexBlob blob : blobs) {
         writer.add(
             new Blob(

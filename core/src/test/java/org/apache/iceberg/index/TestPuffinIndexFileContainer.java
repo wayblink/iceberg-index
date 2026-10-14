@@ -41,4 +41,42 @@ class TestPuffinIndexFileContainer {
     container.write(localOutput(location), List.of(first, second));
     assertThat(container.read(localInput(location))).containsExactly(first, second);
   }
+
+  @Test
+  public void compressesBlobsAndReadsThemBack(@TempDir Path tempDir) throws IOException {
+    String location = tempDir.resolve("index-file-1.puffin").toString();
+    // an index payload is many entries over few data files, which repeats long runs of the same
+    // bytes, so it compresses about as well as the column the index was built from
+    byte[] payload = new byte[1 << 20];
+    for (int i = 0; i < payload.length; i++) {
+      payload[i] = (byte) (i % 97);
+    }
+    IndexBlob blob = IndexBlob.of("iceberg-vector-entries-v2", payload);
+
+    container.write(localOutput(location), List.of(blob));
+
+    assertThat(container.read(localInput(location))).containsExactly(blob);
+    assertThat(java.nio.file.Files.size(java.nio.file.Paths.get(location)))
+        .isLessThan(payload.length / 2);
+  }
+
+  @Test
+  public void canBeToldToWriteBlobsUncompressed(@TempDir Path tempDir) throws IOException {
+    String location = tempDir.resolve("index-file-1.puffin").toString();
+    byte[] payload = new byte[1 << 20];
+    for (int i = 0; i < payload.length; i++) {
+      payload[i] = (byte) (i % 97);
+    }
+    IndexBlob blob = IndexBlob.of("iceberg-vector-entries-v2", payload);
+
+    System.setProperty(PuffinIndexFileContainer.INDEX_BLOB_COMPRESSION_PROPERTY, "none");
+    try {
+      container.write(localOutput(location), List.of(blob));
+      assertThat(container.read(localInput(location))).containsExactly(blob);
+      assertThat(java.nio.file.Files.size(java.nio.file.Paths.get(location)))
+          .isGreaterThan(payload.length);
+    } finally {
+      System.clearProperty(PuffinIndexFileContainer.INDEX_BLOB_COMPRESSION_PROPERTY);
+    }
+  }
 }
