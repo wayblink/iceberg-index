@@ -70,6 +70,46 @@ class TestVectorIndexAdapter {
   }
 
   @Test
+  public void writesADataFileOncePerIndexFileRatherThanOncePerEntry() {
+    VectorIndexAdapter adapter = adapter(VectorIndexDefinition.Metric.EUCLIDEAN);
+    // many entries over few data files is the shape a real index file has, and it is where writing
+    // the path per entry costs the most
+    List<IndexEntry> entries = Lists.newArrayList();
+    for (int i = 0; i < 500; i++) {
+      String dataFile = "a-rather-long-data-file-path-" + (i % 2) + ".parquet";
+      entries.add(IndexEntry.of(dataFile, i, adapter.encodeVector(new float[] {i, -i})));
+    }
+
+    ByteBuffer payload = adapter.encodeEntries(entries);
+
+    assertThat(adapter.decodeEntries(payload)).containsExactlyElementsOf(entries);
+
+    // the two paths appear once each in the payload, not once per entry
+    byte[] bytes = new byte[payload.remaining()];
+    payload.duplicate().get(bytes);
+    assertThat(countOccurrences(bytes, "a-rather-long-data-file-path-0.parquet")).isEqualTo(1);
+    assertThat(countOccurrences(bytes, "a-rather-long-data-file-path-1.parquet")).isEqualTo(1);
+  }
+
+  private static int countOccurrences(byte[] bytes, String needle) {
+    byte[] pattern = needle.getBytes(java.nio.charset.StandardCharsets.UTF_8);
+    int count = 0;
+    for (int i = 0; i <= bytes.length - pattern.length; i++) {
+      boolean found = true;
+      for (int j = 0; j < pattern.length; j++) {
+        if (bytes[i + j] != pattern[j]) {
+          found = false;
+          break;
+        }
+      }
+      if (found) {
+        count += 1;
+      }
+    }
+    return count;
+  }
+
+  @Test
   public void ordersResultsByMetric() {
     List<IndexEntry> entries =
         List.of(

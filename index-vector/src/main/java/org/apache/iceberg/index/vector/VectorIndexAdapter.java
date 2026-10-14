@@ -31,6 +31,7 @@ import java.io.UncheckedIOException;
 import java.nio.ByteBuffer;
 import java.util.Comparator;
 import java.util.List;
+import java.util.Set;
 import org.apache.iceberg.index.IndexAdapter;
 import org.apache.iceberg.index.IndexDefinition;
 import org.apache.iceberg.index.IndexEntry;
@@ -38,6 +39,7 @@ import org.apache.iceberg.index.IndexSearchResult;
 import org.apache.iceberg.relocated.com.google.common.base.Preconditions;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableList;
 import org.apache.iceberg.relocated.com.google.common.collect.Lists;
+import org.apache.iceberg.relocated.com.google.common.collect.Sets;
 
 /**
  * The vector adapter: payload codec, exact search, and metric-aware ordering for vector indexes.
@@ -64,8 +66,8 @@ public final class VectorIndexAdapter implements IndexAdapter, java.io.Serializa
   public static final String AUXILIARY_BLOB_TYPE = "iceberg-vector-hnsw-v1";
 
   private static final int VALUE_FORMAT_VERSION = 1;
-  private static final int ENTRIES_FORMAT_VERSION = 1;
-  private static final int HNSW_PAYLOAD_FORMAT_VERSION = 1;
+  private static final int ENTRIES_FORMAT_VERSION = 2;
+  private static final int HNSW_PAYLOAD_VERSION = 2;
 
   private final VectorIndexDefinition definition;
 
@@ -137,10 +139,19 @@ public final class VectorIndexAdapter implements IndexAdapter, java.io.Serializa
     ByteArrayOutputStream bytes = new ByteArrayOutputStream();
     try (DataOutputStream out = new DataOutputStream(bytes)) {
       out.writeInt(ENTRIES_FORMAT_VERSION);
+      // the data files an entry points at are written once, as a dictionary, and an entry refers to
+      // one by position: a path is long and every entry of a file repeats it, which is most of the
+      // payload once there are many entries per file
+      List<String> dataFiles = dataFilesOf(entries);
+      out.writeInt(dataFiles.size());
+      for (String dataFile : dataFiles) {
+        out.writeUTF(dataFile);
+      }
+
       out.writeInt(entries.size());
       for (IndexEntry entry : entries) {
         decodeVector(entry.payload(), "Entry");
-        out.writeUTF(entry.dataFile());
+        out.writeInt(dataFiles.indexOf(entry.dataFile()));
         out.writeLong(entry.rowPosition());
         byte[] payload = entry.payload();
         out.writeInt(payload.length);
@@ -162,11 +173,24 @@ public final class VectorIndexAdapter implements IndexAdapter, java.io.Serializa
           version == ENTRIES_FORMAT_VERSION,
           "Unsupported vector entries format version: %s",
           version);
+      int dataFileCount = in.readInt();
+      Preconditions.checkArgument(
+          dataFileCount >= 0, "Invalid vector data file count: %s", dataFileCount);
+      List<String> dataFiles = Lists.newArrayListWithCapacity(dataFileCount);
+      for (int i = 0; i < dataFileCount; i++) {
+        dataFiles.add(in.readUTF());
+      }
+
       int entryCount = in.readInt();
       Preconditions.checkArgument(entryCount >= 0, "Invalid vector entry count: %s", entryCount);
       List<IndexEntry> entries = Lists.newArrayList();
       for (int i = 0; i < entryCount; i++) {
-        String dataFile = in.readUTF();
+        int dataFileIndex = in.readInt();
+        Preconditions.checkArgument(
+            dataFileIndex >= 0 && dataFileIndex < dataFiles.size(),
+            "Invalid vector data file index: %s",
+            dataFileIndex);
+        String dataFile = dataFiles.get(dataFileIndex);
         long rowPosition = in.readLong();
         int payloadLength = in.readInt();
         Preconditions.checkArgument(
@@ -179,6 +203,18 @@ public final class VectorIndexAdapter implements IndexAdapter, java.io.Serializa
     } catch (IOException e) {
       throw new UncheckedIOException("Failed to decode vector index entries", e);
     }
+  }
+
+  /**
+   * The distinct data files of the given entries, in the order they first appear, which is the
+   * dictionary an encoded entry refers to its data file by.
+   */
+  private static List<String> dataFilesOf(List<IndexEntry> entries) {
+    Set<String> dataFiles = Sets.newLinkedHashSet();
+    for (IndexEntry entry : entries) {
+      dataFiles.add(entry.dataFile());
+    }
+    return ImmutableList.copyOf(dataFiles);
   }
 
   @Override
@@ -228,13 +264,20 @@ public final class VectorIndexAdapter implements IndexAdapter, java.io.Serializa
 
     ByteArrayOutputStream payload = new ByteArrayOutputStream();
     try (DataOutputStream out = new DataOutputStream(payload)) {
-      out.writeInt(HNSW_PAYLOAD_FORMAT_VERSION);
+      out.writeInt(HNSW_PAYLOAD_VERSION);
       byte[] graphBytes = graph.toByteArray();
       out.writeInt(graphBytes.length);
       out.write(graphBytes);
+      // the same dictionary the entries use: a graph node refers to its data file by position
+      List<String> dataFiles = dataFilesOf(materialized);
+      out.writeInt(dataFiles.size());
+      for (String dataFile : dataFiles) {
+        out.writeUTF(dataFile);
+      }
+
       out.writeInt(materialized.size());
       for (IndexEntry entry : materialized) {
-        out.writeUTF(entry.dataFile());
+        out.writeInt(dataFiles.indexOf(entry.dataFile()));
         out.writeLong(entry.rowPosition());
       }
     } catch (IOException e) {
@@ -255,20 +298,31 @@ public final class VectorIndexAdapter implements IndexAdapter, java.io.Serializa
     try (DataInputStream in = new DataInputStream(new ByteArrayInputStream(bytes))) {
       int version = in.readInt();
       Preconditions.checkArgument(
-          version == HNSW_PAYLOAD_FORMAT_VERSION,
-          "Unsupported HNSW payload format version: %s",
-          version);
+          version == HNSW_PAYLOAD_VERSION, "Unsupported HNSW payload format version: %s", version);
       int graphLength = in.readInt();
       Preconditions.checkArgument(graphLength >= 0, "Invalid HNSW graph length: %s", graphLength);
       byte[] graph = new byte[graphLength];
       in.readFully(graph);
+      int dataFileCount = in.readInt();
+      Preconditions.checkArgument(
+          dataFileCount >= 0, "Invalid HNSW data file count: %s", dataFileCount);
+      String[] dictionary = new String[dataFileCount];
+      for (int i = 0; i < dataFileCount; i++) {
+        dictionary[i] = in.readUTF();
+      }
+
       int mappingCount = in.readInt();
       Preconditions.checkArgument(
           mappingCount >= 0, "Invalid HNSW mapping count: %s", mappingCount);
       String[] dataFiles = new String[mappingCount];
       long[] positions = new long[mappingCount];
       for (int i = 0; i < mappingCount; i++) {
-        dataFiles[i] = in.readUTF();
+        int dataFileIndex = in.readInt();
+        Preconditions.checkArgument(
+            dataFileIndex >= 0 && dataFileIndex < dictionary.length,
+            "Invalid HNSW data file index: %s",
+            dataFileIndex);
+        dataFiles[i] = dictionary[dataFileIndex];
         positions[i] = in.readLong();
       }
 
