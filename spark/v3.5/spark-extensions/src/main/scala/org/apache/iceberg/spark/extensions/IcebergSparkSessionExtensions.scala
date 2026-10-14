@@ -40,6 +40,13 @@ class IcebergSparkSessionExtensions extends (SparkSessionExtensions => Unit) {
   private val TEXT_MATCH = "match"
 
   override def apply(extensions: SparkSessionExtensions): Unit = {
+    // the index types the engine ships with. IndexTypes is a static registry that fails fast on an
+    // unknown type, so a session that has not registered them can neither build nor read an index,
+    // and the rewrite rules stand aside rather than failing the query. Registering here is what
+    // makes a deployment work without the process having to know about the index layer.
+    org.apache.iceberg.index.vector.VectorIndexTypes.register()
+    org.apache.iceberg.index.text.TextIndexTypes.register()
+
     // parser extensions
     extensions.injectParser { case (_, parser) => new IcebergSparkSqlExtensionsParser(parser) }
 
