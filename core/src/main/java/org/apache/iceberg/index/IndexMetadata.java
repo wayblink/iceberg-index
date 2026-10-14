@@ -50,7 +50,7 @@ public final class IndexMetadata {
    * file. Zero, the default, means one index file per data file. A refresh keeps the budget the
    * index was built with.
    */
-  public static final String ENTRIES_PER_INDEX_FILE_PROPERTY = "entries-per-index-file";
+  public static final String MAX_ENTRIES_PER_INDEX_FILE_PROPERTY = "max-entries-per-index-file";
 
   private final String indexUuid;
   private final String tableUuid;
@@ -176,10 +176,15 @@ public final class IndexMetadata {
 
   /**
    * Returns the entry budget that groups data files into index files, or zero when each data file
-   * gets an index file of its own. See {@link #ENTRIES_PER_INDEX_FILE_PROPERTY}.
+   * gets an index file of its own.
+   *
+   * <p>The budget is an upper bound and never splits a data file, so a table whose data files are
+   * larger than the budget keeps one index file per data file, and only a table with many small
+   * data files sees them merged into larger index files, which is what makes an HNSW graph span
+   * more vectors. See {@link #MAX_ENTRIES_PER_INDEX_FILE_PROPERTY}.
    */
-  public long entriesPerIndexFile() {
-    String value = properties.get(ENTRIES_PER_INDEX_FILE_PROPERTY);
+  public long maxEntriesPerIndexFile() {
+    String value = properties.get(MAX_ENTRIES_PER_INDEX_FILE_PROPERTY);
     if (value == null) {
       return 0L;
     }
@@ -187,7 +192,7 @@ public final class IndexMetadata {
       return Long.parseLong(value);
     } catch (NumberFormatException e) {
       throw new IllegalArgumentException(
-          "Invalid " + ENTRIES_PER_INDEX_FILE_PROPERTY + " property: " + value, e);
+          "Invalid " + MAX_ENTRIES_PER_INDEX_FILE_PROPERTY + " property: " + value, e);
     }
   }
 

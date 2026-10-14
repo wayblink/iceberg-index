@@ -57,13 +57,13 @@ final class IndexGrouping {
    *
    * @param table the table to index
    * @param snapshotId the source table snapshot whose data files are grouped
-   * @param entriesPerIndexFile the entry budget, or zero for one index file per data file
+   * @param maxEntriesPerIndexFile the entry budget, or zero for one index file per data file
    * @return a map from data file location to group id, in snapshot order
    */
-  static Map<String, Integer> assign(Table table, long snapshotId, long entriesPerIndexFile) {
+  static Map<String, Integer> assign(Table table, long snapshotId, long maxEntriesPerIndexFile) {
     List<DataFile> dataFiles = dataFiles(table, snapshotId);
     Map<String, Integer> assignment = Maps.newLinkedHashMap();
-    if (entriesPerIndexFile <= 0) {
+    if (maxEntriesPerIndexFile <= 0) {
       int group = 0;
       for (DataFile dataFile : dataFiles) {
         assignment.put(dataFile.path().toString(), group);
@@ -76,7 +76,7 @@ final class IndexGrouping {
     long entries = 0L;
     for (DataFile dataFile : dataFiles) {
       long records = Math.max(1L, dataFile.recordCount());
-      if (entries > 0 && entries + records > entriesPerIndexFile) {
+      if (entries > 0 && entries + records > maxEntriesPerIndexFile) {
         group++;
         entries = 0L;
       }

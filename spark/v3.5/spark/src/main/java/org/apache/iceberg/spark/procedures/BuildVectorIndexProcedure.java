@@ -60,8 +60,8 @@ class BuildVectorIndexProcedure extends BaseProcedure {
       optionalInParameter("max_m", DataTypes.IntegerType);
   private static final ProcedureParameter EF_CONSTRUCTION_PARAM =
       optionalInParameter("ef_construction", DataTypes.IntegerType);
-  private static final ProcedureParameter ENTRIES_PER_INDEX_FILE_PARAM =
-      optionalInParameter("entries_per_index_file", DataTypes.LongType);
+  private static final ProcedureParameter MAX_ENTRIES_PER_INDEX_FILE_PARAM =
+      optionalInParameter("max_entries_per_index_file", DataTypes.LongType);
   private static final ProcedureParameter EF_SEARCH_PARAM =
       optionalInParameter("ef_search", DataTypes.IntegerType);
   private static final ProcedureParameter[] PARAMETERS =
@@ -74,7 +74,7 @@ class BuildVectorIndexProcedure extends BaseProcedure {
         MAX_M_PARAM,
         EF_CONSTRUCTION_PARAM,
         EF_SEARCH_PARAM,
-        ENTRIES_PER_INDEX_FILE_PARAM
+        MAX_ENTRIES_PER_INDEX_FILE_PARAM
       };
 
   private static final StructType OUTPUT_TYPE =
@@ -121,8 +121,8 @@ class BuildVectorIndexProcedure extends BaseProcedure {
     int maxM = input.asInt(MAX_M_PARAM, 16);
     int efConstruction = input.asInt(EF_CONSTRUCTION_PARAM, 200);
     int efSearch = input.asInt(EF_SEARCH_PARAM, 50);
-    long entriesPerIndexFile =
-        VectorIndexProcedures.entriesPerIndexFile(input, ENTRIES_PER_INDEX_FILE_PARAM);
+    long maxEntriesPerIndexFile =
+        VectorIndexProcedures.maxEntriesPerIndexFile(input, MAX_ENTRIES_PER_INDEX_FILE_PARAM);
 
     return modifyIcebergTable(
         input.ident(TABLE_PARAM),
@@ -158,8 +158,8 @@ class BuildVectorIndexProcedure extends BaseProcedure {
                               .efSearch(efSearch)
                               .build())
                       .property(
-                          IndexMetadata.ENTRIES_PER_INDEX_FILE_PROPERTY,
-                          Long.toString(entriesPerIndexFile))
+                          IndexMetadata.MAX_ENTRIES_PER_INDEX_FILE_PROPERTY,
+                          Long.toString(maxEntriesPerIndexFile))
                       .build());
 
           IndexMetadata updated =

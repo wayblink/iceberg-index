@@ -77,7 +77,7 @@ class TestRewriteVectorSearch {
 
   @Test
   public void rewritesANearestNeighbourQueryIntoAnIndexLookup() {
-    String table = tableWithIndex("docs_exact", "exact");
+    String table = tableWithIndex("docs_exact", "hnsw");
 
     List<Row> hits =
         spark
@@ -112,11 +112,32 @@ class TestRewriteVectorSearch {
     List<Row> withoutIndex = spark.sql(String.format(query, plain)).collectAsList();
 
     // with an index the same query must give the same rows in the same order
-    String indexed = tableWithIndex("docs_scan_indexed", "exact");
+    String indexed = tableWithIndex("docs_scan_indexed", "hnsw");
     List<Row> withIndex = spark.sql(String.format(query, indexed)).collectAsList();
 
     assertThat(withIndex).containsExactlyElementsOf(withoutIndex);
     assertThat(planOf(indexed, String.format(query, indexed))).contains("LocalRelation");
+  }
+
+  @Test
+  public void leavesAnExactIndexAloneAndScans() {
+    // an exact index repacks the vector column with a row reference and is searched by walking
+    // every entry, which is the work a scan does over a payload larger than the column itself
+    String table = tableWithIndex("docs_exact_only", "exact");
+
+    assertThat(
+            planOf(
+                table,
+                String.format(
+                    "SELECT id FROM local.%s ORDER BY vec_distance(embedding, array(0.9d, 0.1d)) LIMIT 2",
+                    table)))
+        .doesNotContain("LocalRelation");
+
+    // the answers are still right, they just come from a scan
+    List<Row> hits = search(table, 2);
+    assertThat(hits).hasSize(2);
+    assertThat(hits.get(0).getLong(0)).isEqualTo(1L);
+    assertThat(hits.get(1).getLong(0)).isEqualTo(3L);
   }
 
   @Test
@@ -136,7 +157,7 @@ class TestRewriteVectorSearch {
     spark.sql(
         String.format(
             "CALL local.system.build_vector_index("
-                + "table => '%s', column => 'embedding', dimension => 2, mode => 'exact')",
+                + "table => '%s', column => 'embedding', dimension => 2, mode => 'hnsw')",
             table));
 
     String query =
@@ -180,7 +201,7 @@ class TestRewriteVectorSearch {
 
   @Test
   public void usesAnIndexThatIsBehindAndScansTheDifference() {
-    String table = tableWithIndex("docs_behind", "exact");
+    String table = tableWithIndex("docs_behind", "hnsw");
     // a row added after the index was built leaves the index behind the current snapshot
     spark.sql(String.format("INSERT INTO local.%s VALUES (5, 'echo', array(2.0d, 1.0d))", table));
 
@@ -196,7 +217,7 @@ class TestRewriteVectorSearch {
 
   @Test
   public void doesNotReturnRowsDeletedAfterTheIndexWasBuilt() {
-    String table = tableWithIndex("docs_deleted", "exact");
+    String table = tableWithIndex("docs_deleted", "hnsw");
     spark.sql(String.format("DELETE FROM local.%s WHERE id = 1", table));
 
     assertThat(planOf(table, nearestNeighbour(table, 3))).contains("LocalRelation");
@@ -216,7 +237,7 @@ class TestRewriteVectorSearch {
             table));
     spark.sql(
         String.format(
-            "CALL local.system.build_vector_index(table => '%s', column => 'embedding', dimension => 2, mode => 'exact')",
+            "CALL local.system.build_vector_index(table => '%s', column => 'embedding', dimension => 2, mode => 'hnsw')",
             table));
 
     // the index was built on the second snapshot, so it has nothing to say about the first one
@@ -237,7 +258,7 @@ class TestRewriteVectorSearch {
 
   @Test
   public void leavesThePlanAloneWhenTheQueryIsNotANearestNeighbourQuery() {
-    String table = tableWithIndex("docs_shape", "exact");
+    String table = tableWithIndex("docs_shape", "hnsw");
 
     // descending order asks for the farthest rows, which the index does not answer
     assertThat(
@@ -267,7 +288,7 @@ class TestRewriteVectorSearch {
     spark.sql(
         String.format(
             "CALL local.system.build_vector_index("
-                + "table => '%s', column => 'embedding', dimension => 2, mode => 'exact')",
+                + "table => '%s', column => 'embedding', dimension => 2, mode => 'hnsw')",
             table));
 
     // the partition column is not in the data file, its value comes from the path
@@ -287,7 +308,7 @@ class TestRewriteVectorSearch {
     spark.sql(
         String.format(
             "CALL local.system.build_vector_index("
-                + "table => '%s', column => 'embedding', dimension => 2, mode => 'exact')",
+                + "table => '%s', column => 'embedding', dimension => 2, mode => 'hnsw')",
             table));
 
     // the bucket number is in the path but the column value is not, so the rows cannot be read back

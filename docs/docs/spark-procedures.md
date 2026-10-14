@@ -1326,7 +1326,7 @@ merged at query time, so an incremental refresh never has to rewrite the whole i
 | `min_token_length` |      | int    | Minimum token length (default `2`)                     |
 | `lowercase`   |           | boolean| Lowercase tokens before indexing (default `true`)      |
 | `stopwords`   |           | array<string> | Optional stopword list                          |
-| `entries_per_index_file` |   | long  | Entry budget that groups data files into index files (default 0: one index file per data file) |
+| `max_entries_per_index_file` |   | long  | Upper bound on the entries of one index file (default 1000000). Never splits a data file, so a table with large data files keeps one index file per data file; a table with many small ones sees them merged |
 
 #### Output
 
@@ -1345,7 +1345,7 @@ CALL catalog_name.system.build_text_index(
 ```
 
 Grouping several data files into one index file is what makes an HNSW graph span more than a single
-data file, which is the reason to do it. `entries_per_index_file` sets the budget: data files are
+data file, which is the reason to do it. `max_entries_per_index_file` sets the budget: data files are
 packed until the budget is reached, and each pack becomes one index file. Zero, the default, keeps
 one index file per data file. The budget is a property of the index, so refreshes keep it.
 
@@ -1358,7 +1358,7 @@ and complete either way.
 -- two data files' worth of entries per index file
 CALL catalog_name.system.build_vector_index(
     table => 'db.documents', column => 'embedding', dimension => 128,
-    entries_per_index_file => 20000);
+    max_entries_per_index_file => 20000);
 ```
 
 ### `refresh_text_index`

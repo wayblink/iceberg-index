@@ -145,6 +145,17 @@ case class RewriteVectorSearch(spark: SparkSession) extends Rule[LogicalPlan] {
     }
     val definition = index.definition().asInstanceOf[VectorIndexDefinition]
 
+    // an exact index is the vector column repacked with a row reference, and searching it walks
+    // every entry, which is the same work as scanning the table, over a payload that is larger than
+    // the column it repacks. Rewriting would make the query slower, so the scan is left alone.
+    if (definition.mode() == IndexMode.EXACT) {
+      logger.warn(
+        "Index of column {} of table {} is exact, which searches every entry like a scan does, "
+          + "so scanning",
+        Array[Object](column, table.name()): _*)
+      return None
+    }
+
     val snapshotId = IndexRewriteSupport.scanSnapshotId(sparkTable).getOrElse {
       return None
     }

@@ -56,8 +56,8 @@ class BuildTextIndexProcedure extends BaseProcedure {
       optionalInParameter("min_token_length", DataTypes.IntegerType);
   private static final ProcedureParameter LOWERCASE_PARAM =
       optionalInParameter("lowercase", DataTypes.BooleanType);
-  private static final ProcedureParameter ENTRIES_PER_INDEX_FILE_PARAM =
-      optionalInParameter("entries_per_index_file", DataTypes.LongType);
+  private static final ProcedureParameter MAX_ENTRIES_PER_INDEX_FILE_PARAM =
+      optionalInParameter("max_entries_per_index_file", DataTypes.LongType);
   private static final ProcedureParameter STOPWORDS_PARAM =
       optionalInParameter("stopwords", STRING_ARRAY);
   private static final ProcedureParameter[] PARAMETERS =
@@ -69,7 +69,7 @@ class BuildTextIndexProcedure extends BaseProcedure {
         MIN_TOKEN_LENGTH_PARAM,
         LOWERCASE_PARAM,
         STOPWORDS_PARAM,
-        ENTRIES_PER_INDEX_FILE_PARAM
+        MAX_ENTRIES_PER_INDEX_FILE_PARAM
       };
 
   private static final StructType OUTPUT_TYPE =
@@ -145,8 +145,8 @@ class BuildTextIndexProcedure extends BaseProcedure {
             definition.stopword(stopword);
           }
 
-          long entriesPerIndexFile =
-              VectorIndexProcedures.entriesPerIndexFile(input, ENTRIES_PER_INDEX_FILE_PARAM);
+          long maxEntriesPerIndexFile =
+              VectorIndexProcedures.maxEntriesPerIndexFile(input, MAX_ENTRIES_PER_INDEX_FILE_PARAM);
           String indexUuid = UUID.randomUUID().toString();
           long sourceSnapshotId = table.currentSnapshot().snapshotId();
           IndexMetadata created =
@@ -157,8 +157,8 @@ class BuildTextIndexProcedure extends BaseProcedure {
                       .indexUuid(indexUuid)
                       .definition(definition.build())
                       .property(
-                          IndexMetadata.ENTRIES_PER_INDEX_FILE_PROPERTY,
-                          Long.toString(entriesPerIndexFile))
+                          IndexMetadata.MAX_ENTRIES_PER_INDEX_FILE_PROPERTY,
+                          Long.toString(maxEntriesPerIndexFile))
                       .build());
 
           IndexMetadata updated =

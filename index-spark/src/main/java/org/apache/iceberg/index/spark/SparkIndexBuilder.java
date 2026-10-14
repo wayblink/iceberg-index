@@ -119,7 +119,7 @@ public final class SparkIndexBuilder {
               vectorColumn,
               adapter,
               null,
-              currentMetadata.entriesPerIndexFile(),
+              currentMetadata.maxEntriesPerIndexFile(),
               writer);
       manifestList = writer.writeManifestList(indexLocation, snapshotId, indexFiles);
     } catch (RuntimeException e) {
@@ -226,7 +226,7 @@ public final class SparkIndexBuilder {
               vectorColumn,
               adapter,
               rebuildFiles,
-              currentMetadata.entriesPerIndexFile(),
+              currentMetadata.maxEntriesPerIndexFile(),
               writer);
       indexFiles = Lists.newArrayList(carried);
       indexFiles.addAll(newIndexFiles);
@@ -262,7 +262,7 @@ public final class SparkIndexBuilder {
       String vectorColumn,
       IndexAdapter adapter,
       Set<String> onlyFiles,
-      long entriesPerIndexFile,
+      long maxEntriesPerIndexFile,
       IndexSnapshotWriter writer) {
     if (onlyFiles != null && onlyFiles.isEmpty()) {
       return Lists.newArrayList();
@@ -274,7 +274,7 @@ public final class SparkIndexBuilder {
     // budget of zero every group holds a single data file, which is the 1:1 layout
     Map<String, Integer> assignment =
         IndexGrouping.restrict(
-            IndexGrouping.assign(table, sourceTableSnapshotId, entriesPerIndexFile),
+            IndexGrouping.assign(table, sourceTableSnapshotId, maxEntriesPerIndexFile),
             onlyFiles == null
                 ? Sets.newHashSet(IndexEntries.dataFiles(table, sourceTableSnapshotId))
                 : onlyFiles);

@@ -162,13 +162,14 @@ public class TestMultipleIndexesPerTable extends ExtensionsTestBase {
       sql("INSERT INTO %s VALUES (%d, array(%d.0d, 1.0d))", tableName, id, id);
     }
 
-    // without a budget every data file gets an index file of its own
+    // the default budget is large, so four data files of one row each are packed into a single
+    // index file: a budget is an upper bound, and merging small data files is what it is for
     sql(
         "CALL %s.system.build_vector_index(table => '%s', column => 'embedding', dimension => 2)",
         catalogName, tableName);
     List<Object[]> listOutput =
         sql("CALL %s.system.list_indexes(table => '%s')", catalogName, tableName);
-    assertThat(((Number) listOutput.get(0)[5]).longValue()).isEqualTo(4L);
+    assertThat(((Number) listOutput.get(0)[5]).longValue()).isEqualTo(1L);
     assertThat(((Number) listOutput.get(0)[6]).longValue()).isEqualTo(4L);
 
     // a budget of two entries packs two data files into one index file
@@ -179,7 +180,7 @@ public class TestMultipleIndexesPerTable extends ExtensionsTestBase {
     }
     sql(
         "CALL %s.system.build_vector_index(table => '%s', column => 'embedding', dimension => 2, "
-            + "entries_per_index_file => 2)",
+            + "max_entries_per_index_file => 2)",
         catalogName, grouped);
 
     List<Object[]> groupedOutput =
@@ -195,7 +196,7 @@ public class TestMultipleIndexesPerTable extends ExtensionsTestBase {
     }
     sql(
         "CALL %s.system.build_vector_index(table => '%s', column => 'embedding', dimension => 2, "
-            + "entries_per_index_file => 1)",
+            + "max_entries_per_index_file => 1)",
         catalogName, single);
     List<Object[]> singleOutput =
         sql("CALL %s.system.list_indexes(table => '%s')", catalogName, single);
@@ -221,7 +222,7 @@ public class TestMultipleIndexesPerTable extends ExtensionsTestBase {
     // two data files per index file
     sql(
         "CALL %s.system.build_text_index(table => '%s', column => 'body', "
-            + "entries_per_index_file => 2)",
+            + "max_entries_per_index_file => 2)",
         catalogName, tableName);
 
     List<Object[]> before =

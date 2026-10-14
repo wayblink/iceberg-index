@@ -27,6 +27,12 @@ import org.apache.spark.sql.connector.iceberg.catalog.ProcedureParameter;
 /** Shared helpers for the vector index SQL procedures. */
 final class VectorIndexProcedures {
 
+  /**
+   * The default entry budget that groups data files into index files. Large enough that a data file
+   * of a usual size keeps an index file of its own, so a table is not fragmented by default.
+   */
+  static final long DEFAULT_MAX_ENTRIES_PER_INDEX_FILE = 1_000_000L;
+
   private VectorIndexProcedures() {}
 
   /** Registers the vector index type with the core index type registry. */
@@ -47,10 +53,14 @@ final class VectorIndexProcedures {
   /** Resolves the field ID of the vector column, failing if the column does not exist. */
   /**
    * Reads the entry budget that groups data files into index files from a build procedure's input.
-   * Zero, the default, keeps one index file per data file.
+   *
+   * <p>The budget is an upper bound on a group and never splits a data file, so a table whose data
+   * files are larger than the budget keeps one index file per data file, and only a table with many
+   * small data files sees them merged. The default is large enough that a data file of a usual size
+   * is left alone; lower it to trade parallelism for a larger HNSW graph, which recalls better.
    */
-  static long entriesPerIndexFile(ProcedureInput input, ProcedureParameter parameter) {
-    return input.asLong(parameter, 0L);
+  static long maxEntriesPerIndexFile(ProcedureInput input, ProcedureParameter parameter) {
+    return input.asLong(parameter, DEFAULT_MAX_ENTRIES_PER_INDEX_FILE);
   }
 
   static int fieldId(Table table, String column) {
