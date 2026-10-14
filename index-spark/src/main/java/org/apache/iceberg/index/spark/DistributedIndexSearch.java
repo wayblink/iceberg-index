@@ -34,15 +34,15 @@ import org.apache.iceberg.index.IndexSearchResult;
 import org.apache.iceberg.index.IndexTypes;
 import org.apache.iceberg.index.PuffinIndexFileContainer;
 import org.apache.iceberg.inmemory.InMemoryInputFile;
+import org.apache.iceberg.io.FileIO;
+import org.apache.iceberg.io.IOUtil;
+import org.apache.iceberg.io.InputFile;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableList;
 import org.apache.iceberg.relocated.com.google.common.collect.Lists;
 import org.apache.spark.api.java.JavaSparkContext;
 import org.apache.spark.api.java.function.FlatMapFunction;
 import org.apache.spark.broadcast.Broadcast;
-import org.apache.spark.sql.Dataset;
-import org.apache.spark.sql.Row;
 import org.apache.spark.sql.SparkSession;
-import scala.Tuple2;
 import scala.Tuple3;
 
 /**
@@ -72,9 +72,6 @@ import scala.Tuple3;
  * hits exist than the top-k it returned, because it only ever saw the top-k.
  */
 public final class DistributedIndexSearch {
-
-  private static final String PATH_COLUMN = "path";
-  private static final String CONTENT_COLUMN = "content";
 
   private DistributedIndexSearch() {}
 
@@ -140,38 +137,33 @@ public final class DistributedIndexSearch {
     Broadcast<IndexAdapter> adapterRef = context.broadcast(adapter);
     // a ByteBuffer is not serializable, so the payload travels as bytes
     Broadcast<byte[]> queryRef = context.broadcast(toBytes(query.payload().duplicate()));
+    // the file IO travels whole, so an executor reads a payload the way the table is read, with the
+    // properties of its catalog rather than with whatever the session happens to be configured with
+    Broadcast<FileIO> ioRef = context.broadcast(table.io());
 
     // the limit is captured as a primitive: the query itself is not serializable. One more than the
     // query asks for is kept, because that is what says whether there is another round to ask for.
     int topK = query.topK();
     int localTopK = topK + 1;
 
-    // whole files as rows: the binary file data source reads a whole file as one row, which is what
-    // keeps the payload of an index file inside a single task; its own schema is fixed, so the
-    // columns are selected after
-    Dataset<Row> blobs =
-        spark
-            .read()
-            .format("binaryFile")
-            .load(locations.toArray(new String[0]))
-            .select(PATH_COLUMN, CONTENT_COLUMN);
-
+    // one index file per partition, because an index file is the unit of work: it carries a graph
+    // or
+    // a posting list of its own, so it is read whole and searched as a whole, and the number of
+    // partitions is the number of index files rather than whatever a byte budget would make of them
     List<Tuple3<String, Long, Double>> top =
-        blobs
-            .toJavaRDD()
-            .map(row -> Tuple2.apply(row.getString(0), row.<byte[]>getAs(1)))
+        context
+            .parallelize(locations, locations.size())
             .mapPartitions(
-                (FlatMapFunction<Iterator<Tuple2<String, byte[]>>, Tuple3<String, Long, Double>>)
-                    iterator -> {
+                (FlatMapFunction<Iterator<String>, Tuple3<String, Long, Double>>)
+                    locations1 -> {
+                      IndexAdapter fileAdapter = adapterRef.getValue();
+                      ByteBuffer fileQuery = ByteBuffer.wrap(queryRef.getValue());
+                      FileIO fileIO = ioRef.getValue();
                       List<Tuple3<String, Long, Double>> fileHits = Lists.newArrayList();
-                      while (iterator.hasNext()) {
-                        Tuple2<String, byte[]> blob = iterator.next();
+                      while (locations1.hasNext()) {
+                        byte[] content = readPayload(fileIO, locations1.next());
                         for (IndexSearchResult hit :
-                            searchFile(
-                                blob._2(),
-                                adapterRef.getValue(),
-                                ByteBuffer.wrap(queryRef.getValue()),
-                                localTopK)) {
+                            searchFile(content, fileAdapter, fileQuery, localTopK)) {
                           fileHits.add(
                               new Tuple3<>(hit.dataFile(), hit.rowPosition(), hit.score()));
                         }
@@ -226,6 +218,30 @@ public final class DistributedIndexSearch {
     byte[] bytes = new byte[buffer.remaining()];
     buffer.duplicate().get(bytes);
     return bytes;
+  }
+
+  /** Reads the payload of one index file, which an executor reads whole. */
+  private static byte[] readPayload(FileIO io, String location) {
+    InputFile file = io.newInputFile(location);
+    long length = file.getLength();
+    if (length > Integer.MAX_VALUE) {
+      throw new IllegalArgumentException(
+          "Index file "
+              + location
+              + " is "
+              + length
+              + " bytes, more than the "
+              + Integer.MAX_VALUE
+              + " bytes a payload can be read into; build it with a smaller grouping budget");
+    }
+
+    byte[] content = new byte[(int) length];
+    try (java.io.InputStream in = file.newStream()) {
+      IOUtil.readFully(in, content, 0, content.length);
+    } catch (java.io.IOException e) {
+      throw new java.io.UncheckedIOException("Failed to read index file " + location, e);
+    }
+    return content;
   }
 
   /** Searches one index file, which an executor has read whole. */

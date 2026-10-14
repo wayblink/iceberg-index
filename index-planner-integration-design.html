@@ -184,11 +184,22 @@ driver 单线程跑一秒多，批量 100 个查询就是 150 秒；读取顺序
   <tr><td>回表</td><td>executor</td><td>按命中位置读数据行，删除感知</td><td>0</td></tr>
 </table>
 
-<p><b>分区不是字节问题，是单位问题。</b>曾用 <code>spark.read.format("binaryFile")</code> 读索引文件，
+<p><b>分区不是字节问题，是单位问题。</b>最初用 <code>spark.read.format("binaryFile")</code> 读索引文件，
 但其分区由 <code>maxPartitionBytes</code>（默认 128MB）+ <code>openCostInBytes</code>（默认 4MB，小文件也按此计）
-+ <code>minPartitionNum</code>（默认集群核数）共同决定，与索引文件的语义边界无关（<code>TestBinaryFilePartitioning</code> 钉住了这套行为，
-也钉住了 per-read 的 <code>maxPartitionBytes</code> 选项对 binaryFile 不生效）。并行度实际是
++ <code>minPartitionNum</code>（默认集群核数）共同决定，与索引文件的语义边界无关（<code>TestBinaryFilePartitioning</code>
+钉住了这套行为，也钉住了 per-read 的 <code>maxPartitionBytes</code> 选项对 binaryFile 不生效）。并行度实际是
 <code>max(按大小打包的分区数, 集群核数)</code> 且不超过文件数。</p>
+
+<p>现已改为 <b>一个索引文件一个分区</b>：driver 侧从 manifest 拿到文件位置列表，
+<code>parallelize(locations, locations.size())</code> 显式分区，executor 侧用广播的 <code>FileIO</code>
+（带 catalog 属性，不是 session 的 Hadoop conf）整文件读入。<code>TestDistributedIndexSearch</code> 挂
+SparkListener 数 task：12 个索引文件就是 12 个 task，与字节预算和最小分区数无关。</p>
+
+<p><b>回表同样不能一个命中文件一个 job。</b>最初 <code>IndexEntries.rowsAt</code> 对每个命中数据文件
+<code>.collect()</code> 一次，且删除文件也是每文件重读一遍（位置删除 + 等值删除各一次）——
+一个查询实际发起 <b>3N+1 个 job</b>。现已整批化：删除文件按快照读一次（最多 2 个 job，
+等值删除键广播下去），行读取 union 后一次 collect，driver 上只按命中行分组。
+顺带把位置删除的查找从线性扫描改成排序 + 二分。</p>
 
 <p><b>归约的顺序是 SPI 契约。</b>分布式归约只能在 task 间传「分数 + 行引用」三个值，
 所以 <code>IndexAdapter.resultComparator()</code> 被明确为契约：按分数排序（距离升序、相似度降序），

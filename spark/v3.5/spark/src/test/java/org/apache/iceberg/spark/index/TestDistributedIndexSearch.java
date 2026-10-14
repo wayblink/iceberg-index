@@ -38,6 +38,8 @@ import org.apache.iceberg.index.vector.VectorIndexDefinition;
 import org.apache.iceberg.index.vector.VectorIndexDefinition.Metric;
 import org.apache.iceberg.index.vector.VectorIndexTypes;
 import org.apache.iceberg.relocated.com.google.common.collect.Lists;
+import org.apache.spark.scheduler.SparkListener;
+import org.apache.spark.scheduler.SparkListenerTaskEnd;
 import org.apache.spark.sql.Row;
 import org.apache.spark.sql.SparkSession;
 import org.junit.jupiter.api.AfterAll;
@@ -135,12 +137,32 @@ class TestDistributedIndexSearch {
     float[] query = {0.5f, 0.5f};
 
     for (int topK : new int[] {1, 3, 5, INSERTS}) {
-      DistributedIndexSearch.SearchOutcome outcome =
-          DistributedIndexSearch.search(
-              spark, built, table, IndexQuery.of(snapshotId, adapter.encodeQuery(query), topK));
+      CountingListener listener = new CountingListener();
+      spark.sparkContext().addSparkListener(listener);
+      DistributedIndexSearch.SearchOutcome outcome;
+      try {
+        outcome =
+            DistributedIndexSearch.search(
+                spark, built, table, IndexQuery.of(snapshotId, adapter.encodeQuery(query), topK));
+      } finally {
+        spark.sparkContext().removeSparkListener(listener);
+      }
 
       assertThat(outcome.hits()).containsExactlyElementsOf(bruteForceTopK(query, topK));
       assertThat(outcome.moreHits()).isEqualTo(topK < INSERTS);
+      // one task per index file: the index file is the unit of work, so a byte budget or a minimum
+      // partition count has no say in how the search is split up
+      assertThat(listener.tasks).isEqualTo(INSERTS);
+    }
+  }
+
+  /** Counts the tasks a search ran, which is what its parallelism was. */
+  private static final class CountingListener extends SparkListener {
+    private int tasks;
+
+    @Override
+    public void onTaskEnd(SparkListenerTaskEnd end) {
+      tasks += 1;
     }
   }
 

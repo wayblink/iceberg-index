@@ -21,6 +21,7 @@ package org.apache.iceberg.index.spark;
 import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collection;
 import java.util.List;
 import java.util.Map;
@@ -32,14 +33,19 @@ import org.apache.iceberg.Schema;
 import org.apache.iceberg.Table;
 import org.apache.iceberg.index.IndexAdapter;
 import org.apache.iceberg.io.CloseableIterable;
+import org.apache.iceberg.relocated.com.google.common.collect.ImmutableList;
+import org.apache.iceberg.relocated.com.google.common.collect.ImmutableMap;
+import org.apache.iceberg.relocated.com.google.common.collect.ImmutableSet;
 import org.apache.iceberg.relocated.com.google.common.collect.Lists;
 import org.apache.iceberg.relocated.com.google.common.collect.Maps;
 import org.apache.iceberg.relocated.com.google.common.collect.Sets;
 import org.apache.iceberg.types.Types;
 import org.apache.spark.api.java.JavaPairRDD;
 import org.apache.spark.api.java.JavaRDD;
+import org.apache.spark.api.java.JavaSparkContext;
 import org.apache.spark.api.java.function.Function;
 import org.apache.spark.api.java.function.PairFunction;
+import org.apache.spark.broadcast.Broadcast;
 import org.apache.spark.sql.Dataset;
 import org.apache.spark.sql.Row;
 import org.apache.spark.sql.RowFactory;
@@ -94,23 +100,22 @@ public final class IndexEntries {
   public static Dataset<Row> entries(
       SparkSession spark, Table table, long snapshotId, String column, IndexAdapter adapter) {
     Schema tableSchema = table.schema();
+    List<FileScanTask> tasks = scanTasks(table, snapshotId);
+    SnapshotDeletes deletes = SnapshotDeletes.read(spark, tasks, tableSchema);
 
     // the data read needs the indexed column plus the columns referenced by equality deletes
     Set<String> columnsToRead = Sets.newLinkedHashSet();
     columnsToRead.add(column);
-    for (FileScanTask task : scanTasks(table, snapshotId)) {
-      columnsToRead.addAll(
-          equalityColumns(tableSchema, equalityDeletes(Lists.newArrayList(task.deletes()))));
-    }
+    columnsToRead.addAll(deletes.keyColumns());
     List<String> readColumns = Lists.newArrayList(columnsToRead);
 
     Dataset<Row> entries = null;
-    for (FileScanTask task : scanTasks(table, snapshotId)) {
+    for (FileScanTask task : tasks) {
       String dataFile = task.file().location().toString();
 
       List<String> capturedReadColumns = readColumns;
       JavaRDD<Row> entryRows =
-          liveRowsOf(spark, table, task, capturedReadColumns, null, null)
+          liveRowsOf(spark, task, capturedReadColumns, null, null, deletes)
               .mapToPair(
                   (PairFunction<Tuple2<Long, Row>, Long, Row>)
                       entry ->
@@ -129,6 +134,12 @@ public final class IndexEntries {
     }
 
     return entries == null ? spark.createDataFrame(Lists.newArrayList(), SCHEMA) : entries;
+  }
+
+  /** The delete files of the tasks being read, read once. */
+  private static SnapshotDeletes deletesFor(
+      SparkSession spark, List<FileScanTask> tasks, Table table) {
+    return SnapshotDeletes.read(spark, tasks, table.schema());
   }
 
   /**
@@ -150,20 +161,36 @@ public final class IndexEntries {
       Map<String, ? extends Collection<Long>> positionsByFile,
       List<String> columns,
       StructType readSchema) {
-    Map<String, Map<Long, Row>> rowsByFile = Maps.newLinkedHashMap();
+    List<FileScanTask> tasks = Lists.newArrayList();
     for (FileScanTask task : scanTasks(table, snapshotId)) {
+      if (positionsByFile.containsKey(task.file().location().toString())) {
+        tasks.add(task);
+      }
+    }
+
+    // one job for every file being resolved, rather than one per file: a query resolves one data
+    // file per hit, so the per-file version pays the cost of starting a job for each of them
+    JavaPairRDD<String, Tuple2<Long, Row>> rows = null;
+    for (FileScanTask task : tasks) {
       String dataFile = task.file().location().toString();
       Collection<Long> positions = positionsByFile.get(dataFile);
-      if (positions == null) {
-        continue;
-      }
+      JavaPairRDD<String, Tuple2<Long, Row>> fileRows =
+          liveRowsOf(spark, task, columns, positions, readSchema, deletesFor(spark, tasks, table))
+              .mapToPair(
+                  (PairFunction<Tuple2<Long, Row>, String, Tuple2<Long, Row>>)
+                      entry -> new Tuple2<>(dataFile, entry));
+      rows = rows == null ? fileRows : rows.union(fileRows);
+    }
 
-      Map<Long, Row> rows = Maps.newLinkedHashMap();
-      for (Tuple2<Long, Row> entry :
-          liveRowsOf(spark, table, task, columns, positions, readSchema).collect()) {
-        rows.put(entry._1(), entry._2());
-      }
-      rowsByFile.put(dataFile, rows);
+    Map<String, Map<Long, Row>> rowsByFile = Maps.newLinkedHashMap();
+    if (rows == null) {
+      return rowsByFile;
+    }
+
+    for (Tuple2<String, Tuple2<Long, Row>> entry : rows.collect()) {
+      rowsByFile
+          .computeIfAbsent(entry._1(), key -> Maps.newLinkedHashMap())
+          .put(entry._2()._1(), entry._2()._2());
     }
 
     return rowsByFile;
@@ -187,11 +214,17 @@ public final class IndexEntries {
       Collection<String> dataFiles,
       List<String> columns,
       StructType readSchema) {
-    List<JavaRDD<Row>> perFile = Lists.newArrayList();
+    List<FileScanTask> tasks = Lists.newArrayList();
     for (FileScanTask task : scanTasks(table, snapshotId)) {
       if (dataFiles.contains(task.file().location().toString())) {
-        perFile.add(liveRowsOf(spark, table, task, columns, null, readSchema).values());
+        tasks.add(task);
       }
+    }
+
+    SnapshotDeletes deletes = SnapshotDeletes.read(spark, tasks, table.schema());
+    List<JavaRDD<Row>> perFile = Lists.newArrayList();
+    for (FileScanTask task : tasks) {
+      perFile.add(liveRowsOf(spark, task, columns, null, readSchema, deletes).values());
     }
 
     if (perFile.isEmpty()) {
@@ -213,19 +246,17 @@ public final class IndexEntries {
    */
   private static JavaPairRDD<Long, Row> liveRowsOf(
       SparkSession spark,
-      Table table,
       FileScanTask task,
       List<String> columns,
       Collection<Long> positions,
-      StructType readSchema) {
-    Schema tableSchema = table.schema();
+      StructType readSchema,
+      SnapshotDeletes deletes) {
     String dataFile = task.file().location().toString();
-    List<DeleteFile> deleteFiles = Lists.newArrayList(task.deletes());
 
     // delete files are read on the driver so the executor-side filter is a simple lookup
-    long[] deletedPositions = readDeletedPositions(spark, positionDeletes(deleteFiles), dataFile);
-    List<String> keyColumns = equalityColumns(tableSchema, equalityDeletes(deleteFiles));
-    Set<String> equalityKeys = readEqualityKeys(spark, equalityDeletes(deleteFiles), keyColumns);
+    long[] deletedPositions = deletes.deletedPositions(dataFile);
+    List<String> keyColumns = deletes.keyColumns();
+    Set<String> equalityKeys = deletes.equalityKeys();
 
     Set<String> columnsToRead = Sets.newLinkedHashSet();
     columnsToRead.addAll(columns);
@@ -269,7 +300,7 @@ public final class IndexEntries {
       return false;
     }
 
-    if (containsPosition(deletedPositions, position)) {
+    if (Arrays.binarySearch(deletedPositions, position) >= 0) {
       return false;
     }
 
@@ -353,32 +384,118 @@ public final class IndexEntries {
   }
 
   /**
-   * Reads the positions removed from a data file by the given position delete files. Position
-   * delete files are parquet files with {@code file_path} and {@code pos} columns; only rows
-   * pointing at the given data file are collected.
+   * The rows a snapshot's delete files remove, read once for every data file being read.
+   *
+   * <p>Reading them per data file is what makes row resolution expensive: each file resolved would
+   * read the delete files that apply to it again, and a delete file that applies to many data files
+   * would be read once per file. Equality keys are the same for every data file, so they are read
+   * once and broadcast rather than carried into every task.
    */
-  private static long[] readDeletedPositions(
-      SparkSession spark, List<DeleteFile> positionDeletes, String dataFile) {
-    List<Long> positions = Lists.newArrayList();
+  private static final class SnapshotDeletes {
+
+    private static final long[] NO_POSITIONS = new long[0];
+
+    private final Map<String, long[]> deletedPositionsByFile;
+    private final Broadcast<Set<String>> equalityKeys;
+    private final List<String> keyColumns;
+
+    private SnapshotDeletes(
+        Map<String, long[]> deletedPositionsByFile,
+        Broadcast<Set<String>> equalityKeys,
+        List<String> keyColumns) {
+      this.deletedPositionsByFile = deletedPositionsByFile;
+      this.equalityKeys = equalityKeys;
+      this.keyColumns = keyColumns;
+    }
+
+    /** A snapshot without delete files, which is the common case. */
+    static SnapshotDeletes none() {
+      return new SnapshotDeletes(ImmutableMap.of(), null, ImmutableList.of());
+    }
+
+    /** Reads the delete files that apply to the given tasks, in at most two jobs. */
+    static SnapshotDeletes read(SparkSession spark, List<FileScanTask> tasks, Schema tableSchema) {
+      Set<DeleteFile> positionDeletes = Sets.newLinkedHashSet();
+      Set<DeleteFile> equalityDeletes = Sets.newLinkedHashSet();
+      for (FileScanTask task : tasks) {
+        for (DeleteFile deleteFile : task.deletes()) {
+          if (deleteFile.content() == FileContent.POSITION_DELETES) {
+            positionDeletes.add(deleteFile);
+          } else if (deleteFile.content() == FileContent.EQUALITY_DELETES) {
+            equalityDeletes.add(deleteFile);
+          }
+        }
+      }
+
+      if (positionDeletes.isEmpty() && equalityDeletes.isEmpty()) {
+        return none();
+      }
+
+      List<String> keyColumns = equalityColumns(tableSchema, ImmutableList.copyOf(equalityDeletes));
+      Map<String, long[]> deletedByFile =
+          positionDeletes.isEmpty()
+              ? ImmutableMap.of()
+              : readDeletedPositions(spark, positionDeletes);
+
+      Broadcast<Set<String>> keys = null;
+      if (!equalityDeletes.isEmpty()) {
+        keys =
+            JavaSparkContext.fromSparkContext(spark.sparkContext())
+                .broadcast(readEqualityKeys(spark, equalityDeletes, keyColumns));
+      }
+
+      return new SnapshotDeletes(deletedByFile, keys, keyColumns);
+    }
+
+    /** The positions removed from a data file, sorted so a lookup is a binary search. */
+    long[] deletedPositions(String dataFile) {
+      long[] positions = deletedPositionsByFile.get(dataFile);
+      return positions == null ? NO_POSITIONS : positions;
+    }
+
+    Set<String> equalityKeys() {
+      return equalityKeys == null ? ImmutableSet.of() : equalityKeys.getValue();
+    }
+
+    List<String> keyColumns() {
+      return keyColumns;
+    }
+  }
+
+  /**
+   * Reads the positions removed by the given position delete files, grouped by the data file they
+   * point at. Position delete files are parquet files with {@code file_path} and {@code pos}
+   * columns, and all of them are read in one job.
+   */
+  private static Map<String, long[]> readDeletedPositions(
+      SparkSession spark, Collection<DeleteFile> positionDeletes) {
+    Dataset<Row> deletes = null;
     for (DeleteFile deleteFile : positionDeletes) {
-      List<Row> rows =
+      Dataset<Row> file =
           spark
               .read()
               .parquet(deleteFile.location().toString())
-              .select(DELETE_FILE_PATH_COLUMN, DELETE_POSITION_COLUMN)
-              .collectAsList();
-      for (Row row : rows) {
-        if (dataFile.equals(row.getString(0))) {
-          positions.add(row.getLong(1));
-        }
-      }
+              .select(DELETE_FILE_PATH_COLUMN, DELETE_POSITION_COLUMN);
+      deletes = deletes == null ? file : deletes.union(file);
     }
 
-    long[] result = new long[positions.size()];
-    for (int i = 0; i < result.length; i++) {
-      result[i] = positions.get(i);
+    Map<String, List<Long>> byFile = Maps.newHashMap();
+    for (Row row : deletes.collectAsList()) {
+      byFile.computeIfAbsent(row.getString(0), key -> Lists.newArrayList()).add(row.getLong(1));
     }
-    return result;
+
+    Map<String, long[]> positionsByFile = Maps.newHashMap();
+    for (Map.Entry<String, List<Long>> entry : byFile.entrySet()) {
+      long[] positions = new long[entry.getValue().size()];
+      int index = 0;
+      for (long position : entry.getValue()) {
+        positions[index++] = position;
+      }
+      Arrays.sort(positions);
+      positionsByFile.put(entry.getKey(), positions);
+    }
+
+    return positionsByFile;
   }
 
   /**
@@ -389,30 +506,34 @@ public final class IndexEntries {
    * column name falls back to the field id when the name is not the table's field name.
    */
   private static Set<String> readEqualityKeys(
-      SparkSession spark, List<DeleteFile> equalityDeletes, List<String> keyColumns) {
-    Set<String> keys = Sets.newHashSet();
+      SparkSession spark, Collection<DeleteFile> equalityDeletes, List<String> keyColumns) {
+    Dataset<Row> deletes = null;
     for (DeleteFile deleteFile : equalityDeletes) {
-      List<Row> rows = spark.read().parquet(deleteFile.location().toString()).collectAsList();
-      for (Row row : rows) {
-        StringBuilder key = new StringBuilder();
-        for (int i = 0; i < keyColumns.size() && i < row.size(); i++) {
-          Object value = row.get(i);
-          key.append(encodedValue(value)).append(VALUE_SEPARATOR);
-        }
-        keys.add(key.toString());
+      Dataset<Row> file = spark.read().parquet(deleteFile.location().toString());
+      deletes = deletes == null ? file : deletes.union(file);
+    }
+
+    Set<String> keys = Sets.newHashSet();
+    for (Row row : deletes.collectAsList()) {
+      StringBuilder key = new StringBuilder();
+      for (int i = 0; i < keyColumns.size() && i < row.size(); i++) {
+        Object value = row.get(i);
+        key.append(encodedValue(value)).append(VALUE_SEPARATOR);
       }
+      keys.add(key.toString());
     }
     return keys;
   }
 
   /** The table columns of the equality fields, in field id order. */
-  private static List<String> equalityColumns(Schema schema, List<DeleteFile> equalityDeletes) {
+  private static List<String> equalityColumns(
+      Schema schema, Collection<DeleteFile> equalityDeletes) {
     if (equalityDeletes.isEmpty()) {
       return Lists.newArrayList();
     }
 
     List<String> columns = Lists.newArrayList();
-    for (int fieldId : equalityDeletes.get(0).equalityFieldIds()) {
+    for (int fieldId : equalityDeletes.iterator().next().equalityFieldIds()) {
       Types.NestedField field = schema.findField(fieldId);
       columns.add(field == null ? String.valueOf(fieldId) : field.name());
     }
@@ -446,15 +567,6 @@ public final class IndexEntries {
       return scala.collection.JavaConverters.seqAsJavaList((scala.collection.Seq<?>) value);
     }
     return value;
-  }
-
-  private static boolean containsPosition(long[] positions, long position) {
-    for (long candidate : positions) {
-      if (candidate == position) {
-        return true;
-      }
-    }
-    return false;
   }
 
   private static float[] toFloats(List<Object> values) {
