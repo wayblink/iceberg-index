@@ -30,8 +30,13 @@ import org.apache.spark.sql.catalyst.expressions.Expression
 import org.apache.spark.sql.catalyst.expressions.GenericInternalRow
 import org.apache.spark.sql.execution.datasources.v2.DataSourceV2Relation
 import org.apache.spark.sql.catalyst.plans.logical.LogicalPlan
+import org.apache.spark.sql.catalyst.util.ArrayData
 import org.apache.spark.sql.Row
 import org.apache.spark.sql.SparkSession
+import org.apache.spark.sql.types.DataType
+import org.apache.spark.sql.types.Decimal
+import org.apache.spark.sql.types.DataType
+import org.apache.spark.sql.types.Decimal
 import org.apache.spark.sql.types.StructType
 
 /**
@@ -43,6 +48,29 @@ import org.apache.spark.sql.types.StructType
  * caller learns which hits survived from what is missing.
  */
 object IndexRewriteSupport {
+
+  /**
+   * The floats of a vector, read element by element.
+   *
+   * <p>Spark's own conversion from an array to doubles only works when the array is backed by
+   * doubles, and a vector column is not necessarily one: {@code array(1.0, 2.0)} in a query is an
+   * array of decimals, and a {@code float} column is backed by floats. Both fail a cast to double,
+   * so every element is converted on its own, through the element type the expression knows.
+   */
+  def toFloats(values: ArrayData, elementType: DataType): Array[Float] = {
+    val count = values.numElements()
+    Array.tabulate(count)(index => toFloat(values.get(index, elementType)))
+  }
+
+  private def toFloat(value: Any): Float = {
+    value match {
+      case null => throw new IllegalArgumentException("Vector element is null")
+      // Spark's Decimal wraps a BigDecimal rather than extending Number, so it is taken apart here
+      case decimal: Decimal => decimal.toDouble.floatValue
+      case number: Number => number.floatValue
+      case other => throw new IllegalArgumentException("Vector element is not a number: " + other)
+    }
+  }
 
   /** The first Iceberg scan of a plan, which is the one the indexed column belongs to. */
   def findIcebergScan(plan: LogicalPlan): Option[DataSourceV2Relation] = {

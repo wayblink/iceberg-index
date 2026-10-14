@@ -24,6 +24,7 @@ import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.expressions.codegen.CodegenFallback
 import org.apache.spark.sql.catalyst.expressions.Expression
 import org.apache.spark.sql.catalyst.util.ArrayData
+import org.apache.spark.sql.types.ArrayType
 import org.apache.spark.sql.types.DoubleType
 
 /**
@@ -50,10 +51,16 @@ case class VectorDistanceExpression(metric: Metric, vector: Expression, query: E
     if (stored == null || asked == null) {
       null
     } else {
+      val storedVector = stored.asInstanceOf[ArrayData]
+      val askedVector = asked.asInstanceOf[ArrayData]
       VectorDistance.distance(
         metric,
-        toFloats(stored.asInstanceOf[ArrayData]),
-        toFloats(asked.asInstanceOf[ArrayData]))
+        IndexRewriteSupport.toFloats(
+          storedVector,
+          vector.dataType.asInstanceOf[ArrayType].elementType),
+        IndexRewriteSupport.toFloats(
+          askedVector,
+          query.dataType.asInstanceOf[ArrayType].elementType))
     }
   }
 
@@ -62,10 +69,5 @@ case class VectorDistanceExpression(metric: Metric, vector: Expression, query: E
   override protected def withNewChildrenInternal(
       newChildren: IndexedSeq[Expression]): Expression = {
     copy(metric, newChildren(0), newChildren(1))
-  }
-
-  private def toFloats(values: ArrayData): Array[Float] = {
-    val doubles = values.toDoubleArray
-    Array.tabulate(doubles.length)(index => doubles(index).toFloat)
   }
 }

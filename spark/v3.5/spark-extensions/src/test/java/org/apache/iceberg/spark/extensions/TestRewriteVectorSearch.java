@@ -120,6 +120,39 @@ class TestRewriteVectorSearch {
   }
 
   @Test
+  public void acceptsAQueryVectorOfDecimalsAndAFloatColumn() {
+    // array(0.9, 0.1) is an array of decimals in Spark rather than an array of doubles, and a float
+    // column is backed by floats: neither survives Spark's own conversion of an array to doubles
+    String table = "db.docs_float";
+    spark.sql(
+        String.format(
+            "CREATE TABLE local.%s (id bigint, body string, embedding array<float>) USING iceberg",
+            table));
+    spark.sql(
+        String.format(
+            "INSERT INTO local.%s VALUES (1, 'alpha', array(1.0F, 0.0F)), "
+                + "(2, 'bravo', array(0.0F, 1.0F)), (3, 'charlie', array(0.7071F, 0.7071F))",
+            table));
+    spark.sql(
+        String.format(
+            "CALL local.system.build_vector_index("
+                + "table => '%s', column => 'embedding', dimension => 2, mode => 'exact')",
+            table));
+
+    String query =
+        String.format(
+            "SELECT id FROM local.%s ORDER BY vec_distance(embedding, array(0.9, 0.1)) LIMIT 2",
+            table);
+
+    // the two closest to (0.9, 0.1) are alpha and charlie, whichever numeric type carried them
+    List<Row> hits = spark.sql(query).collectAsList();
+    assertThat(hits).hasSize(2);
+    assertThat(hits.get(0).getLong(0)).isEqualTo(1L);
+    assertThat(hits.get(1).getLong(0)).isEqualTo(3L);
+    assertThat(planOf(table, query)).contains("LocalRelation");
+  }
+
+  @Test
   public void leavesThePlanAloneWithoutAnIndex() {
     String table = table("docs_no_index");
     assertThat(

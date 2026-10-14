@@ -309,10 +309,11 @@ case class RewriteVectorSearch(spark: SparkSession) extends Rule[LogicalPlan] {
   private def queryFloats(distance: VectorDistanceExpression): Array[Float] = {
     distance.query.eval(EmptyRow) match {
       case values: org.apache.spark.sql.catalyst.util.ArrayData =>
-        val doubles = values.toDoubleArray
-        Array.tabulate(doubles.length)(index => doubles(index).toFloat)
+        IndexRewriteSupport.toFloats(
+          values,
+          distance.query.dataType.asInstanceOf[org.apache.spark.sql.types.ArrayType].elementType)
       case other =>
-        throw new IllegalArgumentException("Query vector must be an array of doubles: " + other)
+        throw new IllegalArgumentException("Query vector must be an array of numbers: " + other)
     }
   }
 
