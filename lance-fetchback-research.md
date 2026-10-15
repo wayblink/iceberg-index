@@ -217,4 +217,4 @@ python3 parquet_bench.py data/pq_5k.parquet 100 10
 python3 fadvise.py data/lance_5k
 ```
 
-原始结果：`/data/workspace/lance-bench/results.log`。
+原始结果：`/data/workspace/lance-bench/results.log`（数据文件已清理，`gen_data.py` + `gen_parquet.py` 可完整重建）。
