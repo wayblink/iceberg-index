@@ -26,13 +26,22 @@ import java.util.Collection;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.Collections;
+import java.util.Iterator;
 import org.apache.iceberg.DeleteFile;
 import org.apache.iceberg.FileContent;
+import org.apache.iceberg.FileFormat;
 import org.apache.iceberg.FileScanTask;
 import org.apache.iceberg.Schema;
 import org.apache.iceberg.Table;
+import org.apache.iceberg.data.Record;
+import org.apache.iceberg.formats.FormatModelRegistry;
+import org.apache.iceberg.formats.ReadBuilder;
+import org.apache.iceberg.hadoop.HadoopInputFile;
+import org.apache.iceberg.hadoop.SerializableConfiguration;
 import org.apache.iceberg.index.IndexAdapter;
 import org.apache.iceberg.io.CloseableIterable;
+import org.apache.iceberg.io.InputFile;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableList;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableMap;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableSet;
@@ -44,6 +53,7 @@ import org.apache.spark.api.java.JavaPairRDD;
 import org.apache.spark.api.java.JavaRDD;
 import org.apache.spark.api.java.JavaSparkContext;
 import org.apache.spark.api.java.function.Function;
+import org.apache.spark.api.java.function.PairFlatMapFunction;
 import org.apache.spark.api.java.function.PairFunction;
 import org.apache.spark.broadcast.Broadcast;
 import org.apache.spark.sql.Dataset;
@@ -51,6 +61,7 @@ import org.apache.spark.sql.Row;
 import org.apache.spark.sql.RowFactory;
 import org.apache.spark.sql.SparkSession;
 import org.apache.spark.sql.catalyst.expressions.GenericRowWithSchema;
+import org.apache.spark.sql.types.DataType;
 import org.apache.spark.sql.types.DataTypes;
 import org.apache.spark.sql.types.StructField;
 import org.apache.spark.sql.types.StructType;
@@ -115,7 +126,7 @@ public final class IndexEntries {
 
       List<String> capturedReadColumns = readColumns;
       JavaRDD<Row> entryRows =
-          liveRowsOf(spark, task, capturedReadColumns, null, null, deletes)
+          liveRowsOf(spark, tableSchema, task, capturedReadColumns, null, null, deletes)
               .mapToPair(
                   (PairFunction<Tuple2<Long, Row>, Long, Row>)
                       entry ->
@@ -190,7 +201,8 @@ public final class IndexEntries {
       String dataFile = task.file().location().toString();
       Collection<Long> positions = positionsByFile.get(dataFile);
       JavaPairRDD<String, Tuple2<Long, Row>> fileRows =
-          liveRowsOf(spark, task, columns, positions, readSchema, deletesFor(spark, tasks, table))
+          liveRowsOf(
+              spark, table.schema(), task, columns, positions, readSchema, deletesFor(spark, tasks, table))
               .mapToPair(
                   (PairFunction<Tuple2<Long, Row>, String, Tuple2<Long, Row>>)
                       entry -> new Tuple2<>(dataFile, entry));
@@ -250,7 +262,7 @@ public final class IndexEntries {
     SnapshotDeletes deletes = SnapshotDeletes.read(spark, tasks, table.schema());
     List<JavaRDD<Row>> perFile = Lists.newArrayList();
     for (FileScanTask task : tasks) {
-      perFile.add(liveRowsOf(spark, task, columns, null, readSchema, deletes).values());
+      perFile.add(liveRowsOf(spark, table.schema(), task, columns, null, readSchema, deletes).values());
     }
 
     if (perFile.isEmpty()) {
@@ -272,6 +284,7 @@ public final class IndexEntries {
    */
   private static JavaPairRDD<Long, Row> liveRowsOf(
       SparkSession spark,
+      Schema tableSchema,
       FileScanTask task,
       List<String> columns,
       Collection<Long> positions,
@@ -292,15 +305,11 @@ public final class IndexEntries {
     StructType readWith = readSchema == null ? null : schemaFor(readColumns, readSchema);
     // the projection to the requested columns happens below, by name, so the read itself can take
     // every column the file has
-    Dataset<Row> data =
-        readWith == null
-            ? spark.read().parquet(dataFile)
-            : spark.read().schema(readWith).parquet(dataFile);
+    JavaPairRDD<Row, Long> data = positionedRows(spark, tableSchema, task, readColumns, readWith);
 
     List<String> capturedReadColumns = readColumns;
     List<String> capturedColumns = columns;
-    return data.toJavaRDD()
-        .zipWithIndex()
+    return data
         .filter(
             (Function<Tuple2<Row, Long>, Boolean>)
                 tuple -> isLive(tuple, positions, deletedPositions, equalityKeys, keyColumns))
@@ -331,6 +340,144 @@ public final class IndexEntries {
     }
 
     return equalityKeys.isEmpty() || !equalityKeys.contains(equalityKey(tuple._1(), keyColumns));
+  }
+
+  /**
+   * Reads one data file as (position, row) pairs, whatever format it is stored in.
+   *
+   * <p>Parquet keeps its native Spark read. Every other format is read through the Iceberg format
+   * model for that file's format, which keeps the index layer format-agnostic: a Lance data file is
+   * read by the Lance format model rather than being handed to a parquet reader.
+   */
+  private static JavaPairRDD<Row, Long> positionedRows(
+      SparkSession spark, Schema tableSchema, FileScanTask task, List<String> columns, StructType readSchema) {
+    String dataFile = task.file().location().toString();
+    FileFormat format = task.file().format();
+
+    if (format == FileFormat.PARQUET) {
+      Dataset<Row> data =
+          readSchema == null
+              ? spark.read().parquet(dataFile)
+              : spark.read().schema(readSchema).parquet(dataFile);
+      return data.toJavaRDD().zipWithIndex();
+    }
+
+    Schema projection = tableSchema.select(columns.toArray(new String[0]));
+    StructType sparkSchema = toSparkSchema(projection);
+    SerializableConfiguration conf =
+        new SerializableConfiguration(spark.sessionState().newHadoopConf());
+
+    return JavaSparkContext.fromSparkContext(spark.sparkContext())
+        .parallelize(Collections.singletonList(dataFile), 1)
+        .flatMapToPair(
+            (PairFlatMapFunction<String, Row, Long>)
+                file -> readFileWithFormat(file, format, projection, sparkSchema, conf));
+  }
+
+  /** Reads every row of one data file with the format model for its format, in file order. */
+  private static Iterator<Tuple2<Row, Long>> readFileWithFormat(
+      String location,
+      FileFormat format,
+      Schema projection,
+      StructType sparkSchema,
+      SerializableConfiguration conf)
+      throws IOException {
+    InputFile input = HadoopInputFile.fromLocation(location, conf.get());
+    ReadBuilder<Record, Void> builder =
+        FormatModelRegistry.readBuilder(format, Record.class, input);
+
+    List<Tuple2<Row, Long>> rows = Lists.newArrayList();
+    long position = 0;
+    try (CloseableIterable<Record> records = builder.project(projection).build()) {
+      for (Record record : records) {
+        Object[] values = new Object[projection.columns().size()];
+        for (int i = 0; i < values.length; i++) {
+          Types.NestedField field = projection.columns().get(i);
+          values[i] = toSparkValue(field.type(), record.getField(field.name()));
+        }
+        rows.add(new Tuple2<>(new GenericRowWithSchema(values, sparkSchema), position++));
+      }
+    }
+    return rows.iterator();
+  }
+
+  /** The Spark schema of an Iceberg projection, for the rows the format model returns. */
+  private static StructType toSparkSchema(Schema schema) {
+    StructField[] fields = new StructField[schema.columns().size()];
+    for (int i = 0; i < fields.length; i++) {
+      Types.NestedField field = schema.columns().get(i);
+      fields[i] =
+          new StructField(
+              field.name(), toSparkType(field.type()), field.isOptional(), org.apache.spark.sql.types.Metadata.empty());
+    }
+    return new StructType(fields);
+  }
+
+  private static DataType toSparkType(org.apache.iceberg.types.Type type) {
+    switch (type.typeId()) {
+      case BOOLEAN:
+        return DataTypes.BooleanType;
+      case INTEGER:
+      case DATE:
+        return DataTypes.IntegerType;
+      case LONG:
+      case TIME:
+      case TIMESTAMP:
+      case TIMESTAMP_NANO:
+        return DataTypes.LongType;
+      case FLOAT:
+        return DataTypes.FloatType;
+      case DOUBLE:
+        return DataTypes.DoubleType;
+      case STRING:
+        return DataTypes.StringType;
+      case BINARY:
+      case FIXED:
+      case UUID:
+        return DataTypes.BinaryType;
+      case DECIMAL:
+        Types.DecimalType decimal = (Types.DecimalType) type;
+        return DataTypes.createDecimalType(decimal.precision(), decimal.scale());
+      case LIST:
+        return DataTypes.createArrayType(toSparkType(type.asListType().elementType()));
+      default:
+        throw new UnsupportedOperationException("Unsupported column type for the index layer: " + type);
+    }
+  }
+
+  /** Converts an Iceberg value into the value a Spark row holds for it. */
+  private static Object toSparkValue(org.apache.iceberg.types.Type type, Object value) {
+    if (value == null) {
+      return null;
+    }
+
+    switch (type.typeId()) {
+      case LIST: {
+        // Spark hands array columns to external rows as Scala sequences, which is what callers of
+        // Row.getList expect back
+        List<?> list = (List<?>) value;
+        List<Object> elements = Lists.newArrayListWithCapacity(list.size());
+        for (Object element : list) {
+          elements.add(toSparkValue(type.asListType().elementType(), element));
+        }
+        return scala.collection.JavaConverters.asScalaBuffer(elements);
+      }
+      case DATE:
+        return (int) ((java.time.LocalDate) value).toEpochDay();
+      case TIME:
+        return ((java.time.LocalTime) value).toNanoOfDay() / 1000L;
+      case TIMESTAMP:
+        return microsToSpark(((java.time.OffsetDateTime) value).toInstant());
+      case TIMESTAMP_NANO:
+        return ((java.time.Instant) value).getEpochSecond() * 1_000_000L
+            + ((java.time.Instant) value).getNano() / 1000L;
+      default:
+        return value;
+    }
+  }
+
+  private static long microsToSpark(java.time.Instant instant) {
+    return instant.getEpochSecond() * 1_000_000L + instant.getNano() / 1000L;
   }
 
   private static Object[] asValues(Row row, List<String> readColumns, List<String> columns) {

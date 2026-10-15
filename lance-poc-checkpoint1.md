@@ -122,7 +122,7 @@ export JAVA_HOME=/opt/homebrew/opt/openjdk@17
 
 验证：新增 `TestLanceFormatTable.writesAndReadsAListColumn`（3000 行 × `array<float>[4]`，校验 `sum(size(vec))`、`sum(vec[0])`、逐行取值、data file 仍为 `.lance`）→ **6/6 全绿**。
 
-### 新阻塞点：索引层把数据文件读取硬编码成 parquet
+### （已解决，见 §9）新阻塞点：索引层把数据文件读取硬编码成 parquet
 
 - `index-spark/.../IndexEntries.java:297`：`spark.read().parquet(dataFile)`（回表 `liveRowsOf`）
 - 同一文件里建索引/读取向量列也走同一条 Spark parquet 读路径
@@ -139,3 +139,39 @@ export JAVA_HOME=/opt/homebrew/opt/openjdk@17
 4. 回归门槛：`TestRewriteVectorSearch`（12 个用例）必须保持全绿——它是索引改写行为的护栏。
 
 `TestLanceFetchBack`（Lance 表 vs parquet 表的回表 A/B）已写好并按上述原因 `@Disabled`，解除阻塞后直接启用即可给出检查点 2 的端到端数字（回表延迟 + 相同结果校验）。
+
+
+---
+
+## 9. 检查点 2 完成：索引层 format-aware 读取 + Lance 回表端到端
+
+### 改动（index-spark，孩子卡 #983）
+
+`IndexEntries.liveRowsOf` 原来用 `spark.read().parquet(dataFile)` 读数据文件（建索引与回表共用）。现在抽成 `positionedRows`：
+
+| 格式 | 读取方式 |
+|---|---|
+| parquet | 保留原 Spark parquet 读（向量化、行为与耗时不变） |
+| 其它格式 | `task.file().format()` + `FormatModelRegistry.readBuilder(format, Record.class, inputFile)`（executor 侧 `HadoopInputFile` + `SerializableConfiguration`），行位置由读取顺序给出，不再依赖 `zipWithIndex` |
+
+配套：Iceberg→Spark 值的本地转换（primitive + list；数组按 Spark 外部 Row 的约定返回 Scala Seq，与 `columnValue` 的期望一致）；delete 文件读取仍是 parquet（POC 固定 `write.delete.format.default=parquet`，Lance delete 文件留作后续）。
+
+**护栏**：`TestRewriteVectorSearch` 12/12 保持绿（parquet 路径无回归）。
+
+### 端到端结果（`TestLanceFetchBack`，200k 行 × 32 维，两种格式同数据同索引）
+
+```
+rows=200000 dim=32 topK=10
+query whole plan   lance=336ms parquet=290ms
+fetchback 10 rows  lance=79ms  parquet=87ms
+data bytes         lance=31.18MB parquet=6.93MB
+full scan no index (lance)=198ms
+topId=12345 sameResults=true
+```
+
+- **正确性成立**：Lance-backed 表能建向量索引、能跑改写后的 `ORDER BY vec_distance(...) LIMIT k`，结果与 parquet 表**逐行一致**（`sameResults=true`）。
+- **回表段 79ms vs 87ms**（约 9%）：这个规模下**Spark 任务启动开销（几十 ms）盖过了格式差异**，与 #707 的格式级数据（每次回表 32KB vs 31MB I/O）不矛盾——差距要在大表上才显出来。
+- **整条查询 lance 336ms vs parquet 290ms，且都慢于无索引全扫 198ms**：20 万行规模下索引+回表的路子本来就不划算（生产基线是 SIFT1M 上"全扫 17.7s vs 索引 7.65s"）。
+- **存储**：本例 Lance 31.2MB vs parquet 6.9MB（4.5x）。payload 是 md5 十六进制字符串、向量是 sin 值，parquet 的 snappy+字典收益大；Lance 默认编码在这个数据上明显偏大 → **上生产前要单独调压缩/编码配置**（第三方实测是 +50%，本例更差，说明这取决于数据形态）。
+
+**结论**：集成链路（建索引、回表、改写、结果一致性）在本地已经跑通并可回归；**回表加速的量化必须在集群上用 SIFT1M/10M 规模重跑**（即 #810 检查点 2 的剩余部分），本机 20 万行无法体现。

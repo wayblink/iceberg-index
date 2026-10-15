@@ -30,7 +30,6 @@ import org.apache.spark.sql.Row;
 import org.apache.spark.sql.SparkSession;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
-import org.junit.jupiter.api.Disabled;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
@@ -43,7 +42,7 @@ import org.junit.jupiter.api.io.TempDir;
  */
 class TestLanceFetchBack {
 
-  private static final int ROWS = 50_000;
+  private static final int ROWS = 200_000;
   private static final int DIM = 32;
   private static final int TOP_K = 10;
 
@@ -88,16 +87,15 @@ class TestLanceFetchBack {
             + format
             + "')");
 
-    // deterministic one-hot vectors: row id has 1.0 at position id % DIM, 0.001 elsewhere
+    // deterministic, incompressible payload and vectors: a synthetic payload of repeated
+    // characters would compress to nothing and hide the read amplification this test is for
     spark.sql(
         "INSERT INTO "
             + table
-            + " SELECT id, rpad(cast(id as string), 40, 'p'), "
+            + " SELECT id, md5(cast(id as string)), "
             + "transform(sequence(0, "
             + (DIM - 1)
-            + "), x -> cast(case when x = cast(id % "
-            + DIM
-            + " as int) then 1.0 else 0.001 end as float)) FROM range("
+            + "), x -> cast(sin(cast(id as double) + cast(x as double)) as float)) FROM range("
             + ROWS
             + ")");
 
@@ -140,34 +138,36 @@ class TestLanceFetchBack {
     return best;
   }
 
-  @Disabled(
-      "Blocked: the index layer reads data files with spark.read().parquet(...) "
-          + "(IndexEntries.liveRowsOf and the vector build path), so an index cannot be built on or "
-          + "resolved against a Lance-backed table yet. Re-enable once those reads go through the "
-          + "format model for the file's format.")
   @Test
-  public void lanceAndParquetFetchBackTheSameRows() throws IOException {
+  public void lanceAndParquetFetchBackTheSameRows() throws Exception {
     String lance = createIndexedTable("fetch_lance", "lance");
     String parquet = createIndexedTable("fetch_parquet", "parquet");
 
     // a query vector that is exactly row 12345's vector, so the top hit is unambiguous
-    String queryVector = "array(" + unitVectorFor(12345) + ")";
+    String queryVector = "array(" + vectorFor(12345) + ")";
 
     List<Row> lanceHits = search(lance, queryVector);
     List<Row> parquetHits = search(parquet, queryVector);
 
     assertThat(lanceHits).hasSize(TOP_K);
     assertThat(lanceHits).containsExactlyElementsOf(parquetHits);
-    // the one-hot query vector is row 12345's vector, so the hits are the rows sharing id % DIM
-    assertThat(Math.floorMod(lanceHits.get(0).getLong(0), DIM))
-        .isEqualTo(Math.floorMod(12345L, DIM));
-    assertThat(lanceHits.get(0).getString(1)).startsWith("payload-");
+    // the query vector is row 12345's own vector, so the closest row is 12345
+    assertThat(lanceHits.get(0).getLong(0)).isEqualTo(12345L);
+    assertThat(lanceHits.get(0).getString(1))
+        .isEqualTo(md5Hex(String.valueOf(lanceHits.get(0).getLong(0))));
 
     long lanceMs = bestMillis(lance, queryVector);
     long parquetMs = bestMillis(parquet, queryVector);
 
     long lanceBytes = dataBytes(lance);
     long parquetBytes = dataBytes(parquet);
+
+    // the fetch-back leg on its own: read the same ten row positions from one data file of each
+    // table, with no index search and no merge in the measurement
+    long lanceFetchMs = bestFetchMillis(lance);
+    long parquetFetchMs = bestFetchMillis(parquet);
+    long lanceFetchBytes = lanceBytes;
+    long parquetFetchBytes = parquetBytes;
 
     // unscanned baseline: no index, the planner falls back to a full scan
     spark.sql("DROP TABLE IF EXISTS local.db.fetch_scan");
@@ -178,29 +178,12 @@ class TestLanceFetchBack {
     long scanMs = bestMillis("local.db.fetch_scan", queryVector);
 
     String summary =
-        "rows="
-            + ROWS
-            + " dim="
-            + DIM
-            + " topK="
-            + TOP_K
-            + "\\n"
-            + "lance:   bestMs="
-            + lanceMs
-            + " dataBytes="
-            + lanceBytes
-            + "\\n"
-            + "parquet: bestMs="
-            + parquetMs
-            + " dataBytes="
-            + parquetBytes
-            + "\\n"
-            + "fullScanWithoutIndex(lance, bestMs)="
-            + scanMs
-            + "\\n"
-            + "topId="
-            + lanceHits.get(0).getLong(0)
-            + " sameResults=true\\n";
+        "rows=" + ROWS + " dim=" + DIM + " topK=" + TOP_K + "\n"
+            + "query whole plan   lance=" + lanceMs + "ms parquet=" + parquetMs + "ms\n"
+            + "fetchback 10 rows  lance=" + lanceFetchMs + "ms parquet=" + parquetFetchMs + "ms\n"
+            + "data bytes         lance=" + lanceBytes + " parquet=" + parquetBytes + "\n"
+            + "full scan no index (lance)=" + scanMs + "ms\n"
+            + "topId=" + lanceHits.get(0).getLong(0) + " sameResults=true\n";
 
     Files.createDirectories(report.getParent());
     Files.writeString(
@@ -208,15 +191,67 @@ class TestLanceFetchBack {
     System.out.println("[LANCE-FETCHBACK]\\n" + summary);
   }
 
-  private String unitVectorFor(long seed) {
+  private String vectorFor(long seed) {
     StringBuilder sb = new StringBuilder();
     for (int i = 0; i < DIM; i++) {
       if (i > 0) {
         sb.append(", ");
       }
-      sb.append(i == Math.floorMod(seed, DIM) ? "1.0f" : "0.001f");
+      // the query vector must match the stored floats exactly, so it is built the same way
+      sb.append((float) Math.sin(seed + i)).append("f");
     }
     return sb.toString();
+  }
+
+  /**
+   * Times the fetch-back leg alone: {@link org.apache.iceberg.index.spark.IndexEntries#rowsAt} for
+   * ten spread-out positions of one data file, which is what turns index hits into rows.
+   */
+  /** md5 hex of a string, matching Spark's md5() so the payload can be checked without a helper. */
+  private static String md5Hex(String value) throws Exception {
+    byte[] digest =
+        java.security.MessageDigest.getInstance("MD5")
+            .digest(value.getBytes(java.nio.charset.StandardCharsets.UTF_8));
+    StringBuilder hex = new StringBuilder(digest.length * 2);
+    for (byte b : digest) {
+      hex.append(String.format("%02x", b));
+    }
+    return hex.toString();
+  }
+
+  private long bestFetchMillis(String table) throws Exception {
+    org.apache.iceberg.Table icebergTable =
+        org.apache.iceberg.spark.Spark3Util.loadIcebergTable(spark, table);
+    long snapshotId = icebergTable.currentSnapshot().snapshotId();
+
+    List<Row> files = spark.sql("SELECT file_path, record_count FROM " + table + ".files").collectAsList();
+    String dataFile = files.get(0).getString(0);
+    long rowCount = files.get(0).getLong(1);
+
+    java.util.Map<String, java.util.List<Long>> positionsByFile = new java.util.HashMap<>();
+    java.util.List<Long> positions = new java.util.ArrayList<>();
+    for (int i = 0; i < TOP_K; i++) {
+      positions.add(Math.min(rowCount - 1, (long) i * (rowCount / TOP_K)));
+    }
+    positionsByFile.put(dataFile, positions);
+
+    long best = Long.MAX_VALUE;
+    for (int i = 0; i < 5; i++) {
+      long start = System.nanoTime();
+      java.util.Map<String, java.util.Map<Long, Row>> rows =
+          org.apache.iceberg.index.spark.IndexEntries.rowsAt(
+              spark,
+              icebergTable,
+              snapshotId,
+              positionsByFile,
+              java.util.Arrays.asList("id", "payload", "embedding"),
+              null);
+      best = Math.min(best, (System.nanoTime() - start) / 1_000_000);
+      if (rows.size() != 1 || rows.values().iterator().next().size() != TOP_K) {
+        throw new IllegalStateException("fetch back returned " + rows);
+      }
+    }
+    return best;
   }
 
   private long dataBytes(String table) {
