@@ -175,3 +175,40 @@ topId=12345 sameResults=true
 - **存储**：本例 Lance 31.2MB vs parquet 6.9MB（4.5x）。payload 是 md5 十六进制字符串、向量是 sin 值，parquet 的 snappy+字典收益大；Lance 默认编码在这个数据上明显偏大 → **上生产前要单独调压缩/编码配置**（第三方实测是 +50%，本例更差，说明这取决于数据形态）。
 
 **结论**：集成链路（建索引、回表、改写、结果一致性）在本地已经跑通并可回归；**回表加速的量化必须在集群上用 SIFT1M/10M 规模重跑**（即 #810 检查点 2 的剩余部分），本机 20 万行无法体现。
+
+---
+
+## 10. 集群验证（#1037）：SIFT1M 上 Lance vs parquet 的回表 A/B
+
+环境：A 集群（sh-a-spark），k8s spark-submit，3 executor × 2 core × 10g，**Gluten-free**（镜像里本来就没有 Gluten），Lance 走镜像主类路径。
+
+### 结果（同一批查询、同一套 HNSW 索引、100 万 × 128 维，warm run）
+
+| | parquet（sift1m_base） | Lance（sift1m_lance_v2） |
+|---|---|---|
+| 行数 / 数据文件 | 1,000,000 / 28 | 1,000,000 / 9 |
+| 数据字节 | 94.4 MB | **518.7 MB（5.5x）** |
+| 索引 | HNSW，PUBLISHED | HNSW，PUBLISHED |
+| TIMING plan data files | 11 ms | 5 ms |
+| TIMING uncovered | 14 ms | 8 ms |
+| **TIMING search+resolve（含回表）** | **3281 ms** | **1581 ms（2.08x 快）** |
+| TIMING merge | 0 ms | 0 ms |
+| **整条查询（best of 3）** | **3317 ms** | **1784 ms（2.07x 快）** |
+| top-10 pk | 932085,934876,561813,708177,706771,695756,435345,701258,455537,872728 | **完全相同** |
+
+冷启 run0：parquet 5957ms / Lance 2450ms。索引搜索在两边是同一份索引、同样工作量，所以 search+resolve 的 1.7s 差额来自**读命中行那一步（回表）**——即回表路径在 Lance 上约快 2x，整条查询 3.3s → 1.8s。
+（生产基线参考：全扫 17.7s / 索引 7.65s，其中回表段 3.2s。本次 parquet 侧 3.3s 与基线同量级。）
+
+### 集群侧踩到的坑（都已解决，属于本 POC 的接线成本）
+
+1. **镜像里的 Lance bundle 没有 HDFS provider**：基础镜像自带的 `lance-spark-bundle` 里 `.so` 是 160MB、无 hdfs 符号；换成厂内 `lance-tpcds-hdfs` worktree 里**刷新过 JNI 的 bundle**（285MB `.so`，含 HDFS provider）后，HDFS 读写才通。
+2. **Arrow 代际混用可用**：镜像里 Spark 自带 arrow 12.0.1，bundle 自带 arrow 15.0.2（c-data 只在 bundle 里）。我们按 15.0.2 编译的 `iceberg-lance.jar` 在这个组合下**实测可用**（冒烟 + 全流程）。
+3. **索引构建 OOM**：4g executor 跑索引构建被 SIGKILL（exit 137）；提到 **10g + `spark.sql.shuffle.partitions=32`**（Lance 文件更小）后通过。根因是 format model 读取路径**逐行装箱**（`List<Float>`），内存约为原始 float 的 4 倍；后续可做向量化读取（列为优化项）。
+4. **`DROP TABLE ... PURGE` 不清 `<table>/indexes/`**：重建同名表会捡到旧索引，`build_vector_index` 直接报 "A vector index already exists"（且没有 `drop_vector_index` 过程）。本次用新表名绕过。**这是索引层自身的卫生问题**（孤儿索引清理），与 Lance 无关，值得单独开卡。
+5. **EXACT 索引会让改写让开**（卡片 #573 的设计）：第一次 A/B 用了 `mode => 'exact'`，结果三条 Lance 查询全部走全扫（日志：`Index ... is exact, which searches every entry like a scan does, so scanning`），2.7s 的数字其实是 Lance 全扫；换成 **HNSW** 后才真正走索引，才有上面的对比。
+
+### 结论（检查点 2）
+
+- **B2b 端到端成立**：Lance 作为 Iceberg data file 格式，在集群 100 万 × 128 维上完成「建表 → 建 HNSW 索引 → 改写命中 → 回表 → 结果与 parquet 逐行一致」，回表路径约 **2x**、整条查询 3.3s → 1.8s。
+- **代价明确**：同一份 SIFT1M 数据 Lance 占 **5.5x** 空间（94MB → 519MB，SIFT 是 0–255 的整数但以 float32 存）。上生产前必须做编码/压缩选型（列式字典、量化为 uint8 等）。
+- **剩余工作**：向量化读取降低内存（同时会让回表更快）；索引层面的孤儿清理/`drop_vector_index`；以及 #944 的 10M 规模复测。
