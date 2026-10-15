@@ -1,0 +1,31 @@
+--- /tmp/LanceFileReader.java	2026-10-15 17:59:10
++++ /tmp/LanceFileReaderPatched.java	2026-10-15 17:59:12
+@@ -157,14 +157,26 @@
+       int batchSize,
+       FileReadOptions options)
+       throws IOException {
+-    try (ArrowArrayStream ffiArrowArrayStream = ArrowArrayStream.allocateNew(allocator)) {
++    // Ownership of the C stream moves to the imported reader, which releases it on close.
++    // Closing the wrapper here would free the struct memory the reader still points at: reads
++    // appear to work, then close fails with "ArrowArrayStream is already closed" and the native
++    // reader is never released. Only close the wrapper when the import never happened.
++    ArrowArrayStream ffiArrowArrayStream = ArrowArrayStream.allocateNew(allocator);
++    boolean imported = false;
++    try {
+       readAllNative(
+           batchSize,
+           projectedNames,
+           ranges,
+           ffiArrowArrayStream.memoryAddress(),
+           options.getBlobReadMode().getValue());
+-      return Data.importArrayStream(allocator, ffiArrowArrayStream);
++      ArrowReader reader = Data.importArrayStream(allocator, ffiArrowArrayStream);
++      imported = true;
++      return reader;
++    } finally {
++      if (!imported) {
++        ffiArrowArrayStream.close();
++      }
+     }
+   }
+ }

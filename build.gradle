@@ -1098,6 +1098,61 @@ project(':iceberg-arrow') {
   }
 }
 
+project(':iceberg-lance') {
+  test {
+    useJUnitPlatform()
+    jvmArgs '--add-opens=java.base/java.nio=ALL-UNNAMED'
+  }
+  dependencies {
+    implementation project(path: ':iceberg-bundled-guava', configuration: 'shadow')
+    api project(':iceberg-api')
+    implementation project(':iceberg-core')
+
+    // Lance is Arrow-native. The Lance Java SDK ships its own Arrow generation, so
+    // arrow-vector/arrow-memory-netty/arrow-c-data are declared to keep the conversion
+    // code compiling; they are not relocated because Lance calls into Arrow by class name
+    // from native code.
+    // lance-core pins Arrow 18; the rest of this fork (and Spark 3.5) is on Arrow 15. Lance
+    // reaches Arrow through the C data interface and its Java layer only needs the stable
+    // vector/c-data classes, so Arrow comes from the repo-wide version instead.
+    // POC: lance-core is patched locally (see lance/patches/) to fix the ArrowArrayStream
+    // ownership bug that breaks reader close. Replace -poc1 with the released version once the
+    // fix lands upstream.
+    api('org.lance:lance-core:5.0.0-beta.6-poc1') {
+      exclude group: 'org.apache.arrow'
+    }
+    implementation("org.apache.arrow:arrow-c-data:${libs.versions.arrow.get()}") {
+      exclude group: 'com.google.code.findbugs', module: 'jsr305'
+    }
+    runtimeOnly libs.netty.buffer
+
+    implementation(libs.arrow.vector) {
+      exclude group: 'io.netty', module: 'netty-buffer'
+      exclude group: 'io.netty', module: 'netty-common'
+      exclude group: 'com.google.code.findbugs', module: 'jsr305'
+    }
+    implementation(libs.arrow.memory.netty) {
+      exclude group: 'com.google.code.findbugs', module: 'jsr305'
+      exclude group: 'io.netty', module: 'netty-common'
+      exclude group: 'io.netty', module: 'netty-buffer'
+    }
+
+    // Spark types are provided by the Spark runtime; the lance module only compiles against
+    // them to adapt Arrow batches into InternalRow/ColumnarBatch.
+    compileOnly("org.apache.spark:spark-hive_2.12:${libs.versions.spark35.get()}") {
+      exclude group: 'org.apache.arrow'
+      exclude group: 'org.apache.parquet'
+      exclude group: 'org.apache.avro', module: 'avro'
+      exclude group: 'io.netty', module: 'netty-buffer'
+      exclude group: 'io.netty', module: 'netty-common'
+      exclude group: 'org.roaringbitmap'
+    }
+
+    testImplementation project(path: ':iceberg-api', configuration: 'testArtifacts')
+    testImplementation project(path: ':iceberg-core', configuration: 'testArtifacts')
+  }
+}
+
 project(':iceberg-nessie') {
   test {
     useJUnitPlatform()
