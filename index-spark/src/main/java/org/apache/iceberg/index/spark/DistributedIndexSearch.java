@@ -23,6 +23,7 @@ import java.nio.ByteBuffer;
 import java.util.Comparator;
 import java.util.Iterator;
 import java.util.List;
+import java.util.concurrent.TimeUnit;
 import org.apache.iceberg.Table;
 import org.apache.iceberg.index.IndexAdapter;
 import org.apache.iceberg.index.IndexBlob;
@@ -43,6 +44,8 @@ import org.apache.spark.api.java.JavaSparkContext;
 import org.apache.spark.api.java.function.FlatMapFunction;
 import org.apache.spark.broadcast.Broadcast;
 import org.apache.spark.sql.SparkSession;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import scala.Tuple3;
 
 /**
@@ -72,6 +75,8 @@ import scala.Tuple3;
  * hits exist than the top-k it returned, because it only ever saw the top-k.
  */
 public final class DistributedIndexSearch {
+
+  private static final Logger LOG = LoggerFactory.getLogger(DistributedIndexSearch.class);
 
   private DistributedIndexSearch() {}
 
@@ -161,12 +166,23 @@ public final class DistributedIndexSearch {
                       FileIO fileIO = ioRef.getValue();
                       List<Tuple3<String, Long, Double>> fileHits = Lists.newArrayList();
                       while (locations1.hasNext()) {
-                        byte[] content = readPayload(fileIO, locations1.next());
+                        String location = locations1.next();
+                        long readStart = System.nanoTime();
+                        byte[] content = readPayload(fileIO, location);
+                        long readNanos = System.nanoTime() - readStart;
+                        long searchStart = System.nanoTime();
                         for (IndexSearchResult hit :
                             searchFile(content, fileAdapter, fileQuery, localTopK)) {
                           fileHits.add(
                               new Tuple3<>(hit.dataFile(), hit.rowPosition(), hit.score()));
                         }
+                        LOG.debug(
+                            "index file {} read {} ms ({} bytes), search {} ms",
+                            location.substring(location.lastIndexOf('/') + 1),
+                            TimeUnit.MILLISECONDS.convert(readNanos, TimeUnit.NANOSECONDS),
+                            content.length,
+                            TimeUnit.MILLISECONDS.convert(
+                                System.nanoTime() - searchStart, TimeUnit.NANOSECONDS));
                       }
                       return fileHits.iterator();
                     })

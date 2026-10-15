@@ -164,7 +164,11 @@ case class RewriteVectorSearch(spark: SparkSession) extends Rule[LogicalPlan] {
     val query = queryFloats(distance)
     val payload = new VectorIndexAdapter(definition).encodeQuery(query)
     val metric = definition.metric()
+    val t0 = System.currentTimeMillis()
     val dataFiles = IndexEntries.dataFiles(table, snapshotId).asScala.toSet
+    logger.info(
+      "TIMING plan data files {} ms",
+      java.lang.Long.valueOf(System.currentTimeMillis() - t0))
 
     // an index with nothing to say about this snapshot is not an error, it just means scanning
     val coverage = IndexQuery.of(snapshotId, payload, 0).withConsistency(Consistency.AT_OR_BEFORE)
@@ -178,15 +182,20 @@ case class RewriteVectorSearch(spark: SparkSession) extends Rule[LogicalPlan] {
             snapshotId)
           return None
       }
+    logger.info("TIMING uncovered {} ms", java.lang.Long.valueOf(System.currentTimeMillis() - t0))
     if (uncovered.size == dataFiles.size) {
       // the index is so far behind that its uncovered part is the whole table
       return None
     }
 
     val tableSchema = IndexRewriteSupport.tableSchema(sparkTable)
+    val tSearch = System.currentTimeMillis()
     val hitRows =
       liveHitRows(reader, index, table, snapshotId, payload, dataFiles, limit, names, tableSchema)
         .getOrElse(return None)
+    logger.info(
+      "TIMING search+resolve {} ms",
+      java.lang.Long.valueOf(System.currentTimeMillis() - tSearch))
 
     val residual =
       residualRows(
@@ -199,8 +208,10 @@ case class RewriteVectorSearch(spark: SparkSession) extends Rule[LogicalPlan] {
         columnIndex,
         query,
         metric)
+    val tMerge = System.currentTimeMillis()
     val rows =
       (hitRows ++ residual).sortBy(row => distanceOf(row, columnIndex, query, metric)).take(limit)
+    logger.info("TIMING merge {} ms", java.lang.Long.valueOf(System.currentTimeMillis() - tMerge))
 
     if (rows.isEmpty) {
       return None
