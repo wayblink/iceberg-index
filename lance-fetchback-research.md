@@ -14,12 +14,12 @@
 | 点查性能 | **Lance 对 parquet 是数量级胜利**：同规模 10 行点查，Lance ~1.4–2.1ms / ~32KB I/O；parquet（生产同形态 ~3MB row group）~53ms / ~31MB I/O；parquet（128MB row group）~1839ms / ~471MB I/O。差距是结构性的，不是调优问题 |
 | Iceberg 关系 | **核心枚举不认 Lance，但 1.11.0 的 File Format API 就是为此开的口子**：格式可插拔（`FormatModel`/`FormatModelRegistry`），PMC 官方博客**点名 Lance 与 Vortex**。我们 fork 基线即 1.11.0，Spark 3.5 已有 `SparkFormatModels`（§11.1） |
 | 架构统一性 | **两条不破坏立论的活路**：(1) **Lance 作为表的 data file 格式**（`write.format.default=lance`）——Iceberg 独占 catalog/snapshot/delete，无第二套系统、无桥接，统一性完整；(2) 派生 sidecar（仅当基础表必须留 parquet）。**用 Lance 自己的 catalog/表格式（落位 A）仍然否决**（§5、§11.8） |
-| 删除/更新语义 | Lance 内部语义与 Iceberg **概念同构**（version↔snapshot、deletion vector↔position delete、row address=(fragment,offset)↔(file,pos)），可对齐；真正成本在 **Lance version ↔ Iceberg snapshot 的桥接** |
+| 删除/更新语义 | Lance 内部语义与 Iceberg **概念同构**（version↔snapshot、deletion vector↔position delete、row address=(fragment,offset)↔(file,pos)），可对齐。**首次写下时假定了 sidecar 落位，因此强调“桥接成本”；在 B2b 落位下这些桥接成本大部分不存在**（§11.8） |
 | 厂内先例 | **有，且已趟平链路**：Lance fork（含公司自研 HDFS provider）+ tpcds worktree（100G/1T Lance 建表）+ Kyuubi 103 个 TPC-DS query 全跑通 |
 | Spark 3.5 成熟度 | **可用但不成熟**：beta connector（0.4.0-beta-2），与生产 Gluten 有 Arrow classpath 冲突，必须专用 engine 且关闭 Gluten；HDFS 支持依赖公司 fork，升级需 rebase。**索引侧测试可先把 Gluten 排除，用 Gluten-free engine 跑** |
 | 业界先例（§11） | **有，且很新**：Iceberg File Format API 定稿并点名 Lance；Lance 有两个 apache/iceberg POC（#15585 模块式、#15751 走 API，读写+Spark SQL 闭环，均因 stale 关闭而非否决）；Vortex 同路线 open 并推进（#15915），其公开实测证明**非字节可切格式必须补 row-splittability**（补后 TPC-H 100 整库快 ~30%）；第三方实测随机取 20–50 行快 ~40x、存储 +50% |
 
-**建议（第一轮版，第二轮修订见 §11.8）：不做基础表替换。** 回表优化优先走 B1（索引内物化/覆盖索引，立论内、无第二系统、回表直接归零）；若后续出现"B1 投影列覆盖不了的任意列点查"需求，再按 POC 卡片验证 Lance 路线。
+**建议（第二轮修订后）：B1（覆盖索引）→ B2b（Lance 作 Iceberg data file 格式）→ B2a（sidecar）；换成 Lance 自己的表格式/catalog（落位 A）否决。** B1 立论内、零第二系统、对“向量 + pk/少量列”类查询回表直接归零；B2b 把“回表本身也快”也拿到，且不引入第二套系统。
 
 > **第二轮修订（必读）**：联网核查后发现 Iceberg 1.11.0 的 **File Format API** 让"把 Lance 当纯数据格式加进 Iceberg"成为**不破坏统一性的首选路线**（Iceberg 独占 catalog/snapshot/delete）。推荐顺序变为 **B1 → B2b（Lance 作 data file 格式）→ B2a（sidecar）**，落位 A（Lance 表格式 + 自己的 catalog）仍否决。完整证据与代价分析见 **§11**，POC 已按此修订为 #810。
 
