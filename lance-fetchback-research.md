@@ -18,7 +18,9 @@
 | 厂内先例 | **有，且已趟平链路**：Lance fork（含公司自研 HDFS provider）+ tpcds worktree（100G/1T Lance 建表）+ Kyuubi 103 个 TPC-DS query 全跑通 |
 | Spark 3.5 成熟度 | **可用但不成熟**：beta connector（0.4.0-beta-2），与生产 Gluten 有 Arrow classpath 冲突，必须专用 engine 且关闭 Gluten；HDFS 支持依赖公司 fork，升级需 rebase |
 
-**建议：不做基础表替换。** 回表优化优先走 B1（索引内物化/覆盖索引，立论内、无第二系统、回表直接归零）；若后续出现"B1 投影列覆盖不了的任意列点查"需求，再按 POC 卡片验证 Lance sidecar 路线。
+**建议（第一轮版，第二轮修订见 §11.8）：不做基础表替换。** 回表优化优先走 B1（索引内物化/覆盖索引，立论内、无第二系统、回表直接归零）；若后续出现"B1 投影列覆盖不了的任意列点查"需求，再按 POC 卡片验证 Lance 路线。
+
+> **第二轮修订（必读）**：联网核查后发现 Iceberg 1.11.0 的 **File Format API** 让"把 Lance 当纯数据格式加进 Iceberg"成为**不破坏统一性的首选路线**（Iceberg 独占 catalog/snapshot/delete）。推荐顺序变为 **B1 → B2b（Lance 作 data file 格式）→ B2a（sidecar）**，落位 A（Lance 表格式 + 自己的 catalog）仍否决。完整证据与代价分析见 **§11**，POC 已按此修订为 #810。
 
 ---
 
@@ -91,12 +93,14 @@ p99：Lance 各布局 2.3–4.1ms；parquet-5k 78ms；parquet-230k 2293ms。Lanc
 
 **没有，且结构上不会有。**
 
-- Iceberg 的 `FileFormat` 是封闭枚举（`api/src/main/java/org/apache/iceberg/FileFormat.java`）：`PUFFIN / ORC / PARQUET / AVRO / METADATA`。manifest 里的 data file 只能声明这几种格式；加 Lance 需要改 Iceberg core 的枚举与 reader SPI。
-- 更深层的不匹配：Iceberg 的 scan 规划模型建立在**可 split 的顺序字节范围**上（split 规划、column projection、delete file 合并）；Lance 的随机访问模型是**(fragment, offset) → page**，没有"split 成字节范围"的自然对应。即便硬加一个 FileFormat，也享受不到 Iceberg 的 split 并行与 delete 合并语义。
-- Lance 自己是**表格式**（dataset root 下 `data/ _versions/ _deletions/ _indices/ _refs/ tree/`，每 version 一个 manifest），与 Iceberg 是平级概念，不是"Iceberg 里的一种文件格式"。
-- 厂内实际用法也证明了这一定位：`lance-namespace-hive2-0.1.3` 把 Lance 表注册进 HMS，Spark 侧是**独立 catalog**（`spark.sql.catalog.lance=org.lance.spark.LanceNamespaceSparkCatalog`），与 `spark_catalog`（Iceberg）并列，不是其下一层。
+> **⚠ 本节在第二轮被部分修正：见 §11。**Iceberg 1.11.0 已交付 **File Format API**（格式可插拔，PMC 博客点名 Lance/Vortex），因此“给 Iceberg 加 Lance data file 格式”是官方预留的扩展点，不需要改 core SPI 设计。仍然成立的是：Lance 用自己的 catalog/表格式时，与 Iceberg 平级。
 
-**结论：Lance 只能作为与 Iceberg 平级的表存储外层存在。**
+- Iceberg 的 `FileFormat` 仍是**封闭枚举**（`api/src/main/java/org/apache/iceberg/FileFormat.java`）：`PUFFIN / ORC / PARQUET / AVRO / METADATA`——新格式需要同时改枚举与注册（Vortex 的 PR 就是把 `VORTEX("vortex", true)` 加进去）；但枚举不是“结构上不可动”，而是一个需要上游/规范同步的扩展点。
+- 更深层的不匹配：Iceberg 的 scan 规划模型建立在**可 split 的顺序字节范围**上；Lance 的随机访问模型是 **(fragment, offset) → page**，没有“split 成字节范围”的自然对应。**这是这条路真正的硬伤**（Vortex 已经踩过，见 §11.3），但可以解：补 row-split 或“多写小文件换并行度”。
+- Lance 自己是**表格式**（dataset root 下 `data/ _versions/ _deletions/ _indices/ _refs/ tree/`，每 version 一个 manifest），与 Iceberg 是平级概念，不是“Iceberg 里的一种文件格式”。
+- 厂内实际用法也证明了这一定位：`lance-namespace-hive2-0.1.3` 把 Lance 表注册进 HMS，Spark 侧是**独立 catalog**（`spark.sql.catalog.lance=org.lance.spark.LanceNamespaceSparkCatalog`），与 `spark_catalog`（Iceberg）并列。
+
+**结论（修订）：Lance 作为 data file 编码可以进 Iceberg（§11）；Lance 作为表格式/catalog 与 Iceberg 平级。**
 
 ---
 
@@ -104,18 +108,21 @@ p99：Lance 各布局 2.3–4.1ms；parquet-5k 78ms；parquet-230k 2293ms。Lanc
 
 立论原文（latency-analysis）："不需要维护第二套系统：数据、快照、删除语义、权限都和表一致。"
 
-三种落位，逐个过：
+四种落位，逐个过（第二列为第一轮判断，第四列为第二轮修订）：
 
-| 落位 | 做法 | 对立论的影响 |
-|---|---|---|
-| A. 基础表换 Lance | Iceberg 表的数据文件改成 .lance | **直接破坏**。双表格式、双快照模型、双 catalog；Iceberg 从"权威"降级为"另一个元数据源"，统一性名存实亡。一票否决 |
-| B. 派生 sidecar | Iceberg 保持权威；为每个（需要的）snapshot 物化一份 Lance 回表副本，索引与它绑定 | **部分受损但可控**。权威仍在 Iceberg；Lance 副本是指数层同级的"物化访问结构"（与 index leaf files 同性质）。代价：全量数据第二副本 + snapshot/delete/rewrite 桥接 + 孤儿清理——本质上是"缩小版的第二套系统" |
-| C. 只把索引/向量段存 Lance | 不动回表路径 | 不破坏立论（这正是 ecosystem 拓扑文档已建议的方向），但**不解决 3.2s 回表**，与 B2 目标无关 |
+| 落位 | 做法 | 对立论的影响 | 第二轮修订 |
+|---|---|---|---|
+| A. 换成 Lance 的表格式 + 自己的 catalog | 整表交给 Lance 管（Lance metadata/namespace 成为权威） | **直接破坏**。双表格式、双快照模型、双 catalog；Iceberg 降级为“另一个元数据源”。一票否决 | 仍然否决 |
+| **B2b. Lance 作为 Iceberg 表的 data file 格式**（`write.format.default=lance`） | 表仍是 Iceberg 表：catalog、snapshot、delete/update、权限全在 Iceberg；只是 data file 用 Lance 编码，由 Iceberg 的 File Format API 读写 | **不破坏**：没有第二套系统、没有第二个权威、没有桥接 | **新增，且为首选**（依据 §11） |
+| B2a. 派生 sidecar | Iceberg 权威不变；为每个 snapshot 物化一份 Lance 回表副本，索引绑定 | **部分受损**：权威仍在 Iceberg，但多一份全量副本 + snapshot/delete/rewrite 桥接 + 双向 GC | 降为备选（仅当基础表必须保持 parquet） |
+| C. 只把索引/向量段存 Lance | 不动回表路径 | 不破坏立论（ecosystem 拓扑文档已建议），但**不解决 3.2s 回表** | 不变 |
 
-判断：
+判断（修订）：
 
-- **B2 若做，只有 B 成立。** 而 B 的桥接成本（§6）恰是立论里最疼的部分——它买来的，是"任意列点查都快"。
-- 对比 B1（索引内物化投影列）：B1 在同一立论内让"向量+少量列"的查询**完全不用回表**（3.2s → 0），不引入任何第二存储。B1 覆盖不到的，是"查询要回表取很多列/大 payload"的场景。
+- **B2 的首选形式是 B2b**：它把“回表快”与“统一性”同时拿到，代价从“桥接”转移到“规范扩展 + 跨引擎互操作 + 格式工程缺口”（§11.6、§11.8）。
+- B2a 的桥接成本（§6）仍在，但只在“基础表必须保持 parquet（其它引擎不能读 Lance）”时才值得付。
+- 对比 B1（索引内物化投影列）：B1 在同一立论内让“向量+少量列”的查询**完全不用回表**（3.2s → 0），不引入任何新格式。B1 覆盖不到的，是“查询要回表取很多列/大 payload”的场景。
+- B1 与 B2b 不互斥：B1 管“常用投影”，B2b 管“回表本身也快”。
 - 所以这不是"Lance 好不好"的问题，是**用什么代价换什么覆盖面的问题**：B1 用索引体积换窄覆盖面；B2(sidecar) 用第二副本+桥接换任意列点查。
 
 ---
@@ -185,8 +192,8 @@ sidecar 路线下要额外维护的不变量：
 ## 9. 建议
 
 1. **回表优化先做 B1（索引内物化投影列）**：立论内、零第二系统、对"向量 + pk/少量列"类查询回表直接归零。多数在线检索查询落在这个类别。
-2. **B2 不作为基础表替换**（落位 A 否决）。
-3. **若确有任意列点查需求，按 POC 卡片（#810）验证 sidecar 路线**：重点验证 §6.2 的桥接成本与 §8 的 Gluten 共存问题，用真集群端到端数据决定是否值得。
+2. **落位 A（换成 Lance 表格式 + 自己的 catalog）否决**；但 **B2b（Lance 作 data file 格式，走 Iceberg File Format API）改为可选首选**，依据 §11（官方 API + Lance/Vortex 先例 + 我们 fork 已具备）。
+3. **若确有任意列点查需求，按 POC 卡片（#810）验证 B2b**：重点验证 (a) Lance data file 在 Spark 3.5 上的读写闭环与 Iceberg 删除/更新语义（position delete 仍由 Iceberg 管）；(b) 回表 3.2s → ？端到端；(c) splittability/列统计 缺失对 fallback 全扫的影响；(d) 跨引擎互操作成本。索引侧测试**先把 Gluten 排除**（专用 Gluten-free engine），避免 Arrow classpath 冲突把 POC 复杂化。
 4. 无论走哪条，**parquet row group 调小**都是应立即做的无形态变更（配置级，生产 3MB 文件本身就是小 row group，此条对生产的实际收益有限，但对"大 row group 表"是免费午餐）——注意它与 B1/B2 不互斥。
 
 ---
@@ -218,3 +225,105 @@ python3 fadvise.py data/lance_5k
 ```
 
 原始结果：`/data/workspace/lance-bench/results.log`（数据文件已清理，`gen_data.py` + `gen_parquet.py` 可完整重建）。
+
+---
+
+## 11. 第二轮（联网核查）· Lance 作为 Iceberg **原生数据格式**的可行性与业界先例
+
+第一轮的判断是"Lance 是 Iceberg 不认的平级表格式，只能做 sidecar"。第二轮核实后修正了一半：**Iceberg 已经把自己的文件格式层做成插件机制，Lance 正是被点名的候选之一**。若走这条路，"把 Lance 当纯数据格式、不使用它的 catalog 层"就不破坏架构统一性——Iceberg 仍然独占 catalog、snapshot、删除/更新语义，Lance 只是 data file 的编码。
+
+### 11.1 Iceberg File Format API（已定稿，随 1.11.0 发布）
+
+- 2026-02-20 Iceberg PMC 官方博客《Introducing the Apache Iceberg File Format API》：文件格式层改为**可插拔**（`FormatModel` / `FormatModelRegistry` / `ReadBuilder` / `WriteBuilder`），随 **1.11.0** 发布，引擎侧接入已合并。
+- 博客原文明确把新格式的动机写成我们的场景："New formats now emphasize extremely fast random access... File structures that **do not match traditional row-group-based designs**"；并在 "What the New API Unlocks" 里点名：**"allows us to try out formats such as Vortex and Lance to integrate cleanly using predictable APIs"**。
+- 注册方式：`FormatModelRegistry.register(FormatModel)`；core 里是一份类名列表（`CLASSES_TO_REGISTER`），新增一种格式 = 新增一个模块 + 在列表里加一个类名 + 给 `FileFormat` 枚举加一个值。
+- **我们 fork 已具备**：基线为 `apache-iceberg-1.11.0-688-g5ee64caba`，`core/src/main/java/org/apache/iceberg/formats/` 下 `FormatModel` / `FormatModelRegistry` 齐备，`ReadBuilder` 已有 `split(start,length)`，且 `SparkFormatModels` 在 **spark/v3.5、v4.0、v4.1 三个版本都有源码**。即：**不需要等上游、也不需要 Spark 4，我们在 Spark 3.5.7 上就能自己接**。
+
+### 11.2 先例一：Lance 自己（两个 POC，均因 stale 关闭，非技术否决）
+
+| 出处 | 内容 | 状态 |
+|---|---|---|
+| apache/iceberg **#15585** | 新增 `iceberg-lance` 模块 + `FileFormat.LANCE("lance", true)`，约 3.2k 行，22 文件 | 2026-04-18 stale 关闭 |
+| apache/iceberg **#15751** | **走 File Format API 的完整 POC**：`FormatModel`/`ReadBuilder`/`WriteBuilder` 读写闭环；Spark 4.1 SQL `CREATE TABLE ... TBLPROPERTIES('write.format.default'='lance')` / INSERT / SELECT / 投影 / WHERE；向量化（`ArrowColumnVector`）与行式两条读路径；**position delete 写路径（`DeleteSchemaUtil.pathPosSchema()` + `PositionDelete` 转换器）**；19 个单测；Iceberg schema 经 Arrow field id 保留 | 作者标注 draft/POC、"not requesting merge"，2026-05-01 stale bot 关闭 |
+
+#15751 自述的**已知缺口**（`LANCE_SDK_GAPS.md`，5 项）：
+
+1. 文件写入字节数需绕（JNI 的 `closeNative` 丢弃 `finish()` 返回值）；
+2. **无列级统计 → 丢失文件级 pruning**（等 Lance PR #5639 落地 + JNI 暴露）；
+3. **`splittable=false` → 一个文件一个 task，无文件内并行**；
+4. filter 不下推（靠 Iceberg 残差过滤保正确性，但会全读）；
+5. `NameMapping` 不生效（列改名后读不了老文件）。
+
+其中第 3 项有已经被踩过的前车（§11.3）；第 2 项对**点查**不痛不痒，对**全表扫描**才痛。
+
+### 11.3 先例二：Vortex（同一条路，走得更远，且有公开实测）
+
+- **apache/iceberg #15915 "Core: Add Vortex format to Iceberg"**：由 Vortex 作者（Spiral）提交，**仍 open、持续更新**（66 commits / 211 files）。核心改动正是给 `FileFormat` 枚举加 `VORTEX("vortex", true)`，再加注册与 `ReadBuilder` 的**行切分**扩展——即"新增一种格式"的实际改动面很小，真正的工作在格式侧。
+- **SpiralDB × Microsoft Gray Systems Lab《Vortex on Ice》**（2026 Iceberg Summit 的 tech demo）记录了完整代价与收益：
+  - 做法与我们设想的完全一致：基于 File Format API 的 fork + **JNI 绑定 Rust 库**（Vortex 与 Lance 同为 Rust + Arrow，路径同构）。
+  - **踩的坑**：Vortex 不是按字节范围可切的（columnar 布局），于是 Iceberg "一个文件一个 task"，单 task 几千万行导致 shuffle spill/merge 极慢，**大 join 查询一度比 Parquet 慢 2x**。原文归因："It all goes back to Iceberg's idea of file **splittability**."
+  - **解法**：给 Iceberg 规划器加 **row-splittability**（元数据里报"行区间"而非字节区间）。补上后：**整套 TPC-H 100 快约 30%，最慢的几个查询快 2–4x**。
+  - 对我们的含义：**这是同一条路的实测先例，也是必答题**。我们的 fork 目前只有字节 split，**没有 row-split**——要么补它，要么接受"一个文件一个 task"。注意我们生产表本来就是 ~3MB 小文件（5k 行级），"一文件一 task"的并行度损失在**小文件布局下并不致命**，这反而让我们的现状比 Vortex 的 512MB 大文件场景更宽容。
+
+### 11.4 第三方独立数据点（littleDrew，apache/iceberg #13438）
+
+1M 行自测（他自己的口径，注明"40x 是在 Lance 文件上测的、不是 Lance 表"）：
+
+- 随机取 20–50 行：**快约 40x**；
+- 全表扫描：列数 < 50 时快 1.5–3x，**列多则不如 parquet**；
+- **磁盘占用比 parquet 多约 50%**。
+
+与本轮自建基准（26x–1000x，取决于 row group 大小）方向一致，并补上两条我们没测的代价：**列多时扫描不占优、存储 +50%**。存储这条与我们实测吻合（同数据 Lance 514MB vs parquet 521MB 量级相当，但那是 vector 主导的小列场景；列多时 Lance 的编码开销会显现）。
+
+### 11.5 社区治理状态（决定能不能进上游）
+
+Issue #13438 中 Iceberg PMC 成员 pvary 给出的三步：
+
+1. reader/writer API 层 —— **已完成**（#12298 → #12774 → 1.11.0）；
+2. 合规测试框架（TCK）—— **进行中**（官方博客 "Current State" 里唯一未打勾项）；有了它，Lance 这类格式才有功能性验证的落脚点；
+3. **社区决定"要不要、怎么支持新格式"** —— **未决**；当前精力在收尾 V3。
+
+含义：**技术上可以自己做（fork 内），短期内不要指望上游合并**。两个 Lance POC 都是被 stale bot 关掉而非被否决，也谈不上"社区已认可"。
+
+### 11.6 规范与跨引擎互操作
+
+Iceberg v1–v4 规范中 `data_file.file_format` 的取值是 **avro / orc / parquet（+ puffin，用于删除/统计 blob）**。也就是说 **Lance 作为 data file 是规范扩展**：Java 实现（枚举 + FormatModel）能跑，但 Trino / Flink / pyiceberg / iceberg-rust / iceberg-go 要各自实现 Lance reader 才能读同一张表。
+
+**"架构统一"在控制面成立（一套 catalog/snapshot/delete/权限），在访问面则取决于各引擎是否补 Lance reader。** 这是 B2b 相比 parquet 的真实代价，必须在 POC 里明确记账（我们自己的引擎栈：Spark 3.5 可以补；Kyuubi/Trino 若也要读同一张表，就得补或走 fallback）。
+
+### 11.7 反向先例：Lance 自己是"伴生表"方案
+
+Lance 官方 namespace 规范中，**Apache Iceberg REST Catalog** 的支持方式是：注册 Lance 表时**在同一路径创建一个 dummy schema 的伴生 Iceberg 表**，用 table properties 标记它是 Lance 表。即 Lance 生态目前交付的 Iceberg 互操作是 **catalog 层伴生**，不是 data-file 层集成。
+
+反过来说明了 B2b 的现状：**POC 有（#15751），产品无**。
+
+### 11.8 结论修订（对第一轮的修正）
+
+| 第一轮结论 | 第二轮修订 |
+|---|---|
+| "Iceberg 不认 Lance，`FileFormat` 是封闭枚举，**结构上不会有**" | **部分错误**。枚举仍封闭，但 1.11.0 的 **File Format API** 就是为此开的口子，官方博客**点名 Lance**。我们 fork 已具备该 API + Spark 3.5 接入 |
+| "唯一可行落位是派生 sidecar" | **新增更好的落位 B2b：Lance 作为 Iceberg 表的 data file 格式**。Iceberg 独占 catalog/snapshot/delete，**无第二套系统、无桥接**，统一性完整 |
+| sidecar 的桥接成本（§6 五项） | 在 B2b 下**大部分消失**（不需 snapshot 对齐、不需跨系统 delete 传播、不需双向 GC）。代价转移到：跨引擎互操作（§11.6）、splittability（§11.3）、列统计缺失、Lance SDK 五缺口、JNI/HDFS 依赖与 fork 维护、+50% 存储（§11.4） |
+
+**落位排序（修订）**
+
+1. **B1 · 覆盖索引**：最便宜，立论内，回表归零（窄投影）。
+2. **B2b · Lance 作 data file 格式**：统一性完整，回表直接读 Lance；需补 row-split（或依赖小文件布局）、接受规范扩展与跨引擎成本。
+3. **B2a · sidecar**：仅当基础表必须保持 parquet 时。
+4. **A · 换成 Lance 表格式 + 自己的 catalog**：否决。
+
+**测试范围说明**：索引侧验证可先把 Gluten 排除（用 Gluten-free 的专用 engine 跑 Lance 读取），避免 Arrow classpath 冲突与 Gluten 关闭矩阵把 POC 复杂化——这一点已写入 #810。
+
+### 参考资料（第二轮联网核查）
+
+| 资料 | 链接 |
+|---|---|
+| Iceberg PMC：Introducing the Apache Iceberg File Format API（2026-02-20，点名 Lance/Vortex） | https://iceberg.apache.org/blog/apache-iceberg-file-format-api/ |
+| apache/iceberg #12225 File Format API（issue） / #12774 API 实现（PR） / #12298 更早的接口层（PR） | https://github.com/apache/iceberg/issues/12225 · .../pull/12774 · .../pull/12298 |
+| apache/iceberg #15751 Core, Data, Lance: Add Lance file format support via File Format API（POC，stale 关闭） | https://github.com/apache/iceberg/pull/15751 |
+| apache/iceberg #15585 feat: Add iceberg-lance module（模块式方案，stale 关闭） | https://github.com/apache/iceberg/pull/15585 |
+| apache/iceberg #15915 Core: Add Vortex format to Iceberg（open，Spiral 提交） | https://github.com/apache/iceberg/pull/15915 |
+| apache/iceberg #13438 Lance 集成讨论（含 pvary 的三步路线、littleDrew 的实测数据） | https://github.com/apache/iceberg/issues/13438 |
+| SpiralDB × Microsoft GS Lab：Vortex on Ice（row-splittability 的由来与 TPC-H 100 实测） | https://spiraldb.com/blog/vortex-on-ice |
+| Iceberg 规范：manifest `data_file.file_format` 取值 | https://iceberg.apache.org/spec/ |
+| Lance 规范：Apache Iceberg REST Catalog（伴生表方案） | https://lance.org/format/namespace/supported-catalogs/iceberg/ |
