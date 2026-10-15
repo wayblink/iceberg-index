@@ -91,9 +91,52 @@ public class SparkLanceWriter {
         Types.DecimalType decType = (Types.DecimalType) field.type();
         Decimal decimal = row.getDecimal(ordinal, decType.precision(), decType.scale());
         return decimal != null ? decimal.toJavaBigDecimal() : null;
+      case LIST:
+        return extractList(row, ordinal, field);
       default:
         throw new UnsupportedOperationException(
             "Unsupported type for Spark writer: " + field.type().typeId());
     }
+  }
+  /** Converts a Spark array into the Java list the Arrow list writer expects. */
+  private static List<Object> extractList(
+      InternalRow row, int ordinal, Types.NestedField field) {
+    org.apache.spark.sql.catalyst.util.ArrayData array = row.getArray(ordinal);
+    if (array == null) {
+      return null;
+    }
+
+    Types.NestedField elementField = field.type().asListType().fields().get(0);
+    List<Object> elements = new java.util.ArrayList<>(array.numElements());
+    for (int i = 0; i < array.numElements(); i++) {
+      if (array.isNullAt(i)) {
+        elements.add(null);
+        continue;
+      }
+      switch (elementField.type().typeId()) {
+        case BOOLEAN:
+          elements.add(array.getBoolean(i));
+          break;
+        case INTEGER:
+          elements.add(array.getInt(i));
+          break;
+        case LONG:
+          elements.add(array.getLong(i));
+          break;
+        case FLOAT:
+          elements.add(array.getFloat(i));
+          break;
+        case DOUBLE:
+          elements.add(array.getDouble(i));
+          break;
+        case STRING:
+          elements.add(array.getUTF8String(i).toString());
+          break;
+        default:
+          throw new UnsupportedOperationException(
+              "Unsupported list element type for Spark writer: " + elementField.type().typeId());
+      }
+    }
+    return elements;
   }
 }

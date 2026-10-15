@@ -27,6 +27,7 @@ import java.time.LocalTime;
 import java.time.OffsetDateTime;
 import java.time.ZoneOffset;
 import java.time.temporal.ChronoUnit;
+import java.util.List;
 import java.util.Map;
 import java.util.UUID;
 import org.apache.arrow.vector.BigIntVector;
@@ -42,7 +43,11 @@ import org.apache.arrow.vector.TimeStampMicroTZVector;
 import org.apache.arrow.vector.TimeStampMicroVector;
 import org.apache.arrow.vector.VarBinaryVector;
 import org.apache.arrow.vector.VarCharVector;
+import org.apache.arrow.vector.FieldVector;
 import org.apache.arrow.vector.VectorSchemaRoot;
+import org.apache.arrow.vector.complex.ListVector;
+import org.apache.arrow.vector.complex.writer.BaseWriter;
+import org.apache.arrow.vector.types.Types.MinorType;
 import org.apache.iceberg.Schema;
 import org.apache.iceberg.data.GenericRecord;
 import org.apache.iceberg.data.Record;
@@ -148,6 +153,9 @@ class LanceArrowConverter {
       case DECIMAL:
         BigDecimal decimal = (BigDecimal) value;
         ((DecimalVector) batch.getVector(vectorName)).setSafe(rowIndex, decimal);
+        break;
+      case LIST:
+        writeListValue(batch, vectorName, field, rowIndex, value);
         break;
       default:
         writeTemporalOrBinaryValue(batch, vectorName, field, rowIndex, value);
@@ -256,6 +264,8 @@ class LanceArrowConverter {
         return ((Float8Vector) batch.getVector(vectorName)).get(rowIndex);
       case DECIMAL:
         return ((DecimalVector) batch.getVector(vectorName)).getObject(rowIndex);
+      case LIST:
+        return readListValue(batch, vectorName, rowIndex, field);
       default:
         return readTemporalOrBinaryValue(batch, vectorName, rowIndex, field);
     }
@@ -310,5 +320,94 @@ class LanceArrowConverter {
     long seconds = Math.floorDiv(micros, 1_000_000);
     long nanoAdjustment = Math.floorMod(micros, 1_000_000) * 1000L;
     return OffsetDateTime.ofInstant(Instant.ofEpochSecond(seconds, nanoAdjustment), ZoneOffset.UTC);
+  }
+  /** Writes a Java list into an Arrow list vector, one element type at a time. */
+  @SuppressWarnings("unchecked")
+  private static void writeListValue(
+      VectorSchemaRoot batch, String vectorName, Types.NestedField field, int rowIndex, Object value) {
+    ListVector listVector = (ListVector) batch.getVector(vectorName);
+    Types.NestedField elementField = field.type().asListType().fields().get(0);
+    List<Object> elements = (List<Object>) value;
+
+    BaseWriter.ListWriter writer = listVector.getWriter();
+    writer.setPosition(rowIndex);
+    writer.startList();
+    for (Object element : elements) {
+      if (element == null) {
+        writer.writeNull();
+        continue;
+      }
+      writeListElement(writer, elementField, element);
+    }
+    writer.endList();
+  }
+
+  private static void writeListElement(
+      BaseWriter.ListWriter writer, Types.NestedField elementField, Object element) {
+    switch (elementField.type().typeId()) {
+      case BOOLEAN:
+        writer.bit().writeBit((Boolean) element ? 1 : 0);
+        break;
+      case INTEGER:
+        writer.integer().writeInt((Integer) element);
+        break;
+      case LONG:
+        writer.bigInt().writeBigInt((Long) element);
+        break;
+      case FLOAT:
+        writer.float4().writeFloat4((Float) element);
+        break;
+      case DOUBLE:
+        writer.float8().writeFloat8((Double) element);
+        break;
+      case STRING:
+        writer.varChar().writeVarChar(element.toString());
+        break;
+      default:
+        throw new UnsupportedOperationException(
+            "Unsupported list element type: " + elementField.type().typeId());
+    }
+  }
+
+  /** Reads a row of an Arrow list vector into a Java list. */
+  private static List<Object> readListValue(
+      VectorSchemaRoot batch, String vectorName, int rowIndex, Types.NestedField field) {
+    ListVector listVector = (ListVector) batch.getVector(vectorName);
+    Types.NestedField elementField = field.type().asListType().fields().get(0);
+    int start = listVector.getOffsetBuffer().getInt((long) rowIndex * 4);
+    int end = listVector.getOffsetBuffer().getInt((long) (rowIndex + 1) * 4);
+    FieldVector elementVector = listVector.getDataVector();
+
+    List<Object> elements = new java.util.ArrayList<>(end - start);
+    for (int i = start; i < end; i++) {
+      if (elementVector.isNull(i)) {
+        elements.add(null);
+        continue;
+      }
+      elements.add(
+          readListElement(elementVector, elementField, i, elementVector.getMinorType()));
+    }
+    return elements;
+  }
+
+  private static Object readListElement(
+      FieldVector elementVector, Types.NestedField elementField, int index, MinorType minorType) {
+    switch (minorType) {
+      case BIT:
+        return ((BitVector) elementVector).get(index) == 1;
+      case INT:
+        return ((IntVector) elementVector).get(index);
+      case BIGINT:
+        return ((BigIntVector) elementVector).get(index);
+      case FLOAT4:
+        return ((Float4Vector) elementVector).get(index);
+      case FLOAT8:
+        return ((Float8Vector) elementVector).get(index);
+      case VARCHAR:
+        return new String(((VarCharVector) elementVector).get(index), StandardCharsets.UTF_8);
+      default:
+        throw new UnsupportedOperationException(
+            "Unsupported list element type: " + elementField.type().typeId() + " (" + minorType + ")");
+    }
   }
 }

@@ -1,6 +1,6 @@
 rows=200000 dim=0
-lance: files=4 dataBytes=4892204 dataFiles=4 plannedTasks=4 sparkScanPartitions=1 countMs=40 fullScanMs=76
+lance: files=4 dataBytes=4897452 dataFiles=4 plannedTasks=4 sparkScanPartitions=1 countMs=41 fullScanMs=93
 lance rowCount=200000
-parquet: files=4 dataBytes=653853 dataFiles=4 plannedTasks=5 sparkScanPartitions=14 countMs=34 fullScanMs=89
+parquet: files=4 dataBytes=653853 dataFiles=4 plannedTasks=5 sparkScanPartitions=14 countMs=31 fullScanMs=79
 parquet rowCount=200000
 lanceFileRows=4

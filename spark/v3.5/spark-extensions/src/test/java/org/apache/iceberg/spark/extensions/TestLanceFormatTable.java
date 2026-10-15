@@ -206,4 +206,39 @@ class TestLanceFormatTable {
         .isEqualTo(2L);
     assertThat(spark.sql("SELECT count(*) FROM " + table).head().getLong(0)).isEqualTo(3L);
   }
+
+  @Test
+  public void writesAndReadsAListColumn() {
+    String table = "local.db.lance_list";
+    spark.sql("CREATE NAMESPACE IF NOT EXISTS local.db");
+    spark.sql("DROP TABLE IF EXISTS " + table);
+    spark.sql(
+        "CREATE TABLE "
+            + table
+            + " (id bigint, vec array<float>) USING iceberg "
+            + "TBLPROPERTIES ('write.format.default' = 'lance')");
+
+    // enough rows to cross several Lance batches, with a vector-shaped list column
+    spark.sql(
+        "INSERT INTO "
+            + table
+            + " SELECT id, array(cast(id as float), cast(-id as float), 0.5f, 1.5f) FROM range(3000)");
+
+    assertThat(spark.sql("SELECT count(*) FROM " + table).head().getLong(0)).isEqualTo(3000L);
+    assertThat(spark.sql("SELECT sum(size(vec)) FROM " + table).head().getLong(0))
+        .isEqualTo(12000L);
+    assertThat(spark.sql("SELECT sum(vec[0]) FROM " + table).head().getDouble(0))
+        .isEqualTo((2999L * 3000L) / 2.0);
+
+    java.util.List<Row> rows =
+        spark.sql("SELECT id, vec FROM " + table + " WHERE id < 3 ORDER BY id").collectAsList();
+    assertThat(rows).hasSize(3);
+    assertThat(rows.get(2).getList(1))
+        .containsExactly(2.0f, -2.0f, 0.5f, 1.5f);
+
+    // the list column round-trips through Lance, not a side channel
+    List<Row> files =
+        spark.sql("SELECT file_path FROM " + table + ".files").collectAsList();
+    assertThat(files).allSatisfy(row -> assertThat(row.getString(0)).endsWith(".lance"));
+  }
 }

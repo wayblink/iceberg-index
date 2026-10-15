@@ -117,6 +117,8 @@ public class SparkLanceRowReader {
 
   private static Object readSparkValue(FieldVector vector, int rowIdx, Types.NestedField field) {
     switch (field.type().typeId()) {
+      case LIST:
+        return readSparkList((org.apache.arrow.vector.complex.ListVector) vector, rowIdx, field);
       case BOOLEAN:
         return ((BitVector) vector).get(rowIdx) == 1;
       case INTEGER:
@@ -170,5 +172,20 @@ public class SparkLanceRowReader {
       default:
         return value;
     }
+  }
+  private static org.apache.spark.sql.catalyst.util.GenericArrayData readSparkList(
+      org.apache.arrow.vector.complex.ListVector listVector,
+      int rowIdx,
+      Types.NestedField field) {
+    int start = listVector.getOffsetBuffer().getInt((long) rowIdx * 4);
+    int end = listVector.getOffsetBuffer().getInt((long) (rowIdx + 1) * 4);
+    FieldVector dataVector = listVector.getDataVector();
+    Types.NestedField elementField = field.type().asListType().fields().get(0);
+
+    Object[] elements = new Object[end - start];
+    for (int i = start; i < end; i++) {
+      elements[i - start] = dataVector.isNull(i) ? null : readSparkValue(dataVector, i, elementField);
+    }
+    return new org.apache.spark.sql.catalyst.util.GenericArrayData(elements);
   }
 }

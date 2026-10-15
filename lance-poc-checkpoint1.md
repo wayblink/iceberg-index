@@ -103,3 +103,39 @@ export JAVA_HOME=/opt/homebrew/opt/openjdk@17
 ```
 
 本地依赖：`~/lance-m2/org/lance/lance-core/5.0.0-beta.6-poc1/`（打过补丁的 SDK，由 `lance/patches/0001-*.patch` 生成）+ `~/.gradle/init.d/00-cn-mirror.gradle`（镜像源 + 本地仓库）。
+
+---
+
+## 8. 检查点 2 进展（2026-10-15 续）
+
+### 已清障：LIST / FIXED_SIZE_LIST 支持
+
+向量列是 array，原来直接抛 `Unsupported type for Spark writer: LIST`。已补齐：
+
+| 层 | 改动 |
+|---|---|
+| schema | 双向转换原本已支持 list（`ArrowType.List` ↔ `Types.ListType`） |
+| generic 写 | `LanceArrowConverter.writeListValue`：Java List → `ListVector`（boolean/int/long/float/double/string 元素） |
+| generic 读 | `readListValue`：`ListVector` → Java List |
+| Spark 写 | `SparkLanceWriter.extractList`：`InternalRow.getArray` → Java List |
+| Spark 行读 | `SparkLanceRowReader.readSparkList`：`ListVector` → `GenericArrayData`（覆盖 `array<float>` 向量列） |
+
+验证：新增 `TestLanceFormatTable.writesAndReadsAListColumn`（3000 行 × `array<float>[4]`，校验 `sum(size(vec))`、`sum(vec[0])`、逐行取值、data file 仍为 `.lance`）→ **6/6 全绿**。
+
+### 新阻塞点：索引层把数据文件读取硬编码成 parquet
+
+- `index-spark/.../IndexEntries.java:297`：`spark.read().parquet(dataFile)`（回表 `liveRowsOf`）
+- 同一文件里建索引/读取向量列也走同一条 Spark parquet 读路径
+- 现象：在 Lance-backed 表上 `CALL system.build_vector_index(...)` 直接失败
+  `[CANNOT_READ_FILE_FOOTER] ... .lance is not a parquet file`
+
+这不是 Lance 的问题，是索引层自己的假设。**修复方向（待做）**：
+
+1. 把"读一个数据文件的行"抽成一个 format-aware 的读取：
+   `FileFormat.fromFileName(path)` + `FormatModelRegistry.readBuilder(format, <targetType>, inputFile)`，
+   Lance 侧我们已注册 `Record.class`（generic）与 Spark 的 `InternalRow` / `ColumnarBatch` 模型，parquet/orc/avro 也有对应模型 → 一套代码覆盖所有格式。
+2. `liveRowsOf` 现在靠 `toJavaRDD().zipWithIndex()` 拿行位置，这是 parquet 单文件读的副作用；换成 format-aware 读取后位置应来自读取器（Lance 是 (fragment, offset)，parquet 是行组内偏移），比 `zipWithIndex` 更可靠。
+3. delete 文件读取（`IndexEntries` 里 `spark.read().parquet(deleteFile)`）同样要 format-aware；本轮 POC 可先把 `write.delete.format.default` 固定在 parquet 以减少变量。
+4. 回归门槛：`TestRewriteVectorSearch`（12 个用例）必须保持全绿——它是索引改写行为的护栏。
+
+`TestLanceFetchBack`（Lance 表 vs parquet 表的回表 A/B）已写好并按上述原因 `@Disabled`，解除阻塞后直接启用即可给出检查点 2 的端到端数字（回表延迟 + 相同结果校验）。
