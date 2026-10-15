@@ -165,7 +165,11 @@ case class RewriteVectorSearch(spark: SparkSession) extends Rule[LogicalPlan] {
     val payload = new VectorIndexAdapter(definition).encodeQuery(query)
     val metric = definition.metric()
     val t0 = System.currentTimeMillis()
-    val dataFiles = IndexEntries.dataFiles(table, snapshotId).asScala.toSet
+    // one pass over the snapshot's manifests serves the whole rewrite: the data file list the index
+    // coverage is checked against, and the rows the hits point at
+    val scanTasks = IndexEntries.scanTasks(table, snapshotId)
+    val dataFiles =
+      scanTasks.asScala.map(task => task.file().location().toString()).toSet
     logger.info(
       "TIMING plan data files {} ms",
       java.lang.Long.valueOf(System.currentTimeMillis() - t0))
@@ -191,7 +195,17 @@ case class RewriteVectorSearch(spark: SparkSession) extends Rule[LogicalPlan] {
     val tableSchema = IndexRewriteSupport.tableSchema(sparkTable)
     val tSearch = System.currentTimeMillis()
     val hitRows =
-      liveHitRows(reader, index, table, snapshotId, payload, dataFiles, limit, names, tableSchema)
+      liveHitRows(
+        reader,
+        index,
+        table,
+        snapshotId,
+        payload,
+        dataFiles,
+        limit,
+        names,
+        tableSchema,
+        scanTasks)
         .getOrElse(return None)
     logger.info(
       "TIMING search+resolve {} ms",
@@ -200,14 +214,14 @@ case class RewriteVectorSearch(spark: SparkSession) extends Rule[LogicalPlan] {
     val residual =
       residualRows(
         table,
-        snapshotId,
         uncovered,
         names,
         tableSchema,
         limit,
         columnIndex,
         query,
-        metric)
+        metric,
+        scanTasks)
     val tMerge = System.currentTimeMillis()
     val rows =
       (hitRows ++ residual).sortBy(row => distanceOf(row, columnIndex, query, metric)).take(limit)
@@ -241,7 +255,8 @@ case class RewriteVectorSearch(spark: SparkSession) extends Rule[LogicalPlan] {
       dataFiles: Set[String],
       limit: Int,
       names: Seq[String],
-      tableSchema: StructType): Option[List[Row]] = {
+      tableSchema: StructType,
+      scanTasks: java.util.List[org.apache.iceberg.FileScanTask]): Option[List[Row]] = {
     var searchLimit = limit
     var rows: List[Row] = Nil
     var done = false
@@ -275,10 +290,10 @@ case class RewriteVectorSearch(spark: SparkSession) extends Rule[LogicalPlan] {
         IndexEntries.rowsAt(
           spark,
           table,
-          snapshotId,
           positionsByFile.asJava,
           names.toList.asJava,
-          tableSchema)
+          tableSchema,
+          scanTasks)
 
       // the live hits, best first: a removed row leaves a hole the next hit fills
       rows = hits.flatMap(hit => liveRow(rowsByFile, hit))
@@ -302,20 +317,20 @@ case class RewriteVectorSearch(spark: SparkSession) extends Rule[LogicalPlan] {
   /** All live rows of the data files the index does not cover, closest first. */
   private def residualRows(
       table: org.apache.iceberg.Table,
-      snapshotId: Long,
       uncovered: Set[String],
       names: Seq[String],
       tableSchema: StructType,
       limit: Int,
       columnIndex: Int,
       query: Array[Float],
-      metric: Metric): List[Row] = {
+      metric: Metric,
+      scanTasks: java.util.List[org.apache.iceberg.FileScanTask]): List[Row] = {
     if (uncovered.isEmpty) {
       return Nil
     }
 
     IndexEntries
-      .liveRows(spark, table, snapshotId, uncovered.asJava, names.toList.asJava, tableSchema)
+      .liveRows(spark, table, uncovered.asJava, names.toList.asJava, tableSchema, scanTasks)
       .rdd
       .takeOrdered(limit)(Ordering.by(row => distanceOf(row, columnIndex, query, metric)))
       .toList

@@ -161,8 +161,23 @@ public final class IndexEntries {
       Map<String, ? extends Collection<Long>> positionsByFile,
       List<String> columns,
       StructType readSchema) {
+    return rowsAt(spark, table, positionsByFile, columns, readSchema, scanTasks(table, snapshotId));
+  }
+
+  /**
+   * Reads the live rows of a snapshot at the given positions, from scan tasks that were already
+   * planned. Planning a snapshot reads its manifests, so a query that already planned it should
+   * pass the tasks on instead of paying for a second pass.
+   */
+  public static Map<String, Map<Long, Row>> rowsAt(
+      SparkSession spark,
+      Table table,
+      Map<String, ? extends Collection<Long>> positionsByFile,
+      List<String> columns,
+      StructType readSchema,
+      List<FileScanTask> scanTasks) {
     List<FileScanTask> tasks = Lists.newArrayList();
-    for (FileScanTask task : scanTasks(table, snapshotId)) {
+    for (FileScanTask task : scanTasks) {
       if (positionsByFile.containsKey(task.file().location().toString())) {
         tasks.add(task);
       }
@@ -214,8 +229,19 @@ public final class IndexEntries {
       Collection<String> dataFiles,
       List<String> columns,
       StructType readSchema) {
+    return liveRows(spark, table, dataFiles, columns, readSchema, scanTasks(table, snapshotId));
+  }
+
+  /** Reads all live rows of the given data files, from scan tasks that were already planned. */
+  public static Dataset<Row> liveRows(
+      SparkSession spark,
+      Table table,
+      Collection<String> dataFiles,
+      List<String> columns,
+      StructType readSchema,
+      List<FileScanTask> scanTasks) {
     List<FileScanTask> tasks = Lists.newArrayList();
-    for (FileScanTask task : scanTasks(table, snapshotId)) {
+    for (FileScanTask task : scanTasks) {
       if (dataFiles.contains(task.file().location().toString())) {
         tasks.add(task);
       }
@@ -353,7 +379,15 @@ public final class IndexEntries {
     return deletesByFile;
   }
 
-  private static List<FileScanTask> scanTasks(Table table, long snapshotId) {
+  /**
+   * Plans the data files of a table snapshot, with the delete files that apply to each of them.
+   *
+   * <p>This is the one pass over the manifests a query needs, and it is not free: it reads the
+   * manifest list and the manifests of the snapshot. A caller that needs both the file list and the
+   * rows of some of those files should plan once and pass the result on, rather than planning
+   * again.
+   */
+  public static List<FileScanTask> scanTasks(Table table, long snapshotId) {
     List<FileScanTask> tasks = Lists.newArrayList();
     try (CloseableIterable<FileScanTask> planned =
         table.newScan().useSnapshot(snapshotId).planFiles()) {
