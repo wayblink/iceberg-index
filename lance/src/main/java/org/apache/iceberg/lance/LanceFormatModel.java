@@ -223,7 +223,7 @@ public class LanceFormatModel<D, S>
 
       org.apache.arrow.vector.types.pojo.Schema arrowSchema =
           LanceSchemaUtil.icebergToArrow(
-              writeSchema, LanceSchemaUtil.encodingMetadata(config));
+              writeSchema, LanceSchemaUtil.encodingMetadata(config), true);
 
       Function<D, Map<String, Object>> recordConverter;
       if (content == FileContent.POSITION_DELETES) {
@@ -395,7 +395,7 @@ public class LanceFormatModel<D, S>
         projectedColumns = LanceSchemaUtil.columnNames(fileSchema);
         arrowSchema =
             LanceSchemaUtil.icebergToArrow(
-                fileSchema, LanceSchemaUtil.encodingMetadata(config));
+                fileSchema, LanceSchemaUtil.encodingMetadata(config), false);
       }
 
       final List<String> columns = projectedColumns;

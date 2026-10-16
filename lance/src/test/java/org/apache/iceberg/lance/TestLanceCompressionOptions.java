@@ -180,7 +180,14 @@ class TestLanceCompressionOptions {
       }
     }
 
-    long plain = writeThroughModel(model, schema, values, rows, java.util.Collections.emptyMap());
+    long byDefault = writeThroughModel(model, schema, values, rows, java.util.Collections.emptyMap());
+    long plain =
+        writeThroughModel(
+            model,
+            schema,
+            values,
+            rows,
+            ImmutableMap.of("lance.encoding.compression", "none"));
     long zstd =
         writeThroughModel(
             model, schema, values, rows, ImmutableMap.of("lance.encoding.compression", "zstd"));
@@ -190,7 +197,8 @@ class TestLanceCompressionOptions {
 
     long valuesTotal = (long) rows * DIM;
     System.out.printf("rows=%d dim=%d values=%d%n", rows, DIM, valuesTotal);
-    System.out.printf("model float32 plain      %9d bytes  %.3f B/value%n", plain, plain * 1.0 / valuesTotal);
+    System.out.printf("model float32 default    %9d bytes  %.3f B/value%n", byDefault, byDefault * 1.0 / valuesTotal);
+    System.out.printf("model float32 compression=none %9d bytes  %.3f B/value%n", plain, plain * 1.0 / valuesTotal);
     System.out.printf("model float32 + zstd     %9d bytes  %.3f B/value%n", zstd, zstd * 1.0 / valuesTotal);
     System.out.printf("model float32 + lz4      %9d bytes  %.3f B/value%n", lz4, lz4 * 1.0 / valuesTotal);
   }
