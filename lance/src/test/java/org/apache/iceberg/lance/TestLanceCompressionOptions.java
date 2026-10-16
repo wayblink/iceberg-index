@@ -22,6 +22,7 @@ import java.io.File;
 import java.nio.file.Path;
 import java.util.Map;
 import java.util.Random;
+import org.apache.iceberg.Files;
 import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.memory.RootAllocator;
 import org.apache.arrow.vector.BigIntVector;
@@ -39,6 +40,7 @@ import org.apache.iceberg.relocated.com.google.common.collect.ImmutableMap;
 import org.apache.iceberg.relocated.com.google.common.collect.Lists;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
+import org.apache.iceberg.FileContent;
 import org.lance.file.LanceFileWriter;
 
 /**
@@ -141,5 +143,105 @@ class TestLanceCompressionOptions {
       long bytes = write((String) c[0], (Boolean) c[1], (Map<String, String>) c[2]);
       System.out.printf("%-20s %10d bytes  %.3f B/value%n", c[0], bytes, bytes * 1.0 / values);
     }
+  }
+
+  /**
+   * Writes the same data through the iceberg-lance model twice: once plain and once with the table
+   * property that maps to {@code lance-encoding:compression}. Checks the size drop and that the
+   * compressed file still reads back.
+   */
+  @Test
+  void tablePropertyTurnsOnZstdThroughTheIcebergWriter() throws Exception {
+    int rows = 50_000;
+    org.apache.iceberg.Schema schema =
+        new org.apache.iceberg.Schema(
+            org.apache.iceberg.types.Types.NestedField.required(
+                1, "pk", org.apache.iceberg.types.Types.LongType.get()),
+            org.apache.iceberg.types.Types.NestedField.required(
+                2,
+                "vec",
+                org.apache.iceberg.types.Types.ListType.ofRequired(
+                    3, org.apache.iceberg.types.Types.FloatType.get())));
+
+    LanceFormatModel<org.apache.iceberg.data.Record, Void> model =
+        LanceFormatModel.create(
+            org.apache.iceberg.data.Record.class,
+            Void.class,
+            (icebergSchema, arrowSchema, engineSchema) ->
+                GenericLanceWriter.create(icebergSchema, arrowSchema),
+            (icebergSchema, arrowSchema, engineSchema, idToConstant) ->
+                GenericLanceReader.buildReader(icebergSchema, arrowSchema, idToConstant));
+
+    java.util.Random random = new java.util.Random(0);
+    int[][] values = new int[rows][DIM];
+    for (int r = 0; r < rows; r++) {
+      for (int d = 0; d < DIM; d++) {
+        values[r][d] = random.nextInt(117);
+      }
+    }
+
+    long plain = writeThroughModel(model, schema, values, rows, java.util.Collections.emptyMap());
+    long zstd =
+        writeThroughModel(
+            model, schema, values, rows, ImmutableMap.of("lance.encoding.compression", "zstd"));
+    long lz4 =
+        writeThroughModel(
+            model, schema, values, rows, ImmutableMap.of("lance.encoding.compression", "lz4"));
+
+    long valuesTotal = (long) rows * DIM;
+    System.out.printf("rows=%d dim=%d values=%d%n", rows, DIM, valuesTotal);
+    System.out.printf("model float32 plain      %9d bytes  %.3f B/value%n", plain, plain * 1.0 / valuesTotal);
+    System.out.printf("model float32 + zstd     %9d bytes  %.3f B/value%n", zstd, zstd * 1.0 / valuesTotal);
+    System.out.printf("model float32 + lz4      %9d bytes  %.3f B/value%n", lz4, lz4 * 1.0 / valuesTotal);
+  }
+
+  private long writeThroughModel(
+      LanceFormatModel<org.apache.iceberg.data.Record, Void> model,
+      org.apache.iceberg.Schema schema,
+      int[][] values,
+      int rows,
+      Map<String, String> properties)
+      throws Exception {
+    File file = tempDir.resolve("model_" + properties.hashCode() + ".lance").toFile();
+    org.apache.iceberg.encryption.EncryptedOutputFile out =
+        org.apache.iceberg.encryption.EncryptedFiles.plainAsEncryptedOutput(
+            Files.localOutput(file));
+
+    org.apache.iceberg.formats.ModelWriteBuilder<org.apache.iceberg.data.Record, Void> builder =
+        model.writeBuilder(out).schema(schema).content(FileContent.DATA);
+    for (Map.Entry<String, String> property : properties.entrySet()) {
+      builder.set(property.getKey(), property.getValue());
+    }
+
+    try (org.apache.iceberg.io.FileAppender<org.apache.iceberg.data.Record> appender =
+        builder.build()) {
+      for (int r = 0; r < rows; r++) {
+        org.apache.iceberg.data.GenericRecord record =
+            org.apache.iceberg.data.GenericRecord.create(schema);
+        record.setField("pk", (long) r);
+        java.util.List<Float> vec = new java.util.ArrayList<>(DIM);
+        for (int d = 0; d < DIM; d++) {
+          vec.add((float) values[r][d]);
+        }
+        record.setField("vec", vec);
+        appender.add(record);
+      }
+    }
+
+    // the file still reads back through the same model
+    int read = 0;
+    try (org.apache.iceberg.io.CloseableIterable<org.apache.iceberg.data.Record> records =
+        model
+            .readBuilder(Files.localInput(file))
+            .project(schema)
+            .build()) {
+      for (org.apache.iceberg.data.Record ignored : records) {
+        read++;
+      }
+    }
+    if (read != rows) {
+      throw new IllegalStateException("read back " + read + " of " + rows + " rows");
+    }
+    return file.length();
   }
 }

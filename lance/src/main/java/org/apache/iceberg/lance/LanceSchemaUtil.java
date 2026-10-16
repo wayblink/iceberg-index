@@ -44,13 +44,53 @@ public class LanceSchemaUtil {
   static final String ICEBERG_FIELD_ID = "PARQUET:field_id";
   static final String ICEBERG_SCHEMA_KEY = "iceberg.schema";
 
+  /** Prefix of the table properties that configure Lance's per-column encoding. */
+  public static final String ENCODING_PROPERTY_PREFIX = "lance.encoding.";
+
+  /** Prefix of the Arrow field metadata keys the Lance encoder reads. */
+  public static final String ENCODING_METADATA_PREFIX = "lance-encoding:";
+
+  /**
+   * Maps table properties like {@code lance.encoding.compression=zstd} to the Arrow field metadata
+   * keys the Lance encoder reads ({@code lance-encoding:compression}).
+   */
+  public static Map<String, String> encodingMetadata(Map<String, String> properties) {
+    Map<String, String> metadata = Maps.newLinkedHashMap();
+    for (Map.Entry<String, String> property : properties.entrySet()) {
+      if (property.getKey().startsWith(ENCODING_PROPERTY_PREFIX)) {
+        metadata.put(
+            ENCODING_METADATA_PREFIX
+                + property.getKey().substring(ENCODING_PROPERTY_PREFIX.length()),
+            property.getValue());
+      }
+    }
+    return metadata;
+  }
+
   private LanceSchemaUtil() {}
 
   /** Convert an Iceberg schema to an Arrow schema, preserving field IDs in metadata. */
   public static Schema icebergToArrow(org.apache.iceberg.Schema icebergSchema) {
+    return icebergToArrow(icebergSchema, java.util.Collections.emptyMap());
+  }
+
+  /**
+   * Convert an Iceberg schema to an Arrow schema, preserving field IDs in metadata and attaching
+   * Lance encoding configuration to the leaf fields.
+   *
+   * <p>Lance reads its per-column encoding settings (compression, RLE threshold, dictionary
+   * thresholds) from Arrow field metadata, so a table property can enable them for the columns that
+   * carry the data - a vector column, say.
+   *
+   * @param icebergSchema the Iceberg schema to convert
+   * @param leafMetadata metadata keys to attach to every leaf field, e.g. {@code
+   *     lance-encoding:compression}
+   */
+  public static Schema icebergToArrow(
+      org.apache.iceberg.Schema icebergSchema, Map<String, String> leafMetadata) {
     List<Field> fields = Lists.newArrayList();
     for (Types.NestedField column : icebergSchema.columns()) {
-      fields.add(convertField(column));
+      fields.add(convertField(column, leafMetadata));
     }
     return new Schema(fields);
   }
@@ -73,7 +113,8 @@ public class LanceSchemaUtil {
     return names;
   }
 
-  private static Field convertField(Types.NestedField icebergField) {
+  private static Field convertField(
+      Types.NestedField icebergField, Map<String, String> leafMetadata) {
     Map<String, String> metadata = Maps.newHashMap();
     metadata.put(ICEBERG_FIELD_ID, String.valueOf(icebergField.fieldId()));
 
@@ -82,16 +123,16 @@ public class LanceSchemaUtil {
 
     if (icebergField.type().isStructType()) {
       for (Types.NestedField child : icebergField.type().asStructType().fields()) {
-        children.add(convertField(child));
+        children.add(convertField(child, leafMetadata));
       }
     } else if (icebergField.type().isListType()) {
       Types.ListType listType = icebergField.type().asListType();
       Types.NestedField elementField = listType.fields().get(0);
-      children.add(convertField(elementField));
+      children.add(convertField(elementField, leafMetadata));
     } else if (icebergField.type().isMapType()) {
       Types.MapType mapType = icebergField.type().asMapType();
-      Field keyField = convertField(mapType.fields().get(0));
-      Field valueField = convertField(mapType.fields().get(1));
+      Field keyField = convertField(mapType.fields().get(0), leafMetadata);
+      Field valueField = convertField(mapType.fields().get(1), leafMetadata);
       List<Field> entryChildren = Lists.newArrayList();
       entryChildren.add(keyField);
       entryChildren.add(valueField);
@@ -99,6 +140,11 @@ public class LanceSchemaUtil {
           new Field(
               "entries", new FieldType(false, ArrowType.Struct.INSTANCE, null), entryChildren);
       children.add(entriesField);
+    }
+
+    if (children.isEmpty()) {
+      // a leaf field holds the values Lance encodes, so its encoding settings live here
+      metadata.putAll(leafMetadata);
     }
 
     return new Field(

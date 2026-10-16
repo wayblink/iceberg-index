@@ -325,3 +325,36 @@ topId=12345 sameResults=true
 6. **接入成本**：`LanceSchemaUtil.convertField` 目前只写 `ICEBERG_FIELD_ID`；要把 Iceberg 侧属性（例如表属性 `lance.encoding.compression=zstd`）映射到 list element 的 field metadata，改动很小（写入路径的 `ModelWriteBuilder.set()` 已经能把 writer 属性带进来）。
 
 **下一步该测的**：把"体积"和"回表耗时"一起测（zstd/lz4 会在刚快 2x 的回表路径上加解压 CPU）——建议用 SIFT1M 在集群上跑 `float32+plain` / `float32+zstd` / `float32+lz4` / `int32` 四组。
+
+### 10.5 为什么 Lance 的字典编码排除了 32 位？（官方理由，2025-10-20 issue #5004）
+
+维护者原文（issue #5004，至今 open）：
+
+> 目前 2.1 的字典编码只覆盖部分 128 位定宽类型。我认为这是几件事叠加：
+> * 当时我们**还没有对字典索引做 bit-packing**，所以把字典编码用于更小的类型不太可能有收益；
+> * 在**所有列上估计 cardinality 太贵**；
+> * TPC-H 数据有大量 128 位 decimal 能从字典编码受益，因此专注 128 位有**被夸大且不真实**的 benchmark 收益。
+> 不过我们至少应该考虑 64 位、甚至 32 位类型。
+
+逐条对上代码：
+
+1. **索引没 bit-pack 之前，窄类型做了不划算**：索引常量 `DICT_INDICES_BITS_PER_VALUE = 32`，若索引固定 4 字节，4 字节的值变成「4 字节索引 + 字典」= 不省甚至更差；只有 128 位大值划算。
+2. **cardinality 估计太贵** → 代码在**估计阶段直接跳过**（不是评估后放弃）：
+   ```rust
+   let bytes_per_value = match fixed_block.bits_per_value { 64 => 8, 128 => 16, _ => return None };
+   ```
+   低基数 float32 列连被评估的机会都没有。
+3. **benchmark 数据偏置**：TPC-H 的 128 位 decimal 让首版只做 128 位。
+
+演进（都是"逐代加"，非"永久排除"）：
+
+| 时间 | 事件 |
+|---|---|
+| 2025-09-25 | #4813 支持已是字典数组的数据（2.1） |
+| 2025-10-20 | **#5004 open：允许字典编码支持更多定宽类型**（"至少 64 位，也许 32 位"） |
+| 2026-01-01 | **#5594 加 64 位字典（int64/double）**，随**格式 2.2** 落地；PR 表格里直接拿 Parquet 做对照 |
+| 2026-01-28 | #5011 索引统一 32 位；#5055 不划算就中止字典 |
+| 2026-02-25 | #5891 用字典条目/编码尺寸替代 cardinality 决策 |
+| 今天的主线 | `64|128` 之外仍 `return None` → **32 位仍未实现** |
+
+**结论**：32 位（`array<float>`）不是设计性排除，而是历史范围遗留；已在 #5004 挂着，但 open 近一年且落地要新格式版本号 → 不要等。2.1 下仍是：整数 bitpacking 1.05 / float32+zstd 1.33 / float32+lz4 1.78（parquet 字典 0.73）。Lance 官方自己也拿 Parquet 当压缩对标（#5594），说明这是他们已知短板。
