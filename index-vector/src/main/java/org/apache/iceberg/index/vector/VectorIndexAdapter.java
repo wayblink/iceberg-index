@@ -20,6 +20,7 @@ package org.apache.iceberg.index.vector;
 
 import com.github.jelmerk.knn.DistanceFunction;
 import com.github.jelmerk.knn.Item;
+import com.github.jelmerk.knn.ProgressListener;
 import com.github.jelmerk.knn.SearchResult;
 import com.github.jelmerk.knn.hnsw.HnswIndex;
 import java.io.ByteArrayInputStream;
@@ -64,6 +65,16 @@ public final class VectorIndexAdapter implements IndexAdapter, java.io.Serializa
 
   /** Blob type of auxiliary HNSW index files. */
   public static final String AUXILIARY_BLOB_TYPE = "iceberg-vector-hnsw-v1";
+
+  /**
+   * Building an index hands the library a listener to call as the work proceeds. There is nothing
+   * to report here, and the library takes the remainder of the completed count and the interval to
+   * decide when to call it, so the interval is one the remainder never reaches rather than zero,
+   * which the library would divide by.
+   */
+  private static final ProgressListener NO_PROGRESS = (workDone, max) -> {};
+
+  private static final int NEVER_REPORT_PROGRESS = Integer.MAX_VALUE;
 
   private static final int VALUE_FORMAT_VERSION = 1;
   private static final int ENTRIES_FORMAT_VERSION = 2;
@@ -242,7 +253,13 @@ public final class VectorIndexAdapter implements IndexAdapter, java.io.Serializa
 
   @Override
   public ByteBuffer encodeAuxiliaryPayload(List<IndexEntry> entries) {
+    return encodeAuxiliaryPayload(entries, 1);
+  }
+
+  @Override
+  public ByteBuffer encodeAuxiliaryPayload(List<IndexEntry> entries, int parallelism) {
     Preconditions.checkNotNull(entries, "Index entries are null");
+    Preconditions.checkArgument(parallelism >= 1, "Parallelism must be at least one");
     List<IndexEntry> materialized = Lists.newArrayList(entries);
     HnswIndex<Long, float[], VectorItem, Float> index =
         HnswIndex.newBuilder(definition.dimension(), distanceFunction(), materialized.size())
@@ -250,9 +267,28 @@ public final class VectorIndexAdapter implements IndexAdapter, java.io.Serializa
             .withEfConstruction(definition.efConstruction())
             .withEf(definition.efSearch())
             .build();
+
+    List<VectorItem> items = Lists.newArrayListWithCapacity(materialized.size());
     for (int i = 0; i < materialized.size(); i++) {
-      float[] vector = decodeVector(materialized.get(i).payload(), "Entry");
-      index.add(new VectorItem((long) i, vector));
+      items.add(new VectorItem((long) i, decodeVector(materialized.get(i).payload(), "Entry")));
+    }
+
+    // inserting the items one at a time only ever uses one core, and building the graph is the
+    // expensive part of a build, so a caller that has more cores to give gets a thread pool here.
+    // One thread stays on this path so that a single threaded build produces the same graph it
+    // always did.
+    int threads = Math.max(1, Math.min(parallelism, items.size()));
+    if (threads > 1) {
+      try {
+        index.addAll(items, threads, NO_PROGRESS, NEVER_REPORT_PROGRESS);
+      } catch (InterruptedException e) {
+        Thread.currentThread().interrupt();
+        throw new RuntimeException("Interrupted while building the HNSW index", e);
+      }
+    } else {
+      for (VectorItem item : items) {
+        index.add(item);
+      }
     }
 
     ByteArrayOutputStream graph = new ByteArrayOutputStream();

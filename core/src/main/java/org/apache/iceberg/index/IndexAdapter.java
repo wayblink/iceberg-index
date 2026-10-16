@@ -188,6 +188,22 @@ public interface IndexAdapter {
   }
 
   /**
+   * Encodes entries into the payload of an auxiliary index file, using up to {@code parallelism}
+   * threads.
+   *
+   * <p>Building one of these payloads is usually the expensive part of a build, and whether it can
+   * use more than one core is a property of the engine rather than of the index type: a task has to
+   * know how many cores it was given. The engine therefore passes that number in, and an index type
+   * that can split the work may use it. The default ignores the hint.
+   *
+   * @param entries the entries the payload holds
+   * @param parallelism how many threads the caller may use; at least one
+   */
+  default ByteBuffer encodeAuxiliaryPayload(List<IndexEntry> entries, int parallelism) {
+    return encodeAuxiliaryPayload(entries);
+  }
+
+  /**
    * Returns the top-k results for an encoded query over the entries in one auxiliary payload.
    *
    * @param payload the encoded auxiliary content of a single index file

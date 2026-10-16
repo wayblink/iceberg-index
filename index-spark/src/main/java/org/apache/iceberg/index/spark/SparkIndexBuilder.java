@@ -299,6 +299,10 @@ public final class SparkIndexBuilder {
       return Lists.newArrayList();
     }
 
+    // how many cores the task writing an index file was given, which is what it may use to build
+    // the graph. One, unless the engine was told otherwise through spark.task.cpus
+    int buildThreads = spark.sparkContext().getConf().getInt("spark.task.cpus", 1);
+
     List<Row> indexFileRows =
         allRows
             .mapPartitionsWithIndex(
@@ -328,7 +332,7 @@ public final class SparkIndexBuilder {
                   IndexFile.Kind kind;
                   if (writesAuxiliary) {
                     blobType = adapter.auxiliaryBlobType();
-                    payload = adapter.encodeAuxiliaryPayload(groupEntries).array();
+                    payload = adapter.encodeAuxiliaryPayload(groupEntries, buildThreads).array();
                     kind = IndexFile.Kind.AUXILIARY;
                   } else {
                     blobType = adapter.entryBlobType();
