@@ -268,6 +268,7 @@ topId=12345 sameResults=true
        if fixed.bits_per_value != 64 && fixed.bits_per_value != 128 { return None; }
    ```
    → `array<float>` 是 32 位，**永远不会被字典编码**（无论门限怎么调）。32 位浮点能用的只有 plain / BSS / lz4-zstd。
+   而且 64 位值那条路要 **文件格式 ≥ 2.2**，而 2.2 在规范里标注为 **unstable**（见下），默认/稳定版是 2.1 → 生产上等于拿不到字典编码。
 
 **实测（同 200k×128、取值 0..116，本地 lance 模块 `TestLanceEncodingSizes`）**：
 
@@ -281,3 +282,22 @@ topId=12345 sameResults=true
 **对我们的意义**：SIFT 描述子本来就是 0..255 的整数，存成 `array<int>`（或 tinyint）语义更正确、体积直接降 3.86x，而且**我们现有的写入路径已经支持**（`LanceArrowConverter` 的 LIST 分支已支持 INTEGER 元素）。进一步可用 `lance-encoding:compression=zstd` + BSS 缩小剩余差距——但需要把 Iceberg 列属性映射成 Arrow field metadata（`LanceSchemaUtil` 目前只写 `ICEBERG_FIELD_ID`，Java SDK 的 `WriteParams` 本身没有编码开关）。
 
 **待验证**：① 索引/改写路径是否接受 `array<int>` 向量列（适配器把 `Number` 转 float，可能只差一个类型校验）；② 开压缩后回表耗时的净变化（压缩省空间但加解压 CPU）。
+
+
+### 10.3 版本速查（2026-10-15 核对）
+
+**文件（编码）格式版本**（`rust/lance-encoding/src/version.rs` + `docs/src/format/file/versioning.md`）：
+
+| 版本 | 状态 |
+|---|---|
+| 0.1 | legacy，已不能写 |
+| 2.0 | 稳定 |
+| **2.1** | **默认 / 最新稳定**（`#[default] V2_1`，`stable` 别名解析到它） |
+| 2.2 | **unstable**（文档标注；64 位值的字典编码、map 支持等从这代开始） |
+| **2.3** | **最新，但不稳定**，只能经 `next` 别名使用（文档警告不可用于生产） |
+
+**软件版本**：我们 fork 的 crate = `5.0.0-beta.6`；crates.io `lance` 最新 = **13.0.0**；Maven Central `org.lance:lance-core` 最新 = **14.0.0-beta.18**（2026-10-15 更新，Java 侧版本线独立）。
+
+**表（dataset/table）格式**：无单一数字版本，用 feature flags（`FLAG_DELETION_FILES` / `FLAG_STABLE_ROW_IDS` / `FLAG_TABLE_CONFIG` / `FLAG_BASE_PATHS`；≥32 的未知位会被拒绝）。
+
+**对我们的意义**：① 我们写出的文件是默认 **2.1**，bitpacking 在这代就生效（所以"整数列"方案可用）；② 字典编码要 2.2（unstable）或变长数据，生产不可依赖；③ Java SDK 5.0.0-beta.6 与上游 14.0.0-beta.18 差距很大，升级要连带 rebase 公司 HDFS 补丁——这是"跟随上游"的真实成本。

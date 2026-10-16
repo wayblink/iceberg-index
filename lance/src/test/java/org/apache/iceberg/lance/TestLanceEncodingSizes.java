@@ -52,13 +52,16 @@ class TestLanceEncodingSizes {
             GenericLanceReader.buildReader(icebergSchema, arrowSchema, idToConstant));
   }
 
-  private long write(Types.NestedField vectorField, java.util.function.IntFunction<Object> vectorOf)
+  private long write(
+      Types.NestedField vectorField,
+      java.util.function.IntFunction<Object> vectorOf,
+      String label)
       throws IOException {
     Schema schema =
         new Schema(
             Types.NestedField.required(1, "pk", Types.LongType.get()), vectorField);
     LanceFormatModel<Record, Void> model = model();
-    File file = tempDir.resolve(vectorField.name() + "." + vectorField.type() + ".lance").toFile();
+    File file = tempDir.resolve("vec_" + label + ".lance").toFile();
     EncryptedOutputFile out = EncryptedFiles.plainAsEncryptedOutput(Files.localOutput(file));
 
     Random random = new Random(0);
@@ -83,38 +86,46 @@ class TestLanceEncodingSizes {
         values[row][d] = random.nextInt(117); // SIFT-like 0..116
       }
     }
-
-    long float32 =
-        write(
-            Types.NestedField.required(
-                2, "vec", Types.ListType.ofRequired(3, Types.FloatType.get())),
-            row -> {
-              List<Float> out = new java.util.ArrayList<>(DIM);
-              for (int v : values[row]) {
-                out.add((float) v);
-              }
-              return out;
-            });
-
-    long int32 =
-        write(
-            Types.NestedField.required(
-                2, "vec", Types.ListType.ofRequired(3, Types.IntegerType.get())),
-            row -> {
-              List<Integer> out = new java.util.ArrayList<>(DIM);
-              for (int v : values[row]) {
-                out.add(v);
-              }
-              return out;
-            });
-
     long valuesTotal = (long) ROWS * DIM;
-    System.out.printf(
-        "rows=%d dim=%d values=%d%n", ROWS, DIM, valuesTotal);
-    System.out.printf(
-        "float32 list: %d bytes  (%.3f B/value)%n", float32, float32 * 1.0 / valuesTotal);
-    System.out.printf(
-        "int32   list: %d bytes  (%.3f B/value)%n", int32, int32 * 1.0 / valuesTotal);
-    System.out.printf("int vs float ratio: %.2fx%n", int32 * 1.0 / float32);
+    System.out.printf("rows=%d dim=%d values=%d%n", ROWS, DIM, valuesTotal);
+
+    org.apache.iceberg.types.Type[] types = {
+      Types.FloatType.get(),
+      Types.IntegerType.get(),
+      Types.LongType.get(),
+      Types.DoubleType.get(),
+      Types.IntegerType.get(), // second int run: same type, checks stability
+    };
+    String[] names = {"float32", "int32", "int64", "float64", "int32-again"};
+
+    for (int t = 0; t < types.length; t++) {
+      org.apache.iceberg.types.Type type = types[t];
+      long bytes =
+          write(
+              Types.NestedField.required(2, "vec", Types.ListType.ofRequired(3, type)),
+              row -> {
+                java.util.List<Object> out = new java.util.ArrayList<>(DIM);
+                for (int v : values[row]) {
+                  switch (type.typeId()) {
+                    case FLOAT:
+                      out.add((float) v);
+                      break;
+                    case DOUBLE:
+                      out.add((double) v);
+                      break;
+                    case LONG:
+                      out.add((long) v);
+                      break;
+                    default:
+                      out.add(v);
+                      break;
+                  }
+                }
+                return out;
+              },
+              names[t]);
+      System.out.printf(
+          "%-11s %-14s %10d bytes  %.3f B/value%n", names[t], type, bytes, bytes * 1.0 / valuesTotal);
+    }
   }
 }
