@@ -301,3 +301,27 @@ topId=12345 sameResults=true
 **表（dataset/table）格式**：无单一数字版本，用 feature flags（`FLAG_DELETION_FILES` / `FLAG_STABLE_ROW_IDS` / `FLAG_TABLE_CONFIG` / `FLAG_BASE_PATHS`；≥32 的未知位会被拒绝）。
 
 **对我们的意义**：① 我们写出的文件是默认 **2.1**，bitpacking 在这代就生效（所以"整数列"方案可用）；② 字典编码要 2.2（unstable）或变长数据，生产不可依赖；③ Java SDK 5.0.0-beta.6 与上游 14.0.0-beta.18 差距很大，升级要连带 rebase 公司 HDFS 补丁——这是"跟随上游"的真实成本。
+
+### 10.4 2.1（当前稳定版）下 SIFT 向量列的压缩配方（实测）
+
+同一批数据（200k×128、值 0..116），全部用默认的 2.1 格式，本地 lance 模块 `TestLanceCompressionOptions` / `TestLanceEncodingSizes` 实测：
+
+| 手段 | B/value | 相对 float32 原始 | 需要配置 |
+|---|---|---|---|
+| `array<float>` plain（我们现状） | 4.050 | 1.00x | — |
+| **`array<int>` plain**（bitpacking） | **1.050** | **3.86x** | 无（换列类型即可） |
+| **`array<float>` + `compression=zstd`**（level 9） | **1.326** | **3.05x** | 需写 field metadata |
+| `array<float>` + `compression=lz4` | 1.776 | 2.28x | 同上 |
+| `array<int>` + zstd（叠加） | 1.086 | 3.73x | 同上，**反而更大** |
+| 参考：parquet（默认 snappy+字典） | 0.74–0.91 | 4.4–5.5x | — |
+
+要点：
+
+1. **通用压缩默认是关的**，打开就有 3x——这是"2.1 已经支持、我们没用"的那块能力。配置键写在 **Arrow field metadata**（编码器只从 field metadata 读，`compression` 没有环境变量回退）：`lance-encoding:compression=zstd`、`lance-encoding:compression-level=9`、`lance-encoding:general=on`。`bss=on` 在 zstd 之上没有额外收益（实测 1.326 → 1.326）。
+2. **整数列（bitpacking）比 zstd 更好且零配置**（1.05 vs 1.33），但会改列类型（`array<float>` → `array<int>`），需要确认索引/改写路径接受整数向量列。
+3. **两者不要叠加**：bitpacking 之后再 zstd 只会变大（1.050 → 1.086）。
+4. **lz4 是速度折中**：1.776 B/value（仍比原始小 2.3x），解压比 zstd 快，适合"回表延迟敏感"的场景。
+5. 想再往下只能靠**语义量化**（4-bit 码 → ~0.5 B/value、1-bit 码 → ~0.125 B/value + 码本），这是检索精度/体积的权衡，不属于格式能力。
+6. **接入成本**：`LanceSchemaUtil.convertField` 目前只写 `ICEBERG_FIELD_ID`；要把 Iceberg 侧属性（例如表属性 `lance.encoding.compression=zstd`）映射到 list element 的 field metadata，改动很小（写入路径的 `ModelWriteBuilder.set()` 已经能把 writer 属性带进来）。
+
+**下一步该测的**：把"体积"和"回表耗时"一起测（zstd/lz4 会在刚快 2x 的回表路径上加解压 CPU）——建议用 SIFT1M 在集群上跑 `float32+plain` / `float32+zstd` / `float32+lz4` / `int32` 四组。
