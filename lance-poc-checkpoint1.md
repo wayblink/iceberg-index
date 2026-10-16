@@ -358,3 +358,29 @@ topId=12345 sameResults=true
 | 今天的主线 | `64|128` 之外仍 `return None` → **32 位仍未实现** |
 
 **结论**：32 位（`array<float>`）不是设计性排除，而是历史范围遗留；已在 #5004 挂着，但 open 近一年且落地要新格式版本号 → 不要等。2.1 下仍是：整数 bitpacking 1.05 / float32+zstd 1.33 / float32+lz4 1.78（parquet 字典 0.73）。Lance 官方自己也拿 Parquet 当压缩对标（#5594），说明这是他们已知短板。
+
+---
+
+## 11. 四组编码对照（集群 SIFT1M，体积 + 回表耗时）—— #1123
+
+做法：把 `sift1m_base` 的 100 万行分别写成 4 张 Lance-backed Iceberg 表（同数据、同 HNSW EXACT→**HNSW** 索引、同查询），表属性经 Iceberg `setAll(table.properties())` → `ModelWriteBuilder.set()` → Arrow field metadata 生效（本次为此在 `LanceSchemaUtil` 加了 `lance.encoding.*` 映射）。
+
+| 表 | 列类型 | 编码 | 数据字节 | B/value | 查询 ms（run0/1/2） | 回表所在段（TIMING search+resolve，稳态） |
+|---|---|---|---|---|---|---|
+| `sift1m_lance_f32_plain` | `array<float>` | 无（默认） | 518,694,619 | 4.052 | 3535 / 2233 / **1654** | 1704 ms |
+| `sift1m_lance_f32_zstd` | `array<float>` | **zstd(9)** | 164,106,419 | **1.282** | 2974 / 3201 / **1657** | 1499–1704 ms |
+| `sift1m_lance_f32_lz4` | `array<float>` | lz4 | 238,501,821 | 1.863 | 3562 / 2081 / 1705 | 1704 ms |
+| `sift1m_lance_i32_plain` | `array<int>` | bitpacking | **149,054,917** | **1.164** | 1919 / 1599 / **1623** | **1466–1499 ms** |
+| （参考）parquet `sift1m_base` | `array<float>` | 字典+snappy | 94,386,159 | 0.734 | 3317 / 3689 | 3281 ms |
+
+- 四组的 top-10 pk **完全相同**（recall 等价）。
+- 与无索引全扫（~17.7s 基线）相比都在 1.6–1.7s 量级，说明**改写确实命中索引**（i32 组也有 TIMING 输出 → `array<int>` 向量列在索引+改写路径上可用）。
+
+结论：
+
+1. **表属性开 zstd 是"免费"的 3.16x**：4.052 → 1.282 B/value，稳态查询耗时与不压缩**没有可测差异**（1657 vs 1654 ms）。在这个规模上解压成本被并行与 IO 等待吸收。
+2. **整数列 bitpacking 最优**：1.164 B/value（3.48x），且稳定态最快（1623 ms）——代价是列类型变成 `array<int>`（只适用于本身就量化的向量，如 SIFT；一般 embedding 不适用）。
+3. **lz4 不值得**：1.863 B/value 且没有比 zstd 更快（1705 ms）→ 在这份数据上被 zstd 支配。
+4. **对 parquet 的差距从 5.5x 收到 1.6–1.8x**（0.734 是 parquet 字典的极限）。要追平/反超只剩两条：语义量化（4-bit ≈ 0.5 B/value）或等 2.2 的 64 位字典转正（见 §10.3/§10.5）。
+
+**建议（B2b 存储记账）**：默认给向量列开 `lance.encoding.compression=zstd`（对任意 float embedding 通用、零延迟代价）；对量化/字节值向量优先存 `array<int>`（更小更快）。两者叠加无收益（§10.4 已实测）。
