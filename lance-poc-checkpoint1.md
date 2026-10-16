@@ -551,3 +551,29 @@ Map<String, Map<Long, String>> rowsByFile =
 4. 顺序：**先缓存/批处理 → 再量化 → 最后才是回表格式（Lance）**。格式问题在 10M 上只影响那条 15% 的支路，且其中一半是框架开销。
 
 （注：本表绝对数比 §13.3 那轮大（同表 11.6–13.5 s），因为集群当时有生产负载；**占比比绝对值更可信**。）
+
+---
+
+## 15. 批索引摊销落地（#1203）：10M 上每 query 22.3 s → 266 ms
+
+实现（commit 已提交）：
+1. **core `IndexAdapter` 增加"加载一次、搜索多次"**：`PreparedSearch` + `prepareAuxiliary(payload)`（图）与 `prepare(payload)`（entries），默认实现按原样每次解码 → 其它索引类型不受影响。
+2. **`VectorIndexAdapter` 实现两者**：HNSW 图 / entries 解析与 `HnswIndex.load` 只做一次，返回的 searcher 只做 `findNearest` + 精确重打分。
+3. **`DistributedIndexSearch.searchBatch`**：每索引文件一个 partition，**`readPayload` 一次 + `prepare` 一次**，task 内对所有 query 打分 → 输出 (queryId, hit)，再用有界累加器（map 端先合并）按 queryId 归并 top-k。
+4. **`IndexSearch.search` 改走 batch**；**`system.vector_search_batch` 增加查询表入口**（`query_table` / `query_id_column` / `vector_column`，仍需必填参数在前）。
+5. 测试：`TestVectorIndexSearchBatch` 12/12（含查询表用例：与内联写法逐行一致）、`TestRewriteVectorSearch` 12/12、`TestIndexTableFunctions` 6/6；适配器新增两个用例**"prepare 后把 payload 覆写为 0，再搜索两次仍返回同样结果"** —— 证明 payload 不会被再次读取。
+
+集群实测（`sift10m_lance_zstd`，10M 行，同一 job 内先逐条再批量，镜像 `sparkann-lance-e2e:v6`）：
+
+| 路径 | 每条 query | 说明 |
+|---|---|---|
+| 单查询（改写路径） | 29361 / 19521 / 18078 ms，**均值 22320 ms** | 每条都完整读+解压+反序列化 38 个索引文件 |
+| **批处理 n=100** | 总 **26619 ms**，**每条 266 ms** | 返回 1000 行 = 100 × top-10 ✓ |
+| **per-query 加速比** | **83.85x** | 整批耗时 ≈ 单条查询耗时 |
+
+比 §14 模型的 6.7x 上限还高，因为批处理同时摊掉三件事（正是 §14.3 预言的三得）：**索引加载（82%）+ 每 query 的 job/task 开销 + 回表**（回表本来就整批摊销，现在其占比也随之摊薄）。剩下的 266 ms/query ≈ 搜索 ~60 ms + 回表分摊 + 归并。
+
+**结论**：
+- 批量/离线场景（评测、批量检索、`sift10m_query` 一万条）用 batch 路径，收益 ~2 个数量级；
+- 单查询/高 QPS 场景要靠**缓存（#708）**——同一件事、不同摊销尺度；
+- 这条落地后，`parquet vs Lance` 的对照应该在 **batch 模式下重测**：索引加载被摊掉后，剩下的主体是"搜索 + 回表"，而那才是 Lance 的格式优势能显出来的地方（§13.5 的结论）。
