@@ -27,6 +27,9 @@ import java.util.Map;
 import org.apache.iceberg.Table;
 import org.apache.iceberg.hadoop.HadoopTables;
 import org.apache.iceberg.index.spark.IndexEntries;
+import org.apache.iceberg.index.vector.VectorIndexAdapter;
+import org.apache.iceberg.index.vector.VectorIndexDefinition;
+import org.apache.iceberg.index.vector.VectorIndexTypes;
 import org.apache.iceberg.relocated.com.google.common.collect.Lists;
 import org.apache.iceberg.relocated.com.google.common.collect.Maps;
 import org.apache.spark.scheduler.SparkListener;
@@ -59,6 +62,11 @@ class TestIndexRowLookup {
 
   private static SparkSession spark;
   private static Path warehouseDir;
+
+  @BeforeAll
+  static void registerVectorIndexType() {
+    VectorIndexTypes.register();
+  }
 
   @BeforeAll
   static void startSpark(@TempDir Path warehouse) {
@@ -136,6 +144,106 @@ class TestIndexRowLookup {
     // per file instead used to add a job per file that read the whole file a second time, which is
     // what this bound is here to catch
     assertThat(jobs.started).as("jobs: %s", jobs.calls).isLessThanOrEqualTo(DATA_FILES + 1);
+  }
+
+  /**
+   * The positions the index records are the row ordinals in the data file, which is what a position
+   * delete refers to and what Iceberg's own {@code _pos} metadata column reports. If the two ever
+   * disagree, the index points at the wrong rows, so this compares them row for row rather than
+   * trusting that a lookup happens to return something plausible.
+   */
+  @Test
+  public void numbersTheRowsTheWayIcebergDoes() throws NoSuchTableException {
+    spark.sql(
+        "CREATE TABLE local.db.positioned (id bigint, embedding array<double>) USING iceberg");
+    for (int file = 0; file < 4; file++) {
+      spark
+          .range(ROWS_PER_FILE)
+          .select(
+              functions.col("id").plus(file * ROWS_PER_FILE).as("id"),
+              functions.array(functions.lit(1.0d), functions.lit(2.0d)).as("embedding"))
+          .repartition(1)
+          .writeTo("local.db.positioned")
+          .append();
+    }
+
+    Table table =
+        new HadoopTables(spark.sessionState().newHadoopConf())
+            .load(warehouseDir.resolve("db/positioned").toUri().toString());
+    long snapshotId = table.currentSnapshot().snapshotId();
+
+    Map<String, Map<Long, Long>> fromIceberg = Maps.newLinkedHashMap();
+    for (Row row : spark.sql("SELECT _file, _pos, id FROM local.db.positioned").collectAsList()) {
+      fromIceberg
+          .computeIfAbsent(fileName(row.getString(0)), key -> Maps.newLinkedHashMap())
+          .put(row.getLong(1), row.getLong(2));
+    }
+
+    VectorIndexAdapter adapter =
+        new VectorIndexAdapter(
+            VectorIndexDefinition.builder()
+                .fieldId(2)
+                .dimension(2)
+                .metric(VectorIndexDefinition.Metric.EUCLIDEAN)
+                .build());
+
+    Map<String, Map<Long, Long>> fromEntries = Maps.newLinkedHashMap();
+    Map<String, Collection<Long>> allPositions = Maps.newLinkedHashMap();
+    for (Row row :
+        IndexEntries.entries(spark, table, snapshotId, "embedding", adapter).collectAsList()) {
+      fromEntries.computeIfAbsent(fileName(row.getString(0)), key -> Maps.newLinkedHashMap());
+      allPositions
+          .computeIfAbsent(fileName(row.getString(0)), key -> Lists.newArrayList())
+          .add(row.getLong(1));
+    }
+
+    assertThat(fromIceberg).isNotEmpty();
+    assertThat(fromEntries.keySet()).isEqualTo(fromIceberg.keySet());
+
+    // resolving each position through the lookup has to produce the row Iceberg says is there
+    Map<String, Collection<Long>> positionsByFile = Maps.newLinkedHashMap();
+    for (String file : fromIceberg.keySet()) {
+      positionsByFile.put(fileName(file), fromIceberg.get(file).keySet());
+    }
+    Map<String, Map<Long, Row>> resolved = Maps.newLinkedHashMap();
+    for (Map.Entry<String, Map<Long, Row>> entry :
+        IndexEntries.rowsAt(
+                spark,
+                table,
+                snapshotId,
+                positionsByFileByName(IndexEntries.dataFiles(table, snapshotId), positionsByFile),
+                Lists.newArrayList("id"),
+                null)
+            .entrySet()) {
+      resolved.put(fileName(entry.getKey()), entry.getValue());
+    }
+
+    for (String file : fromIceberg.keySet()) {
+      assertThat(resolved.get(file)).as("the rows of %s", file).isNotNull();
+      for (Map.Entry<Long, Long> position : fromIceberg.get(file).entrySet()) {
+        Row row = resolved.get(file).get(position.getKey());
+        assertThat(row).as("row at %s of %s", position.getKey(), file).isNotNull();
+        assertThat(row.getLong(0))
+            .as("id at position %s of %s", position.getKey(), file)
+            .isEqualTo(position.getValue());
+      }
+    }
+  }
+
+  private static Map<String, Collection<Long>> positionsByFileByName(
+      List<String> dataFiles, Map<String, Collection<Long>> positionsByFileName) {
+    Map<String, Collection<Long>> byPath = Maps.newLinkedHashMap();
+    for (String dataFile : dataFiles) {
+      Collection<Long> positions = positionsByFileName.get(fileName(dataFile));
+      if (positions != null) {
+        byPath.put(dataFile, positions);
+      }
+    }
+    return byPath;
+  }
+
+  private static String fileName(String location) {
+    return location.substring(location.lastIndexOf('/') + 1);
   }
 
   private static class CountingJobs extends SparkListener {

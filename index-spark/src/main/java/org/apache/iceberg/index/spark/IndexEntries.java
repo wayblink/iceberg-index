@@ -316,9 +316,13 @@ public final class IndexEntries {
 
     List<String> capturedReadColumns = readColumns;
     List<String> capturedColumns = columns;
+    // a caller may hand over a collection view, such as a map's key set, which Spark cannot ship to
+    // an executor; copying it here keeps that from surfacing as a task serialization failure
+    Collection<Long> wantedPositions = positions == null ? null : Lists.newArrayList(positions);
     return data.filter(
             (Function<Tuple2<Row, Long>, Boolean>)
-                tuple -> isLive(tuple, positions, deletedPositions, equalityKeys, keyColumns))
+                tuple ->
+                    isLive(tuple, wantedPositions, deletedPositions, equalityKeys, keyColumns))
         .mapToPair(
             (PairFunction<Tuple2<Row, Long>, Long, Row>)
                 tuple ->
