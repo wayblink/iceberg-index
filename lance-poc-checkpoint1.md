@@ -384,3 +384,22 @@ topId=12345 sameResults=true
 4. **对 parquet 的差距从 5.5x 收到 1.6–1.8x**（0.734 是 parquet 字典的极限）。要追平/反超只剩两条：语义量化（4-bit ≈ 0.5 B/value）或等 2.2 的 64 位字典转正（见 §10.3/§10.5）。
 
 **建议（B2b 存储记账）**：默认给向量列开 `lance.encoding.compression=zstd`（对任意 float embedding 通用、零延迟代价）；对量化/字节值向量优先存 `array<int>`（更小更快）。两者叠加无收益（§10.4 已实测）。
+
+---
+
+## 12. 默认 zstd 落地 + 1M/10M 重建（#1137）
+
+改动：写入路径对**浮点叶子字段默认注入 zstd**（`lance-encoding:compression=zstd` + `general=on` + level 9），整数列不动（zstd 叠在 bitpacking 上只会变大），表属性可覆盖（`lance.encoding.compression=none` 关掉）。本地端到端验证：默认 1.324 B/value，`none` 4.213。
+
+集群重建（**不设任何 encoding 属性**，验证默认生效；parquet 原始表未动）：
+
+| 表 | 行数 | 文件 | 字节 | B/value | 源 parquet 字节 | 源 B/value | 倍数 |
+|---|---|---|---|---|---|---|---|
+| `sift1m_lance_zstd` | 1,000,000 | 9 | 166,168,507 | **1.298** | 94,386,159 | 0.737 | 1.76x |
+| `sift10m_lance_zstd` | 10,000,000 | 38 | 1,660,786,855 | **1.297** | 951,470,780 | 0.743 | 1.75x |
+
+- 1M 的改写查询：3680 / 2456 / **1782 ms**，top-10 pk 与 parquet 表完全相同（与 §11 的 2.07x 结论一致：parquet 侧 3317–3689ms）。
+- 10M 索引构建中（每个 task ~264s、38 partitions ≈ 30–40 min），完成后补记。
+- 保留的 parquet 对照表：`sift1m_base`、`sift10m_base`（各自已有 HNSW 索引），供后续 parquet vs Lance 对比。
+
+**命名约定（后续对比用）**：parquet 侧 `sift{1,10}m_base`；Lance 侧 `sift{1,10}m_lance_zstd`。
