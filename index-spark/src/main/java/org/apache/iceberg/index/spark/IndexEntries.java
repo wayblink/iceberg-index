@@ -23,11 +23,11 @@ import java.io.UncheckedIOException;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collection;
+import java.util.Collections;
+import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
-import java.util.Collections;
-import java.util.Iterator;
 import org.apache.iceberg.DeleteFile;
 import org.apache.iceberg.FileContent;
 import org.apache.iceberg.FileFormat;
@@ -194,15 +194,21 @@ public final class IndexEntries {
       }
     }
 
-    // one job for every file being resolved, rather than one per file: a query resolves one data
-    // file per hit, so the per-file version pays the cost of starting a job for each of them
+    // the rows of every file are unioned and read by one job, which only holds because the
+    // positions are counted as the rows stream past rather than asked of Spark per file
     JavaPairRDD<String, Tuple2<Long, Row>> rows = null;
     for (FileScanTask task : tasks) {
       String dataFile = task.file().location().toString();
       Collection<Long> positions = positionsByFile.get(dataFile);
       JavaPairRDD<String, Tuple2<Long, Row>> fileRows =
           liveRowsOf(
-              spark, table.schema(), task, columns, positions, readSchema, deletesFor(spark, tasks, table))
+                  spark,
+                  table.schema(),
+                  task,
+                  columns,
+                  positions,
+                  readSchema,
+                  deletesFor(spark, tasks, table))
               .mapToPair(
                   (PairFunction<Tuple2<Long, Row>, String, Tuple2<Long, Row>>)
                       entry -> new Tuple2<>(dataFile, entry));
@@ -262,7 +268,8 @@ public final class IndexEntries {
     SnapshotDeletes deletes = SnapshotDeletes.read(spark, tasks, table.schema());
     List<JavaRDD<Row>> perFile = Lists.newArrayList();
     for (FileScanTask task : tasks) {
-      perFile.add(liveRowsOf(spark, table.schema(), task, columns, null, readSchema, deletes).values());
+      perFile.add(
+          liveRowsOf(spark, table.schema(), task, columns, null, readSchema, deletes).values());
     }
 
     if (perFile.isEmpty()) {
@@ -309,8 +316,7 @@ public final class IndexEntries {
 
     List<String> capturedReadColumns = readColumns;
     List<String> capturedColumns = columns;
-    return data
-        .filter(
+    return data.filter(
             (Function<Tuple2<Row, Long>, Boolean>)
                 tuple -> isLive(tuple, positions, deletedPositions, equalityKeys, keyColumns))
         .mapToPair(
@@ -350,7 +356,11 @@ public final class IndexEntries {
    * read by the Lance format model rather than being handed to a parquet reader.
    */
   private static JavaPairRDD<Row, Long> positionedRows(
-      SparkSession spark, Schema tableSchema, FileScanTask task, List<String> columns, StructType readSchema) {
+      SparkSession spark,
+      Schema tableSchema,
+      FileScanTask task,
+      List<String> columns,
+      StructType readSchema) {
     String dataFile = task.file().location().toString();
     FileFormat format = task.file().format();
 
@@ -359,7 +369,15 @@ public final class IndexEntries {
           readSchema == null
               ? spark.read().parquet(dataFile)
               : spark.read().schema(readSchema).parquet(dataFile);
-      return data.toJavaRDD().zipWithIndex();
+      // The position of a row is its ordinal in the file, so it has to be counted as the rows
+      // stream past. zipWithIndex would give the same answer, but it runs a job of its own to size
+      // the partitions first, so a lookup that touches ten data files pays for ten jobs and reads
+      // each file twice. Merging to one partition first costs nothing when the file was going to
+      // be read by a single task anyway, and it is how every other format is read below.
+      return data.toJavaRDD()
+          .coalesce(1)
+          .mapPartitionsToPair(
+              (PairFlatMapFunction<Iterator<Row>, Row, Long>) rows -> new NumberedRows(rows), true);
     }
 
     Schema projection = tableSchema.select(columns.toArray(new String[0]));
@@ -372,6 +390,26 @@ public final class IndexEntries {
         .flatMapToPair(
             (PairFlatMapFunction<String, Row, Long>)
                 file -> readFileWithFormat(file, format, projection, sparkSchema, conf));
+  }
+
+  /** Pairs each row with its position, counting rows as they pass. */
+  private static final class NumberedRows implements Iterator<Tuple2<Row, Long>> {
+    private final Iterator<Row> rows;
+    private long position = 0;
+
+    NumberedRows(Iterator<Row> rows) {
+      this.rows = rows;
+    }
+
+    @Override
+    public boolean hasNext() {
+      return rows.hasNext();
+    }
+
+    @Override
+    public Tuple2<Row, Long> next() {
+      return new Tuple2<>(rows.next(), position++);
+    }
   }
 
   /** Reads every row of one data file with the format model for its format, in file order. */
@@ -408,7 +446,10 @@ public final class IndexEntries {
       Types.NestedField field = schema.columns().get(i);
       fields[i] =
           new StructField(
-              field.name(), toSparkType(field.type()), field.isOptional(), org.apache.spark.sql.types.Metadata.empty());
+              field.name(),
+              toSparkType(field.type()),
+              field.isOptional(),
+              org.apache.spark.sql.types.Metadata.empty());
     }
     return new StructType(fields);
   }
@@ -441,7 +482,8 @@ public final class IndexEntries {
       case LIST:
         return DataTypes.createArrayType(toSparkType(type.asListType().elementType()));
       default:
-        throw new UnsupportedOperationException("Unsupported column type for the index layer: " + type);
+        throw new UnsupportedOperationException(
+            "Unsupported column type for the index layer: " + type);
     }
   }
 
@@ -452,16 +494,17 @@ public final class IndexEntries {
     }
 
     switch (type.typeId()) {
-      case LIST: {
-        // Spark hands array columns to external rows as Scala sequences, which is what callers of
-        // Row.getList expect back
-        List<?> list = (List<?>) value;
-        List<Object> elements = Lists.newArrayListWithCapacity(list.size());
-        for (Object element : list) {
-          elements.add(toSparkValue(type.asListType().elementType(), element));
+      case LIST:
+        {
+          // Spark hands array columns to external rows as Scala sequences, which is what callers of
+          // Row.getList expect back
+          List<?> list = (List<?>) value;
+          List<Object> elements = Lists.newArrayListWithCapacity(list.size());
+          for (Object element : list) {
+            elements.add(toSparkValue(type.asListType().elementType(), element));
+          }
+          return scala.collection.JavaConverters.asScalaBuffer(elements);
         }
-        return scala.collection.JavaConverters.asScalaBuffer(elements);
-      }
       case DATE:
         return (int) ((java.time.LocalDate) value).toEpochDay();
       case TIME:

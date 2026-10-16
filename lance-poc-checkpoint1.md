@@ -245,3 +245,39 @@ topId=12345 sameResults=true
 - 注意**权衡**：任何压缩都会给刚变快 2x 的回表路径加解压 CPU，需要实测净收益（建议下一步就是"uint8 版 Lance 表：体积 + 查询耗时"一起测）。
 
 索引文件本身已经是 zstd 压缩过的（#575），5.5x 只关于数据文件。
+
+### 10.2 Lance 有没有 parquet 那样的编码能力？——有，但默认关着，且字典编码不覆盖 32 位值
+
+**能力清单**（`rust/lance-encoding`，规范见 `docs/src/format/file/encoding.md`）：字典编码、Bitpacking、RLE、FSST（变长）、Byte Stream Split（BSS，浮点）、Constant（全 null）、以及 general 压缩（lz4 / zstd / snappy）。配置项写在 **Arrow field metadata** 里（也可用 `LANCE_ENCODING_*` 环境变量）：
+
+| Key | 默认 | 说明 |
+|---|---|---|
+| `lance-encoding:compression` | **none** | lz4 / zstd / none，是否做通用压缩 |
+| `lance-encoding:general` | **off** | 是否应用 general 压缩 |
+| `lance-encoding:bss` | auto | 字节流切分，**只在 general 压缩开启时才生效** |
+| `lance-encoding:rle-threshold` | 0.5 | runs/values 低于它才用 RLE |
+| `lance-encoding:dict-divisor` / `dict-size-ratio` | 2 / 0.8 | 字典编码的启用门限 |
+| `lance-encoding:dict-values-compression` | lz4 | 字典值本身的压缩 |
+
+**为什么我们的列一点没吃到**：两件事叠加
+
+1. **默认不做通用压缩**（`compression=none`、`general=off`，BSS 也因此不生效）——parquet 默认却是 snappy + 字典，两边默认策略相反（Lance 偏向随机读速度）。
+2. **字典编码在代码里只覆盖 64/128 位定宽值**：`rust/lance-encoding/src/encodings/logical/primitive.rs:4884` 附近
+   ```rust
+   DataBlock::FixedWidth(fixed) => {
+       if fixed.bits_per_value != 64 && fixed.bits_per_value != 128 { return None; }
+   ```
+   → `array<float>` 是 32 位，**永远不会被字典编码**（无论门限怎么调）。32 位浮点能用的只有 plain / BSS / lz4-zstd。
+
+**实测（同 200k×128、取值 0..116，本地 lance 模块 `TestLanceEncodingSizes`）**：
+
+| 列类型 | 字节 | B/value |
+|---|---|---|
+| `array<float>` | 103,674,594 | **4.050** |
+| `array<int>` | 26,874,592 | **1.050（3.86x 小）** |
+
+整数列触发了 bitpacking（mini-block 1024 值/块、块内 7 bit）。对照 parquet 的 0.74–0.91 B/value，**把向量列存成整数后 5.5x 缩到约 1.2–1.4x**。
+
+**对我们的意义**：SIFT 描述子本来就是 0..255 的整数，存成 `array<int>`（或 tinyint）语义更正确、体积直接降 3.86x，而且**我们现有的写入路径已经支持**（`LanceArrowConverter` 的 LIST 分支已支持 INTEGER 元素）。进一步可用 `lance-encoding:compression=zstd` + BSS 缩小剩余差距——但需要把 Iceberg 列属性映射成 Arrow field metadata（`LanceSchemaUtil` 目前只写 `ICEBERG_FIELD_ID`，Java SDK 的 `WriteParams` 本身没有编码开关）。
+
+**待验证**：① 索引/改写路径是否接受 `array<int>` 向量列（适配器把 `Number` 转 float，可能只差一个类型校验）；② 开压缩后回表耗时的净变化（压缩省空间但加解压 CPU）。
