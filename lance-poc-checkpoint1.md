@@ -480,3 +480,34 @@ TIMING 计数核对：第二轮 39 条 `search+resolve` = 1M 两张表各 13 次
   2. **少加载**：量化（int8/PQ 让每 entry 从 512B 降到 64–128B，同时反序列化节点更小更快）；或懒加载/按需反序列化（只访问搜索路径上的节点）——后者要换掉 hnswlib 的 `loadIndex`，需自研图格式+访问器，工程量大但理论收益最大。
   3. **调整文件粒度**：文件越少，固定开销（任务启动、读整块）占比越低，但精度下降（实测 1M：28 细图 1.000 vs 9 粗图 0.883）——是旋钮，不是免费收益。
 - 另外别忘了 §13.3 的实测：**这些规模下全扫压缩列比索引路径还快 1.9–3.4x** —— 索引侧优化的天花板需要先和"干脆扫描"比较才知道值不值。
+
+### 13.5 批查询摊销：已有入口，但只摊了回表，没摊索引加载
+
+**已有**：`spark/v3.5/spark/src/main/java/org/apache/iceberg/spark/procedures/VectorSearchBatchProcedure.java`
+```sql
+CALL spark_catalog.system.vector_search_batch(
+  table => 'db.docs', column => 'embedding',
+  queries => array('1,3,11,...', '4,5,12,...'),   -- 每条一个逗号分隔向量
+  k => 10);
+-- 返回 (query_id, data_file, pos, score, row) —— **按 query 各自的 top-k**，不是合并的一个 top-k
+```
+`index-spark/.../IndexSearch.search(...)` 的实现分成两半：
+
+```java
+for (ByteBuffer query : queries)                     // ← 索引：每个 query 各跑一次
+  hitsPerQuery.add(DistributedIndexSearch.search(...).hits());
+Map<String, Map<Long, String>> rowsByFile =
+  resolveRows(spark, table, snapshotId, hitsPerQuery); // ← 回表：整批只跑一个 job
+```
+
+所以现状是：
+- ✅ **回表已摊销**：整批命中的 data file 只读一次、位置去重（javadoc 也是这么写的）；
+- ❌ **索引加载没摊销**：`DistributedIndexSearch.search` 每个 query 调一次 → 索引文件被读 + 解压 + 反序列化 **N 次**。
+
+这与实测的成本结构正好错位（每文件：读+解压 25–40%、反序列化+搜索 60–75%）——**摊的是小头，没摊大头**。
+
+**要做的（一条卡的两半）**：
+1. **索引加载摊销**：每个索引文件一个 task，**加载/反序列化一次**，在 task 内对该文件遍历全部 N 条 query，最后按 qid 做分组 top-k。收益估算（1M，索引路 ~3.6s/query，其中索引加载 ~2.5–3s、搜索+回表 ~0.5s）：100 条 query ≈ 6 min → ≈ 55 s（6–7x），且随 N 增大趋近 N 倍（上限由"搜索+回表"决定）。
+2. **查询表入口**：现在的 `queries => array('...')` 要把每条向量塞进字符串参数，几十条还行，`sift10m_query` 那种 1 万条不现实；批量评测需要一个读**查询表**（带 qid 列）的入口（TVF 或 procedure 变体）。P1 的 TVF 设计只覆盖单向量，没覆盖这个。
+
+**为什么这和 Lance 有关**：把索引加载摊销掉之后，"回表"成为剩余成本的主体——而回表正是 Lance 赢的地方（10 行 32KB vs 31MB）。**parquet vs Lance 的差异必须在 batch 模式下重测**，否则永远被索引加载的噪声淹没（§13.3 的结论就是被它淹没的）。
