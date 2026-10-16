@@ -399,7 +399,8 @@ topId=12345 sameResults=true
 | `sift10m_lance_zstd` | 10,000,000 | 38 | 1,660,786,855 | **1.297** | 951,470,780 | 0.743 | 1.75x |
 
 - 1M 的改写查询：3680 / 2456 / **1782 ms**，top-10 pk 与 parquet 表完全相同（与 §11 的 2.07x 结论一致：parquet 侧 3317–3689ms）。
-- 10M 索引构建中（每个 task ~264s、38 partitions ≈ 30–40 min），完成后补记。
+- 10M 索引构建完成（HNSW PUBLISHED；每 task ~250–265s × 38 partitions，总约 40 min）。10M 改写查询：16867 / 18361 / **13427 ms**，三次 top-10 pk 一致。
+- 10M 的 TIMING 归因：plan 5–137 ms、uncovered 9–140 ms、**search+resolve 13180–18023 ms**、merge ≈0 → **10M 规模下查询已被"索引搜索+回表"整段吞掉**（对照 1M：1782 ms）。搜索段里 HNSW 图每次查询都要反序列化（延迟分析文档里占 48% 的那个瓶颈）随索引变大而线性放大，**回表的 2x 优势在大表上会被稀释**——这正是 #1141 要量化的规模效应。
 - 保留的 parquet 对照表：`sift1m_base`、`sift10m_base`（各自已有 HNSW 索引），供后续 parquet vs Lance 对比。
 
 **命名约定（后续对比用）**：parquet 侧 `sift{1,10}m_base`；Lance 侧 `sift{1,10}m_lance_zstd`。
