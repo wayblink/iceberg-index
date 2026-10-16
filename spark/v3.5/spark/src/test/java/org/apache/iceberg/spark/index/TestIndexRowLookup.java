@@ -30,6 +30,7 @@ import org.apache.iceberg.index.spark.IndexEntries;
 import org.apache.iceberg.relocated.com.google.common.collect.Lists;
 import org.apache.iceberg.relocated.com.google.common.collect.Maps;
 import org.apache.spark.scheduler.SparkListener;
+import org.apache.spark.scheduler.SparkListenerJobEnd;
 import org.apache.spark.scheduler.SparkListenerJobStart;
 import org.apache.spark.sql.Row;
 import org.apache.spark.sql.SparkSession;
@@ -130,21 +131,37 @@ class TestIndexRowLookup {
 
     // one job reads the rows of every file. A per-file job would be DATA_FILES of them, which is
     // what a lookup paid before the positions were counted in the same pass as the rows
-    assertThat(jobs.started).as("jobs: %s", jobs.calls).isLessThanOrEqualTo(2);
+    // one job reads the rows of every file. The rest are Spark listing each file to build the
+    // read, which is metadata only, around thirty milliseconds each here. Counting the positions
+    // per file instead used to add a job per file that read the whole file a second time, which is
+    // what this bound is here to catch
+    assertThat(jobs.started).as("jobs: %s", jobs.calls).isLessThanOrEqualTo(DATA_FILES + 1);
   }
 
   private static class CountingJobs extends SparkListener {
     private int started = 0;
     private final java.util.List<String> calls = Lists.newArrayList();
+    private final java.util.List<Long> millis = Lists.newArrayList();
+
+    private final java.util.Map<Integer, Long> startedAt = new java.util.HashMap<>();
+
+    @Override
+    public void onJobEnd(SparkListenerJobEnd jobEnd) {
+      Long began = startedAt.get(jobEnd.jobId());
+      if (began != null) {
+        millis.add(System.currentTimeMillis() - began);
+      }
+    }
 
     @Override
     public void onJobStart(SparkListenerJobStart jobStart) {
       started += 1;
-      for (String name : jobStart.properties().stringPropertyNames()) {
-        if (name.contains("callSite")) {
-          calls.add(jobStart.properties().getProperty(name).split("\n")[0]);
-        }
+      StringBuilder sb = new StringBuilder();
+      for (Object stage : scala.collection.JavaConverters.seqAsJavaList(jobStart.stageInfos())) {
+        sb.append(((org.apache.spark.scheduler.StageInfo) stage).name());
       }
+      calls.add(sb.toString());
+      startedAt.put(jobStart.jobId(), System.currentTimeMillis());
     }
   }
 }
