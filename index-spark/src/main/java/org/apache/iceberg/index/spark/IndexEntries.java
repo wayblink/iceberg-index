@@ -110,9 +110,33 @@ public final class IndexEntries {
    */
   public static Dataset<Row> entries(
       SparkSession spark, Table table, long snapshotId, String column, IndexAdapter adapter) {
+    JavaRDD<Row> rows = entryRows(spark, table, scanTasks(table, snapshotId), column, adapter);
+    return rows == null
+        ? spark.createDataFrame(Lists.newArrayList(), SCHEMA)
+        : spark.createDataFrame(rows, SCHEMA);
+  }
+
+  /**
+   * The index entries of the given data files, as rows of the entry schema.
+   *
+   * <p>Unlike {@link #entries} this does not union a whole snapshot into one dataset without saying
+   * how: every data file's rows stay in their own partition. A caller that writes one index file
+   * per group of data files can then read the files of one group into a single task, so the vectors
+   * of that group never cross the cluster. Returns null when there are no data files to read.
+   */
+  public static JavaRDD<Row> entryRows(
+      SparkSession spark,
+      Table table,
+      java.util.Collection<FileScanTask> tasks,
+      String column,
+      IndexAdapter adapter) {
     Schema tableSchema = table.schema();
-    List<FileScanTask> tasks = scanTasks(table, snapshotId);
-    SnapshotDeletes deletes = SnapshotDeletes.read(spark, tasks, tableSchema);
+    List<FileScanTask> taskList = Lists.newArrayList(tasks);
+    if (taskList.isEmpty()) {
+      return null;
+    }
+
+    SnapshotDeletes deletes = SnapshotDeletes.read(spark, taskList, tableSchema);
 
     // the data read needs the indexed column plus the columns referenced by equality deletes
     Set<String> columnsToRead = Sets.newLinkedHashSet();
@@ -120,13 +144,12 @@ public final class IndexEntries {
     columnsToRead.addAll(deletes.keyColumns());
     List<String> readColumns = Lists.newArrayList(columnsToRead);
 
-    Dataset<Row> entries = null;
-    for (FileScanTask task : tasks) {
+    JavaRDD<Row> rows = null;
+    for (FileScanTask task : taskList) {
       String dataFile = task.file().location().toString();
 
-      List<String> capturedReadColumns = readColumns;
-      JavaRDD<Row> entryRows =
-          liveRowsOf(spark, tableSchema, task, capturedReadColumns, null, null, deletes)
+      JavaRDD<Row> fileRows =
+          liveRowsOf(spark, tableSchema, task, readColumns, null, null, deletes)
               .mapToPair(
                   (PairFunction<Tuple2<Long, Row>, Long, Row>)
                       entry ->
@@ -136,15 +159,13 @@ public final class IndexEntries {
                                   dataFile,
                                   entry._1(),
                                   adapter.encodeEntryValue(
-                                      columnValue(
-                                          entry._2(), capturedReadColumns.indexOf(column))))))
+                                      columnValue(entry._2(), readColumns.indexOf(column))))))
               .values();
 
-      Dataset<Row> fileEntries = spark.createDataFrame(entryRows, SCHEMA);
-      entries = entries == null ? fileEntries : entries.union(fileEntries);
+      rows = rows == null ? fileRows : rows.union(fileRows);
     }
 
-    return entries == null ? spark.createDataFrame(Lists.newArrayList(), SCHEMA) : entries;
+    return rows;
   }
 
   /** The delete files of the tasks being read, read once. */
@@ -321,8 +342,7 @@ public final class IndexEntries {
     Collection<Long> wantedPositions = positions == null ? null : Lists.newArrayList(positions);
     return data.filter(
             (Function<Tuple2<Row, Long>, Boolean>)
-                tuple ->
-                    isLive(tuple, wantedPositions, deletedPositions, equalityKeys, keyColumns))
+                tuple -> isLive(tuple, wantedPositions, deletedPositions, equalityKeys, keyColumns))
         .mapToPair(
             (PairFunction<Tuple2<Row, Long>, Long, Row>)
                 tuple ->

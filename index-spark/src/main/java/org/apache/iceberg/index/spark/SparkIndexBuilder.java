@@ -20,11 +20,11 @@ package org.apache.iceberg.index.spark;
 
 import java.io.IOException;
 import java.io.UncheckedIOException;
-import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
+import org.apache.iceberg.FileScanTask;
 import org.apache.iceberg.Snapshot;
 import org.apache.iceberg.Table;
 import org.apache.iceberg.index.IndexAdapter;
@@ -44,17 +44,12 @@ import org.apache.iceberg.index.text.TextIndexTypes;
 import org.apache.iceberg.index.vector.VectorIndexTypes;
 import org.apache.iceberg.io.FileIO;
 import org.apache.iceberg.relocated.com.google.common.collect.Lists;
+import org.apache.iceberg.relocated.com.google.common.collect.Maps;
 import org.apache.iceberg.relocated.com.google.common.collect.Sets;
-import org.apache.spark.HashPartitioner;
-import org.apache.spark.api.java.JavaSparkContext;
-import org.apache.spark.api.java.function.FlatMapFunction;
-import org.apache.spark.broadcast.Broadcast;
-import org.apache.spark.sql.Dataset;
+import org.apache.spark.api.java.JavaRDD;
 import org.apache.spark.sql.Row;
 import org.apache.spark.sql.RowFactory;
 import org.apache.spark.sql.SparkSession;
-import org.apache.spark.sql.functions;
-import scala.Tuple2;
 
 /**
  * Builds a vector index snapshot for an Iceberg table snapshot with Spark.
@@ -279,72 +274,79 @@ public final class SparkIndexBuilder {
                 ? Sets.newHashSet(IndexEntries.dataFiles(table, sourceTableSnapshotId))
                 : onlyFiles);
 
-    Dataset<Row> entries =
-        IndexEntries.entries(spark, table, sourceTableSnapshotId, vectorColumn, adapter);
-    if (onlyFiles != null) {
-      entries =
-          entries.filter(functions.col(IndexEntries.DATA_FILE_COLUMN).isin(onlyFiles.toArray()));
+    // The rows of a group are read by the task that writes its index file, so the vectors of a
+    // group never travel: each group is read into one partition and the partitions are
+    // concatenated.
+    // Grouping them with a shuffle instead, which is what this used to do, moved every vector in
+    // the
+    // table across the cluster to reach the task that was to build its graph, and a lost executor
+    // then cost the whole stage rather than one partition's work.
+    Map<Integer, List<FileScanTask>> tasksByIndexFile =
+        tasksByIndexFile(table, sourceTableSnapshotId, assignment);
+
+    JavaRDD<Row> allRows = null;
+    for (List<FileScanTask> groupTasks : tasksByIndexFile.values()) {
+      JavaRDD<Row> rows = IndexEntries.entryRows(spark, table, groupTasks, vectorColumn, adapter);
+      if (rows != null) {
+        // a group is one index file, so its rows have to reach one task; merging the partitions of
+        // its data files is a narrow transformation, which is the point of reading this way
+        JavaRDD<Row> onePartition = rows.coalesce(1);
+        allRows = allRows == null ? onePartition : allRows.union(onePartition);
+      }
     }
 
-    Broadcast<Map<String, Integer>> groups =
-        JavaSparkContext.fromSparkContext(spark.sparkContext()).broadcast(assignment);
-    List<Row> indexFileRows =
-        entries
-            .toJavaRDD()
-            .mapToPair(row -> Tuple2.apply(groups.value().getOrDefault(row.getString(0), 0), row))
-            .groupByKey(new HashPartitioner(Math.max(1, assignment.size())))
-            .mapPartitions(
-                (FlatMapFunction<Iterator<Tuple2<Integer, Iterable<Row>>>, Row>)
-                    iterator -> {
-                      IndexFileContainer fileContainer = new PuffinIndexFileContainer();
-                      List<Row> files = Lists.newArrayList();
-                      int seq = 0;
-                      while (iterator.hasNext()) {
-                        Tuple2<Integer, Iterable<Row>> group = iterator.next();
-                        List<IndexEntry> groupEntries = Lists.newArrayList();
-                        Set<String> covered = Sets.newLinkedHashSet();
-                        for (Row row : group._2()) {
-                          covered.add(row.getString(0));
-                          groupEntries.add(
-                              IndexEntry.of(row.getString(0), row.getLong(1), row.getAs(2)));
-                        }
+    if (allRows == null) {
+      return Lists.newArrayList();
+    }
 
-                        String location =
-                            indexLocation
-                                + "/"
-                                + DATA_DIR
-                                + "/index-file-"
-                                + snapshotId
-                                + "-"
-                                + seq
-                                + "-"
-                                + UUID.randomUUID();
-                        String blobType;
-                        byte[] payload;
-                        IndexFile.Kind kind;
-                        if (writesAuxiliary) {
-                          blobType = adapter.auxiliaryBlobType();
-                          payload = adapter.encodeAuxiliaryPayload(groupEntries).array();
-                          kind = IndexFile.Kind.AUXILIARY;
-                        } else {
-                          blobType = adapter.entryBlobType();
-                          payload = adapter.encodeEntries(groupEntries).array();
-                          kind = IndexFile.Kind.ENTRY_BEARING;
-                        }
-                        fileContainer.write(
-                            fileIO.newOutputFile(location),
-                            List.of(IndexBlob.of(blobType, payload)));
-                        files.add(
-                            RowFactory.create(
-                                location,
-                                (long) groupEntries.size(),
-                                Lists.newArrayList(covered),
-                                kind.name(),
-                                blobType));
-                        seq++;
-                      }
-                      return files.iterator();
-                    })
+    List<Row> indexFileRows =
+        allRows
+            .mapPartitionsWithIndex(
+                (index, iterator) -> {
+                  IndexFileContainer fileContainer = new PuffinIndexFileContainer();
+                  int seq = index;
+                  List<IndexEntry> groupEntries = Lists.newArrayList();
+                  Set<String> covered = Sets.newLinkedHashSet();
+                  while (iterator.hasNext()) {
+                    Row row = iterator.next();
+                    covered.add(row.getString(0));
+                    groupEntries.add(IndexEntry.of(row.getString(0), row.getLong(1), row.getAs(2)));
+                  }
+
+                  String location =
+                      indexLocation
+                          + "/"
+                          + DATA_DIR
+                          + "/index-file-"
+                          + snapshotId
+                          + "-"
+                          + seq
+                          + "-"
+                          + UUID.randomUUID();
+                  String blobType;
+                  byte[] payload;
+                  IndexFile.Kind kind;
+                  if (writesAuxiliary) {
+                    blobType = adapter.auxiliaryBlobType();
+                    payload = adapter.encodeAuxiliaryPayload(groupEntries).array();
+                    kind = IndexFile.Kind.AUXILIARY;
+                  } else {
+                    blobType = adapter.entryBlobType();
+                    payload = adapter.encodeEntries(groupEntries).array();
+                    kind = IndexFile.Kind.ENTRY_BEARING;
+                  }
+                  fileContainer.write(
+                      fileIO.newOutputFile(location), List.of(IndexBlob.of(blobType, payload)));
+                  return List.of(
+                          RowFactory.create(
+                              location,
+                              (long) groupEntries.size(),
+                              Lists.newArrayList(covered),
+                              kind.name(),
+                              blobType))
+                      .iterator();
+                },
+                true)
             .collect();
 
     // the index files were written by the executors, so record them in this attempt's ledger now
@@ -368,6 +370,25 @@ public final class SparkIndexBuilder {
     }
 
     return indexFiles;
+  }
+
+  /**
+   * The data files of each index file, keyed by group and in a stable group order.
+   *
+   * <p>The rows of a group are read together by the task that writes its index file, which is what
+   * keeps them from having to be shuffled into place first.
+   */
+  private static Map<Integer, List<FileScanTask>> tasksByIndexFile(
+      Table table, long sourceTableSnapshotId, Map<String, Integer> assignment) {
+    Map<Integer, List<FileScanTask>> byGroup = Maps.newTreeMap();
+    for (FileScanTask task : IndexEntries.scanTasks(table, sourceTableSnapshotId)) {
+      Integer group = assignment.get(task.file().location().toString());
+      if (group != null) {
+        byGroup.computeIfAbsent(group, key -> Lists.newArrayList()).add(task);
+      }
+    }
+
+    return byGroup;
   }
 
   /**
