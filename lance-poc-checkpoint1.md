@@ -212,3 +212,36 @@ topId=12345 sameResults=true
 - **B2b 端到端成立**：Lance 作为 Iceberg data file 格式，在集群 100 万 × 128 维上完成「建表 → 建 HNSW 索引 → 改写命中 → 回表 → 结果与 parquet 逐行一致」，回表路径约 **2x**、整条查询 3.3s → 1.8s。
 - **代价明确**：同一份 SIFT1M 数据 Lance 占 **5.5x** 空间（94MB → 519MB，SIFT 是 0–255 的整数但以 float32 存）。上生产前必须做编码/压缩选型（列式字典、量化为 uint8 等）。
 - **剩余工作**：向量化读取降低内存（同时会让回表更快）；索引层面的孤儿清理/`drop_vector_index`；以及 #944 的 10M 规模复测。
+
+### 10.1 为什么 Lance 文件大 5.5x：定量拆解
+
+先看每值字节数（1,000,000 × 128 = 128M 个值）：
+
+| | 字节 | B/value |
+|---|---|---|
+| 原始 float32 | 512.0 MB | 4.00 |
+| 集群实测 parquet（sift1m_base） | 94.4 MB | **0.74** |
+| 集群实测 Lance（sift1m_lance_v2） | 518.7 MB | **4.05** |
+
+同形状合成数据（1M×128，取值 0..116，float32，pyarrow 写入）验证机制：
+
+| 写法 | 字节 | B/value |
+|---|---|---|
+| parquet 默认（snappy + 字典） | 116.8 MB | 0.91 |
+| parquet snappy，**关字典** | 261.5 MB | 2.04 |
+| parquet **无压缩无字典** | 525.0 MB | 4.10 |
+| parquet 存成 uint8（snappy + 字典） | 116.8 MB | 0.91 |
+
+结论有三条：
+
+1. **差距几乎全部来自 parquet 的字典编码**：SIFT 描述子本就是 0..255 的整数（实测值域 0..116），却以 float32 存 —— 只有 ~117 个不同值。parquet 把它编码成 ~7 bit 的字典索引 + RLE，于是 0.7–0.9 B/value；关掉字典立刻变 2.0，再关压缩就是 4.1。
+2. **Lance 的 v2 默认编码对 float32 列基本不做处理**：518.7MB ≈ 512MB 原始大小（+1% 元数据）。它的字典/bitpacking/RLE 主要服务字符串与整数列，浮点列落回 plain。所以不是"Lance 天生费 5 倍"，而是"parquet 吃到了这份数据的低基数字典红利，Lance 没吃"。
+3. **高熵数据下两者持平**：本地 1M×128 正态分布随机 float 基准（#707）Lance 514MB vs parquet 521MB。低熵数据（SIFT）才拉开 5.5x。
+
+**Lance 侧目前没有编码/压缩开关**：`WriteParams` / `org.lance.file` 都没有 compression/encoding 选项，Java SDK 无法指定（要走就得改 Rust 默认或走 Dataset 侧的写参数）。可用的手段在数据表示层：
+
+- **把向量列改存整数**（SIFT 的原生形态，`array<int>`/tinyint）：原始就是 128MB，Lance 的整数编码（bitpacking/RLE）会生效 → 预期大幅缩小；parquet 仍在 ~117MB。需要给 `LanceArrowConverter`/Spark writer 补 int8/int16 元素类型，索引适配器把 `Number` 转 float 即可。
+- **float16 或标量量化/二值化**：2 B/value 或 1 B/value，同时加速 ANN。
+- 注意**权衡**：任何压缩都会给刚变快 2x 的回表路径加解压 CPU，需要实测净收益（建议下一步就是"uint8 版 Lance 表：体积 + 查询耗时"一起测）。
+
+索引文件本身已经是 zstd 压缩过的（#575），5.5x 只关于数据文件。
