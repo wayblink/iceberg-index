@@ -20,6 +20,7 @@ package org.apache.iceberg.spark.procedures;
 
 import java.util.List;
 import org.apache.iceberg.index.spark.VectorIndexSearch;
+import org.apache.iceberg.relocated.com.google.common.base.Preconditions;
 import org.apache.iceberg.relocated.com.google.common.collect.Lists;
 import org.apache.iceberg.spark.procedures.SparkProcedures.ProcedureBuilder;
 import org.apache.spark.sql.Row;
@@ -38,7 +39,8 @@ import org.apache.spark.unsafe.types.UTF8String;
  * <p>Like {@link VectorSearchProcedure}, each hit carries its row reference ({@code _file} + {@code
  * _pos}), score and the matched row as a JSON string, plus the index of the query it belongs to.
  * Rows are ordered by query and then by score. Unlike repeated single searches, the matched rows of
- * all queries are resolved by reading each hit data file once, so a batch of N queries costs one
+ * all queries are resolved by reading each hit data file once, and every index file is loaded once
+ * for the whole batch, so a batch of N queries costs one
  * read per distinct hit data file.
  *
  * <p>Queries are passed as an array of strings, one comma-separated list of numbers per query, for
@@ -56,10 +58,25 @@ class VectorSearchBatchProcedure extends BaseProcedure {
   private static final ProcedureParameter COLUMN_PARAM =
       requiredInParameter("column", DataTypes.StringType);
   private static final ProcedureParameter QUERIES_PARAM =
-      requiredInParameter("queries", STRING_ARRAY);
+      optionalInParameter("queries", STRING_ARRAY);
   private static final ProcedureParameter K_PARAM = requiredInParameter("k", DataTypes.IntegerType);
+  private static final ProcedureParameter QUERY_TABLE_PARAM =
+      optionalInParameter("query_table", DataTypes.StringType);
+  private static final ProcedureParameter QUERY_ID_COLUMN_PARAM =
+      optionalInParameter("query_id_column", DataTypes.StringType);
+  private static final ProcedureParameter VECTOR_COLUMN_PARAM =
+      optionalInParameter("vector_column", DataTypes.StringType);
   private static final ProcedureParameter[] PARAMETERS =
-      new ProcedureParameter[] {TABLE_PARAM, COLUMN_PARAM, QUERIES_PARAM, K_PARAM};
+      new ProcedureParameter[] {
+        // required parameters first: Spark rejects an optional one before a required one
+        TABLE_PARAM,
+        COLUMN_PARAM,
+        K_PARAM,
+        QUERIES_PARAM,
+        QUERY_TABLE_PARAM,
+        QUERY_ID_COLUMN_PARAM,
+        VECTOR_COLUMN_PARAM
+      };
 
   private static final StructType OUTPUT_TYPE =
       new StructType(
@@ -101,10 +118,9 @@ class VectorSearchBatchProcedure extends BaseProcedure {
     String column = input.asString(COLUMN_PARAM);
     int topK = input.asInt(K_PARAM);
 
-    List<float[]> queryVectors = Lists.newArrayList();
-    for (String encodedQuery : input.asStringArray(QUERIES_PARAM)) {
-      queryVectors.add(parseQuery(encodedQuery));
-    }
+    List<float[]> queryVectors = input.isProvided(QUERY_TABLE_PARAM)
+        ? queriesFromTable(input)
+        : queriesFromArray(input);
 
     return modifyIcebergTable(
         input.ident(TABLE_PARAM),
@@ -129,6 +145,41 @@ class VectorSearchBatchProcedure extends BaseProcedure {
 
           return rows.toArray(new InternalRow[0]);
         });
+  }
+
+  /** Reads the query vectors from a table, one row per query, in the given id order. */
+  private List<float[]> queriesFromTable(ProcedureInput input) {
+    String queryTable = input.asString(QUERY_TABLE_PARAM);
+    String vectorColumn = input.asString(VECTOR_COLUMN_PARAM, "vector");
+    String sql = "SELECT `" + vectorColumn + "` FROM " + queryTable;
+    if (input.isProvided(QUERY_ID_COLUMN_PARAM)) {
+      // a stable order, so the query ids the results carry line up with the table's own ids
+      sql = sql + " ORDER BY `" + input.asString(QUERY_ID_COLUMN_PARAM) + "`";
+    }
+
+    List<float[]> queryVectors = Lists.newArrayList();
+    for (Row row : spark().sql(sql).collectAsList()) {
+      List<?> values = row.getList(0);
+      float[] query = new float[values.size()];
+      for (int i = 0; i < query.length; i++) {
+        query[i] = ((Number) values.get(i)).floatValue();
+      }
+      queryVectors.add(query);
+    }
+    return queryVectors;
+  }
+
+  /** Reads the query vectors given inline as comma-separated number lists. */
+  private List<float[]> queriesFromArray(ProcedureInput input) {
+    Preconditions.checkArgument(
+        input.isProvided(QUERIES_PARAM),
+        "Provide either queries or query_table for %s",
+        input.asString(TABLE_PARAM));
+    List<float[]> queryVectors = Lists.newArrayList();
+    for (String encodedQuery : input.asStringArray(QUERIES_PARAM)) {
+      queryVectors.add(parseQuery(encodedQuery));
+    }
+    return queryVectors;
   }
 
   /** Parses one query vector from its comma-separated number list. */

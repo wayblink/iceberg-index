@@ -24,6 +24,7 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import java.nio.ByteBuffer;
 import java.util.List;
 import org.apache.iceberg.index.IndexEntry;
+import org.apache.iceberg.index.IndexAdapter;
 import org.apache.iceberg.index.IndexSearchResult;
 import org.apache.iceberg.relocated.com.google.common.collect.Lists;
 import org.junit.jupiter.api.Test;
@@ -209,5 +210,45 @@ class TestVectorIndexAdapter {
                   new float[] {(float) Math.cos(angle), (float) Math.sin(angle)})));
     }
     return entries;
+  }
+
+  @Test
+  public void preparedSearchDoesNotReadThePayloadAgain() {
+    // the whole point of preparing a payload is that the decode happens once, so a search that
+    // happens after the payload has been overwritten still answers from the loaded form
+    VectorIndexAdapter hnsw = hnswAdapter(VectorIndexDefinition.Metric.EUCLIDEAN);
+    List<IndexEntry> entries = circleEntries(hnsw, 40);
+    ByteBuffer auxiliary = hnsw.encodeAuxiliaryPayload(entries);
+    ByteBuffer query = hnsw.encodeQuery(new float[] {0.8f, 0.6f});
+
+    IndexAdapter.PreparedSearch prepared = hnsw.prepareAuxiliary(auxiliary);
+    List<IndexSearchResult> first = prepared.search(query, 5);
+
+    // destroy the payload the searcher was prepared from
+    while (auxiliary.hasRemaining()) {
+      auxiliary.put((byte) 0);
+    }
+
+    assertThat(prepared.search(query, 5))
+        .as("a second search must not touch the payload")
+        .isEqualTo(first);
+    assertThat(first).isNotEmpty();
+  }
+
+  @Test
+  public void preparedEntrySearchDoesNotDecodeThePayloadAgain() {
+    VectorIndexAdapter exact = adapter(VectorIndexDefinition.Metric.EUCLIDEAN);
+    List<IndexEntry> entries = circleEntries(exact, 40);
+    ByteBuffer payload = exact.encodeEntries(entries);
+    ByteBuffer query = exact.encodeQuery(new float[] {0.8f, 0.6f});
+
+    IndexAdapter.PreparedSearch prepared = exact.prepare(payload);
+    List<IndexSearchResult> first = prepared.search(query, 5);
+
+    while (payload.hasRemaining()) {
+      payload.put((byte) 0);
+    }
+
+    assertThat(prepared.search(query, 5)).isEqualTo(first).isNotEmpty();
   }
 }

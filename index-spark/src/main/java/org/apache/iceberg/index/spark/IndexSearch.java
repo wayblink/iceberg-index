@@ -122,17 +122,15 @@ public final class IndexSearch {
     org.apache.iceberg.index.IndexAdapter adapter =
         org.apache.iceberg.index.IndexTypes.fromType(metadata.indexType())
             .createAdapter(metadata.definition());
-    List<List<IndexSearchResult>> hitsPerQuery = Lists.newArrayList();
+    // every query is answered from the same snapshot, so one pass over the index files serves the
+    // whole batch: each file is read and prepared once and searched once per query
+    List<IndexQuery> indexQueries = Lists.newArrayListWithCapacity(queries.size());
     for (ByteBuffer query : queries) {
-      hitsPerQuery.add(
-          Lists.newArrayList(
-              DistributedIndexSearch.search(
-                      spark,
-                      metadata,
-                      table,
-                      IndexQuery.of(snapshot.sourceTableSnapshotId(), query.duplicate(), topK))
-                  .hits()));
+      indexQueries.add(
+          IndexQuery.of(snapshot.sourceTableSnapshotId(), query.duplicate(), topK));
     }
+    List<List<IndexSearchResult>> hitsPerQuery =
+        DistributedIndexSearch.searchBatch(spark, metadata, table, indexQueries);
 
     Map<String, Map<Long, String>> rowsByFile =
         resolveRows(spark, table, snapshot.sourceTableSnapshotId(), hitsPerQuery);

@@ -45,6 +45,8 @@ public class TestVectorIndexSearchBatch extends ExtensionsTestBase {
   @AfterEach
   public void removeTables() {
     sql("DROP TABLE IF EXISTS %s", tableName("vectors_batch_match_" + catalogName));
+    sql("DROP TABLE IF EXISTS %s", tableName("vectors_batch_from_table_" + catalogName));
+    sql("DROP TABLE IF EXISTS %s", tableName("vectors_batch_queries_" + catalogName));
     sql("DROP TABLE IF EXISTS %s", tableName("vectors_batch_empty_" + catalogName));
   }
 
@@ -145,5 +147,48 @@ public class TestVectorIndexSearchBatch extends ExtensionsTestBase {
     int start = rowJson.indexOf("\"id\":") + 5;
     int end = rowJson.indexOf(',', start);
     return Long.parseLong(rowJson.substring(start, end == -1 ? rowJson.length() - 1 : end));
+  }
+
+  @TestTemplate
+  public void testBatchSearchFromAQueryTable() {
+    String tableName = tableName("vectors_batch_from_table_" + catalogName);
+    String queriesName = tableName("vectors_batch_queries_" + catalogName);
+    sql("DROP TABLE IF EXISTS %s", queriesName);
+    sql("CREATE TABLE %s (id bigint, embedding array<double>) USING iceberg", tableName);
+    sql(
+        "INSERT INTO %s SELECT id, array(CAST(id AS double), CAST(10 - id AS double)) "
+            + "FROM range(0, 20)",
+        tableName);
+    sql(
+        "CALL %s.system.build_vector_index("
+            + "table => '%s', column => 'embedding', dimension => 2, metric => 'euclidean')",
+        catalogName, tableName);
+
+    sql("CREATE TABLE %s (query_id bigint, q array<double>) USING iceberg", queriesName);
+    sql(
+        "INSERT INTO %s VALUES (7, array(0.0, 10.0)), (3, array(10.0, 0.0)), (5, array(5.0, 5.0))",
+        queriesName);
+
+    // the queries come from a table and are answered in query_id order
+    List<Object[]> fromTable =
+        sql(
+            "CALL %s.system.vector_search_batch(table => '%s', column => 'embedding', "
+                + "query_table => '%s', query_id_column => 'query_id', vector_column => 'q', k => 3)",
+            catalogName, tableName, queriesName);
+
+    List<Object[]> inline =
+        sql(
+            "CALL %s.system.vector_search_batch(table => '%s', column => 'embedding', "
+                + "queries => array('10.0,0.0', '5.0,5.0', '0.0,10.0'), k => 3)",
+            catalogName, tableName);
+
+    // same three queries, ordered by query id, so the rows must agree query for query
+    assertThat(fromTable).hasSize(inline.size());
+    for (int i = 0; i < inline.size(); i++) {
+      assertThat(parseId((String) fromTable.get(i)[4]))
+          .as("row %s", i)
+          .isEqualTo(parseId((String) inline.get(i)[4]));
+    }
+    sql("DROP TABLE IF EXISTS %s", queriesName);
   }
 }

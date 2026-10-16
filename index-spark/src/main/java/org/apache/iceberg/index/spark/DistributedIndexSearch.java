@@ -23,6 +23,7 @@ import java.nio.ByteBuffer;
 import java.util.Comparator;
 import java.util.Iterator;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.TimeUnit;
 import org.apache.iceberg.Table;
 import org.apache.iceberg.index.IndexAdapter;
@@ -40,12 +41,16 @@ import org.apache.iceberg.io.IOUtil;
 import org.apache.iceberg.io.InputFile;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableList;
 import org.apache.iceberg.relocated.com.google.common.collect.Lists;
+import org.apache.spark.api.java.JavaPairRDD;
 import org.apache.spark.api.java.JavaSparkContext;
 import org.apache.spark.api.java.function.FlatMapFunction;
+import org.apache.spark.api.java.function.Function2;
+import org.apache.spark.api.java.function.PairFlatMapFunction;
 import org.apache.spark.broadcast.Broadcast;
 import org.apache.spark.sql.SparkSession;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import scala.Tuple2;
 import scala.Tuple3;
 
 /**
@@ -199,6 +204,187 @@ public final class DistributedIndexSearch {
     }
 
     return new SearchOutcome(ImmutableList.copyOf(hits), moreHits);
+  }
+
+  /**
+   * Searches the index snapshot a batch of queries is answered from, loading each index file once.
+   *
+   * <p>A query on its own reads and decodes every index file of the snapshot, so N queries cost N
+   * times that work. This searches each file once for the whole batch: the payload is read once,
+   * prepared once, and then scored once per query, so the batch pays one load and N searches.
+   *
+   * @param spark the Spark session
+   * @param metadata the index to search
+   * @param table the table the index belongs to, used to resolve the snapshot and its file IO
+   * @param queries the queries to answer; all are answered from the snapshot of the first one
+   * @return the hits of each query, best first, in the order the queries were given
+   */
+  public static List<List<IndexSearchResult>> searchBatch(
+      SparkSession spark, IndexMetadata metadata, Table table, List<IndexQuery> queries) {
+    if (queries.isEmpty()) {
+      return ImmutableList.of();
+    }
+
+    IndexAdapter adapter =
+        IndexTypes.fromType(metadata.indexType()).createAdapter(metadata.definition());
+    if (adapter.searchesAllPayloadsTogether()) {
+      // each query needs the merged payloads, and such a search has no per-file form to batch
+      List<List<IndexSearchResult>> perQuery = Lists.newArrayListWithCapacity(queries.size());
+      IndexReader togetherReader = new IndexReader(metadata, table);
+      for (IndexQuery query : queries) {
+        perQuery.add(togetherReader.search(query));
+      }
+      return perQuery;
+    }
+
+    IndexReader reader = new IndexReader(metadata, table);
+    List<IndexFile> files = reader.indexFiles(queries.get(0));
+    List<List<IndexSearchResult>> perQuery = Lists.newArrayListWithCapacity(queries.size());
+    if (files.isEmpty()) {
+      for (int i = 0; i < queries.size(); i++) {
+        perQuery.add(ImmutableList.of());
+      }
+      return perQuery;
+    }
+
+    List<String> locations = Lists.newArrayListWithCapacity(files.size());
+    for (IndexFile file : files) {
+      locations.add(file.location());
+    }
+
+    JavaSparkContext context = JavaSparkContext.fromSparkContext(spark.sparkContext());
+    Broadcast<IndexAdapter> adapterRef = context.broadcast(adapter);
+    // a ByteBuffer is not serializable, so the payloads travel as bytes
+    List<byte[]> queryPayloads = Lists.newArrayListWithCapacity(queries.size());
+    int widestTopK = 0;
+    for (IndexQuery query : queries) {
+      queryPayloads.add(toBytes(query.payload().duplicate()));
+      widestTopK = Math.max(widestTopK, query.topK());
+    }
+    Broadcast<List<byte[]>> queriesRef = context.broadcast(queryPayloads);
+    Broadcast<FileIO> ioRef = context.broadcast(table.io());
+
+    // one more than the widest query asks for is kept per query, because that is what says whether
+    // there is another round to ask for
+    int localTopK = widestTopK + 1;
+
+    JavaPairRDD<Integer, Tuple3<String, Long, Double>> fileHits =
+        context
+            .parallelize(locations, locations.size())
+            .mapPartitionsToPair(
+                (PairFlatMapFunction<Iterator<String>, Integer, Tuple3<String, Long, Double>>)
+                    locations1 -> {
+                      IndexAdapter fileAdapter = adapterRef.getValue();
+                      List<byte[]> fileQueries = queriesRef.getValue();
+                      FileIO fileIO = ioRef.getValue();
+                      List<Tuple2<Integer, Tuple3<String, Long, Double>>> batchHits =
+                          Lists.newArrayList();
+                      while (locations1.hasNext()) {
+                        String location = locations1.next();
+                        long readStart = System.nanoTime();
+                        byte[] content = readPayload(fileIO, location);
+                        long readNanos = System.nanoTime() - readStart;
+
+                        long searchStart = System.nanoTime();
+                        List<IndexBlob> blobs;
+                        try {
+                          blobs = new PuffinIndexFileContainer().read(new InMemoryInputFile(content));
+                        } catch (java.io.IOException e) {
+                          throw new java.io.UncheckedIOException("Failed to read an index file", e);
+                        }
+                        IndexAdapter.PreparedSearch prepared = null;
+                        String blobType =
+                            fileAdapter.writesAuxiliaryFiles()
+                                ? fileAdapter.auxiliaryBlobType()
+                                : fileAdapter.entryBlobType();
+                        for (IndexBlob blob : blobs) {
+                          if (blobType.equals(blob.type())) {
+                            prepared =
+                                fileAdapter.writesAuxiliaryFiles()
+                                    ? fileAdapter.prepareAuxiliary(ByteBuffer.wrap(blob.payload()))
+                                    : fileAdapter.prepare(ByteBuffer.wrap(blob.payload()));
+                            break;
+                          }
+                        }
+                        if (prepared == null) {
+                          continue;
+                        }
+                        for (int queryId = 0; queryId < fileQueries.size(); queryId++) {
+                          for (IndexSearchResult hit :
+                              prepared.search(
+                                  ByteBuffer.wrap(fileQueries.get(queryId)), localTopK)) {
+                            batchHits.add(
+                                new Tuple2<>(
+                                    queryId,
+                                    new Tuple3<>(
+                                        hit.dataFile(), hit.rowPosition(), hit.score())));
+                          }
+                        }
+                        LOG.debug(
+                            "index file {} read {} ms ({} bytes), batch search of {} queries {} ms",
+                            location.substring(location.lastIndexOf('/') + 1),
+                            TimeUnit.MILLISECONDS.convert(readNanos, TimeUnit.NANOSECONDS),
+                            content.length,
+                            fileQueries.size(),
+                            TimeUnit.MILLISECONDS.convert(
+                                System.nanoTime() - searchStart, TimeUnit.NANOSECONDS));
+                      }
+                      return batchHits.iterator();
+                    });
+
+    // the per-query top-k is merged with a bounded accumulator, so the shuffle carries at most one
+    // entry per (query, index file) instead of every hit
+    Comparator<Tuple3<String, Long, Double>> order = hitOrder(adapter);
+    int mergeLimit = localTopK;
+    Function2<
+            List<Tuple3<String, Long, Double>>,
+            Tuple3<String, Long, Double>,
+            List<Tuple3<String, Long, Double>>>
+        mergeHit =
+            (hits, hit) -> {
+              hits.add(hit);
+              return bounded(hits, order, mergeLimit);
+            };
+    Function2<
+            List<Tuple3<String, Long, Double>>,
+            List<Tuple3<String, Long, Double>>,
+            List<Tuple3<String, Long, Double>>>
+        mergeHits =
+            (left, right) -> {
+              left.addAll(right);
+              return bounded(left, order, mergeLimit);
+            };
+    Map<Integer, List<Tuple3<String, Long, Double>>> topByQuery =
+        fileHits
+            .aggregateByKey(
+                Lists.<Tuple3<String, Long, Double>>newArrayList(), mergeHit, mergeHits)
+            .collectAsMap();
+
+    for (int queryId = 0; queryId < queries.size(); queryId++) {
+      List<Tuple3<String, Long, Double>> top =
+          topByQuery.getOrDefault(queryId, Lists.newArrayList());
+      top = bounded(top, order, queries.get(queryId).topK());
+      List<IndexSearchResult> hits = Lists.newArrayListWithCapacity(top.size());
+      for (Tuple3<String, Long, Double> hit : top) {
+        hits.add(IndexSearchResult.of(hit._1(), hit._2(), hit._3()));
+      }
+      perQuery.add(ImmutableList.copyOf(hits));
+    }
+
+    return perQuery;
+  }
+
+  /** Keeps the best {@code limit} hits of a query and drops the rest. */
+  private static List<Tuple3<String, Long, Double>> bounded(
+      List<Tuple3<String, Long, Double>> hits,
+      Comparator<Tuple3<String, Long, Double>> order,
+      int limit) {
+    if (hits.size() <= limit) {
+      return hits;
+    }
+    List<Tuple3<String, Long, Double>> sorted = Lists.newArrayList(hits);
+    sorted.sort(order);
+    return Lists.newArrayList(sorted.subList(0, limit));
   }
 
   /**

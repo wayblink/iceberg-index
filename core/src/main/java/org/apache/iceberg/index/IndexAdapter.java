@@ -100,6 +100,38 @@ public interface IndexAdapter {
    *
    * <p>Like {@link #searchAll}, but for auxiliary payloads.
    */
+  /**
+   * Loads the auxiliary payload of one index file so that several queries can search it without
+   * decoding it again.
+   *
+   * <p>This is what makes a batch of queries cost one load per index file instead of one load per
+   * query: the graph (or posting list) is decoded once and then searched once per query. The
+   * default decodes per search, which is what an adapter that has no loaded form does.
+   *
+   * @param payload the auxiliary payload of one index file
+   * @return a searcher over the loaded payload
+   */
+  default PreparedSearch prepareAuxiliary(ByteBuffer payload) {
+    return (query, topK) -> searchAuxiliary(payload, query, topK);
+  }
+
+  /**
+   * Loads the entry-bearing payload of one index file so that several queries can search it without
+   * decoding it again, the counterpart of {@link #prepareAuxiliary(ByteBuffer)} for an index whose
+   * entries are what is searched.
+   *
+   * @param payload the entry-bearing payload of one index file
+   * @return a searcher over the loaded payload
+   */
+  default PreparedSearch prepare(ByteBuffer payload) {
+    return (query, topK) -> search(payload, query, topK);
+  }
+
+  /** A loaded index payload that can be searched more than once. */
+  interface PreparedSearch {
+    List<IndexSearchResult> search(ByteBuffer query, int topK);
+  }
+
   default List<IndexSearchResult> searchAuxiliaryAll(
       List<ByteBuffer> payloads, ByteBuffer query, int topK) {
     return searchAndMerge(payloads, payload -> searchAuxiliary(payload, query, topK), topK);

@@ -229,26 +229,34 @@ public final class VectorIndexAdapter implements IndexAdapter, java.io.Serializa
   }
 
   @Override
-  public List<IndexSearchResult> search(ByteBuffer payload, ByteBuffer query, int topK) {
-    Preconditions.checkArgument(topK >= 0, "Top-k must be non-negative: %s", topK);
-    float[] queryVector = decodeQuery(query);
-    if (topK == 0) {
-      return ImmutableList.of();
-    }
-
+  public PreparedSearch prepare(ByteBuffer payload) {
+    // the entries are decoded once, so a batch pays the decode per index file instead of per query
     List<IndexEntry> entries = decodeEntries(payload);
-    List<IndexSearchResult> results = Lists.newArrayList();
-    for (IndexEntry entry : entries) {
-      float[] vector = decodeVector(entry.payload(), "Entry");
-      results.add(
-          IndexSearchResult.of(entry.dataFile(), entry.rowPosition(), score(queryVector, vector)));
-    }
+    return (query, topK) -> {
+      Preconditions.checkArgument(topK >= 0, "Top-k must be non-negative: %s", topK);
+      if (topK == 0) {
+        return ImmutableList.of();
+      }
 
-    results.sort(resultComparator());
-    if (results.size() > topK) {
-      results = Lists.newArrayList(results.subList(0, topK));
-    }
-    return ImmutableList.copyOf(results);
+      float[] queryVector = decodeQuery(query);
+      List<IndexSearchResult> results = Lists.newArrayList();
+      for (IndexEntry entry : entries) {
+        float[] vector = decodeVector(entry.payload(), "Entry");
+        results.add(
+            IndexSearchResult.of(entry.dataFile(), entry.rowPosition(), score(queryVector, vector)));
+      }
+
+      results.sort(resultComparator());
+      if (results.size() > topK) {
+        results = Lists.newArrayList(results.subList(0, topK));
+      }
+      return ImmutableList.copyOf(results);
+    };
+  }
+
+  @Override
+  public List<IndexSearchResult> search(ByteBuffer payload, ByteBuffer query, int topK) {
+    return prepare(payload).search(query, topK);
   }
 
   @Override
@@ -323,13 +331,7 @@ public final class VectorIndexAdapter implements IndexAdapter, java.io.Serializa
   }
 
   @Override
-  public List<IndexSearchResult> searchAuxiliary(ByteBuffer payload, ByteBuffer query, int topK) {
-    Preconditions.checkArgument(topK >= 0, "Top-k must be non-negative: %s", topK);
-    float[] queryVector = decodeQuery(query);
-    if (topK == 0) {
-      return ImmutableList.of();
-    }
-
+  public PreparedSearch prepareAuxiliary(ByteBuffer payload) {
     byte[] bytes = toBytes(payload);
     try (DataInputStream in = new DataInputStream(new ByteArrayInputStream(bytes))) {
       int version = in.readInt();
@@ -362,35 +364,49 @@ public final class VectorIndexAdapter implements IndexAdapter, java.io.Serializa
         positions[i] = in.readLong();
       }
 
+      // the load happens here, once per payload, and the returned searcher only traverses
       HnswIndex<Long, float[], VectorItem, Float> index =
           HnswIndex.load(new ByteArrayInputStream(graph));
       index.setEf(definition.efSearch());
 
-      // the graph is asked for as many candidates as its search width allows, not just for the
-      // number asked for: the traversal is the same either way, and a wider candidate set gives the
-      // exact re-scoring below more true neighbours to order
-      int candidates = Math.max(topK, definition.efSearch());
-      List<SearchResult<VectorItem, Float>> nearest = index.findNearest(queryVector, candidates);
+      return (query, topK) -> {
+        Preconditions.checkArgument(topK >= 0, "Top-k must be non-negative: %s", topK);
+        if (topK == 0) {
+          return ImmutableList.of();
+        }
 
-      List<IndexSearchResult> results = Lists.newArrayList();
-      for (SearchResult<VectorItem, Float> result : nearest) {
-        int id = Math.toIntExact(result.item().id());
-        Preconditions.checkArgument(
-            id >= 0 && id < mappingCount, "HNSW result id out of range: %s", id);
-        // re-score with the exact metric, on the stored vector, so a score is the one exact search
-        // would give
-        results.add(
-            IndexSearchResult.of(
-                dataFiles[id], positions[id], score(queryVector, result.item().vector())));
-      }
+        float[] queryVector = decodeQuery(query);
+        // the graph is asked for as many candidates as its search width allows, not just for the
+        // number asked for: the traversal is the same either way, and a wider candidate set gives
+        // the exact re-scoring below more true neighbours to order
+        int candidates = Math.max(topK, definition.efSearch());
+        List<SearchResult<VectorItem, Float>> nearest = index.findNearest(queryVector, candidates);
 
-      // the candidates come back in the order the graph ranked them, which is not necessarily the
-      // order of the exact scores, so the re-scored results are ordered by those before truncating
-      results.sort(resultComparator());
-      return results.size() > topK ? Lists.newArrayList(results.subList(0, topK)) : results;
+        List<IndexSearchResult> results = Lists.newArrayList();
+        for (SearchResult<VectorItem, Float> result : nearest) {
+          int id = Math.toIntExact(result.item().id());
+          Preconditions.checkArgument(
+              id >= 0 && id < mappingCount, "HNSW result id out of range: %s", id);
+          // re-score with the exact metric, on the stored vector, so a score is the one exact search
+          // would give
+          results.add(
+              IndexSearchResult.of(
+                  dataFiles[id], positions[id], score(queryVector, result.item().vector())));
+        }
+
+        // the candidates come back in the order the graph ranked them, which is not necessarily the
+        // order of the exact scores, so the re-scored results are ordered by those before truncating
+        results.sort(resultComparator());
+        return results.size() > topK ? Lists.newArrayList(results.subList(0, topK)) : results;
+      };
     } catch (IOException e) {
-      throw new UncheckedIOException("Failed to search the HNSW index payload", e);
+      throw new UncheckedIOException("Failed to load the HNSW index payload", e);
     }
+  }
+
+  @Override
+  public List<IndexSearchResult> searchAuxiliary(ByteBuffer payload, ByteBuffer query, int topK) {
+    return prepareAuxiliary(payload).search(query, topK);
   }
 
   @Override
