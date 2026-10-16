@@ -1,6 +1,0 @@
-rows=200000 dim=32 topK=10
-query whole plan   lance=334ms parquet=314ms
-fetchback 10 rows  lance=83ms parquet=89ms
-data bytes         lance=7436948 parquet=6925953
-full scan no index (lance)=256ms
-topId=12345 sameResults=true

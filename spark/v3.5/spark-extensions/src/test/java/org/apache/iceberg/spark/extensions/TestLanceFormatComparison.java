@@ -35,7 +35,7 @@ import org.junit.jupiter.api.io.TempDir;
  * byte-range splittable, so Iceberg plans one task per file where Parquet contributes one task per
  * row group. Also records the storage footprint of both encodings for the same rows.
  *
- * <p>The numbers are written to target/lance-poc-comparison.txt for the POC report.
+ * <p>The numbers are written to build/lance-poc-comparison.txt for the POC report.
  */
 class TestLanceFormatComparison {
 
@@ -59,7 +59,7 @@ class TestLanceFormatComparison {
             .config("spark.sql.catalog.local.type", "hadoop")
             .config("spark.sql.catalog.local.warehouse", warehouse.toUri().toString())
             .getOrCreate();
-    report = Path.of("target", "lance-poc-comparison.txt");
+    report = Path.of("build", "lance-poc-comparison.txt");
   }
 
   @AfterAll

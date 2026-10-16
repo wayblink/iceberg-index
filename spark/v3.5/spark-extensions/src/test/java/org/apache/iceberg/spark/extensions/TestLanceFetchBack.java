@@ -38,7 +38,7 @@ import org.junit.jupiter.api.io.TempDir;
  * on a Lance-backed table and on a parquet-backed table. The index lookup is identical in both, so
  * the difference is what Iceberg has to read to turn the hits into rows.
  *
- * <p>Result is written to target/lance-poc-fetchback.txt for the POC report.
+ * <p>Result is written to build/lance-poc-fetchback.txt for the POC report.
  */
 class TestLanceFetchBack {
 
@@ -65,7 +65,7 @@ class TestLanceFetchBack {
             .config("spark.sql.catalog.local.type", "hadoop")
             .config("spark.sql.catalog.local.warehouse", warehouse.toUri().toString())
             .getOrCreate();
-    report = Path.of("target", "lance-poc-fetchback.txt");
+    report = Path.of("build", "lance-poc-fetchback.txt");
   }
 
   @AfterAll
