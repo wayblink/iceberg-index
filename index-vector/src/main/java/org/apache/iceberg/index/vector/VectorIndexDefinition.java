@@ -23,6 +23,7 @@ import org.apache.iceberg.index.IndexDefinition;
 import org.apache.iceberg.relocated.com.google.common.base.MoreObjects;
 import org.apache.iceberg.relocated.com.google.common.base.Preconditions;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableMap;
+import org.apache.iceberg.relocated.com.google.common.collect.Maps;
 
 /**
  * The vector index definition: the indexed source field, the vector dimension, and the similarity
@@ -83,9 +84,6 @@ public final class VectorIndexDefinition implements IndexDefinition {
   private final Metric metric;
   private final VectorStructure structure;
   private final VectorQuantizer quantizer;
-  private final int maxM;
-  private final int efConstruction;
-  private final int efSearch;
   private final Map<String, String> properties;
 
   private VectorIndexDefinition(
@@ -94,27 +92,17 @@ public final class VectorIndexDefinition implements IndexDefinition {
       Metric metric,
       VectorStructure structure,
       VectorQuantizer quantizer,
-      int maxM,
-      int efConstruction,
-      int efSearch,
       Map<String, String> properties) {
     Preconditions.checkArgument(fieldId > 0, "Invalid vector field id: %s", fieldId);
     Preconditions.checkArgument(dimension > 0, "Invalid vector dimension: %s", dimension);
     Preconditions.checkNotNull(metric, "Vector index metric is null");
     Preconditions.checkNotNull(structure, "Vector index structure is null");
     Preconditions.checkNotNull(quantizer, "Vector index quantizer is null");
-    Preconditions.checkArgument(maxM > 0, "Invalid HNSW m: %s", maxM);
-    Preconditions.checkArgument(
-        efConstruction > 0, "Invalid HNSW efConstruction: %s", efConstruction);
-    Preconditions.checkArgument(efSearch > 0, "Invalid HNSW efSearch: %s", efSearch);
     this.fieldId = fieldId;
     this.dimension = dimension;
     this.metric = metric;
     this.structure = structure;
     this.quantizer = quantizer;
-    this.maxM = maxM;
-    this.efConstruction = efConstruction;
-    this.efSearch = efSearch;
     this.properties = ImmutableMap.copyOf(properties);
   }
 
@@ -150,21 +138,6 @@ public final class VectorIndexDefinition implements IndexDefinition {
     return quantizer;
   }
 
-  /** Returns the HNSW graph degree parameter; only used in {@link VectorStructure#HNSW}. */
-  public int maxM() {
-    return maxM;
-  }
-
-  /** Returns the HNSW construction ef parameter; only used in {@link VectorStructure#HNSW}. */
-  public int efConstruction() {
-    return efConstruction;
-  }
-
-  /** Returns the HNSW search ef parameter; only used in {@link VectorStructure#HNSW}. */
-  public int efSearch() {
-    return efSearch;
-  }
-
   public Map<String, String> properties() {
     return properties;
   }
@@ -183,9 +156,6 @@ public final class VectorIndexDefinition implements IndexDefinition {
         && metric == that.metric
         && structure == that.structure
         && quantizer == that.quantizer
-        && maxM == that.maxM
-        && efConstruction == that.efConstruction
-        && efSearch == that.efSearch
         && properties.equals(that.properties);
   }
 
@@ -196,9 +166,6 @@ public final class VectorIndexDefinition implements IndexDefinition {
     result = 31 * result + metric.hashCode();
     result = 31 * result + structure.hashCode();
     result = 31 * result + quantizer.hashCode();
-    result = 31 * result + Integer.hashCode(maxM);
-    result = 31 * result + Integer.hashCode(efConstruction);
-    result = 31 * result + Integer.hashCode(efSearch);
     result = 31 * result + properties.hashCode();
     return result;
   }
@@ -211,9 +178,6 @@ public final class VectorIndexDefinition implements IndexDefinition {
         .add("metric", metric)
         .add("structure", structure)
         .add("quantizer", quantizer)
-        .add("maxM", maxM)
-        .add("efConstruction", efConstruction)
-        .add("efSearch", efSearch)
         .add("properties", properties)
         .toString();
   }
@@ -224,10 +188,7 @@ public final class VectorIndexDefinition implements IndexDefinition {
     private Metric metric;
     private VectorStructure structure = VectorStructure.FLAT;
     private VectorQuantizer quantizer = VectorQuantizer.NONE;
-    private int maxM = 16;
-    private int efConstruction = 200;
-    private int efSearch = 50;
-    private final ImmutableMap.Builder<String, String> properties = ImmutableMap.builder();
+    private final Map<String, String> properties = Maps.newLinkedHashMap();
 
     private Builder() {}
 
@@ -258,22 +219,22 @@ public final class VectorIndexDefinition implements IndexDefinition {
       return this;
     }
 
-    /** Sets the HNSW graph degree; defaults to 16. */
+    /**
+     * Sets the HNSW graph degree. Sugar over {@link #property}, so that a caller with a number in
+     * hand does not have to turn it into a string.
+     */
     public Builder maxM(int newMaxM) {
-      this.maxM = newMaxM;
-      return this;
+      return property(HnswOptions.MAX_M, Integer.toString(newMaxM));
     }
 
-    /** Sets the HNSW construction ef; defaults to 200. */
+    /** Sets the HNSW construction ef; sugar over {@link #property}. */
     public Builder efConstruction(int newEfConstruction) {
-      this.efConstruction = newEfConstruction;
-      return this;
+      return property(HnswOptions.EF_CONSTRUCTION, Integer.toString(newEfConstruction));
     }
 
-    /** Sets the HNSW search ef; defaults to 50. */
+    /** Sets the HNSW search ef; sugar over {@link #property}. */
     public Builder efSearch(int newEfSearch) {
-      this.efSearch = newEfSearch;
-      return this;
+      return property(HnswOptions.EF_SEARCH, Integer.toString(newEfSearch));
     }
 
     public Builder property(String key, String value) {
@@ -293,15 +254,7 @@ public final class VectorIndexDefinition implements IndexDefinition {
       Preconditions.checkNotNull(structure, "Vector index structure is not set");
       Preconditions.checkNotNull(quantizer, "Vector index quantizer is not set");
       return new VectorIndexDefinition(
-          fieldId,
-          dimension,
-          metric,
-          structure,
-          quantizer,
-          maxM,
-          efConstruction,
-          efSearch,
-          properties.build());
+          fieldId, dimension, metric, structure, quantizer, ImmutableMap.copyOf(properties));
     }
   }
 }

@@ -22,11 +22,13 @@ import com.fasterxml.jackson.core.JsonGenerator;
 import com.fasterxml.jackson.databind.JsonNode;
 import java.io.IOException;
 import java.util.Locale;
+import java.util.Map;
 import org.apache.iceberg.index.IndexAdapter;
 import org.apache.iceberg.index.IndexDefinition;
 import org.apache.iceberg.index.IndexType;
 import org.apache.iceberg.index.IndexTypes;
 import org.apache.iceberg.relocated.com.google.common.base.Preconditions;
+import org.apache.iceberg.relocated.com.google.common.collect.Maps;
 import org.apache.iceberg.util.JsonUtil;
 
 /**
@@ -65,9 +67,7 @@ public final class VectorIndexType implements IndexType {
             .metric(parseMetric(JsonUtil.getString(METRIC, node)))
             .structure(parseStructure(node))
             .quantizer(parseQuantizer(node))
-            .maxM(JsonUtil.getInt(M, node))
-            .efConstruction(JsonUtil.getInt(EF_CONSTRUCTION, node))
-            .efSearch(JsonUtil.getInt(EF_SEARCH, node));
+            .properties(legacyHnswOptions(node));
     if (node.has(PROPERTIES)) {
       builder.properties(JsonUtil.getStringMap(PROPERTIES, node));
     }
@@ -87,9 +87,6 @@ public final class VectorIndexType implements IndexType {
     generator.writeStringField(METRIC, vectorDefinition.metric().name());
     generator.writeStringField(STRUCTURE, vectorDefinition.structure().name());
     generator.writeStringField(QUANTIZER, vectorDefinition.quantizer().name());
-    generator.writeNumberField(M, vectorDefinition.maxM());
-    generator.writeNumberField(EF_CONSTRUCTION, vectorDefinition.efConstruction());
-    generator.writeNumberField(EF_SEARCH, vectorDefinition.efSearch());
     if (!vectorDefinition.properties().isEmpty()) {
       JsonUtil.writeStringMap(PROPERTIES, vectorDefinition.properties(), generator);
     }
@@ -110,6 +107,28 @@ public final class VectorIndexType implements IndexType {
     } catch (IllegalArgumentException e) {
       throw new IllegalArgumentException("Unsupported vector index metric: " + value, e);
     }
+  }
+
+  /**
+   * Reads the algorithm parameters a definition used to keep as fields of its own.
+   *
+   * <p>They now live in the property map with the rest of the structure's options, so a definition
+   * written before the move has to be read into it. Note the keys: the old top level key for the
+   * graph degree was {@code m}, while the property is {@code max-m}.
+   */
+  private static Map<String, String> legacyHnswOptions(JsonNode node) {
+    Map<String, String> options = Maps.newLinkedHashMap();
+    if (node.has(M)) {
+      options.put(HnswOptions.MAX_M, Integer.toString(JsonUtil.getInt(M, node)));
+    }
+    if (node.has(EF_CONSTRUCTION)) {
+      options.put(
+          HnswOptions.EF_CONSTRUCTION, Integer.toString(JsonUtil.getInt(EF_CONSTRUCTION, node)));
+    }
+    if (node.has(EF_SEARCH)) {
+      options.put(HnswOptions.EF_SEARCH, Integer.toString(JsonUtil.getInt(EF_SEARCH, node)));
+    }
+    return options;
   }
 
   private static VectorIndexDefinition.VectorStructure parseStructure(JsonNode node) {

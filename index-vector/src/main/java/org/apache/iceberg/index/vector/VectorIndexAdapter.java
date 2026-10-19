@@ -84,8 +84,10 @@ public final class VectorIndexAdapter implements IndexAdapter, java.io.Serializa
   private static final int HNSW_PAYLOAD_VERSION = 2;
 
   private final VectorIndexDefinition definition;
+  private final HnswOptions hnswOptions;
 
   public VectorIndexAdapter(VectorIndexDefinition definition) {
+    Preconditions.checkNotNull(definition, "Vector index definition is null");
     // the structure and the quantizer are recorded so a definition can express what is coming, but
     // this build only has a kernel for these. Failing here beats building an index nothing can
     // search, and the message says what is available.
@@ -101,7 +103,10 @@ public final class VectorIndexAdapter implements IndexAdapter, java.io.Serializa
         "Unsupported vector quantizer %s: this build stores vectors as they are (%s)",
         definition.quantizer(),
         VectorQuantizer.NONE);
-    this.definition = Preconditions.checkNotNull(definition, "Vector index definition is null");
+    this.definition = definition;
+    // the options are read once, so a malformed one fails when the adapter is made rather than in
+    // the middle of a build or a search
+    this.hnswOptions = HnswOptions.from(definition.properties());
   }
 
   @Override
@@ -290,9 +295,9 @@ public final class VectorIndexAdapter implements IndexAdapter, java.io.Serializa
     List<IndexEntry> materialized = Lists.newArrayList(entries);
     HnswIndex<Long, float[], VectorItem, Float> index =
         HnswIndex.newBuilder(definition.dimension(), distanceFunction(), materialized.size())
-            .withM(definition.maxM())
-            .withEfConstruction(definition.efConstruction())
-            .withEf(definition.efSearch())
+            .withM(hnswOptions.maxM())
+            .withEfConstruction(hnswOptions.efConstruction())
+            .withEf(hnswOptions.efSearch())
             .build();
 
     List<VectorItem> items = Lists.newArrayListWithCapacity(materialized.size());
@@ -386,7 +391,7 @@ public final class VectorIndexAdapter implements IndexAdapter, java.io.Serializa
       // the load happens here, once per payload, and the returned searcher only traverses
       HnswIndex<Long, float[], VectorItem, Float> index =
           HnswIndex.load(new ByteArrayInputStream(graph));
-      index.setEf(definition.efSearch());
+      index.setEf(hnswOptions.efSearch());
 
       return (query, topK) -> {
         Preconditions.checkArgument(topK >= 0, "Top-k must be non-negative: %s", topK);
@@ -398,7 +403,7 @@ public final class VectorIndexAdapter implements IndexAdapter, java.io.Serializa
         // the graph is asked for as many candidates as its search width allows, not just for the
         // number asked for: the traversal is the same either way, and a wider candidate set gives
         // the exact re-scoring below more true neighbours to order
-        int candidates = Math.max(topK, definition.efSearch());
+        int candidates = Math.max(topK, hnswOptions.efSearch());
         List<SearchResult<VectorItem, Float>> nearest = index.findNearest(queryVector, candidates);
 
         List<IndexSearchResult> results = Lists.newArrayList();

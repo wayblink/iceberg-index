@@ -50,9 +50,10 @@ class TestVectorIndexDefinitionSerialization {
         (VectorIndexDefinition) TYPE.parseDefinition(node(hnswLegacyJson()));
     assertThat(hnsw.structure()).isEqualTo(VectorStructure.HNSW);
     assertThat(hnsw.quantizer()).isEqualTo(VectorQuantizer.NONE);
-    assertThat(hnsw.maxM()).isEqualTo(8);
-    assertThat(hnsw.efConstruction()).isEqualTo(100);
-    assertThat(hnsw.efSearch()).isEqualTo(64);
+    HnswOptions options = HnswOptions.from(hnsw.properties());
+    assertThat(options.maxM()).isEqualTo(8);
+    assertThat(options.efConstruction()).isEqualTo(100);
+    assertThat(options.efSearch()).isEqualTo(64);
   }
 
   @Test
@@ -96,6 +97,74 @@ class TestVectorIndexDefinitionSerialization {
             .build();
     assertThat(definition.structure()).isEqualTo(VectorStructure.FLAT);
     assertThat(definition.quantizer()).isEqualTo(VectorQuantizer.NONE);
+  }
+
+  @Test
+  public void writesTheHnswOptionsAsPropertiesRatherThanFields() {
+    VectorIndexDefinition definition =
+        VectorIndexDefinition.builder()
+            .fieldId(2)
+            .dimension(8)
+            .metric(VectorIndexDefinition.Metric.EUCLIDEAN)
+            .structure(VectorStructure.HNSW)
+            .maxM(32)
+            .efConstruction(400)
+            .efSearch(120)
+            .build();
+
+    String json =
+        JsonUtil.generate(
+            generator -> {
+              generator.writeStartObject();
+              TYPE.writeDefinition(definition, generator);
+              generator.writeEndObject();
+            },
+            false);
+
+    // the options are properties of the definition, not fields of its own
+    assertThat(json).contains("\"properties\"");
+    assertThat(json).contains("\"max-m\":\"32\"");
+    assertThat(json).contains("\"ef-construction\":\"400\"");
+    assertThat(json).contains("\"ef-search\":\"120\"");
+    assertThat(json).doesNotContain("\"m\"");
+    assertThat(json).doesNotContain("\"ef-construction\":400");
+
+    assertThat(TYPE.parseDefinition(node(json))).isEqualTo(definition);
+  }
+
+  @Test
+  public void rejectsAnOptionTheStructureDoesNotRead() {
+    // nlist belongs to IVF, not to HNSW; taking it silently would hide a definition that asks for
+    // something the structure it named cannot do
+    assertThatThrownBy(
+            () ->
+                new VectorIndexAdapter(
+                    VectorIndexDefinition.builder()
+                        .fieldId(2)
+                        .dimension(8)
+                        .metric(VectorIndexDefinition.Metric.EUCLIDEAN)
+                        .structure(VectorStructure.HNSW)
+                        .property("nlist", "128")
+                        .build()))
+        .isInstanceOf(IllegalArgumentException.class)
+        .hasMessageContaining("Unknown HNSW option nlist")
+        .hasMessageContaining("max-m");
+  }
+
+  @Test
+  public void rejectsAnOptionThatIsNotANumber() {
+    assertThatThrownBy(
+            () ->
+                new VectorIndexAdapter(
+                    VectorIndexDefinition.builder()
+                        .fieldId(2)
+                        .dimension(8)
+                        .metric(VectorIndexDefinition.Metric.EUCLIDEAN)
+                        .structure(VectorStructure.HNSW)
+                        .property(HnswOptions.MAX_M, "sixteen")
+                        .build()))
+        .isInstanceOf(IllegalArgumentException.class)
+        .hasMessageContaining("HNSW option max-m is not a number: sixteen");
   }
 
   @Test

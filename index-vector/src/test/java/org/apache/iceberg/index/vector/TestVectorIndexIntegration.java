@@ -87,7 +87,7 @@ class TestVectorIndexIntegration {
     assertThat(parsed).isEqualTo(hnsw);
     VectorIndexDefinition definition = (VectorIndexDefinition) parsed.definition();
     assertThat(definition.structure()).isEqualTo(VectorIndexDefinition.VectorStructure.HNSW);
-    assertThat(definition.maxM()).isEqualTo(8);
+    assertThat(HnswOptions.from(definition.properties()).maxM()).isEqualTo(8);
 
     // exact mode writes entry-bearing files; HNSW mode writes auxiliary files
     assertThat(indexFileOf(fileIO, exact).kind()).isEqualTo(Kind.ENTRY_BEARING);
