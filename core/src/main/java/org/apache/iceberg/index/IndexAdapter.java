@@ -21,7 +21,9 @@ package org.apache.iceberg.index;
 import java.nio.ByteBuffer;
 import java.util.Comparator;
 import java.util.List;
+import java.util.Set;
 import javax.annotation.Nullable;
+import org.apache.iceberg.relocated.com.google.common.collect.ImmutableSet;
 import org.apache.iceberg.relocated.com.google.common.collect.Lists;
 
 /**
@@ -212,6 +214,27 @@ public interface IndexAdapter {
    */
   default boolean isTableWide() {
     return false;
+  }
+
+  /**
+   * The blob types this adapter reads in the entry-bearing role.
+   *
+   * <p>{@link #entryBlobType()} is the one it writes. A type that has been renamed keeps the old
+   * name here, because a reader that only recognised the new name would skip every index written
+   * before the change rather than read it.
+   */
+  default Set<String> readableEntryBlobTypes() {
+    return ImmutableSet.of(entryBlobType());
+  }
+
+  /**
+   * The blob types this adapter reads in the auxiliary role, empty when it writes none.
+   *
+   * <p>{@link #auxiliaryBlobType()} is the one it writes; see {@link #readableEntryBlobTypes} for
+   * why the old names stay.
+   */
+  default Set<String> readableAuxiliaryBlobTypes() {
+    return writesAuxiliaryFiles() ? ImmutableSet.of(auxiliaryBlobType()) : ImmutableSet.of();
   }
 
   /** Encodes entries into the payload of an auxiliary index file. */

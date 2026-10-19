@@ -40,6 +40,9 @@ public final class TestingIndexAdapter implements IndexAdapter {
   /** Blob type of testing index files. */
   public static final String BLOB_TYPE = "iceberg-testing-entries-v1";
 
+  /** Stands in for the name this adapter wrote before a rename; it must still be readable. */
+  public static final String LEGACY_BLOB_TYPE = "iceberg-testing-entries-renamed-away";
+
   private static final int FORMAT_VERSION = 1;
 
   private final TestingIndexDefinition definition;
@@ -68,6 +71,18 @@ public final class TestingIndexAdapter implements IndexAdapter {
   @Override
   public String entryBlobType() {
     return BLOB_TYPE;
+  }
+
+  /**
+   * A second name this adapter can read, standing in for the name it wrote before a rename.
+   *
+   * <p>The reader filters on the blob type, so a rename is only safe if the old name is still read;
+   * a test can record a file under this name to check that it is.
+   */
+  @Override
+  public java.util.Set<String> readableEntryBlobTypes() {
+    return org.apache.iceberg.relocated.com.google.common.collect.ImmutableSet.of(
+        BLOB_TYPE, LEGACY_BLOB_TYPE);
   }
 
   @Override

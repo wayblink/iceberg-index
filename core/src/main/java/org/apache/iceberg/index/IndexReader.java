@@ -96,20 +96,20 @@ public final class IndexReader {
       return searchCorrelated(adapter, manifestList, query);
     }
 
-    String auxiliaryBlobType = adapter.auxiliaryBlobType();
+    Set<String> auxiliaryBlobTypes = adapter.readableAuxiliaryBlobTypes();
+    Set<String> entryBlobTypes = java.util.Collections.singleton(adapter.entryBlobType());
     List<IndexSearchResult> results = Lists.newArrayList();
     for (IndexManifestList.ManifestRef ref : manifestList.manifests()) {
       IndexManifest manifest = readManifest(ref.location());
       for (IndexFile indexFile : manifest.indexFiles()) {
         if (indexFile.kind() == IndexFile.Kind.ENTRY_BEARING
-            && adapter.entryBlobType().equals(indexFile.blobType())) {
-          IndexBlob blob = readBlob(indexFile.location(), adapter.entryBlobType());
+            && entryBlobTypes.contains(indexFile.blobType())) {
+          IndexBlob blob = readBlob(indexFile.location(), indexFile.blobType());
           results.addAll(
               adapter.search(ByteBuffer.wrap(blob.payload()), query.payload(), query.topK()));
-        } else if (auxiliaryBlobType != null
-            && indexFile.kind() == IndexFile.Kind.AUXILIARY
-            && auxiliaryBlobType.equals(indexFile.blobType())) {
-          IndexBlob blob = readBlob(indexFile.location(), auxiliaryBlobType);
+        } else if (indexFile.kind() == IndexFile.Kind.AUXILIARY
+            && auxiliaryBlobTypes.contains(indexFile.blobType())) {
+          IndexBlob blob = readBlob(indexFile.location(), indexFile.blobType());
           results.addAll(
               adapter.searchAuxiliary(
                   ByteBuffer.wrap(blob.payload()), query.payload(), query.topK()));
@@ -162,17 +162,17 @@ public final class IndexReader {
     IndexAdapter adapter =
         IndexTypes.fromType(metadata.indexType()).createAdapter(metadata.definition());
 
-    String auxiliaryBlobType = adapter.auxiliaryBlobType();
+    Set<String> auxiliaryBlobTypes = adapter.readableAuxiliaryBlobTypes();
+    Set<String> entryBlobTypes = java.util.Collections.singleton(adapter.entryBlobType());
     List<IndexFile> files = Lists.newArrayList();
     for (IndexManifestList.ManifestRef ref : readManifestList(snapshot).manifests()) {
       for (IndexFile indexFile : readManifest(ref.location()).indexFiles()) {
         boolean carriesEntries =
             indexFile.kind() == IndexFile.Kind.ENTRY_BEARING
-                && adapter.entryBlobType().equals(indexFile.blobType());
+                && entryBlobTypes.contains(indexFile.blobType());
         boolean carriesAuxiliary =
-            auxiliaryBlobType != null
-                && indexFile.kind() == IndexFile.Kind.AUXILIARY
-                && auxiliaryBlobType.equals(indexFile.blobType());
+            indexFile.kind() == IndexFile.Kind.AUXILIARY
+                && auxiliaryBlobTypes.contains(indexFile.blobType());
         if (carriesEntries || carriesAuxiliary) {
           files.add(indexFile);
         }
@@ -205,20 +205,20 @@ public final class IndexReader {
 
   /** The payloads of every index file of a snapshot, by kind. */
   private Payloads readPayloads(IndexAdapter adapter, IndexManifestList manifestList) {
-    String auxiliaryBlobType = adapter.auxiliaryBlobType();
+    Set<String> auxiliaryBlobTypes = adapter.readableAuxiliaryBlobTypes();
+    Set<String> entryBlobTypes = java.util.Collections.singleton(adapter.entryBlobType());
     List<ByteBuffer> entryPayloads = Lists.newArrayList();
     List<ByteBuffer> auxiliaryPayloads = Lists.newArrayList();
     for (IndexManifestList.ManifestRef ref : manifestList.manifests()) {
       IndexManifest manifest = readManifest(ref.location());
       for (IndexFile indexFile : manifest.indexFiles()) {
         if (indexFile.kind() == IndexFile.Kind.ENTRY_BEARING
-            && adapter.entryBlobType().equals(indexFile.blobType())) {
-          IndexBlob blob = readBlob(indexFile.location(), adapter.entryBlobType());
+            && entryBlobTypes.contains(indexFile.blobType())) {
+          IndexBlob blob = readBlob(indexFile.location(), indexFile.blobType());
           entryPayloads.add(ByteBuffer.wrap(blob.payload()));
-        } else if (auxiliaryBlobType != null
-            && indexFile.kind() == IndexFile.Kind.AUXILIARY
-            && auxiliaryBlobType.equals(indexFile.blobType())) {
-          IndexBlob blob = readBlob(indexFile.location(), auxiliaryBlobType);
+        } else if (indexFile.kind() == IndexFile.Kind.AUXILIARY
+            && auxiliaryBlobTypes.contains(indexFile.blobType())) {
+          IndexBlob blob = readBlob(indexFile.location(), indexFile.blobType());
           auxiliaryPayloads.add(ByteBuffer.wrap(blob.payload()));
         }
         // other payload types are skipped for forward compatibility

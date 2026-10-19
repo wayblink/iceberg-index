@@ -41,6 +41,7 @@ import org.apache.iceberg.index.vector.VectorIndexDefinition.VectorQuantizer;
 import org.apache.iceberg.index.vector.VectorIndexDefinition.VectorStructure;
 import org.apache.iceberg.relocated.com.google.common.base.Preconditions;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableList;
+import org.apache.iceberg.relocated.com.google.common.collect.ImmutableSet;
 import org.apache.iceberg.relocated.com.google.common.collect.Lists;
 import org.apache.iceberg.relocated.com.google.common.collect.Sets;
 
@@ -66,8 +67,17 @@ public final class VectorIndexAdapter implements IndexAdapter, java.io.Serializa
   /** Blob type of entry-bearing vector index files. */
   public static final String ENTRY_BLOB_TYPE = "iceberg-vector-entries-v1";
 
+  /**
+   * The auxiliary blob type written before the algorithm was taken out of the name.
+   *
+   * <p>A blob type says which role a payload plays, not which algorithm wrote it: the algorithm is
+   * in the payload header, where it can grow without renaming a type that indexes already on tables
+   * are recorded under.
+   */
+  public static final String LEGACY_AUXILIARY_BLOB_TYPE = "iceberg-vector-hnsw-v1";
+
   /** Blob type of auxiliary HNSW index files. */
-  public static final String AUXILIARY_BLOB_TYPE = "iceberg-vector-hnsw-v1";
+  public static final String AUXILIARY_BLOB_TYPE = "iceberg-vector-auxiliary-v1";
 
   /**
    * Building an index hands the library a listener to call as the work proceeds. There is nothing
@@ -80,8 +90,19 @@ public final class VectorIndexAdapter implements IndexAdapter, java.io.Serializa
   private static final int NEVER_REPORT_PROGRESS = Integer.MAX_VALUE;
 
   private static final int VALUE_FORMAT_VERSION = 1;
-  private static final int ENTRIES_FORMAT_VERSION = 2;
-  private static final int HNSW_PAYLOAD_VERSION = 2;
+
+  /** The kernel that writes the auxiliary payloads, named in their header. */
+  private static final String HNSW_KERNEL = "hnswlib";
+
+  /** The kernel that writes the entry payloads, named in their header. */
+  private static final String SCAN_KERNEL = "bruteforce";
+
+  private static final int KERNEL_FORMAT_VERSION = 1;
+
+  /** The header written before the kernel was named; only this adapter ever wrote it. */
+  private static final int LEGACY_PAYLOAD_HEADER = 2;
+
+  private static final int PAYLOAD_HEADER = 3;
 
   private final VectorIndexDefinition definition;
   private final HnswOptions hnswOptions;
@@ -112,6 +133,13 @@ public final class VectorIndexAdapter implements IndexAdapter, java.io.Serializa
   @Override
   public IndexDefinition definition() {
     return definition;
+  }
+
+  @Override
+  public java.util.Set<String> readableAuxiliaryBlobTypes() {
+    // both names, because an index written before the rename is still on tables and a reader that
+    // only knew the new name would skip it rather than read it
+    return ImmutableSet.of(AUXILIARY_BLOB_TYPE, LEGACY_AUXILIARY_BLOB_TYPE);
   }
 
   @Override
@@ -172,7 +200,7 @@ public final class VectorIndexAdapter implements IndexAdapter, java.io.Serializa
     Preconditions.checkNotNull(entries, "Index entries are null");
     ByteArrayOutputStream bytes = new ByteArrayOutputStream();
     try (DataOutputStream out = new DataOutputStream(bytes)) {
-      out.writeInt(ENTRIES_FORMAT_VERSION);
+      writePayloadHeader(out, SCAN_KERNEL);
       // the data files an entry points at are written once, as a dictionary, and an entry refers to
       // one by position: a path is long and every entry of a file repeats it, which is most of the
       // payload once there are many entries per file
@@ -202,11 +230,7 @@ public final class VectorIndexAdapter implements IndexAdapter, java.io.Serializa
     Preconditions.checkNotNull(payload, "Entry payload is null");
     byte[] bytes = toBytes(payload);
     try (DataInputStream in = new DataInputStream(new ByteArrayInputStream(bytes))) {
-      int version = in.readInt();
-      Preconditions.checkArgument(
-          version == ENTRIES_FORMAT_VERSION,
-          "Unsupported vector entries format version: %s",
-          version);
+      readPayloadHeader(in, SCAN_KERNEL, "entries");
       int dataFileCount = in.readInt();
       Preconditions.checkArgument(
           dataFileCount >= 0, "Invalid vector data file count: %s", dataFileCount);
@@ -243,6 +267,59 @@ public final class VectorIndexAdapter implements IndexAdapter, java.io.Serializa
    * The distinct data files of the given entries, in the order they first appear, which is the
    * dictionary an encoded entry refers to its data file by.
    */
+  /**
+   * Writes which kernel produced a payload and in which of its formats.
+   *
+   * <p>The blob type says the payload's role, not its algorithm, so the payload has to say who
+   * wrote it: a reader that meets one from a kernel it does not have can then say so, instead of
+   * failing somewhere inside a decode with a version number that means nothing to the caller.
+   */
+  private static void writePayloadHeader(DataOutputStream out, String kernel) throws IOException {
+    out.writeInt(PAYLOAD_HEADER);
+    out.writeUTF(kernel);
+    out.writeInt(KERNEL_FORMAT_VERSION);
+  }
+
+  /**
+   * Reads and checks a payload header, accepting the one written before kernels were named.
+   *
+   * <p>The old form is a bare format version, and only this adapter ever wrote it, so it is
+   * attributed to the kernel that writes that role now.
+   */
+  private static void readPayloadHeader(DataInputStream in, String expectedKernel, String role)
+      throws IOException {
+    int version = in.readInt();
+    if (version == LEGACY_PAYLOAD_HEADER) {
+      return;
+    }
+
+    Preconditions.checkArgument(
+        version == PAYLOAD_HEADER,
+        "Unsupported %s payload format version: %s (this build reads %s and %s)",
+        role,
+        version,
+        LEGACY_PAYLOAD_HEADER,
+        PAYLOAD_HEADER);
+
+    String kernel = in.readUTF();
+    int kernelVersion = in.readInt();
+    Preconditions.checkArgument(
+        expectedKernel.equals(kernel),
+        "%s payload was written by kernel %s version %s; this build reads kernel %s version %s",
+        role,
+        kernel,
+        kernelVersion,
+        expectedKernel,
+        KERNEL_FORMAT_VERSION);
+    Preconditions.checkArgument(
+        kernelVersion == KERNEL_FORMAT_VERSION,
+        "%s payload was written by kernel %s version %s; this build reads version %s",
+        role,
+        kernel,
+        kernelVersion,
+        KERNEL_FORMAT_VERSION);
+  }
+
   private static List<String> dataFilesOf(List<IndexEntry> entries) {
     Set<String> dataFiles = Sets.newLinkedHashSet();
     for (IndexEntry entry : entries) {
@@ -332,7 +409,7 @@ public final class VectorIndexAdapter implements IndexAdapter, java.io.Serializa
 
     ByteArrayOutputStream payload = new ByteArrayOutputStream();
     try (DataOutputStream out = new DataOutputStream(payload)) {
-      out.writeInt(HNSW_PAYLOAD_VERSION);
+      writePayloadHeader(out, HNSW_KERNEL);
       byte[] graphBytes = graph.toByteArray();
       out.writeInt(graphBytes.length);
       out.write(graphBytes);
@@ -358,9 +435,7 @@ public final class VectorIndexAdapter implements IndexAdapter, java.io.Serializa
   public PreparedSearch prepareAuxiliary(ByteBuffer payload) {
     byte[] bytes = toBytes(payload);
     try (DataInputStream in = new DataInputStream(new ByteArrayInputStream(bytes))) {
-      int version = in.readInt();
-      Preconditions.checkArgument(
-          version == HNSW_PAYLOAD_VERSION, "Unsupported HNSW payload format version: %s", version);
+      readPayloadHeader(in, HNSW_KERNEL, "HNSW");
       int graphLength = in.readInt();
       Preconditions.checkArgument(graphLength >= 0, "Invalid HNSW graph length: %s", graphLength);
       byte[] graph = new byte[graphLength];

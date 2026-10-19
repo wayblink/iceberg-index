@@ -31,6 +31,108 @@ import org.junit.jupiter.api.Test;
 
 class TestVectorIndexAdapter {
 
+  /**
+   * Rewrites a payload's header into the form written before the kernel was named: a bare format
+   * version, then the body.
+   *
+   * <p>An index built by an earlier build is recorded with that form, so the reader has to accept
+   * it or every such index silently stops being readable.
+   */
+  private static ByteBuffer asLegacyPayload(ByteBuffer payload) {
+    byte[] bytes = new byte[payload.remaining()];
+    payload.duplicate().get(bytes);
+    java.nio.ByteBuffer buffer = java.nio.ByteBuffer.wrap(bytes);
+    int headerVersion = buffer.getInt();
+    assertThat(headerVersion).as("the header this helper rewrites").isEqualTo(3);
+    int kernelNameLength = buffer.getShort();
+    buffer.position(buffer.position() + kernelNameLength);
+    buffer.getInt(); // the kernel's own format version
+    byte[] body = new byte[buffer.remaining()];
+    buffer.get(body);
+
+    java.nio.ByteBuffer legacy = java.nio.ByteBuffer.allocate(4 + body.length);
+    legacy.putInt(2);
+    legacy.put(body);
+    legacy.flip();
+    return legacy;
+  }
+
+  @Test
+  public void readsPayloadsWrittenBeforeTheKernelWasNamed() {
+    VectorIndexAdapter adapter =
+        new VectorIndexAdapter(
+            VectorIndexDefinition.builder()
+                .fieldId(1)
+                .dimension(2)
+                .metric(VectorIndexDefinition.Metric.EUCLIDEAN)
+                .structure(VectorIndexDefinition.VectorStructure.HNSW)
+                .maxM(8)
+                .efConstruction(100)
+                .efSearch(64)
+                .build());
+
+    List<IndexEntry> entries =
+        Lists.newArrayList(
+            IndexEntry.of("data-1.parquet", 0, adapter.encodeVector(new float[] {1.0f, 0.0f})),
+            IndexEntry.of("data-2.parquet", 1, adapter.encodeVector(new float[] {0.0f, 1.0f})));
+
+    ByteBuffer query = adapter.encodeQuery(new float[] {1.0f, 0.1f});
+
+    // both roles, because both headers changed
+    ByteBuffer entryPayload = asLegacyPayload(adapter.encodeEntries(entries));
+    assertThat(adapter.decodeEntries(entryPayload))
+        .as("an entry payload from before the header named the kernel")
+        .hasSize(2);
+    assertThat(adapter.search(entryPayload, query, 1)).hasSize(1);
+
+    ByteBuffer auxiliaryPayload = asLegacyPayload(adapter.encodeAuxiliaryPayload(entries, 1));
+    assertThat(adapter.prepareAuxiliary(auxiliaryPayload).search(query, 1))
+        .as("an auxiliary payload from before the header named the kernel")
+        .hasSize(1);
+  }
+
+  @Test
+  public void refusesAPayloadFromAKernelItDoesNotHave() {
+    VectorIndexAdapter adapter =
+        new VectorIndexAdapter(
+            VectorIndexDefinition.builder()
+                .fieldId(1)
+                .dimension(2)
+                .metric(VectorIndexDefinition.Metric.EUCLIDEAN)
+                .structure(VectorIndexDefinition.VectorStructure.HNSW)
+                .build());
+
+    ByteBuffer entries =
+        adapter.encodeEntries(
+            Lists.newArrayList(
+                IndexEntry.of(
+                    "data-1.parquet", 0, adapter.encodeVector(new float[] {1.0f, 0.0f}))));
+
+    // replace the kernel name with one this build has no searcher for
+    byte[] bytes = new byte[entries.remaining()];
+    entries.duplicate().get(bytes);
+    java.nio.ByteBuffer buffer = java.nio.ByteBuffer.wrap(bytes);
+    buffer.getInt();
+    int nameLength = buffer.getShort();
+    String name =
+        new String(bytes, buffer.position(), nameLength, java.nio.charset.StandardCharsets.UTF_8);
+    int at = buffer.position();
+    byte[] replacement = "faiss".getBytes(java.nio.charset.StandardCharsets.UTF_8);
+    byte[] rewritten = new byte[bytes.length - nameLength + replacement.length];
+    System.arraycopy(bytes, 0, rewritten, 0, at - 2);
+    rewritten[at - 2] = (byte) ((replacement.length >> 8) & 0xFF);
+    rewritten[at - 1] = (byte) (replacement.length & 0xFF);
+    System.arraycopy(replacement, 0, rewritten, at, replacement.length);
+    System.arraycopy(
+        bytes, at + nameLength, rewritten, at + replacement.length, bytes.length - at - nameLength);
+
+    assertThat(name).isEqualTo("bruteforce");
+    assertThatThrownBy(() -> adapter.decodeEntries(java.nio.ByteBuffer.wrap(rewritten)))
+        .isInstanceOf(IllegalArgumentException.class)
+        .hasMessageContaining("written by kernel faiss")
+        .hasMessageContaining("this build reads kernel bruteforce");
+  }
+
   private final VectorIndexAdapter cosine = adapter(VectorIndexDefinition.Metric.COSINE);
 
   private static VectorIndexAdapter adapter(VectorIndexDefinition.Metric metric) {
@@ -177,7 +279,11 @@ class TestVectorIndexAdapter {
           .as("metric %s", metric)
           .isEqualTo(exact.search(entryPayload, query, 5));
       assertThat(hnsw.searchAuxiliary(auxiliary, query, 0)).isEmpty();
-      assertThat(hnsw.auxiliaryBlobType()).isEqualTo("iceberg-vector-hnsw-v1");
+      // the name says the payload's role, not the algorithm: the algorithm is in the payload header
+      assertThat(hnsw.auxiliaryBlobType()).isEqualTo("iceberg-vector-auxiliary-v1");
+      assertThat(hnsw.readableAuxiliaryBlobTypes())
+          .as("the name it used to write is still readable")
+          .contains("iceberg-vector-auxiliary-v1", "iceberg-vector-hnsw-v1");
       assertThat(hnsw.writesAuxiliaryFiles()).isTrue();
       assertThat(exact.writesAuxiliaryFiles()).isFalse();
     }
