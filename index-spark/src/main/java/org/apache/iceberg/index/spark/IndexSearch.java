@@ -126,14 +126,20 @@ public final class IndexSearch {
     // whole batch: each file is read and prepared once and searched once per query
     List<IndexQuery> indexQueries = Lists.newArrayListWithCapacity(queries.size());
     for (ByteBuffer query : queries) {
-      indexQueries.add(
-          IndexQuery.of(snapshot.sourceTableSnapshotId(), query.duplicate(), topK));
+      indexQueries.add(IndexQuery.of(snapshot.sourceTableSnapshotId(), query.duplicate(), topK));
     }
     List<List<IndexSearchResult>> hitsPerQuery =
         DistributedIndexSearch.searchBatch(spark, metadata, table, indexQueries);
 
+    // the hits are positions in the files the index was built from, but the rows are read from the
+    // table as it is now: a row deleted since the index was built must not be returned, and a file
+    // that is no longer part of the table leaves its hits without a row
+    long resolveSnapshotId =
+        table.currentSnapshot() != null
+            ? table.currentSnapshot().snapshotId()
+            : snapshot.sourceTableSnapshotId();
     Map<String, Map<Long, String>> rowsByFile =
-        resolveRows(spark, table, snapshot.sourceTableSnapshotId(), hitsPerQuery);
+        resolveRows(spark, table, resolveSnapshotId, hitsPerQuery);
 
     List<Row> rows = Lists.newArrayList();
     for (int queryId = 0; queryId < hitsPerQuery.size(); queryId++) {

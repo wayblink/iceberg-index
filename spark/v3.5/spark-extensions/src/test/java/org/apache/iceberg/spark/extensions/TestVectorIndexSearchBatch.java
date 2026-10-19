@@ -69,18 +69,73 @@ public class TestVectorIndexSearchBatch extends ExtensionsTestBase {
         "CALL %s.system.vector_search_batch(table => '%s', column => 'embedding', "
             + "queries => array('0.0,10.0', '10.0,0.0', '5.0,5.0'), k => 3)";
 
-    // cold: every index file is read and prepared for this one batch
-    List<Object[]> cold = sql(search, catalogName, tableName);
+    List<Object[]> uncached = sql(search, catalogName, tableName);
 
-    // warm: the payloads and their prepared structures come from the executor's cache, so the
-    // hits have to be the same rows in the same order
     spark.conf().set(CACHE_ENABLED, "true");
     try {
+      // cold: every index file is read and prepared for this batch, the first one with the cache on
+      List<Object[]> cold = sql(search, catalogName, tableName);
+      // warm: the payloads and their prepared structures come from the executor's cache, so the
+      // hits have to be the same rows in the same order
       List<Object[]> warm = sql(search, catalogName, tableName);
+      // the executor is this JVM here, so the second batch has to have come from the cache
+      assertThat(
+              org.apache.iceberg.index.spark.ExecutorIndexCacheProbe.stats().hits())
+          .isPositive();
       assertThat(warm).hasSameSizeAs(cold);
       for (int i = 0; i < cold.size(); i++) {
         assertThat(rowValues(warm.get(i))).isEqualTo(rowValues(cold.get(i)));
       }
+      for (int i = 0; i < uncached.size(); i++) {
+        assertThat(rowValues(warm.get(i))).isEqualTo(rowValues(uncached.get(i)));
+      }
+    } finally {
+      spark.conf().unset(CACHE_ENABLED);
+    }
+  }
+
+  @TestTemplate
+  public void cachedBatchSearchAppliesDeletes() {
+    String tableName = tableName("vectors_batch_cached_deletes_" + catalogName);
+    sql("CREATE TABLE %s (id bigint, embedding array<double>) USING iceberg", tableName);
+    sql(
+        "INSERT INTO %s SELECT id, array(CAST(id AS double), CAST(10 - id AS double)) "
+            + "FROM range(0, 20)",
+        tableName);
+    sql(
+        "CALL %s.system.build_vector_index("
+            + "table => '%s', column => 'embedding', dimension => 2, metric => 'euclidean')",
+        catalogName, tableName);
+
+    String search =
+        "CALL %s.system.vector_search_batch(table => '%s', column => 'embedding', "
+            + "queries => array('0.0,10.0', '10.0,0.0'), k => 5)";
+
+    sql("DELETE FROM %s WHERE id IN (0, 1, 10)", tableName);
+
+    List<Object[]> uncached = sql(search, catalogName, tableName);
+
+    spark.conf().set(CACHE_ENABLED, "true");
+    try {
+      // cold and warm: the same payloads, read once and then remembered, have to give the same
+      // rows, and neither may return a deleted one
+      List<Object[]> cold = sql(search, catalogName, tableName);
+      List<Object[]> warm = sql(search, catalogName, tableName);
+      for (List<Object[]> cached : java.util.Arrays.asList(cold, warm)) {
+        assertThat(cached).hasSameSizeAs(uncached);
+        for (int i = 0; i < uncached.size(); i++) {
+          assertThat(rowValues(cached.get(i))).isEqualTo(rowValues(uncached.get(i)));
+        }
+      }
+
+      // a position the delete removed has no row left to return, so the hit comes back without one
+      // rather than with the deleted row's values
+      List<Long> ids =
+          warm.stream()
+              .filter(row -> row[4] != null)
+              .map(row -> parseId((String) row[4]))
+              .collect(Collectors.toList());
+      assertThat(ids).doesNotContain(0L, 1L, 10L);
     } finally {
       spark.conf().unset(CACHE_ENABLED);
     }

@@ -158,13 +158,13 @@ final class ExecutorIndexCache {
       }
     }
 
-    long bytes() {
+    public long bytes() {
       return bytes;
     }
   }
 
   /** The counters an executor reports, so a run can say whether the cache did anything. */
-  static final class Stats {
+  public static final class Stats {
     private final long hits;
     private final long misses;
     private final long loads;
@@ -190,31 +190,31 @@ final class ExecutorIndexCache {
       this.entries = entries;
     }
 
-    long hits() {
+    public long hits() {
       return hits;
     }
 
-    long misses() {
+    public long misses() {
       return misses;
     }
 
-    long loads() {
+    public long loads() {
       return loads;
     }
 
-    long evictions() {
+    public long evictions() {
       return evictions;
     }
 
-    long skippedTooLarge() {
+    public long skippedTooLarge() {
       return skippedTooLarge;
     }
 
-    long bytes() {
+    public long bytes() {
       return bytes;
     }
 
-    long entries() {
+    public long entries() {
       return entries;
     }
 

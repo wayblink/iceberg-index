@@ -154,6 +154,9 @@ public final class DistributedIndexSearch {
     Broadcast<ExecutorIndexCache.Config> cacheRef =
         context.broadcast(ExecutorIndexCache.Config.from(spark));
     String cacheKey = cacheKey(adapter);
+    // captured by the task directly: an accumulator only reports through the copy it was created
+    // from, so a broadcast copy of it would update nothing
+    org.apache.spark.util.CollectionAccumulator<String> cacheReports = cacheReports(context, cacheRef.getValue());
 
     // the limit is captured as a primitive: the query itself is not serializable. One more than the
     // query asks for is kept, because that is what says whether there is another round to ask for.
@@ -204,9 +207,11 @@ public final class DistributedIndexSearch {
                             TimeUnit.MILLISECONDS.convert(
                                 System.nanoTime() - searchStart, TimeUnit.NANOSECONDS));
                       }
+                      reportCache(cacheReports);
                       return fileHits.iterator();
                     })
             .takeOrdered(localTopK, hitOrder(adapter));
+    printCacheReports(cacheReports);
 
     List<IndexSearchResult> hits = Lists.newArrayListWithCapacity(top.size());
     for (Tuple3<String, Long, Double> hit : top) {
@@ -281,6 +286,9 @@ public final class DistributedIndexSearch {
     Broadcast<ExecutorIndexCache.Config> cacheRef =
         context.broadcast(ExecutorIndexCache.Config.from(spark));
     String cacheKey = cacheKey(adapter);
+    // captured by the task directly: an accumulator only reports through the copy it was created
+    // from, so a broadcast copy of it would update nothing
+    org.apache.spark.util.CollectionAccumulator<String> cacheReports = cacheReports(context, cacheRef.getValue());
 
     // one more than the widest query asks for is kept per query, because that is what says whether
     // there is another round to ask for
@@ -338,6 +346,7 @@ public final class DistributedIndexSearch {
                             TimeUnit.MILLISECONDS.convert(
                                 System.nanoTime() - searchStart, TimeUnit.NANOSECONDS));
                       }
+                      reportCache(cacheReports);
                       return batchHits.iterator();
                     });
 
@@ -367,6 +376,7 @@ public final class DistributedIndexSearch {
         fileHits
             .aggregateByKey(Lists.<Tuple3<String, Long, Double>>newArrayList(), mergeHit, mergeHits)
             .collectAsMap();
+    printCacheReports(cacheReports);
 
     for (int queryId = 0; queryId < queries.size(); queryId++) {
       List<Tuple3<String, Long, Double>> top =
@@ -428,6 +438,54 @@ public final class DistributedIndexSearch {
     byte[] bytes = new byte[buffer.remaining()];
     buffer.duplicate().get(bytes);
     return bytes;
+  }
+
+  /**
+   * Collects what each executor's cache holds, when asked to.
+   *
+   * <p>The counters belong to the executor, so they travel back through an accumulator: an
+   * executor's own output is in a pod log that a run may not keep, and its logger is often above
+   * the level a counter line is written at.
+   */
+  private static org.apache.spark.util.CollectionAccumulator<String> cacheReports(
+      JavaSparkContext context, ExecutorIndexCache.Config config) {
+    // reported whenever the cache is on: a run that turned it on is a run that wants to know
+    // whether it did anything
+    return config.enabled() ? context.sc().collectionAccumulator() : null;
+  }
+
+  static void reportCache(org.apache.spark.util.CollectionAccumulator<String> reports) {
+    if (reports != null) {
+      String executor;
+      try {
+        executor =
+            org.apache.spark.SparkEnv.get() != null
+                ? org.apache.spark.SparkEnv.get().executorId()
+                : "driver";
+      } catch (RuntimeException e) {
+        executor = "unknown";
+      }
+
+      reports.add(executor + ": " + ExecutorIndexCache.get().stats());
+    }
+  }
+
+  /** Prints the last report of each executor, once the action that produced them has finished. */
+  private static void printCacheReports(
+      org.apache.spark.util.CollectionAccumulator<String> reports) {
+    if (reports == null) {
+      return;
+    }
+
+    Map<String, String> lastByExecutor = new java.util.LinkedHashMap<>();
+    for (String report : reports.value()) {
+      int colon = report.indexOf(':');
+      lastByExecutor.put(colon < 0 ? report : report.substring(0, colon), report);
+    }
+
+    for (String report : lastByExecutor.values()) {
+      System.out.println("CACHE " + report);
+    }
   }
 
   /** Reads the payload of one index file, which an executor reads whole. */
