@@ -37,6 +37,7 @@ import org.apache.iceberg.index.IndexQuery;
 import org.apache.iceberg.index.IndexReader;
 import org.apache.iceberg.index.IndexSearchResult;
 import org.apache.iceberg.index.IndexSnapshot;
+import org.apache.iceberg.index.vector.VectorIndexDefinition.VectorStructure;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
@@ -58,9 +59,10 @@ class TestVectorIndexIntegration {
     LocalFileIO fileIO = new LocalFileIO();
     float[] query = {0.95f, 0.05f};
 
-    IndexMetadata exact = build(fileIO, tempDir, "exact", VectorIndexDefinition.IndexMode.EXACT);
+    IndexMetadata exact =
+        build(fileIO, tempDir, "exact", VectorIndexDefinition.VectorStructure.FLAT);
     IndexReader exactReader = new IndexReader(exact, fileIO);
-    VectorIndexAdapter exactAdapter = adapter(VectorIndexDefinition.IndexMode.EXACT);
+    VectorIndexAdapter exactAdapter = adapter(VectorIndexDefinition.VectorStructure.FLAT);
     List<IndexSearchResult> exactResults =
         exactReader.search(IndexQuery.of(10, exactAdapter.encodeQuery(query), 2));
     assertThat(exactResults)
@@ -70,9 +72,9 @@ class TestVectorIndexIntegration {
     assertThat(exactReader.uncoveredDataFiles(10, List.of("data-1.parquet", "data-9.parquet")))
         .containsExactly("data-9.parquet");
 
-    IndexMetadata hnsw = build(fileIO, tempDir, "hnsw", VectorIndexDefinition.IndexMode.HNSW);
+    IndexMetadata hnsw = build(fileIO, tempDir, "hnsw", VectorIndexDefinition.VectorStructure.HNSW);
     IndexReader hnswReader = new IndexReader(hnsw, fileIO);
-    VectorIndexAdapter hnswAdapter = adapter(VectorIndexDefinition.IndexMode.HNSW);
+    VectorIndexAdapter hnswAdapter = adapter(VectorIndexDefinition.VectorStructure.HNSW);
     List<IndexSearchResult> hnswResults =
         hnswReader.search(IndexQuery.of(10, hnswAdapter.encodeQuery(query), 2));
     assertThat(hnswResults)
@@ -84,7 +86,7 @@ class TestVectorIndexIntegration {
     IndexMetadata parsed = IndexMetadataParser.fromJson(IndexMetadataParser.toJson(hnsw));
     assertThat(parsed).isEqualTo(hnsw);
     VectorIndexDefinition definition = (VectorIndexDefinition) parsed.definition();
-    assertThat(definition.mode()).isEqualTo(VectorIndexDefinition.IndexMode.HNSW);
+    assertThat(definition.structure()).isEqualTo(VectorIndexDefinition.VectorStructure.HNSW);
     assertThat(definition.maxM()).isEqualTo(8);
 
     // exact mode writes entry-bearing files; HNSW mode writes auxiliary files
@@ -95,8 +97,8 @@ class TestVectorIndexIntegration {
   }
 
   private static IndexMetadata build(
-      LocalFileIO fileIO, Path tempDir, String indexUuid, VectorIndexDefinition.IndexMode mode) {
-    VectorIndexAdapter adapter = adapter(mode);
+      LocalFileIO fileIO, Path tempDir, String indexUuid, VectorStructure structure) {
+    VectorIndexAdapter adapter = adapter(structure);
     IndexMetadata metadata =
         IndexMetadata.builder()
             .indexUuid(indexUuid)
@@ -108,7 +110,7 @@ class TestVectorIndexIntegration {
                     .fieldId(1)
                     .dimension(2)
                     .metric(VectorIndexDefinition.Metric.COSINE)
-                    .mode(mode)
+                    .structure(structure)
                     .maxM(8)
                     .efConstruction(100)
                     .efSearch(64)
@@ -132,13 +134,13 @@ class TestVectorIndexIntegration {
                 .build());
   }
 
-  private static VectorIndexAdapter adapter(VectorIndexDefinition.IndexMode mode) {
+  private static VectorIndexAdapter adapter(VectorStructure structure) {
     return new VectorIndexAdapter(
         VectorIndexDefinition.builder()
             .fieldId(1)
             .dimension(2)
             .metric(VectorIndexDefinition.Metric.COSINE)
-            .mode(mode)
+            .structure(structure)
             .maxM(8)
             .efConstruction(100)
             .efSearch(64)

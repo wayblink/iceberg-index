@@ -48,6 +48,8 @@ public final class VectorIndexType implements IndexType {
   private static final String EF_CONSTRUCTION = "ef-construction";
   private static final String EF_SEARCH = "ef-search";
   private static final String PROPERTIES = "properties";
+  private static final String STRUCTURE = "structure";
+  private static final String QUANTIZER = "quantizer";
 
   @Override
   public String type() {
@@ -61,7 +63,8 @@ public final class VectorIndexType implements IndexType {
             .fieldId(JsonUtil.getInt(FIELD_ID, node))
             .dimension(JsonUtil.getInt(DIMENSION, node))
             .metric(parseMetric(JsonUtil.getString(METRIC, node)))
-            .mode(parseMode(JsonUtil.getString(MODE, node)))
+            .structure(parseStructure(node))
+            .quantizer(parseQuantizer(node))
             .maxM(JsonUtil.getInt(M, node))
             .efConstruction(JsonUtil.getInt(EF_CONSTRUCTION, node))
             .efSearch(JsonUtil.getInt(EF_SEARCH, node));
@@ -82,7 +85,8 @@ public final class VectorIndexType implements IndexType {
     generator.writeNumberField(FIELD_ID, vectorDefinition.fieldId());
     generator.writeNumberField(DIMENSION, vectorDefinition.dimension());
     generator.writeStringField(METRIC, vectorDefinition.metric().name());
-    generator.writeStringField(MODE, vectorDefinition.mode().name());
+    generator.writeStringField(STRUCTURE, vectorDefinition.structure().name());
+    generator.writeStringField(QUANTIZER, vectorDefinition.quantizer().name());
     generator.writeNumberField(M, vectorDefinition.maxM());
     generator.writeNumberField(EF_CONSTRUCTION, vectorDefinition.efConstruction());
     generator.writeNumberField(EF_SEARCH, vectorDefinition.efSearch());
@@ -108,11 +112,44 @@ public final class VectorIndexType implements IndexType {
     }
   }
 
-  private static VectorIndexDefinition.IndexMode parseMode(String value) {
+  private static VectorIndexDefinition.VectorStructure parseStructure(JsonNode node) {
+    if (node.has(STRUCTURE)) {
+      String value = JsonUtil.getString(STRUCTURE, node);
+      try {
+        return VectorIndexDefinition.VectorStructure.valueOf(value.toUpperCase(Locale.ROOT));
+      } catch (IllegalArgumentException e) {
+        throw new IllegalArgumentException("Unsupported vector index structure: " + value, e);
+      }
+    }
+
+    // definitions written before the two axes were separated name a single mode; EXACT meant a flat
+    // scan and HNSW meant a graph, both with the vectors stored as they were
+    if (node.has(MODE)) {
+      switch (JsonUtil.getString(MODE, node).toUpperCase(Locale.ROOT)) {
+        case "EXACT":
+          return VectorIndexDefinition.VectorStructure.FLAT;
+        case "HNSW":
+          return VectorIndexDefinition.VectorStructure.HNSW;
+        default:
+          throw new IllegalArgumentException(
+              "Unsupported vector index mode: " + JsonUtil.getString(MODE, node));
+      }
+    }
+
+    return VectorIndexDefinition.VectorStructure.FLAT;
+  }
+
+  private static VectorIndexDefinition.VectorQuantizer parseQuantizer(JsonNode node) {
+    if (!node.has(QUANTIZER)) {
+      // a definition written before the two axes were separated never quantized
+      return VectorIndexDefinition.VectorQuantizer.NONE;
+    }
+
+    String value = JsonUtil.getString(QUANTIZER, node);
     try {
-      return VectorIndexDefinition.IndexMode.valueOf(value.toUpperCase(Locale.ROOT));
+      return VectorIndexDefinition.VectorQuantizer.valueOf(value.toUpperCase(Locale.ROOT));
     } catch (IllegalArgumentException e) {
-      throw new IllegalArgumentException("Unsupported vector index mode: " + value, e);
+      throw new IllegalArgumentException("Unsupported vector index quantizer: " + value, e);
     }
   }
 }

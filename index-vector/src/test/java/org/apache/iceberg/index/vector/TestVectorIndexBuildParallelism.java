@@ -87,7 +87,7 @@ class TestVectorIndexBuildParallelism {
             .fieldId(1)
             .dimension(DIMENSION)
             .metric(VectorIndexDefinition.Metric.COSINE)
-            .mode(VectorIndexDefinition.IndexMode.HNSW)
+            .structure(VectorIndexDefinition.VectorStructure.HNSW)
             .maxM(16)
             .efConstruction(200)
             .efSearch(200)

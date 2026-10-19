@@ -31,21 +31,44 @@ import org.apache.iceberg.relocated.com.google.common.collect.ImmutableMap;
  * <p>This is the first {@link IndexDefinition} implementation; other index types (scalar, text, and
  * so on) follow the same pattern without adding new top-level concepts.
  *
- * <p>The {@link IndexMode} selects the search strategy: {@link IndexMode#EXACT} stores the entries
- * as an entry-bearing payload and scans it linearly, while {@link IndexMode#HNSW} additionally
- * builds an HNSW graph over the entries and stores it as an auxiliary payload for approximate
- * search.
+ * <p>How the vectors are organised ({@link VectorStructure}) and how each one is stored ({@link
+ * VectorQuantizer}) are two separate choices. Every structure can be paired with every quantizer in
+ * principle, so they are two fields rather than one enumeration: a single one would have to grow to
+ * one value per combination.
  */
 public final class VectorIndexDefinition implements IndexDefinition {
 
   private static final long serialVersionUID = 1L;
 
-  /** Search strategies supported by the vector index. */
-  public enum IndexMode {
-    /** Exact linear scan over the entry payload. */
-    EXACT,
-    /** Approximate search over an HNSW graph stored as an auxiliary payload. */
-    HNSW
+  /** How the vectors of a table are organised for search. */
+  public enum VectorStructure {
+    /**
+     * Every vector in one list, scanned in full; also the reference the others are measured
+     * against.
+     */
+    FLAT,
+    /** A navigable small-world graph over the vectors. */
+    HNSW,
+    /**
+     * Vectors clustered around centroids, searched by visiting the nearest lists. Not implemented.
+     */
+    IVF
+  }
+
+  /**
+   * How a vector is stored, which is independent of how the vectors are organised.
+   *
+   * <p>A quantizer trades accuracy of the stored form for size. <strong>Not implemented
+   * yet:</strong> no kernel applies {@link #RABITQ}, so asking for it fails rather than silently
+   * falling back.
+   */
+  public enum VectorQuantizer {
+    /** The vector as it was given. */
+    NONE,
+    /**
+     * One bit per dimension, scored approximately and re-ranked against the rows. Not implemented.
+     */
+    RABITQ
   }
 
   /** Similarity and distance metrics supported by the vector index. */
@@ -58,7 +81,8 @@ public final class VectorIndexDefinition implements IndexDefinition {
   private final int fieldId;
   private final int dimension;
   private final Metric metric;
-  private final IndexMode mode;
+  private final VectorStructure structure;
+  private final VectorQuantizer quantizer;
   private final int maxM;
   private final int efConstruction;
   private final int efSearch;
@@ -68,7 +92,8 @@ public final class VectorIndexDefinition implements IndexDefinition {
       int fieldId,
       int dimension,
       Metric metric,
-      IndexMode mode,
+      VectorStructure structure,
+      VectorQuantizer quantizer,
       int maxM,
       int efConstruction,
       int efSearch,
@@ -76,7 +101,8 @@ public final class VectorIndexDefinition implements IndexDefinition {
     Preconditions.checkArgument(fieldId > 0, "Invalid vector field id: %s", fieldId);
     Preconditions.checkArgument(dimension > 0, "Invalid vector dimension: %s", dimension);
     Preconditions.checkNotNull(metric, "Vector index metric is null");
-    Preconditions.checkNotNull(mode, "Vector index mode is null");
+    Preconditions.checkNotNull(structure, "Vector index structure is null");
+    Preconditions.checkNotNull(quantizer, "Vector index quantizer is null");
     Preconditions.checkArgument(maxM > 0, "Invalid HNSW m: %s", maxM);
     Preconditions.checkArgument(
         efConstruction > 0, "Invalid HNSW efConstruction: %s", efConstruction);
@@ -84,7 +110,8 @@ public final class VectorIndexDefinition implements IndexDefinition {
     this.fieldId = fieldId;
     this.dimension = dimension;
     this.metric = metric;
-    this.mode = mode;
+    this.structure = structure;
+    this.quantizer = quantizer;
     this.maxM = maxM;
     this.efConstruction = efConstruction;
     this.efSearch = efSearch;
@@ -113,22 +140,27 @@ public final class VectorIndexDefinition implements IndexDefinition {
     return metric;
   }
 
-  /** Returns the search strategy selected for this index. */
-  public IndexMode mode() {
-    return mode;
+  /** Returns how the vectors are organised. */
+  public VectorStructure structure() {
+    return structure;
   }
 
-  /** Returns the HNSW graph degree parameter; only used in {@link IndexMode#HNSW}. */
+  /** Returns how each vector is stored. */
+  public VectorQuantizer quantizer() {
+    return quantizer;
+  }
+
+  /** Returns the HNSW graph degree parameter; only used in {@link VectorStructure#HNSW}. */
   public int maxM() {
     return maxM;
   }
 
-  /** Returns the HNSW construction ef parameter; only used in {@link IndexMode#HNSW}. */
+  /** Returns the HNSW construction ef parameter; only used in {@link VectorStructure#HNSW}. */
   public int efConstruction() {
     return efConstruction;
   }
 
-  /** Returns the HNSW search ef parameter; only used in {@link IndexMode#HNSW}. */
+  /** Returns the HNSW search ef parameter; only used in {@link VectorStructure#HNSW}. */
   public int efSearch() {
     return efSearch;
   }
@@ -149,7 +181,8 @@ public final class VectorIndexDefinition implements IndexDefinition {
     return fieldId == that.fieldId
         && dimension == that.dimension
         && metric == that.metric
-        && mode == that.mode
+        && structure == that.structure
+        && quantizer == that.quantizer
         && maxM == that.maxM
         && efConstruction == that.efConstruction
         && efSearch == that.efSearch
@@ -161,7 +194,8 @@ public final class VectorIndexDefinition implements IndexDefinition {
     int result = Integer.hashCode(fieldId);
     result = 31 * result + Integer.hashCode(dimension);
     result = 31 * result + metric.hashCode();
-    result = 31 * result + mode.hashCode();
+    result = 31 * result + structure.hashCode();
+    result = 31 * result + quantizer.hashCode();
     result = 31 * result + Integer.hashCode(maxM);
     result = 31 * result + Integer.hashCode(efConstruction);
     result = 31 * result + Integer.hashCode(efSearch);
@@ -175,7 +209,8 @@ public final class VectorIndexDefinition implements IndexDefinition {
         .add("fieldId", fieldId)
         .add("dimension", dimension)
         .add("metric", metric)
-        .add("mode", mode)
+        .add("structure", structure)
+        .add("quantizer", quantizer)
         .add("maxM", maxM)
         .add("efConstruction", efConstruction)
         .add("efSearch", efSearch)
@@ -187,7 +222,8 @@ public final class VectorIndexDefinition implements IndexDefinition {
     private Integer fieldId;
     private Integer dimension;
     private Metric metric;
-    private IndexMode mode = IndexMode.EXACT;
+    private VectorStructure structure = VectorStructure.FLAT;
+    private VectorQuantizer quantizer = VectorQuantizer.NONE;
     private int maxM = 16;
     private int efConstruction = 200;
     private int efSearch = 50;
@@ -210,9 +246,15 @@ public final class VectorIndexDefinition implements IndexDefinition {
       return this;
     }
 
-    /** Sets the search strategy; defaults to {@link IndexMode#EXACT}. */
-    public Builder mode(IndexMode newMode) {
-      this.mode = newMode;
+    /** Sets how the vectors are organised; defaults to {@link VectorStructure#FLAT}. */
+    public Builder structure(VectorStructure newStructure) {
+      this.structure = newStructure;
+      return this;
+    }
+
+    /** Sets how each vector is stored; defaults to {@link VectorQuantizer#NONE}. */
+    public Builder quantizer(VectorQuantizer newQuantizer) {
+      this.quantizer = newQuantizer;
       return this;
     }
 
@@ -248,9 +290,18 @@ public final class VectorIndexDefinition implements IndexDefinition {
       Preconditions.checkNotNull(fieldId, "Vector field id is not set");
       Preconditions.checkNotNull(dimension, "Vector dimension is not set");
       Preconditions.checkNotNull(metric, "Vector index metric is not set");
-      Preconditions.checkNotNull(mode, "Vector index mode is not set");
+      Preconditions.checkNotNull(structure, "Vector index structure is not set");
+      Preconditions.checkNotNull(quantizer, "Vector index quantizer is not set");
       return new VectorIndexDefinition(
-          fieldId, dimension, metric, mode, maxM, efConstruction, efSearch, properties.build());
+          fieldId,
+          dimension,
+          metric,
+          structure,
+          quantizer,
+          maxM,
+          efConstruction,
+          efSearch,
+          properties.build());
     }
   }
 }

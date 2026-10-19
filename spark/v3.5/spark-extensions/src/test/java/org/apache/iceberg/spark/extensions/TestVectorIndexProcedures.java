@@ -45,6 +45,7 @@ public class TestVectorIndexProcedures extends ExtensionsTestBase {
     sql("DROP TABLE IF EXISTS %s", tableName("vectors_exists_" + catalogName));
     sql("DROP TABLE IF EXISTS %s", tableName("vectors_missing_" + catalogName));
     sql("DROP TABLE IF EXISTS %s", tableName("vectors_dimension_" + catalogName));
+    sql("DROP TABLE IF EXISTS %s", tableName("vectors_structure_" + catalogName));
   }
 
   @TestTemplate
@@ -83,7 +84,9 @@ public class TestVectorIndexProcedures extends ExtensionsTestBase {
     assertThat(((Number) listOutput.get(0)[5]).longValue()).isPositive();
     assertThat(((Number) listOutput.get(0)[6]).longValue()).isEqualTo(6L);
     // type-specific parameters live in the definition JSON
-    assertThat(listOutput.get(0)[7].toString()).contains("\"mode\":\"EXACT\"");
+    assertThat(listOutput.get(0)[7].toString())
+        .contains("\"structure\":\"FLAT\"")
+        .contains("\"quantizer\":\"NONE\"");
     assertThat(listOutput.get(0)[7].toString()).contains("\"metric\":\"COSINE\"");
     assertThat(listOutput.get(0)[7].toString()).contains("\"dimension\":2");
 
@@ -109,6 +112,57 @@ public class TestVectorIndexProcedures extends ExtensionsTestBase {
   }
 
   @TestTemplate
+  public void testStructureAndQuantizerParameters() {
+    String tableName = tableName("vectors_structure_" + catalogName);
+    sql("CREATE TABLE %s (id bigint, embedding array<double>) USING iceberg", tableName);
+    sql("INSERT INTO %s VALUES (1, array(1.0, 0.0)), (2, array(0.0, 1.0))", tableName);
+
+    // structure says the same thing the mode parameter used to, and quantizer defaults to none
+    List<Object[]> built =
+        sql(
+            "CALL %s.system.build_vector_index(table => '%s', column => 'embedding', dimension => 2, structure => 'HNSW', ef_search => 64)",
+            catalogName, tableName);
+    assertThat(built).hasSize(1);
+
+    List<Object[]> listed =
+        sql("CALL %s.system.list_indexes(table => '%s')", catalogName, tableName);
+    assertThat(listed.get(0)[7].toString()).contains("\"structure\":\"HNSW\"");
+    assertThat(listed.get(0)[7].toString()).contains("\"quantizer\":\"NONE\"");
+  }
+
+  @TestTemplate
+  public void testRefusesAStructureNothingSearchesYet() {
+    String tableName = tableName("vectors_structure_" + catalogName);
+    sql("CREATE TABLE %s (id bigint, embedding array<double>) USING iceberg", tableName);
+    sql("INSERT INTO %s VALUES (1, array(1.0, 0.0)), (2, array(0.0, 1.0))", tableName);
+
+    // IVF is a structure a definition may name, but no kernel implements it, so the build says so
+    // rather than leaving behind an index nothing can search
+    assertThatThrownBy(
+            () ->
+                sql(
+                    "CALL %s.system.build_vector_index(table => '%s', column => 'embedding', dimension => 2, structure => 'IVF')",
+                    catalogName, tableName))
+        .isInstanceOf(IllegalArgumentException.class)
+        .hasMessageContaining("Unsupported vector structure IVF");
+  }
+
+  @TestTemplate
+  public void testRefusesBothModeAndStructure() {
+    String tableName = tableName("vectors_structure_" + catalogName);
+    sql("CREATE TABLE %s (id bigint, embedding array<double>) USING iceberg", tableName);
+    sql("INSERT INTO %s VALUES (1, array(1.0, 0.0)), (2, array(0.0, 1.0))", tableName);
+
+    assertThatThrownBy(
+            () ->
+                sql(
+                    "CALL %s.system.build_vector_index(table => '%s', column => 'embedding', dimension => 2, mode => 'EXACT', structure => 'HNSW')",
+                    catalogName, tableName))
+        .isInstanceOf(IllegalArgumentException.class)
+        .hasMessageContaining("not both");
+  }
+
+  @TestTemplate
   public void testBuildVectorIndexInHnswMode() {
     String tableName = tableName("vectors_hnsw_" + catalogName);
     sql("CREATE TABLE %s (id bigint, embedding array<double>) USING iceberg", tableName);
@@ -121,7 +175,7 @@ public class TestVectorIndexProcedures extends ExtensionsTestBase {
     List<Object[]> listOutput =
         sql("CALL %s.system.list_indexes(table => '%s')", catalogName, tableName);
     assertThat(listOutput).hasSize(1);
-    assertThat(listOutput.get(0)[7].toString()).contains("\"mode\":\"HNSW\"");
+    assertThat(listOutput.get(0)[7].toString()).contains("\"structure\":\"HNSW\"");
 
     List<Object[]> searchOutput =
         sql(

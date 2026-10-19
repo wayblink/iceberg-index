@@ -23,8 +23,8 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 import java.nio.ByteBuffer;
 import java.util.List;
-import org.apache.iceberg.index.IndexEntry;
 import org.apache.iceberg.index.IndexAdapter;
+import org.apache.iceberg.index.IndexEntry;
 import org.apache.iceberg.index.IndexSearchResult;
 import org.apache.iceberg.relocated.com.google.common.collect.Lists;
 import org.junit.jupiter.api.Test;
@@ -44,7 +44,7 @@ class TestVectorIndexAdapter {
             .fieldId(1)
             .dimension(2)
             .metric(metric)
-            .mode(VectorIndexDefinition.IndexMode.HNSW)
+            .structure(VectorIndexDefinition.VectorStructure.HNSW)
             .maxM(8)
             .efConstruction(100)
             .efSearch(64)

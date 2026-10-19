@@ -31,7 +31,7 @@ import org.apache.iceberg.index.IndexSearchResult
 import org.apache.iceberg.index.vector.VectorIndexAdapter
 import org.apache.iceberg.index.vector.VectorIndexDefinition
 import org.apache.iceberg.index.vector.VectorDistance
-import org.apache.iceberg.index.vector.VectorIndexDefinition.IndexMode
+import org.apache.iceberg.index.vector.VectorIndexDefinition.VectorStructure
 import org.apache.iceberg.index.vector.VectorIndexDefinition.Metric
 import org.apache.iceberg.index.spark.{DistributedIndexSearch, IndexEntries, VectorIndexes}
 import org.apache.iceberg.spark.SparkSchemaUtil
@@ -148,7 +148,7 @@ case class RewriteVectorSearch(spark: SparkSession) extends Rule[LogicalPlan] {
     // an exact index is the vector column repacked with a row reference, and searching it walks
     // every entry, which is the same work as scanning the table, over a payload that is larger than
     // the column it repacks. Rewriting would make the query slower, so the scan is left alone.
-    if (definition.mode() == IndexMode.EXACT) {
+    if (definition.structure() == VectorStructure.FLAT) {
       logger.warn(
         "Index of column {} of table {} is exact, which searches every entry like a scan does, "
           + "so scanning",

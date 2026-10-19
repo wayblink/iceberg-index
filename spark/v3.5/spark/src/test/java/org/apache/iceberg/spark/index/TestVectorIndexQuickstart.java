@@ -173,7 +173,7 @@ class TestVectorIndexQuickstart {
                         .fieldId(2)
                         .dimension(2)
                         .metric(Metric.COSINE)
-                        .mode(VectorIndexDefinition.IndexMode.HNSW)
+                        .structure(VectorIndexDefinition.VectorStructure.HNSW)
                         .build())
                 .build());
     IndexMetadata hnswBuilt =

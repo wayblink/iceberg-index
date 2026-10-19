@@ -37,6 +37,8 @@ import org.apache.iceberg.index.IndexAdapter;
 import org.apache.iceberg.index.IndexDefinition;
 import org.apache.iceberg.index.IndexEntry;
 import org.apache.iceberg.index.IndexSearchResult;
+import org.apache.iceberg.index.vector.VectorIndexDefinition.VectorQuantizer;
+import org.apache.iceberg.index.vector.VectorIndexDefinition.VectorStructure;
 import org.apache.iceberg.relocated.com.google.common.base.Preconditions;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableList;
 import org.apache.iceberg.relocated.com.google.common.collect.Lists;
@@ -50,11 +52,12 @@ import org.apache.iceberg.relocated.com.google.common.collect.Sets;
  * entry: data file, row position, payload length, payload bytes]}. Both encodings are versioned so
  * they can evolve independently of the container and the metadata model.
  *
- * <p>Search is exact (linear scan) by default. In {@link VectorIndexDefinition.IndexMode#HNSW}
- * mode, the adapter also builds an HNSW graph over the entries and stores it as an auxiliary
- * payload: {@code [format version][graph length][serialized graph][mapping from item id to row
- * reference]}. Approximate search loads the graph, retrieves candidates, and re-scores them with
- * the exact metric, so result scores are identical to exact search regardless of the graph.
+ * <p>Search is exact (linear scan) by default. In {@link
+ * VectorIndexDefinition.VectorStructure#HNSW} mode, the adapter also builds an HNSW graph over the
+ * entries and stores it as an auxiliary payload: {@code [format version][graph length][serialized
+ * graph][mapping from item id to row reference]}. Approximate search loads the graph, retrieves
+ * candidates, and re-scores them with the exact metric, so result scores are identical to exact
+ * search regardless of the graph.
  */
 public final class VectorIndexAdapter implements IndexAdapter, java.io.Serializable {
 
@@ -83,6 +86,21 @@ public final class VectorIndexAdapter implements IndexAdapter, java.io.Serializa
   private final VectorIndexDefinition definition;
 
   public VectorIndexAdapter(VectorIndexDefinition definition) {
+    // the structure and the quantizer are recorded so a definition can express what is coming, but
+    // this build only has a kernel for these. Failing here beats building an index nothing can
+    // search, and the message says what is available.
+    Preconditions.checkArgument(
+        definition.structure() == VectorStructure.FLAT
+            || definition.structure() == VectorStructure.HNSW,
+        "Unsupported vector structure %s: this build searches %s and %s",
+        definition.structure(),
+        VectorStructure.FLAT,
+        VectorStructure.HNSW);
+    Preconditions.checkArgument(
+        definition.quantizer() == VectorQuantizer.NONE,
+        "Unsupported vector quantizer %s: this build stores vectors as they are (%s)",
+        definition.quantizer(),
+        VectorQuantizer.NONE);
     this.definition = Preconditions.checkNotNull(definition, "Vector index definition is null");
   }
 
@@ -103,7 +121,7 @@ public final class VectorIndexAdapter implements IndexAdapter, java.io.Serializa
 
   @Override
   public boolean writesAuxiliaryFiles() {
-    return definition.mode() == VectorIndexDefinition.IndexMode.HNSW;
+    return definition.structure() == VectorIndexDefinition.VectorStructure.HNSW;
   }
 
   /** Encodes a vector value as an entry payload or query payload. */
@@ -243,7 +261,8 @@ public final class VectorIndexAdapter implements IndexAdapter, java.io.Serializa
       for (IndexEntry entry : entries) {
         float[] vector = decodeVector(entry.payload(), "Entry");
         results.add(
-            IndexSearchResult.of(entry.dataFile(), entry.rowPosition(), score(queryVector, vector)));
+            IndexSearchResult.of(
+                entry.dataFile(), entry.rowPosition(), score(queryVector, vector)));
       }
 
       results.sort(resultComparator());
@@ -387,7 +406,8 @@ public final class VectorIndexAdapter implements IndexAdapter, java.io.Serializa
           int id = Math.toIntExact(result.item().id());
           Preconditions.checkArgument(
               id >= 0 && id < mappingCount, "HNSW result id out of range: %s", id);
-          // re-score with the exact metric, on the stored vector, so a score is the one exact search
+          // re-score with the exact metric, on the stored vector, so a score is the one exact
+          // search
           // would give
           results.add(
               IndexSearchResult.of(
@@ -395,7 +415,8 @@ public final class VectorIndexAdapter implements IndexAdapter, java.io.Serializa
         }
 
         // the candidates come back in the order the graph ranked them, which is not necessarily the
-        // order of the exact scores, so the re-scored results are ordered by those before truncating
+        // order of the exact scores, so the re-scored results are ordered by those before
+        // truncating
         results.sort(resultComparator());
         return results.size() > topK ? Lists.newArrayList(results.subList(0, topK)) : results;
       };

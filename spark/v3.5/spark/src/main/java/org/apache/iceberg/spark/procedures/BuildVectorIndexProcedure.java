@@ -25,8 +25,10 @@ import org.apache.iceberg.index.IndexSnapshot;
 import org.apache.iceberg.index.SidecarIndexCatalog;
 import org.apache.iceberg.index.spark.SparkIndexBuilder;
 import org.apache.iceberg.index.vector.VectorIndexDefinition;
-import org.apache.iceberg.index.vector.VectorIndexDefinition.IndexMode;
 import org.apache.iceberg.index.vector.VectorIndexDefinition.Metric;
+import org.apache.iceberg.index.vector.VectorIndexDefinition.VectorQuantizer;
+import org.apache.iceberg.index.vector.VectorIndexDefinition.VectorStructure;
+import org.apache.iceberg.relocated.com.google.common.base.Preconditions;
 import org.apache.iceberg.spark.procedures.SparkProcedures.ProcedureBuilder;
 import org.apache.spark.sql.catalyst.InternalRow;
 import org.apache.spark.sql.connector.catalog.TableCatalog;
@@ -54,8 +56,15 @@ class BuildVectorIndexProcedure extends BaseProcedure {
       requiredInParameter("dimension", DataTypes.IntegerType);
   private static final ProcedureParameter METRIC_PARAM =
       optionalInParameter("metric", DataTypes.StringType);
+  private static final ProcedureParameter STRUCTURE_PARAM =
+      optionalInParameter("structure", DataTypes.StringType);
+  private static final ProcedureParameter QUANTIZER_PARAM =
+      optionalInParameter("quantizer", DataTypes.StringType);
+
+  /** Names the structure before it was separated from the quantizer; still accepted. */
   private static final ProcedureParameter MODE_PARAM =
       optionalInParameter("mode", DataTypes.StringType);
+
   private static final ProcedureParameter MAX_M_PARAM =
       optionalInParameter("max_m", DataTypes.IntegerType);
   private static final ProcedureParameter EF_CONSTRUCTION_PARAM =
@@ -70,6 +79,8 @@ class BuildVectorIndexProcedure extends BaseProcedure {
         COLUMN_PARAM,
         DIMENSION_PARAM,
         METRIC_PARAM,
+        STRUCTURE_PARAM,
+        QUANTIZER_PARAM,
         MODE_PARAM,
         MAX_M_PARAM,
         EF_CONSTRUCTION_PARAM,
@@ -117,7 +128,8 @@ class BuildVectorIndexProcedure extends BaseProcedure {
     String column = input.asString(COLUMN_PARAM);
     int dimension = input.asInt(DIMENSION_PARAM);
     Metric metric = parseMetric(input.asString(METRIC_PARAM, Metric.COSINE.name()));
-    IndexMode mode = parseMode(input.asString(MODE_PARAM, IndexMode.EXACT.name()));
+    VectorStructure structure = parseStructure(input, MODE_PARAM);
+    VectorQuantizer quantizer = parseQuantizer(input, QUANTIZER_PARAM);
     int maxM = input.asInt(MAX_M_PARAM, 16);
     int efConstruction = input.asInt(EF_CONSTRUCTION_PARAM, 200);
     int efSearch = input.asInt(EF_SEARCH_PARAM, 50);
@@ -152,7 +164,8 @@ class BuildVectorIndexProcedure extends BaseProcedure {
                               .fieldId(fieldId)
                               .dimension(dimension)
                               .metric(metric)
-                              .mode(mode)
+                              .structure(structure)
+                              .quantizer(quantizer)
                               .maxM(maxM)
                               .efConstruction(efConstruction)
                               .efSearch(efSearch)
@@ -184,11 +197,53 @@ class BuildVectorIndexProcedure extends BaseProcedure {
     }
   }
 
-  private static IndexMode parseMode(String mode) {
+  /**
+   * Reads the structure from the {@code structure} parameter, or from the {@code mode} parameter
+   * that named it before the two axes were separated: {@code EXACT} meant a flat scan and {@code
+   * HNSW} meant a graph.
+   */
+  private static VectorStructure parseStructure(ProcedureInput input, ProcedureParameter legacy) {
+    String structure = input.asString(STRUCTURE_PARAM, null);
+    String mode = input.asString(legacy, null);
+    Preconditions.checkArgument(
+        structure == null || mode == null,
+        "Pass either %s or %s, not both",
+        STRUCTURE_PARAM.name(),
+        legacy.name());
+
+    if (structure != null) {
+      try {
+        return VectorStructure.valueOf(structure.toUpperCase(java.util.Locale.ROOT));
+      } catch (IllegalArgumentException e) {
+        throw new IllegalArgumentException("Unsupported vector index structure: " + structure, e);
+      }
+    }
+
+    if (mode != null) {
+      switch (mode.toUpperCase(java.util.Locale.ROOT)) {
+        case "EXACT":
+          return VectorStructure.FLAT;
+        case "HNSW":
+          return VectorStructure.HNSW;
+        default:
+          throw new IllegalArgumentException("Unsupported vector index mode: " + mode);
+      }
+    }
+
+    return VectorStructure.FLAT;
+  }
+
+  private static VectorQuantizer parseQuantizer(
+      ProcedureInput input, ProcedureParameter parameter) {
+    String quantizer = input.asString(parameter, null);
+    if (quantizer == null) {
+      return VectorQuantizer.NONE;
+    }
+
     try {
-      return IndexMode.valueOf(mode.toUpperCase(java.util.Locale.ROOT));
+      return VectorQuantizer.valueOf(quantizer.toUpperCase(java.util.Locale.ROOT));
     } catch (IllegalArgumentException e) {
-      throw new IllegalArgumentException("Unknown mode: " + mode, e);
+      throw new IllegalArgumentException("Unsupported vector index quantizer: " + quantizer, e);
     }
   }
 
