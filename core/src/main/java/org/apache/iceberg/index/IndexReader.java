@@ -97,7 +97,7 @@ public final class IndexReader {
     }
 
     Set<String> auxiliaryBlobTypes = adapter.readableAuxiliaryBlobTypes();
-    Set<String> entryBlobTypes = java.util.Collections.singleton(adapter.entryBlobType());
+    Set<String> entryBlobTypes = adapter.readableEntryBlobTypes();
     List<IndexSearchResult> results = Lists.newArrayList();
     for (IndexManifestList.ManifestRef ref : manifestList.manifests()) {
       IndexManifest manifest = readManifest(ref.location());
@@ -163,7 +163,7 @@ public final class IndexReader {
         IndexTypes.fromType(metadata.indexType()).createAdapter(metadata.definition());
 
     Set<String> auxiliaryBlobTypes = adapter.readableAuxiliaryBlobTypes();
-    Set<String> entryBlobTypes = java.util.Collections.singleton(adapter.entryBlobType());
+    Set<String> entryBlobTypes = adapter.readableEntryBlobTypes();
     List<IndexFile> files = Lists.newArrayList();
     for (IndexManifestList.ManifestRef ref : readManifestList(snapshot).manifests()) {
       for (IndexFile indexFile : readManifest(ref.location()).indexFiles()) {
@@ -206,7 +206,7 @@ public final class IndexReader {
   /** The payloads of every index file of a snapshot, by kind. */
   private Payloads readPayloads(IndexAdapter adapter, IndexManifestList manifestList) {
     Set<String> auxiliaryBlobTypes = adapter.readableAuxiliaryBlobTypes();
-    Set<String> entryBlobTypes = java.util.Collections.singleton(adapter.entryBlobType());
+    Set<String> entryBlobTypes = adapter.readableEntryBlobTypes();
     List<ByteBuffer> entryPayloads = Lists.newArrayList();
     List<ByteBuffer> auxiliaryPayloads = Lists.newArrayList();
     for (IndexManifestList.ManifestRef ref : manifestList.manifests()) {
