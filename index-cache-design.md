@@ -190,3 +190,55 @@ prepared.search(query, topK);   // ← 内部串行化，见 §5
 1. **集群 A/B 实测**（本设计的验收 A1–A6）：10M 表上，冷启动 vs 同一 executor 上第 2 条查询，分段（索引搜索/回表/合并）报告。
 2. 真实字节上报：`VectorKernel`/kernel 还没重写 `estimatedBytes()`，目前按"payload × 2"记账。
 3. 指标上报到 driver（现在只有 `stats()` 与 DEBUG 日志；executor 侧需要保留 pod 才能读）。
+
+---
+
+## 13. 集群验证结果（A1–A4）：本地证明有效，集群未见收益
+
+### 已验证 ✅
+
+| 项 | 结果 |
+|---|---|
+| A5 正确性（无 delete） | `cachedBatchSearchReturnsTheSameHits`：冷/热/关缓存三者逐行相同 |
+| A5 正确性（有 delete） | `cachedBatchSearchAppliesDeletes`：**暴露并修掉了一个真 bug**（见下） |
+| A6 并发 | 单测：8 线程共享同一 entry，搜索不重叠；两线程同时请求只 prepare 一次 |
+| 缓存真的命中 | 集成测试断言 `stats().hits() > 0`（第一版测试顺序写错，把 cold 放在开启缓存之前，导致永远 miss——已修） |
+
+**顺带修掉的产品 bug**：`IndexSearch` 解析命中行时用的是**索引快照对应的表快照**，
+所以索引建好之后删除的行仍会带着数据返回。改为按**当前表快照**解析：命中仍来自索引快照，
+但被删除的位置返回"无 row 的 hit"（正是该 reader 文档里写的契约）。
+
+### 集群 A1–A4 ❌ 未见收益
+
+3 executors × 2 cores，10M `sift10m_lance_zstd`，38 个索引文件：
+
+| 测量 | 结果 |
+|---|---|
+| COLD（缓存首次） | 7821 ms |
+| WARM（同 query 第 2 次） | 7589 ms |
+| WARM2 | 7653 ms |
+| 100 条流 | min 6852 / P50 7107 / P95 7359 ms |
+| planning（`indexFiles`） | 8–66 ms |
+
+**没有加速**。而本地已证明缓存命中，所以两种解释尚未区分：
+1. 集群上缓存没命中（配置/类加载/键不一致）；
+2. 命中了，但 `prepare` 不是那 ~1 秒的主体。
+
+### 关键的环境发现（决定了后续怎么做）
+
+| 发现 | 证据 |
+|---|---|
+| `spark.driver.extraJavaOptions` 在 k8s **cluster 模式被忽略** | 埋点属性从未到达 driver JVM |
+| `--driver-java-options` 在该集群同样未生效 | 同上 |
+| executor 的 `System.err`/INFO 日志读不到 | pod 日志里搜不到我们打印的行 |
+| **Spark task 本身只要 1.5–2.5 ms** | 空 38-task 作业 60 ms（热） |
+| 单查询索引搜索 ∝ `ceil(文件数/slot 数)` | 6 slot 6.9 s，12 slot 4.1 s，38 文件 |
+
+因此**报告通道改为累加器**（`CollectionAccumulator<String>`，driver 侧打印 `CACHE ...`），
+并且上报条件改成"缓存开启就上报"，不再依赖任何系统属性。
+
+### 下一步（#1570 承接）
+
+一次干净的运行：缓存开启 → 冷/热各一次 → 读 driver 日志里的 `CACHE executor-*: hits=…`。
+- 若 hits=0 → 修键/配置（工程问题，半小时内可定位）；
+- 若 hits>0 而耗时不变 → 那 ~1 秒不是 prepare，去查 `readPayload`（整文件读取）与 Lance native open。
