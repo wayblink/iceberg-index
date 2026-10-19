@@ -20,7 +20,6 @@ package org.apache.iceberg.spark.extensions;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
-import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
@@ -34,9 +33,9 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
 /**
- * A/B for the fetch-back leg of an indexed vector query: the same rows and the same vector index
- * on a Lance-backed table and on a parquet-backed table. The index lookup is identical in both, so
- * the difference is what Iceberg has to read to turn the hits into rows.
+ * A/B for the fetch-back leg of an indexed vector query: the same rows and the same vector index on
+ * a Lance-backed table and on a parquet-backed table. The index lookup is identical in both, so the
+ * difference is what Iceberg has to read to turn the hits into rows.
  *
  * <p>Result is written to build/lance-poc-fetchback.txt for the POC report.
  */
@@ -178,12 +177,34 @@ class TestLanceFetchBack {
     long scanMs = bestMillis("local.db.fetch_scan", queryVector);
 
     String summary =
-        "rows=" + ROWS + " dim=" + DIM + " topK=" + TOP_K + "\n"
-            + "query whole plan   lance=" + lanceMs + "ms parquet=" + parquetMs + "ms\n"
-            + "fetchback 10 rows  lance=" + lanceFetchMs + "ms parquet=" + parquetFetchMs + "ms\n"
-            + "data bytes         lance=" + lanceBytes + " parquet=" + parquetBytes + "\n"
-            + "full scan no index (lance)=" + scanMs + "ms\n"
-            + "topId=" + lanceHits.get(0).getLong(0) + " sameResults=true\n";
+        "rows="
+            + ROWS
+            + " dim="
+            + DIM
+            + " topK="
+            + TOP_K
+            + "\n"
+            + "query whole plan   lance="
+            + lanceMs
+            + "ms parquet="
+            + parquetMs
+            + "ms\n"
+            + "fetchback 10 rows  lance="
+            + lanceFetchMs
+            + "ms parquet="
+            + parquetFetchMs
+            + "ms\n"
+            + "data bytes         lance="
+            + lanceBytes
+            + " parquet="
+            + parquetBytes
+            + "\n"
+            + "full scan no index (lance)="
+            + scanMs
+            + "ms\n"
+            + "topId="
+            + lanceHits.get(0).getLong(0)
+            + " sameResults=true\n";
 
     Files.createDirectories(report.getParent());
     Files.writeString(
@@ -224,7 +245,8 @@ class TestLanceFetchBack {
         org.apache.iceberg.spark.Spark3Util.loadIcebergTable(spark, table);
     long snapshotId = icebergTable.currentSnapshot().snapshotId();
 
-    List<Row> files = spark.sql("SELECT file_path, record_count FROM " + table + ".files").collectAsList();
+    List<Row> files =
+        spark.sql("SELECT file_path, record_count FROM " + table + ".files").collectAsList();
     String dataFile = files.get(0).getString(0);
     long rowCount = files.get(0).getLong(1);
 

@@ -40,8 +40,7 @@ import org.apache.spark.unsafe.types.UTF8String;
  * _pos}), score and the matched row as a JSON string, plus the index of the query it belongs to.
  * Rows are ordered by query and then by score. Unlike repeated single searches, the matched rows of
  * all queries are resolved by reading each hit data file once, and every index file is loaded once
- * for the whole batch, so a batch of N queries costs one
- * read per distinct hit data file.
+ * for the whole batch, so a batch of N queries costs one read per distinct hit data file.
  *
  * <p>Queries are passed as an array of strings, one comma-separated list of numbers per query, for
  * example {@code array('0.95,0.05', '0.0,0.95')} for two 2-dimensional queries.
@@ -118,9 +117,8 @@ class VectorSearchBatchProcedure extends BaseProcedure {
     String column = input.asString(COLUMN_PARAM);
     int topK = input.asInt(K_PARAM);
 
-    List<float[]> queryVectors = input.isProvided(QUERY_TABLE_PARAM)
-        ? queriesFromTable(input)
-        : queriesFromArray(input);
+    List<float[]> queryVectors =
+        input.isProvided(QUERY_TABLE_PARAM) ? queriesFromTable(input) : queriesFromArray(input);
 
     return modifyIcebergTable(
         input.ident(TABLE_PARAM),

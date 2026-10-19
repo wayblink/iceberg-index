@@ -18,7 +18,6 @@
  */
 package org.apache.iceberg.spark.extensions;
 
-import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
@@ -40,7 +39,7 @@ import org.junit.jupiter.api.io.TempDir;
 class TestLanceFormatComparison {
 
   private static final int ROWS = 200_000;
-  
+
   private static SparkSession spark;
   private static Path report;
 
@@ -95,7 +94,8 @@ class TestLanceFormatComparison {
               + ROWS
               + ")");
 
-      org.apache.iceberg.Table icebergTable = org.apache.iceberg.spark.Spark3Util.loadIcebergTable(spark, table);
+      org.apache.iceberg.Table icebergTable =
+          org.apache.iceberg.spark.Spark3Util.loadIcebergTable(spark, table);
       long filesInScan = 0;
       try (org.apache.iceberg.io.CloseableIterable<org.apache.iceberg.FileScanTask> files =
           icebergTable.newScan().planFiles()) {
@@ -110,15 +110,21 @@ class TestLanceFormatComparison {
           tasksInScan += task.files().size();
         }
       }
-      long countTasks = spark.sql("SELECT * FROM " + table).queryExecution().executedPlan()
-          .execute().getNumPartitions();
+      long countTasks =
+          spark
+              .sql("SELECT * FROM " + table)
+              .queryExecution()
+              .executedPlan()
+              .execute()
+              .getNumPartitions();
 
       long bytes =
           spark.sql("SELECT sum(file_size_in_bytes) FROM " + table + ".files").head().getLong(0);
       long files = spark.sql("SELECT count(*) FROM " + table + ".files").head().getLong(0);
 
       long countMs = timeMillis("SELECT count(*) FROM " + table);
-      long fullScanMs = timeMillis("SELECT sum(id) FROM " + table + " WHERE payload LIKE 'payload-1%'");
+      long fullScanMs =
+          timeMillis("SELECT sum(id) FROM " + table + " WHERE payload LIKE 'payload-1%'");
 
       out.append(format)
           .append(": files=")
@@ -140,7 +146,8 @@ class TestLanceFormatComparison {
       long rowCount = spark.sql("SELECT count(*) FROM " + table).head().getLong(0);
       out.append(format).append(" rowCount=").append(rowCount).append('\n');
       if (rowCount != ROWS) {
-        throw new IllegalStateException(format + " row count mismatch: " + rowCount + " != " + ROWS);
+        throw new IllegalStateException(
+            format + " row count mismatch: " + rowCount + " != " + ROWS);
       }
     }
 

@@ -82,7 +82,10 @@ class TestLanceFormatTable {
             + " VALUES (1, 'alice', 95.5), (2, 'bob', 87.3), (3, 'charlie', 92.1)");
 
     assertThat(spark.sql("SELECT count(*) FROM " + table).head().getLong(0)).isEqualTo(3L);
-    assertThat(spark.sql("SELECT id, name FROM " + table + " WHERE score > 90 ORDER BY id").collectAsList())
+    assertThat(
+            spark
+                .sql("SELECT id, name FROM " + table + " WHERE score > 90 ORDER BY id")
+                .collectAsList())
         .extracting(row -> row.getLong(0) + ":" + row.getString(1))
         .containsExactly("1:alice", "3:charlie");
 
@@ -130,7 +133,9 @@ class TestLanceFormatTable {
 
     // copy-on-write deletes rewrite the data file, so it is still a Lance file owned by Iceberg
     List<Row> dataFiles =
-        spark.sql("SELECT file_path FROM " + table + ".all_files WHERE content = 0").collectAsList();
+        spark
+            .sql("SELECT file_path FROM " + table + ".all_files WHERE content = 0")
+            .collectAsList();
     assertThat(dataFiles).isNotEmpty();
     assertThat(dataFiles).allSatisfy(row -> assertThat(row.getString(0)).endsWith(".lance"));
   }
@@ -199,10 +204,15 @@ class TestLanceFormatTable {
             + table
             + " (id bigint) USING iceberg TBLPROPERTIES ('write.format.default' = 'lance')");
     spark.sql("INSERT INTO " + table + " VALUES (1), (2)");
-    long firstSnapshot = spark.sql("SELECT snapshot_id FROM " + table + ".snapshots").head().getLong(0);
+    long firstSnapshot =
+        spark.sql("SELECT snapshot_id FROM " + table + ".snapshots").head().getLong(0);
     spark.sql("INSERT INTO " + table + " VALUES (3)");
 
-    assertThat(spark.sql("SELECT count(*) FROM " + table + " VERSION AS OF " + firstSnapshot).head().getLong(0))
+    assertThat(
+            spark
+                .sql("SELECT count(*) FROM " + table + " VERSION AS OF " + firstSnapshot)
+                .head()
+                .getLong(0))
         .isEqualTo(2L);
     assertThat(spark.sql("SELECT count(*) FROM " + table).head().getLong(0)).isEqualTo(3L);
   }
@@ -233,12 +243,10 @@ class TestLanceFormatTable {
     java.util.List<Row> rows =
         spark.sql("SELECT id, vec FROM " + table + " WHERE id < 3 ORDER BY id").collectAsList();
     assertThat(rows).hasSize(3);
-    assertThat(rows.get(2).getList(1))
-        .containsExactly(2.0f, -2.0f, 0.5f, 1.5f);
+    assertThat(rows.get(2).getList(1)).containsExactly(2.0f, -2.0f, 0.5f, 1.5f);
 
     // the list column round-trips through Lance, not a side channel
-    List<Row> files =
-        spark.sql("SELECT file_path FROM " + table + ".files").collectAsList();
+    List<Row> files = spark.sql("SELECT file_path FROM " + table + ".files").collectAsList();
     assertThat(files).allSatisfy(row -> assertThat(row.getString(0)).endsWith(".lance"));
   }
 }
