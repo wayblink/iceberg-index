@@ -42,7 +42,6 @@ import org.apache.iceberg.hadoop.SerializableConfiguration;
 import org.apache.iceberg.index.IndexAdapter;
 import org.apache.iceberg.io.CloseableIterable;
 import org.apache.iceberg.io.InputFile;
-import org.apache.iceberg.relocated.com.google.common.base.Preconditions;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableList;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableMap;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableSet;
@@ -150,7 +149,7 @@ public final class IndexEntries {
       String dataFile = task.file().location().toString();
 
       JavaRDD<Row> fileRows =
-          liveRowsOf(spark, tableSchema, task, readColumns, null, null, deletes)
+          liveRowsOf(spark, tableSchema, task, readColumns, null, null, deletes, null)
               .mapToPair(
                   (PairFunction<Tuple2<Long, Row>, Long, Row>)
                       entry ->
@@ -218,6 +217,11 @@ public final class IndexEntries {
 
     // the rows of every file are unioned and read by one job, which only holds because the
     // positions are counted as the rows stream past rather than asked of Spark per file
+    // one serializable configuration for the whole fetch-back: building it copies the session's
+    // Hadoop configuration, which is not something to do once per data file
+    SerializableConfiguration conf =
+        new SerializableConfiguration(spark.sessionState().newHadoopConf());
+
     JavaPairRDD<String, Tuple2<Long, Row>> rows = null;
     for (FileScanTask task : tasks) {
       String dataFile = task.file().location().toString();
@@ -230,7 +234,8 @@ public final class IndexEntries {
                   columns,
                   positions,
                   readSchema,
-                  deletesFor(spark, tasks, table))
+                  deletesFor(spark, tasks, table),
+                  conf)
               .mapToPair(
                   (PairFunction<Tuple2<Long, Row>, String, Tuple2<Long, Row>>)
                       entry -> new Tuple2<>(dataFile, entry));
@@ -296,7 +301,8 @@ public final class IndexEntries {
     List<JavaRDD<Row>> perFile = Lists.newArrayList();
     for (FileScanTask task : tasks) {
       perFile.add(
-          liveRowsOf(spark, table.schema(), task, columns, null, readSchema, deletes).values());
+          liveRowsOf(spark, table.schema(), task, columns, null, readSchema, deletes, null)
+              .values());
     }
 
     if (perFile.isEmpty()) {
@@ -323,7 +329,8 @@ public final class IndexEntries {
       List<String> columns,
       Collection<Long> positions,
       StructType readSchema,
-      SnapshotDeletes deletes) {
+      SnapshotDeletes deletes,
+      SerializableConfiguration conf) {
     String dataFile = task.file().location().toString();
 
     // delete files are read on the driver so the executor-side filter is a simple lookup
@@ -340,7 +347,7 @@ public final class IndexEntries {
     // the projection to the requested columns happens below, by name, so the read itself can take
     // every column the file has
     JavaPairRDD<Row, Long> data =
-        positionedRows(spark, tableSchema, task, readColumns, positions, readWith);
+        positionedRows(spark, tableSchema, task, readColumns, positions, readWith, conf);
 
     List<String> capturedReadColumns = readColumns;
     List<String> capturedColumns = columns;
@@ -392,7 +399,8 @@ public final class IndexEntries {
       FileScanTask task,
       List<String> columns,
       Collection<Long> positions,
-      StructType readSchema) {
+      StructType readSchema,
+      SerializableConfiguration conf) {
     String dataFile = task.file().location().toString();
     FileFormat format = task.file().format();
 
@@ -414,24 +422,55 @@ public final class IndexEntries {
 
     Schema projection = tableSchema.select(columns.toArray(new String[0]));
     StructType sparkSchema = toSparkSchema(projection);
-    SerializableConfiguration conf =
-        new SerializableConfiguration(spark.sessionState().newHadoopConf());
+    SerializableConfiguration readConf =
+        conf != null ? conf : new SerializableConfiguration(spark.sessionState().newHadoopConf());
 
     return JavaSparkContext.fromSparkContext(spark.sparkContext())
         .parallelize(Collections.singletonList(dataFile), 1)
         .flatMapToPair(
             (PairFlatMapFunction<String, Row, Long>)
                 file ->
-                    readFileWithFormat(
-                        file, format, projection, sparkSchema, positions, conf));
+                    readFileWithFormat(file, format, projection, sparkSchema, positions, readConf));
+  }
+
+  /**
+   * The deserialized Hadoop configuration for this task.
+   *
+   * <p>Deserializing it costs more than a file open, and a task can resolve several files, so it is
+   * kept per thread and rebuilt only when the configuration handed down changes.
+   */
+  private static org.apache.hadoop.conf.Configuration taskConf(SerializableConfiguration conf) {
+    CachedConf cached = TASK_CONF.get();
+    if (cached == null || cached.source != conf) {
+      cached = new CachedConf(conf, conf.get());
+      TASK_CONF.set(cached);
+    }
+    return cached.conf;
+  }
+
+  private static final class CachedConf {
+    private final SerializableConfiguration source;
+    private final org.apache.hadoop.conf.Configuration conf;
+
+    private CachedConf(
+        SerializableConfiguration source, org.apache.hadoop.conf.Configuration conf) {
+      this.source = source;
+      this.conf = conf;
+    }
+  }
+
+  private static final ThreadLocal<CachedConf> TASK_CONF = new ThreadLocal<>();
+
+  private static long ms(long nanos) {
+    return java.util.concurrent.TimeUnit.NANOSECONDS.toMillis(nanos);
   }
 
   /**
    * How many tasks the fetch-back uses for the given number of hit files.
    *
    * <p>Defaults to one task per file, which is what a fetch-back of a handful of large files wants;
-   * {@code iceberg.index.fetch-back.tasks} lowers it, which is what a fetch-back of many small reads
-   * wants because the per-task cost then dominates.
+   * {@code iceberg.index.fetch-back.tasks} lowers it, which is what a fetch-back of many small
+   * reads wants because the per-task cost then dominates.
    */
   private static int readTaskCount(int files) {
     int wanted = Integer.getInteger("iceberg.index.fetch-back.tasks", files);
@@ -467,9 +506,13 @@ public final class IndexEntries {
       Collection<Long> positions,
       SerializableConfiguration conf)
       throws IOException {
-    InputFile input = HadoopInputFile.fromLocation(location, conf.get());
+    long tStart = System.nanoTime();
+    InputFile input = HadoopInputFile.fromLocation(location, taskConf(conf));
+    long tInput = System.nanoTime();
     ReadBuilder<Record, Void> builder =
         FormatModelRegistry.readBuilder(format, Record.class, input);
+    long tBuilder = System.nanoTime();
+    boolean timings = Boolean.getBoolean("iceberg.index.fetch-back.timings");
 
     // a lookup knows the rows it wants: ask the format to read only those, which is what lets a
     // page-oriented format read a handful of pages instead of the whole file
@@ -482,7 +525,9 @@ public final class IndexEntries {
 
     List<Tuple2<Row, Long>> rows = Lists.newArrayList();
     long nextPosition = 0;
+    long tOpen;
     try (CloseableIterable<Record> records = builder.project(projection).build()) {
+      tOpen = System.nanoTime();
       for (Record record : records) {
         Object[] values = new Object[projection.columns().size()];
         for (int i = 0; i < values.length; i++) {
@@ -494,6 +539,23 @@ public final class IndexEntries {
         rows.add(new Tuple2<>(new GenericRowWithSchema(values, sparkSchema), position));
         nextPosition++;
       }
+    }
+
+    if (timings) {
+      long tRead = System.nanoTime();
+      System.err.println(
+          "[FETCH-BACK] "
+              + location.substring(location.lastIndexOf('/') + 1)
+              + " conf+input="
+              + ms(tInput - tStart)
+              + "ms builder="
+              + ms(tBuilder - tInput)
+              + "ms open="
+              + ms(tOpen - tBuilder)
+              + "ms read="
+              + ms(tRead - tOpen)
+              + "ms rows="
+              + rows.size());
     }
 
     if (wanted != null && rows.size() != wanted.size()) {

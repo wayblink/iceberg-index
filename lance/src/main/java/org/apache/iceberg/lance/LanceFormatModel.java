@@ -32,7 +32,6 @@ import org.apache.iceberg.FileContent;
 import org.apache.iceberg.FileFormat;
 import org.apache.iceberg.MetricsConfig;
 import org.apache.iceberg.Schema;
-import org.apache.iceberg.types.Types;
 import org.apache.iceberg.deletes.PositionDelete;
 import org.apache.iceberg.encryption.EncryptedOutputFile;
 import org.apache.iceberg.expressions.Expression;
@@ -48,6 +47,7 @@ import org.apache.iceberg.mapping.NameMapping;
 import org.apache.iceberg.relocated.com.google.common.base.Preconditions;
 import org.apache.iceberg.relocated.com.google.common.collect.Lists;
 import org.apache.iceberg.relocated.com.google.common.collect.Maps;
+import org.apache.iceberg.types.Types;
 import org.lance.file.LanceFileReader;
 
 /**
@@ -425,8 +425,7 @@ public class LanceFormatModel<D, S>
         // idToConstant and do not exist in the Lance file. Asking Lance for them fails the read.
         List<org.apache.iceberg.types.Types.NestedField> fileFields = new java.util.ArrayList<>();
         for (org.apache.iceberg.types.Types.NestedField field : projectedSchema.columns()) {
-          if (!idToConstant.containsKey(field.fieldId())
-              && !isMetadataColumn(field.fieldId())) {
+          if (!idToConstant.containsKey(field.fieldId()) && !isMetadataColumn(field.fieldId())) {
             fileFields.add(field);
           }
         }
@@ -480,6 +479,21 @@ public class LanceFormatModel<D, S>
   // Iterator
   // ---------------------------------------------------------------------------
 
+  /**
+   * Parent allocator for this thread: a task that resolves many files pays for one root allocator
+   * and a child per file, rather than a root per file.
+   */
+  private static final ThreadLocal<RootAllocator> PARENT_ALLOCATOR = new ThreadLocal<>();
+
+  private static RootAllocator parentAllocator() {
+    RootAllocator allocator = PARENT_ALLOCATOR.get();
+    if (allocator == null) {
+      allocator = new RootAllocator(Long.MAX_VALUE);
+      PARENT_ALLOCATOR.set(allocator);
+    }
+    return allocator;
+  }
+
   private static class LanceCloseableIterator<D> implements CloseableIterator<D> {
     private final BufferAllocator allocator;
     private final LanceFileReader fileReader;
@@ -504,14 +518,27 @@ public class LanceFormatModel<D, S>
         Map<Integer, ?> idToConstant,
         Function<Map.Entry<VectorSchemaRoot, Map<Integer, ?>>, CloseableIterable<D>> readerFunc)
         throws IOException {
-      this.allocator = new RootAllocator(Long.MAX_VALUE);
+      long tAlloc = System.nanoTime();
+      this.allocator = parentAllocator().newChildAllocator(path, 0, Long.MAX_VALUE);
+      long tAllocDone = System.nanoTime();
       this.filePath = path;
       this.idToConstant = idToConstant;
       this.readerFunc = readerFunc;
       this.finished = false;
 
       this.fileReader = LanceFileReader.open(path, storageOptions, allocator);
+      long tNative = System.nanoTime();
       this.arrowReader = fileReader.readAll(columns, ranges, batchSize);
+      if (Boolean.getBoolean("iceberg.index.fetch-back.timings")) {
+        System.err.println(
+            "[FETCH-BACK-LANCE] allocator="
+                + java.util.concurrent.TimeUnit.NANOSECONDS.toMillis(tAllocDone - tAlloc)
+                + "ms nativeOpen="
+                + java.util.concurrent.TimeUnit.NANOSECONDS.toMillis(tNative - tAllocDone)
+                + "ms readAllInit="
+                + java.util.concurrent.TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - tNative)
+                + "ms");
+      }
     }
 
     @Override
@@ -529,9 +556,7 @@ public class LanceFormatModel<D, S>
         if (arrowReader.loadNextBatch()) {
           VectorSchemaRoot batch = arrowReader.getVectorSchemaRoot();
           CloseableIterable<D> records =
-              readerFunc.apply(
-                  new java.util.AbstractMap.SimpleEntry<>(
-                      batch, batchConstants()));
+              readerFunc.apply(new java.util.AbstractMap.SimpleEntry<>(batch, batchConstants()));
           rowsRead += batch.getRowCount();
           currentBatchIterator = records.iterator();
           return currentBatchIterator.hasNext();
