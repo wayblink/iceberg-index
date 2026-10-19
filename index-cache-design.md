@@ -167,3 +167,26 @@ prepared.search(query, topK);   // ← 内部串行化，见 §5
 - 今天的回表结论（文件数 × ~150 ms，原因未定位）**不影响**本设计：索引侧缓存省的是 prepare/I/O，与回表正交。
 - 但两者会在"端到端延迟"上相加：缓存把索引侧从 ~20 s 压到 ~0.5 s 后，回表（单查询 2.8–6.4 s）会**成为最大项**。届时如果还要继续压，就只有两条路（减少文件数 / 定位那 150 ms），需要另开卡片。
 - 这也是为什么本设计必须**分段测量**（§8 A2/A3），否则会出现"索引侧 20x 提升，端到端只有 3x"的错觉。
+
+---
+
+## 12. 实现记录（P0/P1 已落地，待集群 A/B）
+
+提交 `bf374ff7d`。
+
+**已实现**
+- `ExecutorIndexCache`（`index-spark`，JVM 单例）：`LinkedHashMap(accessOrder)` 做 LRU、按字节记账、per-location 单飞（`ConcurrentHashMap<String, Object>` 作 monitor）、`skippedTooLarge`、`hits/misses/loads/evictions/bytes` 统计。
+- 接入两处调用点：`DistributedIndexSearch.search`（单查询）与 `searchBatch`（批）。原来"读 payload + Puffin 解析 + prepare"整体移进 `Loader`，只在 miss 时执行。
+- 配置（driver 读、随 job 广播）：`spark.iceberg.index.cache.enabled`（默认 false）、`.bytes`（默认 512m）、`.max-entry-bytes`（默认 256m），支持 k/m/g 后缀。
+- 缓存键 = `adapter 类名 | blob 类型` + 文件 location（索引文件不可变，不主动失效）。
+- 并发：`CachedFile.searching(...)` 持 per-file 锁，满足 kernel"单线程使用 PreparedSearch"的契约。
+- 计数：`PreparedSearch.estimatedBytes()` 默认 0，缓存回退到"payload 长度的两倍"。
+
+**测试**
+- `TestExecutorIndexCache`（7 个）：命中、按 location/adapter 隔离、LRU 淘汰、超限不缓存、关闭时每次重建、两线程并发只 prepare 一次（单飞）、同一文件搜索不并发（锁）。
+- `TestVectorIndexSearchBatch.cachedBatchSearchReturnsTheSameHits`：开缓存后重复批查询，逐行相同。另 12 个既有用例全绿。
+
+**尚未做**
+1. **集群 A/B 实测**（本设计的验收 A1–A6）：10M 表上，冷启动 vs 同一 executor 上第 2 条查询，分段（索引搜索/回表/合并）报告。
+2. 真实字节上报：`VectorKernel`/kernel 还没重写 `estimatedBytes()`，目前按"payload × 2"记账。
+3. 指标上报到 driver（现在只有 `stats()` 与 DEBUG 日志；executor 侧需要保留 pod 才能读）。
