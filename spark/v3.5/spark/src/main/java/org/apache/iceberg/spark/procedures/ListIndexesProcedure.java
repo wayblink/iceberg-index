@@ -22,6 +22,7 @@ import java.util.List;
 import org.apache.iceberg.index.IndexMetadata;
 import org.apache.iceberg.index.IndexMetadataParser;
 import org.apache.iceberg.index.IndexSnapshot;
+import org.apache.iceberg.index.spark.VectorIndexes;
 import org.apache.iceberg.relocated.com.google.common.collect.Lists;
 import org.apache.iceberg.spark.procedures.SparkProcedures.ProcedureBuilder;
 import org.apache.spark.sql.catalyst.InternalRow;
@@ -90,8 +91,9 @@ class ListIndexesProcedure extends BaseProcedure {
     return modifyIcebergTable(
         input.ident(TABLE_PARAM),
         table -> {
-          List<IndexMetadata> indexes =
-              VectorIndexProcedures.indexCatalog(table).listIndexes(table.location());
+          // only the indexes of this table instance: a location outlives the table, so a table
+          // created again there still has the indexes of the one before it on disk
+          List<IndexMetadata> indexes = VectorIndexes.indexesOf(table);
           List<InternalRow> rows = Lists.newArrayListWithCapacity(indexes.size());
           for (IndexMetadata metadata : indexes) {
             IndexSnapshot snapshot = metadata.latestSnapshot();

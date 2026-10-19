@@ -57,6 +57,24 @@ public interface IndexCatalog {
   List<IndexMetadata> listIndexes(String tableLocation);
 
   /**
+   * Lists the indexes registered for a table that belong to the given table instance.
+   *
+   * <p>An index is stored under the table's location, which outlives the table: dropping a table
+   * leaves the sidecar behind, and a table created again at the same location is a different table
+   * with a different UUID. The indexes left behind are not the new table's, and reporting them
+   * would refuse to build the indexes it needs, so they are left out.
+   *
+   * <p>The default reports everything, for a catalog that keeps its indexes somewhere the table's
+   * own lifecycle removes.
+   *
+   * @param tableLocation the table's location
+   * @param tableUuid the uuid of the table instance asking, or null when it is not known
+   */
+  default List<IndexMetadata> listIndexes(String tableLocation, String tableUuid) {
+    return listIndexes(tableLocation);
+  }
+
+  /**
    * Writes updated index metadata back to the index's metadata tree.
    *
    * @param metadata the updated metadata; its {@link IndexMetadata#location()} selects the tree

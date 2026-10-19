@@ -35,6 +35,8 @@ import org.apache.iceberg.relocated.com.google.common.collect.ImmutableList;
 import org.apache.iceberg.relocated.com.google.common.collect.Lists;
 import org.apache.iceberg.relocated.com.google.common.io.ByteStreams;
 import org.apache.iceberg.util.JsonUtil;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 /**
  * An {@link IndexCatalog} that keeps index metadata in a self-contained sidecar tree under the
@@ -90,6 +92,8 @@ public final class SidecarIndexCatalog implements IndexCatalog {
   private static final String REGISTRY_INDEX_UUIDS = "index-uuids";
   private static final int REGISTRY_VERSION = 1;
 
+  private static final Logger LOG = LoggerFactory.getLogger(SidecarIndexCatalog.class);
+
   private final FileIO fileIO;
 
   public SidecarIndexCatalog(FileIO fileIO) {
@@ -122,10 +126,50 @@ public final class SidecarIndexCatalog implements IndexCatalog {
             .build();
     writeMetadata(metadata, 1, 0);
 
-    List<String> indexUuids = Lists.newArrayList(readIndexUuids(tableLocation));
+    // whatever the registry holds that belongs to another table instance is not this table's, so
+    // it is replaced rather than added to: the table was dropped and created again at this location
+    List<String> indexUuids = Lists.newArrayList();
+    for (IndexMetadata existing : listIndexes(tableLocation, request.tableUuid())) {
+      indexUuids.add(existing.indexUuid());
+    }
     indexUuids.add(request.indexUuid());
     writeRegistry(tableLocation, indexUuids);
     return metadata;
+  }
+
+  /**
+   * Lists the indexes of a table location that belong to the given table instance, leaving out the
+   * ones a dropped table left behind.
+   *
+   * <p>The table's location outlives the table, so a table created again at the same location finds
+   * the indexes of the one before it. They are not its, and counting them as existing would refuse
+   * to build the index it needs.
+   */
+  @Override
+  public List<IndexMetadata> listIndexes(String tableLocation, String tableUuid) {
+    Preconditions.checkArgument(
+        tableLocation != null && !tableLocation.isEmpty(), "Table location is empty");
+    List<IndexMetadata> indexes = listIndexes(tableLocation);
+    if (tableUuid == null) {
+      return indexes;
+    }
+
+    List<IndexMetadata> mine = Lists.newArrayListWithCapacity(indexes.size());
+    for (IndexMetadata metadata : indexes) {
+      // an index written before the table uuid was recorded is given the benefit of the doubt
+      if (metadata.tableUuid() == null || tableUuid.equals(metadata.tableUuid())) {
+        mine.add(metadata);
+      } else {
+        LOG.warn(
+            "Ignoring index {} of table {}: it was built for table instance {}, not {}",
+            metadata.indexUuid(),
+            tableLocation,
+            metadata.tableUuid(),
+            tableUuid);
+      }
+    }
+
+    return mine;
   }
 
   @Override

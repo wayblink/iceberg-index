@@ -88,7 +88,7 @@ public final class VectorIndexes {
   /** Finds the index of a type for a table by the indexed column, or null if none exists. */
   public static IndexMetadata findIndexOrNull(Table table, String column, String indexType) {
     int fieldId = fieldId(table, column);
-    for (IndexMetadata metadata : indexCatalog(table).listIndexes(table.location())) {
+    for (IndexMetadata metadata : indexesOf(table)) {
       if (indexType.equals(metadata.indexType()) && metadata.definition().fieldId() == fieldId) {
         return metadata;
       }
@@ -99,12 +99,24 @@ public final class VectorIndexes {
   /** Finds any index of any type for a table by the indexed column, or null if none exists. */
   public static IndexMetadata findAnyIndexOrNull(Table table, String column) {
     int fieldId = fieldId(table, column);
-    for (IndexMetadata metadata : indexCatalog(table).listIndexes(table.location())) {
+    for (IndexMetadata metadata : indexesOf(table)) {
       if (metadata.definition().fieldId() == fieldId) {
         return metadata;
       }
     }
     return null;
+  }
+
+  /**
+   * The indexes that belong to this table instance.
+   *
+   * <p>An index lives under the table's location, which outlives the table: dropping a table leaves
+   * the sidecar behind, and a table created again at the same location is a different table. Its
+   * indexes are not this table's, so they are left out rather than reported as an index that already
+   * exists.
+   */
+  public static List<IndexMetadata> indexesOf(Table table) {
+    return indexCatalog(table).listIndexes(table.location(), String.valueOf(table.uuid()));
   }
 
   /**
