@@ -242,7 +242,12 @@ public final class IndexEntries {
       return rowsByFile;
     }
 
-    for (Tuple2<String, Tuple2<Long, Row>> entry : rows.collect()) {
+    // a lookup reads a few rows from each hit file, so what the fetch-back pays is opening the
+    // files and starting the tasks rather than moving bytes. Packing the files into fewer tasks
+    // keeps that fixed cost paid a handful of times instead of once per file; the number is a
+    // property so the trade-off against per-file parallelism can be measured.
+    int readTasks = readTaskCount(tasks.size());
+    for (Tuple2<String, Tuple2<Long, Row>> entry : rows.coalesce(readTasks).collect()) {
       rowsByFile
           .computeIfAbsent(entry._1(), key -> Maps.newLinkedHashMap())
           .put(entry._2()._1(), entry._2()._2());
@@ -419,6 +424,18 @@ public final class IndexEntries {
                 file ->
                     readFileWithFormat(
                         file, format, projection, sparkSchema, positions, conf));
+  }
+
+  /**
+   * How many tasks the fetch-back uses for the given number of hit files.
+   *
+   * <p>Defaults to one task per file, which is what a fetch-back of a handful of large files wants;
+   * {@code iceberg.index.fetch-back.tasks} lowers it, which is what a fetch-back of many small reads
+   * wants because the per-task cost then dominates.
+   */
+  private static int readTaskCount(int files) {
+    int wanted = Integer.getInteger("iceberg.index.fetch-back.tasks", files);
+    return Math.max(1, Math.min(files, wanted));
   }
 
   /** Pairs each row with its position, counting rows as they pass. */
