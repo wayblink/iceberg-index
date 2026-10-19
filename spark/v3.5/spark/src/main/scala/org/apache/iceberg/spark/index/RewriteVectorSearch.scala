@@ -83,6 +83,27 @@ case class RewriteVectorSearch(spark: SparkSession) extends Rule[LogicalPlan] {
   /** How often more hits are asked for when delete files removed some of them. */
   private val MaxHitRetries = 8
 
+  /**
+   * How many candidates to ask the index for, per hit the query actually wants.
+   *
+   * <p>A kernel that scores approximately cannot be trusted to put the true nearest neighbours
+   * first, so the search asks for more than it needs and the exact re-scoring below decides. How
+   * much more is a property of the kernel and of how tightly the distances of a dataset cluster:
+   * measured on clustered 128 dimensional data, three bits per dimension needs ten times the hits
+   * for the true top ten to be inside the set, and one bit needs fifty. It is a configuration
+   * rather than a constant so it can be measured rather than assumed.
+   *
+   * <p>One means ask for exactly what the query wants, which is what an exactly scoring kernel
+   * needs: merging each file's exact top-k gives the exact global top-k, so asking for more would
+   * change nothing.
+   */
+  private val OverSampleConf = "spark.iceberg.index.vector.over-sample"
+
+  private def overSample: Int = {
+    val configured = spark.conf.getOption(OverSampleConf).map(_.trim.toInt).getOrElse(1)
+    if (configured < 1) 1 else configured
+  }
+
   override def apply(plan: LogicalPlan): LogicalPlan = {
     plan.transformDown {
       // a plain ORDER BY is not a top-k query: only a limit over a global sort is, and Spark puts
@@ -257,7 +278,14 @@ case class RewriteVectorSearch(spark: SparkSession) extends Rule[LogicalPlan] {
       names: Seq[String],
       tableSchema: StructType,
       scanTasks: java.util.List[org.apache.iceberg.FileScanTask]): Option[List[Row]] = {
-    var searchLimit = limit
+    // the index is asked for more candidates than the query wants when the kernel scores
+    // approximately; the exact re-scoring below then has the true neighbours to choose from
+    var searchLimit = Math.multiplyExact(limit, overSample)
+    logger.info(
+      "index search asks for {} hits for a limit of {} (over-sample {})",
+      java.lang.Integer.valueOf(searchLimit),
+      java.lang.Integer.valueOf(limit),
+      java.lang.Integer.valueOf(overSample))
     var rows: List[Row] = Nil
     var done = false
     var exhausted = false

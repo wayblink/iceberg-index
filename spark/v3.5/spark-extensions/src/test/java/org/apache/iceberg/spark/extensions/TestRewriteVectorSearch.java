@@ -120,6 +120,39 @@ class TestRewriteVectorSearch {
   }
 
   @Test
+  public void askingForAWiderCandidateSetDoesNotChangeTheAnswer() {
+    String query =
+        "SELECT id FROM local.%s ORDER BY vec_distance(embedding, array(0.0d, 0.95d)) LIMIT 3";
+    String indexed = tableWithIndex("docs_oversample", "hnsw");
+
+    List<Row> widenedOnce;
+    try {
+      // one is what an exactly scoring kernel needs: merging each file's exact top-k is already the
+      // exact global top-k, so asking for more would only fetch more rows for the same answer
+      spark.conf().set("spark.iceberg.index.vector.over-sample", "1");
+      widenedOnce = spark.sql(String.format(query, indexed)).collectAsList();
+
+      for (String overSample : new String[] {"5", "50"}) {
+        spark.conf().set("spark.iceberg.index.vector.over-sample", overSample);
+        assertThat(spark.sql(String.format(query, indexed)).collectAsList())
+            .as("the same rows in the same order, over-sampling by %s", overSample)
+            .containsExactlyElementsOf(widenedOnce);
+      }
+
+      // a value that means nothing falls back to asking for what the query wants, rather than
+      // failing a query over a configuration
+      for (String nonsense : new String[] {"0", "-3"}) {
+        spark.conf().set("spark.iceberg.index.vector.over-sample", nonsense);
+        assertThat(spark.sql(String.format(query, indexed)).collectAsList())
+            .as("a usable answer for the configured value %s", nonsense)
+            .containsExactlyElementsOf(widenedOnce);
+      }
+    } finally {
+      spark.conf().unset("spark.iceberg.index.vector.over-sample");
+    }
+  }
+
+  @Test
   public void leavesAnExactIndexAloneAndScans() {
     // an exact index repacks the vector column with a row reference and is searched by walking
     // every entry, which is the work a scan does over a payload larger than the column itself
