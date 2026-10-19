@@ -122,6 +122,23 @@ public interface ReadBuilder<D, S> {
   /** Sets a mapping from external schema names to Iceberg type IDs. */
   ReadBuilder<D, S> withNameMapping(NameMapping nameMapping);
 
+  /**
+   * Reads only the rows at the given positions of the file.
+   *
+   * <p>A lookup that has already found the rows it wants reads page-sized ranges instead of the
+   * whole file, which is what makes reading a handful of rows cost a handful of pages. A format
+   * that cannot seek to a row ignores this and reads the file, then the caller filters, so the
+   * default is to ignore it.
+   *
+   * <p>A builder that honours it returns exactly these rows, in ascending position order.
+   *
+   * @param positions the file positions to read, sorted ascending and distinct
+   * @return this for method chaining
+   */
+  default ReadBuilder<D, S> positions(java.util.Collection<Long> positions) {
+    return this;
+  }
+
   /** Builds the reader. */
   CloseableIterable<D> build();
 }

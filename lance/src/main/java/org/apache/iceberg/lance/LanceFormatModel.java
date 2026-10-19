@@ -32,6 +32,7 @@ import org.apache.iceberg.FileContent;
 import org.apache.iceberg.FileFormat;
 import org.apache.iceberg.MetricsConfig;
 import org.apache.iceberg.Schema;
+import org.apache.iceberg.types.Types;
 import org.apache.iceberg.deletes.PositionDelete;
 import org.apache.iceberg.encryption.EncryptedOutputFile;
 import org.apache.iceberg.expressions.Expression;
@@ -44,6 +45,8 @@ import org.apache.iceberg.io.DeleteSchemaUtil;
 import org.apache.iceberg.io.FileAppender;
 import org.apache.iceberg.io.InputFile;
 import org.apache.iceberg.mapping.NameMapping;
+import org.apache.iceberg.relocated.com.google.common.base.Preconditions;
+import org.apache.iceberg.relocated.com.google.common.collect.Lists;
 import org.apache.iceberg.relocated.com.google.common.collect.Maps;
 import org.lance.file.LanceFileReader;
 
@@ -69,6 +72,32 @@ public class LanceFormatModel<D, S>
         org.apache.arrow.vector.types.pojo.Schema> {
 
   private static final int DEFAULT_BATCH_SIZE = 1024;
+
+  /**
+   * Turns ascending positions into the row ranges the file reader takes, merging runs so a
+   * contiguous group of hits costs one range.
+   */
+  private static List<org.lance.util.Range> toRanges(List<Long> positions) {
+    if (positions == null || positions.isEmpty()) {
+      return null;
+    }
+
+    List<org.lance.util.Range> ranges = Lists.newArrayList();
+    long start = positions.get(0);
+    long end = start + 1;
+    for (int i = 1; i < positions.size(); i++) {
+      long position = positions.get(i);
+      if (position == end) {
+        end = position + 1;
+      } else {
+        ranges.add(org.lance.util.Range.of(Math.toIntExact(start), Math.toIntExact(end)));
+        start = position;
+        end = position + 1;
+      }
+    }
+    ranges.add(org.lance.util.Range.of(Math.toIntExact(start), Math.toIntExact(end)));
+    return ranges;
+  }
 
   /** Metadata columns live in Iceberg, not in the Lance file. */
   private static boolean isMetadataColumn(int fieldId) {
@@ -290,6 +319,7 @@ public class LanceFormatModel<D, S>
     private S engineSchema;
     private Map<Integer, ?> idToConstant = Collections.emptyMap();
     private int batchSize = DEFAULT_BATCH_SIZE;
+    private List<Long> positions;
     private final Map<String, String> config = Maps.newHashMap();
 
     ReadBuilderWrapper(
@@ -364,6 +394,15 @@ public class LanceFormatModel<D, S>
     }
 
     @Override
+    public ReadBuilder<D, S> positions(java.util.Collection<Long> requested) {
+      // sorted and distinct: the reader is asked for ascending row ranges and hands the rows back
+      // in that order
+      this.positions =
+          requested.stream().distinct().sorted().collect(java.util.stream.Collectors.toList());
+      return this;
+    }
+
+    @Override
     public CloseableIterable<D> build() {
       String path = inputFile.location();
 
@@ -398,6 +437,17 @@ public class LanceFormatModel<D, S>
                 fileSchema, LanceSchemaUtil.encodingMetadata(config), false);
       }
 
+      // a lookup that knows its rows reads only the pages that hold them
+      final List<org.lance.util.Range> ranges = toRanges(positions);
+      if (ranges != null && projectedSchema != null) {
+        for (Types.NestedField field : projectedSchema.columns()) {
+          Preconditions.checkArgument(
+              field.fieldId() != org.apache.iceberg.MetadataColumns.ROW_POSITION.fieldId(),
+              "Reading _pos with a position filter is not supported: the filtered read does not "
+                  + "count rows from the start of the file");
+        }
+      }
+
       final List<String> columns = projectedColumns;
       final org.apache.arrow.vector.types.pojo.Schema finalArrowSchema = arrowSchema;
       final Schema readSchema = projectedSchema;
@@ -412,7 +462,7 @@ public class LanceFormatModel<D, S>
         public CloseableIterator<D> iterator() {
           try {
             return new LanceCloseableIterator<>(
-                path, storageOptions, columns, readBatchSize, constants, readerFunc);
+                path, storageOptions, columns, ranges, readBatchSize, constants, readerFunc);
           } catch (IOException e) {
             throw new java.io.UncheckedIOException("Failed to open Lance file reader", e);
           }
@@ -449,6 +499,7 @@ public class LanceFormatModel<D, S>
         String path,
         Map<String, String> storageOptions,
         List<String> columns,
+        List<org.lance.util.Range> ranges,
         int batchSize,
         Map<Integer, ?> idToConstant,
         Function<Map.Entry<VectorSchemaRoot, Map<Integer, ?>>, CloseableIterable<D>> readerFunc)
@@ -460,7 +511,7 @@ public class LanceFormatModel<D, S>
       this.finished = false;
 
       this.fileReader = LanceFileReader.open(path, storageOptions, allocator);
-      this.arrowReader = fileReader.readAll(columns, null, batchSize);
+      this.arrowReader = fileReader.readAll(columns, ranges, batchSize);
     }
 
     @Override

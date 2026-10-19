@@ -42,6 +42,7 @@ import org.apache.iceberg.hadoop.SerializableConfiguration;
 import org.apache.iceberg.index.IndexAdapter;
 import org.apache.iceberg.io.CloseableIterable;
 import org.apache.iceberg.io.InputFile;
+import org.apache.iceberg.relocated.com.google.common.base.Preconditions;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableList;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableMap;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableSet;
@@ -333,7 +334,8 @@ public final class IndexEntries {
     StructType readWith = readSchema == null ? null : schemaFor(readColumns, readSchema);
     // the projection to the requested columns happens below, by name, so the read itself can take
     // every column the file has
-    JavaPairRDD<Row, Long> data = positionedRows(spark, tableSchema, task, readColumns, readWith);
+    JavaPairRDD<Row, Long> data =
+        positionedRows(spark, tableSchema, task, readColumns, positions, readWith);
 
     List<String> capturedReadColumns = readColumns;
     List<String> capturedColumns = columns;
@@ -384,6 +386,7 @@ public final class IndexEntries {
       Schema tableSchema,
       FileScanTask task,
       List<String> columns,
+      Collection<Long> positions,
       StructType readSchema) {
     String dataFile = task.file().location().toString();
     FileFormat format = task.file().format();
@@ -413,7 +416,9 @@ public final class IndexEntries {
         .parallelize(Collections.singletonList(dataFile), 1)
         .flatMapToPair(
             (PairFlatMapFunction<String, Row, Long>)
-                file -> readFileWithFormat(file, format, projection, sparkSchema, conf));
+                file ->
+                    readFileWithFormat(
+                        file, format, projection, sparkSchema, positions, conf));
   }
 
   /** Pairs each row with its position, counting rows as they pass. */
@@ -442,14 +447,24 @@ public final class IndexEntries {
       FileFormat format,
       Schema projection,
       StructType sparkSchema,
+      Collection<Long> positions,
       SerializableConfiguration conf)
       throws IOException {
     InputFile input = HadoopInputFile.fromLocation(location, conf.get());
     ReadBuilder<Record, Void> builder =
         FormatModelRegistry.readBuilder(format, Record.class, input);
 
+    // a lookup knows the rows it wants: ask the format to read only those, which is what lets a
+    // page-oriented format read a handful of pages instead of the whole file
+    List<Long> wanted = null;
+    if (positions != null && !positions.isEmpty()) {
+      wanted = Lists.newArrayList(positions);
+      java.util.Collections.sort(wanted);
+      builder.positions(wanted);
+    }
+
     List<Tuple2<Row, Long>> rows = Lists.newArrayList();
-    long position = 0;
+    long nextPosition = 0;
     try (CloseableIterable<Record> records = builder.project(projection).build()) {
       for (Record record : records) {
         Object[] values = new Object[projection.columns().size()];
@@ -457,8 +472,21 @@ public final class IndexEntries {
           Types.NestedField field = projection.columns().get(i);
           values[i] = toSparkValue(field.type(), record.getField(field.name()));
         }
-        rows.add(new Tuple2<>(new GenericRowWithSchema(values, sparkSchema), position++));
+        // a format that honoured the positions returned exactly those rows, in ascending order
+        long position = wanted == null ? nextPosition : wanted.get((int) nextPosition);
+        rows.add(new Tuple2<>(new GenericRowWithSchema(values, sparkSchema), position));
+        nextPosition++;
       }
+    }
+
+    if (wanted != null && rows.size() != wanted.size()) {
+      // the format ignored the positions and read the file, which is allowed: number the rows the
+      // way an unfiltered read would, so the caller's position filter still picks the hit rows
+      List<Tuple2<Row, Long>> numbered = Lists.newArrayListWithCapacity(rows.size());
+      for (int i = 0; i < rows.size(); i++) {
+        numbered.add(new Tuple2<>(rows.get(i)._1(), (long) i));
+      }
+      return numbered.iterator();
     }
     return rows.iterator();
   }

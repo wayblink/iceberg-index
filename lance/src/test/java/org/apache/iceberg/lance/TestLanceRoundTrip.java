@@ -333,4 +333,72 @@ class TestLanceRoundTrip {
     assertThat(postCloseLength).isGreaterThan(0);
     assertThat(postCloseLength).isEqualTo(file.length());
   }
+
+  @Test
+  void readsOnlyTheRowsAtTheRequestedPositions() throws IOException {
+    LanceFormatModel<Record, Void> model = createModel();
+    File file = lanceFile("positions");
+
+    List<Record> written = Lists.newArrayList();
+    for (int i = 0; i < 200; i++) {
+      GenericRecord record = GenericRecord.create(SIMPLE_SCHEMA);
+      record.setField("id", i);
+      record.setField("name", "user_" + i);
+      record.setField("age", 20 + (i % 50));
+      record.setField("score", i * 1.5);
+      written.add(record);
+    }
+    writeRecords(model, file, SIMPLE_SCHEMA, written);
+
+    // a lookup that knows its rows reads only the pages that hold them
+    InputFile inputFile = Files.localInput(file);
+    List<Record> read =
+        Lists.newArrayList(
+            model
+                .readBuilder(inputFile)
+                .project(SIMPLE_SCHEMA)
+                .positions(Lists.newArrayList(7L, 8L, 150L))
+                .build());
+
+    // exactly the requested rows, in ascending position order
+    assertThat(read).hasSize(3);
+    assertThat(read.get(0).getField("id")).isEqualTo(7);
+    assertThat(read.get(1).getField("id")).isEqualTo(8);
+    assertThat(read.get(2).getField("id")).isEqualTo(150);
+    assertThat(read.get(2).getField("name")).isEqualTo("user_150");
+  }
+
+  @Test
+  void positionReadsMatchAFilteredFullRead() throws IOException {
+    LanceFormatModel<Record, Void> model = createModel();
+    File file = lanceFile("positions_match");
+
+    List<Record> written = Lists.newArrayList();
+    for (int i = 0; i < 50; i++) {
+      GenericRecord record = GenericRecord.create(SIMPLE_SCHEMA);
+      record.setField("id", i);
+      record.setField("name", "user_" + i);
+      record.setField("age", 20 + (i % 50));
+      record.setField("score", i * 1.5);
+      written.add(record);
+    }
+    writeRecords(model, file, SIMPLE_SCHEMA, written);
+
+    List<Long> positions = Lists.newArrayList(1L, 2L, 30L, 49L);
+    List<Record> filteredRead =
+        Lists.newArrayList(
+            model
+                .readBuilder(Files.localInput(file))
+                .project(SIMPLE_SCHEMA)
+                .positions(positions)
+                .build());
+
+    List<Record> fullRead = readRecords(model, file, SIMPLE_SCHEMA);
+    List<Record> expected = Lists.newArrayList();
+    for (long position : positions) {
+      expected.add(fullRead.get((int) position));
+    }
+
+    assertThat(filteredRead).containsExactlyElementsOf(expected);
+  }
 }

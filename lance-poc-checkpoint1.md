@@ -604,3 +604,32 @@ Map<String, Map<Long, String>> rowsByFile =
 2. **为什么不是数量级**：索引加载摊掉后，每 query 的剩余成本变成"**HNSW 搜索（两格式相同）+ 回表**"，而回表在这个实现里是**每文件一个 task** 的框架开销主导（10M 一次回表要开 38–39 个文件、跑一个 Spark job），**不是读多少字节**。Lance 省的是字节（10 行 32 KB vs 31 MB），省不掉 task/job 的开销。
 3. 所以对"是否用 Lance 换回表格式"的判断：在**批量/离线**场景它只是 1.1–1.9x 的乘数，而 `#1203` 的批摊销是 **~84x**；在**单查询**场景要靠缓存（#708）。**格式问题依旧是最后一位**，但在 batch 模式下它终于可测、且方向为正。
 4. 若要进一步放大格式优势，得先把回表的"每文件一个 task"变成"**每批一次读取**"（按位置聚合成更少的读、或走本地列式读取），那才会让 Lance 的字节优势变成时间优势。
+
+---
+
+## 17. 回表按位置读（#1454，第一半）：实现 + 单元级验证完成，集群测量被生产负载污染
+
+实现（commit 已提交）：
+1. **core `ReadBuilder.positions(Collection<Long>)`**（默认 no-op，契约：支持者只返回这些行、按升序；忽略者照旧整读，调用方自行过滤）。
+2. **`lance` 模块实现它**：positions → 合并成 `org.lance.util.Range` 列表，交给 `LanceFileReader.readAll(columns, ranges, batchSize)`，只读覆盖命中行的 page；`_pos` 与位置过滤同时使用会显式报错（过滤读不再从文件头计数）。
+3. **`IndexEntries.readFileWithFormat`**：把 positions 下传；模型支持时按"请求顺序一一对应"取位置；模型忽略时（如 avro/orc）回退为顺序编号，下游过滤行为不变。
+
+单元级验证（全绿）：
+- `TestLanceRoundTrip` 新增两例：`positions(7,8,150)` 只返回这 3 行且升序、内容正确；`positions(1,2,30,49)` 与"整读后按位置取"逐行一致。
+- 既有护栏：`TestRewriteVectorSearch` 12、`TestVectorIndexSearchBatch` 12、`TestIndexTableFunctions` 6、`TestLanceFetchBack` 1、`TestLanceFormatTable` 6 —— 全绿。
+
+**集群测量（失败的一次尝试）**：镜像仓库 push 凭据失效（`unauthorized`），改用 HDFS + `--files` + `extraClassPath` 注入新 jar（extraClassPath 前置，压过镜像内旧版）。跑出来的数字被同期生产负载严重污染，**同一轮内自相矛盾**：
+
+| 表 | 批量 100 总耗时 | 每 query | 回表段 | 命中文件 |
+|---|---|---|---|---|
+| 1M parquet | 198824 ms | 1988 | 43955 | 28 |
+| 1M Lance | 106677 ms | 1066 | **2225** | 9 |
+| 10M Lance | 205720 ms | 2057 | 10609 | 38 |
+| 10M parquet | 56969 ms | 569 | 19362 | 39 |
+
+（同一轮里 1M parquet 198s、10M parquet 57s —— 1M 那一批正好撞上生产高峰，绝对值不可用。）
+
+**能说的与不能说的**：
+- 可以说：位置读已实现并有单元级证据（只读请求的行、与整读等价）；1M 的回表段从上一轮 4820 ms 降到 2225 ms（2.2x），而同轮 parquet 仍在 44s —— 方向符合预期。
+- 不能说：10M 的回表段仍是 10.6s、与上一轮持平 —— 说明**page 粒度 + 每文件一个 task 的固定开销**仍是主体（38 个文件 × 每文件至少若干 page），而不是字节数；这与 §16 的判断一致：**第二半（把 38 个 task 合并）不先做，位置读的收益拿不满**。
+- 需要在 cluster 空闲窗口重测（三档：现状 / ① / ①+②），否则数字没有意义。
