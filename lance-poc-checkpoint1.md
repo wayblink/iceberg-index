@@ -713,3 +713,32 @@ Map<String, Map<Long, String>> rowsByFile =
 2. **减少文件数是线性收益**：28 个文件 × 155 ms ≈ 4.3 s（对上 §19 单查询 top-50 的 6.4 s），8 个文件 → ~1.2 s。但它属于写入/compaction 策略。
 3. **最值钱的工程动作是砍掉这 155 ms 里的"我们自己的那部分"**：复用 allocator（现在每文件 new RootAllocator）、缓存 HDFS Configuration/FormatModel 查找、把 N 个文件的 open + 读合并到一个 task 里顺序做。若我们能把它从 155 ms 降到 30–50 ms，**fetch-back 会等比例下降、且不依赖数据管道**。
 4. 对 #1485 决策 2 的含义不变但更清晰：交互式场景下重排读数据文件 = 文件数 × 155 ms 起跳 → 38 文件 ≈ 5.9 s 起；批量场景因为已经命中全部文件，过采样免费（§19）。
+
+---
+
+## 21. 压 per-file 开销（#1518）：conf/allocator 不是成本，native open + I/O 才是
+
+按 #1512 的分解，先做了三个"纯代码、不依赖数据管道"的优化，再用同一探针复测：
+
+| 优化 | 内容 |
+|---|---|
+| conf 提升 | `SerializableConfiguration` 从"每文件一次 `newHadoopConf()` 拷贝 + 序列化"改为每次 `rowsAt` 一次 |
+| conf 缓存 | task 内线程本地缓存反序列化后的 `Configuration`（打包多文件/批量时复用） |
+| allocator 复用 | 每线程一个 `RootAllocator`，每个文件用 child allocator 并只关 child（原来每文件 new/close 一个 root） |
+
+复测（10M Lance，10 行，取 min）：
+
+| 场景 | 优化前 | 优化后 |
+|---|---|---|
+| A1（1 文件 1 页） | 1060 ms | 1161 ms |
+| A2（1 文件 10 页） | 1023 ms | 1057 ms |
+| B（10 文件 10 页） | 2413 ms | 2356 ms |
+
+**没有变化。** 说明每文件 ~155 ms **不是** conf 反序列化、不是 HadoopInputFile、也不是 allocator 创建 —— 而是 **Lance native open（JNI + native reader 初始化 + footer 读）+ 每次 range read 的 I/O 延迟**，且是在**单个 task 内串行**发生的（探针默认把 10 个文件放在一个 task 里）。
+
+剩下的三条路（按可用性排序）：
+1. **把同一 task 内的多个文件 open/read 并行化**（线程池或让 task 数 = 文件数且执行器足够）→ 若 10 个 open 并行，B 会落到 ≈ A2 + ε。先前 §18 见到的"合并 task 只降 5%"是因为执行器少、并行度不够，不是并行无效。
+2. **减少文件数**（compaction，属于数据管道；§20 的线性关系不变）。
+3. 索引内留重排向量 —— 用户已明确不做（#1485 决策 2）。
+
+本轮提交保留了 conf/allocator 优化（它们消除的是"随文件数增长的工作"，虽然在这条探针上被 native open 淹没了），并加了 `iceberg.index.fetch-back.timings` 开关用于后续 profile。
