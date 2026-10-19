@@ -57,22 +57,64 @@ public final class RaBitQQuantizer implements java.io.Serializable {
   /** The number of numbers kept per vector besides the code. */
   static final int FACTORS = 3;
 
+  /** The property the number of bits per dimension is read from. */
+  public static final String BITS = "rabitq-bits";
+
+  private static final int DEFAULT_BITS = 1;
+  private static final int MAX_BITS = 8;
+
   private final int dimension;
   private final int padded;
   private final long seed;
+  private final int bits;
   private final float[] center;
   private final float[] signs;
 
-  RaBitQQuantizer(int dimension, long seed, float[] center) {
+  RaBitQQuantizer(int dimension, long seed, int bits, float[] center) {
+    Preconditions.checkArgument(
+        bits >= 1 && bits <= MAX_BITS, "Bits per dimension must be 1 to %s: %s", MAX_BITS, bits);
     this.dimension = dimension;
     this.padded = nextPowerOfTwo(dimension);
     this.seed = seed;
+    this.bits = bits;
     this.center = center.clone();
     this.signs = signs(seed, padded);
   }
 
+  /** The number of bits per dimension this quantizer was made with. */
+  public int bits() {
+    return bits;
+  }
+
+  /** How many distinct levels a coordinate is quantized to. */
+  private int levels() {
+    return 1 << bits;
+  }
+
+  /** Reads the bit count from the index options. */
+  public static int bitsFrom(java.util.Map<String, String> properties) {
+    Preconditions.checkNotNull(properties, "Index properties are null");
+    String value = properties.get(BITS);
+    if (value == null) {
+      return DEFAULT_BITS;
+    }
+
+    try {
+      int bits = Integer.parseInt(value.trim());
+      Preconditions.checkArgument(
+          bits >= 1 && bits <= MAX_BITS,
+          "Index option %s must be 1 to %s: %s",
+          BITS,
+          MAX_BITS,
+          bits);
+      return bits;
+    } catch (NumberFormatException e) {
+      throw new IllegalArgumentException("Index option " + BITS + " is not a number: " + value, e);
+    }
+  }
+
   /** Trains the quantizer on the vectors a list holds: the centre is their mean. */
-  static RaBitQQuantizer train(float[][] vectors, int dimension, long seed) {
+  static RaBitQQuantizer train(float[][] vectors, int dimension, long seed, int bits) {
     Preconditions.checkArgument(dimension > 0, "Dimension must be positive: %s", dimension);
     float[] center = new float[dimension];
     if (vectors.length > 0) {
@@ -86,7 +128,7 @@ public final class RaBitQQuantizer implements java.io.Serializable {
       }
     }
 
-    return new RaBitQQuantizer(dimension, seed, center);
+    return new RaBitQQuantizer(dimension, seed, bits, center);
   }
 
   int dimension() {
@@ -107,7 +149,7 @@ public final class RaBitQQuantizer implements java.io.Serializable {
 
   /** How many bytes a code takes. */
   int codeBytes() {
-    return (padded + 7) / 8;
+    return (padded * bits + 7) / 8;
   }
 
   /** The centre of the vectors, for a caller that has to report it. */
@@ -124,19 +166,35 @@ public final class RaBitQQuantizer implements java.io.Serializable {
         dimension);
     float[] rotated = rotate(vector);
     double norm = 0.0;
+    for (int i = 0; i < dimension; i++) {
+      norm += (double) rotated[i] * rotated[i];
+    }
+
+    // the grid each coordinate is quantized on spans the vector's own largest coordinate, so the
+    // levels are spent where the coordinates are rather than on a range they never reach; the scale
+    // is not stored because the projection below absorbs it
+    double largest = 0.0;
+    for (int i = 0; i < padded; i++) {
+      largest = Math.max(largest, Math.abs(rotated[i]));
+    }
+
+    int levels = levels();
+    double scale = largest == 0.0 ? 0.0 : 1.0 / largest;
     double correction = 0.0;
     for (int i = 0; i < padded; i++) {
-      if (i < dimension) {
-        norm += (double) rotated[i] * rotated[i];
-      }
-      correction += Math.abs(rotated[i]);
-      setBit(code, offset, i, rotated[i] >= 0.0f);
+      double relative = padded == 0 || largest == 0.0 ? 0.0 : rotated[i] * scale;
+      int level =
+          (int)
+              Math.round(
+                  Math.max(0.0, Math.min(levels - 1, (relative + 1.0) * (levels - 1) / 2.0)));
+      setLevel(code, offset, i, level);
+      correction += (double) decodeLevel(level, levels) * (rotated[i] / Math.sqrt(norm));
     }
 
     factors[0] = (float) Math.sqrt(norm);
     // <x, u>, the projection of the code onto the direction it stands for, which is what makes the
     // estimate unbiased rather than systematically short
-    factors[1] = norm == 0.0 ? 1.0f : (float) (correction / Math.sqrt(norm));
+    factors[1] = norm == 0.0 ? 1.0f : (float) correction;
     double dotWithCenter = 0.0;
     for (int d = 0; d < dimension; d++) {
       dotWithCenter += (double) (vector[d] - center[d]) * center[d];
@@ -158,13 +216,10 @@ public final class RaBitQQuantizer implements java.io.Serializable {
     double correction = factors[1];
     // <x, P q'>, over the coordinates the code covers; a zero padded coordinate contributes
     // nothing on either side
+    int levels = levels();
     double projection = 0.0;
     for (int i = 0; i < padded; i++) {
-      if (getBit(code, offset, i)) {
-        projection += rotatedQuery[i];
-      } else {
-        projection -= rotatedQuery[i];
-      }
+      projection += decodeLevel(getLevel(code, offset, i), levels) * rotatedQuery[i];
     }
 
     double estimatedInner = norm == 0.0 || correction == 0.0 ? 0.0 : norm * projection / correction;
@@ -179,9 +234,10 @@ public final class RaBitQQuantizer implements java.io.Serializable {
       byte[] code, int offset, float[] factors, float[] rotatedQuery, float[] query) {
     double norm = factors[0];
     double correction = factors[1];
+    int levels = levels();
     double projection = 0.0;
     for (int i = 0; i < padded; i++) {
-      projection += getBit(code, offset, i) ? rotatedQuery[i] : -rotatedQuery[i];
+      projection += decodeLevel(getLevel(code, offset, i), levels) * rotatedQuery[i];
     }
 
     double centeredInner = norm == 0.0 || correction == 0.0 ? 0.0 : norm * projection / correction;
@@ -263,14 +319,31 @@ public final class RaBitQQuantizer implements java.io.Serializable {
     return signs;
   }
 
-  private static void setBit(byte[] code, int offset, int index, boolean value) {
-    if (value) {
-      code[offset + (index >> 3)] |= (byte) (1 << (index & 7));
+  /** The value a level stands for: {@code levels} of them spread evenly over the range. */
+  private static double decodeLevel(int level, int levels) {
+    return levels == 1 ? 0.0 : -1.0 + 2.0 * level / (levels - 1);
+  }
+
+  private void setLevel(byte[] code, int offset, int index, int level) {
+    int bitOffset = offset * 8 + index * bits;
+    for (int bit = 0; bit < bits; bit++) {
+      if ((level & (1 << bit)) != 0) {
+        int position = bitOffset + bit;
+        code[position >> 3] |= (byte) (1 << (position & 7));
+      }
     }
   }
 
-  private static boolean getBit(byte[] code, int offset, int index) {
-    return (code[offset + (index >> 3)] & (1 << (index & 7))) != 0;
+  private int getLevel(byte[] code, int offset, int index) {
+    int bitOffset = offset * 8 + index * bits;
+    int level = 0;
+    for (int bit = 0; bit < bits; bit++) {
+      int position = bitOffset + bit;
+      if ((code[position >> 3] & (1 << (position & 7))) != 0) {
+        level |= 1 << bit;
+      }
+    }
+    return level;
   }
 
   private static int nextPowerOfTwo(int value) {

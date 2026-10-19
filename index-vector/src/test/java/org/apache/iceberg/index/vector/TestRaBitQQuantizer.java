@@ -43,8 +43,17 @@ class TestRaBitQQuantizer {
 
   @Test
   public void estimatesDistancesAndTheirOrder() {
+    // the bit count is an index option, so what it buys is measured rather than assumed: more bits
+    // per dimension means smaller codes are not the trade, the trade is a bigger code for a better
+    // estimate, and this records where the estimate becomes good enough to order a cluster
+    for (int bits : new int[] {1, 2, 3, 4}) {
+      measureBits(bits);
+    }
+  }
+
+  private void measureBits(int bits) {
     float[][] vectors = clusteredVectors(VECTORS, DIMENSION, 20, 7L);
-    RaBitQQuantizer quantizer = RaBitQQuantizer.train(vectors, DIMENSION, SEED);
+    RaBitQQuantizer quantizer = RaBitQQuantizer.train(vectors, DIMENSION, SEED, bits);
 
     byte[] codes = new byte[VECTORS * quantizer.codeBytes()];
     float[][] factors = new float[VECTORS][];
@@ -58,7 +67,12 @@ class TestRaBitQQuantizer {
     // the encoding is one bit per dimension rounded up to whole bytes, plus three numbers
     assertThat(codeBytes + 4 * RaBitQQuantizer.FACTORS)
         .as("bytes per vector, against %s for the vector itself", 4 * DIMENSION)
-        .isLessThan(4 * DIMENSION / 8);
+        .isLessThan(4 * DIMENSION);
+    if (bits <= 3) {
+      // up to three bits per dimension the code plus its three numbers is under a quarter of the
+      // vector, which is the range an index is likely to choose from
+      assertThat(codeBytes + 4 * RaBitQQuantizer.FACTORS).isLessThan((4 * DIMENSION) / 4);
+    }
 
     int queries = 20;
     Measurements measurements = measure(quantizer, vectors, codes, factors, queries);
@@ -75,7 +89,9 @@ class TestRaBitQQuantizer {
     double containedWide = (double) measurements.insideTop1000 / (queries * 10);
     double pearson = pearson(measurements.correlation);
     System.out.println(
-        "QUANT codeBytes="
+        "QUANT bits="
+            + bits
+            + " codeBytes="
             + codeBytes
             + " bytesPerVector="
             + (codeBytes + 4 * RaBitQQuantizer.FACTORS)
@@ -97,16 +113,22 @@ class TestRaBitQQuantizer {
     assertThat(pearson)
         .as("how well the estimate tracks the true distance across the whole set")
         .isGreaterThan(0.95);
-    assertThat(overlap)
-        .as("the share of the exact top ten that the estimate also finds, recorded not asserted")
-        .isGreaterThan(0.0);
+    // what an index needs from a quantizer is not that its own ranking is right, because even a
+    // small error cannot separate the tenth nearest of a cluster from the eleventh: it is that the
+    // true neighbours are inside a candidate set the caller can afford to re-rank exactly
+    assertThat(contained)
+        .as("the share of the exact top ten inside the estimated top hundred at %s bits", bits)
+        .isGreaterThan(bits >= 3 ? 0.99 : 0.8);
+    assertThat(meanRelativeError)
+        .as("error falls as bits are spent, at %s bits", bits)
+        .isLessThan(bits == 1 ? 0.06 : 0.05);
   }
 
   @Test
   public void reproducesTheSameCodesFromTheSameSeed() {
     float[][] vectors = randomVectors(100, DIMENSION, 3L);
-    RaBitQQuantizer first = RaBitQQuantizer.train(vectors, DIMENSION, SEED);
-    RaBitQQuantizer second = RaBitQQuantizer.train(vectors, DIMENSION, SEED);
+    RaBitQQuantizer first = RaBitQQuantizer.train(vectors, DIMENSION, SEED, 1);
+    RaBitQQuantizer second = RaBitQQuantizer.train(vectors, DIMENSION, SEED, 1);
 
     assertThat(second.center()).isEqualTo(first.center());
     assertThat(second.seed()).isEqualTo(first.seed());
@@ -127,7 +149,7 @@ class TestRaBitQQuantizer {
     // the Hadamard transform needs a power of two, so a vector is zero padded to one; the padding
     // is zero on both sides of an inner product, which leaves the estimate alone
     float[][] vectors = randomVectors(200, 100, 11L);
-    RaBitQQuantizer quantizer = RaBitQQuantizer.train(vectors, 100, SEED);
+    RaBitQQuantizer quantizer = RaBitQQuantizer.train(vectors, 100, SEED, 1);
     assertThat(quantizer.padded()).isEqualTo(128);
     assertThat(quantizer.codeBytes()).isEqualTo(16);
 
