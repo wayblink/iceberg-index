@@ -27,9 +27,17 @@ import org.apache.iceberg.index.IndexAdapter;
 import org.apache.iceberg.index.IndexEntry;
 import org.apache.iceberg.index.IndexSearchResult;
 import org.apache.iceberg.relocated.com.google.common.collect.Lists;
+import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 
 class TestVectorIndexAdapter {
+
+  @BeforeAll
+  static void registerVectorIndexType() {
+    // constructing an adapter resolves the kernel its definition asks for, and the kernels are
+    // registered with the type rather than guessed at
+    VectorIndexTypes.register();
+  }
 
   /**
    * Rewrites a payload's header into the form written before the kernel was named: a bare format
@@ -59,48 +67,33 @@ class TestVectorIndexAdapter {
 
   @Test
   public void readsPayloadsWrittenBeforeTheKernelWasNamed() {
-    VectorIndexAdapter adapter =
-        new VectorIndexAdapter(
-            VectorIndexDefinition.builder()
-                .fieldId(1)
-                .dimension(2)
-                .metric(VectorIndexDefinition.Metric.EUCLIDEAN)
-                .structure(VectorIndexDefinition.VectorStructure.HNSW)
-                .maxM(8)
-                .efConstruction(100)
-                .efSearch(64)
-                .build());
+    // the entry-bearing role belongs to the flat structure, the auxiliary role to one that builds
+    // something over the vectors; both headers changed, so both are checked
+    VectorIndexAdapter scan = flatAdapter(VectorIndexDefinition.Metric.EUCLIDEAN);
+    VectorIndexAdapter graph = hnswAdapter(VectorIndexDefinition.Metric.EUCLIDEAN);
 
     List<IndexEntry> entries =
         Lists.newArrayList(
-            IndexEntry.of("data-1.parquet", 0, adapter.encodeVector(new float[] {1.0f, 0.0f})),
-            IndexEntry.of("data-2.parquet", 1, adapter.encodeVector(new float[] {0.0f, 1.0f})));
+            IndexEntry.of("data-1.parquet", 0, scan.encodeVector(new float[] {1.0f, 0.0f})),
+            IndexEntry.of("data-2.parquet", 1, scan.encodeVector(new float[] {0.0f, 1.0f})));
 
-    ByteBuffer query = adapter.encodeQuery(new float[] {1.0f, 0.1f});
+    ByteBuffer query = scan.encodeQuery(new float[] {1.0f, 0.1f});
 
-    // both roles, because both headers changed
-    ByteBuffer entryPayload = asLegacyPayload(adapter.encodeEntries(entries));
-    assertThat(adapter.decodeEntries(entryPayload))
+    ByteBuffer entryPayload = asLegacyPayload(scan.encodeEntries(entries));
+    assertThat(scan.decodeEntries(entryPayload))
         .as("an entry payload from before the header named the kernel")
         .hasSize(2);
-    assertThat(adapter.search(entryPayload, query, 1)).hasSize(1);
+    assertThat(scan.search(entryPayload, query, 1)).hasSize(1);
 
-    ByteBuffer auxiliaryPayload = asLegacyPayload(adapter.encodeAuxiliaryPayload(entries, 1));
-    assertThat(adapter.prepareAuxiliary(auxiliaryPayload).search(query, 1))
+    ByteBuffer auxiliaryPayload = asLegacyPayload(graph.encodeAuxiliaryPayload(entries, 1));
+    assertThat(graph.prepareAuxiliary(auxiliaryPayload).search(query, 1))
         .as("an auxiliary payload from before the header named the kernel")
         .hasSize(1);
   }
 
   @Test
   public void refusesAPayloadFromAKernelItDoesNotHave() {
-    VectorIndexAdapter adapter =
-        new VectorIndexAdapter(
-            VectorIndexDefinition.builder()
-                .fieldId(1)
-                .dimension(2)
-                .metric(VectorIndexDefinition.Metric.EUCLIDEAN)
-                .structure(VectorIndexDefinition.VectorStructure.HNSW)
-                .build());
+    VectorIndexAdapter adapter = flatAdapter(VectorIndexDefinition.Metric.EUCLIDEAN);
 
     ByteBuffer entries =
         adapter.encodeEntries(
@@ -138,6 +131,16 @@ class TestVectorIndexAdapter {
   private static VectorIndexAdapter adapter(VectorIndexDefinition.Metric metric) {
     return new VectorIndexAdapter(
         VectorIndexDefinition.builder().fieldId(1).dimension(2).metric(metric).build());
+  }
+
+  private static VectorIndexAdapter flatAdapter(VectorIndexDefinition.Metric metric) {
+    return new VectorIndexAdapter(
+        VectorIndexDefinition.builder()
+            .fieldId(1)
+            .dimension(2)
+            .metric(metric)
+            .structure(VectorIndexDefinition.VectorStructure.FLAT)
+            .build());
   }
 
   private static VectorIndexAdapter hnswAdapter(VectorIndexDefinition.Metric metric) {

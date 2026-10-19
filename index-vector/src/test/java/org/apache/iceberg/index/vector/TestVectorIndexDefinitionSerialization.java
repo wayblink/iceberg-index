@@ -25,6 +25,7 @@ import com.fasterxml.jackson.databind.JsonNode;
 import org.apache.iceberg.index.vector.VectorIndexDefinition.VectorQuantizer;
 import org.apache.iceberg.index.vector.VectorIndexDefinition.VectorStructure;
 import org.apache.iceberg.util.JsonUtil;
+import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 
 /**
@@ -36,6 +37,13 @@ import org.junit.jupiter.api.Test;
  * being readable.
  */
 class TestVectorIndexDefinitionSerialization {
+
+  @BeforeAll
+  static void registerVectorIndexType() {
+    // constructing an adapter resolves the kernel its definition asks for, and the kernels are
+    // registered with the type rather than guessed at
+    VectorIndexTypes.register();
+  }
 
   private static final VectorIndexType TYPE = new VectorIndexType();
 
@@ -207,7 +215,8 @@ class TestVectorIndexDefinitionSerialization {
                         .structure(VectorStructure.IVF)
                         .build()))
         .isInstanceOf(IllegalArgumentException.class)
-        .hasMessageContaining("Unsupported vector structure IVF")
+        .hasMessageContaining("No vector kernel builds a IVF index")
+        .hasMessageContaining("bruteforce")
         .hasMessageContaining("FLAT");
 
     assertThatThrownBy(
@@ -220,7 +229,7 @@ class TestVectorIndexDefinitionSerialization {
                         .quantizer(VectorQuantizer.RABITQ)
                         .build()))
         .isInstanceOf(IllegalArgumentException.class)
-        .hasMessageContaining("Unsupported vector quantizer RABITQ");
+        .hasMessageContaining("No vector kernel builds a FLAT index with the RABITQ quantizer");
   }
 
   private static String exactLegacyJson() {

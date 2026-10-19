@@ -38,9 +38,15 @@ public final class VectorIndexTypes {
 
   private VectorIndexTypes() {}
 
-  /** Registers the vector index type in the core registry. */
+  /**
+   * Registers the vector index type in the core registry, and the kernels it ships with.
+   *
+   * <p>The kernels are registered here because the type is useless without one: a process that
+   * registered the type but no kernel would accept a definition and then fail to build it.
+   */
   public static void register() {
     IndexTypes.register(new VectorIndexType());
+    VectorKernels.registerDefaults();
   }
 
   /** Returns a new instance of the vector index type. */

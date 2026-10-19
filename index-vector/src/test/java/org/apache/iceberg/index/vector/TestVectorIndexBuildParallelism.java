@@ -26,6 +26,7 @@ import java.util.List;
 import org.apache.iceberg.index.IndexEntry;
 import org.apache.iceberg.index.IndexSearchResult;
 import org.apache.iceberg.relocated.com.google.common.collect.Lists;
+import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 
 /**
@@ -39,6 +40,13 @@ import org.junit.jupiter.api.Test;
  * parallel build.
  */
 class TestVectorIndexBuildParallelism {
+
+  @BeforeAll
+  static void registerVectorIndexType() {
+    // constructing an adapter resolves the kernel its definition asks for, and the kernels are
+    // registered with the type rather than guessed at
+    VectorIndexTypes.register();
+  }
 
   private static final int DIMENSION = 8;
   private static final int ENTRIES = 500;
