@@ -80,6 +80,18 @@ public final class VectorScoring implements Serializable {
     }
   }
 
+  /**
+   * Compares two scores the way results are ordered: negative when the first is better.
+   *
+   * <p>A distance is better when it is smaller and a similarity when it is larger, so anything that
+   * has to pick the closest of several candidates asks this rather than assuming a direction.
+   */
+  public int compareScores(double left, double right) {
+    return metric == VectorIndexDefinition.Metric.EUCLIDEAN
+        ? Double.compare(left, right)
+        : Double.compare(right, left);
+  }
+
   /** Orders results best first, breaking ties by the row a hit points at. */
   public Comparator<IndexSearchResult> comparator() {
     Comparator<IndexSearchResult> tieBreaker =

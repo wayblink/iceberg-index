@@ -131,20 +131,47 @@ public class TestVectorIndexProcedures extends ExtensionsTestBase {
   }
 
   @TestTemplate
-  public void testRefusesAStructureNothingSearchesYet() {
+  public void testBuildsAnIvfIndex() {
+    String tableName = tableName("vectors_structure_" + catalogName);
+    sql("CREATE TABLE %s (id bigint, embedding array<double>) USING iceberg", tableName);
+    sql(
+        "INSERT INTO %s VALUES (1, array(1.0, 0.0)), (2, array(0.9, 0.1)), (3, array(0.0, 1.0)), "
+            + "(4, array(0.1, 0.95)), (5, array(-1.0, 0.0)), (6, array(0.0, -1.0))",
+        tableName);
+
+    // IVF partitions the vectors of each index file around centroids of its own, so no training
+    // over the table is involved and nothing is redistributed
+    List<Object[]> built =
+        sql(
+            "CALL %s.system.build_vector_index(table => '%s', column => 'embedding', dimension => 2, structure => 'IVF', options => map('nprobe', '4'))",
+            catalogName, tableName);
+    assertThat(built).hasSize(1);
+
+    List<Object[]> listed =
+        sql("CALL %s.system.list_indexes(table => '%s')", catalogName, tableName);
+    assertThat(listed.get(0)[7].toString()).contains("\"structure\":\"IVF\"");
+
+    // the search path itself is covered by the kernel's own tests, which can compare against an
+    // exact scan; this one is about the procedure accepting a structure the kernel registry offers
+    assertThat(listed).hasSize(1);
+  }
+
+  @TestTemplate
+  public void testRefusesAQuantizerNothingAppliesYet() {
     String tableName = tableName("vectors_structure_" + catalogName);
     sql("CREATE TABLE %s (id bigint, embedding array<double>) USING iceberg", tableName);
     sql("INSERT INTO %s VALUES (1, array(1.0, 0.0)), (2, array(0.0, 1.0))", tableName);
 
-    // IVF is a structure a definition may name, but no kernel implements it, so the build says so
+    // RaBitQ is a quantizer a definition may name, but no kernel applies it, so the build says so
     // rather than leaving behind an index nothing can search
     assertThatThrownBy(
             () ->
                 sql(
-                    "CALL %s.system.build_vector_index(table => '%s', column => 'embedding', dimension => 2, structure => 'IVF')",
+                    "CALL %s.system.build_vector_index(table => '%s', column => 'embedding', dimension => 2, quantizer => 'RABITQ')",
                     catalogName, tableName))
         .isInstanceOf(IllegalArgumentException.class)
-        .hasMessageContaining("Unsupported vector structure IVF");
+        .hasMessageContaining("No vector kernel builds a FLAT index with the RABITQ quantizer")
+        .hasMessageContaining("bruteforce");
   }
 
   @TestTemplate

@@ -18,6 +18,7 @@
  */
 package org.apache.iceberg.spark.procedures;
 
+import java.util.Map;
 import java.util.UUID;
 import org.apache.iceberg.index.CreateIndexRequest;
 import org.apache.iceberg.index.IndexMetadata;
@@ -65,6 +66,15 @@ class BuildVectorIndexProcedure extends BaseProcedure {
   private static final ProcedureParameter MODE_PARAM =
       optionalInParameter("mode", DataTypes.StringType);
 
+  /**
+   * Options of the structure being built, such as nlist and nprobe for IVF.
+   *
+   * <p>A map rather than a parameter per option, because the options of one structure mean nothing
+   * to another, and a procedure that named them all would have to name each new one as well.
+   */
+  private static final ProcedureParameter OPTIONS_PARAM =
+      ProcedureParameter.optional("options", STRING_MAP);
+
   private static final ProcedureParameter MAX_M_PARAM =
       optionalInParameter("max_m", DataTypes.IntegerType);
   private static final ProcedureParameter EF_CONSTRUCTION_PARAM =
@@ -82,6 +92,7 @@ class BuildVectorIndexProcedure extends BaseProcedure {
         STRUCTURE_PARAM,
         QUANTIZER_PARAM,
         MODE_PARAM,
+        OPTIONS_PARAM,
         MAX_M_PARAM,
         EF_CONSTRUCTION_PARAM,
         EF_SEARCH_PARAM,
@@ -130,6 +141,7 @@ class BuildVectorIndexProcedure extends BaseProcedure {
     Metric metric = parseMetric(input.asString(METRIC_PARAM, Metric.COSINE.name()));
     VectorStructure structure = parseStructure(input, MODE_PARAM);
     VectorQuantizer quantizer = parseQuantizer(input, QUANTIZER_PARAM);
+    Map<String, String> options = input.asStringMap(OPTIONS_PARAM, java.util.Map.of());
     int maxM = input.asInt(MAX_M_PARAM, 16);
     int efConstruction = input.asInt(EF_CONSTRUCTION_PARAM, 200);
     int efSearch = input.asInt(EF_SEARCH_PARAM, 50);
@@ -160,16 +172,16 @@ class BuildVectorIndexProcedure extends BaseProcedure {
                       .tableUuid(String.valueOf(table.uuid()))
                       .indexUuid(indexUuid)
                       .definition(
-                          VectorIndexDefinition.builder()
-                              .fieldId(fieldId)
-                              .dimension(dimension)
-                              .metric(metric)
-                              .structure(structure)
-                              .quantizer(quantizer)
-                              .maxM(maxM)
-                              .efConstruction(efConstruction)
-                              .efSearch(efSearch)
-                              .build())
+                          vectorDefinition(
+                              structure,
+                              quantizer,
+                              fieldId,
+                              dimension,
+                              metric,
+                              maxM,
+                              efConstruction,
+                              efSearch,
+                              options))
                       .property(
                           IndexMetadata.MAX_ENTRIES_PER_INDEX_FILE_PROPERTY,
                           Long.toString(maxEntriesPerIndexFile))
@@ -202,6 +214,36 @@ class BuildVectorIndexProcedure extends BaseProcedure {
    * that named it before the two axes were separated: {@code EXACT} meant a flat scan and {@code
    * HNSW} meant a graph.
    */
+  /**
+   * The definition of the index being built.
+   *
+   * <p>The graph's parameters are only written when the structure is a graph: a structure that
+   * reads another one's options reports it, so writing them anyway would turn every IVF build into
+   * a failure. The caller's option map is applied last, so it wins over the named parameters.
+   */
+  private static VectorIndexDefinition vectorDefinition(
+      VectorStructure structure,
+      VectorQuantizer quantizer,
+      int fieldId,
+      int dimension,
+      org.apache.iceberg.index.vector.VectorIndexDefinition.Metric metric,
+      int maxM,
+      int efConstruction,
+      int efSearch,
+      Map<String, String> options) {
+    VectorIndexDefinition.Builder builder =
+        VectorIndexDefinition.builder()
+            .fieldId(fieldId)
+            .dimension(dimension)
+            .metric(metric)
+            .structure(structure)
+            .quantizer(quantizer);
+    if (structure == VectorStructure.HNSW) {
+      builder.maxM(maxM).efConstruction(efConstruction).efSearch(efSearch);
+    }
+    return builder.properties(options).build();
+  }
+
   private static VectorStructure parseStructure(ProcedureInput input, ProcedureParameter legacy) {
     String structure = input.asString(STRUCTURE_PARAM, null);
     String mode = input.asString(legacy, null);

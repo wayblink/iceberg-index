@@ -203,22 +203,8 @@ class TestVectorIndexDefinitionSerialization {
 
   @Test
   public void refusesToBuildAnIndexNothingCanSearchYet() {
-    // IVF and RaBitQ are named so that a definition can express them, but no kernel implements
-    // either, and building an index nothing can read is worse than refusing
-    assertThatThrownBy(
-            () ->
-                new VectorIndexAdapter(
-                    VectorIndexDefinition.builder()
-                        .fieldId(2)
-                        .dimension(4)
-                        .metric(VectorIndexDefinition.Metric.COSINE)
-                        .structure(VectorStructure.IVF)
-                        .build()))
-        .isInstanceOf(IllegalArgumentException.class)
-        .hasMessageContaining("No vector kernel builds a IVF index")
-        .hasMessageContaining("bruteforce")
-        .hasMessageContaining("FLAT");
-
+    // RaBitQ is a quantizer a definition may name, but no kernel applies it, and building an index
+    // nothing can read is worse than refusing
     assertThatThrownBy(
             () ->
                 new VectorIndexAdapter(
@@ -229,7 +215,8 @@ class TestVectorIndexDefinitionSerialization {
                         .quantizer(VectorQuantizer.RABITQ)
                         .build()))
         .isInstanceOf(IllegalArgumentException.class)
-        .hasMessageContaining("No vector kernel builds a FLAT index with the RABITQ quantizer");
+        .hasMessageContaining("No vector kernel builds a FLAT index with the RABITQ quantizer")
+        .hasMessageContaining("bruteforce");
   }
 
   private static String exactLegacyJson() {

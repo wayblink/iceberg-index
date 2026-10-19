@@ -110,6 +110,7 @@ public final class VectorKernels {
   public static void registerDefaults() {
     FACTORIES.putIfAbsent(BruteforceKernel.NAME, new BruteforceKernel.Factory());
     FACTORIES.putIfAbsent(HnswlibKernel.NAME, new HnswlibKernel.Factory());
+    FACTORIES.putIfAbsent(IvfKernel.NAME, new IvfKernel.Factory());
   }
 
   private static java.util.List<VectorKernelFactory> factoriesInNameOrder() {
