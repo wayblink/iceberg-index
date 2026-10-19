@@ -37,6 +37,8 @@ import org.junit.jupiter.api.extension.ExtendWith;
 @ExtendWith(ParameterizedTestExtension.class)
 public class TestVectorIndexSearchBatch extends ExtensionsTestBase {
 
+  private static final String CACHE_ENABLED = "spark.iceberg.index.cache.enabled";
+
   @BeforeAll
   static void registerVectorIndexType() {
     VectorIndexTypes.register();
@@ -48,6 +50,44 @@ public class TestVectorIndexSearchBatch extends ExtensionsTestBase {
     sql("DROP TABLE IF EXISTS %s", tableName("vectors_batch_from_table_" + catalogName));
     sql("DROP TABLE IF EXISTS %s", tableName("vectors_batch_queries_" + catalogName));
     sql("DROP TABLE IF EXISTS %s", tableName("vectors_batch_empty_" + catalogName));
+  }
+
+  @TestTemplate
+  public void cachedBatchSearchReturnsTheSameHits() {
+    String tableName = tableName("vectors_batch_cached_" + catalogName);
+    sql("CREATE TABLE %s (id bigint, embedding array<double>) USING iceberg", tableName);
+    sql(
+        "INSERT INTO %s SELECT id, array(CAST(id AS double), CAST(10 - id AS double)) "
+            + "FROM range(0, 20)",
+        tableName);
+    sql(
+        "CALL %s.system.build_vector_index("
+            + "table => '%s', column => 'embedding', dimension => 2, metric => 'euclidean')",
+        catalogName, tableName);
+
+    String search =
+        "CALL %s.system.vector_search_batch(table => '%s', column => 'embedding', "
+            + "queries => array('0.0,10.0', '10.0,0.0', '5.0,5.0'), k => 3)";
+
+    // cold: every index file is read and prepared for this one batch
+    List<Object[]> cold = sql(search, catalogName, tableName);
+
+    // warm: the payloads and their prepared structures come from the executor's cache, so the
+    // hits have to be the same rows in the same order
+    spark.conf().set(CACHE_ENABLED, "true");
+    try {
+      List<Object[]> warm = sql(search, catalogName, tableName);
+      assertThat(warm).hasSameSizeAs(cold);
+      for (int i = 0; i < cold.size(); i++) {
+        assertThat(rowValues(warm.get(i))).isEqualTo(rowValues(cold.get(i)));
+      }
+    } finally {
+      spark.conf().unset(CACHE_ENABLED);
+    }
+  }
+
+  private static List<Object> rowValues(Object[] row) {
+    return java.util.Arrays.asList(row);
   }
 
   @TestTemplate

@@ -150,6 +150,10 @@ public final class DistributedIndexSearch {
     // the file IO travels whole, so an executor reads a payload the way the table is read, with the
     // properties of its catalog rather than with whatever the session happens to be configured with
     Broadcast<FileIO> ioRef = context.broadcast(table.io());
+    // whether an executor remembers index files between queries, and how much it may keep
+    Broadcast<ExecutorIndexCache.Config> cacheRef =
+        context.broadcast(ExecutorIndexCache.Config.from(spark));
+    String cacheKey = cacheKey(adapter);
 
     // the limit is captured as a primitive: the query itself is not serializable. One more than the
     // query asks for is kept, because that is what says whether there is another round to ask for.
@@ -169,23 +173,34 @@ public final class DistributedIndexSearch {
                       IndexAdapter fileAdapter = adapterRef.getValue();
                       ByteBuffer fileQuery = ByteBuffer.wrap(queryRef.getValue());
                       FileIO fileIO = ioRef.getValue();
+                      ExecutorIndexCache.Config cacheConfig = cacheRef.getValue();
                       List<Tuple3<String, Long, Double>> fileHits = Lists.newArrayList();
                       while (locations1.hasNext()) {
                         String location = locations1.next();
                         long readStart = System.nanoTime();
-                        byte[] content = readPayload(fileIO, location);
+                        ExecutorIndexCache.CachedFile file =
+                            ExecutorIndexCache.get()
+                                .file(
+                                    location,
+                                    cacheConfig,
+                                    cacheKey,
+                                    () -> {
+                                      byte[] content = readPayload(fileIO, location);
+                                      return ExecutorIndexCache.loaded(
+                                          content, prepareFile(content, fileAdapter));
+                                    });
                         long readNanos = System.nanoTime() - readStart;
                         long searchStart = System.nanoTime();
                         for (IndexSearchResult hit :
-                            searchFile(content, fileAdapter, fileQuery, localTopK)) {
+                            file.searching(
+                                prepared -> prepared.search(fileQuery.duplicate(), localTopK))) {
                           fileHits.add(
                               new Tuple3<>(hit.dataFile(), hit.rowPosition(), hit.score()));
                         }
                         LOG.debug(
-                            "index file {} read {} ms ({} bytes), search {} ms",
+                            "index file {} read {} ms, search {} ms",
                             location.substring(location.lastIndexOf('/') + 1),
                             TimeUnit.MILLISECONDS.convert(readNanos, TimeUnit.NANOSECONDS),
-                            content.length,
                             TimeUnit.MILLISECONDS.convert(
                                 System.nanoTime() - searchStart, TimeUnit.NANOSECONDS));
                       }
@@ -263,6 +278,9 @@ public final class DistributedIndexSearch {
     }
     Broadcast<List<byte[]>> queriesRef = context.broadcast(queryPayloads);
     Broadcast<FileIO> ioRef = context.broadcast(table.io());
+    Broadcast<ExecutorIndexCache.Config> cacheRef =
+        context.broadcast(ExecutorIndexCache.Config.from(spark));
+    String cacheKey = cacheKey(adapter);
 
     // one more than the widest query asks for is kept per query, because that is what says whether
     // there is another round to ask for
@@ -277,54 +295,45 @@ public final class DistributedIndexSearch {
                       IndexAdapter fileAdapter = adapterRef.getValue();
                       List<byte[]> fileQueries = queriesRef.getValue();
                       FileIO fileIO = ioRef.getValue();
+                      ExecutorIndexCache.Config cacheConfig = cacheRef.getValue();
                       List<Tuple2<Integer, Tuple3<String, Long, Double>>> batchHits =
                           Lists.newArrayList();
                       while (locations1.hasNext()) {
                         String location = locations1.next();
                         long readStart = System.nanoTime();
-                        byte[] content = readPayload(fileIO, location);
+                        ExecutorIndexCache.CachedFile file =
+                            ExecutorIndexCache.get()
+                                .file(
+                                    location,
+                                    cacheConfig,
+                                    cacheKey,
+                                    () -> {
+                                      byte[] content = readPayload(fileIO, location);
+                                      return ExecutorIndexCache.loaded(
+                                          content, prepareFile(content, fileAdapter));
+                                    });
                         long readNanos = System.nanoTime() - readStart;
 
                         long searchStart = System.nanoTime();
-                        List<IndexBlob> blobs;
-                        try {
-                          blobs = new PuffinIndexFileContainer().read(new InMemoryInputFile(content));
-                        } catch (java.io.IOException e) {
-                          throw new java.io.UncheckedIOException("Failed to read an index file", e);
-                        }
-                        IndexAdapter.PreparedSearch prepared = null;
-                        String blobType =
-                            fileAdapter.writesAuxiliaryFiles()
-                                ? fileAdapter.auxiliaryBlobType()
-                                : fileAdapter.entryBlobType();
-                        for (IndexBlob blob : blobs) {
-                          if (blobType.equals(blob.type())) {
-                            prepared =
-                                fileAdapter.writesAuxiliaryFiles()
-                                    ? fileAdapter.prepareAuxiliary(ByteBuffer.wrap(blob.payload()))
-                                    : fileAdapter.prepare(ByteBuffer.wrap(blob.payload()));
-                            break;
-                          }
-                        }
-                        if (prepared == null) {
-                          continue;
-                        }
-                        for (int queryId = 0; queryId < fileQueries.size(); queryId++) {
-                          for (IndexSearchResult hit :
-                              prepared.search(
-                                  ByteBuffer.wrap(fileQueries.get(queryId)), localTopK)) {
-                            batchHits.add(
-                                new Tuple2<>(
-                                    queryId,
-                                    new Tuple3<>(
-                                        hit.dataFile(), hit.rowPosition(), hit.score())));
-                          }
-                        }
+                        file.searching(
+                            prepared -> {
+                              for (int queryId = 0; queryId < fileQueries.size(); queryId++) {
+                                for (IndexSearchResult hit :
+                                    prepared.search(
+                                        ByteBuffer.wrap(fileQueries.get(queryId)), localTopK)) {
+                                  batchHits.add(
+                                      new Tuple2<>(
+                                          queryId,
+                                          new Tuple3<>(
+                                              hit.dataFile(), hit.rowPosition(), hit.score())));
+                                }
+                              }
+                              return null;
+                            });
                         LOG.debug(
-                            "index file {} read {} ms ({} bytes), batch search of {} queries {} ms",
+                            "index file {} read {} ms, batch search of {} queries {} ms",
                             location.substring(location.lastIndexOf('/') + 1),
                             TimeUnit.MILLISECONDS.convert(readNanos, TimeUnit.NANOSECONDS),
-                            content.length,
                             fileQueries.size(),
                             TimeUnit.MILLISECONDS.convert(
                                 System.nanoTime() - searchStart, TimeUnit.NANOSECONDS));
@@ -356,8 +365,7 @@ public final class DistributedIndexSearch {
             };
     Map<Integer, List<Tuple3<String, Long, Double>>> topByQuery =
         fileHits
-            .aggregateByKey(
-                Lists.<Tuple3<String, Long, Double>>newArrayList(), mergeHit, mergeHits)
+            .aggregateByKey(Lists.<Tuple3<String, Long, Double>>newArrayList(), mergeHit, mergeHits)
             .collectAsMap();
 
     for (int queryId = 0; queryId < queries.size(); queryId++) {
@@ -446,9 +454,8 @@ public final class DistributedIndexSearch {
     return content;
   }
 
-  /** Searches one index file, which an executor has read whole. */
-  private static List<IndexSearchResult> searchFile(
-      byte[] content, IndexAdapter adapter, ByteBuffer query, int topK) {
+  /** Prepares one index file, which an executor has read whole, for any number of searches. */
+  private static IndexAdapter.PreparedSearch prepareFile(byte[] content, IndexAdapter adapter) {
     String blobType =
         adapter.writesAuxiliaryFiles() ? adapter.auxiliaryBlobType() : adapter.entryBlobType();
 
@@ -464,12 +471,25 @@ public final class DistributedIndexSearch {
         continue;
       }
 
-      if (adapter.writesAuxiliaryFiles()) {
-        return adapter.searchAuxiliary(ByteBuffer.wrap(blob.payload()), query, topK);
-      }
-      return adapter.search(ByteBuffer.wrap(blob.payload()), query, topK);
+      ByteBuffer payload = ByteBuffer.wrap(blob.payload());
+      return adapter.writesAuxiliaryFiles()
+          ? adapter.prepareAuxiliary(payload)
+          : adapter.prepare(payload);
     }
 
-    return ImmutableList.of();
+    // an index file without the blob the adapter searches has no hits, which a prepared search
+    // over an empty payload would not say either, so the caller is given an empty one
+    return (query, topK) -> ImmutableList.of();
+  }
+
+  /**
+   * What a prepared index file depends on besides its payload: the adapter reading it, and which
+   * blob of the file it takes. Two definitions that read different payload formats produce
+   * different payloads, so they do not need to be told apart here.
+   */
+  private static String cacheKey(IndexAdapter adapter) {
+    return adapter.getClass().getName()
+        + "|"
+        + (adapter.writesAuxiliaryFiles() ? adapter.auxiliaryBlobType() : adapter.entryBlobType());
   }
 }

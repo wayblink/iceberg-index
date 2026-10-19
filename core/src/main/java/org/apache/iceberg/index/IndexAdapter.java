@@ -132,6 +132,17 @@ public interface IndexAdapter {
   /** A loaded index payload that can be searched more than once. */
   interface PreparedSearch {
     List<IndexSearchResult> search(ByteBuffer query, int topK);
+
+    /**
+     * How much memory this searcher holds, for a caller that keeps it around between queries.
+     *
+     * <p>Zero means the searcher does not know, and a caller falls back to the size of the payload
+     * it was prepared from, which is a lower bound: a searcher that expands the payload into a
+     * structure holds more than the bytes it read.
+     */
+    default long estimatedBytes() {
+      return 0L;
+    }
   }
 
   default List<IndexSearchResult> searchAuxiliaryAll(
