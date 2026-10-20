@@ -498,7 +498,9 @@ public final class DistributedIndexSearch {
     table.mergeAll(reports.value());
     table.prune();
     IndexCacheLocations.Summary summary = table.summary(cacheKeys);
-    LOG.info("index cache mode={} this query: {}", config.mode(), summary);
+    // the driver's logger is often above INFO, and this line is how a run says whether the cache
+    // did anything, so it goes to standard out
+    System.out.println("INDEX_CACHE mode=" + config.mode() + " this query: " + summary);
 
     if (summary.coverage() < 1.0 && config.mode() == ExecutorIndexCache.Mode.PIN_ALL) {
       LOG.info(
@@ -586,8 +588,12 @@ public final class DistributedIndexSearch {
 
   /** Prepares one index file, which an executor has read whole, for any number of searches. */
   private static IndexAdapter.PreparedSearch prepareFile(byte[] content, IndexAdapter adapter) {
-    String blobType =
-        adapter.writesAuxiliaryFiles() ? adapter.auxiliaryBlobType() : adapter.entryBlobType();
+    // every type the adapter can still read, not just the one it writes: an index built before a
+    // rename is still on tables, and a reader that only knew the current name would skip it
+    java.util.Set<String> blobTypes =
+        adapter.writesAuxiliaryFiles()
+            ? adapter.readableAuxiliaryBlobTypes()
+            : adapter.readableEntryBlobTypes();
 
     List<IndexBlob> blobs;
     try {
@@ -597,19 +603,37 @@ public final class DistributedIndexSearch {
     }
 
     for (IndexBlob blob : blobs) {
-      if (!blobType.equals(blob.type())) {
+      if (!blobTypes.contains(blob.type())) {
         continue;
       }
 
       ByteBuffer payload = ByteBuffer.wrap(blob.payload());
-      return adapter.writesAuxiliaryFiles()
-          ? adapter.prepareAuxiliary(payload)
-          : adapter.prepare(payload);
+      try {
+        return adapter.writesAuxiliaryFiles()
+            ? adapter.prepareAuxiliary(payload)
+            : adapter.prepare(payload);
+      } catch (ClassCastException | IllegalArgumentException e) {
+        // a payload an index was written with can stop being readable when the entries it holds
+        // change shape; that is a rebuild, and the message has to say so rather than look like a
+        // cache or scheduling problem
+        throw new IllegalStateException(
+            "Cannot read the "
+                + blob.type()
+                + " payload of an index file: it was written by a version whose payload this "
+                + "build does not read. Rebuild the index.",
+            e);
+      }
     }
 
-    // an index file without the blob the adapter searches has no hits, which a prepared search
-    // over an empty payload would not say either, so the caller is given an empty one
-    return (query, topK) -> ImmutableList.of();
+    // a file the adapter cannot read is not an empty result: saying so is the difference between
+    // "this index has nothing" and "this build cannot read that index", and the second one is what
+    // a payload written by another version looks like
+    List<String> present = Lists.newArrayList();
+    for (IndexBlob blob : blobs) {
+      present.add(blob.type());
+    }
+
+    throw new IllegalStateException("Index file has no " + blobTypes + " blob, only " + present);
   }
 
   /**
