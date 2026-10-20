@@ -152,11 +152,13 @@ public final class DistributedIndexSearch {
     Broadcast<FileIO> ioRef = context.broadcast(table.io());
     // whether an executor remembers index files between queries, and how much it may keep
     Broadcast<ExecutorIndexCache.Config> cacheRef =
-        context.broadcast(ExecutorIndexCache.Config.from(spark));
+        context.broadcast(
+            ExecutorIndexCache.Config.from(spark, workingSetBytes(table.io(), files)));
     String cacheKey = cacheKey(adapter);
     // captured by the task directly: an accumulator only reports through the copy it was created
     // from, so a broadcast copy of it would update nothing
-    org.apache.spark.util.CollectionAccumulator<String> cacheReports = cacheReports(context, cacheRef.getValue());
+    org.apache.spark.util.CollectionAccumulator<String> cacheReports =
+        cacheReports(context, cacheRef.getValue());
 
     // the limit is captured as a primitive: the query itself is not serializable. One more than the
     // query asks for is kept, because that is what says whether there is another round to ask for.
@@ -284,11 +286,13 @@ public final class DistributedIndexSearch {
     Broadcast<List<byte[]>> queriesRef = context.broadcast(queryPayloads);
     Broadcast<FileIO> ioRef = context.broadcast(table.io());
     Broadcast<ExecutorIndexCache.Config> cacheRef =
-        context.broadcast(ExecutorIndexCache.Config.from(spark));
+        context.broadcast(
+            ExecutorIndexCache.Config.from(spark, workingSetBytes(table.io(), files)));
     String cacheKey = cacheKey(adapter);
     // captured by the task directly: an accumulator only reports through the copy it was created
     // from, so a broadcast copy of it would update nothing
-    org.apache.spark.util.CollectionAccumulator<String> cacheReports = cacheReports(context, cacheRef.getValue());
+    org.apache.spark.util.CollectionAccumulator<String> cacheReports =
+        cacheReports(context, cacheRef.getValue());
 
     // one more than the widest query asks for is kept per query, because that is what says whether
     // there is another round to ask for
@@ -486,6 +490,45 @@ public final class DistributedIndexSearch {
     for (String report : lastByExecutor.values()) {
       System.out.println("CACHE " + report);
     }
+  }
+
+  /**
+   * The bytes the query's index files hold. An index file never changes once written, so a size is
+   * remembered: the budget it feeds is decided once per query and the lookup is a metadata call.
+   */
+  static long workingSetBytes(FileIO io, List<IndexFile> files) {
+    long total = 0;
+    for (IndexFile file : files) {
+      total += sizeOf(io, file.location());
+    }
+
+    return total;
+  }
+
+  private static final Map<String, Long> KNOWN_SIZES =
+      new java.util.concurrent.ConcurrentHashMap<>();
+
+  private static long sizeOf(FileIO io, String location) {
+    Long known = KNOWN_SIZES.get(location);
+    if (known != null) {
+      return known;
+    }
+
+    long size;
+    try {
+      size = io.newInputFile(location).getLength();
+    } catch (RuntimeException e) {
+      // a size is only used to size a budget, so an unreadable one leaves the budget to its
+      // defaults rather than failing the query
+      LOG.debug("Could not read the size of index file {}", location, e);
+      return 0L;
+    }
+
+    if (KNOWN_SIZES.size() < 100_000) {
+      KNOWN_SIZES.put(location, size);
+    }
+
+    return size;
   }
 
   /** Reads the payload of one index file, which an executor reads whole. */

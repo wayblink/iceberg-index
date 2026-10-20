@@ -60,6 +60,8 @@ final class ExecutorIndexCache {
     static final String ENABLED = "spark.iceberg.index.cache.enabled";
     static final String BYTES = "spark.iceberg.index.cache.bytes";
     static final String MAX_ENTRY_BYTES = "spark.iceberg.index.cache.max-entry-bytes";
+    static final String HEAP_FRACTION = "spark.iceberg.index.cache.heap-fraction";
+    static final long MIN_BUDGET_BYTES = 512L * 1024L * 1024L;
 
     private static final Config DISABLED = new Config(false, 0, 0);
 
@@ -84,16 +86,108 @@ final class ExecutorIndexCache {
       return new Config(enabled, maxBytes, maxEntryBytes);
     }
 
-    static Config from(org.apache.spark.sql.SparkSession spark) {
+    /**
+     * The cache's settings for one query.
+     *
+     * @param spark the session
+     * @param workingSetBytes the bytes the query's index files hold, which the budget has to cover
+     *     for a per-executor share to stay resident; zero when it is not known
+     */
+    static Config from(org.apache.spark.sql.SparkSession spark, long workingSetBytes) {
       boolean enabled = Boolean.parseBoolean(spark.conf().get(ENABLED, "false"));
       if (!enabled) {
         return DISABLED;
       }
 
-      long maxBytes = parseBytes(spark.conf().get(BYTES, "512m"), BYTES);
+      String configured = spark.conf().get(BYTES, null);
       long maxEntryBytes = parseBytes(spark.conf().get(MAX_ENTRY_BYTES, "256m"), MAX_ENTRY_BYTES);
-      Preconditions.checkArgument(maxBytes > 0, "The cache budget must be positive: %s", maxBytes);
-      return new Config(true, maxBytes, maxEntryBytes);
+      long configuredBytes = configured != null ? parseBytes(configured, BYTES) : 0L;
+      long budget =
+          derive(
+              configured,
+              configuredBytes,
+              workingSetBytes,
+              executors(spark),
+              heapBytes(spark),
+              heapFraction(spark));
+      Config config = new Config(true, budget, maxEntryBytes);
+      if (config.maxBytes() < maxEntryBytes) {
+        // an entry limit larger than the budget would let one file evict everything and still be
+        // evicted itself, so the limit follows the budget down
+        return new Config(true, budget, budget);
+      }
+
+      return config;
+    }
+
+    /**
+     * The budget for one executor.
+     *
+     * <p>A configured budget is used as it is, because a run that names one wants that number; when
+     * it is below an executor's share of the working set the cache can only evict what it just
+     * loaded, so that case is reported rather than silently left to thrash.
+     *
+     * <p>Without a configured budget the budget is the smaller of a share of the executor's heap
+     * and the bytes one executor has to hold, which is the whole of what a resident cache needs.
+     */
+    static long derive(
+        String configuredValue,
+        long configuredBytes,
+        long workingSetBytes,
+        int executors,
+        long heapBytes,
+        double heapFraction) {
+      long perExecutor = workingSetBytes > 0 ? ceilDiv(workingSetBytes, Math.max(1, executors)) : 0;
+      long heapBudget = (long) (heapBytes * heapFraction);
+      if (configuredValue != null) {
+        Preconditions.checkArgument(configuredBytes > 0, "The cache budget must be positive");
+        if (perExecutor > 0 && configuredBytes < (long) (perExecutor * 0.9)) {
+          LOG.warn(
+              "The index cache budget of {} bytes is below the {} bytes one executor has to hold "
+                  + "(working set {} over {} executors); the cache will evict what it just loaded "
+                  + "and a repeated query will not be served from it. Raise {} or leave it unset.",
+              configuredBytes,
+              perExecutor,
+              workingSetBytes,
+              executors,
+              BYTES);
+        }
+
+        return configuredBytes;
+      }
+
+      long wanted = perExecutor > 0 ? (long) (perExecutor * 1.2) : MIN_BUDGET_BYTES;
+      return Math.min(heapBudget, Math.max(MIN_BUDGET_BYTES, wanted));
+    }
+
+    /** The executors a stage runs on, which is what a working set is shared between. */
+    private static int executors(org.apache.spark.sql.SparkSession spark) {
+      String instances = spark.conf().get("spark.executor.instances", "1");
+      try {
+        return Math.max(1, Integer.parseInt(instances.trim()));
+      } catch (NumberFormatException e) {
+        return 1;
+      }
+    }
+
+    private static long heapBytes(org.apache.spark.sql.SparkSession spark) {
+      return parseBytes(spark.conf().get("spark.executor.memory", "1g"), "spark.executor.memory");
+    }
+
+    private static double heapFraction(org.apache.spark.sql.SparkSession spark) {
+      String value = spark.conf().get(HEAP_FRACTION, "0.25");
+      try {
+        double fraction = Double.parseDouble(value.trim());
+        Preconditions.checkArgument(
+            fraction > 0 && fraction <= 1, "The heap fraction must be in (0, 1]: %s", fraction);
+        return fraction;
+      } catch (NumberFormatException e) {
+        throw new IllegalArgumentException("Not a fraction for " + HEAP_FRACTION + ": " + value, e);
+      }
+    }
+
+    private static long ceilDiv(long dividend, long divisor) {
+      return (dividend + divisor - 1) / divisor;
     }
 
     private static long parseBytes(String value, String key) {
@@ -237,6 +331,8 @@ final class ExecutorIndexCache {
     }
   }
 
+  private static final String CONFIG_BYTES_KEY = Config.BYTES;
+
   private static final ExecutorIndexCache INSTANCE = new ExecutorIndexCache();
 
   static ExecutorIndexCache get() {
@@ -338,7 +434,18 @@ final class ExecutorIndexCache {
         Map.Entry<String, CachedFile> evicted = oldest.next();
         bytes -= evicted.getValue().bytes();
         oldest.remove();
-        evictions.incrementAndGet();
+        if (evictions.incrementAndGet() == 1 && hits.get() == 0) {
+          // evicting before anything has been reused means the budget is smaller than what the
+          // queries are working through, and every query will pay for the same reads again
+          LOG.warn(
+              "The index cache evicted an entry before it served a single hit: budget {} bytes, "
+                  + "{} entries of {} bytes. The budget is likely below the working set, so raise "
+                  + "{}, unset it to derive one, or turn the cache off.",
+              maxBytes,
+              files.size(),
+              bytes,
+              CONFIG_BYTES_KEY);
+        }
       }
     }
   }
