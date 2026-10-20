@@ -183,6 +183,11 @@ public final class RaBitQQuantizer implements java.io.Serializable {
         "Vector has %s dimensions, the quantizer was trained for %s",
         vector.length,
         dimension);
+    // the bits of the region this code occupies are cleared first: writing a code sets bits and
+    // never clears them, so a caller that hands the same array back for the next vector would get
+    // the bits of both
+    java.util.Arrays.fill(code, offset, offset + codeBytes(), (byte) 0);
+
     float[] rotated = rotate(vector);
     double norm = 0.0;
     for (int i = 0; i < dimension; i++) {

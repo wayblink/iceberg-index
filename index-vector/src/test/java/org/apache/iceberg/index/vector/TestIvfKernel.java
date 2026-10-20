@@ -57,7 +57,7 @@ class TestIvfKernel {
   public void answersExactlyWhenItVisitsEveryPartition() {
     List<IndexEntry> entries = entries(VectorIndexDefinition.Metric.EUCLIDEAN);
 
-    VectorIndexAdapter ivf = adapter(VectorIndexDefinition.Metric.EUCLIDEAN, 0, ENTRIES);
+    VectorIndexAdapter ivf = adapterLegacy(VectorIndexDefinition.Metric.EUCLIDEAN, 0, ENTRIES);
     ByteBuffer payload = ivf.encodeAuxiliaryPayload(entries, 1);
 
     VectorIndexAdapter exact = flatAdapter(VectorIndexDefinition.Metric.EUCLIDEAN);
@@ -77,12 +77,12 @@ class TestIvfKernel {
   public void visitsOnlyThePartitionsItWasTold() {
     List<IndexEntry> entries = entries(VectorIndexDefinition.Metric.EUCLIDEAN);
 
-    VectorIndexAdapter patient = adapter(VectorIndexDefinition.Metric.EUCLIDEAN, 0, ENTRIES);
+    VectorIndexAdapter patient = adapterLegacy(VectorIndexDefinition.Metric.EUCLIDEAN, 0, ENTRIES);
     ByteBuffer payload = patient.encodeAuxiliaryPayload(entries, 1);
     ByteBuffer query = patient.encodeQuery(vector(11));
     List<IndexSearchResult> all = patient.prepareAuxiliary(payload).search(query, 10);
 
-    VectorIndexAdapter hasty = adapter(VectorIndexDefinition.Metric.EUCLIDEAN, 1, ENTRIES);
+    VectorIndexAdapter hasty = adapterLegacy(VectorIndexDefinition.Metric.EUCLIDEAN, 1, ENTRIES);
     List<IndexSearchResult> one = hasty.prepareAuxiliary(payload).search(query, 10);
 
     // visiting one partition cannot return more than one partition holds, and cannot return more
@@ -111,7 +111,7 @@ class TestIvfKernel {
   @Test
   public void buildsTheSamePayloadTwice() {
     List<IndexEntry> entries = entries(VectorIndexDefinition.Metric.EUCLIDEAN);
-    VectorIndexAdapter ivf = adapter(VectorIndexDefinition.Metric.EUCLIDEAN, 0, ENTRIES);
+    VectorIndexAdapter ivf = adapterLegacy(VectorIndexDefinition.Metric.EUCLIDEAN, 0, ENTRIES);
 
     ByteBuffer first = ivf.encodeAuxiliaryPayload(entries, 1);
     ByteBuffer second = ivf.encodeAuxiliaryPayload(entries, 1);
@@ -123,7 +123,7 @@ class TestIvfKernel {
 
   @Test
   public void indexesASingleVector() {
-    VectorIndexAdapter ivf = adapter(VectorIndexDefinition.Metric.EUCLIDEAN, 0, 1);
+    VectorIndexAdapter ivf = adapterLegacy(VectorIndexDefinition.Metric.EUCLIDEAN, 0, 1);
     List<IndexEntry> entries =
         Lists.newArrayList(IndexEntry.of("data-1.parquet", 0, ivf.encodeVector(vector(0))));
 
@@ -135,7 +135,7 @@ class TestIvfKernel {
 
   @Test
   public void indexesVectorsThatAreAllTheSame() {
-    VectorIndexAdapter ivf = adapter(VectorIndexDefinition.Metric.EUCLIDEAN, 0, 50);
+    VectorIndexAdapter ivf = adapterLegacy(VectorIndexDefinition.Metric.EUCLIDEAN, 0, 50);
     float[] same = vector(1);
     List<IndexEntry> entries = Lists.newArrayList();
     for (int i = 0; i < 50; i++) {
@@ -151,7 +151,7 @@ class TestIvfKernel {
 
   @Test
   public void refusesAZeroVectorUnderCosine() {
-    VectorIndexAdapter ivf = adapter(VectorIndexDefinition.Metric.COSINE, 0, 10);
+    VectorIndexAdapter ivf = adapterLegacy(VectorIndexDefinition.Metric.COSINE, 0, 10);
     float[] zero = new float[DIMENSION];
     assertThatThrownBy(
             () ->
@@ -244,6 +244,81 @@ class TestIvfKernel {
         .isGreaterThan(0.9);
   }
 
+  @Test
+  public void findsTheNearestNeighboursWhenItVisitsOnlyTheNearestPartitions() {
+    // the other quantized test visits every partition, which cannot fail: scanning everything finds
+    // everything, and says nothing about whether the codes can order what a narrower search does
+    // visit. This is the case an index is actually asked for: many vectors per partition and a
+    // handful of partitions visited.
+    int total = 4000;
+    int nlist = 20;
+    List<IndexEntry> entries = entries(VectorIndexDefinition.Metric.EUCLIDEAN, total);
+
+    VectorIndexAdapter quantized =
+        quantizedAdapter(VectorIndexDefinition.Metric.EUCLIDEAN, nlist, 2);
+    VectorIndexAdapter exact = flatAdapter(VectorIndexDefinition.Metric.EUCLIDEAN);
+
+    ByteBuffer codes = quantized.encodeAuxiliaryPayload(entries, 1);
+    ByteBuffer vectors = exact.encodeEntries(entries);
+
+    int found = 0;
+    int probes = 10;
+    for (int q = 0; q < probes; q++) {
+      ByteBuffer query = exact.encodeQuery(vector(q * 13));
+      List<IndexSearchResult> fromCodes = quantized.prepareAuxiliary(codes).search(query, 10);
+      Set<Long> returned = Sets.newHashSet();
+      for (IndexSearchResult hit : fromCodes) {
+        returned.add(hit.rowPosition());
+      }
+      for (IndexSearchResult exactHit : exact.prepare(vectors).search(query, 10)) {
+        if (returned.contains(exactHit.rowPosition())) {
+          found += 1;
+        }
+      }
+    }
+
+    System.out.println(
+        "IVFQ narrow recall=" + String.format("%.3f", found / (double) (probes * 10)));
+
+    // the same partitioning with the vectors stored as they are: if this finds them, the partitions
+    // a narrow search visits are the right ones and the codes are what loses the order
+    VectorIndexAdapter unquantized = adapter(VectorIndexDefinition.Metric.EUCLIDEAN, nlist, 2);
+    ByteBuffer stored = unquantized.encodeAuxiliaryPayload(entries, 1);
+    int foundUnquantized = 0;
+    for (int q = 0; q < probes; q++) {
+      ByteBuffer query = exact.encodeQuery(vector(q * 13));
+      Set<Long> returned = Sets.newHashSet();
+      for (IndexSearchResult hit : unquantized.prepareAuxiliary(stored).search(query, 10)) {
+        returned.add(hit.rowPosition());
+      }
+      for (IndexSearchResult exactHit : exact.prepare(vectors).search(query, 10)) {
+        if (returned.contains(exactHit.rowPosition())) {
+          foundUnquantized += 1;
+        }
+      }
+    }
+    System.out.println(
+        "IVFQ narrow recallUnquantized="
+            + String.format("%.3f", foundUnquantized / (double) (probes * 10)));
+    assertThat(found / (double) (probes * 10))
+        .as("the exact top ten among the partitions a narrow search visits")
+        .isGreaterThan(0.6);
+  }
+
+  private static VectorIndexAdapter quantizedAdapter(
+      VectorIndexDefinition.Metric metric, int nlist, int nprobe) {
+    return new VectorIndexAdapter(
+        VectorIndexDefinition.builder()
+            .fieldId(1)
+            .dimension(DIMENSION)
+            .metric(metric)
+            .structure(VectorIndexDefinition.VectorStructure.IVF)
+            .quantizer(VectorIndexDefinition.VectorQuantizer.RABITQ)
+            .property(IvfOptions.NLIST, Integer.toString(nlist))
+            .property(IvfOptions.NPROBE, Integer.toString(nprobe))
+            .build());
+  }
+
   private static VectorIndexAdapter quantizedAdapter(
       VectorIndexDefinition.Metric metric, int expectedEntries) {
     return new VectorIndexAdapter(
@@ -258,6 +333,21 @@ class TestIvfKernel {
   }
 
   private static VectorIndexAdapter adapter(
+      VectorIndexDefinition.Metric metric, int nlist, int nprobe) {
+    VectorIndexDefinition.Builder builder =
+        VectorIndexDefinition.builder()
+            .fieldId(1)
+            .dimension(DIMENSION)
+            .metric(metric)
+            .structure(VectorIndexDefinition.VectorStructure.IVF)
+            .property(IvfOptions.NPROBE, Integer.toString(nprobe));
+    if (nlist > 0) {
+      builder.property(IvfOptions.NLIST, Integer.toString(nlist));
+    }
+    return new VectorIndexAdapter(builder.build());
+  }
+
+  private static VectorIndexAdapter adapterLegacy(
       VectorIndexDefinition.Metric metric, int nprobe, int expectedEntries) {
     VectorIndexDefinition.Builder builder =
         VectorIndexDefinition.builder()
@@ -283,9 +373,13 @@ class TestIvfKernel {
   }
 
   private static List<IndexEntry> entries(VectorIndexDefinition.Metric metric) {
+    return entries(metric, ENTRIES);
+  }
+
+  private static List<IndexEntry> entries(VectorIndexDefinition.Metric metric, int count) {
     VectorIndexAdapter adapter = flatAdapter(metric);
-    List<IndexEntry> entries = Lists.newArrayListWithCapacity(ENTRIES);
-    for (int i = 0; i < ENTRIES; i++) {
+    List<IndexEntry> entries = Lists.newArrayListWithCapacity(count);
+    for (int i = 0; i < count; i++) {
       entries.add(
           IndexEntry.of("data-" + (i / 100) + ".parquet", i, adapter.encodeVector(vector(i))));
     }
