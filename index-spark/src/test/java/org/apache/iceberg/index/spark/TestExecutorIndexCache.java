@@ -182,6 +182,49 @@ class TestExecutorIndexCache {
   }
 
   @Test
+  void aTableBeyondItsShareIsTheOneThatLosesRoom() {
+    AtomicInteger loads = new AtomicInteger();
+    ExecutorIndexCache.Config small = ownerConfig("small", 400, 400);
+    ExecutorIndexCache.Config large = ownerConfig("large", 400, 400);
+
+    // small keeps one entry of 100; large fills the rest and then needs more
+    ask("s3://bucket/small-a.puffin", small, loads);
+    ask("s3://bucket/large-a.puffin", large, loads);
+    ask("s3://bucket/large-b.puffin", large, loads);
+    ask("s3://bucket/large-c.puffin", large, loads);
+    ask("s3://bucket/large-d.puffin", large, loads);
+
+    // 400 bytes over two tables is 200 each, so large has to give up its own oldest entry rather
+    // than push small out
+    assertThat(ExecutorIndexCache.get().residentKeys())
+        .anyMatch(key -> key.endsWith("small-a.puffin"));
+    assertThat(ExecutorIndexCache.get().residentKeys())
+        .noneMatch(key -> key.endsWith("large-a.puffin"));
+  }
+
+  @Test
+  void aTableBorrowsRoomAnotherIsNotUsing() {
+    AtomicInteger loads = new AtomicInteger();
+    ExecutorIndexCache.Config small = ownerConfig("small", 300, 300);
+    ExecutorIndexCache.Config large = ownerConfig("large", 300, 300);
+
+    // with only one table holding anything, it may use the whole budget
+    ask("s3://bucket/large-a.puffin", large, loads);
+    ask("s3://bucket/large-b.puffin", large, loads);
+
+    assertThat(ExecutorIndexCache.get().residentKeys()).hasSize(2);
+
+    // when the other table arrives it takes its share back from the borrower
+    ask("s3://bucket/small-a.puffin", small, loads);
+    ask("s3://bucket/small-b.puffin", small, loads);
+
+    assertThat(ExecutorIndexCache.get().residentKeys())
+        .anyMatch(key -> key.endsWith("small-a.puffin"));
+    assertThat(ExecutorIndexCache.get().residentKeys())
+        .anyMatch(key -> key.endsWith("small-b.puffin"));
+  }
+
+  @Test
   void readsAgainWhenDisabled() {
     AtomicInteger loads = new AtomicInteger();
 
@@ -293,6 +336,24 @@ class TestExecutorIndexCache {
 
   private static ExecutorIndexCache.Config config(long maxBytes, long maxEntryBytes) {
     return ExecutorIndexCache.Config.of(true, maxBytes, maxEntryBytes);
+  }
+
+  /** A PIN_HOT cache admits a file on its second ask, so asking twice is what plants an entry. */
+  private void ask(String location, ExecutorIndexCache.Config config, AtomicInteger loads) {
+    cache.file(location, config, "adapter", () -> load(loads, 100));
+    cache.file(location, config, "adapter", () -> load(loads, 100));
+  }
+
+  private static ExecutorIndexCache.Config ownerConfig(
+      String owner, long maxBytes, long maxEntryBytes) {
+    return ExecutorIndexCache.Config.of(
+            true, maxBytes, maxEntryBytes, ExecutorIndexCache.Mode.PIN_HOT, 0)
+        .withOwner(owner);
+  }
+
+  private static ExecutorIndexCache.Config owned(String owner, long maxBytes, long maxEntryBytes) {
+    return ExecutorIndexCache.Config.from(
+        org.apache.spark.sql.SparkSession.builder().getOrCreate(), 0, owner);
   }
 
   private static ExecutorIndexCache.Config mode(

@@ -153,7 +153,7 @@ public final class DistributedIndexSearch {
     // whether an executor remembers index files between queries, and how much it may keep
     long workingSet = workingSetBytes(table.io(), files);
     Broadcast<ExecutorIndexCache.Config> cacheRef =
-        context.broadcast(ExecutorIndexCache.Config.from(spark, workingSet));
+        context.broadcast(ExecutorIndexCache.Config.from(spark, workingSet, table.location()));
     String cacheKey = cacheKey(adapter);
     List<String> cacheKeys = cacheKeys(cacheKey, locations);
     // what each executor holds, so a task can be sent to one that already has its file
@@ -290,7 +290,7 @@ public final class DistributedIndexSearch {
     Broadcast<FileIO> ioRef = context.broadcast(table.io());
     long workingSet = workingSetBytes(table.io(), files);
     Broadcast<ExecutorIndexCache.Config> cacheRef =
-        context.broadcast(ExecutorIndexCache.Config.from(spark, workingSet));
+        context.broadcast(ExecutorIndexCache.Config.from(spark, workingSet, table.location()));
     String cacheKey = cacheKey(adapter);
     List<String> cacheKeys = cacheKeys(cacheKey, locations);
     IndexCacheLocations locationsTable = IndexCacheLocations.forContext(context.sc());

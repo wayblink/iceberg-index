@@ -88,21 +88,28 @@ final class ExecutorIndexCache {
     static final String IDLE_TTL = "spark.iceberg.index.cache.idle-ttl";
     static final long MIN_BUDGET_BYTES = 512L * 1024L * 1024L;
 
-    private static final Config DISABLED = new Config(false, 0, 0, Mode.STREAM, 0);
+    private static final Config DISABLED = new Config(false, 0, 0, Mode.STREAM, 0, "");
 
     private final boolean enabled;
     private final long maxBytes;
     private final long maxEntryBytes;
     private final Mode mode;
     private final long idleTtlMillis;
+    private final String owner;
 
     private Config(
-        boolean enabled, long maxBytes, long maxEntryBytes, Mode mode, long idleTtlMillis) {
+        boolean enabled,
+        long maxBytes,
+        long maxEntryBytes,
+        Mode mode,
+        long idleTtlMillis,
+        String owner) {
       this.enabled = enabled;
       this.maxBytes = maxBytes;
       this.maxEntryBytes = maxEntryBytes;
       this.mode = mode;
       this.idleTtlMillis = idleTtlMillis;
+      this.owner = owner;
     }
 
     static Config disabled() {
@@ -113,7 +120,7 @@ final class ExecutorIndexCache {
       Preconditions.checkArgument(maxBytes > 0, "The cache budget must be positive: %s", maxBytes);
       Preconditions.checkArgument(
           maxEntryBytes > 0, "The per-entry limit must be positive: %s", maxEntryBytes);
-      return new Config(enabled, maxBytes, maxEntryBytes, Mode.PIN_ALL, 0);
+      return new Config(enabled, maxBytes, maxEntryBytes, Mode.PIN_ALL, 0, "");
     }
 
     static Config of(
@@ -121,7 +128,7 @@ final class ExecutorIndexCache {
       Preconditions.checkArgument(maxBytes > 0, "The cache budget must be positive: %s", maxBytes);
       Preconditions.checkArgument(
           maxEntryBytes > 0, "The per-entry limit must be positive: %s", maxEntryBytes);
-      return new Config(enabled, maxBytes, maxEntryBytes, mode, idleTtlMillis);
+      return new Config(enabled, maxBytes, maxEntryBytes, mode, idleTtlMillis, "");
     }
 
     /**
@@ -132,6 +139,16 @@ final class ExecutorIndexCache {
      *     for a per-executor share to stay resident; zero when it is not known
      */
     static Config from(org.apache.spark.sql.SparkSession spark, long workingSetBytes) {
+      return from(spark, workingSetBytes, "");
+    }
+
+    /**
+     * The settings for one query of one table.
+     *
+     * @param owner what the entries belong to, which is what a fair share is divided between
+     */
+    static Config from(
+        org.apache.spark.sql.SparkSession spark, long workingSetBytes, String owner) {
       boolean enabled = Boolean.parseBoolean(spark.conf().get(ENABLED, "false"));
       if (!enabled) {
         return DISABLED;
@@ -152,7 +169,8 @@ final class ExecutorIndexCache {
       Mode mode = mode(spark.conf().get(MODE, "auto"), workingSetBytes, budget, executors);
       long idleTtlMillis = durationMillis(spark.conf().get(IDLE_TTL, "30m"), IDLE_TTL);
       long effectiveEntryLimit = Math.min(maxEntryBytes, budget);
-      return new Config(true, budget, effectiveEntryLimit, mode, idleTtlMillis);
+      return new Config(
+          true, budget, effectiveEntryLimit, mode, idleTtlMillis, owner == null ? "" : owner);
     }
 
     /**
@@ -312,6 +330,15 @@ final class ExecutorIndexCache {
       return idleTtlMillis;
     }
 
+    /** The table these entries belong to, used to divide the budget fairly. */
+    String owner() {
+      return owner;
+    }
+
+    Config withOwner(String newOwner) {
+      return new Config(enabled, maxBytes, maxEntryBytes, mode, idleTtlMillis, newOwner);
+    }
+
     /** Only a mode that keeps files is worth the bookkeeping. */
     boolean caching() {
       return enabled && mode != Mode.STREAM;
@@ -320,6 +347,7 @@ final class ExecutorIndexCache {
 
   /** One index file as an executor remembers it. */
   static final class CachedFile {
+    private final String owner;
     private final byte[] payload;
     private final IndexAdapter.PreparedSearch prepared;
     private final long bytes;
@@ -331,7 +359,9 @@ final class ExecutorIndexCache {
     private boolean protectedRank;
     private long lastAccessNanos = System.nanoTime();
 
-    private CachedFile(byte[] payload, IndexAdapter.PreparedSearch prepared, long bytes) {
+    private CachedFile(
+        String owner, byte[] payload, IndexAdapter.PreparedSearch prepared, long bytes) {
+      this.owner = owner;
       this.payload = payload;
       this.prepared = prepared;
       this.bytes = bytes;
@@ -367,6 +397,14 @@ final class ExecutorIndexCache {
 
     public long bytes() {
       return bytes;
+    }
+
+    String owner() {
+      return owner;
+    }
+
+    CachedFile withOwner(String newOwner) {
+      return new CachedFile(newOwner, payload, prepared, bytes);
     }
 
     private void touch() {
@@ -483,6 +521,9 @@ final class ExecutorIndexCache {
   private final AtomicLong evictions = new AtomicLong();
   private final AtomicLong skippedTooLarge = new AtomicLong();
   private long bytes = 0;
+  // what each table holds, so a share of the budget can be reserved per table
+  private final Map<String, Long> bytesByOwner = new LinkedHashMap<>();
+  private final Map<String, Integer> entriesByOwner = new LinkedHashMap<>();
   private long lastSweepNanos = System.nanoTime();
   private static long sweepIntervalNanos = java.util.concurrent.TimeUnit.SECONDS.toNanos(30);
 
@@ -506,7 +547,7 @@ final class ExecutorIndexCache {
       return loader.load();
     }
 
-    String cacheKey = key + "|" + location;
+    String cacheKey = config.owner() + "|" + key + "|" + location;
     sweepIfDue(config);
     CachedFile hit = lookup(cacheKey);
     if (hit != null) {
@@ -541,7 +582,11 @@ final class ExecutorIndexCache {
           return loaded;
         }
 
-        put(cacheKey, loaded, config, askedTwice);
+        CachedFile stored = put(cacheKey, loaded, config, askedTwice);
+        if (stored != loaded) {
+          // the cached copy carries the owner; a caller should see the entry it will hit next time
+          return stored;
+        }
         LOG.debug(
             "Cached {} in {} ms ({} bytes, mode {})",
             location,
@@ -587,7 +632,7 @@ final class ExecutorIndexCache {
     }
   }
 
-  private void put(String cacheKey, CachedFile file, Config config, boolean askedTwice) {
+  private CachedFile put(String cacheKey, CachedFile file, Config config, boolean askedTwice) {
     synchronized (mapLock) {
       CachedFile previous = protectedFiles.remove(cacheKey);
       if (previous == null) {
@@ -595,9 +640,11 @@ final class ExecutorIndexCache {
       }
 
       if (previous != null) {
-        bytes -= previous.bytes();
+        release(previous);
       }
 
+      // the loader does not know which table it is loading for, so the entry is stamped here
+      file = file.withOwner(config.owner());
       file.pinned = config.mode() == Mode.PIN_ALL;
       // an admitted PIN_HOT entry starts on probation: being asked twice earns it a place, being
       // asked again is what earns it protection
@@ -608,15 +655,21 @@ final class ExecutorIndexCache {
       }
 
       bytes += file.bytes();
+      bytesByOwner.merge(file.owner(), file.bytes(), Long::sum);
+      entriesByOwner.merge(file.owner(), 1, Integer::sum);
       evict(config.maxBytes());
 
       if (bytes > config.maxBytes()) {
         // everything left is either pinned or being searched, so this file is not kept at all
         // rather than being added to a budget that is already over
         if (protectedFiles.remove(cacheKey) != null || probation.remove(cacheKey) != null) {
-          bytes -= file.bytes();
+          release(file);
         }
+
+        return file;
       }
+
+      return file;
     }
   }
 
@@ -630,7 +683,13 @@ final class ExecutorIndexCache {
   private void evict(long maxBytes) {
     boolean warned = false;
     while (bytes > maxBytes) {
-      Map.Entry<String, CachedFile> victim = oldestEvictable(probation, false);
+      // the table holding the most beyond its fair share goes first, so one large index cannot
+      // crowd out a small one that is also being queried
+      Map.Entry<String, CachedFile> victim = mostOverQuota(maxBytes);
+      if (victim == null) {
+        victim = oldestEvictable(probation, false);
+      }
+
       if (victim == null) {
         victim = oldestEvictable(protectedFiles, true);
       }
@@ -640,7 +699,7 @@ final class ExecutorIndexCache {
         return;
       }
 
-      bytes -= victim.getValue().bytes();
+      release(victim.getValue());
       if (protectedFiles.remove(victim.getKey()) == null) {
         probation.remove(victim.getKey());
       }
@@ -655,6 +714,58 @@ final class ExecutorIndexCache {
             Config.BYTES);
       }
     }
+  }
+
+  /**
+   * The oldest evictable entry of the table that is furthest beyond its fair share.
+   *
+   * <p>The share is the budget divided by the number of tables holding anything, recomputed as
+   * tables come and go: a table that borrows room another table is not using keeps it until that
+   * table asks for it back, which is what "borrowed" means here.
+   */
+  private Map.Entry<String, CachedFile> mostOverQuota(long maxBytes) {
+    int owners = Math.max(1, bytesByOwner.size());
+    long quota = maxBytes / owners;
+    String worst = null;
+    long worstExcess = 0;
+    for (Map.Entry<String, Long> entry : bytesByOwner.entrySet()) {
+      long excess = entry.getValue() - quota;
+      if (excess > worstExcess) {
+        worst = entry.getKey();
+        worstExcess = excess;
+      }
+    }
+
+    if (worst == null) {
+      return null;
+    }
+
+    String owner = worst;
+    Map.Entry<String, CachedFile> found = oldestEvictableOf(probation, owner, false);
+    return found != null ? found : oldestEvictableOf(protectedFiles, owner, true);
+  }
+
+  private Map.Entry<String, CachedFile> oldestEvictableOf(
+      Map<String, CachedFile> segment, String owner, boolean skipPinned) {
+    for (Map.Entry<String, CachedFile> entry : segment.entrySet()) {
+      CachedFile file = entry.getValue();
+      if (skipPinned && file.pinned) {
+        continue;
+      }
+
+      if (owner.equals(file.owner()) && !file.inUse()) {
+        return entry;
+      }
+    }
+
+    return null;
+  }
+
+  private void release(CachedFile file) {
+    bytes -= file.bytes();
+    bytesByOwner.computeIfPresent(
+        file.owner(), (owner, held) -> held - file.bytes() <= 0 ? null : held - file.bytes());
+    entriesByOwner.computeIfPresent(file.owner(), (owner, held) -> held <= 1 ? null : held - 1);
   }
 
   private Map.Entry<String, CachedFile> oldestEvictable(
@@ -781,11 +892,11 @@ final class ExecutorIndexCache {
   static CachedFile loaded(byte[] payload, IndexAdapter.PreparedSearch prepared) {
     long preparedBytes = prepared.estimatedBytes();
     long bytes = payload.length + (preparedBytes > 0 ? preparedBytes : payload.length);
-    return new CachedFile(payload, prepared, bytes);
+    return new CachedFile("", payload, prepared, bytes);
   }
 
   static CachedFile loaded(byte[] payload, IndexAdapter.PreparedSearch prepared, long bytes) {
-    return new CachedFile(payload, prepared, bytes);
+    return new CachedFile("", payload, prepared, bytes);
   }
 
   Set<String> residentKeys() {
