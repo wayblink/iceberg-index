@@ -21,10 +21,19 @@ package org.apache.iceberg.spark.extensions;
 import static org.assertj.core.api.Assertions.assertThat;
 
 import java.nio.file.Path;
+import java.util.Comparator;
 import java.util.List;
+import java.util.Locale;
+import java.util.stream.Collectors;
 import org.apache.iceberg.index.vector.VectorIndexTypes;
+import org.apache.iceberg.relocated.com.google.common.collect.Lists;
 import org.apache.spark.sql.Row;
+import org.apache.spark.sql.RowFactory;
 import org.apache.spark.sql.SparkSession;
+import org.apache.spark.sql.types.DataTypes;
+import org.apache.spark.sql.types.Metadata;
+import org.apache.spark.sql.types.StructField;
+import org.apache.spark.sql.types.StructType;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
@@ -120,15 +129,88 @@ class TestRewriteVectorSearch {
   }
 
   @Test
-  public void askingForAWiderCandidateSetDoesNotChangeTheAnswer() {
+  public void overSamplingReachesTheReScoringInsteadOfBeingTruncated() {
+    // an approximate kernel ranks its candidates by an estimate, so the query asks for more of them
+    // than it needs and an exact re-scoring picks the nearest. That only works when every candidate
+    // reaches the re-scoring: keeping the kernel's own best `limit` throws the rest away, and the
+    // answer is then whatever the estimate said, however wide the candidate set was asked to be
+    int rows = 2000;
+    int dimension = 128;
+    java.util.Random random = new java.util.Random(20261021L);
+    java.util.List<Row> data = Lists.newArrayList();
+    float[][] vectors = new float[rows][dimension];
+    for (int id = 0; id < rows; id++) {
+      List<Float> values = Lists.newArrayList();
+      for (int d = 0; d < dimension; d++) {
+        vectors[id][d] = random.nextInt(256);
+        values.add(vectors[id][d]);
+      }
+      data.add(RowFactory.create((long) id, "row" + id, values));
+    }
+
+    String table = "docs_oversample_reaches";
+    spark
+        .createDataFrame(
+            data,
+            new StructType(
+                new StructField[] {
+                  new StructField("id", DataTypes.LongType, false, Metadata.empty()),
+                  new StructField("body", DataTypes.StringType, false, Metadata.empty()),
+                  new StructField(
+                      "embedding",
+                      DataTypes.createArrayType(DataTypes.FloatType),
+                      false,
+                      Metadata.empty())
+                }))
+        .writeTo("local.db." + table)
+        .createOrReplace();
+    spark.sql(
+        String.format(
+            "CALL local.system.build_vector_index("
+                + "table => 'db.%s', column => 'embedding', dimension => 128, "
+                + "metric => 'euclidean', structure => 'IVF', quantizer => 'RABITQ', "
+                + "options => map('nlist', '20', 'nprobe', '20', 'rabitq-bits', '3'), "
+                + "max_entries_per_index_file => 100000)",
+            table));
+
+    float[] query = new float[dimension];
+    for (int d = 0; d < dimension; d++) {
+      query[d] = random.nextInt(256);
+    }
+
+    // the whole table is asked for as candidates (200 x 10 rows), so the re-scoring has every row
+    // to choose from and its answer is the exact one
+    try {
+      spark.conf().set("spark.iceberg.index.vector.over-sample", "200");
+      List<Long> returned =
+          spark
+              .sql(
+                  String.format(
+                      "SELECT id FROM local.db.%s "
+                          + "ORDER BY vec_distance(embedding, %s) LIMIT 10",
+                      table, toSqlArray(query)))
+              .collectAsList()
+              .stream()
+              .map(row -> row.getLong(0))
+              .collect(Collectors.toList());
+      assertThat(returned)
+          .as("the exact ten nearest, out of the whole table as candidates")
+          .containsExactlyElementsOf(exactNearest(vectors, query, 10));
+    } finally {
+      spark.conf().unset("spark.iceberg.index.vector.over-sample");
+    }
+  }
+
+  @Test
+  public void overSamplingDoesNotChangeTheAnswerOnATableSmallerThanTheCandidateSet() {
     String query =
         "SELECT id FROM local.%s ORDER BY vec_distance(embedding, array(0.0d, 0.95d)) LIMIT 3";
     String indexed = tableWithIndex("docs_oversample", "hnsw");
 
     List<Row> widenedOnce;
     try {
-      // one is what an exactly scoring kernel needs: merging each file's exact top-k is already the
-      // exact global top-k, so asking for more would only fetch more rows for the same answer
+      // this table is four rows, so every over-sample already holds the whole table and there is
+      // nothing for a wider candidate set to add: the answer cannot change
       spark.conf().set("spark.iceberg.index.vector.over-sample", "1");
       widenedOnce = spark.sql(String.format(query, indexed)).collectAsList();
 
@@ -456,5 +538,37 @@ class TestRewriteVectorSearch {
                 "SELECT id FROM local.%s ORDER BY vec_distance(embedding, array(0.9d, 0.1d)) + 0.0d LIMIT %d",
                 table, limit))
         .collectAsList();
+  }
+
+  /** The ids of the {@code count} nearest vectors, closest first, ties by id. */
+  private static List<Long> exactNearest(float[][] vectors, float[] query, int count) {
+    List<Long> ids = Lists.newArrayList();
+    for (int id = 0; id < vectors.length; id++) {
+      ids.add((long) id);
+    }
+    ids.sort(
+        Comparator.<Long>comparingDouble(id -> distance(query, vectors[id.intValue()]))
+            .thenComparingLong(id -> id));
+    return ids.subList(0, count);
+  }
+
+  private static double distance(float[] left, float[] right) {
+    double sum = 0.0;
+    for (int i = 0; i < left.length; i++) {
+      double difference = (double) left[i] - right[i];
+      sum += difference * difference;
+    }
+    return sum;
+  }
+
+  private static String toSqlArray(float[] vector) {
+    StringBuilder sql = new StringBuilder("array(");
+    for (int i = 0; i < vector.length; i++) {
+      if (i > 0) {
+        sql.append(", ");
+      }
+      sql.append(String.format(Locale.ROOT, "%sd", vector[i]));
+    }
+    return sql.append(')').toString();
   }
 }

@@ -267,12 +267,16 @@ case class RewriteVectorSearch(spark: SparkSession) extends Rule[LogicalPlan] {
   }
 
   /**
-   * The rows of the index hits that still exist in the table snapshot being read.
+   * The rows of the index hits that still exist in the table snapshot being read, best first.
    *
-   * <p>The index is asked for more hits when delete files removed some of them, because the limit
-   * has to be met with live rows: a removed row leaves a hole the next hit fills. The hits arrive
-   * in the adapter's own order, which is the order a kernel is searched in, so the best of them is
-   * the first one whatever the metric measures.
+   * <p>The index is asked for more hits than the query wants, because its scores are estimates: what
+   * it returns is a candidate set that the caller re-scores exactly, so that the nearest rows are
+   * chosen by the real distance rather than by the estimate. The hits arrive in the adapter's own
+   * order, which is the order a kernel is searched in, so the best of them is the first one whatever
+   * the metric measures.
+   *
+   * <p>The index is asked for still more hits when delete files removed some of them, because the
+   * limit has to be met with live rows: a removed row leaves a hole the next hit fills.
    */
   private def liveHitRows(
       reader: IndexReader,
@@ -339,7 +343,11 @@ case class RewriteVectorSearch(spark: SparkSession) extends Rule[LogicalPlan] {
       }
     }
 
-    Some(rows.take(limit))
+    // every live candidate is handed back rather than the first `limit` of them: the caller re-scores
+    // what it is given exactly and keeps the nearest, and cutting the list here would leave the
+    // kernel's own order to decide which candidates reach that re-scoring, which is the whole of what
+    // the over-sampling was asked for
+    Some(rows)
   }
 
   /** The row of a hit, or nothing when the row was removed after the index snapshot was built. */
