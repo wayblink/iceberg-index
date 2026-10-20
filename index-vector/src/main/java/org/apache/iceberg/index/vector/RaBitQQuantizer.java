@@ -61,6 +61,15 @@ public final class RaBitQQuantizer implements java.io.Serializable {
   public static final String BITS = "rabitq-bits";
 
   private static final int DEFAULT_BITS = 1;
+
+  /**
+   * The rotation every quantizer shares by default.
+   *
+   * <p>Fixed rather than random so that rebuilding a file reproduces its codes; a reader is told it
+   * anyway, so the value itself carries no meaning beyond being the one that was used.
+   */
+  private static final long DEFAULT_SEED = 0x9E3779B97F4A7C15L;
+
   private static final int MAX_BITS = 8;
 
   private final int dimension;
@@ -111,6 +120,16 @@ public final class RaBitQQuantizer implements java.io.Serializable {
     } catch (NumberFormatException e) {
       throw new IllegalArgumentException("Index option " + BITS + " is not a number: " + value, e);
     }
+  }
+
+  /**
+   * A quantizer carrying only the rotation seed and the bit count.
+   *
+   * <p>For a caller that centres each of its partitions itself: the seed and the bits are what has
+   * to agree between building and searching, while the centre is a property of the partition.
+   */
+  static RaBitQQuantizer blank(int dimension, int bits) {
+    return new RaBitQQuantizer(dimension, DEFAULT_SEED, bits, new float[dimension]);
   }
 
   /** Trains the quantizer on the vectors a list holds: the centre is their mean. */

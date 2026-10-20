@@ -88,11 +88,13 @@ class TestVectorKernels {
                         .fieldId(1)
                         .dimension(2)
                         .metric(VectorIndexDefinition.Metric.EUCLIDEAN)
-                        .structure(VectorIndexDefinition.VectorStructure.IVF)
+                        // a graph whose vectors are quantized: no kernel offers it, because the
+                        // graph library keeps the vectors itself
+                        .structure(VectorIndexDefinition.VectorStructure.HNSW)
                         .quantizer(VectorIndexDefinition.VectorQuantizer.RABITQ)
                         .build()))
         .isInstanceOf(IllegalArgumentException.class)
-        .hasMessageContaining("No vector kernel builds a IVF index with the RABITQ quantizer")
+        .hasMessageContaining("No vector kernel builds a HNSW index with the RABITQ quantizer")
         .hasMessageContaining(FAKE);
   }
 

@@ -23,9 +23,11 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 import java.nio.ByteBuffer;
 import java.util.List;
+import java.util.Set;
 import org.apache.iceberg.index.IndexEntry;
 import org.apache.iceberg.index.IndexSearchResult;
 import org.apache.iceberg.relocated.com.google.common.collect.Lists;
+import org.apache.iceberg.relocated.com.google.common.collect.Sets;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 
@@ -198,6 +200,65 @@ class TestIvfKernel {
                         .build()))
         .isInstanceOf(IllegalArgumentException.class)
         .hasMessageContaining("IVF option nprobe is not a number: many");
+  }
+
+  @Test
+  public void quantizesTheVectorsWhenAskedTo() {
+    // the same partitioning with the vectors stored as codes: this is the form whose payload is
+    // small enough to matter, and what it costs is accuracy of the scores
+    List<IndexEntry> entries = entries(VectorIndexDefinition.Metric.EUCLIDEAN);
+    VectorIndexAdapter quantized =
+        quantizedAdapter(VectorIndexDefinition.Metric.EUCLIDEAN, ENTRIES);
+    VectorIndexAdapter exact = flatAdapter(VectorIndexDefinition.Metric.EUCLIDEAN);
+
+    ByteBuffer codes = quantized.encodeAuxiliaryPayload(entries, 1);
+    ByteBuffer vectors = exact.encodeEntries(entries);
+    assertThat(codes.remaining())
+        .as("a code per vector plus three numbers, against the vector itself")
+        .isLessThan(vectors.remaining());
+
+    // the estimate is close to the exact order, not equal to it, which is the whole point: what it
+    // is for is naming a wide candidate set that an exact re-scoring then orders
+    int found = 0;
+    int probes = 10;
+    for (int q = 0; q < probes; q++) {
+      ByteBuffer query = exact.encodeQuery(vector(q * 13));
+      List<IndexSearchResult> fromCodes =
+          quantized.prepareAuxiliary(codes).search(query, ENTRIES / 2);
+      Set<Long> wide = Sets.newHashSet();
+      for (int i = 0; i < 100 && i < fromCodes.size(); i++) {
+        wide.add(fromCodes.get(i).rowPosition());
+      }
+      for (IndexSearchResult exactHit : exact.prepare(vectors).search(query, 10)) {
+        if (wide.contains(exactHit.rowPosition())) {
+          found += 1;
+        }
+      }
+    }
+
+    System.out.println(
+        "IVFQ proxyBytes="
+            + codes.remaining()
+            + " exactBytes="
+            + vectors.remaining()
+            + " exactTop10InsideQuantizedTop100="
+            + String.format("%.3f", found / (double) (probes * 10)));
+    assertThat(found / (double) (probes * 10))
+        .as("the exact top ten inside the quantized top hundred")
+        .isGreaterThan(0.9);
+  }
+
+  private static VectorIndexAdapter quantizedAdapter(
+      VectorIndexDefinition.Metric metric, int expectedEntries) {
+    return new VectorIndexAdapter(
+        VectorIndexDefinition.builder()
+            .fieldId(1)
+            .dimension(DIMENSION)
+            .metric(metric)
+            .structure(VectorIndexDefinition.VectorStructure.IVF)
+            .quantizer(VectorIndexDefinition.VectorQuantizer.RABITQ)
+            .property(IvfOptions.NPROBE, Integer.toString(expectedEntries))
+            .build());
   }
 
   private static VectorIndexAdapter adapter(
