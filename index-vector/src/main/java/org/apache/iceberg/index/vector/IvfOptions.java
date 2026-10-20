@@ -69,13 +69,30 @@ public final class IvfOptions implements java.io.Serializable {
 
   /** Reads the options, taking the default for each one the properties do not set. */
   public static IvfOptions from(Map<String, String> properties) {
+    return from(properties, VectorIndexDefinition.VectorQuantizer.NONE);
+  }
+
+  /**
+   * Reads the options of a structure that is going to store its vectors with {@code quantizer}.
+   *
+   * <p>The quantizer is a separate axis and has options of its own, so those are accepted here too:
+   * a property is rejected when nothing about this combination reads it, not when this class alone
+   * does not.
+   */
+  public static IvfOptions from(
+      Map<String, String> properties, VectorIndexDefinition.VectorQuantizer quantizer) {
     Preconditions.checkNotNull(properties, "Index properties are null");
+    java.util.Set<String> readable = Sets.newLinkedHashSet(KEYS);
+    if (quantizer == VectorIndexDefinition.VectorQuantizer.RABITQ) {
+      readable.add(RaBitQQuantizer.BITS);
+    }
+
     for (String key : properties.keySet()) {
       Preconditions.checkArgument(
-          KEYS.contains(key),
+          readable.contains(key),
           "Unknown IVF option %s: this structure reads %s",
           key,
-          Sets.newTreeSet(KEYS));
+          Sets.newTreeSet(readable));
     }
 
     return new IvfOptions(

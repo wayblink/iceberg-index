@@ -45,7 +45,7 @@ import org.junit.jupiter.api.Test;
  */
 class TestIvfKernel {
 
-  private static final int DIMENSION = 8;
+  private static final int DIMENSION = 128;
   private static final int ENTRIES = 400;
 
   @BeforeAll
@@ -125,14 +125,10 @@ class TestIvfKernel {
   public void indexesASingleVector() {
     VectorIndexAdapter ivf = adapter(VectorIndexDefinition.Metric.EUCLIDEAN, 0, 1);
     List<IndexEntry> entries =
-        Lists.newArrayList(
-            IndexEntry.of(
-                "data-1.parquet", 0, ivf.encodeVector(new float[] {1, 0, 0, 0, 0, 0, 0, 0})));
+        Lists.newArrayList(IndexEntry.of("data-1.parquet", 0, ivf.encodeVector(vector(0))));
 
     ByteBuffer payload = ivf.encodeAuxiliaryPayload(entries, 1);
-    assertThat(
-            ivf.prepareAuxiliary(payload)
-                .search(ivf.encodeQuery(new float[] {1, 0, 0, 0, 0, 0, 0, 0}), 1))
+    assertThat(ivf.prepareAuxiliary(payload).search(ivf.encodeQuery(vector(0)), 1))
         .extracting(IndexSearchResult::dataFile)
         .containsExactly("data-1.parquet");
   }
@@ -140,7 +136,7 @@ class TestIvfKernel {
   @Test
   public void indexesVectorsThatAreAllTheSame() {
     VectorIndexAdapter ivf = adapter(VectorIndexDefinition.Metric.EUCLIDEAN, 0, 50);
-    float[] same = {1, 2, 3, 4, 5, 6, 7, 8};
+    float[] same = vector(1);
     List<IndexEntry> entries = Lists.newArrayList();
     for (int i = 0; i < 50; i++) {
       entries.add(IndexEntry.of("data-1.parquet", i, ivf.encodeVector(same)));

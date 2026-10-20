@@ -634,7 +634,7 @@ public final class IvfKernel implements VectorKernel {
     public VectorKernel create(VectorIndexDefinition definition) {
       return new IvfKernel(
           definition.dimension(),
-          IvfOptions.from(definition.properties()),
+          IvfOptions.from(definition.properties(), definition.quantizer()),
           new VectorScoring(definition.metric()),
           RaBitQQuantizer.blank(
               definition.dimension(), RaBitQQuantizer.bitsFrom(definition.properties())));

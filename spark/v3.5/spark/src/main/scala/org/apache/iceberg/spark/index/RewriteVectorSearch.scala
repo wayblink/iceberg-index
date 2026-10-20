@@ -100,7 +100,12 @@ case class RewriteVectorSearch(spark: SparkSession) extends Rule[LogicalPlan] {
   private val OverSampleConf = "spark.iceberg.index.vector.over-sample"
 
   private def overSample: Int = {
-    val configured = spark.conf.getOption(OverSampleConf).map(_.trim.toInt).getOrElse(1)
+    // the spark context's configuration carries what spark-submit was given, and the session's
+    // carries what a SET statement set: a rule cannot assume it was configured the same way as the
+    // process that started it
+    val fromContext = spark.sparkContext.getConf.getOption(OverSampleConf).map(_.trim.toInt)
+    val configured =
+      fromContext.orElse(spark.conf.getOption(OverSampleConf).map(_.trim.toInt)).getOrElse(1)
     if (configured < 1) 1 else configured
   }
 
