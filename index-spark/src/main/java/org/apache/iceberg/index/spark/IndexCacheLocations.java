@@ -271,6 +271,12 @@ final class IndexCacheLocations {
   private final Map<String, View> views = new LinkedHashMap<>();
   private final Object lock = new Object();
 
+  // what the last query decided, so a status call can explain the counts it returns
+  private volatile String lastMode = "UNKNOWN";
+  private volatile long lastWorkingSetBytes = 0;
+  private volatile double lastCoverage = 0;
+  private volatile long lastQueryMillis = 0;
+
   static IndexCacheLocations forContext(SparkContext context) {
     String application = context.applicationId();
     return BY_APPLICATION.computeIfAbsent(
@@ -379,6 +385,30 @@ final class IndexCacheLocations {
     return covered;
   }
 
+  /** Records what a query decided, so a later status call can put the counts in context. */
+  void recordQuery(String mode, long workingSetBytes, double coverage) {
+    this.lastMode = mode;
+    this.lastWorkingSetBytes = workingSetBytes;
+    this.lastCoverage = coverage;
+    this.lastQueryMillis = System.currentTimeMillis();
+  }
+
+  String lastMode() {
+    return lastMode;
+  }
+
+  long lastWorkingSetBytes() {
+    return lastWorkingSetBytes;
+  }
+
+  double lastCoverage() {
+    return lastCoverage;
+  }
+
+  long lastQueryMillis() {
+    return lastQueryMillis;
+  }
+
   Summary summary(Collection<String> cacheKeys) {
     int executors;
     int files = 0;
@@ -402,6 +432,30 @@ final class IndexCacheLocations {
             ? 0.0
             : (double) coveredCount(cacheKeys) / cacheKeys.size();
     return new Summary(executors, files, bytes, coverage, hits, misses, evictions);
+  }
+
+  /** A snapshot of every executor the table knows about, for a status report. */
+  List<Report> reports() {
+    List<Report> reports = new ArrayList<>();
+    synchronized (lock) {
+      for (View view : views.values()) {
+        reports.add(
+            new Report(
+                view.executorId,
+                view.host,
+                view.epoch,
+                view.seq,
+                view.keys,
+                view.hits,
+                view.misses,
+                0,
+                view.evictions,
+                view.bytes,
+                view.keys.length));
+      }
+    }
+
+    return reports;
   }
 
   int size() {

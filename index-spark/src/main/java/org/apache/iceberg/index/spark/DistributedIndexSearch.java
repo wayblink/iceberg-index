@@ -151,9 +151,9 @@ public final class DistributedIndexSearch {
     // properties of its catalog rather than with whatever the session happens to be configured with
     Broadcast<FileIO> ioRef = context.broadcast(table.io());
     // whether an executor remembers index files between queries, and how much it may keep
+    long workingSet = workingSetBytes(table.io(), files);
     Broadcast<ExecutorIndexCache.Config> cacheRef =
-        context.broadcast(
-            ExecutorIndexCache.Config.from(spark, workingSetBytes(table.io(), files)));
+        context.broadcast(ExecutorIndexCache.Config.from(spark, workingSet));
     String cacheKey = cacheKey(adapter);
     List<String> cacheKeys = cacheKeys(cacheKey, locations);
     // what each executor holds, so a task can be sent to one that already has its file
@@ -216,7 +216,7 @@ public final class DistributedIndexSearch {
                       return fileHits.iterator();
                     })
             .takeOrdered(localTopK, hitOrder(adapter));
-    mergeCacheReports(cacheReports, locationsTable, cacheKeys, cacheRef.getValue());
+    mergeCacheReports(cacheReports, locationsTable, cacheKeys, cacheRef.getValue(), workingSet);
 
     List<IndexSearchResult> hits = Lists.newArrayListWithCapacity(top.size());
     for (Tuple3<String, Long, Double> hit : top) {
@@ -288,9 +288,9 @@ public final class DistributedIndexSearch {
     }
     Broadcast<List<byte[]>> queriesRef = context.broadcast(queryPayloads);
     Broadcast<FileIO> ioRef = context.broadcast(table.io());
+    long workingSet = workingSetBytes(table.io(), files);
     Broadcast<ExecutorIndexCache.Config> cacheRef =
-        context.broadcast(
-            ExecutorIndexCache.Config.from(spark, workingSetBytes(table.io(), files)));
+        context.broadcast(ExecutorIndexCache.Config.from(spark, workingSet));
     String cacheKey = cacheKey(adapter);
     List<String> cacheKeys = cacheKeys(cacheKey, locations);
     IndexCacheLocations locationsTable = IndexCacheLocations.forContext(context.sc());
@@ -385,7 +385,7 @@ public final class DistributedIndexSearch {
         fileHits
             .aggregateByKey(Lists.<Tuple3<String, Long, Double>>newArrayList(), mergeHit, mergeHits)
             .collectAsMap();
-    mergeCacheReports(cacheReports, locationsTable, cacheKeys, cacheRef.getValue());
+    mergeCacheReports(cacheReports, locationsTable, cacheKeys, cacheRef.getValue(), workingSet);
 
     for (int queryId = 0; queryId < queries.size(); queryId++) {
       List<Tuple3<String, Long, Double>> top =
@@ -490,7 +490,8 @@ public final class DistributedIndexSearch {
       org.apache.spark.util.CollectionAccumulator<IndexCacheLocations.Report> reports,
       IndexCacheLocations table,
       List<String> cacheKeys,
-      ExecutorIndexCache.Config config) {
+      ExecutorIndexCache.Config config,
+      long workingSetBytes) {
     if (reports == null) {
       return;
     }
@@ -498,6 +499,7 @@ public final class DistributedIndexSearch {
     table.mergeAll(reports.value());
     table.prune();
     IndexCacheLocations.Summary summary = table.summary(cacheKeys);
+    table.recordQuery(config.mode().name(), workingSetBytes, summary.coverage());
     // the driver's logger is often above INFO, and this line is how a run says whether the cache
     // did anything, so it goes to standard out
     System.out.println("INDEX_CACHE mode=" + config.mode() + " this query: " + summary);
