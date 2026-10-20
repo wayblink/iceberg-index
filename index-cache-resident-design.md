@@ -403,3 +403,34 @@ final class IndexFileRDD extends RDD<String> {
 **测试**：`TestIndexCacheBudget` 5/5、`TestExecutorIndexCache` 7/7、`TestVectorIndexSearchBatch` 20/20。
 
 **过程中修掉的自伤 bug**：`derive(configured, parseBytes(configured, ...))` 在未配置时会 NPE（Java 参数 eager 求值），已改为先判空再解析——集成测试立刻暴露了它。
+
+---
+
+## 18. 实现记录：P1–P4（commit d411e0919）
+
+**P1 上报与位置表**
+- `IndexCacheLocations`（driver）：`Report{executorId, host, epoch, seq, keys(排序的 64 位 FNV 哈希), stats}`；
+  合并规则：同 epoch 取更大的 seq；epoch 不同整条替换；`prune(ttl=10min)` 丢弃不再上报者；`SparkListener.onExecutorRemoved` 即时清理。
+- 每个 task 结束回传一份快照（`CollectionAccumulator`），查询后 driver 记录
+  `index cache mode=... this query: executors=.. files=.. coverage=..`。
+
+**P2 位置感知调度**
+- `IndexFileRDD`（Scala；每个索引文件一个 partition），`getPreferredLocations` 返回持有该文件的 host（≤2）；
+- 两条搜索路径都改用它；`spark.iceberg.index.schedule.locality`（默认 true）可关闭。
+- 实现约束（踩过的坑）：① `TaskLocation.ExecutorCacheTaskLocation` 是 `private[spark]`，因此用**主机级** hint
+  （k8s 一 pod 一节点时等价于 executor 级）；② RDD 会被 `mapPartitions` 作为依赖序列化，位置表字段必须 `@transient`；
+  ③ Scala companion 与 class 同名时不生成静态转发器，Java 侧调用要用不同的 object 名（`IndexFileRdds`）。
+
+**P3 三档 + 2Q**
+- `Mode{PIN_ALL, PIN_HOT, STREAM}`，driver 按 `workingSet vs capacity(预算×executor 数)` 选档，可被
+  `spark.iceberg.index.cache.mode` 覆盖。
+- PIN_ALL：全部 pin，**不为腾空间淘汰**（装不下就不缓存新文件，并已有预算告警）。
+- PIN_HOT：第二次访问才准入（扫描不污染），第三次访问晋升 protected（2Q）。
+- STREAM：不缓存，等价关闭。
+
+**P4 空闲卸载**
+- `idle-ttl`（默认 30m）+ sweep 间隔 30s；正在 `searching()` 持有的条目不释放；测试用 1ms TTL + 0 间隔验证。
+- **未做**（见 #1706）：`index_cache_report()` SQL 过程、每表公平配额。
+
+**测试**：`TestExecutorIndexCache` 12、`TestIndexCacheBudget` 5、`TestIndexCacheLocations` 6、
+`TestVectorIndexSearchBatch` 21、`TestIndexTableFunctions` 6、`TestRewriteVectorSearch` 13，全绿。
