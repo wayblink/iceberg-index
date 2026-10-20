@@ -468,3 +468,23 @@ final class IndexFileRDD extends RDD<String> {
 ### 遗留疑点（需要单独查）
 
 `VectorIndexSearch.search(...)` 在这个 Lance 表上返回 **0 行**（探针里 `CONSISTENT rows=0`），所以"结果一致性"这一项**并未真正验证**。本地测试覆盖的是 Parquet/Hadoop 表（`TestVectorIndexSearchBatch` 24 个全绿），Lance 表走 `IndexSearch.resolveRows` 的路径没有本地用例。已开卡跟踪。
+
+---
+
+## 20. 决策：不做 payload 向后兼容（2026-10-20）
+
+**决定**（用户）：不考虑兼容问题，**始终以最新版本的实现为尊**。
+
+因此：
+
+1. `VectorIndexAdapter.readableAuxiliaryBlobTypes()` 只返回当前的 `iceberg-vector-auxiliary-v1`；
+   旧名 `iceberg-vector-hnsw-v1` 常量与分支已删除（旧测试断言"旧名仍可读"已改为"一个角色一个类型"）。
+2. 读取路径按 adapter 声明的**可读类型集合**匹配 blob（与 `IndexReader` 一致），但集合里只有一个当前类型。
+3. 旧 payload 一律**显式失败**：
+   - blob 类型不匹配 → `Index file has no <types> blob, only [...]`；
+   - payload 无法按当前条目结构解析 → `Cannot read the <type> payload ... Rebuild the index.`
+4. 运维含义：升级到新的 payload 格式后，**必须重建索引**；文档与错误信息都指向这一点。
+
+**重建记录**（集群 A，`sparkann.sift10m_lance_zstd`）：
+- 先按 `structure => 'FLAT'`（参数缺省）重建了一次，132 s 完成 —— 说明**重建时务必显式给 `structure`**，否则默认 FLAT（精确全扫），与原先的 HNSW 语义不同；
+- 随后按 `structure => 'HNSW', max_m => 16, ef_construction => 200, ef_search => 50, max_entries_per_index_file => 262144` 重建。

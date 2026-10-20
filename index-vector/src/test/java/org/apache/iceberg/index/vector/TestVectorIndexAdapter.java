@@ -285,8 +285,8 @@ class TestVectorIndexAdapter {
       // the name says the payload's role, not the algorithm: the algorithm is in the payload header
       assertThat(hnsw.auxiliaryBlobType()).isEqualTo("iceberg-vector-auxiliary-v1");
       assertThat(hnsw.readableAuxiliaryBlobTypes())
-          .as("the name it used to write is still readable")
-          .contains("iceberg-vector-auxiliary-v1", "iceberg-vector-hnsw-v1");
+          .as("one type per role")
+          .containsExactly("iceberg-vector-auxiliary-v1");
       assertThat(hnsw.writesAuxiliaryFiles()).isTrue();
       assertThat(exact.writesAuxiliaryFiles()).isFalse();
     }

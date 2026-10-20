@@ -51,15 +51,6 @@ public final class VectorIndexAdapter implements IndexAdapter, java.io.Serializa
 
   public static final String AUXILIARY_BLOB_TYPE = "iceberg-vector-auxiliary-v1";
 
-  /**
-   * The auxiliary blob type written before the algorithm was taken out of the name.
-   *
-   * <p>A blob type says which role a payload plays, not which algorithm wrote it: the algorithm is
-   * in the payload header, where it can grow without renaming a type that indexes already on tables
-   * are recorded under.
-   */
-  public static final String LEGACY_AUXILIARY_BLOB_TYPE = "iceberg-vector-hnsw-v1";
-
   private final VectorIndexDefinition definition;
   private final VectorKernel kernel;
   private final VectorScoring scoring;
@@ -90,9 +81,9 @@ public final class VectorIndexAdapter implements IndexAdapter, java.io.Serializa
 
   @Override
   public Set<String> readableAuxiliaryBlobTypes() {
-    // both names, because an index written before the rename is still on tables and a reader that
-    // only knew the new name would skip it rather than read it
-    return ImmutableSet.of(AUXILIARY_BLOB_TYPE, LEGACY_AUXILIARY_BLOB_TYPE);
+    // one type per role: the algorithm that wrote a payload is recorded inside it, so it never
+    // belongs in the type a reader looks for
+    return ImmutableSet.of(AUXILIARY_BLOB_TYPE);
   }
 
   @Override
