@@ -26,6 +26,15 @@ public final class ExecutorIndexCacheProbe {
     return ExecutorIndexCache.get().stats();
   }
 
+  public static int locatedExecutors(org.apache.spark.sql.SparkSession spark) {
+    return IndexCacheLocations.forContext(spark.sparkContext()).size();
+  }
+
+  public static double coverage(
+      org.apache.spark.sql.SparkSession spark, java.util.List<String> cacheKeys) {
+    return IndexCacheLocations.forContext(spark.sparkContext()).summary(cacheKeys).coverage();
+  }
+
   public static String config(org.apache.spark.sql.SparkSession spark) {
     ExecutorIndexCache.Config config = ExecutorIndexCache.Config.from(spark, 0L);
     return "enabled="

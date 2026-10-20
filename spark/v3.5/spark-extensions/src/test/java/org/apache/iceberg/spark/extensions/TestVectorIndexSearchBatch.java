@@ -79,8 +79,7 @@ public class TestVectorIndexSearchBatch extends ExtensionsTestBase {
       // hits have to be the same rows in the same order
       List<Object[]> warm = sql(search, catalogName, tableName);
       // the executor is this JVM here, so the second batch has to have come from the cache
-      assertThat(
-              org.apache.iceberg.index.spark.ExecutorIndexCacheProbe.stats().hits())
+      assertThat(org.apache.iceberg.index.spark.ExecutorIndexCacheProbe.stats().hits())
           .isPositive();
       assertThat(warm).hasSameSizeAs(cold);
       for (int i = 0; i < cold.size(); i++) {
@@ -136,6 +135,37 @@ public class TestVectorIndexSearchBatch extends ExtensionsTestBase {
               .map(row -> parseId((String) row[4]))
               .collect(Collectors.toList());
       assertThat(ids).doesNotContain(0L, 1L, 10L);
+    } finally {
+      spark.conf().unset(CACHE_ENABLED);
+    }
+  }
+
+  @TestTemplate
+  public void cachedSearchRecordsWhereItIsCached() {
+    String tableName = tableName("vectors_batch_located_" + catalogName);
+    sql("CREATE TABLE %s (id bigint, embedding array<double>) USING iceberg", tableName);
+    sql(
+        "INSERT INTO %s SELECT id, array(CAST(id AS double), CAST(10 - id AS double)) "
+            + "FROM range(0, 20)",
+        tableName);
+    sql(
+        "CALL %s.system.build_vector_index("
+            + "table => '%s', column => 'embedding', dimension => 2, metric => 'euclidean')",
+        catalogName, tableName);
+
+    String search =
+        "CALL %s.system.vector_search_batch(table => '%s', column => 'embedding', "
+            + "queries => array('0.0,10.0'), k => 3)";
+
+    spark.conf().set(CACHE_ENABLED, "true");
+    try {
+      // the executor reports what it holds at the end of the task, so after a query the driver
+      // knows where the files are; a repeated query then finds them there
+      sql(search, catalogName, tableName);
+      sql(search, catalogName, tableName);
+
+      assertThat(org.apache.iceberg.index.spark.ExecutorIndexCacheProbe.locatedExecutors(spark))
+          .isPositive();
     } finally {
       spark.conf().unset(CACHE_ENABLED);
     }

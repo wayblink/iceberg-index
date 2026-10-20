@@ -19,9 +19,12 @@
 package org.apache.iceberg.index.spark;
 
 import java.io.Serializable;
+import java.util.ArrayList;
 import java.util.Iterator;
 import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.locks.ReentrantLock;
@@ -38,7 +41,8 @@ import org.slf4j.LoggerFactory;
  * do again on every one of its files, and it is most of what a search over an index costs. An
  * executor runs several queries, so the result is kept here, in a map that belongs to the JVM and
  * outlives the tasks. The cost is that an executor is no longer stateless: the map has a byte
- * budget, evicts least recently used entries, and is only filled when the caller turns it on.
+ * budget, evicts entries it does not expect to need again, and is only filled when the caller turns
+ * it on.
  *
  * <p>Index files are immutable — a new snapshot refers to new files rather than to a rewritten
  * version of an old one — so an entry is keyed by the file's location and never invalidated. A file
@@ -50,10 +54,29 @@ import org.slf4j.LoggerFactory;
  * searched from one thread at a time. An executor has as many task threads as cores, so a single
  * entry can be asked for by two threads at once; {@link CachedFile#searching} holds a lock for the
  * duration of a search rather than duplicating the structure per thread.
+ *
+ * <h2>Three admission modes</h2>
+ *
+ * <p>A query over an index whose working set fits the budget can simply keep every file ({@link
+ * Mode#PIN_ALL}). When it does not fit, keeping every file makes each query evict what the next one
+ * reads, which is worse than not caching at all; then the cache either admits a file only after it
+ * has been asked for twice ({@link Mode#PIN_HOT}, so a scan does not displace what repeats) or
+ * stays out of the way ({@link Mode#STREAM}). The mode is decided by the driver, which is the only
+ * side that knows the working set and the cluster's total budget.
  */
 final class ExecutorIndexCache {
 
   private static final Logger LOG = LoggerFactory.getLogger(ExecutorIndexCache.class);
+
+  /** How an executor treats the entries it is asked for. */
+  enum Mode {
+    /** Keep every file, and do not evict a kept file to make room. */
+    PIN_ALL,
+    /** Admit a file only once it has been asked for twice, then protect it from eviction. */
+    PIN_HOT,
+    /** Do not keep anything; every query reads its files again. */
+    STREAM
+  }
 
   /** Settings travel to the executors with the job, so they are read once on the driver. */
   static final class Config implements Serializable {
@@ -61,18 +84,25 @@ final class ExecutorIndexCache {
     static final String BYTES = "spark.iceberg.index.cache.bytes";
     static final String MAX_ENTRY_BYTES = "spark.iceberg.index.cache.max-entry-bytes";
     static final String HEAP_FRACTION = "spark.iceberg.index.cache.heap-fraction";
+    static final String MODE = "spark.iceberg.index.cache.mode";
+    static final String IDLE_TTL = "spark.iceberg.index.cache.idle-ttl";
     static final long MIN_BUDGET_BYTES = 512L * 1024L * 1024L;
 
-    private static final Config DISABLED = new Config(false, 0, 0);
+    private static final Config DISABLED = new Config(false, 0, 0, Mode.STREAM, 0);
 
     private final boolean enabled;
     private final long maxBytes;
     private final long maxEntryBytes;
+    private final Mode mode;
+    private final long idleTtlMillis;
 
-    private Config(boolean enabled, long maxBytes, long maxEntryBytes) {
+    private Config(
+        boolean enabled, long maxBytes, long maxEntryBytes, Mode mode, long idleTtlMillis) {
       this.enabled = enabled;
       this.maxBytes = maxBytes;
       this.maxEntryBytes = maxEntryBytes;
+      this.mode = mode;
+      this.idleTtlMillis = idleTtlMillis;
     }
 
     static Config disabled() {
@@ -83,7 +113,15 @@ final class ExecutorIndexCache {
       Preconditions.checkArgument(maxBytes > 0, "The cache budget must be positive: %s", maxBytes);
       Preconditions.checkArgument(
           maxEntryBytes > 0, "The per-entry limit must be positive: %s", maxEntryBytes);
-      return new Config(enabled, maxBytes, maxEntryBytes);
+      return new Config(enabled, maxBytes, maxEntryBytes, Mode.PIN_ALL, 0);
+    }
+
+    static Config of(
+        boolean enabled, long maxBytes, long maxEntryBytes, Mode mode, long idleTtlMillis) {
+      Preconditions.checkArgument(maxBytes > 0, "The cache budget must be positive: %s", maxBytes);
+      Preconditions.checkArgument(
+          maxEntryBytes > 0, "The per-entry limit must be positive: %s", maxEntryBytes);
+      return new Config(enabled, maxBytes, maxEntryBytes, mode, idleTtlMillis);
     }
 
     /**
@@ -100,24 +138,48 @@ final class ExecutorIndexCache {
       }
 
       String configured = spark.conf().get(BYTES, null);
-      long maxEntryBytes = parseBytes(spark.conf().get(MAX_ENTRY_BYTES, "256m"), MAX_ENTRY_BYTES);
       long configuredBytes = configured != null ? parseBytes(configured, BYTES) : 0L;
+      long maxEntryBytes = parseBytes(spark.conf().get(MAX_ENTRY_BYTES, "256m"), MAX_ENTRY_BYTES);
+      int executors = executors(spark);
       long budget =
           derive(
               configured,
               configuredBytes,
               workingSetBytes,
-              executors(spark),
+              executors,
               heapBytes(spark),
               heapFraction(spark));
-      Config config = new Config(true, budget, maxEntryBytes);
-      if (config.maxBytes() < maxEntryBytes) {
-        // an entry limit larger than the budget would let one file evict everything and still be
-        // evicted itself, so the limit follows the budget down
-        return new Config(true, budget, budget);
+      Mode mode = mode(spark.conf().get(MODE, "auto"), workingSetBytes, budget, executors);
+      long idleTtlMillis = durationMillis(spark.conf().get(IDLE_TTL, "30m"), IDLE_TTL);
+      long effectiveEntryLimit = Math.min(maxEntryBytes, budget);
+      return new Config(true, budget, effectiveEntryLimit, mode, idleTtlMillis);
+    }
+
+    /**
+     * Which admission mode the working set calls for.
+     *
+     * <p>The cluster's total budget is what a working set has to fit into, since every executor may
+     * be asked for any file. Twice the budget is the range where a hot subset is worth keeping;
+     * past that the cache would spend its time evicting, so it stays out of the way.
+     */
+    static Mode mode(
+        String configured, long workingSetBytes, long budgetPerExecutor, int executors) {
+      if (configured != null && !"auto".equalsIgnoreCase(configured.trim())) {
+        return Mode.valueOf(configured.trim().toUpperCase(java.util.Locale.ROOT).replace('-', '_'));
       }
 
-      return config;
+      if (workingSetBytes <= 0) {
+        return Mode.PIN_ALL;
+      }
+
+      long capacity = budgetPerExecutor * Math.max(1, executors);
+      if (workingSetBytes <= capacity) {
+        return Mode.PIN_ALL;
+      } else if (workingSetBytes <= 2 * capacity) {
+        return Mode.PIN_HOT;
+      } else {
+        return Mode.STREAM;
+      }
     }
 
     /**
@@ -186,14 +248,22 @@ final class ExecutorIndexCache {
       }
     }
 
-    private static long ceilDiv(long dividend, long divisor) {
-      return (dividend + divisor - 1) / divisor;
+    static long parseBytes(String value, String key) {
+      return parse(value, key, 1L);
     }
 
-    private static long parseBytes(String value, String key) {
+    private static long durationMillis(String value, String key) {
+      return parse(value, key, 1L) * 1000L;
+    }
+
+    private static long parse(String value, String key, long multiplier) {
       String trimmed = value.trim().toLowerCase(java.util.Locale.ROOT);
       long scale = 1;
-      if (trimmed.endsWith("m")) {
+      if (trimmed.endsWith("ms")) {
+        scale = 1;
+        multiplier *= 1;
+        trimmed = trimmed.substring(0, trimmed.length() - 2);
+      } else if (trimmed.endsWith("m")) {
         scale = 1024L * 1024L;
         trimmed = trimmed.substring(0, trimmed.length() - 1);
       } else if (trimmed.endsWith("g")) {
@@ -202,14 +272,24 @@ final class ExecutorIndexCache {
       } else if (trimmed.endsWith("k")) {
         scale = 1024L;
         trimmed = trimmed.substring(0, trimmed.length() - 1);
+      } else if (trimmed.endsWith("h")) {
+        scale = 60L * 60L;
+        trimmed = trimmed.substring(0, trimmed.length() - 1);
+      } else if (trimmed.endsWith("s")) {
+        scale = 1;
+        trimmed = trimmed.substring(0, trimmed.length() - 1);
       }
 
       try {
-        return Long.parseLong(trimmed.trim()) * scale;
+        return Long.parseLong(trimmed.trim()) * scale * multiplier;
       } catch (NumberFormatException e) {
         throw new IllegalArgumentException(
-            "Not a size for " + key + ": " + value + " (use 512m, 2g, or a number of bytes)", e);
+            "Not a size for " + key + ": " + value + " (use 512m, 2g, 30m, or a number)", e);
       }
+    }
+
+    private static long ceilDiv(long dividend, long divisor) {
+      return (dividend + divisor - 1) / divisor;
     }
 
     boolean enabled() {
@@ -223,6 +303,19 @@ final class ExecutorIndexCache {
     long maxEntryBytes() {
       return maxEntryBytes;
     }
+
+    Mode mode() {
+      return mode;
+    }
+
+    long idleTtlMillis() {
+      return idleTtlMillis;
+    }
+
+    /** Only a mode that keeps files is worth the bookkeeping. */
+    boolean caching() {
+      return enabled && mode != Mode.STREAM;
+    }
   }
 
   /** One index file as an executor remembers it. */
@@ -231,6 +324,12 @@ final class ExecutorIndexCache {
     private final IndexAdapter.PreparedSearch prepared;
     private final long bytes;
     private final ReentrantLock searchLock = new ReentrantLock();
+    private int uses;
+    // a PIN_ALL entry: the working set fits, so it is never evicted to make room
+    private boolean pinned;
+    // a 2Q entry: asked for twice, so it outranks an entry seen once
+    private boolean protectedRank;
+    private long lastAccessNanos = System.nanoTime();
 
     private CachedFile(byte[] payload, IndexAdapter.PreparedSearch prepared, long bytes) {
       this.payload = payload;
@@ -252,8 +351,27 @@ final class ExecutorIndexCache {
       }
     }
 
+    /** Whether a search is running against this file, which makes it unsafe to unload. */
+    boolean inUse() {
+      if (searchLock.isHeldByCurrentThread()) {
+        return true;
+      }
+
+      if (searchLock.tryLock()) {
+        searchLock.unlock();
+        return false;
+      }
+
+      return true;
+    }
+
     public long bytes() {
       return bytes;
+    }
+
+    private void touch() {
+      uses += 1;
+      lastAccessNanos = System.nanoTime();
     }
   }
 
@@ -331,16 +449,30 @@ final class ExecutorIndexCache {
     }
   }
 
-  private static final String CONFIG_BYTES_KEY = Config.BYTES;
-
   private static final ExecutorIndexCache INSTANCE = new ExecutorIndexCache();
+
+  /** Changes when the JVM does, so a driver can tell a restarted executor from a live one. */
+  private static final long EPOCH = new java.security.SecureRandom().nextLong();
 
   static ExecutorIndexCache get() {
     return INSTANCE;
   }
 
+  static long epoch() {
+    return EPOCH;
+  }
+
   // access order, so the first entry of the iteration is the least recently used
-  private final Map<String, CachedFile> files = new LinkedHashMap<>(16, 0.75f, true);
+  private final Map<String, CachedFile> probation = new LinkedHashMap<>(16, 0.75f, true);
+  private final Map<String, CachedFile> protectedFiles = new LinkedHashMap<>(16, 0.75f, true);
+  // how often a file has been asked for without being kept, for the PIN_HOT admission
+  private final Map<String, Integer> asked =
+      new LinkedHashMap<>(16, 0.75f, true) {
+        @Override
+        protected boolean removeEldestEntry(Map.Entry<String, Integer> eldest) {
+          return size() > 100_000;
+        }
+      };
   private final Object mapLock = new Object();
   // one monitor per location, so two tasks asking for the same file prepare it once
   private final ConcurrentHashMap<String, Object> loading = new ConcurrentHashMap<>();
@@ -351,6 +483,13 @@ final class ExecutorIndexCache {
   private final AtomicLong evictions = new AtomicLong();
   private final AtomicLong skippedTooLarge = new AtomicLong();
   private long bytes = 0;
+  private long lastSweepNanos = System.nanoTime();
+  private static long sweepIntervalNanos = java.util.concurrent.TimeUnit.SECONDS.toNanos(30);
+
+  /** Lets a test drive the idle sweep without waiting half a minute. */
+  static void sweepIntervalForTests(long nanos) {
+    sweepIntervalNanos = nanos;
+  }
 
   private ExecutorIndexCache() {}
 
@@ -358,16 +497,17 @@ final class ExecutorIndexCache {
    * The index file at the location, read and prepared at most once per executor.
    *
    * @param location the index file's location, which identifies its content
-   * @param config the budget, read on the driver and carried with the job
+   * @param config the budget and mode, read on the driver and carried with the job
    * @param key what the prepared structure depends on besides the payload
    * @param loader reads the payload and prepares it, only called on a miss
    */
   CachedFile file(String location, Config config, String key, Loader loader) {
-    if (!config.enabled()) {
+    if (!config.caching()) {
       return loader.load();
     }
 
     String cacheKey = key + "|" + location;
+    sweepIfDue(config);
     CachedFile hit = lookup(cacheKey);
     if (hit != null) {
       return hit;
@@ -379,6 +519,12 @@ final class ExecutorIndexCache {
         hit = lookup(cacheKey);
         if (hit != null) {
           return hit;
+        }
+
+        boolean askedTwice = config.mode() == Mode.PIN_HOT && askedBefore(cacheKey);
+        if (config.mode() == Mode.PIN_HOT && !askedTwice) {
+          // a scan should not displace what repeats: load it, but wait for a second ask
+          return loader.load();
         }
 
         long start = System.nanoTime();
@@ -395,12 +541,13 @@ final class ExecutorIndexCache {
           return loaded;
         }
 
-        put(cacheKey, loaded, config.maxBytes());
+        put(cacheKey, loaded, config, askedTwice);
         LOG.debug(
-            "Cached {} in {} ms ({} bytes)",
+            "Cached {} in {} ms ({} bytes, mode {})",
             location,
             java.util.concurrent.TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - start),
-            loaded.bytes());
+            loaded.bytes(),
+            config.mode());
         return loaded;
       } finally {
         loading.remove(cacheKey, monitor);
@@ -408,46 +555,161 @@ final class ExecutorIndexCache {
     }
   }
 
+  private boolean askedBefore(String cacheKey) {
+    synchronized (mapLock) {
+      int times = asked.merge(cacheKey, 1, Integer::sum);
+      return times > 1;
+    }
+  }
+
   private CachedFile lookup(String cacheKey) {
     synchronized (mapLock) {
-      CachedFile file = files.get(cacheKey);
+      CachedFile file = protectedFiles.get(cacheKey);
+      if (file == null) {
+        file = probation.get(cacheKey);
+      }
+
       if (file == null) {
         misses.incrementAndGet();
         return null;
       }
 
       hits.incrementAndGet();
+      file.touch();
+      if (file.uses >= 1 && !file.pinned) {
+        // a file asked for twice is what a repeated query looks like, so it outranks one seen once
+        probation.remove(cacheKey);
+        file.protectedRank = true;
+        protectedFiles.put(cacheKey, file);
+      }
+
       return file;
     }
   }
 
-  private void put(String cacheKey, CachedFile file, long maxBytes) {
+  private void put(String cacheKey, CachedFile file, Config config, boolean askedTwice) {
     synchronized (mapLock) {
-      CachedFile previous = files.put(cacheKey, file);
+      CachedFile previous = protectedFiles.remove(cacheKey);
+      if (previous == null) {
+        previous = probation.remove(cacheKey);
+      }
+
       if (previous != null) {
         bytes -= previous.bytes();
       }
-      bytes += file.bytes();
 
-      Iterator<Map.Entry<String, CachedFile>> oldest = files.entrySet().iterator();
-      while (bytes > maxBytes && oldest.hasNext()) {
-        Map.Entry<String, CachedFile> evicted = oldest.next();
-        bytes -= evicted.getValue().bytes();
-        oldest.remove();
-        if (evictions.incrementAndGet() == 1 && hits.get() == 0) {
-          // evicting before anything has been reused means the budget is smaller than what the
-          // queries are working through, and every query will pay for the same reads again
-          LOG.warn(
-              "The index cache evicted an entry before it served a single hit: budget {} bytes, "
-                  + "{} entries of {} bytes. The budget is likely below the working set, so raise "
-                  + "{}, unset it to derive one, or turn the cache off.",
-              maxBytes,
-              files.size(),
-              bytes,
-              CONFIG_BYTES_KEY);
+      file.pinned = config.mode() == Mode.PIN_ALL;
+      // an admitted PIN_HOT entry starts on probation: being asked twice earns it a place, being
+      // asked again is what earns it protection
+      if (file.pinned) {
+        protectedFiles.put(cacheKey, file);
+      } else {
+        probation.put(cacheKey, file);
+      }
+
+      bytes += file.bytes();
+      evict(config.maxBytes());
+
+      if (bytes > config.maxBytes()) {
+        // everything left is either pinned or being searched, so this file is not kept at all
+        // rather than being added to a budget that is already over
+        if (protectedFiles.remove(cacheKey) != null || probation.remove(cacheKey) != null) {
+          bytes -= file.bytes();
         }
       }
     }
+  }
+
+  /**
+   * Makes room, evicting the least recently used file that is neither protected nor in use.
+   *
+   * <p>A PIN_ALL entry is not evicted to make room: the mode exists because the working set fits,
+   * so evicting one would mean the fit was wrong, and the caller learns that from a budget warning
+   * rather than from a cache that quietly does nothing.
+   */
+  private void evict(long maxBytes) {
+    boolean warned = false;
+    while (bytes > maxBytes) {
+      Map.Entry<String, CachedFile> victim = oldestEvictable(probation, false);
+      if (victim == null) {
+        victim = oldestEvictable(protectedFiles, true);
+      }
+
+      if (victim == null) {
+        // everything resident is protected or being searched; the new file is not kept
+        return;
+      }
+
+      bytes -= victim.getValue().bytes();
+      if (protectedFiles.remove(victim.getKey()) == null) {
+        probation.remove(victim.getKey());
+      }
+
+      if (evictions.incrementAndGet() == 1 && hits.get() == 0 && !warned) {
+        warned = true;
+        LOG.warn(
+            "The index cache evicted an entry before it served a single hit: budget {} bytes. "
+                + "The budget is likely below the working set, so raise {}, unset it to derive "
+                + "one, or turn the cache off.",
+            maxBytes,
+            Config.BYTES);
+      }
+    }
+  }
+
+  private Map.Entry<String, CachedFile> oldestEvictable(
+      Map<String, CachedFile> segment, boolean skipPinned) {
+    for (Map.Entry<String, CachedFile> entry : segment.entrySet()) {
+      CachedFile file = entry.getValue();
+      if (skipPinned && file.pinned) {
+        continue;
+      }
+
+      if (!file.inUse()) {
+        return entry;
+      }
+    }
+
+    return null;
+  }
+
+  /** Unloads entries that no query has asked for within the idle window. */
+  private void sweepIfDue(Config config) {
+    long now = System.nanoTime();
+    long ttlNanos =
+        config.idleTtlMillis() > 0
+            ? java.util.concurrent.TimeUnit.MILLISECONDS.toNanos(config.idleTtlMillis())
+            : java.util.concurrent.TimeUnit.MINUTES.toNanos(30);
+    if (ttlNanos <= 0 || now - lastSweepNanos < sweepIntervalNanos) {
+      return;
+    }
+
+    lastSweepNanos = now;
+    synchronized (mapLock) {
+      int unloaded =
+          evictIdle(probation, now - ttlNanos) + evictIdle(protectedFiles, now - ttlNanos);
+      if (unloaded > 0) {
+        LOG.debug("Unloaded {} idle index cache entries ({} bytes left)", unloaded, bytes);
+      }
+    }
+  }
+
+  private int evictIdle(Map<String, CachedFile> segment, long deadlineNanos) {
+    int unloaded = 0;
+    Iterator<Map.Entry<String, CachedFile>> entries = segment.entrySet().iterator();
+    while (entries.hasNext()) {
+      Map.Entry<String, CachedFile> entry = entries.next();
+      CachedFile file = entry.getValue();
+      if (file.lastAccessNanos > deadlineNanos || file.inUse()) {
+        continue;
+      }
+
+      bytes -= file.bytes();
+      entries.remove();
+      unloaded += 1;
+    }
+
+    return unloaded;
   }
 
   Stats stats() {
@@ -459,20 +721,50 @@ final class ExecutorIndexCache {
           evictions.get(),
           skippedTooLarge.get(),
           bytes,
-          files.size());
+          probation.size() + protectedFiles.size());
     }
+  }
+
+  /** The identities of the files this executor can serve, for the driver's location table. */
+  long[] keys() {
+    synchronized (mapLock) {
+      List<String> keys = new ArrayList<>(probation.size() + protectedFiles.size());
+      keys.addAll(probation.keySet());
+      keys.addAll(protectedFiles.keySet());
+      return IndexCacheLocations.sortedHashes(keys);
+    }
+  }
+
+  /** The report this executor sends back at the end of a task. */
+  IndexCacheLocations.Report report(String executorId, String host) {
+    Stats stats = stats();
+    return new IndexCacheLocations.Report(
+        executorId,
+        host,
+        EPOCH,
+        System.nanoTime(),
+        keys(),
+        stats.hits(),
+        stats.misses(),
+        stats.loads(),
+        stats.evictions(),
+        stats.bytes(),
+        stats.entries());
   }
 
   /** Forgets every entry and every counter, so a test starts from a known executor. */
   void clear() {
     synchronized (mapLock) {
-      files.clear();
+      probation.clear();
+      protectedFiles.clear();
+      asked.clear();
       bytes = 0;
       hits.set(0);
       misses.set(0);
       loads.set(0);
       evictions.set(0);
       skippedTooLarge.set(0);
+      lastSweepNanos = System.nanoTime();
     }
   }
 
@@ -494,5 +786,13 @@ final class ExecutorIndexCache {
 
   static CachedFile loaded(byte[] payload, IndexAdapter.PreparedSearch prepared, long bytes) {
     return new CachedFile(payload, prepared, bytes);
+  }
+
+  Set<String> residentKeys() {
+    synchronized (mapLock) {
+      Set<String> keys = new java.util.LinkedHashSet<>(probation.keySet());
+      keys.addAll(protectedFiles.keySet());
+      return keys;
+    }
   }
 }

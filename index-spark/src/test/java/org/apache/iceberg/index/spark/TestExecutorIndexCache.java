@@ -41,6 +41,7 @@ class TestExecutorIndexCache {
   @AfterEach
   void clearCache() {
     cache.clear();
+    ExecutorIndexCache.sweepIntervalForTests(java.util.concurrent.TimeUnit.SECONDS.toNanos(30));
   }
 
   @Test
@@ -76,12 +77,14 @@ class TestExecutorIndexCache {
   @Test
   void evictsLeastRecentlyUsedWhenOverBudget() {
     AtomicInteger loads = new AtomicInteger();
-    ExecutorIndexCache.Config enabled = config(250, 250);
+    ExecutorIndexCache.Config enabled = mode(ExecutorIndexCache.Mode.PIN_HOT, 250, 250);
 
     cache.file("s3://bucket/a.puffin", enabled, "adapter", () -> load(loads, 100));
     cache.file("s3://bucket/b.puffin", enabled, "adapter", () -> load(loads, 100));
-    // whichever of a and b is the least recently used is evicted to make room for c
+    // each is asked twice, so both are admitted; c then needs room
     cache.file("s3://bucket/a.puffin", enabled, "adapter", () -> load(loads, 100));
+    cache.file("s3://bucket/b.puffin", enabled, "adapter", () -> load(loads, 100));
+    cache.file("s3://bucket/c.puffin", enabled, "adapter", () -> load(loads, 100));
     cache.file("s3://bucket/c.puffin", enabled, "adapter", () -> load(loads, 100));
 
     assertThat(cache.stats().evictions()).isEqualTo(1);
@@ -100,6 +103,82 @@ class TestExecutorIndexCache {
     assertThat(loads).hasValue(2);
     assertThat(cache.stats().skippedTooLarge()).isEqualTo(2);
     assertThat(cache.stats().entries()).isZero();
+  }
+
+  @Test
+  void pinHotAdmitsAFileOnlyOnceItIsAskedForTwice() {
+    AtomicInteger loads = new AtomicInteger();
+    ExecutorIndexCache.Config pinHot = mode(ExecutorIndexCache.Mode.PIN_HOT, 1 << 20, 1 << 20);
+
+    cache.file("s3://bucket/a.puffin", pinHot, "adapter", () -> load(loads, 10));
+    assertThat(cache.stats().entries()).isZero();
+
+    cache.file("s3://bucket/a.puffin", pinHot, "adapter", () -> load(loads, 10));
+    assertThat(cache.stats().entries()).isEqualTo(1);
+
+    cache.file("s3://bucket/a.puffin", pinHot, "adapter", () -> load(loads, 10));
+    assertThat(cache.stats().hits()).isEqualTo(1);
+  }
+
+  @Test
+  void streamModeKeepsNothing() {
+    AtomicInteger loads = new AtomicInteger();
+    ExecutorIndexCache.Config stream = mode(ExecutorIndexCache.Mode.STREAM, 1 << 20, 1 << 20);
+
+    for (int i = 0; i < 3; i++) {
+      cache.file("s3://bucket/a.puffin", stream, "adapter", () -> load(loads, 10));
+    }
+
+    assertThat(loads).hasValue(3);
+    assertThat(cache.stats().entries()).isZero();
+  }
+
+  @Test
+  void aFileAskedForTwiceOutranksOneSeenOnce() {
+    AtomicInteger loads = new AtomicInteger();
+    ExecutorIndexCache.Config pinHot = mode(ExecutorIndexCache.Mode.PIN_HOT, 250, 250);
+
+    // a is admitted after its second ask and promoted on its third, so when c needs room the entry
+    // seen once is the one that goes
+    cache.file("s3://bucket/a.puffin", pinHot, "adapter", () -> load(loads, 100));
+    cache.file("s3://bucket/a.puffin", pinHot, "adapter", () -> load(loads, 100));
+    cache.file("s3://bucket/a.puffin", pinHot, "adapter", () -> load(loads, 100));
+    cache.file("s3://bucket/b.puffin", pinHot, "adapter", () -> load(loads, 100));
+    cache.file("s3://bucket/b.puffin", pinHot, "adapter", () -> load(loads, 100));
+    cache.file("s3://bucket/c.puffin", pinHot, "adapter", () -> load(loads, 100));
+    cache.file("s3://bucket/c.puffin", pinHot, "adapter", () -> load(loads, 100));
+    cache.file("s3://bucket/c.puffin", pinHot, "adapter", () -> load(loads, 100));
+
+    assertThat(ExecutorIndexCache.get().residentKeys()).anyMatch(key -> key.endsWith("a.puffin"));
+  }
+
+  @Test
+  void pinAllDoesNotEvictToMakeRoom() {
+    AtomicInteger loads = new AtomicInteger();
+    ExecutorIndexCache.Config pinAll = mode(ExecutorIndexCache.Mode.PIN_ALL, 250, 250);
+
+    cache.file("s3://bucket/a.puffin", pinAll, "adapter", () -> load(loads, 100));
+    cache.file("s3://bucket/b.puffin", pinAll, "adapter", () -> load(loads, 100));
+    // the budget cannot hold a third file, and a pin-all entry is not evicted for one
+    cache.file("s3://bucket/c.puffin", pinAll, "adapter", () -> load(loads, 100));
+
+    assertThat(ExecutorIndexCache.get().residentKeys()).noneMatch(key -> key.endsWith("c.puffin"));
+  }
+
+  @Test
+  void unloadsEntriesThatNoQueryAskedFor() throws Exception {
+    AtomicInteger loads = new AtomicInteger();
+    ExecutorIndexCache.Config ttl =
+        ExecutorIndexCache.Config.of(true, 1 << 20, 1 << 20, ExecutorIndexCache.Mode.PIN_ALL, 1);
+    ExecutorIndexCache.sweepIntervalForTests(0);
+
+    cache.file("s3://bucket/a.puffin", ttl, "adapter", () -> load(loads, 10));
+    assertThat(cache.stats().entries()).isEqualTo(1);
+
+    Thread.sleep(30);
+    cache.file("s3://bucket/b.puffin", ttl, "adapter", () -> load(loads, 10));
+
+    assertThat(ExecutorIndexCache.get().residentKeys()).noneMatch(key -> key.endsWith("a.puffin"));
   }
 
   @Test
@@ -214,6 +293,11 @@ class TestExecutorIndexCache {
 
   private static ExecutorIndexCache.Config config(long maxBytes, long maxEntryBytes) {
     return ExecutorIndexCache.Config.of(true, maxBytes, maxEntryBytes);
+  }
+
+  private static ExecutorIndexCache.Config mode(
+      ExecutorIndexCache.Mode mode, long maxBytes, long maxEntryBytes) {
+    return ExecutorIndexCache.Config.of(true, maxBytes, maxEntryBytes, mode, 0);
   }
 
   private static ExecutorIndexCache.CachedFile load(AtomicInteger loads, int bytes) {

@@ -155,9 +155,13 @@ public final class DistributedIndexSearch {
         context.broadcast(
             ExecutorIndexCache.Config.from(spark, workingSetBytes(table.io(), files)));
     String cacheKey = cacheKey(adapter);
+    List<String> cacheKeys = cacheKeys(cacheKey, locations);
+    // what each executor holds, so a task can be sent to one that already has its file
+    IndexCacheLocations locationsTable = IndexCacheLocations.forContext(context.sc());
+    boolean locality = localityEnabled(spark);
     // captured by the task directly: an accumulator only reports through the copy it was created
     // from, so a broadcast copy of it would update nothing
-    org.apache.spark.util.CollectionAccumulator<String> cacheReports =
+    org.apache.spark.util.CollectionAccumulator<IndexCacheLocations.Report> cacheReports =
         cacheReports(context, cacheRef.getValue());
 
     // the limit is captured as a primitive: the query itself is not serializable. One more than the
@@ -170,8 +174,7 @@ public final class DistributedIndexSearch {
     // a posting list of its own, so it is read whole and searched as a whole, and the number of
     // partitions is the number of index files rather than whatever a byte budget would make of them
     List<Tuple3<String, Long, Double>> top =
-        context
-            .parallelize(locations, locations.size())
+        IndexFileRdds.javaRdd(context.sc(), locations, cacheKeys, locationsTable, locality)
             .mapPartitions(
                 (FlatMapFunction<Iterator<String>, Tuple3<String, Long, Double>>)
                     locations1 -> {
@@ -213,7 +216,7 @@ public final class DistributedIndexSearch {
                       return fileHits.iterator();
                     })
             .takeOrdered(localTopK, hitOrder(adapter));
-    printCacheReports(cacheReports);
+    mergeCacheReports(cacheReports, locationsTable, cacheKeys, cacheRef.getValue());
 
     List<IndexSearchResult> hits = Lists.newArrayListWithCapacity(top.size());
     for (Tuple3<String, Long, Double> hit : top) {
@@ -289,9 +292,12 @@ public final class DistributedIndexSearch {
         context.broadcast(
             ExecutorIndexCache.Config.from(spark, workingSetBytes(table.io(), files)));
     String cacheKey = cacheKey(adapter);
+    List<String> cacheKeys = cacheKeys(cacheKey, locations);
+    IndexCacheLocations locationsTable = IndexCacheLocations.forContext(context.sc());
+    boolean locality = localityEnabled(spark);
     // captured by the task directly: an accumulator only reports through the copy it was created
     // from, so a broadcast copy of it would update nothing
-    org.apache.spark.util.CollectionAccumulator<String> cacheReports =
+    org.apache.spark.util.CollectionAccumulator<IndexCacheLocations.Report> cacheReports =
         cacheReports(context, cacheRef.getValue());
 
     // one more than the widest query asks for is kept per query, because that is what says whether
@@ -299,8 +305,7 @@ public final class DistributedIndexSearch {
     int localTopK = widestTopK + 1;
 
     JavaPairRDD<Integer, Tuple3<String, Long, Double>> fileHits =
-        context
-            .parallelize(locations, locations.size())
+        IndexFileRdds.javaRdd(context.sc(), locations, cacheKeys, locationsTable, locality)
             .mapPartitionsToPair(
                 (PairFlatMapFunction<Iterator<String>, Integer, Tuple3<String, Long, Double>>)
                     locations1 -> {
@@ -380,7 +385,7 @@ public final class DistributedIndexSearch {
         fileHits
             .aggregateByKey(Lists.<Tuple3<String, Long, Double>>newArrayList(), mergeHit, mergeHits)
             .collectAsMap();
-    printCacheReports(cacheReports);
+    mergeCacheReports(cacheReports, locationsTable, cacheKeys, cacheRef.getValue());
 
     for (int queryId = 0; queryId < queries.size(); queryId++) {
       List<Tuple3<String, Long, Double>> top =
@@ -451,45 +456,69 @@ public final class DistributedIndexSearch {
    * executor's own output is in a pod log that a run may not keep, and its logger is often above
    * the level a counter line is written at.
    */
-  private static org.apache.spark.util.CollectionAccumulator<String> cacheReports(
-      JavaSparkContext context, ExecutorIndexCache.Config config) {
+  private static org.apache.spark.util.CollectionAccumulator<IndexCacheLocations.Report>
+      cacheReports(JavaSparkContext context, ExecutorIndexCache.Config config) {
     // reported whenever the cache is on: a run that turned it on is a run that wants to know
     // whether it did anything
     return config.enabled() ? context.sc().collectionAccumulator() : null;
   }
 
-  static void reportCache(org.apache.spark.util.CollectionAccumulator<String> reports) {
-    if (reports != null) {
-      String executor;
-      try {
-        executor =
-            org.apache.spark.SparkEnv.get() != null
-                ? org.apache.spark.SparkEnv.get().executorId()
-                : "driver";
-      } catch (RuntimeException e) {
-        executor = "unknown";
-      }
-
-      reports.add(executor + ": " + ExecutorIndexCache.get().stats());
-    }
-  }
-
-  /** Prints the last report of each executor, once the action that produced them has finished. */
-  private static void printCacheReports(
-      org.apache.spark.util.CollectionAccumulator<String> reports) {
+  /** Sends this executor's view of its cache back, so the driver's location table stays current. */
+  static void reportCache(
+      org.apache.spark.util.CollectionAccumulator<IndexCacheLocations.Report> reports) {
     if (reports == null) {
       return;
     }
 
-    Map<String, String> lastByExecutor = new java.util.LinkedHashMap<>();
-    for (String report : reports.value()) {
-      int colon = report.indexOf(':');
-      lastByExecutor.put(colon < 0 ? report : report.substring(0, colon), report);
+    String executor = "unknown";
+    String host = "unknown";
+    try {
+      if (org.apache.spark.SparkEnv.get() != null) {
+        executor = org.apache.spark.SparkEnv.get().executorId();
+        host = org.apache.spark.SparkEnv.get().blockManager().blockManagerId().host();
+      }
+    } catch (RuntimeException e) {
+      // a host name is only used to place a task, so an unknown one falls back to no hint
+      host = "unknown";
     }
 
-    for (String report : lastByExecutor.values()) {
-      System.out.println("CACHE " + report);
+    reports.add(ExecutorIndexCache.get().report(executor, host));
+  }
+
+  /** Folds the executors' reports into the location table and says what the query had cached. */
+  private static void mergeCacheReports(
+      org.apache.spark.util.CollectionAccumulator<IndexCacheLocations.Report> reports,
+      IndexCacheLocations table,
+      List<String> cacheKeys,
+      ExecutorIndexCache.Config config) {
+    if (reports == null) {
+      return;
     }
+
+    table.mergeAll(reports.value());
+    table.prune();
+    IndexCacheLocations.Summary summary = table.summary(cacheKeys);
+    LOG.info("index cache mode={} this query: {}", config.mode(), summary);
+
+    if (summary.coverage() < 1.0 && config.mode() == ExecutorIndexCache.Mode.PIN_ALL) {
+      LOG.info(
+          "index cache holds {} of the {} files this query read; the rest will be read again",
+          Math.round(summary.coverage() * cacheKeys.size()),
+          cacheKeys.size());
+    }
+  }
+
+  private static List<String> cacheKeys(String adapterKey, List<String> locations) {
+    List<String> keys = Lists.newArrayListWithCapacity(locations.size());
+    for (String location : locations) {
+      keys.add(adapterKey + "|" + location);
+    }
+
+    return keys;
+  }
+
+  private static boolean localityEnabled(SparkSession spark) {
+    return Boolean.parseBoolean(spark.conf().get("spark.iceberg.index.schedule.locality", "true"));
   }
 
   /**
