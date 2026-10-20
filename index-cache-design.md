@@ -242,3 +242,40 @@ prepared.search(query, topK);   // ← 内部串行化，见 §5
 一次干净的运行：缓存开启 → 冷/热各一次 → 读 driver 日志里的 `CACHE executor-*: hits=…`。
 - 若 hits=0 → 修键/配置（工程问题，半小时内可定位）；
 - 若 hits>0 而耗时不变 → 那 ~1 秒不是 prepare，去查 `readPayload`（整文件读取）与 Lance native open。
+
+---
+
+## 14. 集群验证（终）：靠得住的结果 —— P50 4.6x，但预算必须装得下工作集
+
+### 之前四轮为什么是空的
+
+两个原因叠加，都已定位：
+
+1. **类加载**：k8s cluster 模式下 `spark.driver.extraClassPath` 被吞、`--files` 不参与 driver 类加载，
+   driver 一直用镜像自带的 `/opt/spark/jars/iceberg-index-spark-*.jar`（没有缓存类）。
+   修法：`--jars` 提供整套 iceberg jar + `spark.driver/executor.userClassPathFirst=true`
+   （注意必须**整套**替换，只换部分会 `NoSuchMethodError` / `IncompatibleClassChangeError`）。
+   验证手段：打印 `Class.getProtectionDomain().getCodeSource().getLocation()`。
+2. **预算**：默认 512MB 装不下工作集。
+
+### 结果（10M，38 个索引文件，每个 ~120MB，3 executors × 2 cores）
+
+| 配置 | 冷 | 热 | 10 条查询流 |
+|---|---|---|---|
+| 缓存 512MB（默认） | — | — | **命中率 0**：`hits=0 misses=26 loads=13 evictions=9 entries=4 bytes=512MB`（纯抖动） |
+| 缓存 3GB | 5216 ms | 3672 / 3626 ms（1.42x） | **min 751 / P50 1529 / P95 5328 / mean 1870 ms** |
+| 无缓存（同轮基线） | 5902–7039 ms | — | P50 7039 ms |
+
+缓存 3GB 时 executor 上 `hits=137 misses=130 loads=65 evictions=40 entries=25 bytes≈3.1GB`。
+
+**结论：P50 从 7039 → 1529 ms（≈4.6x），min 751 ms（≈9x）**，与 #708 卡片预期的
+"4.4s → <0.5s" 量级一致。收益随查询流稳定（P50 明显低于冷启动）。
+
+### 必须写进产品设计的教训
+
+1. **预算必须按工作集定**：`38 × 120MB ≈ 4.5GB`。预算不足时不是"收益变小"，而是**命中率归零**——
+   每次查询把刚加载的条目淘汰掉，比不开缓存还费（多了加载 + 淘汰开销）。
+   → 建议：`enabled` 打开时若 `bytes < 估计工作集`，要么自动放大，要么明确报错，不要静默抖动。
+2. **默认 512MB 对 10M 规模的向量索引是错的**；建议默认按 `min(25% executor 堆, 索引大小)` 推导。
+3. **注入类路径是集群实验的前置条件**：必须整套 iceberg jar + `userClassPathFirst`，
+   并用 code-source 打印确认。
