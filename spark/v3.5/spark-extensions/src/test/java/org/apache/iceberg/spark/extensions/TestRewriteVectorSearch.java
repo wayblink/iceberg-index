@@ -153,6 +153,52 @@ class TestRewriteVectorSearch {
   }
 
   @Test
+  public void overSamplingKeepsTheNearestCandidatesRatherThanTheFarthest() {
+    // an approximate index is asked for more candidates than the query wants, and the re-scoring
+    // that follows has to keep the nearest of them: keeping the farthest answers with rows that are
+    // nowhere near the query, which is invisible on a table small enough to be one candidate set
+    String table = "db.docs_oversample_order";
+    spark.sql(String.format("CREATE TABLE local.%s %s", table, COLUMNS));
+    StringBuilder values = new StringBuilder();
+    for (int id = 0; id < 400; id++) {
+      values
+          .append(id == 0 ? "" : ", ")
+          .append("(")
+          .append(id)
+          .append(", 'row")
+          .append(id)
+          .append("', array(")
+          .append(id + 1)
+          .append(".0d, 0.0d))");
+    }
+    spark.sql(String.format("INSERT INTO local.%s VALUES %s", table, values));
+    spark.sql(
+        String.format(
+            "CALL local.system.build_vector_index("
+                + "table => '%s', column => 'embedding', dimension => 2, metric => 'euclidean', "
+                + "structure => 'IVF', "
+                + "options => map('nlist', '4', 'nprobe', '4'))",
+            table));
+
+    String query =
+        String.format(
+            "SELECT id FROM local.%s ORDER BY vec_distance(embedding, array(1.1d, 0.0d)) LIMIT 10",
+            table);
+
+    try {
+      spark.conf().set("spark.iceberg.index.vector.over-sample", "10");
+      List<Row> hits = spark.sql(query).collectAsList();
+      // the vectors are 1.0, 2.0, ... 400.0 on a line and the query is 1.1, so the ten nearest
+      // are rows 0 to 9
+      assertThat(hits.stream().map(row -> row.getLong(0)))
+          .as("the ten rows closest to the query")
+          .containsExactly(0L, 1L, 2L, 3L, 4L, 5L, 6L, 7L, 8L, 9L);
+    } finally {
+      spark.conf().unset("spark.iceberg.index.vector.over-sample");
+    }
+  }
+
+  @Test
   public void leavesAnExactIndexAloneAndScans() {
     // an exact index repacks the vector column with a row reference and is searched by walking
     // every entry, which is the work a scan does over a payload larger than the column itself

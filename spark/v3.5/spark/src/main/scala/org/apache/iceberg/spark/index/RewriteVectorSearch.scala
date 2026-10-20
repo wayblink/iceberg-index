@@ -270,7 +270,9 @@ case class RewriteVectorSearch(spark: SparkSession) extends Rule[LogicalPlan] {
    * The rows of the index hits that still exist in the table snapshot being read.
    *
    * <p>The index is asked for more hits when delete files removed some of them, because the limit
-   * has to be met with live rows: a removed row leaves a hole the next hit fills.
+   * has to be met with live rows: a removed row leaves a hole the next hit fills. The hits arrive
+   * in the adapter's own order, which is the order a kernel is searched in, so the best of them is
+   * the first one whatever the metric measures.
    */
   private def liveHitRows(
       reader: IndexReader,
@@ -309,11 +311,12 @@ case class RewriteVectorSearch(spark: SparkSession) extends Rule[LogicalPlan] {
       val searched = outcome.hits().asScala.toList
       exhausted = !outcome.moreHits()
 
-      // hits of data files the table no longer has cannot be resolved, so they are dropped here
+      // hits of data files the table no longer has cannot be resolved, so they are dropped here,
+      // and the order of the adapter is kept: the direction of that order is a function of the
+      // metric, a distance putting the smallest score first and a similarity the largest, so
+      // re-sorting by "best score" would keep the farthest candidates of a distance
       val hits =
-        searched
-          .filter(hit => dataFiles.contains(hit.dataFile))
-          .sortWith((left, right) => left.score() > right.score())
+        searched.filter(hit => dataFiles.contains(hit.dataFile))
       val positionsByFile = hits
         .groupBy(hit => hit.dataFile())
         .map { case (dataFile, fileHits) =>
