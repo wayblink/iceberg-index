@@ -488,3 +488,37 @@ final class IndexFileRDD extends RDD<String> {
 **重建记录**（集群 A，`sparkann.sift10m_lance_zstd`）：
 - 先按 `structure => 'FLAT'`（参数缺省）重建了一次，132 s 完成 —— 说明**重建时务必显式给 `structure`**，否则默认 FLAT（精确全扫），与原先的 HNSW 语义不同；
 - 随后按 `structure => 'HNSW', max_m => 16, ef_construction => 200, ef_search => 50, max_entries_per_index_file => 262144` 重建。
+
+---
+
+## 21. P5 重跑（HNSW 索引重建后，2026-10-20 夜）：最终数字
+
+前置：旧的 payload 无法被当前 build 读取（见 §20），因此先 `drop_vector_index` + `build_vector_index`
+重建 `sparkann.sift10m_lance_zstd`（**structure=HNSW**, m=16, ef-construction=200, ef-search=50,
+max_entries_per_index_file=262144；构建耗时 **1772 s**，38 文件 / 10M 条目）。
+
+| 场景（3 executor × 2 core，缓存 6g/executor） | 耗时 |
+|---|---|
+| 无缓存（`SEGMENT OFF`） | min 17935 / **p50 19623 ms** |
+| 冷（COLD，首次） | 16984 ms |
+| 热（WARM / WARM2） | **695 / 1251 ms**（≈24x） |
+| 10 条流（hint 开） | min 51 / **p50 74** / p95 227 ms |
+| **300 条流（流中杀掉一个 executor）** | min 32 / **p50 41** / p95 73 / max 9436（恢复波峰） |
+| 结果一致性（流前 vs 流后） | **`CONSISTENT true rows=10`** |
+
+### hint 的对照（同预算 6g）
+
+| | 常驻字节（合计） | executor 数 | 结果 |
+|---|---|---|---|
+| hint 开 | **4.72 GB** | 3 | p50 41–74 ms，无 OOM |
+| hint 关 | **29.6 GB** | 6→9（动态扩容） | 每个 executor 缓存全部 38 个文件 → **executor 因 JVM OOM 被杀（exit 52）** |
+
+hint 关的一轮里集群还动态扩容到 9 个 executor，没有位置约束时"每个 executor 都缓存全部文件"会让内存
+随 executor 数线性膨胀（38 × 9 份），最终 OOM。这是位置感知调度最有力的证据。
+
+### 结论
+
+1. 缓存把单查询索引腿从 **~20 s 降到 ~0.7 s（冷后首查）/ ~40–70 ms（稳态）**，与 #708 的预期一致；
+2. **位置调度是必需品**：没有它，扩容会把缓存变成 OOM 源；
+3. **正确性**：流中杀掉 executor 后，结果与流前逐行一致（`CONSISTENT true`），位置表自愈；
+4. payload 格式变更后必须重建索引，错误信息现在会明确说明这一点（§20）。
