@@ -218,3 +218,24 @@ B2b 路线（Lance 作 Iceberg data file 格式）
 ### 10.5 给下一位的提醒
 
 本节的三个问题（10.1 的属性未生效、10.2/10.3 的可信数据、10.4 的未解）都指向同一条：**先证明你的开关/埋点在集群上真的生效，再解释数字**。今天两次落入同一坑（driver JVM 参数、executor 日志）。
+
+### 10.6 ❌ 集群上所有"缓存 A/B"测量无效：driver 加载的是镜像自带的旧 jar
+
+用一行探针打印了实际加载的类来自哪里：
+
+```
+CLASS_DistributedIndexSearch  file:/opt/spark/jars/iceberg-index-spark-1.12.0-SNAPSHOT.jar
+ClassNotFoundException: org.apache.iceberg.index.spark.ExecutorIndexCache
+```
+
+driver 用的是**镜像内置的 jar**，不是 HDFS `patched/` 里的新 jar；新类在那个类加载器里根本不存在。
+因此四轮"COLD 7821 / WARM 7589 / WARM2 7653 ms、100 条流 P50 7107"**全部测的是旧代码**，
+"缓存没有收益"这个结论**不成立**——缓存从未参与。
+
+机制：k8s cluster 模式下 `--files` + `spark.driver.extraClassPath` 不足以让 driver 加载新 jar
+（executor 的 `SPARK_CLASSPATH` 里我们的 jar 在前，driver 不是）。可靠的注入方式只有：
+把 jar 放进镜像的 `/opt/spark/jars/`（需能重建镜像），或用 `spark.kubernetes.driver.*` 卷挂载覆盖。
+
+**教训（今天第三次同类）**：任何"新代码在集群上是否生效"的问题，用
+`X.class.getProtectionDomain().getCodeSource().getLocation()` 打印一次即可定性；
+不打印就下结论，等于在测旧代码。
