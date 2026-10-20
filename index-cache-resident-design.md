@@ -382,3 +382,24 @@ final class IndexFileRDD extends RDD<String> {
 2. **PIN_HOT 的热度从哪来**：只来自本应用历史，还是落盘持久化（跨应用）？建议先只在本应用内，跨应用预热留待"常驻服务"方案。
 3. **是否复制热文件**：预算允许时复制最热的 1–2 个文件到第二个 executor，能抗热点倾斜，但增加一致性成本（两份独立 LRU）。建议 P5 之后评估。
 4. **`estimatedBytes` 的真实上报**：kernel 目前默认回退 payload×2，需要 kernel 实现者补真实值（RaBitQ/IVF 的空间占用差异很大）。
+
+---
+
+## 17. 实现记录：P0 容量自适配（commit 40dbbb468）
+
+**做了什么**
+
+1. 预算改成**按查询推导**（`Config.derive`）：
+   ```
+   perExecutor = ⌈workingSet / executors⌉
+   auto        = min(⌊executor 堆 × heapFraction⌋, max(512MB, perExecutor × 1.2))
+   ```
+   - 显式配置了 `spark.iceberg.index.cache.bytes` 就照用，但若低于 `perExecutor × 0.9` → **打警告**（说明必然抖动）；
+   - `maxEntryBytes` 超过预算时自动跟预算一起下调（否则单文件限额比总预算还大会自相矛盾）。
+2. **工作集大小**由 driver 在 plan 阶段算出：对每个 `IndexFile` 取 `InputFile.getLength()`，按 location 记忆（索引文件不可变），失败时退回 0（预算用默认，不影响查询）。
+3. **抖动告警**：executor 侧在"第一次淘汰发生时 hits 仍为 0"打印警告，明确指出预算/条目数/字节数，以及该调 `bytes` 还是关掉缓存。
+4. 单测 `TestIndexCacheBudget`（5 个）：覆盖"按 per-executor 分额推导""堆比例上限""显式配置优先""工作集未知时用下限""永远不超过堆比例"。
+
+**测试**：`TestIndexCacheBudget` 5/5、`TestExecutorIndexCache` 7/7、`TestVectorIndexSearchBatch` 20/20。
+
+**过程中修掉的自伤 bug**：`derive(configured, parseBytes(configured, ...))` 在未配置时会 NPE（Java 参数 eager 求值），已改为先判空再解析——集成测试立刻暴露了它。
