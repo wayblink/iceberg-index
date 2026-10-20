@@ -434,3 +434,37 @@ final class IndexFileRDD extends RDD<String> {
 
 **测试**：`TestExecutorIndexCache` 12、`TestIndexCacheBudget` 5、`TestIndexCacheLocations` 6、
 `TestVectorIndexSearchBatch` 21、`TestIndexTableFunctions` 6、`TestRewriteVectorSearch` 13，全绿。
+
+---
+
+## 19. P5 集群实验结果（10M `sift10m_lance_zstd`，38 个索引文件，3 executor × 2 core）
+
+### A7 位置感知调度的价值（同预算 6g/executor、同查询）
+
+| 配置 | 缓存条目（合计） | 常驻字节（合计） | 流 P50 | P95 | min |
+|---|---|---|---|---|---|
+| **hint 开**（默认） | **38**（每文件一份） | **4.72 GB** | **57 ms** | 80 ms | 49 ms |
+| **hint 关** | 114（每文件 3 份） | 14.1 GB | 694 ms | 1593 ms | 50 ms |
+
+- **hint 把重复存储从 3× 降到 1×**：不开 hint 时每个 executor 都会缓存全部文件（14.1 GB），开了之后每个文件只有一份（4.72 GB）。
+- 同一个"全覆盖"状态（coverage 都 1.00），hint 的 P50 是 **57 ms 对 694 ms（12x）**——差别来自 JVM 常驻内存（1.6 GB vs 4.7 GB/executor）与 GC。
+- 相对无缓存基线（同轮 `SEGMENT OFF` p50 8812 ms、上轮 7039 ms）：**P50 57 ms ≈ 120–150x**。
+
+### 预算与覆盖率（P0 的实际效果）
+
+| 预算 | 每 executor 条目 | 覆盖率 | 现象 |
+|---|---|---|---|
+| 自动推导（≈1.8g） | 7 | 0.55 | PIN_ALL 拒绝为腾空间淘汰 → 17 个文件永远不被缓存，每查询固定 miss 17 次 |
+| **显式 6g** | ~13 | **1.00** | 每查询 hits +38、misses 冻结在 76（只有前两轮加载） |
+
+> 记账口径（`estimatedBytes` 缺省时按 payload×2）会让自动推导的预算偏小；这是 #1655 的已知后续项。
+
+### A8 故障注入（查询流进行中杀掉一个 executor）
+
+- 300 条查询流跑到第 2–3 条时 `kubectl delete pod --force` 杀掉了 `exec-1`；
+- 作业**正常完成**；流 `min 29 / P50 48 / P95 188 / max 33270 ms`（33 s 的尖峰正好是被杀那一轮的重新调度 + 新 executor 冷加载）；
+- `INDEX_CACHE` 报告位置表在之后恢复为 `executors=3 files=38 coverage=1.00`。
+
+### 遗留疑点（需要单独查）
+
+`VectorIndexSearch.search(...)` 在这个 Lance 表上返回 **0 行**（探针里 `CONSISTENT rows=0`），所以"结果一致性"这一项**并未真正验证**。本地测试覆盖的是 Parquet/Hadoop 表（`TestVectorIndexSearchBatch` 24 个全绿），Lance 表走 `IndexSearch.resolveRows` 的路径没有本地用例。已开卡跟踪。
