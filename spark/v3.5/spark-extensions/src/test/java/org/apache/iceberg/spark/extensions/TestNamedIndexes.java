@@ -144,6 +144,43 @@ public class TestNamedIndexes extends ExtensionsTestBase {
         .hasMessageContaining("name =>");
   }
 
+  @TestTemplate
+  public void aRewriteUsesTheIndexItsQueryNames() {
+    String table = tableName("named_rewrite_" + catalogName);
+    createIndexedTable(table);
+    sql(
+        "CALL %s.system.build_vector_index(table => '%s', column => 'embedding', dimension => 2, "
+            + "name => 'flat_bruteforce', structure => 'FLAT')",
+        catalogName, table);
+    sql(
+        "CALL %s.system.build_vector_index(table => '%s', column => 'embedding', dimension => 2, "
+            + "name => 'ivf', structure => 'IVF', options => map('nprobe', '4'))",
+        catalogName, table);
+
+    String query = "SELECT id FROM %s ORDER BY vec_distance(embedding, array(0.0d, 10.0d)) LIMIT 3";
+    try {
+      // the name decides which arm answers: the IVF index is rewritable, the exact one is not, so
+      // the plan says which one the rule resolved
+      spark.conf().set("spark.iceberg.index.vector.name", "ivf");
+      assertThat(planOf(query, table)).contains("LocalRelation");
+      assertThat(sql(query, table)).hasSize(3);
+
+      spark.conf().set("spark.iceberg.index.vector.name", "flat_bruteforce");
+      assertThat(planOf(query, table)).doesNotContain("LocalRelation");
+
+      // two indexes and no name is not a guess: the query scans, and still answers
+      spark.conf().unset("spark.iceberg.index.vector.name");
+      assertThat(planOf(query, table)).doesNotContain("LocalRelation");
+      assertThat(sql(query, table)).hasSize(3);
+    } finally {
+      spark.conf().unset("spark.iceberg.index.vector.name");
+    }
+  }
+
+  private String planOf(String query, String table) {
+    return spark.sql(String.format(query, table)).queryExecution().optimizedPlan().toString();
+  }
+
   private void createIndexedTable(String table) {
     sql("CREATE TABLE %s (id bigint, embedding array<double>) USING iceberg", table);
     sql(

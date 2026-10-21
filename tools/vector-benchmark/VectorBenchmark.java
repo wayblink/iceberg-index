@@ -16,7 +16,8 @@
  *
  *   BENCHMETA <json>      what was measured: tables, index definition, top k, settings
  *   BENCHSCAN <json>      one exact query: its latency and the rows it returned
- *   BENCHRESULT <json>    one indexed query: setting, latency, hits, and its recall against BENCHSCAN
+ *   BENCHRESULT <json>    one indexed query: index, setting, latency, hits, and its recall against
+ *                         BENCHSCAN
  *   BENCHSUMMARY <json>   closing marker, so a truncated run is recognizable
  *
  * The lines are also written to the output path the caller gives, one flush each. A run takes tens of
@@ -78,6 +79,11 @@ public class VectorBenchmark {
     int repeats = Integer.parseInt(args[8]);
     String outPath = args[9];
     String[] overSamples = args[10].split(",");
+    // several indexes may sit on one column, told apart by name; "-" means leave the column's
+    // default alone, which is what a table with a single index needs. An arm may be written
+    // `name#label` so a UUID, which is how an index built without a name is addressed, still prints
+    // as something a report can show
+    String[] indexNames = args.length > 11 ? args[11].split(",") : new String[] {"-"};
 
     SparkSession spark =
         SparkSession.builder()
@@ -116,14 +122,30 @@ public class VectorBenchmark {
             + repeats
             + ",\"overSamples\":["
             + join(overSamples)
+            + "],\"indexes\":["
+            + quoted(indexNames)
             + "],\"sparkVersion\":\""
             + spark.version()
             + "\"}");
-    for (Row index :
-        spark
-            .sql("CALL hms.system.list_indexes(table => '" + shortName(base) + "')")
-            .collectAsList()) {
+    List<Row> listed =
+        spark.sql("CALL hms.system.list_indexes(table => '" + shortName(base) + "')")
+            .collectAsList();
+    for (Row index : listed) {
       emit(META + "{\"index\":\"" + index.toString().replace("\"", "'") + "\"}");
+    }
+
+    // which of those rows each arm is, so a report shows the arm's own definition rather than every
+    // index the column holds
+    for (String spec : indexNames) {
+      int hash = spec.indexOf('#');
+      String key = (hash < 0 ? spec : spec.substring(0, hash)).trim();
+      String label = (hash < 0 ? spec : spec.substring(hash + 1)).trim();
+      for (Row index : listed) {
+        if (!"-".equals(key) && index.toString().contains(key)) {
+          emit(META + "{\"arm\":\"" + label + "\",\"definition\":\""
+              + index.toString().replace("\"", "'") + "\"}");
+        }
+      }
     }
 
     List<String> vectors = new ArrayList<>();
@@ -181,41 +203,54 @@ public class VectorBenchmark {
 
     int measured = Math.min(queries, vectors.size() - warmup);
     for (int q = warmup; q < warmup + measured; q++) {
-      for (String overSample : overSamples) {
-        spark.conf().set("spark.iceberg.index.vector.over-sample", overSample.trim());
-        for (int repeat = 1; repeat <= repeats; repeat++) {
-          long start = System.nanoTime();
-          List<Row> hits =
-              spark
-                  .sql(
-                      "SELECT pk FROM " + base + " ORDER BY vec_distance(" + column + ", "
-                          + vectors.get(q) + ") LIMIT " + topK)
-                  .collectAsList();
-          long millis = (System.nanoTime() - start) / 1_000_000;
+      for (String indexName : indexNames) {
+        String spec = indexName.trim();
+        int hash = spec.indexOf('#');
+        String arm = hash < 0 ? spec : spec.substring(0, hash);
+        String label = hash < 0 ? spec : spec.substring(hash + 1);
+        if ("-".equals(arm)) {
+          spark.conf().unset("spark.iceberg.index.vector.name");
+        } else {
+          spark.conf().set("spark.iceberg.index.vector.name", arm);
+        }
+        for (String overSample : overSamples) {
+          spark.conf().set("spark.iceberg.index.vector.over-sample", overSample.trim());
+          for (int repeat = 1; repeat <= repeats; repeat++) {
+            long start = System.nanoTime();
+            List<Row> hits =
+                spark
+                    .sql(
+                        "SELECT pk FROM " + base + " ORDER BY vec_distance(" + column + ", "
+                            + vectors.get(q) + ") LIMIT " + topK)
+                    .collectAsList();
+            long millis = (System.nanoTime() - start) / 1_000_000;
 
-          int found = 0;
-          for (Row hit : hits) {
-            if (truth.get(q).contains(hit.getLong(0))) {
-              found += 1;
+            int found = 0;
+            for (Row hit : hits) {
+              if (truth.get(q).contains(hit.getLong(0))) {
+                found += 1;
+              }
             }
-          }
 
-          emit(
-              RESULT
-                  + "{\"over\":" + Integer.parseInt(overSample.trim())
-                  + ",\"repeat\":" + repeat
-                  + ",\"query\":" + q
-                  + ",\"ms\":" + millis
-                  + ",\"hits\":" + hits.size()
-                  + ",\"found\":" + found
-                  + ",\"recall\":" + String.format(Locale.ROOT, "%.6f", topK == 0 ? 0.0
-                      : found / (double) topK)
-                  + "}");
+            emit(
+                RESULT
+                    + "{\"index\":\"" + ("-".equals(label) ? "" : label) + "\""
+                    + ",\"over\":" + Integer.parseInt(overSample.trim())
+                    + ",\"repeat\":" + repeat
+                    + ",\"query\":" + q
+                    + ",\"ms\":" + millis
+                    + ",\"hits\":" + hits.size()
+                    + ",\"found\":" + found
+                    + ",\"recall\":" + String.format(Locale.ROOT, "%.6f",
+                        topK == 0 ? 0.0 : found / (double) topK)
+                    + "}");
+          }
         }
       }
     }
 
     spark.conf().unset("spark.iceberg.index.vector.over-sample");
+    spark.conf().unset("spark.iceberg.index.vector.name");
 
     // the scan baseline as a summary too, so a report does not have to recompute it
     List<Long> measuredScans = new ArrayList<>();
@@ -262,6 +297,16 @@ public class VectorBenchmark {
   private static long percentile(List<Long> sorted, double fraction) {
     int index = (int) Math.round(fraction * (sorted.size() - 1));
     return sorted.get(Math.min(sorted.size() - 1, Math.max(0, index)));
+  }
+
+  private static String quoted(String[] values) {
+    StringBuilder text = new StringBuilder();
+    for (String value : values) {
+      String arm = value.trim();
+      text.append(text.length() == 0 ? "" : ",").append('"').append("-".equals(arm) ? "" : arm)
+          .append('"');
+    }
+    return text.toString();
   }
 
   private static String join(String[] values) {

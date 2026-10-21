@@ -41,7 +41,9 @@ def parse(path):
                 except json.JSONDecodeError:
                     continue
                 if kind == "meta":
-                    if "index" in data:
+                    if "arm" in data:
+                        run.setdefault("arms", {})[data["arm"]] = data.get("definition", "")
+                    elif "index" in data:
                         run["index"].append(data["index"])
                     elif "missing" in data:
                         run["missing"].append(data["query"])
@@ -58,6 +60,29 @@ def parse(path):
                         run.setdefault("summaries", []).append(data)
                 break
     return run
+
+
+def split_by_index(run):
+    """One run per index arm: a log that swept two indexes is two series, not one average."""
+    arms = sorted({row.get("index", "") for row in run["results"]})
+    if len(arms) <= 1:
+        run["arm"] = arms[0] if arms else ""
+        run["label"] = run["name"] + (" · " + run["arm"] if run["arm"] else "")
+        run["first_of_log"] = True
+        return [run]
+
+    logs = []
+    for position, arm in enumerate(arms):
+        clone = dict(run)
+        clone["results"] = [row for row in run["results"] if row.get("index", "") == arm]
+        clone["arm"] = arm
+        clone["name"] = run["name"] + " · " + (arm or "unnamed")
+        # the log lists every index the column holds; an arm shows the one it measured
+        described = run.get("arms", {}).get(arm)
+        clone["index"] = [described] if described else run["index"]
+        clone["first_of_log"] = position == 0
+        logs.append(clone)
+    return logs
 
 
 def quartiles(values):
@@ -341,7 +366,7 @@ class Chart:
 # ---------------------------------------------------------------- report
 
 
-def build(runs, title):
+def build(runs, title, note=""):
     stamp = datetime.now().strftime("%Y-%m-%d %H:%M")
     parts = [f"""<!doctype html>
 <html lang="zh-CN"><head><meta charset="utf-8">
@@ -383,6 +408,8 @@ def build(runs, title):
   .grid-faint {{ stroke:#f2f5f8; stroke-width:1; }}
   .axis-line {{ stroke:#c3ccd6; stroke-width:1.2; }}
   .note {{ color:var(--muted); font-size:13px; }}
+  .note-card {{ background:#fbfcfd; border-left:3px solid #2f6fd0; }}
+  .note-card p {{ margin:6px 0; font-size:14px; line-height:1.7; }}
   ul {{ margin:8px 0 8px 18px; padding:0; }}
   li {{ margin:4px 0; }}
   details {{ margin:10px 0; }}
@@ -393,6 +420,12 @@ def build(runs, title):
 <p class="sub">生成于 {stamp} · 数据来自 benchmark 日志，未经二次加工 ·
 {esc(", ".join(run["name"] for run in runs))}</p>
 """]
+
+    if note:
+        paragraphs = "".join(
+            f"<p>{esc(line).replace('**', '')}</p>" for line in note.strip().split("\n\n")
+        )
+        parts.append(f'<div class="card note-card">{paragraphs}</div>')
 
     # ---- what was measured
     parts.append("<h2>被测对象</h2><div class=\"card\"><table><thead><tr>"
@@ -449,7 +482,7 @@ def build(runs, title):
 
     # ---- chart 1: recall against the over-sample
     chart = Chart("recall@10 随 over-sample 的变化", "over-sample（1 = 关闭）", "recall@10",
-                  pad=(70, 24, 48, 130))
+                  pad=(70, 24, 48, 185))
     every = sorted({over for run in runs for over in by_over(run)})
     xlabels = [str(over) for over in every]
     for index, run in enumerate(runs):
@@ -475,7 +508,7 @@ def build(runs, title):
 
     # ---- chart 2: latency against the over-sample, with the scan as a reference line
     chart = Chart("查询延迟随 over-sample 的变化", "over-sample（1 = 关闭）",
-                  "每次查询耗时 (ms，对数刻度)", pad=(84, 24, 48, 150), log_y=True)
+                  "每次查询耗时 (ms，对数刻度)", pad=(84, 24, 48, 275), log_y=True)
     for index, run in enumerate(runs):
         per_over = by_over(run)
         if not per_over:
@@ -498,7 +531,7 @@ def build(runs, title):
         chart.add_series(f"{run['name']} 中位数", every, medians, colour)
     chart.xlabels = xlabels or ["1"]
     for index, run in enumerate(runs):
-        baseline = scan_latencies(run)
+        baseline = scan_latencies(run) if run.get("first_of_log", True) else []
         if baseline:
             chart.add_hline(statistics.median(baseline),
                             f"{run['name']} 全表扫描 {statistics.median(baseline):.0f} ms",
@@ -509,7 +542,7 @@ def build(runs, title):
 
     # ---- chart 3: the trade-off
     chart = Chart("recall 与延迟的取舍", "每次查询耗时（中位数, ms）", "recall@10",
-                  pad=(70, 24, 48, 130), numeric_x=True, log_x=True)
+                  pad=(70, 24, 48, 185), numeric_x=True, log_x=True)
     for index, run in enumerate(runs):
         per_over = by_over(run)
         if not per_over:
@@ -613,7 +646,7 @@ def build(runs, title):
 def render_strip(chart):
     """A strip plot: one dot per measurement, so a long tail is visible rather than averaged away."""
     w, h = 780, 360
-    left, top, bottom, right = 70, 24, 48, 150
+    left, top, bottom, right = 70, 24, 48, 185
     plot_w, plot_h = w - left - right, h - top - bottom
     values = [entry["strip"][1] for entry in chart.series if "strip" in entry]
     if not values:
@@ -659,9 +692,11 @@ def render_strip(chart):
         parts.append(f'<circle cx="{sx(position):.1f}" cy="{sy(value):.1f}" r="2.8" '
                      f'fill="{entry["colour"]}" opacity="0.6"/>')
     for index, label in enumerate(chart.strip_legend):
-        y = 44 + index * 16
-        parts.append(f'<circle cx="{w - 108}" cy="{y}" r="3.2" fill="{label[1]}" opacity="0.8"/>')
-        parts.append(f'<text x="{w - 100}" y="{y + 4}" class="legend">{esc(label[0])}</text>')
+        y = 40 + index * 16
+        parts.append(f'<circle cx="{w - right + 14}" cy="{y}" r="3.2" fill="{label[1]}" '
+                     f'opacity="0.8"/>')
+        parts.append(f'<text x="{w - right + 22}" y="{y + 4}" class="legend">'
+                     f'{esc(label[0])}</text>')
     parts.append(f'<text x="{left + plot_w / 2:.0f}" y="{h - 24}" text-anchor="middle" '
                  f'class="annotation">纵轴为对数刻度</text>')
     parts.append("</svg>")
@@ -673,18 +708,28 @@ def main():
     parser.add_argument("logs", nargs="+", help="result logs, one per run")
     parser.add_argument("-o", "--out", default="vector-benchmark-report.html")
     parser.add_argument("--title", default="向量索引 benchmark 报告")
+    parser.add_argument("--note", default="", help="paragraphs to put at the top of the report")
+    parser.add_argument("--note-file", default=None, help="read those paragraphs from a file")
     options = parser.parse_args()
 
     paths = []
     for pattern in options.logs:
         matched = glob.glob(pattern)
         paths += matched if matched else [pattern]
-    runs = [parse(path) for path in paths]
+    runs = []
+    for path in paths:
+        for run in split_by_index(parse(path)):
+            runs.append(run)
     if not any(run["results"] for run in runs):
         sys.exit("no BENCHRESULT lines in the given logs")
 
+    note = options.note
+    if options.note_file:
+        with open(options.note_file, encoding="utf-8") as handle:
+            note = handle.read()
+
     with open(options.out, "w", encoding="utf-8") as handle:
-        handle.write(build(runs, options.title))
+        handle.write(build(runs, options.title, note))
     print(f"wrote {options.out}")
 
 

@@ -29,11 +29,23 @@ On `shai`, in `/data/workspace/sparkann/bench` (the directory holds a symlink to
 the jars the image was built from):
 
 ```bash
-./run-benchmark.sh <out-name> <base-table> <query-table> [topK] [queries] [warmup] [repeats] [over-samples]
+./run-benchmark.sh <out-name> <base-table> <query-table> \
+    [topK] [queries] [warmup] [repeats] [over-samples] [indexes]
 
+# one index, the column's default
 ./run-benchmark.sh sift10m-over hms.sparkann.sift10m_base hms.sparkann.sift10m_query \
     10 15 3 2 1,3,10,30,100
+
+# several indexes on one column, one series per arm. An arm is a name or a UUID, optionally
+# followed by #label, because an index built without a name is addressed by its UUID and a report
+# should not have to show one
+./run-benchmark.sh sift10m-three-arms hms.sparkann.sift10m_base hms.sparkann.sift10m_query \
+    10 6 1 2 1,3,10,30 \
+    "f96a952d-...-2de4985c9ba7#ivf_3bit_np150,13c5e8f8-...-301c5ba1b7ae#ivf_1bit_np150"
 ```
+
+A query on a column that holds several indexes has to say which one it means, so the arms are
+selected with `spark.iceberg.index.vector.name`; the benchmark sets it per arm.
 
 * the measurements are collected from the run's own output file on HDFS
   (`/user/wanganyang/sparkann/bench/<out>.jsonl`), not from the driver log: a `kubectl logs -f`
@@ -46,6 +58,12 @@ the jars the image was built from):
   slower over the run does not systematically favour one of them.
 * the image is the only way to change the code being measured (a session extension is not loaded
   through `spark.jars`), so rebuild it with the jars and pass it as `IMG=...`.
+
+## Collecting a run
+
+`run-benchmark.sh` collects the measurements when the submission returns. If a run outlived its
+script, or its log was cut short, `./collect-results.sh <out>` rebuilds `results/<out>.log` from
+whichever of the two copies holds more measurements — the HDFS output file or the driver log.
 
 ## Building the report
 

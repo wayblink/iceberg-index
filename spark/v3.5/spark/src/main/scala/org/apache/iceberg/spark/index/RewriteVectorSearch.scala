@@ -99,13 +99,32 @@ case class RewriteVectorSearch(spark: SparkSession) extends Rule[LogicalPlan] {
    */
   private val OverSampleConf = "spark.iceberg.index.vector.over-sample"
 
+  /**
+   * Which of the column's indexes a query is answered from, by name or by UUID.
+   *
+   * <p>A column may hold several indexes that differ in their parameters, which is how two of them
+   * are compared on one table. A query written as {@code ORDER BY vec_distance(...)} has nowhere to
+   * write the name, so it arrives as a setting; without it, a column that holds several indexes
+   * leaves the plan alone, because answering from one of them would be a guess.
+   */
+  private val IndexNameConf = "spark.iceberg.index.vector.name"
+
+  /**
+   * A setting, from the spark context if it was given at submit time and from the session otherwise.
+   *
+   * <p>A rule cannot assume it was configured the same way as the process that started it: the
+   * context carries what spark-submit was given and the session carries what a SET statement set.
+   */
+  private def conf(name: String): Option[String] = {
+    spark.sparkContext.getConf
+      .getOption(name)
+      .orElse(spark.conf.getOption(name))
+      .map(_.trim)
+      .filter(_.nonEmpty)
+  }
+
   private def overSample: Int = {
-    // the spark context's configuration carries what spark-submit was given, and the session's
-    // carries what a SET statement set: a rule cannot assume it was configured the same way as the
-    // process that started it
-    val fromContext = spark.sparkContext.getConf.getOption(OverSampleConf).map(_.trim.toInt)
-    val configured =
-      fromContext.orElse(spark.conf.getOption(OverSampleConf).map(_.trim.toInt)).getOrElse(1)
+    val configured = conf(OverSampleConf).map(_.toInt).getOrElse(1)
     if (configured < 1) 1 else configured
   }
 
@@ -121,6 +140,29 @@ case class RewriteVectorSearch(spark: SparkSession) extends Rule[LogicalPlan] {
           case None => node
         }
     }
+  }
+
+  /** The index a query on this column is answered from, or none when the plan should stand aside. */
+  private def indexFor(
+      table: org.apache.iceberg.Table,
+      column: String): Option[org.apache.iceberg.index.IndexMetadata] = {
+    val named = conf(IndexNameConf)
+    if (named.isDefined) {
+      return Some(VectorIndexes.findIndex(table, column, "vector", named.get))
+    }
+
+    val indexes = VectorIndexes.indexesFor(table, column, "vector")
+    if (indexes.size() > 1) {
+      // answering from one of them would be a guess, and a guess that returns another index's rows
+      // looks exactly like an answer
+      logger.warn(
+        "Column {} of table {} has {} vector indexes and the query does not name one; set {} to "
+          + "choose, or leave the query to scan",
+        Array[Object](column, table.name(), Integer.valueOf(indexes.size()), IndexNameConf): _*)
+      return None
+    }
+
+    if (indexes.isEmpty) None else Some(indexes.get(0))
   }
 
   /** The global sort of a limit node, if its ordering is an ascending vector distance. */
@@ -159,10 +201,7 @@ case class RewriteVectorSearch(spark: SparkSession) extends Rule[LogicalPlan] {
       return None
     }
 
-    val index = VectorIndexes.findIndexOrNull(table, column, "vector")
-    if (index == null) {
-      return None
-    }
+    val index = indexFor(table, column).getOrElse(return None)
     if (!IndexRewriteSupport.isIndexTypeRegistered(index)) {
       logger.warn(
         "Index type {} of column {} of table {} is not registered in this session, scanning",
