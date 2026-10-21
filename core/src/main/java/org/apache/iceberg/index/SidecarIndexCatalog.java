@@ -118,6 +118,7 @@ public final class SidecarIndexCatalog implements IndexCatalog {
     IndexMetadata metadata =
         IndexMetadata.builder()
             .indexUuid(request.indexUuid())
+            .name(request.name())
             .tableUuid(request.tableUuid())
             .tableLocation(tableLocation)
             .location(indexLocation)

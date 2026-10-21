@@ -85,6 +85,63 @@ public final class VectorIndexes {
     return metadata;
   }
 
+  /**
+   * Finds the index a caller named, by its name or by its UUID.
+   *
+   * <p>A name is what a caller writes in SQL and a UUID is what the metadata uses, so both select
+   * the same index; when neither matches, the message lists what the column does have, which is the
+   * difference between "you typed it wrong" and "there is nothing to search".
+   */
+  public static IndexMetadata findIndex(
+      Table table, String column, String indexType, String nameOrUuid) {
+    if (nameOrUuid == null) {
+      return findIndex(table, column, indexType);
+    }
+
+    int fieldId = fieldId(table, column);
+    Lists.newArrayList();
+    java.util.List<String> available = new java.util.ArrayList<>();
+    for (IndexMetadata metadata : indexesOf(table)) {
+      boolean sameColumn =
+          indexType.equals(metadata.indexType()) && metadata.definition().fieldId() == fieldId;
+      if (!sameColumn) {
+        continue;
+      }
+
+      if (nameOrUuid.equals(metadata.name()) || nameOrUuid.equals(metadata.indexUuid())) {
+        return metadata;
+      }
+
+      available.add(metadata.name() != null ? metadata.name() : metadata.indexUuid());
+    }
+
+    throw new IllegalArgumentException(
+        "No "
+            + indexType
+            + " index named "
+            + nameOrUuid
+            + " exists for column "
+            + column
+            + " of table "
+            + table.name()
+            + "; the column has "
+            + available);
+  }
+
+  /** The indexes of a type over one column, which is what a caller has to choose between. */
+  public static java.util.List<IndexMetadata> indexesFor(
+      Table table, String column, String indexType) {
+    int fieldId = fieldId(table, column);
+    java.util.List<IndexMetadata> found = new java.util.ArrayList<>();
+    for (IndexMetadata metadata : indexesOf(table)) {
+      if (indexType.equals(metadata.indexType()) && metadata.definition().fieldId() == fieldId) {
+        found.add(metadata);
+      }
+    }
+
+    return found;
+  }
+
   /** Finds the index of a type for a table by the indexed column, or null if none exists. */
   public static IndexMetadata findIndexOrNull(Table table, String column, String indexType) {
     int fieldId = fieldId(table, column);
@@ -112,8 +169,8 @@ public final class VectorIndexes {
    *
    * <p>An index lives under the table's location, which outlives the table: dropping a table leaves
    * the sidecar behind, and a table created again at the same location is a different table. Its
-   * indexes are not this table's, so they are left out rather than reported as an index that already
-   * exists.
+   * indexes are not this table's, so they are left out rather than reported as an index that
+   * already exists.
    */
   public static List<IndexMetadata> indexesOf(Table table) {
     return indexCatalog(table).listIndexes(table.location(), String.valueOf(table.uuid()));

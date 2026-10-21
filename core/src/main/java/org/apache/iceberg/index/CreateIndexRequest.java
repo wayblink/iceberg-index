@@ -34,6 +34,7 @@ public final class CreateIndexRequest {
   private final String tableLocation;
   private final String tableUuid;
   private final String indexUuid;
+  private final String name;
   private final IndexDefinition definition;
   private final Map<String, String> properties;
 
@@ -41,6 +42,7 @@ public final class CreateIndexRequest {
       String tableLocation,
       String tableUuid,
       String indexUuid,
+      String name,
       IndexDefinition definition,
       Map<String, String> properties) {
     Preconditions.checkArgument(
@@ -51,6 +53,7 @@ public final class CreateIndexRequest {
     this.tableLocation = tableLocation;
     this.tableUuid = tableUuid;
     this.indexUuid = indexUuid;
+    this.name = name;
     this.definition = definition;
     this.properties = ImmutableMap.copyOf(properties);
   }
@@ -65,6 +68,10 @@ public final class CreateIndexRequest {
 
   public String tableUuid() {
     return tableUuid;
+  }
+
+  public String name() {
+    return name;
   }
 
   public String indexUuid() {
@@ -94,6 +101,7 @@ public final class CreateIndexRequest {
     private String tableLocation;
     private String tableUuid;
     private String indexUuid;
+    private String name;
     private IndexDefinition definition;
     private final ImmutableMap.Builder<String, String> properties = ImmutableMap.builder();
 
@@ -106,6 +114,11 @@ public final class CreateIndexRequest {
 
     public Builder tableUuid(String newTableUuid) {
       this.tableUuid = newTableUuid;
+      return this;
+    }
+
+    public Builder name(String newName) {
+      this.name = newName;
       return this;
     }
 
@@ -135,7 +148,7 @@ public final class CreateIndexRequest {
       Preconditions.checkNotNull(indexUuid, "Index UUID is not set");
       Preconditions.checkNotNull(definition, "Index definition is not set");
       return new CreateIndexRequest(
-          tableLocation, tableUuid, indexUuid, definition, properties.build());
+          tableLocation, tableUuid, indexUuid, name, definition, properties.build());
     }
   }
 }

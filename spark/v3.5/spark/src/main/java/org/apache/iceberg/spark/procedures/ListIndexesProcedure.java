@@ -57,7 +57,8 @@ class ListIndexesProcedure extends BaseProcedure {
             new StructField("status", DataTypes.StringType, true, Metadata.empty()),
             new StructField("index_files", DataTypes.LongType, false, Metadata.empty()),
             new StructField("entries", DataTypes.LongType, false, Metadata.empty()),
-            new StructField("definition", DataTypes.StringType, true, Metadata.empty())
+            new StructField("definition", DataTypes.StringType, true, Metadata.empty()),
+            new StructField("index_name", DataTypes.StringType, true, Metadata.empty())
           });
 
   public static ProcedureBuilder builder() {
@@ -110,7 +111,8 @@ class ListIndexesProcedure extends BaseProcedure {
                     status == null ? null : UTF8String.fromString(status),
                     counts[0],
                     counts[1],
-                    UTF8String.fromString(IndexMetadataParser.toJson(metadata.definition()))));
+                    UTF8String.fromString(IndexMetadataParser.toJson(metadata.definition())),
+                    metadata.name() == null ? null : UTF8String.fromString(metadata.name())));
           }
 
           return rows.toArray(new InternalRow[0]);

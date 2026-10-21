@@ -38,6 +38,7 @@ public final class IndexMetadataParser {
 
   private static final String FORMAT_VERSION = "format-version";
   private static final String INDEX_UUID = "index-uuid";
+  private static final String INDEX_NAME = "index-name";
   private static final String TABLE_UUID = "table-uuid";
   private static final String TABLE_LOCATION = "table-location";
   private static final String LOCATION = "location";
@@ -83,6 +84,9 @@ public final class IndexMetadataParser {
     generator.writeStartObject();
     generator.writeNumberField(FORMAT_VERSION, IndexMetadata.FORMAT_VERSION);
     generator.writeStringField(INDEX_UUID, metadata.indexUuid());
+    if (metadata.name() != null) {
+      generator.writeStringField(INDEX_NAME, metadata.name());
+    }
     generator.writeStringField(TABLE_UUID, metadata.tableUuid());
     if (metadata.tableLocation() != null) {
       generator.writeStringField(TABLE_LOCATION, metadata.tableLocation());
@@ -127,6 +131,10 @@ public final class IndexMetadataParser {
             .location(JsonUtil.getString(LOCATION, node))
             .indexType(indexType)
             .definition(definition);
+    String name = JsonUtil.getStringOrNull(INDEX_NAME, node);
+    if (name != null) {
+      builder.name(name);
+    }
     String tableLocation = JsonUtil.getStringOrNull(TABLE_LOCATION, node);
     if (tableLocation != null) {
       builder.tableLocation(tableLocation);

@@ -49,8 +49,10 @@ class RefreshVectorIndexProcedure extends BaseProcedure {
       requiredInParameter("table", DataTypes.StringType);
   private static final ProcedureParameter COLUMN_PARAM =
       requiredInParameter("column", DataTypes.StringType);
+  private static final ProcedureParameter INDEX_PARAM =
+      optionalInParameter("index", DataTypes.StringType);
   private static final ProcedureParameter[] PARAMETERS =
-      new ProcedureParameter[] {TABLE_PARAM, COLUMN_PARAM};
+      new ProcedureParameter[] {TABLE_PARAM, COLUMN_PARAM, INDEX_PARAM};
 
   private static final StructType OUTPUT_TYPE =
       new StructType(
@@ -99,7 +101,8 @@ class RefreshVectorIndexProcedure extends BaseProcedure {
                 "Table " + tableName + " has no data: cannot refresh an index");
           }
 
-          IndexMetadata metadata = VectorIndexProcedures.findIndex(table, column, "vector");
+          IndexMetadata metadata =
+              VectorIndexProcedures.resolveIndex(table, column, INDEX_PARAM, input);
           SidecarIndexCatalog catalog = VectorIndexProcedures.indexCatalog(table);
           long sourceSnapshotId = table.currentSnapshot().snapshotId();
 

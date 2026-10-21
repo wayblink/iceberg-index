@@ -59,6 +59,9 @@ class VectorSearchBatchProcedure extends BaseProcedure {
   private static final ProcedureParameter QUERIES_PARAM =
       optionalInParameter("queries", STRING_ARRAY);
   private static final ProcedureParameter K_PARAM = requiredInParameter("k", DataTypes.IntegerType);
+
+  private static final ProcedureParameter INDEX_PARAM =
+      optionalInParameter("index", DataTypes.StringType);
   private static final ProcedureParameter QUERY_TABLE_PARAM =
       optionalInParameter("query_table", DataTypes.StringType);
   private static final ProcedureParameter QUERY_ID_COLUMN_PARAM =
@@ -74,7 +77,8 @@ class VectorSearchBatchProcedure extends BaseProcedure {
         QUERIES_PARAM,
         QUERY_TABLE_PARAM,
         QUERY_ID_COLUMN_PARAM,
-        VECTOR_COLUMN_PARAM
+        VECTOR_COLUMN_PARAM,
+        INDEX_PARAM
       };
 
   private static final StructType OUTPUT_TYPE =
@@ -128,7 +132,14 @@ class VectorSearchBatchProcedure extends BaseProcedure {
           }
 
           List<Row> hits =
-              VectorIndexSearch.search(spark(), table, column, queryVectors, topK).collectAsList();
+              VectorIndexSearch.search(
+                      spark(),
+                      table,
+                      column,
+                      VectorIndexProcedures.resolveIndex(table, column, INDEX_PARAM, input),
+                      queryVectors,
+                      topK)
+                  .collectAsList();
 
           List<InternalRow> rows = Lists.newArrayListWithCapacity(hits.size());
           for (Row hit : hits) {

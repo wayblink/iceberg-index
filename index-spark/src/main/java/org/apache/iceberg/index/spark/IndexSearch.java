@@ -108,11 +108,22 @@ public final class IndexSearch {
       String indexType,
       List<ByteBuffer> queries,
       int topK) {
+    return search(
+        spark, table, column, VectorIndexes.findIndex(table, column, indexType), queries, topK);
+  }
+
+  /** The same search, over an index a caller already resolved (by name, or as the only one). */
+  public static Dataset<Row> search(
+      SparkSession spark,
+      org.apache.iceberg.Table table,
+      String column,
+      IndexMetadata metadata,
+      List<ByteBuffer> queries,
+      int topK) {
     if (topK <= 0 || queries.isEmpty()) {
       return spark.createDataFrame(Lists.newArrayList(), RESULT_SCHEMA);
     }
 
-    IndexMetadata metadata = VectorIndexes.findIndex(table, column, indexType);
     IndexSnapshot snapshot = metadata.latestSnapshot();
     if (snapshot == null) {
       throw new IllegalArgumentException(

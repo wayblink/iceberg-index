@@ -53,6 +53,10 @@ public final class IndexMetadata {
   public static final String MAX_ENTRIES_PER_INDEX_FILE_PROPERTY = "max-entries-per-index-file";
 
   private final String indexUuid;
+
+  /** An optional human-readable name, so a table can hold several indexes of one column. */
+  private final String name;
+
   private final String tableUuid;
   private final String tableLocation;
   private final String location;
@@ -64,6 +68,7 @@ public final class IndexMetadata {
 
   private IndexMetadata(
       String indexUuid,
+      String name,
       String tableUuid,
       String tableLocation,
       String location,
@@ -114,6 +119,7 @@ public final class IndexMetadata {
     }
 
     this.indexUuid = indexUuid;
+    this.name = name;
     this.tableUuid = tableUuid;
     this.tableLocation = tableLocation;
     this.location = location;
@@ -143,6 +149,17 @@ public final class IndexMetadata {
 
   public String indexUuid() {
     return indexUuid;
+  }
+
+  /**
+   * The name this index was built with, or null.
+   *
+   * <p>A name is not the identity of an index -- that is the UUID -- but it is what a caller uses
+   * to say which of several indexes over one column to search. An index built without one can only
+   * be the only index over its column.
+   */
+  public String name() {
+    return name;
   }
 
   public String tableUuid() {
@@ -244,6 +261,7 @@ public final class IndexMetadata {
     Builder builder =
         builder()
             .indexUuid(indexUuid)
+            .name(name)
             .tableUuid(tableUuid)
             .location(location)
             .indexType(indexType)
@@ -277,6 +295,7 @@ public final class IndexMetadata {
         && indexType.equals(that.indexType)
         && definition.equals(that.definition)
         && Objects.equals(lastUpdatedMillis, that.lastUpdatedMillis)
+        && Objects.equals(name, that.name)
         && properties.equals(that.properties)
         && snapshots.equals(that.snapshots);
   }
@@ -284,6 +303,7 @@ public final class IndexMetadata {
   @Override
   public int hashCode() {
     int result = indexUuid.hashCode();
+    result = 31 * result + Objects.hashCode(name);
     result = 31 * result + tableUuid.hashCode();
     result = 31 * result + Objects.hashCode(tableLocation);
     result = 31 * result + location.hashCode();
@@ -299,6 +319,7 @@ public final class IndexMetadata {
   public String toString() {
     return MoreObjects.toStringHelper(this)
         .add("indexUuid", indexUuid)
+        .add("name", name)
         .add("tableUuid", tableUuid)
         .add("tableLocation", tableLocation)
         .add("location", location)
@@ -312,6 +333,7 @@ public final class IndexMetadata {
 
   public static final class Builder {
     private String indexUuid;
+    private String name;
     private String tableUuid;
     private String tableLocation;
     private String location;
@@ -325,6 +347,11 @@ public final class IndexMetadata {
 
     public Builder indexUuid(String newIndexUuid) {
       this.indexUuid = newIndexUuid;
+      return this;
+    }
+
+    public Builder name(String newName) {
+      this.name = newName;
       return this;
     }
 
@@ -385,6 +412,7 @@ public final class IndexMetadata {
       Preconditions.checkNotNull(definition, "Index definition is not set");
       return new IndexMetadata(
           indexUuid,
+          name,
           tableUuid,
           tableLocation,
           location,

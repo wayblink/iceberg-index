@@ -51,8 +51,11 @@ class VectorSearchProcedure extends BaseProcedure {
   private static final ProcedureParameter QUERY_PARAM =
       requiredInParameter("query", DataTypes.createArrayType(DataTypes.DoubleType));
   private static final ProcedureParameter K_PARAM = requiredInParameter("k", DataTypes.IntegerType);
+
+  private static final ProcedureParameter INDEX_PARAM =
+      optionalInParameter("index", DataTypes.StringType);
   private static final ProcedureParameter[] PARAMETERS =
-      new ProcedureParameter[] {TABLE_PARAM, COLUMN_PARAM, QUERY_PARAM, K_PARAM};
+      new ProcedureParameter[] {TABLE_PARAM, COLUMN_PARAM, QUERY_PARAM, K_PARAM, INDEX_PARAM};
 
   private static final StructType OUTPUT_TYPE =
       new StructType(
@@ -104,7 +107,12 @@ class VectorSearchProcedure extends BaseProcedure {
 
           List<org.apache.spark.sql.Row> hits =
               VectorIndexSearch.search(
-                      spark(), table, column, List.of(toFloats(queryDoubles)), topK)
+                      spark(),
+                      table,
+                      column,
+                      VectorIndexProcedures.resolveIndex(table, column, INDEX_PARAM, input),
+                      List.of(toFloats(queryDoubles)),
+                      topK)
                   .collectAsList();
 
           List<InternalRow> rows = Lists.newArrayListWithCapacity(hits.size());

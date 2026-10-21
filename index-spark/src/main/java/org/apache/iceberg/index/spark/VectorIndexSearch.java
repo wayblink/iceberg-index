@@ -80,8 +80,24 @@ public final class VectorIndexSearch {
    */
   public static Dataset<Row> search(
       SparkSession spark, Table table, String vectorColumn, List<float[]> queries, int topK) {
+    return search(
+        spark,
+        table,
+        vectorColumn,
+        VectorIndexes.findIndex(table, vectorColumn, "vector"),
+        queries,
+        topK);
+  }
+
+  /** The same search over an index the caller resolved, which is how a named index is searched. */
+  public static Dataset<Row> search(
+      SparkSession spark,
+      Table table,
+      String vectorColumn,
+      IndexMetadata metadata,
+      List<float[]> queries,
+      int topK) {
     VectorIndexes.registerVectorIndexType();
-    IndexMetadata metadata = VectorIndexes.findIndex(table, vectorColumn, "vector");
     VectorIndexDefinition definition = (VectorIndexDefinition) metadata.definition();
     VectorIndexAdapter adapter = new VectorIndexAdapter(definition);
 
@@ -97,6 +113,6 @@ public final class VectorIndexSearch {
       payloads.add(adapter.encodeQuery(query));
     }
 
-    return IndexSearch.search(spark, table, vectorColumn, "vector", payloads, topK);
+    return IndexSearch.search(spark, table, vectorColumn, metadata, payloads, topK);
   }
 }

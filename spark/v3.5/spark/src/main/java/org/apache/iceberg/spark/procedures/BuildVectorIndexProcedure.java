@@ -75,6 +75,9 @@ class BuildVectorIndexProcedure extends BaseProcedure {
   private static final ProcedureParameter OPTIONS_PARAM =
       ProcedureParameter.optional("options", STRING_MAP);
 
+  private static final ProcedureParameter NAME_PARAM =
+      ProcedureParameter.optional("name", DataTypes.StringType);
+
   private static final ProcedureParameter MAX_M_PARAM =
       optionalInParameter("max_m", DataTypes.IntegerType);
   private static final ProcedureParameter EF_CONSTRUCTION_PARAM =
@@ -96,6 +99,7 @@ class BuildVectorIndexProcedure extends BaseProcedure {
         MAX_M_PARAM,
         EF_CONSTRUCTION_PARAM,
         EF_SEARCH_PARAM,
+        NAME_PARAM,
         MAX_ENTRIES_PER_INDEX_FILE_PARAM
       };
 
@@ -158,10 +162,8 @@ class BuildVectorIndexProcedure extends BaseProcedure {
 
           int fieldId = VectorIndexProcedures.fieldId(table, column);
           SidecarIndexCatalog catalog = VectorIndexProcedures.indexCatalog(table);
-          if (VectorIndexProcedures.findAnyIndexOrNull(table, column) != null) {
-            throw new IllegalArgumentException(
-                "A vector index already exists for column " + column + " of table " + tableName);
-          }
+          String name = input.asString(NAME_PARAM, null);
+          checkCanBuild(table, column, tableName, name);
 
           String indexUuid = UUID.randomUUID().toString();
           long sourceSnapshotId = table.currentSnapshot().snapshotId();
@@ -171,6 +173,7 @@ class BuildVectorIndexProcedure extends BaseProcedure {
                       .tableLocation(table.location())
                       .tableUuid(String.valueOf(table.uuid()))
                       .indexUuid(indexUuid)
+                      .name(name)
                       .definition(
                           vectorDefinition(
                               structure,
@@ -199,6 +202,43 @@ class BuildVectorIndexProcedure extends BaseProcedure {
                   UTF8String.fromString(indexUuid), sourceSnapshotId, counts[0], counts[1]);
           return new InternalRow[] {row};
         });
+  }
+
+  /**
+   * Refuses a build that would make the column ambiguous, unless the caller named the index.
+   *
+   * <p>One index per column is what search and refresh assume when no name is given, so a second
+   * unnamed index is refused; a named one is a new index over the same column, which is how the
+   * parameters of two arms are compared side by side.
+   */
+  private static void checkCanBuild(
+      org.apache.iceberg.Table table, String column, String tableName, String name) {
+    java.util.List<org.apache.iceberg.index.IndexMetadata> existing =
+        org.apache.iceberg.index.spark.VectorIndexes.indexesFor(table, column, "vector");
+    if (name == null) {
+      if (!existing.isEmpty()) {
+        throw new IllegalArgumentException(
+            "A vector index already exists for column "
+                + column
+                + " of table "
+                + tableName
+                + "; pass name => '...' to build another index over the same column");
+      }
+
+      return;
+    }
+
+    for (org.apache.iceberg.index.IndexMetadata metadata : existing) {
+      if (name.equals(metadata.name())) {
+        throw new IllegalArgumentException(
+            "An index named "
+                + name
+                + " already exists for column "
+                + column
+                + " of table "
+                + tableName);
+      }
+    }
   }
 
   private static Metric parseMetric(String metric) {
