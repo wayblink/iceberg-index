@@ -96,6 +96,20 @@ def esc(text):
     return (str(text).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;"))
 
 
+def log_ticks(low, high):
+    """Ticks for a log axis covering [low, high], thinned so the labels do not collide."""
+    import math
+    decades = math.log10(high) - math.log10(low)
+    factors = (1,) if decades > 2.5 else (1, 2, 5)
+    ticks = []
+    for exponent in range(int(math.floor(math.log10(low))), int(math.ceil(math.log10(high))) + 1):
+        for factor in factors:
+            value = factor * (10 ** exponent)
+            if low * 0.95 <= value <= high * 1.05:
+                ticks.append(value)
+    return ticks
+
+
 def nice_ticks(low, high, count=5):
     if high - low < 1e-9:
         high = low + 1.0
@@ -118,8 +132,9 @@ class Chart:
     """A minimal line/point chart with an optional band, enough for these measurements."""
 
     def __init__(self, title, xlabel, ylabel, width=780, height=360, pad=(70, 24, 48, 120),
-                 numeric_x=False, log_x=False):
+                 numeric_x=False, log_x=False, log_y=False):
         self.log_x = log_x
+        self.log_y = log_y
         self.numeric_x = numeric_x
         self.title = title
         self.xlabel = xlabel
@@ -156,11 +171,17 @@ class Chart:
         if not lows:
             return 0.0, 1.0
         low, high = min(lows), max(highs)
-        span = high - low
-        if span < 1e-9:
-            span = max(abs(high), 1.0)
-        low = low - span * 0.08
-        high = high + span * 0.08
+        if self.log_y:
+            # a log axis is padded by a factor, not by a fraction of the span: a span of two orders
+            # of magnitude would push a fractional pad below zero and the axis would have to show
+            # ten decades to hold it
+            low, high = low / 1.25, high * 1.25
+        else:
+            span = high - low
+            if span < 1e-9:
+                span = max(abs(high), 1.0)
+            low = low - span * 0.08
+            high = high + span * 0.08
         if self.y_min is not None:
             low = self.y_min
         if self.y_max is not None:
@@ -189,8 +210,14 @@ class Chart:
                 return left + plot_w * (value - x_low) / (x_high - x_low)
             return left + (plot_w * value / count if count else plot_w / 2)
 
+        def ty(value):
+            import math
+            return math.log10(max(1e-9, value)) if self.log_y else value
+
+        y_low, y_high = ty(y_low), ty(y_high)
+
         def sy(value):
-            return top + plot_h * (1 - (value - y_low) / (y_high - y_low))
+            return top + plot_h * (1 - (ty(value) - y_low) / (y_high - y_low))
 
         parts = [
             f'<svg viewBox="0 0 {w} {h}" width="100%" role="img" '
@@ -199,12 +226,16 @@ class Chart:
             f'{esc(self.title)}</text>',
         ]
 
-        for tick in nice_ticks(y_low, y_high, 5):
+        if self.log_y:
+            tick_labels = [(value, f"{value:g}") for value in log_ticks(10 ** y_low, 10 ** y_high)]
+        else:
+            tick_labels = [(tick, f"{tick:g}") for tick in nice_ticks(y_low, y_high, 5)]
+        for tick, label in tick_labels:
             y = sy(tick)
             parts.append(f'<line x1="{left}" y1="{y:.1f}" x2="{left + plot_w}" y2="{y:.1f}" '
                          f'class="grid"/>')
             parts.append(f'<text x="{left - 8}" y="{y + 4:.1f}" text-anchor="end" '
-                         f'class="axis">{tick:g}</text>')
+                         f'class="axis">{esc(label)}</text>')
 
         if self.numeric_x and self.log_x:
             import math
@@ -245,7 +276,7 @@ class Chart:
             lower = " ".join(f"{sx(x if self.numeric_x else i):.1f},{sy(v):.1f}"
                              for i, (x, v) in
                              reversed(list(enumerate(zip(xs, lows)))))
-            parts.append(f'<polygon points="{upper} {lower}" fill="{colour}" opacity="0.16"/>')
+            parts.append(f'<polygon points="{upper} {lower}" fill="{colour}" opacity="0.10"/>')
 
         for y, label, colour in self.hlines:
             # the label is in the legend, which is outside the plot, so the line carries none: an
@@ -419,21 +450,23 @@ def build(runs, title):
     # ---- chart 1: recall against the over-sample
     chart = Chart("recall@10 随 over-sample 的变化", "over-sample（1 = 关闭）", "recall@10",
                   pad=(70, 24, 48, 130))
-    xlabels = None
+    every = sorted({over for run in runs for over in by_over(run)})
+    xlabels = [str(over) for over in every]
     for index, run in enumerate(runs):
         per_over = by_over(run)
         if not per_over:
             continue
-        overs = sorted(per_over)
-        if xlabels is None:
-            xlabels = [str(over) for over in overs]
         colour = PALETTE[index % len(PALETTE)]
-        means = [statistics.mean(per_over[over]["recall"]) for over in overs]
-        spread = []
-        for over in overs:
+        means, spread = [], []
+        for over in every:
+            if over not in per_over:
+                means.append(None)
+                spread.append(None)
+                continue
             values = per_over[over]["recall"]
+            means.append(statistics.mean(values))
             spread.append((min(values), max(values)))
-        chart.add_series(run["name"], overs, means, colour, error=spread)
+        chart.add_series(run["name"], every, means, colour, error=spread)
     chart.xlabels = xlabels or ["1"]
     chart.y_min, chart.y_max = 0.0, 1.02
     parts.append(f'<h2>曲线</h2><div class="card">{chart.render()}'
@@ -441,19 +474,28 @@ def build(runs, title):
                  f'竖线是其中的最小值与最大值：查询之间的差异比轮次之间的差异大得多。</p></div>')
 
     # ---- chart 2: latency against the over-sample, with the scan as a reference line
-    chart = Chart("查询延迟随 over-sample 的变化", "over-sample（1 = 关闭）", "每次查询耗时 (ms)",
-                  pad=(70, 24, 48, 150))
+    chart = Chart("查询延迟随 over-sample 的变化", "over-sample（1 = 关闭）",
+                  "每次查询耗时 (ms，对数刻度)", pad=(84, 24, 48, 150), log_y=True)
     for index, run in enumerate(runs):
         per_over = by_over(run)
         if not per_over:
             continue
-        overs = sorted(per_over)
         colour = PALETTE[index % len(PALETTE)]
-        medians = [statistics.median(per_over[over]["ms"]) for over in overs]
-        lows = [percentile(sorted(per_over[over]["ms"]), 0.25) for over in overs]
-        highs = [percentile(sorted(per_over[over]["ms"]), 0.75) for over in overs]
-        chart.add_band(overs, lows, highs, colour)
-        chart.add_series(f"{run['name']} 中位数", overs, medians, colour)
+        medians, lows, highs = [], [], []
+        for over in every:
+            if over not in per_over:
+                medians.append(None)
+                lows.append(0)
+                highs.append(0)
+                continue
+            entry = per_over[over]
+            medians.append(statistics.median(entry["ms"]))
+            lows.append(percentile(sorted(entry["ms"]), 0.25))
+            highs.append(percentile(sorted(entry["ms"]), 0.75))
+        band = [i for i, value in enumerate(medians) if value is not None]
+        chart.add_band([every[i] for i in band], [lows[i] for i in band],
+                       [highs[i] for i in band], colour)
+        chart.add_series(f"{run['name']} 中位数", every, medians, colour)
     chart.xlabels = xlabels or ["1"]
     for index, run in enumerate(runs):
         baseline = scan_latencies(run)
@@ -461,7 +503,9 @@ def build(runs, title):
             chart.add_hline(statistics.median(baseline),
                             f"{run['name']} 全表扫描 {statistics.median(baseline):.0f} ms",
                             PALETTE[index % len(PALETTE)])
-    parts.append(f'<div class="card">{chart.render()}</div>')
+    parts.append(f'<div class="card">{chart.render()}'
+                 f'<p class="note">实线是每个取值的中位延迟，浅色带是 p25–p75，虚线是该表全表扫描的中位数。</p>'
+                 f'</div>')
 
     # ---- chart 3: the trade-off
     chart = Chart("recall 与延迟的取舍", "每次查询耗时（中位数, ms）", "recall@10",
@@ -488,8 +532,9 @@ def build(runs, title):
         if not per_over:
             continue
         colour = PALETTE[index % len(PALETTE)]
-        overs = sorted(per_over)
-        for position, over in enumerate(overs):
+        for position, over in enumerate(every):
+            if over not in per_over:
+                continue
             for value in per_over[over]["ms"]:
                 # a strip plot: every measurement keeps its own position, so a long tail shows
                 jitter = (hash((run["name"], over, value, position)) % 100) / 100.0 - 0.5
@@ -590,16 +635,12 @@ def render_strip(chart):
              f'xmlns="http://www.w3.org/2000/svg">',
              f'<text x="{w / 2:.0f}" y="20" text-anchor="middle" class="chart-title">'
              f'{"每次查询的耗时分布（点 = 一次查询）"}</text>']
-    for exponent in range(int(low), int(high) + 1):
-        for factor in (1, 2, 5):
-            value = factor * (10 ** exponent)
-            if math.log10(value) < low or math.log10(value) > high:
-                continue
-            y = sy(value)
-            parts.append(f'<line x1="{left}" y1="{y:.1f}" x2="{left + plot_w}" y2="{y:.1f}" '
-                         f'class="grid{"" if factor == 1 else "-faint"}"/>')
-            parts.append(f'<text x="{left - 8}" y="{y + 4:.1f}" text-anchor="end" '
-                         f'class="axis">{value:g}</text>')
+    for value in log_ticks(10 ** low, 10 ** high):
+        y = sy(value)
+        parts.append(f'<line x1="{left}" y1="{y:.1f}" x2="{left + plot_w}" y2="{y:.1f}" '
+                     f'class="grid"/>')
+        parts.append(f'<text x="{left - 8}" y="{y + 4:.1f}" text-anchor="end" '
+                     f'class="axis">{value:g}</text>')
     for index, label in enumerate(chart.xlabels):
         x = sx(index)
         parts.append(f'<text x="{x:.1f}" y="{top + plot_h + 18}" text-anchor="middle" '
