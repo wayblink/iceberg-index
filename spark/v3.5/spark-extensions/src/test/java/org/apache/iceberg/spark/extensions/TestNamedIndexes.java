@@ -130,6 +130,48 @@ public class TestNamedIndexes extends ExtensionsTestBase {
   }
 
   @TestTemplate
+  public void refreshingOneNamedIndexLeavesTheOtherWhereItWas() {
+    String table = tableName("named_refresh_" + catalogName);
+    createIndexedTable(table);
+    sql(
+        "CALL %s.system.build_vector_index(table => '%s', column => 'embedding', dimension => 2, "
+            + "name => 'flat_bruteforce', structure => 'FLAT')",
+        catalogName, table);
+
+    long namedBefore = snapshotOf(table, "flat_bruteforce");
+    long unnamedBefore = snapshotOf(table, null);
+    sql("INSERT INTO %s VALUES (100, array(100.0, 100.0))", table);
+
+    // refresh only the named arm
+    sql(
+        "CALL %s.system.refresh_vector_index(table => '%s', column => 'embedding', "
+            + "index => 'flat_bruteforce')",
+        catalogName, table);
+
+    // snapshot ids are random, not ordered: a refresh shows as a different id, not a larger one
+    assertThat(snapshotOf(table, "flat_bruteforce")).isNotEqualTo(namedBefore);
+    // the unnamed index was not touched: its source snapshot still points at the build
+    assertThat(snapshotOf(table, null)).isEqualTo(unnamedBefore);
+  }
+
+  @TestTemplate
+  public void anUnnamedRefreshRefusesToPickOne() {
+    String table = tableName("named_refresh_ambiguous_" + catalogName);
+    createIndexedTable(table);
+    sql(
+        "CALL %s.system.build_vector_index(table => '%s', column => 'embedding', dimension => 2, "
+            + "name => 'flat_bruteforce', structure => 'FLAT')",
+        catalogName, table);
+
+    assertThatThrownBy(
+            () ->
+                sql(
+                    "CALL %s.system.refresh_vector_index(table => '%s', column => 'embedding')",
+                    catalogName, table))
+        .hasMessageContaining("has 2 vector indexes");
+  }
+
+  @TestTemplate
   public void aSecondUnnamedIndexIsStillRefused() {
     String table = tableName("named_unnamed_" + catalogName);
     createIndexedTable(table);
@@ -191,6 +233,18 @@ public class TestNamedIndexes extends ExtensionsTestBase {
         "CALL %s.system.build_vector_index("
             + "table => '%s', column => 'embedding', dimension => 2, metric => 'euclidean')",
         catalogName, table);
+  }
+
+  /** The source table snapshot an index was last built from, found by name (null for unnamed). */
+  private long snapshotOf(String table, String indexName) {
+    for (Object[] row : sql("CALL %s.system.list_indexes(table => '%s')", catalogName, table)) {
+      boolean matches = indexName == null ? row[8] == null : indexName.equals(row[8]);
+      if (matches) {
+        return ((Number) row[3]).longValue();
+      }
+    }
+
+    throw new IllegalStateException("No index named " + indexName);
   }
 
   private String uuidOf(String table, String indexName) {
