@@ -80,6 +80,12 @@ def size_fact(run, sizes):
         return facts
     base = run["meta"].get("base", "").split(".")[-1]
     entries = sizes.get(base, {})
+    for entry in entries.values():
+        if run.get("arm") and entry.get("arm") == run["arm"]:
+            found = dict(entry)
+            found["indexBytes"] = found.get("bytes")
+            found["indexFiles"] = found.get("files")
+            return found
     if run.get("arm") in (None, "") and len(entries) == 1:
         # an arm with no name is one index, so the table's only entry is the one
         entry = dict(next(iter(entries.values())))
