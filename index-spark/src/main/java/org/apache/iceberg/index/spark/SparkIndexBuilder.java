@@ -284,15 +284,34 @@ public final class SparkIndexBuilder {
     Map<Integer, List<FileScanTask>> tasksByIndexFile =
         tasksByIndexFile(table, sourceTableSnapshotId, assignment);
 
+    // one partition per group, and the groups are unioned in a single call: unioning them one at a
+    // time builds a chain as deep as the number of groups, and Spark serializes that chain into
+    // every task of the stage, so a table with hundreds of data files overflows the stack while a
+    // task is deserialized before it runs
     JavaRDD<Row> allRows = null;
+    List<JavaRDD<Row>> groups = Lists.newArrayList();
     for (List<FileScanTask> groupTasks : tasksByIndexFile.values()) {
       JavaRDD<Row> rows = IndexEntries.entryRows(spark, table, groupTasks, vectorColumn, adapter);
       if (rows != null) {
         // a group is one index file, so its rows have to reach one task; merging the partitions of
         // its data files is a narrow transformation, which is the point of reading this way
-        JavaRDD<Row> onePartition = rows.coalesce(1);
-        allRows = allRows == null ? onePartition : allRows.union(onePartition);
+        groups.add(rows.coalesce(1));
       }
+    }
+
+    if (!groups.isEmpty()) {
+      // unioning in pairs keeps the graph logarithmic in the number of groups rather than linear
+      List<JavaRDD<Row>> level = groups;
+      while (level.size() > 1) {
+        List<JavaRDD<Row>> next = Lists.newArrayListWithCapacity((level.size() + 1) / 2);
+        for (int i = 0; i < level.size(); i += 2) {
+          next.add(i + 1 < level.size() ? level.get(i).union(level.get(i + 1)) : level.get(i));
+        }
+
+        level = next;
+      }
+
+      allRows = level.get(0);
     }
 
     if (allRows == null) {

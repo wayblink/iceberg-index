@@ -137,6 +137,10 @@ public final class IndexEntries {
     }
 
     SnapshotDeletes deletes = SnapshotDeletes.read(spark, taskList, tableSchema);
+    // one configuration for the whole group: each branch of the read would otherwise carry its own
+    // copy of the Hadoop configuration into the stage's task binary
+    SerializableConfiguration conf =
+        new SerializableConfiguration(spark.sessionState().newHadoopConf());
 
     // the data read needs the indexed column plus the columns referenced by equality deletes
     Set<String> columnsToRead = Sets.newLinkedHashSet();
@@ -149,7 +153,7 @@ public final class IndexEntries {
       String dataFile = task.file().location().toString();
 
       JavaRDD<Row> fileRows =
-          liveRowsOf(spark, tableSchema, task, readColumns, null, null, deletes, null)
+          liveRowsOf(spark, tableSchema, task, readColumns, null, null, deletes, conf)
               .mapToPair(
                   (PairFunction<Tuple2<Long, Row>, Long, Row>)
                       entry ->
