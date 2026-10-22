@@ -23,6 +23,17 @@ and reused by every setting.
 candidates the index hands to the exact re-scoring; 1 means off. `nprobe` is a property of the index
 definition, so comparing nprobe values needs one index build per value.
 
+## Dataset trap: the SIFT10M ground truth is for 11M rows
+
+`sift10m_gt` was computed over the **11M** collection (the 10M base plus a 1M insert), and about 9%
+of its ids are `>= 10,000,000`, i.e. rows the 10M table does not hold. Comparing a 10M result with
+that ground truth position by position shifts everything by one and understates recall by up to ten
+points -- which once looked like "recall drops to 6-10 out of 10".
+
+Filter the ids to `< 10,000,000` before taking the first ten; dropping the rows that are not in the
+table does not change the relative order of the rest. `ArmCurve` takes that bound as an argument for
+this reason.
+
 ## Running it
 
 On `shai`, in `/data/workspace/sparkann/bench` (the directory holds a symlink to `image-jars-new`,
