@@ -110,6 +110,33 @@ class TestLanceVectorSearch {
     assertThat(batch).isNotEmpty();
     assertThat(batch.get(0).getString(4)).contains("\"id\":0");
 
+    // the indexed search has to answer what a scan answers: the rewrite recognizes the plain
+    // distance order, and adding a zero keeps it from doing so
+    List<Row> indexed =
+        spark
+            .sql(
+                String.format(
+                    "SELECT id FROM %s ORDER BY vec_distance(embedding, array(0.0d, 100.0d)) LIMIT 3",
+                    table))
+            .collectAsList();
+    List<Row> scanned =
+        spark
+            .sql(
+                String.format(
+                    "SELECT id FROM %s ORDER BY vec_distance(embedding, array(0.0d, 100.0d)) + 0.0d "
+                        + "LIMIT 3",
+                    table))
+            .collectAsList();
+    assertThat(
+            indexed.stream()
+                .map(row -> row.getLong(0))
+                .collect(java.util.stream.Collectors.toList()))
+        .as("the index answers what a full scan answers")
+        .isEqualTo(
+            scanned.stream()
+                .map(row -> row.getLong(0))
+                .collect(java.util.stream.Collectors.toList()));
+
     // the same query answered again has to give the same rows
     List<Row> again =
         spark
