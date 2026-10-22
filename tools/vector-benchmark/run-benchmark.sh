@@ -72,6 +72,8 @@ nohup "$SPARK_HOME/bin/spark-submit" \
   --conf spark.driver.memory=6g \
   --conf spark.driver.cores=2 \
   --conf spark.hadoop.fs.defaultFS="$NN" \
+  --conf spark.driver.extraJavaOptions=--add-opens=java.base/java.nio=ALL-UNNAMED \
+  --conf spark.executor.extraJavaOptions=--add-opens=java.base/java.nio=ALL-UNNAMED \
   "$HERE/vector-benchmark.jar" \
   "$NN/spark-warehouse/" thrift://10.130.17.34:9083 \
   "$BASE" "$QUERY_TABLE" vector "$TOPK" "$QUERIES" "$WARMUP" "$REPEATS" \

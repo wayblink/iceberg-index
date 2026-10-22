@@ -175,6 +175,35 @@ public class TestVectorIndexProcedures extends ExtensionsTestBase {
   }
 
   @TestTemplate
+  public void testAFailedBuildLeavesNoIndexBehind() {
+    String tableName = tableName("vectors_failed_build_" + catalogName);
+    sql("CREATE TABLE %s (id bigint, embedding array<double>) USING iceberg", tableName);
+    // a zero vector has no direction, so the build refuses it part way through, after the index was
+    // registered
+    sql("INSERT INTO %s VALUES (1, array(1.0d, 0.0d)), (2, array(0.0d, 0.0d))", tableName);
+
+    assertThatThrownBy(
+            () ->
+                sql(
+                    "CALL %s.system.build_vector_index(table => '%s', column => 'embedding', "
+                        + "dimension => 2, metric => 'cosine', structure => 'IVF')",
+                    catalogName, tableName))
+        .hasStackTraceContaining("zero vector");
+
+    // nothing that looks like an index is left behind, so the column is not stuck on a build that
+    // never produced anything
+    assertThat(sql("CALL %s.system.list_indexes(table => '%s')", catalogName, tableName)).isEmpty();
+
+    // and the same call, with parameters that can be built, still works
+    sql(
+        "CALL %s.system.build_vector_index(table => '%s', column => 'embedding', "
+            + "dimension => 2, metric => 'euclidean', structure => 'IVF')",
+        catalogName, tableName);
+    assertThat(sql("CALL %s.system.list_indexes(table => '%s')", catalogName, tableName))
+        .hasSize(1);
+  }
+
+  @TestTemplate
   public void testRefusesBothModeAndStructure() {
     String tableName = tableName("vectors_structure_" + catalogName);
     sql("CREATE TABLE %s (id bigint, embedding array<double>) USING iceberg", tableName);

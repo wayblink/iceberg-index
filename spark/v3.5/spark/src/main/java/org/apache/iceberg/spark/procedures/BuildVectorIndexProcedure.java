@@ -190,9 +190,21 @@ class BuildVectorIndexProcedure extends BaseProcedure {
                           Long.toString(maxEntriesPerIndexFile))
                       .build());
 
-          IndexMetadata updated =
-              SparkIndexBuilder.build(
-                  spark(), table, created, sourceSnapshotId, column, System.currentTimeMillis());
+          IndexMetadata updated;
+          try {
+            updated =
+                SparkIndexBuilder.build(
+                    spark(), table, created, sourceSnapshotId, column, System.currentTimeMillis());
+          } catch (Exception e) {
+            // a build that fails must not leave a registration behind: an index with no snapshot
+            // looks like an index that exists, and the column then refuses a retry that does not
+            // name it, so the registration and whatever it wrote are removed before the failure is
+            // reported. The failure is caught as an Exception because a Spark job reports its
+            // failure as a SparkException, which a RuntimeException catch does not see.
+            catalog.dropIndex(table.location(), indexUuid, true);
+            throw e instanceof RuntimeException ? (RuntimeException) e : new RuntimeException(e);
+          }
+
           catalog.updateIndex(updated);
 
           IndexSnapshot snapshot = updated.latestSnapshot();

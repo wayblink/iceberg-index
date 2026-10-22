@@ -58,6 +58,12 @@ selected with `spark.iceberg.index.vector.name`; the benchmark sets it per arm.
   slower over the run does not systematically favour one of them.
 * the image is the only way to change the code being measured (a session extension is not loaded
   through `spark.jars`), so rebuild it with the jars and pass it as `IMG=...`.
+* a Lance table needs two things the plain image does not have: the `iceberg-lance` module in
+  `/opt/spark/jars`, and a `lance-spark-bundle` whose native library carries the HDFS object store
+  provider — the bundle in the company base image does not, and a Lance read on `hdfs://` fails with
+  `No object store provider found for scheme: 'hdfs'`. Both are in the image built after
+  2026-10-22 (`sparkann-e2e:20261022b`). Lance reads also need
+  `--add-opens=java.base/java.nio=ALL-UNNAMED`, which this script passes.
 
 ## Collecting a run
 
