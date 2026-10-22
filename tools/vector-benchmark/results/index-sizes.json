@@ -1,0 +1,22 @@
+{
+  "_comment": "Bytes each index occupies, measured from HDFS with `hdfs dfs -dus <table>/indexes/<uuid>/data` (the first number, not the replicated total). The benchmark emits this itself; this file fills in the runs that predate that field.",
+  "sift1m_base": {
+    "e67e0220-e79b-48f9-8bca-e5ac5a35a940": {
+      "bytes": 62311888, "files": 1, "structure": "IVF", "quantizer": "RABITQ",
+      "properties": "{'nprobe': '50', 'rabitq-bits': '3'}"
+    }
+  },
+  "sift10m_base": {
+    "f96a952d-1e7b-4e5d-958a-2de4985c9ba7": {"bytes": 630294854, "files": 39},
+    "3e6343a5-6821-4d9e-92d6-79437d434fb5": {"bytes": 751623666, "files": 39},
+    "13c5e8f8-7506-4687-80de-301c5ba1b7ae": {"bytes": 323395588, "files": 39}
+  },
+  "sift10m_lance_zstd": {
+    "8912d6d7-2b92-44a6-b3af-635dd04c26e9": {"bytes": 2357699709, "files": 39},
+    "4daf5470-b03b-4b61-84f6-0d3842c40208": {"bytes": 630188057, "files": 38}
+  },
+  "sift100m_base": {
+    "aeeec9a8-5e44-4db1-9c75-054a0491d894": {"bytes": 3207606023, "files": 256},
+    "9ec8fc80-b6cf-41d8-a44d-57c1126cc9f4": {"bytes": 7493661139, "files": 256}
+  }
+}

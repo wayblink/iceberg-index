@@ -42,7 +42,10 @@ def parse(path):
                     continue
                 if kind == "meta":
                     if "arm" in data:
-                        run.setdefault("arms", {})[data["arm"]] = data.get("definition", "")
+                        arms = run.setdefault("arms", {})
+                        arms[data["arm"]] = data.get("definition", "")
+                        facts = run.setdefault("armFacts", {})
+                        facts[data["arm"]] = data
                     elif "index" in data:
                         run["index"].append(data["index"])
                     elif "missing" in data:
@@ -60,6 +63,65 @@ def parse(path):
                         run.setdefault("summaries", []).append(data)
                 break
     return run
+
+
+def index_sizes():
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "results", "index-sizes.json")
+    if not os.path.exists(path):
+        return {}
+    with open(path, encoding="utf-8") as handle:
+        return json.load(handle)
+
+
+def size_fact(run, sizes):
+    """Bytes of the index a run measured: from the run if it says, else from the sidecar."""
+    facts = run.get("armFacts", {}).get(run.get("arm", ""), {})
+    if facts.get("indexBytes"):
+        return facts
+    base = run["meta"].get("base", "").split(".")[-1]
+    entries = sizes.get(base, {})
+    if run.get("arm") in (None, "") and len(entries) == 1:
+        # an arm with no name is one index, so the table's only entry is the one
+        entry = dict(next(iter(entries.values())))
+        entry["indexBytes"] = entry.get("bytes")
+        entry["indexFiles"] = entry.get("files")
+        return entry
+    return facts
+
+
+def cell_of(run):
+    """(scale, format) of the table a run measured: SIFT10M + Lance, SIFT100M + Parquet, ..."""
+    base = run["meta"].get("base", "")
+    import re
+    match = re.search(r"sift(\d+[mM])", base)
+    scale = match.group(1).upper() if match else "?"
+    data_format = "Lance" if "lance" in base.lower() else "Parquet"
+    return scale, data_format
+
+
+def arm_of(run):
+    """The arm of one split run, as a column of the matrix: HNSW, IVF, IVF·1bit, ..."""
+    described = run.get("arms", {}).get(run.get("arm", ""), "")
+    if not described and run.get("index"):
+        described = " ".join(run["index"])
+    structure = run.get("structure") or ""
+    quantizer = run.get("quantizer") or ""
+    properties = run.get("properties") or ""
+    if not structure:
+        # the arm line may predate the fields; fall back to reading them out of the definition text
+        import re
+        found = re.search(r"'structure':'(\w+)'", described)
+        structure = found.group(1) if found else "?"
+        found = re.search(r"'quantizer':'(\w+)'", described)
+        quantizer = found.group(1) if found else "NONE"
+        properties = described
+    if structure != "IVF":
+        return structure
+    if "RABITQ" not in quantizer:
+        return "IVF（未量化）"
+    import re
+    bits = re.search(r"rabitq-bits\D*(\d)", str(properties))
+    return "IVF·" + (bits.group(1) if bits else "?") + "bit"
 
 
 def split_by_index(run):
@@ -399,6 +461,8 @@ def build(runs, title, note=""):
               white-space:nowrap; }}
   tbody tr:hover {{ background:#f9fbfd; }}
   code {{ background:#eef1f4; padding:1px 5px; border-radius:4px; font-size:12.5px; }}
+  td.missing {{ color:#c3ccd6; text-align:center; }}
+  .sub-value {{ color:var(--muted); font-size:12px; }}
   .chart-title {{ font-size:14px; font-weight:600; fill:var(--fg); }}
   .axis {{ font-size:11px; fill:var(--muted); }}
   .axis-label {{ font-size:12px; fill:var(--muted); }}
@@ -479,6 +543,62 @@ def build(runs, title, note=""):
             f'<div class="value">{scan_median:.0f} ms</div>'
             f'<div class="note">中位数，{len(baseline)} 次</div></div>')
     parts.append("</div>")
+
+    # ---- the factorial matrix: every combination of the dimensions being compared
+    reference_over = int(os.environ.get("BENCH_REFERENCE_OVER", "10"))
+    sizes = index_sizes()
+    cells = {}
+    for run in runs:
+        scale, data_format = cell_of(run)
+        arm = arm_of(run)
+        per_over = by_over(run)
+        if reference_over in per_over:
+            entry = per_over[reference_over]
+            facts = size_fact(run, sizes)
+            cells[(scale, data_format, arm)] = {
+                "recall": statistics.mean(entry["recall"]),
+                "median": statistics.median(entry["ms"]),
+                "bytes": facts.get("indexBytes"),
+                "files": facts.get("indexFiles"),
+            }
+
+    if cells:
+        scales = sorted({key[0] for key in cells}, reverse=True)
+        data_formats = [fmt for fmt in ("Parquet", "Lance")
+                        if any(key[1] == fmt for key in cells)]
+        arms = [arm for arm in ("HNSW", "IVF（未量化）", "IVF·1bit", "IVF·2bit", "IVF·3bit",
+                                "IVF·4bit")
+                if any(key[2] == arm for key in cells)]
+        for key in cells:
+            if key[2] not in arms:
+                arms.append(key[2])
+
+        parts.append(
+            f'<h2>正交矩阵（over-sample = {reference_over}）</h2><div class="card">'
+            f'<table><thead><tr><th>规模 / 数据格式</th>'
+            + "".join(f"<th>{esc(arm)}</th>" for arm in arms)
+            + "</tr></thead><tbody>")
+        for scale in scales:
+            for data_format in data_formats:
+                parts.append(f"<tr><td><b>{esc(scale)}</b> · {esc(data_format)}</td>")
+                for arm in arms:
+                    cell = cells.get((scale, data_format, arm))
+                    if not cell:
+                        parts.append('<td class="missing">—</td>')
+                        continue
+                    size = cell["bytes"]
+                    size_text = (f"{size / 1e9:.2f} GB" if size and size >= 1e9
+                                 else f"{size / 1e6:.0f} MB" if size else "—")
+                    parts.append(
+                        f"<td>{cell['recall']:.4f}<br>"
+                        f"<span class='sub-value'>{cell['median'] / 1000:.1f} s</span><br>"
+                        f"<span class='sub-value'>{size_text}</span></td>")
+                parts.append("</tr>")
+        parts.append(
+            "</tbody></table>"
+            f'<p class="note">每格三行：<b>recall@10</b> / <b>中位查询延迟</b> / <b>索引体积</b>'
+            f'（＝索引文件字节数之和，与数据格式无关的部分也照实显示）。"--" 表示这一格还没测：'
+            f'HNSW 不支持 RaBitQ（没有这样的 kernel），其余未测格见文末的补齐计划。</p></div>')
 
     # ---- chart 1: recall against the over-sample
     chart = Chart("recall@10 随 over-sample 的变化", "over-sample（1 = 关闭）", "recall@10",

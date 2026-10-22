@@ -135,15 +135,52 @@ public class VectorBenchmark {
     }
 
     // which of those rows each arm is, so a report shows the arm's own definition rather than every
-    // index the column holds
+    // index the column holds; the bytes it occupies is one of the things being compared, so it is
+    // measured here rather than written down by hand
+    org.apache.iceberg.Table icebergTable;
+    try {
+      icebergTable = org.apache.iceberg.spark.Spark3Util.loadIcebergTable(spark, base);
+    } catch (Exception e) {
+      throw new RuntimeException(e);
+    }
+
     for (String spec : indexNames) {
       int hash = spec.indexOf('#');
       String key = (hash < 0 ? spec : spec.substring(0, hash)).trim();
       String label = (hash < 0 ? spec : spec.substring(hash + 1)).trim();
       for (Row index : listed) {
         if (!"-".equals(key) && index.toString().contains(key)) {
-          emit(META + "{\"arm\":\"" + label + "\",\"definition\":\""
-              + index.toString().replace("\"", "'") + "\"}");
+          org.apache.iceberg.index.IndexMetadata metadata =
+              org.apache.iceberg.index.spark.VectorIndexes.findIndex(
+                  icebergTable, column, "vector", "-".equals(key) ? null : key);
+          long bytes = 0L;
+          int files = 0;
+          for (org.apache.iceberg.index.IndexSnapshot snapshot : metadata.snapshots()) {
+            org.apache.iceberg.index.IndexManifestList manifestList =
+                org.apache.iceberg.index.IndexManifestList.read(
+                    icebergTable.io().newInputFile(snapshot.indexManifestList()));
+            for (org.apache.iceberg.index.IndexManifestList.ManifestRef ref
+                : manifestList.manifests()) {
+              for (org.apache.iceberg.index.IndexFile file
+                  : org.apache.iceberg.index.IndexManifest.read(
+                      icebergTable.io().newInputFile(ref.location())).indexFiles()) {
+                bytes += icebergTable.io().newInputFile(file.location()).getLength();
+                files += 1;
+              }
+            }
+          }
+
+          org.apache.iceberg.index.vector.VectorIndexDefinition definition =
+              (org.apache.iceberg.index.vector.VectorIndexDefinition) metadata.definition();
+          emit(META + "{\"arm\":\"" + label + "\""
+              + ",\"definition\":\"" + index.toString().replace("\"", "'") + "\""
+              + ",\"indexBytes\":" + bytes
+              + ",\"indexFiles\":" + files
+              + ",\"structure\":\"" + definition.structure() + "\""
+              + ",\"quantizer\":\"" + definition.quantizer() + "\""
+              + ",\"properties\":\"" + definition.properties().toString().replace("\"", "'")
+                  + "\""
+              + "}");
         }
       }
     }
