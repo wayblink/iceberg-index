@@ -215,19 +215,6 @@ public interface IndexAdapter {
   }
 
   /**
-   * Returns true when this index type is built and refreshed as a single table-wide index file
-   * instead of one index file per data file.
-   *
-   * <p>Index types whose scoring depends on corpus-wide statistics (for example the document
-   * frequency and average document length of a BM25 text index) cannot be split per data file: a
-   * per-file index would score with stale statistics. A table-wide index file covers all data files
-   * of the snapshot and is rebuilt as a whole whenever anything changes.
-   */
-  default boolean isTableWide() {
-    return false;
-  }
-
-  /**
    * The blob types this adapter reads in the entry-bearing role.
    *
    * <p>{@link #entryBlobType()} is the one it writes. A type that has been renamed keeps the old
