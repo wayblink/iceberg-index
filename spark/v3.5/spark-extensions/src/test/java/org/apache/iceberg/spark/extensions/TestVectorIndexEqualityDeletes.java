@@ -19,6 +19,7 @@
 package org.apache.iceberg.spark.extensions;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 import java.io.File;
 import java.util.List;
@@ -49,6 +50,51 @@ public class TestVectorIndexEqualityDeletes extends ExtensionsTestBase {
     String table = tableName("eq_delete_name_" + catalogName);
     createAndIndex(table);
     assertDeletedRowIsGone(table, "name", "b");
+  }
+
+  @TestTemplate
+  public void aBinaryKeyDeletedByValueDoesNotComeBackFromTheIndex() throws Exception {
+    // the data side and the delete side hand a binary value back as different objects (a ByteBuffer
+    // and a byte array), so the key has to be built from the bytes, not from the value itself
+    String table = tableName("eq_delete_bin_" + catalogName);
+    sql(
+        "CREATE TABLE %s (id bigint, payload binary, embedding array<double>) "
+            + "USING iceberg TBLPROPERTIES ('format-version'='2')",
+        table);
+    sql(
+        "INSERT INTO %s VALUES "
+            + "(1, X'01', array(1.0d, 0.0d)), "
+            + "(2, X'02', array(0.0d, 1.0d)), "
+            + "(3, X'03', array(1.0d, 1.0d))",
+        table);
+    sql(
+        "CALL %s.system.build_vector_index(table => '%s', column => 'embedding', dimension => 2, "
+            + "metric => 'euclidean')",
+        catalogName, table);
+
+    assertDeletedRowIsGone(table, "payload", java.nio.ByteBuffer.wrap(new byte[] {2}));
+  }
+
+  @TestTemplate
+  public void deletingByTwoDifferentKeysIsReportedRatherThanIgnored() throws Exception {
+    String table = tableName("eq_delete_two_keys_" + catalogName);
+    createAndIndex(table);
+    Table icebergTable = org.apache.iceberg.spark.Spark3Util.loadIcebergTable(spark, table);
+    addEqualityDelete(icebergTable, "name", "b");
+    addEqualityDelete(
+        icebergTable,
+        "ts",
+        java.time.Instant.parse("2024-01-01T00:00:03Z").atOffset(java.time.ZoneOffset.UTC));
+
+    // the filter builds one key per row, so two key column sets cannot both be applied: saying so
+    // beats letting the rows of one of them come back
+    assertThatThrownBy(
+            () ->
+                sql(
+                    "CALL %s.system.vector_search(table => '%s', column => 'embedding', "
+                        + "query => array(0.0d, 1.0d), k => 10)",
+                    catalogName, table))
+        .hasMessageContaining("key on different columns");
   }
 
   @TestTemplate

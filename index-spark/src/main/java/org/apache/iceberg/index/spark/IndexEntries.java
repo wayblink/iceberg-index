@@ -42,6 +42,7 @@ import org.apache.iceberg.hadoop.SerializableConfiguration;
 import org.apache.iceberg.index.IndexAdapter;
 import org.apache.iceberg.io.CloseableIterable;
 import org.apache.iceberg.io.InputFile;
+import org.apache.iceberg.relocated.com.google.common.base.Preconditions;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableList;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableMap;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableSet;
@@ -66,6 +67,8 @@ import org.apache.spark.sql.types.DataType;
 import org.apache.spark.sql.types.DataTypes;
 import org.apache.spark.sql.types.StructField;
 import org.apache.spark.sql.types.StructType;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import scala.Tuple2;
 
 /**
@@ -82,6 +85,8 @@ import scala.Tuple2;
  * IndexAdapter#encodeEntryValue(Object)}, so any index type works without engine changes.
  */
 public final class IndexEntries {
+
+  private static final Logger LOG = LoggerFactory.getLogger(IndexEntries.class);
 
   public static final String DATA_FILE_COLUMN = "data_file";
   public static final String POSITION_COLUMN = "pos";
@@ -801,9 +806,23 @@ public final class IndexEntries {
 
       Broadcast<Set<String>> keys = null;
       if (!equalityDeletes.isEmpty()) {
-        keys =
-            JavaSparkContext.fromSparkContext(spark.sparkContext())
-                .broadcast(readEqualityKeys(spark, equalityDeletes, keyFields));
+        if (keyFields.contains(null)) {
+          // a delete file can name a column the table no longer has. A row cannot carry a value for
+          // it, so the delete matches nothing, which is what a full scan decides too: the filter is
+          // left out rather than built from fewer columns, which would compare the wrong values
+          LOG.warn(
+              "Ignoring equality deletes {}: they name a column the table no longer has, so they "
+                  + "remove nothing",
+              equalityDeletes.stream()
+                  .map(deleteFile -> deleteFile.location().toString())
+                  .collect(java.util.stream.Collectors.toList()));
+          keyFields = Lists.newArrayList();
+        } else {
+          checkOneKeySet(equalityDeletes);
+          keys =
+              JavaSparkContext.fromSparkContext(spark.sparkContext())
+                  .broadcast(readEqualityKeys(spark, equalityDeletes, keyFields));
+        }
       }
 
       return new SnapshotDeletes(deletedByFile, keys, keyFields);
@@ -822,7 +841,9 @@ public final class IndexEntries {
     List<String> keyColumns() {
       List<String> names = Lists.newArrayListWithCapacity(keyFields.size());
       for (org.apache.iceberg.types.Types.NestedField field : keyFields) {
-        names.add(field.name());
+        if (field != null) {
+          names.add(field.name());
+        }
       }
 
       return names;
@@ -900,22 +921,54 @@ public final class IndexEntries {
     return keys;
   }
 
-  /** The table columns of the equality fields, in field id order. */
+  /**
+   * The table columns of the equality fields, in field id order, with null where the table no
+   * longer has the column.
+   *
+   * <p>The positions are kept so that they stay aligned with the columns of the delete rows: a
+   * delete file holds its key columns in the order of its field ids, so dropping one here would
+   * pair the remaining columns with the wrong values.
+   */
   private static List<Types.NestedField> equalityFields(
       Schema schema, Collection<DeleteFile> equalityDeletes) {
+    List<Types.NestedField> fields = Lists.newArrayList();
     if (equalityDeletes.isEmpty()) {
-      return Lists.newArrayList();
+      return fields;
     }
 
-    List<Types.NestedField> fields = Lists.newArrayList();
     for (int fieldId : equalityDeletes.iterator().next().equalityFieldIds()) {
-      Types.NestedField field = schema.findField(fieldId);
-      if (field != null) {
-        fields.add(field);
-      }
+      fields.add(schema.findField(fieldId));
     }
 
     return fields;
+  }
+
+  /**
+   * Fails when the delete files of one snapshot key on different columns.
+   *
+   * <p>The filter builds one key per data row, from one set of columns, so a second set cannot be
+   * applied: the keys of one set would be compared with the keys of the other. Failing says so,
+   * instead of letting the rows the second set removed come back.
+   */
+  private static void checkOneKeySet(Collection<DeleteFile> equalityDeletes) {
+    List<Integer> first = null;
+    for (DeleteFile deleteFile : equalityDeletes) {
+      List<Integer> fieldIds = deleteFile.equalityFieldIds();
+      if (first == null) {
+        first = fieldIds;
+      } else {
+        Preconditions.checkArgument(
+            first.equals(fieldIds),
+            "Equality delete files key on different columns: field ids %s and %s (%s keys on the "
+                + "first, %s on the second), so one key per row cannot match both. The index path "
+                + "supports one key column set per table, and a table that needs more cannot use it "
+                + "until that is supported",
+            first,
+            fieldIds,
+            equalityDeletes.iterator().next().location(),
+            deleteFile.location());
+      }
+    }
   }
 
   /**
@@ -963,6 +1016,10 @@ public final class IndexEntries {
                 : ((java.time.LocalTime) value).toNanoOfDay() / 1000L);
       case TIMESTAMP:
         return "timestamp:" + micros(value);
+      case TIMESTAMP_NANO:
+        // the index path reads a nanos timestamp as the micros Spark hands back, so the key carries
+        // the same precision on both sides
+        return "timestamp_nano:" + micros(value);
       case INTEGER:
         return "int:" + ((Number) value).intValue();
       case LONG:
@@ -977,10 +1034,24 @@ public final class IndexEntries {
         return "uuid:" + value;
       case FIXED:
       case BINARY:
-        return type.typeId() + ":" + java.util.Base64.getEncoder().encodeToString((byte[]) value);
+        return type.typeId() + ":" + java.util.Base64.getEncoder().encodeToString(bytes(value));
       default:
         return type.typeId() + ":" + value;
     }
+  }
+
+  /** The bytes of a binary value, which the data and delete readers hand back differently. */
+  private static byte[] bytes(Object value) {
+    if (value instanceof byte[]) {
+      return (byte[]) value;
+    } else if (value instanceof java.nio.ByteBuffer) {
+      java.nio.ByteBuffer buffer = ((java.nio.ByteBuffer) value).duplicate();
+      byte[] out = new byte[buffer.remaining()];
+      buffer.get(out);
+      return out;
+    }
+
+    throw new IllegalArgumentException("Cannot read binary from a " + value.getClass());
   }
 
   /** Microseconds since the epoch, from either a count of them or a timestamp object. */
