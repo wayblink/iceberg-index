@@ -122,7 +122,7 @@ def arm_of(run):
         quantizer = found.group(1) if found else "NONE"
         properties = described
     if structure != "IVF":
-        return structure
+        return "FLAT（暴力）" if structure == "FLAT" else structure
     if "RABITQ" not in quantizer:
         return "IVF（未量化）"
     import re
@@ -558,8 +558,9 @@ def build(runs, title, note=""):
         scale, data_format = cell_of(run)
         arm = arm_of(run)
         per_over = by_over(run)
-        if reference_over in per_over:
-            entry = per_over[reference_over]
+        if reference_over in per_over or len(per_over) == 1:
+            entry = per_over[reference_over] if reference_over in per_over \
+                else next(iter(per_over.values()))
             facts = size_fact(run, sizes)
             cells[(scale, data_format, arm)] = {
                 "recall": statistics.mean(entry["recall"]),
@@ -648,9 +649,9 @@ def build(runs, title, note=""):
                                    [highs[i] for i in band], colour)
             latency_chart.add_series(label, overs, medians, colour)
 
-        recall_chart.xlabels = [str(over) for over in overs]
+        recall_chart.xlabels = [("直接调用" if over == 0 else str(over)) for over in overs]
         recall_chart.y_min, recall_chart.y_max = 0.0, 1.02
-        latency_chart.xlabels = [str(over) for over in overs]
+        latency_chart.xlabels = [("直接调用" if over == 0 else str(over)) for over in overs]
         baseline = [row["ms"] for run in group for row in run["scans"]
                     if not row.get("warmup")]
         if baseline:
@@ -700,7 +701,7 @@ def build(runs, title, note=""):
                 chart.series.append({"label": "", "xs": [], "ys": [], "colour": colour,
                                      "markers": False, "error": None,
                                      "strip": (position + jitter * 0.6, value)})
-    chart.xlabels = [str(over) for over in every] or ["1"]
+    chart.xlabels = [("直接调用" if over == 0 else str(over)) for over in every] or ["1"]
     chart.strip_legend = [(run["name"], PALETTE[index % len(PALETTE)])
                           for index, run in enumerate(runs) if run["results"]]
     parts.append(f'<div class="card">{render_strip(chart)}</div>')

@@ -17,7 +17,9 @@
  *   BENCHMETA <json>      what was measured: tables, index definition, top k, settings
  *   BENCHSCAN <json>      one exact query: its latency and the rows it returned
  *   BENCHRESULT <json>    one indexed query: index, setting, latency, hits, and its recall against
- *                         BENCHSCAN
+ *                         BENCHSCAN. A brute force index is measured through the search procedure
+ *                         instead, because the rewrite rule refuses one: it scores every entry, so
+ *                         running it is slower than scanning, and the rule stands aside on purpose.
  *   BENCHSUMMARY <json>   closing marker, so a truncated run is recognizable
  *
  * The lines are also written to the output path the caller gives, one flush each. A run takes tens of
@@ -84,6 +86,9 @@ public class VectorBenchmark {
     // `name#label` so a UUID, which is how an index built without a name is addressed, still prints
     // as something a report can show
     String[] indexNames = args.length > 11 ? args[11].split(",") : new String[] {"-"};
+    // rule: through ORDER BY, which is what a user writes, and where over-sample matters.
+    // procedure: straight at one index, for the structures the rule declines to use.
+    String mode = args.length > 12 ? args[12] : "rule";
 
     SparkSession spark =
         SparkSession.builder()
@@ -239,6 +244,64 @@ public class VectorBenchmark {
     }
 
     int measured = Math.min(queries, vectors.size() - warmup);
+    if ("procedure".equals(mode)) {
+      for (int q = warmup; q < warmup + measured; q++) {
+        for (String indexName : indexNames) {
+          String label = indexName.contains("#")
+              ? indexName.substring(indexName.indexOf('#') + 1) : indexName.trim();
+          for (int repeat = 1; repeat <= repeats; repeat++) {
+            long start = System.nanoTime();
+            List<Row> hits =
+                spark
+                    .sql(
+                        "CALL hms.system.vector_search(table => '" + shortName(base)
+                            + "', column => '" + column + "', index => '" + label
+                            + "', query => " + vectors.get(q) + ", k => " + topK + ")")
+                    .collectAsList();
+            long millis = (System.nanoTime() - start) / 1_000_000;
+
+            int found = 0;
+            for (Row hit : hits) {
+              String row = hit.getString(3);
+              if (row == null) {
+                continue;
+              }
+              java.util.regex.Matcher matcher =
+                  java.util.regex.Pattern.compile("\"pk\":(-?\\d+)").matcher(row);
+              if (matcher.find() && truth.get(q).contains(Long.parseLong(matcher.group(1)))) {
+                found += 1;
+              }
+            }
+
+            emit(
+                RESULT
+                    + "{\"index\":\"" + label + "\""
+                    + ",\"path\":\"procedure\""
+                    + ",\"over\":0"
+                    + ",\"repeat\":" + repeat
+                    + ",\"query\":" + q
+                    + ",\"ms\":" + millis
+                    + ",\"hits\":" + hits.size()
+                    + ",\"found\":" + found
+                    + ",\"recall\":" + String.format(Locale.ROOT, "%.6f",
+                        topK == 0 ? 0.0 : found / (double) topK)
+                    + "}");
+          }
+        }
+      }
+
+      List<Long> procedureScans = new ArrayList<>();
+      for (int q = warmup; q < warmup + measured; q++) {
+        procedureScans.add(scanMillis.get(q));
+      }
+      emit(SUMMARY + "{\"kind\":\"scan\"," + statistics(procedureScans)
+          + ",\"queries\":" + measured + "}");
+      emit(SUMMARY + "{\"kind\":\"done\"}");
+      file.close();
+      spark.stop();
+      return;
+    }
+
     for (int q = warmup; q < warmup + measured; q++) {
       for (String indexName : indexNames) {
         String spec = indexName.trim();

@@ -1,7 +1,11 @@
 #!/bin/bash
 # Runs the vector benchmark on the A cluster (sh-a-spark) and keeps everything it printed.
 #
-#   ./run-benchmark.sh <out-name> <base-table> <query-table> [topK] [queries] [warmup] [repeats] [over-samples] [indexes]
+#   ./run-benchmark.sh <out-name> <base-table> <query-table> \
+#       [topK] [queries] [warmup] [repeats] [over-samples] [indexes] [mode]
+#
+# [mode] is `rule` (default: ORDER BY, which is what a user writes and where over-sample matters) or
+# `procedure` (CALL vector_search: one index, no over-sample, for the structures the rule declines).
 #
 # <indexes> is a comma separated list of index names to sweep, or "-" for the column's default. A
 # column that holds several indexes is measured one arm per name, in one run and on the same rows,
@@ -28,6 +32,7 @@ WARMUP=${6:-3}
 REPEATS=${7:-2}
 OVERS=${8:-1,3,10,30,100}
 INDEXES=${9:--}
+MODE=${10:-rule}
 
 export JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64
 export HADOOP_HOME=/opt/hadoop-3.3.1
@@ -52,7 +57,7 @@ mkdir -p "$HERE/build"
 
 NAME=sparkann-bench
 SUBMIT_LOG=$(mktemp)
-echo ">>> submitting $OUT: $BASE over $OVERS (x$REPEATS), $QUERIES queries, indexes $INDEXES"
+echo ">>> submitting $OUT: $BASE over $OVERS (x$REPEATS), $QUERIES queries, indexes $INDEXES, mode $MODE"
 nohup "$SPARK_HOME/bin/spark-submit" \
   --master "k8s://$API" \
   --deploy-mode cluster \
@@ -77,7 +82,7 @@ nohup "$SPARK_HOME/bin/spark-submit" \
   "$HERE/vector-benchmark.jar" \
   "$NN/spark-warehouse/" thrift://10.130.17.34:9083 \
   "$BASE" "$QUERY_TABLE" vector "$TOPK" "$QUERIES" "$WARMUP" "$REPEATS" \
-  "$NN/user/wanganyang/sparkann/bench/$OUT.jsonl" "$OVERS" "$INDEXES" \
+  "$NN/user/wanganyang/sparkann/bench/$OUT.jsonl" "$OVERS" "$INDEXES" "$MODE" \
   > "$SUBMIT_LOG" 2>&1 &
 SUBMIT_PID=$!
 
