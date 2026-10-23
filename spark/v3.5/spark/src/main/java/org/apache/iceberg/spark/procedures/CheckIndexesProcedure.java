@@ -55,6 +55,11 @@ import org.apache.spark.unsafe.types.UTF8String;
  */
 class CheckIndexesProcedure extends BaseProcedure {
 
+  // package private so a test can pin the statement a row suggests without staging a broken index
+  static String refreshSuggestionFor(String catalog, String tableName, String column) {
+    return refreshSuggestion(catalog, tableName, column);
+  }
+
   private static final ProcedureParameter TABLE_PARAM =
       ProcedureParameter.required("table", DataTypes.StringType);
 
@@ -110,7 +115,7 @@ class CheckIndexesProcedure extends BaseProcedure {
     Table table;
     try {
       table = org.apache.iceberg.spark.Spark3Util.loadIcebergTable(spark(), tableName);
-      checkTable(table, rows);
+      checkTable(tableCatalog().name(), table, tableName, rows);
     } catch (org.apache.spark.sql.catalyst.parser.ParseException e) {
       throw new IllegalArgumentException("Not a table identifier: " + tableName, e);
     } catch (org.apache.spark.sql.catalyst.analysis.NoSuchTableException e) {
@@ -122,7 +127,8 @@ class CheckIndexesProcedure extends BaseProcedure {
     return rows.toArray(new InternalRow[0]);
   }
 
-  private void checkTable(Table table, List<InternalRow> rows) throws java.io.IOException {
+  private void checkTable(String catalog, Table table, String tableName, List<InternalRow> rows)
+      throws java.io.IOException {
     for (IndexMetadata metadata : org.apache.iceberg.index.spark.VectorIndexes.indexesOf(table)) {
       IndexSnapshot snapshot = metadata.latestSnapshot();
       String column = VectorIndexProcedures.columnName(table, metadata.definition().fieldId());
@@ -162,7 +168,10 @@ class CheckIndexesProcedure extends BaseProcedure {
                 false,
                 snapshot.sourceTableSnapshotId(),
                 isStale(table, snapshot),
-                "payload header is unreadable (" + e.getMessage() + "); rebuild the index"));
+                "payload header is unreadable ("
+                    + e.getMessage()
+                    + "); "
+                    + refreshSuggestion(catalog, tableName, column)));
         continue;
       }
 
@@ -178,7 +187,8 @@ class CheckIndexesProcedure extends BaseProcedure {
                 false,
                 snapshot.sourceTableSnapshotId(),
                 isStale(table, snapshot),
-                "no payload found in the index files; refresh the index"));
+                "no payload found in the index files; "
+                    + refreshSuggestion(catalog, tableName, column)));
         continue;
       }
 
@@ -203,8 +213,19 @@ class CheckIndexesProcedure extends BaseProcedure {
                       + adapter.kernel().name()
                       + " version "
                       + readerVersion
-                      + "; rebuild the index"));
+                      + "; "
+                      + refreshSuggestion(catalog, tableName, column)));
     }
+  }
+
+  /** The statement that rebuilds the index, which is the only thing a mismatch leaves to do. */
+  private static String refreshSuggestion(String catalog, String tableName, String column) {
+    // a table named with or without its catalog both end up as catalog.namespace.table
+    String bare =
+        tableName.startsWith(catalog + ".") ? tableName.substring(catalog.length() + 1) : tableName;
+    return String.format(
+        "run CALL %s.system.refresh_vector_index(table => '%s', column => '%s')",
+        catalog, catalog + "." + bare, column);
   }
 
   /** Reads the header of the first payload, which is where a mismatch shows up first. */
