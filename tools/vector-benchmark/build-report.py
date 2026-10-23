@@ -606,65 +606,63 @@ def build(runs, title, note=""):
             f'（＝索引文件字节数之和，与数据格式无关的部分也照实显示）。"--" 表示这一格还没测：'
             f'HNSW 不支持 RaBitQ（没有这样的 kernel），其余未测格见文末的补齐计划。</p></div>')
 
-    # ---- chart 1: recall against the over-sample
-    chart = Chart("recall@10 随 over-sample 的变化", "over-sample（1 = 关闭）", "recall@10",
-                  pad=(70, 24, 48, 185))
-    every = sorted({over for run in runs for over in by_over(run)})
-    xlabels = [str(over) for over in every]
-    for index, run in enumerate(runs):
-        per_over = by_over(run)
-        if not per_over:
+    # ---- charts, one pair per table: five arms on one axis is readable, twenty is not
+    groups = {}
+    for run in runs:
+        if not run.get("results"):
             continue
-        colour = PALETTE[index % len(PALETTE)]
-        means, spread = [], []
-        for over in every:
-            if over not in per_over:
-                means.append(None)
-                spread.append(None)
-                continue
-            values = per_over[over]["recall"]
-            means.append(statistics.mean(values))
-            spread.append((min(values), max(values)))
-        chart.add_series(run["name"], every, means, colour, error=spread)
-    chart.xlabels = xlabels or ["1"]
-    chart.y_min, chart.y_max = 0.0, 1.02
-    parts.append(f'<h2>曲线</h2><div class="card">{chart.render()}'
-                 f'<p class="note">折线是每个取值下所有（查询 × 轮次）的平均 recall，'
-                 f'竖线是其中的最小值与最大值：查询之间的差异比轮次之间的差异大得多。</p></div>')
+        groups.setdefault(cell_of(run), []).append(run)
 
-    # ---- chart 2: latency against the over-sample, with the scan as a reference line
-    chart = Chart("查询延迟随 over-sample 的变化", "over-sample（1 = 关闭）",
-                  "每次查询耗时 (ms，对数刻度)", pad=(84, 24, 48, 275), log_y=True)
-    for index, run in enumerate(runs):
-        per_over = by_over(run)
-        if not per_over:
-            continue
-        colour = PALETTE[index % len(PALETTE)]
-        medians, lows, highs = [], [], []
-        for over in every:
-            if over not in per_over:
-                medians.append(None)
-                lows.append(0)
-                highs.append(0)
-                continue
-            entry = per_over[over]
-            medians.append(statistics.median(entry["ms"]))
-            lows.append(percentile(sorted(entry["ms"]), 0.25))
-            highs.append(percentile(sorted(entry["ms"]), 0.75))
-        band = [i for i, value in enumerate(medians) if value is not None]
-        chart.add_band([every[i] for i in band], [lows[i] for i in band],
-                       [highs[i] for i in band], colour)
-        chart.add_series(f"{run['name']} 中位数", every, medians, colour)
-    chart.xlabels = xlabels or ["1"]
-    for index, run in enumerate(runs):
-        baseline = scan_latencies(run) if run.get("first_of_log", True) else []
+    parts.append("<h2>曲线（每张表一组）</h2>")
+    for (scale, data_format), group in sorted(groups.items(), reverse=True):
+        overs = sorted({over for run in group for over in by_over(run)})
+        recall_chart = Chart(
+            f"{scale} · {data_format}：recall@10 随 over-sample 的变化",
+            "over-sample（1 = 关闭）", "recall@10", pad=(70, 24, 48, 150))
+        latency_chart = Chart(
+            f"{scale} · {data_format}：查询延迟随 over-sample 的变化",
+            "over-sample（1 = 关闭）", "每次查询耗时 (ms，对数刻度)",
+            pad=(84, 24, 48, 150), log_y=True)
+        for position, run in enumerate(group):
+            per_over = by_over(run)
+            colour = PALETTE[position % len(PALETTE)]
+            label = arm_of(run)
+            means, spread, medians, lows, highs = [], [], [], [], []
+            for over in overs:
+                if over not in per_over:
+                    means.append(None)
+                    spread.append(None)
+                    medians.append(None)
+                    lows.append(0)
+                    highs.append(0)
+                    continue
+                entry = per_over[over]
+                means.append(statistics.mean(entry["recall"]))
+                spread.append((min(entry["recall"]), max(entry["recall"])))
+                medians.append(statistics.median(entry["ms"]))
+                lows.append(percentile(sorted(entry["ms"]), 0.25))
+                highs.append(percentile(sorted(entry["ms"]), 0.75))
+            recall_chart.add_series(label, overs, means, colour, error=spread)
+            band = [i for i, value in enumerate(medians) if value is not None]
+            latency_chart.add_band([overs[i] for i in band], [lows[i] for i in band],
+                                   [highs[i] for i in band], colour)
+            latency_chart.add_series(label, overs, medians, colour)
+
+        recall_chart.xlabels = [str(over) for over in overs]
+        recall_chart.y_min, recall_chart.y_max = 0.0, 1.02
+        latency_chart.xlabels = [str(over) for over in overs]
+        baseline = [row["ms"] for run in group for row in run["scans"]
+                    if not row.get("warmup")]
         if baseline:
-            chart.add_hline(statistics.median(baseline),
-                            f"{run['name']} 全表扫描 {statistics.median(baseline):.0f} ms",
-                            PALETTE[index % len(PALETTE)])
-    parts.append(f'<div class="card">{chart.render()}'
-                 f'<p class="note">实线是每个取值的中位延迟，浅色带是 p25–p75，虚线是该表全表扫描的中位数。</p>'
-                 f'</div>')
+            latency_chart.add_hline(statistics.median(baseline),
+                                    f"全表扫描中位数 {statistics.median(baseline) / 1000:.1f} s",
+                                    "#9aa4b1")
+        parts.append(f'<div class="card">{recall_chart.render()}'
+                     f'<p class="note">竖线是该取值下各次（查询 × 轮次）recall 的 min–max：'
+                     f'查询之间的差异远大于轮次之间的差异。</p></div>')
+        parts.append(f'<div class="card">{latency_chart.render()}'
+                     f'<p class="note">实线是中位延迟，浅色带是 p25–p75，虚线是全表扫描的中位数。</p>'
+                     f'</div>')
 
     # ---- chart 3: the trade-off
     chart = Chart("recall 与延迟的取舍", "每次查询耗时（中位数, ms）", "recall@10",
@@ -683,9 +681,11 @@ def build(runs, title, note=""):
                  f'<p class="note">横轴是每个 over-sample 取值的中位延迟（对数刻度），'
                  f'纵轴是它的平均 recall；越靠左上越好，同一个 run 的点按 over-sample 从小到大连线。</p></div>')
 
-    # ---- chart 4: per-query spread, so the noise is visible
+    # ---- chart 4: per-query spread, so the noise is visible. It keeps one axis for every table,
+    # which is what makes a tail on the 100M rows comparable with the 10M ones.
+    every = sorted({over for run in runs for over in by_over(run)})
     chart = Chart("每次查询的耗时分布（点 = 一次查询）", "over-sample（1 = 关闭）",
-                  "每次查询耗时 (ms)", pad=(70, 24, 48, 130))
+                  "每次查询耗时 (ms)", pad=(70, 24, 48, 200))
     for index, run in enumerate(runs):
         per_over = by_over(run)
         if not per_over:
@@ -700,7 +700,7 @@ def build(runs, title, note=""):
                 chart.series.append({"label": "", "xs": [], "ys": [], "colour": colour,
                                      "markers": False, "error": None,
                                      "strip": (position + jitter * 0.6, value)})
-    chart.xlabels = xlabels or ["1"]
+    chart.xlabels = [str(over) for over in every] or ["1"]
     chart.strip_legend = [(run["name"], PALETTE[index % len(PALETTE)])
                           for index, run in enumerate(runs) if run["results"]]
     parts.append(f'<div class="card">{render_strip(chart)}</div>')
