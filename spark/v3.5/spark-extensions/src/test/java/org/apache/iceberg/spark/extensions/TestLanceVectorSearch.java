@@ -22,7 +22,19 @@ import static org.assertj.core.api.Assertions.assertThat;
 
 import java.nio.file.Path;
 import java.util.List;
+import org.apache.iceberg.DeleteFile;
+import org.apache.iceberg.FileFormat;
+import org.apache.iceberg.PartitionSpec;
+import org.apache.iceberg.Schema;
+import org.apache.iceberg.Table;
+import org.apache.iceberg.data.GenericRecord;
+import org.apache.iceberg.data.Record;
+import org.apache.iceberg.deletes.EqualityDeleteWriter;
+import org.apache.iceberg.encryption.EncryptedFiles;
+import org.apache.iceberg.encryption.EncryptedOutputFile;
+import org.apache.iceberg.formats.FormatModelRegistry;
 import org.apache.iceberg.index.vector.VectorIndexTypes;
+import org.apache.iceberg.spark.Spark3Util;
 import org.apache.spark.sql.Row;
 import org.apache.spark.sql.SparkSession;
 import org.junit.jupiter.api.AfterAll;
@@ -225,5 +237,91 @@ class TestLanceVectorSearch {
             .collect(java.util.stream.Collectors.toList());
     assertThat(indexed).as("the index answers what a full scan answers").isEqualTo(scanned);
     assertThat(indexed).doesNotContain(0L);
+  }
+
+  @Test
+  public void searchAppliesEqualityDeletesStoredInTheTablesOwnFormat() throws Exception {
+    String table = "local.db.lance_vectors_eq_deleted";
+    spark.sql("CREATE NAMESPACE IF NOT EXISTS local.db");
+    spark.sql("DROP TABLE IF EXISTS " + table);
+    spark.sql(
+        "CREATE TABLE "
+            + table
+            + " (id bigint, embedding array<double>) USING iceberg "
+            + "TBLPROPERTIES ('format-version' = '2', 'write.format.default' = 'lance', "
+            + "'write.delete.mode' = 'merge-on-read')");
+    spark.sql(
+        String.format(
+            "INSERT INTO %s SELECT id, array(CAST(id AS double), CAST(100 - id AS double)) "
+                + "FROM range(0, 200)",
+            table));
+    spark.sql(
+        String.format(
+            "CALL local.system.build_vector_index("
+                + "table => '%s', column => 'embedding', dimension => 2, metric => 'euclidean')",
+            table));
+
+    Table iceberg = Spark3Util.loadIcebergTable(spark, table);
+    DeleteFile deleteFile = writeEqualityDelete(iceberg, 0L);
+    assertThat(deleteFile.format())
+        .as("the delete file is written in the table's format, not parquet")
+        .isEqualTo(FileFormat.LANCE);
+    iceberg.newRowDelta().addDeletes(deleteFile).commit();
+
+    List<Row> hits =
+        spark
+            .sql(
+                String.format(
+                    "CALL local.system.vector_search(table => '%s', column => 'embedding', "
+                        + "query => array(0.0d, 100.0d), k => 3)",
+                    table))
+            .collectAsList();
+    assertThat(hits).isNotEmpty();
+    assertThat(hits.stream().map(row -> row.getString(3)).filter(row -> row != null))
+        .as("the row deleted by value is not among the hits")
+        .allSatisfy(row -> assertThat(row).doesNotContain("\"id\":0,"));
+
+    List<Long> indexed =
+        spark
+            .sql(
+                String.format(
+                    "SELECT id FROM %s ORDER BY vec_distance(embedding, array(0.0d, 100.0d)) LIMIT 3",
+                    table))
+            .collectAsList()
+            .stream()
+            .map(row -> row.getLong(0))
+            .collect(java.util.stream.Collectors.toList());
+    List<Long> scanned =
+        spark
+            .sql(
+                String.format(
+                    "SELECT id FROM %s ORDER BY vec_distance(embedding, array(0.0d, 100.0d)) + 0.0d "
+                        + "LIMIT 3",
+                    table))
+            .collectAsList()
+            .stream()
+            .map(row -> row.getLong(0))
+            .collect(java.util.stream.Collectors.toList());
+    assertThat(indexed).as("the index answers what a full scan answers").isEqualTo(scanned);
+    assertThat(indexed).doesNotContain(0L);
+  }
+
+  /** Writes one equality delete row into a delete file in the table's own format. */
+  private static DeleteFile writeEqualityDelete(Table table, long id) throws Exception {
+    Schema keySchema = table.schema().select("id");
+    EncryptedOutputFile out =
+        EncryptedFiles.plainAsEncryptedOutput(
+            table.io().newOutputFile(table.location() + "/data/equality-delete-" + id + ".lance"));
+    EqualityDeleteWriter<Record> writer =
+        FormatModelRegistry.equalityDeleteWriteBuilder(FileFormat.LANCE, Record.class, out)
+            .schema(keySchema)
+            .spec(PartitionSpec.unpartitioned())
+            .equalityFieldIds(keySchema.columns().get(0).fieldId())
+            .build();
+    try (writer) {
+      writer.write(GenericRecord.create(keySchema).copy("id", id));
+    }
+
+    return writer.toDeleteFile();
   }
 }
