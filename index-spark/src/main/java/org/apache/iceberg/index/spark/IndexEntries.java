@@ -48,6 +48,7 @@ import org.apache.iceberg.relocated.com.google.common.collect.ImmutableSet;
 import org.apache.iceberg.relocated.com.google.common.collect.Lists;
 import org.apache.iceberg.relocated.com.google.common.collect.Maps;
 import org.apache.iceberg.relocated.com.google.common.collect.Sets;
+import org.apache.iceberg.types.Type;
 import org.apache.iceberg.types.Types;
 import org.apache.spark.api.java.JavaPairRDD;
 import org.apache.spark.api.java.JavaRDD;
@@ -339,6 +340,7 @@ public final class IndexEntries {
 
     // delete files are read on the driver so the executor-side filter is a simple lookup
     long[] deletedPositions = deletes.deletedPositions(dataFile);
+    List<org.apache.iceberg.types.Types.NestedField> keyFields = deletes.keyFields();
     List<String> keyColumns = deletes.keyColumns();
     Set<String> equalityKeys = deletes.equalityKeys();
 
@@ -360,7 +362,7 @@ public final class IndexEntries {
     Collection<Long> wantedPositions = positions == null ? null : Lists.newArrayList(positions);
     return data.filter(
             (Function<Tuple2<Row, Long>, Boolean>)
-                tuple -> isLive(tuple, wantedPositions, deletedPositions, equalityKeys, keyColumns))
+                tuple -> isLive(tuple, wantedPositions, deletedPositions, equalityKeys, keyFields))
         .mapToPair(
             (PairFunction<Tuple2<Row, Long>, Long, Row>)
                 tuple ->
@@ -377,7 +379,7 @@ public final class IndexEntries {
       Collection<Long> positions,
       long[] deletedPositions,
       Set<String> equalityKeys,
-      List<String> keyColumns) {
+      List<org.apache.iceberg.types.Types.NestedField> keyFields) {
     long position = tuple._2();
     if (positions != null && !positions.isEmpty() && !positions.contains(position)) {
       return false;
@@ -387,7 +389,7 @@ public final class IndexEntries {
       return false;
     }
 
-    return equalityKeys.isEmpty() || !equalityKeys.contains(equalityKey(tuple._1(), keyColumns));
+    return equalityKeys.isEmpty() || !equalityKeys.contains(equalityKey(tuple._1(), keyFields));
   }
 
   /**
@@ -756,15 +758,15 @@ public final class IndexEntries {
 
     private final Map<String, long[]> deletedPositionsByFile;
     private final Broadcast<Set<String>> equalityKeys;
-    private final List<String> keyColumns;
+    private final List<org.apache.iceberg.types.Types.NestedField> keyFields;
 
     private SnapshotDeletes(
         Map<String, long[]> deletedPositionsByFile,
         Broadcast<Set<String>> equalityKeys,
-        List<String> keyColumns) {
+        List<org.apache.iceberg.types.Types.NestedField> keyFields) {
       this.deletedPositionsByFile = deletedPositionsByFile;
       this.equalityKeys = equalityKeys;
-      this.keyColumns = keyColumns;
+      this.keyFields = keyFields;
     }
 
     /** A snapshot without delete files, which is the common case. */
@@ -790,7 +792,8 @@ public final class IndexEntries {
         return none();
       }
 
-      List<String> keyColumns = equalityColumns(tableSchema, ImmutableList.copyOf(equalityDeletes));
+      List<org.apache.iceberg.types.Types.NestedField> keyFields =
+          equalityFields(tableSchema, ImmutableList.copyOf(equalityDeletes));
       Map<String, long[]> deletedByFile =
           positionDeletes.isEmpty()
               ? ImmutableMap.of()
@@ -800,10 +803,10 @@ public final class IndexEntries {
       if (!equalityDeletes.isEmpty()) {
         keys =
             JavaSparkContext.fromSparkContext(spark.sparkContext())
-                .broadcast(readEqualityKeys(spark, equalityDeletes, keyColumns));
+                .broadcast(readEqualityKeys(spark, equalityDeletes, keyFields));
       }
 
-      return new SnapshotDeletes(deletedByFile, keys, keyColumns);
+      return new SnapshotDeletes(deletedByFile, keys, keyFields);
     }
 
     /** The positions removed from a data file, sorted so a lookup is a binary search. */
@@ -817,7 +820,16 @@ public final class IndexEntries {
     }
 
     List<String> keyColumns() {
-      return keyColumns;
+      List<String> names = Lists.newArrayListWithCapacity(keyFields.size());
+      for (org.apache.iceberg.types.Types.NestedField field : keyFields) {
+        names.add(field.name());
+      }
+
+      return names;
+    }
+
+    List<org.apache.iceberg.types.Types.NestedField> keyFields() {
+      return keyFields;
     }
   }
 
@@ -865,7 +877,9 @@ public final class IndexEntries {
    * column name falls back to the field id when the name is not the table's field name.
    */
   private static Set<String> readEqualityKeys(
-      SparkSession spark, Collection<DeleteFile> equalityDeletes, List<String> keyColumns) {
+      SparkSession spark,
+      Collection<DeleteFile> equalityDeletes,
+      List<Types.NestedField> keyFields) {
     Dataset<Row> deletes = null;
     for (DeleteFile deleteFile : equalityDeletes) {
       Dataset<Row> file = spark.read().parquet(deleteFile.location().toString());
@@ -875,9 +889,11 @@ public final class IndexEntries {
     Set<String> keys = Sets.newHashSet();
     for (Row row : deletes.collectAsList()) {
       StringBuilder key = new StringBuilder();
-      for (int i = 0; i < keyColumns.size() && i < row.size(); i++) {
-        Object value = row.get(i);
-        key.append(encodedValue(value)).append(VALUE_SEPARATOR);
+      // a delete file holds its key columns in the order the delete file was written with, which is
+      // the order of the field ids; the value is encoded by the column's type, because the two
+      // sides read it through different readers and only the type is common to both
+      for (int i = 0; i < keyFields.size() && i < row.size(); i++) {
+        key.append(encodedValue(keyFields.get(i).type(), row.get(i))).append(VALUE_SEPARATOR);
       }
       keys.add(key.toString());
     }
@@ -885,34 +901,105 @@ public final class IndexEntries {
   }
 
   /** The table columns of the equality fields, in field id order. */
-  private static List<String> equalityColumns(
+  private static List<Types.NestedField> equalityFields(
       Schema schema, Collection<DeleteFile> equalityDeletes) {
     if (equalityDeletes.isEmpty()) {
       return Lists.newArrayList();
     }
 
-    List<String> columns = Lists.newArrayList();
+    List<Types.NestedField> fields = Lists.newArrayList();
     for (int fieldId : equalityDeletes.iterator().next().equalityFieldIds()) {
       Types.NestedField field = schema.findField(fieldId);
-      columns.add(field == null ? String.valueOf(fieldId) : field.name());
+      if (field != null) {
+        fields.add(field);
+      }
     }
-    return columns;
+
+    return fields;
   }
 
   /**
    * Builds the lookup key of a data row for equality delete matching, in the same encoding as the
    * keys read from the equality delete files.
    */
-  private static String equalityKey(Row row, List<String> keyColumns) {
+  private static String equalityKey(Row row, List<Types.NestedField> keyFields) {
     StringBuilder key = new StringBuilder();
-    for (String keyColumn : keyColumns) {
-      key.append(encodedValue(row.get(row.fieldIndex(keyColumn)))).append(VALUE_SEPARATOR);
+    for (Types.NestedField field : keyFields) {
+      Object value = row.get(row.fieldIndex(field.name()));
+      key.append(encodedValue(field.type(), value)).append(VALUE_SEPARATOR);
     }
     return key.toString();
   }
 
-  private static String encodedValue(Object value) {
-    return value == null ? String.valueOf(NULL_MARKER) : value.getClass().getName() + ":" + value;
+  /**
+   * One key column's value as text, decided by its type rather than by its Java class.
+   *
+   * <p>The data rows and the delete rows reach this point through different readers: a data row is
+   * converted to the Spark representation ({@code toSparkValue}), while a delete row is read by
+   * Spark itself, which hands back {@code java.sql.Timestamp} for a timestamp and {@code
+   * java.math.BigDecimal} for a decimal. Encoding the class name, as this did before, made the two
+   * sides produce different keys for anything but the primitive types, so a delete matched nothing
+   * and the row it removed stayed visible through the index.
+   */
+  private static String encodedValue(Type type, Object value) {
+    if (value == null) {
+      return String.valueOf(NULL_MARKER);
+    }
+
+    // the canonical form of each type, which both sides can produce: the day number, the micros,
+    // the plain text, and so on
+    switch (type.typeId()) {
+      case STRING:
+        return "string:" + value;
+      case DATE:
+        return "date:"
+            + (value instanceof Number
+                ? ((Number) value).intValue()
+                : ((java.sql.Date) value).toLocalDate().toEpochDay());
+      case TIME:
+        return "time:"
+            + (value instanceof Number
+                ? ((Number) value).longValue()
+                : ((java.time.LocalTime) value).toNanoOfDay() / 1000L);
+      case TIMESTAMP:
+        return "timestamp:" + micros(value);
+      case INTEGER:
+        return "int:" + ((Number) value).intValue();
+      case LONG:
+        return "long:" + ((Number) value).longValue();
+      case FLOAT:
+        return "float:" + ((Number) value).floatValue();
+      case DOUBLE:
+        return "double:" + ((Number) value).doubleValue();
+      case BOOLEAN:
+        return "boolean:" + value;
+      case UUID:
+        return "uuid:" + value;
+      case FIXED:
+      case BINARY:
+        return type.typeId() + ":" + java.util.Base64.getEncoder().encodeToString((byte[]) value);
+      default:
+        return type.typeId() + ":" + value;
+    }
+  }
+
+  /** Microseconds since the epoch, from either a count of them or a timestamp object. */
+  private static long micros(Object value) {
+    if (value instanceof Number) {
+      return ((Number) value).longValue();
+    } else if (value instanceof java.sql.Timestamp) {
+      java.sql.Timestamp timestamp = (java.sql.Timestamp) value;
+      return timestamp.getTime() * 1000L + (timestamp.getNanos() / 1000L) % 1000L;
+    } else if (value instanceof java.time.Instant) {
+      java.time.Instant instant = (java.time.Instant) value;
+      return instant.getEpochSecond() * 1_000_000L + instant.getNano() / 1000L;
+    } else if (value instanceof java.time.OffsetDateTime) {
+      return micros(((java.time.OffsetDateTime) value).toInstant());
+    } else if (value instanceof java.time.LocalDateTime) {
+      return micros(((java.time.LocalDateTime) value).toInstant(java.time.ZoneOffset.UTC));
+    }
+
+    throw new IllegalArgumentException("Cannot read a timestamp from a " + value.getClass());
   }
 
   /**
