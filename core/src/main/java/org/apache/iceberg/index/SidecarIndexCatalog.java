@@ -180,7 +180,14 @@ public final class SidecarIndexCatalog implements IndexCatalog {
     // the index tree is written first: registering an index whose metadata does not exist yet
     // would publish an index that cannot be loaded
     writeMetadata(metadata, 1, 0);
-    register(tableLocation, request.tableUuid(), request.indexUuid());
+    try {
+      register(tableLocation, request.tableUuid(), request.indexUuid());
+    } catch (RuntimeException e) {
+      // a registration that never happened must not leave a tree nothing points at
+      purgeMetadata(indexLocation);
+      throw e;
+    }
+
     return metadata;
   }
 
@@ -523,6 +530,13 @@ public final class SidecarIndexCatalog implements IndexCatalog {
   private List<String> readRegistryUuids(String tableLocation, String registryFile) {
     String json = readIfExists(registryPath(tableLocation, registryFile));
     if (json == null) {
+      Preconditions.checkArgument(
+          registryFile == null,
+          "The table points at registry file %s, which does not exist. The table property %s is "
+              + "set to a file that was deleted or never written, so what the table holds is not "
+              + "known; unset it to fall back to the file written in place",
+          registryFile,
+          REGISTRY_PROPERTY);
       return ImmutableList.of();
     }
 

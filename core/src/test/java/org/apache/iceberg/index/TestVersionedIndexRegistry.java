@@ -177,7 +177,22 @@ class TestVersionedIndexRegistry {
   }
 
   @Test
-  void givesUpWhenThePointerKeepsMoving() {
+  void refusesToStartFromEmptyWhenTheRegistryFileIsGone() {
+    TestTables.TestTableOperations ops = operations();
+    SidecarIndexCatalog catalog = versionedCatalog(ops);
+    catalog.createIndex(request("index-a"));
+
+    // the file the table points at was removed: what the table holds is not known, so it must not
+    // be treated as a table with no indexes, which the next registration would overwrite
+    new File(indexesRoot(), registryPointer(ops)).delete();
+
+    assertThatThrownBy(() -> catalog.createIndex(request("index-b")))
+        .isInstanceOf(IllegalArgumentException.class)
+        .hasMessageContaining("does not exist");
+  }
+
+  @Test
+  void aRegistrationThatNeverCompletesLeavesNoTreeBehind() {
     TestTables.TestTableOperations ops = operations();
     SidecarIndexCatalog catalog =
         new SidecarIndexCatalog(
@@ -187,8 +202,9 @@ class TestVersionedIndexRegistry {
     assertThatThrownBy(() -> catalog.createIndex(request("index-a")))
         .isInstanceOf(CommitFailedException.class)
         .hasMessageContaining("index-a");
-    // the index tree is written before the registration, so it is there to be cleaned up
-    assertThat(new File(indexesRoot(), "index-a/metadata/index-metadata-v1-g1.json")).exists();
+    // the tree written before the registration is removed again, so a failed build leaves nothing
+    File metadata = new File(indexesRoot(), "index-a/metadata");
+    assertThat(metadata.exists() ? metadata.listFiles() : new File[0]).isEmpty();
     assertThat(ops.refresh().properties()).doesNotContainKey(SidecarIndexCatalog.REGISTRY_PROPERTY);
   }
 
