@@ -23,6 +23,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 import java.util.List;
 import org.apache.iceberg.ParameterizedTestExtension;
 import org.apache.iceberg.Table;
+import org.apache.iceberg.index.SidecarIndexCatalog;
 import org.apache.iceberg.relocated.com.google.common.collect.Lists;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.TestTemplate;
@@ -79,7 +80,8 @@ public class TestVectorIndexRecreation extends ExtensionsTestBase {
 
     Table table = validationCatalog.loadTable(tableIdentifier(TABLE));
     String tableUuid = String.valueOf(table.uuid());
-    assertThat(table.io().newInputFile(table.location() + "/indexes/index-registry.json").exists())
+    String registry = table.properties().get(SidecarIndexCatalog.REGISTRY_PROPERTY);
+    assertThat(table.io().newInputFile(table.location() + "/indexes/" + registry).exists())
         .as("the sidecar is still on disk after the table is dropped")
         .isTrue();
 

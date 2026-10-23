@@ -118,7 +118,7 @@ class TestIndexBuildShuffle {
             .load(warehouseDir.resolve("db/build").toUri().toString());
     long snapshotId = table.currentSnapshot().snapshotId();
 
-    IndexCatalog indexCatalog = new SidecarIndexCatalog(table.io());
+    IndexCatalog indexCatalog = new SidecarIndexCatalog(table.io(), table);
     IndexMetadata metadata =
         indexCatalog.createIndex(
             CreateIndexRequest.builder()

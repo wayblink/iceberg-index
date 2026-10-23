@@ -25,6 +25,11 @@ import java.io.UncheckedIOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.NoSuchFileException;
 import java.util.List;
+import java.util.UUID;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+import org.apache.iceberg.Table;
+import org.apache.iceberg.exceptions.CommitFailedException;
 import org.apache.iceberg.exceptions.NotFoundException;
 import org.apache.iceberg.io.FileIO;
 import org.apache.iceberg.io.InputFile;
@@ -45,7 +50,10 @@ import org.slf4j.LoggerFactory;
  * <p>Layout under the table location:
  *
  * <ul>
- *   <li>{@code indexes/index-registry.json}: the registry of index UUIDs
+ *   <li>{@code indexes/indexmeta.v{N}-{suffix}.json}: an immutable version of the registry of index
+ *       UUIDs, which the table property {@link #REGISTRY_PROPERTY} names by its file name
+ *   <li>{@code indexes/index-registry.json}: the registry of index UUIDs, written in place by
+ *       tables that do not carry the pointer property
  *   <li>{@code indexes/{index-uuid}/metadata/index-metadata-v{N}-g{G}.json}: a version of the index
  *       metadata root, one file per publication
  *   <li>{@code indexes/{index-uuid}/metadata/index-metadata-pointer-{0,1}.json}: the pointer to the
@@ -56,7 +64,17 @@ import org.slf4j.LoggerFactory;
  * </ul>
  *
  * <p>Discovery uses the registry file because {@link FileIO} exposes no listing operation, which
- * also keeps the layout portable across file systems. All catalog mutations are single-writer.
+ * also keeps the layout portable across file systems.
+ *
+ * <p>The registry used to be a single file written in place, so two writers registering different
+ * indexes at the same time overwrote each other and one index was left behind with no way to find
+ * it. A registry file is now immutable and the table property names the current one, which makes a
+ * registration a compare-and-swap through the table commit: a writer that loses the race retries
+ * against the winner's registry instead of replacing it. A catalog without a pointer property, such
+ * as a table built by {@code HadoopTables}, falls back to the single file and is single-writer.
+ *
+ * <p>The pointer is a file name relative to the {@code indexes} directory, not an absolute path, so
+ * it keeps working when the table is registered or moved under a different location.
  *
  * <p>Publishing an index snapshot is atomic: a new metadata version is written as a new file and
  * only then does the pointer switch to it, so a reader always sees either the previous or the new
@@ -70,7 +88,23 @@ public final class SidecarIndexCatalog implements IndexCatalog {
   /** The directory, relative to the table location, that holds all index trees. */
   public static final String INDEXES_DIR = "indexes";
 
+  /**
+   * The table property that names the current registry file, relative to the {@code indexes}
+   * directory. A table without it keeps its registry in a single file written in place.
+   */
+  public static final String REGISTRY_PROPERTY = "index.registry";
+
+  /** The prefix every immutable registry file name starts with, followed by its version. */
+  public static final String REGISTRY_FILE_PREFIX = "indexmeta.v";
+
+  /** How many recently written registry files are kept, the current one included. */
+  public static final int VERSIONS_TO_KEEP = 10;
+
   private static final String REGISTRY_FILE = "index-registry.json";
+  private static final Pattern REGISTRY_FILE_NAME =
+      Pattern.compile("indexmeta\\.v(\\d{1,9})-[0-9a-f]{8}\\.json");
+  private static final int MAX_REGISTRY_ATTEMPTS = 5;
+  private static final long RETRY_MIN_WAIT_MS = 20L;
   private static final String POINTER_FILE_PREFIX = "index-metadata-pointer-";
   private static final int POINTER_SLOTS = 2;
   private static final String POINTER_GENERATION = "generation";
@@ -90,14 +124,32 @@ public final class SidecarIndexCatalog implements IndexCatalog {
 
   private static final String REGISTRY_FORMAT_VERSION = "format-version";
   private static final String REGISTRY_INDEX_UUIDS = "index-uuids";
-  private static final int REGISTRY_VERSION = 1;
+  private static final String REGISTRY_UPDATED_MS = "updated-ms";
+  private static final String REGISTRY_PREVIOUS_FILE = "previous-file";
+  private static final int REGISTRY_VERSION = 2;
+  private static final int LEGACY_REGISTRY_VERSION = 1;
 
   private static final Logger LOG = LoggerFactory.getLogger(SidecarIndexCatalog.class);
 
   private final FileIO fileIO;
+  private final IndexRegistryPointer pointer;
 
+  /**
+   * Creates a catalog for a table whose registry is a single file written in place, which is what a
+   * table without a pointer property has.
+   */
   public SidecarIndexCatalog(FileIO fileIO) {
+    this(fileIO, (IndexRegistryPointer) null);
+  }
+
+  /** Creates a catalog that registers indexes by pointing the table at a new registry file. */
+  public SidecarIndexCatalog(FileIO fileIO, Table table) {
+    this(fileIO, new TableIndexRegistryPointer(table));
+  }
+
+  SidecarIndexCatalog(FileIO fileIO, IndexRegistryPointer pointer) {
     this.fileIO = Preconditions.checkNotNull(fileIO, "File IO is null");
+    this.pointer = pointer;
   }
 
   @Override
@@ -125,16 +177,10 @@ public final class SidecarIndexCatalog implements IndexCatalog {
             .definition(request.definition())
             .properties(request.properties())
             .build();
+    // the index tree is written first: registering an index whose metadata does not exist yet
+    // would publish an index that cannot be loaded
     writeMetadata(metadata, 1, 0);
-
-    // whatever the registry holds that belongs to another table instance is not this table's, so
-    // it is replaced rather than added to: the table was dropped and created again at this location
-    List<String> indexUuids = Lists.newArrayList();
-    for (IndexMetadata existing : listIndexes(tableLocation, request.tableUuid())) {
-      indexUuids.add(existing.indexUuid());
-    }
-    indexUuids.add(request.indexUuid());
-    writeRegistry(tableLocation, indexUuids);
+    register(tableLocation, request.tableUuid(), request.indexUuid());
     return metadata;
   }
 
@@ -215,19 +261,140 @@ public final class SidecarIndexCatalog implements IndexCatalog {
     Preconditions.checkArgument(
         tableLocation != null && !tableLocation.isEmpty(), "Table location is empty");
     Preconditions.checkArgument(indexUuid != null && !indexUuid.isEmpty(), "Index UUID is empty");
-    List<String> indexUuids = readIndexUuids(tableLocation);
-    if (!indexUuids.contains(indexUuid)) {
+    if (!readIndexUuids(tableLocation).contains(indexUuid)) {
       return false;
     }
 
-    if (purge) {
-      purgeIndexFiles(loadIndex(tableLocation, indexUuid));
+    // load the metadata before unregistering, because purging reads it from disk afterwards
+    IndexMetadata metadata = purge ? loadIndex(tableLocation, indexUuid) : null;
+
+    // unregister first: a registration whose files are already gone cannot be loaded, while files
+    // left behind by a failed purge are only garbage
+    unregister(tableLocation, indexUuid);
+
+    if (metadata != null) {
+      purgeIndexFiles(metadata);
     }
 
-    indexUuids = Lists.newArrayList(indexUuids);
-    indexUuids.remove(indexUuid);
-    writeRegistry(tableLocation, indexUuids);
     return true;
+  }
+
+  /**
+   * Adds an index to the registry, writing a new registry file and then pointing the table at it.
+   *
+   * <p>Whatever the registry holds that belongs to another table instance is dropped rather than
+   * kept: the table was dropped and created again at this location, so those indexes are not the
+   * new table's.
+   */
+  private void register(String tableLocation, String tableUuid, String indexUuid) {
+    if (pointer == null) {
+      List<String> indexUuids = Lists.newArrayList();
+      for (IndexMetadata existing : listIndexes(tableLocation, tableUuid)) {
+        indexUuids.add(existing.indexUuid());
+      }
+      indexUuids.add(indexUuid);
+      writeLegacyRegistry(tableLocation, indexUuids);
+      return;
+    }
+
+    String previous = pointer.current();
+    for (int attempt = 1; ; attempt += 1) {
+      List<String> indexUuids =
+          Lists.newArrayList(uuidsOfTable(tableLocation, previous, tableUuid));
+      if (!indexUuids.contains(indexUuid)) {
+        indexUuids.add(indexUuid);
+      }
+
+      String next = writeRegistryVersion(tableLocation, indexUuids, previous);
+      if (pointer.compareAndSet(previous, next)) {
+        pruneOldVersions(tableLocation, next);
+        return;
+      }
+
+      if (attempt >= MAX_REGISTRY_ATTEMPTS) {
+        throw new CommitFailedException(
+            "Failed to register index %s for table %s after %s attempts: the registry of the "
+                + "table kept changing",
+            indexUuid, tableLocation, MAX_REGISTRY_ATTEMPTS);
+      }
+
+      // another writer moved the pointer: rebuild the registry from the one it published
+      previous = pointer.current();
+      backoff(attempt);
+    }
+  }
+
+  /**
+   * The uuids of a registry that belong to the given table instance, which is what a registration
+   * carries over into the new registry version.
+   */
+  private List<String> uuidsOfTable(String tableLocation, String registryFile, String tableUuid) {
+    List<String> indexUuids = readRegistryUuids(tableLocation, registryFile);
+    if (tableUuid == null) {
+      return indexUuids;
+    }
+
+    List<String> mine = Lists.newArrayListWithCapacity(indexUuids.size());
+    for (String indexUuid : indexUuids) {
+      String json = readMetadataFile(indexLocation(tableLocation, indexUuid));
+      if (json == null) {
+        continue;
+      }
+
+      // an index written before the table uuid was recorded is given the benefit of the doubt
+      IndexMetadata metadata = IndexMetadataParser.fromJson(json);
+      if (metadata.tableUuid() == null || tableUuid.equals(metadata.tableUuid())) {
+        mine.add(indexUuid);
+      }
+    }
+
+    return mine;
+  }
+
+  /** Removes an index from the registry, or does nothing if it is already gone. */
+  private void unregister(String tableLocation, String indexUuid) {
+    if (pointer == null) {
+      List<String> indexUuids = Lists.newArrayList(readIndexUuids(tableLocation));
+      if (indexUuids.remove(indexUuid)) {
+        writeLegacyRegistry(tableLocation, indexUuids);
+      }
+      return;
+    }
+
+    String previous = pointer.current();
+    for (int attempt = 1; ; attempt += 1) {
+      List<String> indexUuids = Lists.newArrayList(readRegistryUuids(tableLocation, previous));
+      if (!indexUuids.remove(indexUuid)) {
+        return;
+      }
+
+      String next = writeRegistryVersion(tableLocation, indexUuids, previous);
+      if (pointer.compareAndSet(previous, next)) {
+        pruneOldVersions(tableLocation, next);
+        return;
+      }
+
+      if (attempt >= MAX_REGISTRY_ATTEMPTS) {
+        throw new CommitFailedException(
+            "Failed to drop index %s from table %s after %s attempts: the registry of the table "
+                + "kept changing",
+            indexUuid, tableLocation, MAX_REGISTRY_ATTEMPTS);
+      }
+
+      previous = pointer.current();
+      backoff(attempt);
+    }
+  }
+
+  private static void backoff(int attempt) {
+    long waitMs = RETRY_MIN_WAIT_MS << Math.min(attempt - 1, 3);
+    try {
+      Thread.sleep(waitMs + (long) (Math.random() * waitMs));
+    } catch (InterruptedException e) {
+      Thread.currentThread().interrupt();
+      throw new CommitFailedException(
+          e, "Interrupted while waiting to retry an index registration");
+    }
   }
 
   private void purgeIndexFiles(IndexMetadata metadata) {
@@ -262,7 +429,8 @@ public final class SidecarIndexCatalog implements IndexCatalog {
   /** Writes a metadata version as a new file and then switches the pointer to it. */
   private void writeMetadata(IndexMetadata metadata, long generation, int slot) {
     String indexLocation = metadata.location();
-    writeString(metadataPath(indexLocation, generation), IndexMetadataParser.toJson(metadata));
+    writeString(
+        metadataPath(indexLocation, generation), IndexMetadataParser.toJson(metadata), false);
     writeString(
         pointerPath(indexLocation, slot),
         JsonUtil.generate(
@@ -273,7 +441,8 @@ public final class SidecarIndexCatalog implements IndexCatalog {
                   POINTER_METADATA_FILE, metadataPath(indexLocation, generation));
               generator.writeEndObject();
             },
-            false));
+            false),
+        false);
   }
 
   /** Reads the current metadata JSON, following the pointer, with a legacy layout fallback. */
@@ -343,14 +512,28 @@ public final class SidecarIndexCatalog implements IndexCatalog {
   }
 
   private List<String> readIndexUuids(String tableLocation) {
-    String json = readIfExists(registryPath(tableLocation));
+    String current = pointer == null ? null : pointer.current();
+    return readRegistryUuids(tableLocation, current);
+  }
+
+  /**
+   * Reads the uuids of the registry file the table points at, or of the legacy file when the table
+   * names none.
+   */
+  private List<String> readRegistryUuids(String tableLocation, String registryFile) {
+    String json = readIfExists(registryPath(tableLocation, registryFile));
     if (json == null) {
       return ImmutableList.of();
     }
+
     JsonNode registryNode = JsonUtil.parse(json, node -> node);
     int version = JsonUtil.getInt(REGISTRY_FORMAT_VERSION, registryNode);
     Preconditions.checkArgument(
-        version == REGISTRY_VERSION, "Unsupported index registry format version: %s", version);
+        version == LEGACY_REGISTRY_VERSION || version == REGISTRY_VERSION,
+        "Unsupported index registry format version: %s in %s",
+        version,
+        registryFile);
+
     List<String> indexUuids = Lists.newArrayList();
     for (JsonNode indexUuid : JsonUtil.get(REGISTRY_INDEX_UUIDS, registryNode)) {
       indexUuids.add(indexUuid.asText());
@@ -358,12 +541,27 @@ public final class SidecarIndexCatalog implements IndexCatalog {
     return indexUuids;
   }
 
-  private void writeRegistry(String tableLocation, List<String> indexUuids) {
+  /** Writes a new registry version and returns its file name, which is never reused. */
+  private String writeRegistryVersion(
+      String tableLocation, List<String> indexUuids, String previousFile) {
+    String fileName =
+        REGISTRY_FILE_PREFIX
+            + nextVersion(previousFile)
+            + "-"
+            + UUID.randomUUID().toString().replace("-", "").substring(0, 8)
+            + ".json";
+    writeString(
+        registryPath(tableLocation, fileName), registryJson(indexUuids, previousFile), true);
+    return fileName;
+  }
+
+  /** The registry a table without a pointer property keeps, written in place. */
+  private void writeLegacyRegistry(String tableLocation, List<String> indexUuids) {
     String json =
         JsonUtil.generate(
             generator -> {
               generator.writeStartObject();
-              generator.writeNumberField(REGISTRY_FORMAT_VERSION, REGISTRY_VERSION);
+              generator.writeNumberField(REGISTRY_FORMAT_VERSION, LEGACY_REGISTRY_VERSION);
               generator.writeArrayFieldStart(REGISTRY_INDEX_UUIDS);
               for (String indexUuid : indexUuids) {
                 generator.writeString(indexUuid);
@@ -372,7 +570,70 @@ public final class SidecarIndexCatalog implements IndexCatalog {
               generator.writeEndObject();
             },
             false);
-    writeString(registryPath(tableLocation), json);
+    writeString(registryPath(tableLocation, null), json, false);
+  }
+
+  private static String registryJson(List<String> indexUuids, String previousFile) {
+    return JsonUtil.generate(
+        generator -> {
+          generator.writeStartObject();
+          generator.writeNumberField(REGISTRY_FORMAT_VERSION, REGISTRY_VERSION);
+          generator.writeNumberField(REGISTRY_UPDATED_MS, System.currentTimeMillis());
+          generator.writeArrayFieldStart(REGISTRY_INDEX_UUIDS);
+          for (String indexUuid : indexUuids) {
+            generator.writeString(indexUuid);
+          }
+          generator.writeEndArray();
+          if (previousFile != null) {
+            generator.writeStringField(REGISTRY_PREVIOUS_FILE, previousFile);
+          }
+          generator.writeEndObject();
+        },
+        false);
+  }
+
+  private static long nextVersion(String previousFile) {
+    if (previousFile == null) {
+      return 1L;
+    }
+
+    Matcher matcher = REGISTRY_FILE_NAME.matcher(previousFile);
+    return matcher.matches() ? Long.parseLong(matcher.group(1)) + 1 : 1L;
+  }
+
+  /**
+   * Deletes the registry versions beyond the ones that are kept, walking back from the current one.
+   *
+   * <p>The chain of versions is the only index of them: {@link FileIO} cannot list a directory, and
+   * the file names carry a random suffix so that two writers never write the same version file.
+   * Pruning is best effort, because an unreferenced registry file is only a small leftover.
+   */
+  private void pruneOldVersions(String tableLocation, String currentFile) {
+    try {
+      String file = currentFile;
+      int kept = 0;
+      while (file != null) {
+        String json = readIfExists(registryPath(tableLocation, file));
+        if (json == null) {
+          return;
+        }
+
+        String previous = previousFile(JsonUtil.parse(json, node -> node));
+        if (kept >= VERSIONS_TO_KEEP) {
+          deleteIfExists(registryPath(tableLocation, file));
+        }
+
+        kept += 1;
+        file = previous;
+      }
+    } catch (RuntimeException e) {
+      LOG.warn("Failed to prune older index registry files of table {}", tableLocation, e);
+    }
+  }
+
+  private static String previousFile(JsonNode registryNode) {
+    JsonNode previous = registryNode.get(REGISTRY_PREVIOUS_FILE);
+    return previous == null || previous.isNull() ? null : previous.asText();
   }
 
   private String readIfExists(String path) {
@@ -394,8 +655,11 @@ public final class SidecarIndexCatalog implements IndexCatalog {
     }
   }
 
-  private void writeString(String path, String content) {
-    try (PositionOutputStream out = fileIO.newOutputFile(path).createOrOverwrite()) {
+  private void writeString(String path, String content, boolean createNew) {
+    try (PositionOutputStream out =
+        createNew
+            ? fileIO.newOutputFile(path).create()
+            : fileIO.newOutputFile(path).createOrOverwrite()) {
       out.write(content.getBytes(StandardCharsets.UTF_8));
     } catch (IOException e) {
       throw new UncheckedIOException("Failed to write " + path, e);
@@ -429,8 +693,19 @@ public final class SidecarIndexCatalog implements IndexCatalog {
     return location + "/" + INDEXES_DIR;
   }
 
-  private static String registryPath(String tableLocation) {
-    return indexesRoot(tableLocation) + "/" + REGISTRY_FILE;
+  private static String registryPath(String tableLocation, String registryFile) {
+    if (registryFile == null) {
+      return indexesRoot(tableLocation) + "/" + REGISTRY_FILE;
+    }
+
+    // the pointer is a file name in this directory, not a path: following anything else would let
+    // a corrupted or hostile property read a file anywhere
+    Preconditions.checkArgument(
+        REGISTRY_FILE_NAME.matcher(registryFile).matches(),
+        "Invalid index registry file: %s (expected %s{N}-{8 hex}.json)",
+        registryFile,
+        REGISTRY_FILE_PREFIX);
+    return indexesRoot(tableLocation) + "/" + registryFile;
   }
 
   private static String indexLocation(String tableLocation, String indexUuid) {

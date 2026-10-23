@@ -111,7 +111,7 @@ class TestVectorIndexQuickstart {
     long snapshotId = table.currentSnapshot().snapshotId();
 
     banner("STEP 2 · create the index (sidecar catalog, plan A)");
-    IndexCatalog indexCatalog = new SidecarIndexCatalog(table.io());
+    IndexCatalog indexCatalog = new SidecarIndexCatalog(table.io(), table);
     IndexMetadata metadata =
         indexCatalog.createIndex(
             CreateIndexRequest.builder()

@@ -15,10 +15,16 @@
 
 | # | 缺口 | 证据 | 影响 | 承接 |
 |---|---|---|---|---|
-| **A1** | 注册表是"读-改-写"，无 CAS | `SidecarIndexCatalog.createIndex` 先 `listIndexes` 再 `writeRegistry`（整文件覆盖，无 etag/generation）；`writeRegistry` 用 `createOrOverwrite` | 并发建两个**命名**索引会丢一个（uuid 从注册表消失，文件成孤儿）；#1822 之后多臂并存是常态，触发面变大 | **#2009**（已定稿 A-versioned） |
+| **A1** | 注册表是"读-改-写"，无 CAS | `SidecarIndexCatalog.createIndex` 先 `listIndexes` 再 `writeRegistry`（整文件覆盖，无 etag/generation）；`writeRegistry` 用 `createOrOverwrite` | 并发建两个**命名**索引会丢一个（uuid 从注册表消失，文件成孤儿）；#1822 之后多臂并存是常态，触发面变大 | **#2009**（A-versioned，已实现待验收） |
 | **A2** | **equality delete 无测试覆盖** | `grep -l equality` 在 `spark-extensions`/`index-spark` 测试零命中；而建索引读取确实读了 `SnapshotDeletes.keyColumns()` | v2 流式写入（Flink/CDC）常用 equality delete，现在只有 positional delete 有 E2E | **#2021** |
 | **A3** | Lance 表的删除文件必须显式 pin 成 parquet | `TestLanceFormatTable:181` 显式设 `write.delete.format.default='parquet'`；未设时删除文件回落到 Lance | 用户漏设 ⇒ 走到覆盖度低得多的 Lance 删除路径 | **#2021** |
 | **A4** | payload 升级后没有"体检"命令 | 过程列表里无 `check_indexes`；旧 payload 只在查到时报错 | 升级后只能一条条查询才发现要重建 | **#2022** |
+
+### A1 的落地形态（与最初设想的差异）
+
+- 注册表文件内容是 `format-version / updated-ms / index-uuids / previous-file`，**不复制** column、name、type：它们是每个索引 `metadata/` 里的权威数据，复制过来只会产生分叉。
+- 最初想记的 `payload-version` 被去掉：payload 版本写在**索引文件自己的头部**（`VectorPayloads.writeHeader`），注册表里记一份反而是二手信息。体检卡 `#2022` 改成读头部。
+- `previous-file` 让旧版本形成链，这既是历史，也是唯一的"目录索引"——`FileIO` 不能列举，所以回收旧版本只能沿链走。
 
 ## B. 性能（决定端到端上限）
 

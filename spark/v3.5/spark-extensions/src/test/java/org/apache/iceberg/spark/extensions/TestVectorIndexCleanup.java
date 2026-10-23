@@ -284,7 +284,8 @@ public class TestVectorIndexCleanup extends ExtensionsTestBase {
   private Path indexDirectory(String tableName) {
     String simpleName = tableName.substring(tableName.lastIndexOf('.') + 1);
     Table table = validationCatalog.loadTable(TableIdentifier.of("default", simpleName));
-    List<IndexMetadata> indexes = new SidecarIndexCatalog(table.io()).listIndexes(table.location());
+    List<IndexMetadata> indexes =
+        new SidecarIndexCatalog(table.io(), table).listIndexes(table.location());
     assertThat(indexes).hasSize(1);
     return new Path(indexes.get(0).location());
   }

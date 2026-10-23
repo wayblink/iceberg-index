@@ -52,7 +52,7 @@ public final class VectorIndexes {
 
   /** Returns the sidecar index catalog for the given table. */
   public static SidecarIndexCatalog indexCatalog(Table table) {
-    return new SidecarIndexCatalog(table.io());
+    return new SidecarIndexCatalog(table.io(), table);
   }
 
   /** Resolves the field ID of the vector column, failing if the column does not exist. */
