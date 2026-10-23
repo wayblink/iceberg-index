@@ -19,7 +19,6 @@
 package org.apache.iceberg.spark.extensions;
 
 import static org.assertj.core.api.Assertions.assertThat;
-import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 import java.io.File;
 import java.util.List;
@@ -76,28 +75,6 @@ public class TestVectorIndexEqualityDeletes extends ExtensionsTestBase {
   }
 
   @TestTemplate
-  public void deletingByTwoDifferentKeysIsReportedRatherThanIgnored() throws Exception {
-    String table = tableName("eq_delete_two_keys_" + catalogName);
-    createAndIndex(table);
-    Table icebergTable = org.apache.iceberg.spark.Spark3Util.loadIcebergTable(spark, table);
-    addEqualityDelete(icebergTable, "name", "b");
-    addEqualityDelete(
-        icebergTable,
-        "ts",
-        java.time.Instant.parse("2024-01-01T00:00:03Z").atOffset(java.time.ZoneOffset.UTC));
-
-    // the filter builds one key per row, so two key column sets cannot both be applied: saying so
-    // beats letting the rows of one of them come back
-    assertThatThrownBy(
-            () ->
-                sql(
-                    "CALL %s.system.vector_search(table => '%s', column => 'embedding', "
-                        + "query => array(0.0d, 1.0d), k => 10)",
-                    catalogName, table))
-        .hasMessageContaining("key on different columns");
-  }
-
-  @TestTemplate
   public void aTimestampKeyDeletedByValueDoesNotComeBackFromTheIndex() throws Exception {
     // the key is the value the row actually holds: a timestamp literal is read in the session's
     // time zone, so restating it here would delete an instant eight hours away from the row
@@ -125,6 +102,87 @@ public class TestVectorIndexEqualityDeletes extends ExtensionsTestBase {
         "CALL %s.system.build_vector_index(table => '%s', column => 'embedding', dimension => 2, "
             + "metric => 'euclidean')",
         catalogName, tableName);
+  }
+
+  @TestTemplate
+  public void deletesOnDifferentKeysInOneSnapshotAreAllApplied() throws Exception {
+    String table = tableName("eq_delete_two_key_sets_" + catalogName);
+    createAndIndex(table);
+
+    Table icebergTable = org.apache.iceberg.spark.Spark3Util.loadIcebergTable(spark, table);
+    java.sql.Timestamp stored =
+        (java.sql.Timestamp) sql("SELECT ts FROM %s WHERE id = 3", table).get(0)[0];
+    DeleteFile byName = deleteFile(icebergTable, "name", "b");
+    DeleteFile byTs =
+        deleteFile(icebergTable, "ts", stored.toInstant().atOffset(java.time.ZoneOffset.UTC));
+
+    // both key sets in one commit: a snapshot can hold equality deletes that key on different
+    // columns, and each removes its own rows
+    icebergTable.newRowDelta().addDeletes(byName).addDeletes(byTs).commit();
+    sql("REFRESH TABLE %s", table);
+
+    List<Long> indexed = indexedIds(table);
+    List<Long> scanned = scannedIds(table);
+    assertThat(indexed).doesNotContain(2L, 3L);
+    assertThat(indexed.stream().sorted().collect(Collectors.toList()))
+        .isEqualTo(scanned.stream().sorted().collect(Collectors.toList()));
+  }
+
+  @TestTemplate
+  public void aDecimalKeyRemovesItsRow() throws Exception {
+    String table = tableName("eq_delete_decimal_" + catalogName);
+    sql(
+        "CREATE TABLE %s (id bigint, price decimal(9, 2), embedding array<double>) USING iceberg "
+            + "TBLPROPERTIES ('format-version'='2')",
+        table);
+    sql(
+        "INSERT INTO %s VALUES "
+            + "(1, CAST(1.00 AS decimal(9,2)), array(1.0d, 0.0d)), "
+            + "(2, CAST(2.50 AS decimal(9,2)), array(0.0d, 1.0d)), "
+            + "(3, CAST(3.75 AS decimal(9,2)), array(1.0d, 1.0d))",
+        table);
+    sql(
+        "CALL %s.system.build_vector_index(table => '%s', column => 'embedding', dimension => 2, "
+            + "metric => 'euclidean')",
+        catalogName, table);
+
+    // a decimal key is carried as the canonical decimal rather than its text, so a delete does not
+    // depend on both sides reading the same scale (TestEqualityKeyEncoding pins 2.50 == 2.5)
+    Table icebergTable = org.apache.iceberg.spark.Spark3Util.loadIcebergTable(spark, table);
+    DeleteFile deleted = deleteFile(icebergTable, "price", new java.math.BigDecimal("2.50"));
+    icebergTable.newRowDelta().addDeletes(deleted).commit();
+    sql("REFRESH TABLE %s", table);
+
+    List<Long> indexed = indexedIds(table);
+    List<Long> scanned = scannedIds(table);
+    assertThat(indexed).doesNotContain(2L);
+    assertThat(indexed.stream().sorted().collect(Collectors.toList()))
+        .isEqualTo(scanned.stream().sorted().collect(Collectors.toList()));
+  }
+
+  @TestTemplate
+  public void aDeleteWithMetricsIsStillApplied() throws Exception {
+    String table = tableName("eq_delete_metrics_" + catalogName);
+    createAndIndex(table);
+
+    Table icebergTable = org.apache.iceberg.spark.Spark3Util.loadIcebergTable(spark, table);
+    // the delete file keeps the metrics its writer produced: a delete that carries bounds is
+    // eligible for pruning against the data files, and that must not stop it from matching
+    DeleteFile withMetrics = deleteFile(icebergTable, "name", "b");
+    icebergTable.newRowDelta().addDeletes(withMetrics).commit();
+    sql("REFRESH TABLE %s", table);
+
+    assertThat(indexedIds(table)).doesNotContain(2L);
+  }
+
+  private DeleteFile deleteFile(Table table, String keyColumn, Object keyValue) throws Exception {
+    Schema deleteSchema = table.schema().select(keyColumn);
+    GenericRecord template = GenericRecord.create(deleteSchema);
+    List<org.apache.iceberg.data.Record> records =
+        java.util.Collections.singletonList(template.copy(keyColumn, keyValue));
+    OutputFile out =
+        Files.localOutput(File.createTempFile("equality-delete", ".parquet", temp.toFile()));
+    return FileHelpers.writeDeleteFile(table, out, records, deleteSchema);
   }
 
   private void assertDeletedRowIsGone(String tableName, String keyColumn, Object keyValue)

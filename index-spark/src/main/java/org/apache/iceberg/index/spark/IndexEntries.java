@@ -47,7 +47,6 @@ import org.apache.iceberg.io.InputFile;
 import org.apache.iceberg.relocated.com.google.common.base.Preconditions;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableList;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableMap;
-import org.apache.iceberg.relocated.com.google.common.collect.ImmutableSet;
 import org.apache.iceberg.relocated.com.google.common.collect.Lists;
 import org.apache.iceberg.relocated.com.google.common.collect.Maps;
 import org.apache.iceberg.relocated.com.google.common.collect.Sets;
@@ -347,9 +346,8 @@ public final class IndexEntries {
 
     // delete files are read on the driver so the executor-side filter is a simple lookup
     long[] deletedPositions = deletes.deletedPositions(dataFile);
-    List<org.apache.iceberg.types.Types.NestedField> keyFields = deletes.keyFields();
+    List<EqualityKeySet> keySets = deletes.keySets();
     List<String> keyColumns = deletes.keyColumns();
-    Set<String> equalityKeys = deletes.equalityKeys();
 
     Set<String> columnsToRead = Sets.newLinkedHashSet();
     columnsToRead.addAll(columns);
@@ -369,7 +367,7 @@ public final class IndexEntries {
     Collection<Long> wantedPositions = positions == null ? null : Lists.newArrayList(positions);
     return data.filter(
             (Function<Tuple2<Row, Long>, Boolean>)
-                tuple -> isLive(tuple, wantedPositions, deletedPositions, equalityKeys, keyFields))
+                tuple -> isLive(tuple, wantedPositions, deletedPositions, keySets))
         .mapToPair(
             (PairFunction<Tuple2<Row, Long>, Long, Row>)
                 tuple ->
@@ -385,8 +383,7 @@ public final class IndexEntries {
       Tuple2<Row, Long> tuple,
       Collection<Long> positions,
       long[] deletedPositions,
-      Set<String> equalityKeys,
-      List<org.apache.iceberg.types.Types.NestedField> keyFields) {
+      List<EqualityKeySet> keySets) {
     long position = tuple._2();
     if (positions != null && !positions.isEmpty() && !positions.contains(position)) {
       return false;
@@ -396,7 +393,15 @@ public final class IndexEntries {
       return false;
     }
 
-    return equalityKeys.isEmpty() || !equalityKeys.contains(equalityKey(tuple._1(), keyFields));
+    // a snapshot can hold equality deletes keyed on different columns, and each of them removes its
+    // own rows: one key per row would only be able to match one of them
+    for (EqualityKeySet keySet : keySets) {
+      if (keySet.keys().contains(equalityKey(tuple._1(), keySet.fields()))) {
+        return false;
+      }
+    }
+
+    return true;
   }
 
   /**
@@ -759,26 +764,43 @@ public final class IndexEntries {
    * would be read once per file. Equality keys are the same for every data file, so they are read
    * once and broadcast rather than carried into every task.
    */
+  /** The keys one equality delete file set removes a row by. */
+  private static final class EqualityKeySet implements java.io.Serializable {
+    private static final long serialVersionUID = 1L;
+
+    private final List<Types.NestedField> fields;
+    private final Broadcast<Set<String>> keys;
+
+    private EqualityKeySet(List<Types.NestedField> fields, Broadcast<Set<String>> keys) {
+      this.fields = fields;
+      this.keys = keys;
+    }
+
+    List<Types.NestedField> fields() {
+      return fields;
+    }
+
+    Set<String> keys() {
+      return keys.getValue();
+    }
+  }
+
   private static final class SnapshotDeletes {
 
     private static final long[] NO_POSITIONS = new long[0];
 
     private final Map<String, long[]> deletedPositionsByFile;
-    private final Broadcast<Set<String>> equalityKeys;
-    private final List<org.apache.iceberg.types.Types.NestedField> keyFields;
+    private final List<EqualityKeySet> keySets;
 
     private SnapshotDeletes(
-        Map<String, long[]> deletedPositionsByFile,
-        Broadcast<Set<String>> equalityKeys,
-        List<org.apache.iceberg.types.Types.NestedField> keyFields) {
+        Map<String, long[]> deletedPositionsByFile, List<EqualityKeySet> keySets) {
       this.deletedPositionsByFile = deletedPositionsByFile;
-      this.equalityKeys = equalityKeys;
-      this.keyFields = keyFields;
+      this.keySets = keySets;
     }
 
     /** A snapshot without delete files, which is the common case. */
     static SnapshotDeletes none() {
-      return new SnapshotDeletes(ImmutableMap.of(), null, ImmutableList.of());
+      return new SnapshotDeletes(ImmutableMap.of(), ImmutableList.of());
     }
 
     /** Reads the delete files that apply to the given tasks, in at most two jobs. */
@@ -800,35 +822,47 @@ public final class IndexEntries {
         return none();
       }
 
-      List<org.apache.iceberg.types.Types.NestedField> keyFields =
-          equalityFields(tableSchema, ImmutableList.copyOf(equalityDeletes));
       Map<String, long[]> deletedByFile =
           positionDeletes.isEmpty()
               ? ImmutableMap.of()
               : readDeletedPositions(table.io(), positionDeletes);
 
-      Broadcast<Set<String>> keys = null;
-      if (!equalityDeletes.isEmpty()) {
+      // equality deletes are grouped by the columns they key on: a snapshot can hold several such
+      // files with different keys, and each removes its own rows
+      Map<List<Integer>, List<DeleteFile>> byFieldIds = Maps.newLinkedHashMap();
+      for (DeleteFile deleteFile : equalityDeletes) {
+        byFieldIds
+            .computeIfAbsent(deleteFile.equalityFieldIds(), ids -> Lists.newArrayList())
+            .add(deleteFile);
+      }
+
+      List<EqualityKeySet> keySets = Lists.newArrayList();
+      for (Map.Entry<List<Integer>, List<DeleteFile>> entry : byFieldIds.entrySet()) {
+        List<org.apache.iceberg.types.Types.NestedField> keyFields =
+            fieldsOf(tableSchema, entry.getKey());
         if (keyFields.contains(null)) {
           // a delete file can name a column the table no longer has. A row cannot carry a value for
-          // it, so the delete matches nothing, which is what a full scan decides too: the filter is
-          // left out rather than built from fewer columns, which would compare the wrong values
+          // it, so the delete matches nothing. Planning a scan already fails on such a file (the
+          // delete index cannot resolve the field), so this is a net rather than a path: dropping
+          // the column from the key would compare the wrong values, which is worse than saying so
           LOG.warn(
               "Ignoring equality deletes {}: they name a column the table no longer has, so they "
                   + "remove nothing",
-              equalityDeletes.stream()
+              entry.getValue().stream()
                   .map(deleteFile -> deleteFile.location().toString())
                   .collect(java.util.stream.Collectors.toList()));
-          keyFields = Lists.newArrayList();
-        } else {
-          checkOneKeySet(equalityDeletes);
-          keys =
-              JavaSparkContext.fromSparkContext(spark.sparkContext())
-                  .broadcast(readEqualityKeys(table.io(), equalityDeletes, keyFields));
+          continue;
         }
+
+        refuseNanosKeys(keyFields, entry.getValue());
+        Set<String> keys = readEqualityKeys(table.io(), entry.getValue(), keyFields);
+        keySets.add(
+            new EqualityKeySet(
+                keyFields,
+                JavaSparkContext.fromSparkContext(spark.sparkContext()).broadcast(keys)));
       }
 
-      return new SnapshotDeletes(deletedByFile, keys, keyFields);
+      return new SnapshotDeletes(deletedByFile, keySets);
     }
 
     /** The positions removed from a data file, sorted so a lookup is a binary search. */
@@ -837,23 +871,22 @@ public final class IndexEntries {
       return positions == null ? NO_POSITIONS : positions;
     }
 
-    Set<String> equalityKeys() {
-      return equalityKeys == null ? ImmutableSet.of() : equalityKeys.getValue();
+    List<EqualityKeySet> keySets() {
+      return keySets;
     }
 
+    /** Every column the equality deletes key on, which is what the read has to project. */
     List<String> keyColumns() {
-      List<String> names = Lists.newArrayListWithCapacity(keyFields.size());
-      for (org.apache.iceberg.types.Types.NestedField field : keyFields) {
-        if (field != null) {
-          names.add(field.name());
+      List<String> names = Lists.newArrayList();
+      for (EqualityKeySet keySet : keySets) {
+        for (org.apache.iceberg.types.Types.NestedField field : keySet.fields()) {
+          if (!names.contains(field.name())) {
+            names.add(field.name());
+          }
         }
       }
 
       return names;
-    }
-
-    List<org.apache.iceberg.types.Types.NestedField> keyFields() {
-      return keyFields;
     }
   }
 
@@ -942,22 +975,10 @@ public final class IndexEntries {
         .build();
   }
 
-  /**
-   * The table columns of the equality fields, in field id order, with null where the table no
-   * longer has the column.
-   *
-   * <p>The positions are kept so that they stay aligned with the columns of the delete rows: a
-   * delete file holds its key columns in the order of its field ids, so dropping one here would
-   * pair the remaining columns with the wrong values.
-   */
-  private static List<Types.NestedField> equalityFields(
-      Schema schema, Collection<DeleteFile> equalityDeletes) {
-    List<Types.NestedField> fields = Lists.newArrayList();
-    if (equalityDeletes.isEmpty()) {
-      return fields;
-    }
-
-    for (int fieldId : equalityDeletes.iterator().next().equalityFieldIds()) {
+  /** The table columns of one equality key set, in field id order; null where a column is gone. */
+  private static List<Types.NestedField> fieldsOf(Schema schema, List<Integer> fieldIds) {
+    List<Types.NestedField> fields = Lists.newArrayListWithCapacity(fieldIds.size());
+    for (int fieldId : fieldIds) {
       fields.add(schema.findField(fieldId));
     }
 
@@ -965,29 +986,27 @@ public final class IndexEntries {
   }
 
   /**
-   * Fails when the delete files of one snapshot key on different columns.
+   * Refuses a key on a nanosecond timestamp.
    *
-   * <p>The filter builds one key per data row, from one set of columns, so a second set cannot be
-   * applied: the keys of one set would be compared with the keys of the other. Failing says so,
-   * instead of letting the rows the second set removed come back.
+   * <p>The index path reads a row into a Spark row before it compares keys, and Spark carries a
+   * timestamp in microseconds, so two rows that differ only below the microsecond would key the
+   * same and a delete would remove both. Refusing the query says so; guessing would remove a live
+   * row and say nothing.
    */
-  private static void checkOneKeySet(Collection<DeleteFile> equalityDeletes) {
-    List<Integer> first = null;
-    for (DeleteFile deleteFile : equalityDeletes) {
-      List<Integer> fieldIds = deleteFile.equalityFieldIds();
-      if (first == null) {
-        first = fieldIds;
-      } else {
+  private static void refuseNanosKeys(
+      List<Types.NestedField> keyFields, Collection<DeleteFile> deleteFiles) {
+    for (Types.NestedField field : keyFields) {
+      if (field.type().typeId() == Type.TypeID.TIMESTAMP_NANO) {
         Preconditions.checkArgument(
-            first.equals(fieldIds),
-            "Equality delete files key on different columns: field ids %s and %s (%s keys on the "
-                + "first, %s on the second), so one key per row cannot match both. The index path "
-                + "supports one key column set per table, and a table that needs more cannot use it "
-                + "until that is supported",
-            first,
-            fieldIds,
-            equalityDeletes.iterator().next().location(),
-            deleteFile.location());
+            false,
+            "Equality deletes key on the nanosecond timestamp column %s, which the index path "
+                + "cannot match: a row is read as microseconds before its key is compared, so a "
+                + "delete would remove every row within the same microsecond. Use a different key "
+                + "column, or query without the index. Delete files: %s",
+            field.name(),
+            deleteFiles.stream()
+                .map(deleteFile -> deleteFile.location().toString())
+                .collect(java.util.stream.Collectors.toList()));
       }
     }
   }
@@ -1015,7 +1034,7 @@ public final class IndexEntries {
    * sides produce different keys for anything but the primitive types, so a delete matched nothing
    * and the row it removed stayed visible through the index.
    */
-  private static String encodedValue(Type type, Object value) {
+  static String encodedValue(Type type, Object value) {
     if (value == null) {
       return String.valueOf(NULL_MARKER);
     }
@@ -1053,6 +1072,10 @@ public final class IndexEntries {
         return "boolean:" + value;
       case UUID:
         return "uuid:" + value;
+      case DECIMAL:
+        // the same number can arrive with a different scale (2.50 and 2.5), and the scale of a
+        // decimal is not part of its value: strip it before comparing
+        return "decimal:" + ((java.math.BigDecimal) value).stripTrailingZeros().toPlainString();
       case FIXED:
       case BINARY:
         return type.typeId() + ":" + java.util.Base64.getEncoder().encodeToString(bytes(value));
