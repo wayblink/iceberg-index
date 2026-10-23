@@ -146,7 +146,40 @@ public final class BruteforceKernel implements VectorKernel {
   public PreparedSearch prepare(ByteBuffer payload) {
     // the entries are decoded once, so a batch pays the decode per index file instead of per query
     List<IndexEntry> entries = entries(payload);
-    return (query, topK) -> {
+    long bytes = preparedBytes(entries);
+    return new EntrySearcher(entries, bytes);
+  }
+
+  /**
+   * What the decoded entries cost: one object per entry, its data file String, and the vector it
+   * was written with. A cache that charged the payload twice would over-charge this kernel.
+   */
+  private static long preparedBytes(List<IndexEntry> entries) {
+    long total =
+        PreparedStructureSize.array((long) PreparedStructureSize.REFERENCE_BYTES * entries.size());
+    for (IndexEntry entry : entries) {
+      total +=
+          PreparedStructureSize.entry(
+              Long.BYTES,
+              PreparedStructureSize.string(entry.dataFile().length()),
+              PreparedStructureSize.bytes(entry.payload().length));
+    }
+
+    return total;
+  }
+
+  /** A prepared search that reports what it holds. */
+  private final class EntrySearcher implements PreparedSearch {
+    private final List<IndexEntry> entries;
+    private final long bytes;
+
+    private EntrySearcher(List<IndexEntry> entries, long bytes) {
+      this.entries = entries;
+      this.bytes = bytes;
+    }
+
+    @Override
+    public List<IndexSearchResult> search(ByteBuffer query, int topK) {
       Preconditions.checkArgument(topK >= 0, "Top-k must be non-negative: %s", topK);
       if (topK == 0) {
         return ImmutableList.of();
@@ -167,7 +200,12 @@ public final class BruteforceKernel implements VectorKernel {
         results = Lists.newArrayList(results.subList(0, topK));
       }
       return ImmutableList.copyOf(results);
-    };
+    }
+
+    @Override
+    public long estimatedBytes() {
+      return bytes;
+    }
   }
 
   static final class Factory implements VectorKernelFactory {

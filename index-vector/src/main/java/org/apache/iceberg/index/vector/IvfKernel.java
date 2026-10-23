@@ -229,7 +229,76 @@ public final class IvfKernel implements VectorKernel {
   @Override
   public PreparedSearch prepare(ByteBuffer payload) {
     Loaded loaded = load(VectorPayloads.toBytes(payload));
-    return (query, topK) -> {
+    return new ListSearcher(loaded);
+  }
+
+  /**
+   * What the decoded lists cost: every entry with the vector or the code it was stored as, the
+   * centroids the search compares the query against, and the per-list centres a quantized index
+   * keeps to score with.
+   *
+   * <p>A quantized list is the case a single factor gets most wrong: its entries hold a handful of
+   * bytes each where an unquantized entry holds a whole vector.
+   */
+  private long preparedBytes(Loaded loaded) {
+    long total = 0;
+    for (float[] centroid : loaded.centroids) {
+      total += PreparedStructureSize.array((long) centroid.length * Float.BYTES);
+    }
+
+    for (int list = 0; list < loaded.lists.size(); list++) {
+      List<IvfEntry> members = loaded.lists.get(list);
+      total += PreparedStructureSize.nestedList(members.size(), entryBytes());
+    }
+
+    if (loaded.listCenters != null) {
+      for (float[] center : loaded.listCenters) {
+        if (center != null) {
+          total += PreparedStructureSize.array((long) center.length * Float.BYTES);
+        }
+      }
+    }
+
+    if (loaded.listQuantizers != null) {
+      // a quantizer holds its own copy of the centre it scores against
+      total += (long) loaded.listQuantizers.length * listQuantizerBytes();
+    }
+
+    return total;
+  }
+
+  /** What one entry costs beyond its list slot: the reference, the fields, and the payload. */
+  private long entryBytes() {
+    long payload =
+        isQuantized()
+            ? PreparedStructureSize.bytes(quantizer.codeBytes())
+                + PreparedStructureSize.floats(RaBitQQuantizer.FACTORS)
+            : PreparedStructureSize.floats(dimension);
+    return PreparedStructureSize.entry(Long.BYTES, PreparedStructureSize.string(64), payload);
+  }
+
+  /** What one per-list quantizer costs: object header, its centre, and the scalar it carries. */
+  private long listQuantizerBytes() {
+    return PreparedStructureSize.entry(16, PreparedStructureSize.floats(dimension));
+  }
+
+  /** A prepared search over the decoded lists, which reports what it holds. */
+  private final class ListSearcher implements PreparedSearch {
+    private final Loaded loaded;
+    private final long bytes;
+
+    private ListSearcher(Loaded loaded) {
+      this.loaded = loaded;
+      this.bytes = preparedBytes(loaded);
+    }
+
+    @Override
+    public long estimatedBytes() {
+      return bytes;
+    }
+
+    @Override
+    public List<IndexSearchResult> search(ByteBuffer query, int topK) {
       Preconditions.checkArgument(topK >= 0, "Top-k must be non-negative: %s", topK);
       if (topK == 0 || loaded.lists.isEmpty()) {
         return ImmutableList.of();
@@ -256,7 +325,7 @@ public final class IvfKernel implements VectorKernel {
       return results.size() > topK
           ? ImmutableList.copyOf(results.subList(0, topK))
           : ImmutableList.copyOf(results);
-    };
+    }
   }
 
   /** Reads the centroids and the lists of a payload, once per payload that is searched. */

@@ -521,6 +521,11 @@ final class ExecutorIndexCache {
   private final AtomicLong evictions = new AtomicLong();
   private final AtomicLong skippedTooLarge = new AtomicLong();
   private long bytes = 0;
+
+  // room promised to loads in flight, and the budget those promises are against
+  private long reservedBytes = 0;
+  private volatile long budgetBytes = Long.MAX_VALUE;
+
   // what each table holds, so a share of the budget can be reserved per table
   private final Map<String, Long> bytesByOwner = new LinkedHashMap<>();
   private final Map<String, Integer> entriesByOwner = new LinkedHashMap<>();
@@ -547,6 +552,7 @@ final class ExecutorIndexCache {
       return loader.load();
     }
 
+    budgetBytes = config.maxBytes();
     String cacheKey = config.owner() + "|" + key + "|" + location;
     sweepIfDue(config);
     CachedFile hit = lookup(cacheKey);
@@ -569,8 +575,22 @@ final class ExecutorIndexCache {
         }
 
         long start = System.nanoTime();
-        CachedFile loaded = loader.load();
+        // the size is not known until the payload is prepared, so the room held is what the entry
+        // limit allows; it goes back as soon as the load finishes
+        long reservation = Math.min(config.maxEntryBytes(), config.maxBytes());
+        long held = reserve(reservation);
+
+        CachedFile loaded;
+        try {
+          loaded = loader.load();
+        } catch (RuntimeException | Error e) {
+          releaseReservation(reservation);
+          throw e;
+        }
+
         loads.incrementAndGet();
+        // the load has finished, so the reservation goes back whether or not the entry is kept
+        releaseReservation(reservation);
         if (loaded.bytes() > config.maxEntryBytes()) {
           // a file larger than the per-entry limit is not worth evicting the rest for
           skippedTooLarge.incrementAndGet();
@@ -581,7 +601,6 @@ final class ExecutorIndexCache {
               config.maxEntryBytes());
           return loaded;
         }
-
         CachedFile stored = put(cacheKey, loaded, config, askedTwice);
         if (stored != loaded) {
           // the cached copy carries the owner; a caller should see the entry it will hit next time
@@ -761,6 +780,49 @@ final class ExecutorIndexCache {
     return null;
   }
 
+  /**
+   * Takes room for an entry that is about to be loaded, or refuses when taking it would exceed the
+   * budget.
+   *
+   * <p>Loading first and measuring afterwards is what makes a budget porous: two tasks that each
+   * load a file both see room until one of them finishes. The reservation is the room that has been
+   * promised to a load in flight, and it is what makes "we will not exceed the budget" true rather
+   * than usually true.
+   */
+  /**
+   * Holds room for an entry that is about to be loaded, taking what is spare.
+   *
+   * <p>Loading first and measuring afterwards is what makes a budget porous: two tasks that each
+   * load a file both see room until one of them finishes, and the second is the one that overflows.
+   * The reservation is the room promised to a load in flight, which is the only thing eviction
+   * cannot reclaim because neither load has been put yet.
+   *
+   * <p>Returns what it actually held, which is what has to be handed back.
+   *
+   * <p>It is deliberately not a refusal. A file whose own size exceeds the budget still gets cached
+   * when it is the only entry, which is what a single-index query needs, and the entry limit is
+   * what refuses those. When there is no room to spare the load simply reserves nothing and
+   * eviction makes room afterwards, as it always did.
+   */
+  private long reserve(long bytes) {
+    synchronized (mapLock) {
+      long spare = budgetBytes - this.bytes - reservedBytes;
+      long held = Math.min(bytes, Math.max(0L, spare));
+      reservedBytes += held;
+      return held;
+    }
+  }
+
+  private void releaseReservation(long bytes) {
+    if (bytes <= 0) {
+      return;
+    }
+
+    synchronized (mapLock) {
+      reservedBytes = Math.max(0L, reservedBytes - bytes);
+    }
+  }
+
   private void release(CachedFile file) {
     bytes -= file.bytes();
     bytesByOwner.computeIfPresent(
@@ -871,6 +933,7 @@ final class ExecutorIndexCache {
       protectedFiles.clear();
       asked.clear();
       bytes = 0;
+      reservedBytes = 0;
       hits.set(0);
       misses.set(0);
       loads.set(0);

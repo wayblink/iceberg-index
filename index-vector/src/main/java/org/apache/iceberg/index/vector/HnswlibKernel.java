@@ -205,43 +205,97 @@ public final class HnswlibKernel implements VectorKernel {
       HnswIndex<Long, float[], VectorItem, Float> index =
           HnswIndex.load(new ByteArrayInputStream(graph));
       index.setEf(options.efSearch());
-
-      return (query, topK) -> {
-        Preconditions.checkArgument(topK >= 0, "Top-k must be non-negative: %s", topK);
-        if (topK == 0) {
-          return ImmutableList.of();
-        }
-
-        float[] queryVector =
-            VectorPayloads.decodeVector(VectorPayloads.toBytes(query), dimension, "Query");
-        // the graph is asked for as many candidates as its search width allows, not just for the
-        // number asked for: the traversal is the same either way, and a wider candidate set gives
-        // the exact re-scoring below more true neighbours to order
-        int candidates = Math.max(topK, options.efSearch());
-        List<SearchResult<VectorItem, Float>> nearest = index.findNearest(queryVector, candidates);
-
-        List<IndexSearchResult> results = Lists.newArrayList();
-        for (SearchResult<VectorItem, Float> result : nearest) {
-          int id = Math.toIntExact(result.item().id());
-          Preconditions.checkArgument(
-              id >= 0 && id < mappingCount, "HNSW result id out of range: %s", id);
-          // re-score with the exact metric on the stored vector, so a score is the one the exact
-          // search would have given
-          results.add(
-              IndexSearchResult.of(
-                  dataFiles[id],
-                  positions[id],
-                  scoring.score(queryVector, result.item().vector())));
-        }
-
-        // the candidates come back in the order the graph ranked them, which is not necessarily the
-        // order of the exact scores, so the re-scored results are ordered by those before
-        // truncating
-        results.sort(scoring.comparator());
-        return results.size() > topK ? Lists.newArrayList(results.subList(0, topK)) : results;
-      };
+      long preparedBytes = preparedBytes(mappingCount, dimension, index.getM());
+      return new GraphSearcher(index, dataFiles, positions, mappingCount, preparedBytes);
     } catch (IOException e) {
       throw new UncheckedIOException("Failed to load the HNSW index payload", e);
+    }
+  }
+
+  /**
+   * What a loaded graph costs: one node with its connection lists per vector, the vector itself,
+   * the id and position tables, and the visited-set scratch the traversal keeps.
+   *
+   * <p>A graph is the case a payload-relative estimate gets most wrong: its connections are a
+   * separate int list per layer per node, so a dense graph holds several times the payload it was
+   * read from.
+   */
+  private static long preparedBytes(int nodes, int dimension, int m) {
+    // level 0 allows twice the connections of a higher layer, and few nodes reach a higher one
+    long connectionsPerNode =
+        (long) 2 * m * Integer.BYTES + 2L * PreparedStructureSize.HEADER_BYTES;
+    long node =
+        PreparedStructureSize.entry(
+            Integer.BYTES + PreparedStructureSize.REFERENCE_BYTES,
+            PreparedStructureSize.floats(dimension),
+            // the id map and the position table, one slot per node
+            (long) nodes * (Long.BYTES + Integer.BYTES));
+
+    long total = nodes * (node + connectionsPerNode);
+    // the lookup table, the visited bitset and the candidate set the traversal reuses
+    total += (long) nodes * 4L * Integer.BYTES;
+    total += PreparedStructureSize.array((long) nodes / 8L);
+    return total;
+  }
+
+  /** A loaded graph, which reports what it holds. */
+  private final class GraphSearcher implements PreparedSearch {
+    private final HnswIndex<Long, float[], VectorItem, Float> index;
+    private final String[] dataFiles;
+    private final long[] positions;
+    private final int mappingCount;
+    private final long bytes;
+
+    private GraphSearcher(
+        HnswIndex<Long, float[], VectorItem, Float> index,
+        String[] dataFiles,
+        long[] positions,
+        int mappingCount,
+        long bytes) {
+      this.index = index;
+      this.dataFiles = dataFiles;
+      this.positions = positions;
+      this.mappingCount = mappingCount;
+      this.bytes = bytes;
+    }
+
+    @Override
+    public long estimatedBytes() {
+      return bytes;
+    }
+
+    @Override
+    public List<IndexSearchResult> search(ByteBuffer query, int topK) {
+      Preconditions.checkArgument(topK >= 0, "Top-k must be non-negative: %s", topK);
+      if (topK == 0) {
+        return ImmutableList.of();
+      }
+
+      float[] queryVector =
+          VectorPayloads.decodeVector(VectorPayloads.toBytes(query), dimension, "Query");
+      // the graph is asked for as many candidates as its search width allows, not just for the
+      // number asked for: the traversal is the same either way, and a wider candidate set gives
+      // the exact re-scoring below more true neighbours to order
+      int candidates = Math.max(topK, options.efSearch());
+      List<SearchResult<VectorItem, Float>> nearest = index.findNearest(queryVector, candidates);
+
+      List<IndexSearchResult> results = Lists.newArrayList();
+      for (SearchResult<VectorItem, Float> result : nearest) {
+        int id = Math.toIntExact(result.item().id());
+        Preconditions.checkArgument(
+            id >= 0 && id < mappingCount, "HNSW result id out of range: %s", id);
+        // re-score with the exact metric on the stored vector, so a score is the one the exact
+        // search would have given
+        results.add(
+            IndexSearchResult.of(
+                dataFiles[id], positions[id], scoring.score(queryVector, result.item().vector())));
+      }
+
+      // the candidates come back in the order the graph ranked them, which is not necessarily the
+      // order of the exact scores, so the re-scored results are ordered by those before
+      // truncating
+      results.sort(scoring.comparator());
+      return results.size() > topK ? Lists.newArrayList(results.subList(0, topK)) : results;
     }
   }
 
