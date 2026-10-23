@@ -41,6 +41,8 @@ import org.apache.iceberg.hadoop.HadoopInputFile;
 import org.apache.iceberg.hadoop.SerializableConfiguration;
 import org.apache.iceberg.index.IndexAdapter;
 import org.apache.iceberg.io.CloseableIterable;
+import org.apache.iceberg.io.DeleteSchemaUtil;
+import org.apache.iceberg.io.FileIO;
 import org.apache.iceberg.io.InputFile;
 import org.apache.iceberg.relocated.com.google.common.base.Preconditions;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableList;
@@ -142,7 +144,7 @@ public final class IndexEntries {
       return null;
     }
 
-    SnapshotDeletes deletes = SnapshotDeletes.read(spark, taskList, tableSchema);
+    SnapshotDeletes deletes = SnapshotDeletes.read(spark, table, taskList, tableSchema);
     // one configuration for the whole group: each branch of the read would otherwise carry its own
     // copy of the Hadoop configuration into the stage's task binary
     SerializableConfiguration conf =
@@ -181,7 +183,7 @@ public final class IndexEntries {
   /** The delete files of the tasks being read, read once. */
   private static SnapshotDeletes deletesFor(
       SparkSession spark, List<FileScanTask> tasks, Table table) {
-    return SnapshotDeletes.read(spark, tasks, table.schema());
+    return SnapshotDeletes.read(spark, table, tasks, table.schema());
   }
 
   /**
@@ -307,7 +309,7 @@ public final class IndexEntries {
       }
     }
 
-    SnapshotDeletes deletes = SnapshotDeletes.read(spark, tasks, table.schema());
+    SnapshotDeletes deletes = SnapshotDeletes.read(spark, table, tasks, table.schema());
     List<JavaRDD<Row>> perFile = Lists.newArrayList();
     for (FileScanTask task : tasks) {
       perFile.add(
@@ -780,7 +782,8 @@ public final class IndexEntries {
     }
 
     /** Reads the delete files that apply to the given tasks, in at most two jobs. */
-    static SnapshotDeletes read(SparkSession spark, List<FileScanTask> tasks, Schema tableSchema) {
+    static SnapshotDeletes read(
+        SparkSession spark, Table table, List<FileScanTask> tasks, Schema tableSchema) {
       Set<DeleteFile> positionDeletes = Sets.newLinkedHashSet();
       Set<DeleteFile> equalityDeletes = Sets.newLinkedHashSet();
       for (FileScanTask task : tasks) {
@@ -802,7 +805,7 @@ public final class IndexEntries {
       Map<String, long[]> deletedByFile =
           positionDeletes.isEmpty()
               ? ImmutableMap.of()
-              : readDeletedPositions(spark, positionDeletes);
+              : readDeletedPositions(table.io(), positionDeletes);
 
       Broadcast<Set<String>> keys = null;
       if (!equalityDeletes.isEmpty()) {
@@ -821,7 +824,7 @@ public final class IndexEntries {
           checkOneKeySet(equalityDeletes);
           keys =
               JavaSparkContext.fromSparkContext(spark.sparkContext())
-                  .broadcast(readEqualityKeys(spark, equalityDeletes, keyFields));
+                  .broadcast(readEqualityKeys(table.io(), equalityDeletes, keyFields));
         }
       }
 
@@ -856,24 +859,29 @@ public final class IndexEntries {
 
   /**
    * Reads the positions removed by the given position delete files, grouped by the data file they
-   * point at. Position delete files are parquet files with {@code file_path} and {@code pos}
-   * columns, and all of them are read in one job.
+   * point at.
+   *
+   * <p>The delete file is read in whatever format it was written in, which for a table that writes
+   * Lance is a Lance file: a parquet reader only knows parquet, and the delete files of a table
+   * follow the table's data format. The Iceberg format model reads both, so the filter does not
+   * depend on the table being written in parquet.
    */
   private static Map<String, long[]> readDeletedPositions(
-      SparkSession spark, Collection<DeleteFile> positionDeletes) {
-    Dataset<Row> deletes = null;
-    for (DeleteFile deleteFile : positionDeletes) {
-      Dataset<Row> file =
-          spark
-              .read()
-              .parquet(deleteFile.location().toString())
-              .select(DELETE_FILE_PATH_COLUMN, DELETE_POSITION_COLUMN);
-      deletes = deletes == null ? file : deletes.union(file);
-    }
-
+      FileIO io, Collection<DeleteFile> positionDeletes) {
     Map<String, List<Long>> byFile = Maps.newHashMap();
-    for (Row row : deletes.collectAsList()) {
-      byFile.computeIfAbsent(row.getString(0), key -> Lists.newArrayList()).add(row.getLong(1));
+    for (DeleteFile deleteFile : positionDeletes) {
+      try (CloseableIterable<Record> rows =
+          openDeletes(io, deleteFile, DeleteSchemaUtil.pathPosSchema())) {
+        for (Record row : rows) {
+          byFile
+              .computeIfAbsent(
+                  String.valueOf(row.getField(DELETE_FILE_PATH_COLUMN)),
+                  key -> Lists.newArrayList())
+              .add(((Number) row.getField(DELETE_POSITION_COLUMN)).longValue());
+        }
+      } catch (IOException e) {
+        throw new UncheckedIOException("Failed to read delete file " + deleteFile.location(), e);
+      }
     }
 
     Map<String, long[]> positionsByFile = Maps.newHashMap();
@@ -895,30 +903,43 @@ public final class IndexEntries {
    * key is the values of the equality columns in field id order, with a null marker for nulls.
    *
    * <p>Equality delete files contain one column per equality field id, in field id order; the
-   * column name falls back to the field id when the name is not the table's field name.
+   * column name falls back to the field id when the name is not the table's field name. As with
+   * position deletes, the file is read in its own format rather than as parquet.
    */
   private static Set<String> readEqualityKeys(
-      SparkSession spark,
-      Collection<DeleteFile> equalityDeletes,
-      List<Types.NestedField> keyFields) {
-    Dataset<Row> deletes = null;
+      FileIO io, Collection<DeleteFile> equalityDeletes, List<Types.NestedField> keyFields) {
+    Schema keySchema = new Schema(keyFields);
+    Set<String> keys = Sets.newHashSet();
     for (DeleteFile deleteFile : equalityDeletes) {
-      Dataset<Row> file = spark.read().parquet(deleteFile.location().toString());
-      deletes = deletes == null ? file : deletes.union(file);
+      try (CloseableIterable<Record> rows = openDeletes(io, deleteFile, keySchema)) {
+        for (Record row : rows) {
+          StringBuilder key = new StringBuilder();
+          // a delete file holds its key columns in the order the delete file was written with,
+          // which
+          // is the order of the field ids; the value is encoded by the column's type, because the
+          // two sides read it through different readers and only the type is common to both
+          for (Types.NestedField field : keyFields) {
+            key.append(encodedValue(field.type(), row.getField(field.name())))
+                .append(VALUE_SEPARATOR);
+          }
+          keys.add(key.toString());
+        }
+      } catch (IOException e) {
+        throw new UncheckedIOException("Failed to read delete file " + deleteFile.location(), e);
+      }
     }
 
-    Set<String> keys = Sets.newHashSet();
-    for (Row row : deletes.collectAsList()) {
-      StringBuilder key = new StringBuilder();
-      // a delete file holds its key columns in the order the delete file was written with, which is
-      // the order of the field ids; the value is encoded by the column's type, because the two
-      // sides read it through different readers and only the type is common to both
-      for (int i = 0; i < keyFields.size() && i < row.size(); i++) {
-        key.append(encodedValue(keyFields.get(i).type(), row.get(i))).append(VALUE_SEPARATOR);
-      }
-      keys.add(key.toString());
-    }
     return keys;
+  }
+
+  /** Opens one delete file of any format with the given projection. */
+  private static CloseableIterable<Record> openDeletes(
+      FileIO io, DeleteFile deleteFile, Schema projection) {
+    InputFile inputFile = io.newInputFile(deleteFile.location());
+    return FormatModelRegistry.readBuilder(deleteFile.format(), Record.class, inputFile)
+        .project(projection)
+        .reuseContainers()
+        .build();
   }
 
   /**

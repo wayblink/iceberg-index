@@ -151,4 +151,79 @@ class TestLanceVectorSearch {
       assertThat(again.get(i).toString()).isEqualTo(batch.get(i).toString());
     }
   }
+
+  @Test
+  public void searchAppliesPositionDeletesStoredInTheTablesOwnFormat() {
+    String table = "local.db.lance_vectors_deleted";
+    spark.sql("CREATE NAMESPACE IF NOT EXISTS local.db");
+    spark.sql("DROP TABLE IF EXISTS " + table);
+    // the delete file format follows the table's data format, so these deletes are Lance files.
+    // Pinning write.delete.format.default to parquet would avoid them, and that is what the tests
+    // of the format itself do; here the point is that the index path does not depend on that pin.
+    spark.sql(
+        "CREATE TABLE "
+            + table
+            + " (id bigint, embedding array<double>) USING iceberg "
+            + "TBLPROPERTIES ('write.format.default' = 'lance', 'write.delete.mode' = 'merge-on-read')");
+    spark.sql(
+        String.format(
+            "INSERT INTO %s SELECT id, array(CAST(id AS double), CAST(100 - id AS double)) "
+                + "FROM range(0, 200)",
+            table));
+    spark.sql(String.format("DELETE FROM %s WHERE id = 0", table));
+
+    List<Row> deleteFiles =
+        spark
+            .sql(String.format("SELECT file_path FROM %s.all_files WHERE content != 0", table))
+            .collectAsList();
+    assertThat(deleteFiles).isNotEmpty();
+    assertThat(deleteFiles)
+        .as("the delete file is written in the table's format, not parquet")
+        .allSatisfy(row -> assertThat(row.getString(0)).endsWith(".lance"));
+
+    spark.sql(
+        String.format(
+            "CALL local.system.build_vector_index("
+                + "table => '%s', column => 'embedding', dimension => 2, metric => 'euclidean')",
+            table));
+
+    // A hit whose row was deleted comes back without a row, and id 0 was the nearest one, so a
+    // search that cannot read the delete file either fails or answers differently from a scan
+    List<Row> hits =
+        spark
+            .sql(
+                String.format(
+                    "CALL local.system.vector_search(table => '%s', column => 'embedding', "
+                        + "query => array(0.0d, 100.0d), k => 3)",
+                    table))
+            .collectAsList();
+    assertThat(hits).isNotEmpty();
+    assertThat(hits.stream().map(row -> row.getString(3)).filter(row -> row != null))
+        .as("the deleted row is not among the hits")
+        .allSatisfy(row -> assertThat(row).doesNotContain("\"id\":0,"));
+
+    List<Long> indexed =
+        spark
+            .sql(
+                String.format(
+                    "SELECT id FROM %s ORDER BY vec_distance(embedding, array(0.0d, 100.0d)) LIMIT 3",
+                    table))
+            .collectAsList()
+            .stream()
+            .map(row -> row.getLong(0))
+            .collect(java.util.stream.Collectors.toList());
+    List<Long> scanned =
+        spark
+            .sql(
+                String.format(
+                    "SELECT id FROM %s ORDER BY vec_distance(embedding, array(0.0d, 100.0d)) + 0.0d "
+                        + "LIMIT 3",
+                    table))
+            .collectAsList()
+            .stream()
+            .map(row -> row.getLong(0))
+            .collect(java.util.stream.Collectors.toList());
+    assertThat(indexed).as("the index answers what a full scan answers").isEqualTo(scanned);
+    assertThat(indexed).doesNotContain(0L);
+  }
 }
