@@ -860,7 +860,8 @@ final class ExecutorIndexCache {
         stats.loads(),
         stats.evictions(),
         stats.bytes(),
-        stats.entries());
+        stats.entries(),
+        System.currentTimeMillis());
   }
 
   /** Forgets every entry and every counter, so a test starts from a known executor. */

@@ -58,6 +58,7 @@ final class IndexCacheLocations {
     private final long evictions;
     private final long bytes;
     private final long entries;
+    private final long reportedAtMillis;
 
     Report(
         String executorId,
@@ -70,7 +71,8 @@ final class IndexCacheLocations {
         long loads,
         long evictions,
         long bytes,
-        long entries) {
+        long entries,
+        long reportedAtMillis) {
       this.executorId = executorId;
       this.host = host;
       this.epoch = epoch;
@@ -82,6 +84,7 @@ final class IndexCacheLocations {
       this.evictions = evictions;
       this.bytes = bytes;
       this.entries = entries;
+      this.reportedAtMillis = reportedAtMillis;
     }
 
     String executorId() {
@@ -98,6 +101,11 @@ final class IndexCacheLocations {
 
     long seq() {
       return seq;
+    }
+
+    /** When the executor reported this, so a status call can say how old the numbers are. */
+    long reportedAtMillis() {
+      return reportedAtMillis;
     }
 
     long[] keys() {
@@ -257,7 +265,10 @@ final class IndexCacheLocations {
       this.misses = report.misses();
       this.evictions = report.evictions();
       this.bytes = report.bytes();
-      this.lastSeenMillis = System.currentTimeMillis();
+      // the executor's own clock, not the moment the driver happened to merge it: a report that
+      // arrives late is old news, and stamping it on arrival would make it look fresh
+      this.lastSeenMillis =
+          report.reportedAtMillis() > 0 ? report.reportedAtMillis() : System.currentTimeMillis();
     }
 
     private boolean isNewerThan(View other) {
@@ -451,7 +462,8 @@ final class IndexCacheLocations {
                 0,
                 view.evictions,
                 view.bytes,
-                view.keys.length));
+                view.keys.length,
+                view.lastSeenMillis));
       }
     }
 

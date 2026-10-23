@@ -41,7 +41,8 @@ class TestIndexCacheLocations {
         0,
         0,
         keys.length * 100L,
-        keys.length);
+        keys.length,
+        System.currentTimeMillis());
   }
 
   @Test

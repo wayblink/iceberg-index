@@ -46,10 +46,14 @@ import org.apache.iceberg.io.FileIO;
 import org.apache.iceberg.relocated.com.google.common.collect.Lists;
 import org.apache.iceberg.relocated.com.google.common.collect.Maps;
 import org.apache.iceberg.relocated.com.google.common.collect.Sets;
+import org.apache.spark.SparkContext;
 import org.apache.spark.api.java.JavaRDD;
 import org.apache.spark.sql.Row;
 import org.apache.spark.sql.RowFactory;
 import org.apache.spark.sql.SparkSession;
+import org.apache.spark.util.LongAccumulator;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 /**
  * Builds a vector index snapshot for an Iceberg table snapshot with Spark.
@@ -63,6 +67,8 @@ import org.apache.spark.sql.SparkSession;
  * through the {@code IndexCatalog} is a separate step.
  */
 public final class SparkIndexBuilder {
+
+  private static final Logger LOG = LoggerFactory.getLogger(SparkIndexBuilder.class);
 
   private static final String DATA_DIR = "data";
   private static final String FILE_MARKER_PREFIX = "f";
@@ -322,6 +328,18 @@ public final class SparkIndexBuilder {
     // the graph. One, unless the engine was told otherwise through spark.task.cpus
     int buildThreads = spark.sparkContext().getConf().getInt("spark.task.cpus", 1);
 
+    // A build of a large table runs for tens of minutes and reports nothing until it ends, which
+    // makes a stuck one indistinguishable from a slow one. The counters are what the progress lines
+    // are printed from: how many index files of how many, and how many have failed. A group that
+    // fails costs its own index file and the build carries on, so the failed count is real news and
+    // not simply the exception that ended the attempt.
+    SparkContext context = spark.sparkContext();
+    LongAccumulator filesBuilt = context.longAccumulator(BUILT_ACCUMULATOR);
+    LongAccumulator filesFailed = context.longAccumulator(FAILED_ACCUMULATOR);
+    LongAccumulator rowsWritten = context.longAccumulator(ENTRIES_ACCUMULATOR);
+    int totalGroups = groups.size();
+    long buildStartedMillis = System.currentTimeMillis();
+
     List<Row> indexFileRows =
         allRows
             .mapPartitionsWithIndex(
@@ -358,8 +376,25 @@ public final class SparkIndexBuilder {
                     payload = adapter.encodeEntries(groupEntries).array();
                     kind = IndexFile.Kind.ENTRY_BEARING;
                   }
-                  fileContainer.write(
-                      fileIO.newOutputFile(location), List.of(IndexBlob.of(blobType, payload)));
+                  try {
+                    fileContainer.write(
+                        fileIO.newOutputFile(location), List.of(IndexBlob.of(blobType, payload)));
+                  } catch (RuntimeException | Error e) {
+                    filesFailed.add(1);
+                    throw e;
+                  }
+
+                  filesBuilt.add(1);
+                  rowsWritten.add(groupEntries.size());
+                  LOG.info(
+                      "Wrote index file {} of {}, {} of {} data files covered, {} rows, {} ms into "
+                          + "the build",
+                      filesBuilt.value(),
+                      totalGroups,
+                      covered.size(),
+                      groupEntries.isEmpty() ? 0 : dataFileCount(tasksByIndexFile, index),
+                      groupEntries.size(),
+                      System.currentTimeMillis() - buildStartedMillis);
                   return List.of(
                           RowFactory.create(
                               location,
@@ -392,7 +427,26 @@ public final class SparkIndexBuilder {
               .build());
     }
 
+    LOG.info(
+        "Built {} of {} index files for {}, {} rows, {} failed, in {} ms",
+        filesBuilt.value(),
+        totalGroups,
+        indexLocation,
+        rowsWritten.value(),
+        filesFailed.value(),
+        System.currentTimeMillis() - buildStartedMillis);
+
     return indexFiles;
+  }
+
+  private static final String BUILT_ACCUMULATOR = "iceberg.index.build.files-built";
+  private static final String FAILED_ACCUMULATOR = "iceberg.index.build.files-failed";
+  private static final String ENTRIES_ACCUMULATOR = "iceberg.index.build.rows";
+
+  /** How many data files the group at this partition index was assigned. */
+  private static int dataFileCount(Map<Integer, List<FileScanTask>> tasksByIndexFile, int index) {
+    List<FileScanTask> tasks = tasksByIndexFile.get(index);
+    return tasks == null ? 0 : tasks.size();
   }
 
   /**

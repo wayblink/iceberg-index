@@ -93,6 +93,26 @@ The report is one HTML file with inline CSS and inline SVG: no network, no JavaS
 It carries the charts (recall and latency against the setting, the recall/latency trade-off, the
 per-query spread), the summary table, the method and its caveats, and every raw measurement.
 
+## Failing a run that got worse
+
+`../vector-index-gate.py` reads two logs and exits non-zero when a setting regressed by more than
+the allowed amount, so "did this change make recall worse" stops being a question answered by eye:
+
+```bash
+# against the run this one has to live up to
+./vector-index-gate.py results/current.log --baseline results/previous.log
+
+# or against an absolute bar, with no earlier run to compare
+./vector-index-gate.py results/current.log --min-recall 0.95 --max-p50 20000
+```
+
+The defaults allow a 0.02 recall drop and a 20% rise in median latency against the baseline, which
+is a little more than the run-to-run spread measured on the cluster; `--max-recall-drop 0` and
+`--max-latency-increase 0` make the check exact for a run on a quiet machine. Only settings both
+runs measured are compared, since a setting one run skipped is not a regression, and a log that
+stops before its `BENCHSUMMARY {"kind":"done"}` line is refused: a truncated run has fewer
+measurements, and fewer measurements read as an improvement.
+
 ## Reading the numbers
 
 * the vertical lines on the recall chart are min–max over (query × round): recall varies far more

@@ -197,8 +197,10 @@ public final class IndexCacheStatus {
   private static List<Row> rows(IndexCacheLocations table) {
     List<IndexCacheLocations.Report> reports = table.reports();
     List<Row> rows = new ArrayList<>(reports.size() + 1);
-    long now = System.currentTimeMillis();
+    // the summary row is the sum of the reports, so it is only as new as the oldest of them
+    long oldestMillis = Long.MAX_VALUE;
     for (IndexCacheLocations.Report report : reports) {
+      oldestMillis = Math.min(oldestMillis, report.reportedAtMillis());
       rows.add(
           new Row(
               report.executorId(),
@@ -213,7 +215,7 @@ public final class IndexCacheStatus {
               report.evictions(),
               table.lastCoverage(),
               table.lastWorkingSetBytes(),
-              now));
+              report.reportedAtMillis()));
     }
 
     boolean alreadyNamed = false;
@@ -238,7 +240,7 @@ public final class IndexCacheStatus {
               rows.stream().mapToLong(Row::evictions).sum(),
               table.lastCoverage(),
               table.lastWorkingSetBytes(),
-              table.lastQueryMillis() > 0 ? table.lastQueryMillis() : now));
+              oldestMillis == Long.MAX_VALUE ? 0L : oldestMillis));
     }
 
     return Collections.unmodifiableList(rows);

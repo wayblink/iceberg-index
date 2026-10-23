@@ -44,6 +44,15 @@ class IndexCacheStatusProcedure extends BaseProcedure {
   private static final ProcedureParameter REFRESH_PARAM =
       optionalInParameter("refresh", DataTypes.BooleanType);
 
+  /**
+   * How old a report may be before it stops describing the present.
+   *
+   * <p>The default snapshot is whatever the executors sent at the end of their last task, so on an
+   * idle cluster it is a picture of the last query rather than of now. Saying which is which is the
+   * whole point of the two columns.
+   */
+  private static final long STALE_AFTER_MILLIS = 10L * 60L * 1000L;
+
   private static final ProcedureParameter[] PARAMETERS = new ProcedureParameter[] {REFRESH_PARAM};
 
   private static final StructType OUTPUT_TYPE =
@@ -61,7 +70,9 @@ class IndexCacheStatusProcedure extends BaseProcedure {
             new StructField("evictions", DataTypes.LongType, false, Metadata.empty()),
             new StructField("coverage", DataTypes.DoubleType, false, Metadata.empty()),
             new StructField("working_set_bytes", DataTypes.LongType, false, Metadata.empty()),
-            new StructField("reported_at", DataTypes.TimestampType, false, Metadata.empty())
+            new StructField("reported_at", DataTypes.TimestampType, false, Metadata.empty()),
+            new StructField("age_ms", DataTypes.LongType, false, Metadata.empty()),
+            new StructField("stale", DataTypes.BooleanType, false, Metadata.empty())
           });
 
   public static ProcedureBuilder builder() {
@@ -96,7 +107,9 @@ class IndexCacheStatusProcedure extends BaseProcedure {
         refresh ? IndexCacheStatus.refresh(spark()) : IndexCacheStatus.snapshot(spark());
 
     List<InternalRow> result = Lists.newArrayListWithCapacity(rows.size());
+    long now = System.currentTimeMillis();
     for (IndexCacheStatus.Row row : rows) {
+      long ageMillis = row.reportedAtMillis() > 0 ? now - row.reportedAtMillis() : -1L;
       result.add(
           newInternalRow(
               UTF8String.fromString(row.executorId()),
@@ -111,7 +124,9 @@ class IndexCacheStatusProcedure extends BaseProcedure {
               row.evictions(),
               row.coverage(),
               row.workingSetBytes(),
-              row.reportedAtMillis() * 1000L));
+              row.reportedAtMillis() * 1000L,
+              ageMillis,
+              ageMillis < 0 || ageMillis > STALE_AFTER_MILLIS));
     }
 
     return result.toArray(new InternalRow[0]);

@@ -73,7 +73,23 @@ public class TestIndexCacheStatus extends ExtensionsTestBase {
     // in a local session the only executor is the driver, so a refresh reports what the snapshot
     // would: no separate executor rows, and no error
     for (Object[] row : rows) {
-      assertThat(row).hasSize(13);
+      assertThat(row).hasSize(15);
+    }
+  }
+
+  @TestTemplate
+  public void aFreshReportSaysSoAndAnOldOneSaysItIsOld() {
+    List<Object[]> rows = sql("CALL %s.system.index_cache_status(refresh => true)", catalogName);
+    assertThat(rows).isNotEmpty();
+
+    long now = System.currentTimeMillis();
+    for (Object[] row : rows) {
+      // a refresh just asked the executors, so nothing it returns can be old: the two columns
+      // exist to tell a caller whether the snapshot still describes the present
+      assertThat((Long) row[13]).as("age in millis").isBetween(0L, 60_000L);
+      assertThat((Boolean) row[14]).as("stale").isFalse();
+      long reportedAt = ((java.sql.Timestamp) row[12]).getTime();
+      assertThat(reportedAt).as("reported_at is a millisecond stamp").isBetween(now - 60_000L, now);
     }
   }
 }
