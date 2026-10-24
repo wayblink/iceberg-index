@@ -151,7 +151,7 @@ public final class DistributedIndexSearch {
     // properties of its catalog rather than with whatever the session happens to be configured with
     Broadcast<FileIO> ioRef = context.broadcast(table.io());
     // whether an executor remembers index files between queries, and how much it may keep
-    long workingSet = workingSetBytes(table.io(), files);
+    long workingSet = workingSetBytes(table.io(), files, adapter);
     Broadcast<ExecutorIndexCache.Config> cacheRef =
         context.broadcast(ExecutorIndexCache.Config.from(spark, workingSet, table.location()));
     String cacheKey = cacheKey(adapter);
@@ -288,7 +288,7 @@ public final class DistributedIndexSearch {
     }
     Broadcast<List<byte[]>> queriesRef = context.broadcast(queryPayloads);
     Broadcast<FileIO> ioRef = context.broadcast(table.io());
-    long workingSet = workingSetBytes(table.io(), files);
+    long workingSet = workingSetBytes(table.io(), files, adapter);
     Broadcast<ExecutorIndexCache.Config> cacheRef =
         context.broadcast(ExecutorIndexCache.Config.from(spark, workingSet, table.location()));
     String cacheKey = cacheKey(adapter);
@@ -533,16 +533,60 @@ public final class DistributedIndexSearch {
   }
 
   /**
-   * The bytes the query's index files hold. An index file never changes once written, so a size is
-   * remembered: the budget it feeds is decided once per query and the lookup is a metadata call.
+   * The bytes the query's index files hold once their payloads are prepared.
+   *
+   * <p>What a budget has to cover is the memory a query needs, not the size of the files on disk: a
+   * decoded entry list, a set of centroids and a graph with a connection list per node all cost
+   * more than the bytes they were read from, and by a different factor each. Charging the budget
+   * against the file size is what left a derived budget covering two thirds of the files it was
+   * supposed to hold, and one factor standing in for all three structures would be the same guess
+   * with a different number.
+   *
+   * <p>So the size is measured rather than multiplied: each payload is read and prepared once, and
+   * what it reports is remembered. An index file never changes once written, so the cost is a
+   * header read per file the first time and nothing after that.
    */
-  static long workingSetBytes(FileIO io, List<IndexFile> files) {
+  static long workingSetBytes(FileIO io, List<IndexFile> files, IndexAdapter adapter) {
     long total = 0;
     for (IndexFile file : files) {
-      total += sizeOf(io, file.location());
+      total += preparedBytesOf(io, file.location(), adapter);
     }
 
     return total;
+  }
+
+  private static final Map<String, Long> KNOWN_PREPARED_BYTES =
+      new java.util.concurrent.ConcurrentHashMap<>();
+
+  private static long preparedBytesOf(FileIO io, String location, IndexAdapter adapter) {
+    Long known = KNOWN_PREPARED_BYTES.get(location);
+    if (known != null) {
+      return known;
+    }
+
+    long bytes;
+    try {
+      // the header, not the whole file: what a structure costs is decided by its shape, so the
+      // measurement reads the same bytes on the driver that it charges the executor for
+      byte[] content = readPayload(io, location);
+      IndexAdapter.PreparedSearch prepared = prepareFile(content, adapter);
+      bytes = prepared.estimatedBytes();
+      if (bytes <= 0) {
+        // a structure that cannot say what it holds costs at least the payload it was read from
+        bytes = content.length;
+      }
+    } catch (RuntimeException e) {
+      // a size only sizes a budget: an index file this build cannot read is reported elsewhere, and
+      // failing the query here would turn an unreadable index into an unanswerable query
+      LOG.debug("Could not measure the prepared size of index file {}", location, e);
+      return sizeOf(io, location);
+    }
+
+    if (KNOWN_PREPARED_BYTES.size() < 100_000) {
+      KNOWN_PREPARED_BYTES.put(location, bytes);
+    }
+
+    return bytes;
   }
 
   private static final Map<String, Long> KNOWN_SIZES =

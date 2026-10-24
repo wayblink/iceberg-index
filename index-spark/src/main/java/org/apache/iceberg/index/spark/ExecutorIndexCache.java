@@ -211,26 +211,15 @@ final class ExecutorIndexCache {
       }
 
       // compared in the same unit as the budget: what the payloads become, not what they weigh
-      long residentBytes = (long) (workingSetBytes * PREPARED_TO_PAYLOAD);
       long capacity = budgetPerExecutor * Math.max(1, executors);
-      if (residentBytes <= capacity) {
+      if (workingSetBytes <= capacity) {
         return Mode.PIN_ALL;
-      } else if (residentBytes <= 2 * capacity) {
+      } else if (workingSetBytes <= 2 * capacity) {
         return Mode.PIN_HOT;
       } else {
         return Mode.STREAM;
       }
     }
-
-    /**
-     * How much memory a working set needs once its payloads are prepared.
-     *
-     * <p>The working set a reader computes is the size of the index files on disk. What the cache
-     * has to hold is what those payloads become: a decoded entry list, a set of centroids, a graph
-     * with a connection list per node. Charging the budget against the file size is what made a
-     * derived budget cover two thirds of the files it was supposed to fit.
-     */
-    static final double PREPARED_TO_PAYLOAD = 3.5;
 
     /**
      * The budget for one executor.
@@ -249,11 +238,9 @@ final class ExecutorIndexCache {
         int executors,
         long heapBytes,
         double heapFraction) {
-      // the file sizes a reader reports are what the index weighs on disk; what an executor has to
-      // hold is what those payloads become once prepared, which is several times more
-      long residentBytes =
-          workingSetBytes > 0 ? (long) (workingSetBytes * PREPARED_TO_PAYLOAD) : 0L;
-      long perExecutor = residentBytes > 0 ? ceilDiv(residentBytes, Math.max(1, executors)) : 0;
+      // the working set a caller passes is what the payloads become once prepared, which is what
+      // this budget has to hold; multiplying the file sizes into that is the guess this replaced
+      long perExecutor = workingSetBytes > 0 ? ceilDiv(workingSetBytes, Math.max(1, executors)) : 0;
       long heapBudget = (long) (heapBytes * heapFraction);
       if (configuredValue != null) {
         Preconditions.checkArgument(configuredBytes > 0, "The cache budget must be positive");
@@ -272,7 +259,7 @@ final class ExecutorIndexCache {
         return configuredBytes;
       }
 
-      long wanted = perExecutor > 0 ? perExecutor : MIN_BUDGET_BYTES;
+      long wanted = perExecutor > 0 ? (long) (perExecutor * 1.2) : MIN_BUDGET_BYTES;
       return Math.min(heapBudget, Math.max(MIN_BUDGET_BYTES, wanted));
     }
 

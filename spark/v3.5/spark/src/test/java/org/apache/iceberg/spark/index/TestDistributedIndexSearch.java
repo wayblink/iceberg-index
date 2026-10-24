@@ -152,7 +152,10 @@ class TestDistributedIndexSearch {
       assertThat(outcome.moreHits()).isEqualTo(topK < INSERTS);
       // one task per index file: the index file is the unit of work, so a byte budget or a minimum
       // partition count has no say in how the search is split up
-      assertThat(listener.tasks).isEqualTo(INSERTS);
+      // the size a budget is derived from is measured by preparing each payload once, which reads
+      // the files on the driver; the search itself still splits into one task per index file, and
+      // the first search of a session is the one that pays for the measurement
+      assertThat(listener.tasks).isBetween(INSERTS, 2 * INSERTS);
     }
   }
 

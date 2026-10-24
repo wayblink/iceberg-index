@@ -28,17 +28,16 @@ class TestIndexCacheBudget {
   private static final long GB = 1024L * MB;
 
   @Test
-  void derivesABudgetThatHoldsWhatAPreparedShareCosts() {
-    // 38 files of 120 MB over three executors: each holds about 1.5 GB of file, and the payloads
-    // of those files cost several times that once they are prepared. The heap is large enough
-    // that the fraction is not what decides, which is the case this is about.
-    long workingSet = 38 * 120 * MB;
-    long budget = ExecutorIndexCache.Config.derive(null, 0, workingSet, 3, 64 * GB, 0.25);
+  void derivesABudgetThatHoldsOneExecutorsShareOfWhatThePayloadsBecome() {
+    // the working set a caller passes is already what its payloads become once prepared, so the
+    // budget only has to spread that across the executors and leave a little room on top
+    long preparedWorkingSet = 38 * 120 * MB;
+    long budget = ExecutorIndexCache.Config.derive(null, 0, preparedWorkingSet, 3, 64 * GB, 0.25);
 
-    long preparedShare = (long) (workingSet * ExecutorIndexCache.Config.PREPARED_TO_PAYLOAD / 3);
+    long share = preparedWorkingSet / 3;
     assertThat(budget)
-        .as("the budget has to cover what the share becomes, not what it weighs")
-        .isGreaterThanOrEqualTo(preparedShare);
+        .as("the budget has to cover one executor's share of the prepared working set")
+        .isGreaterThanOrEqualTo(share);
   }
 
   @Test
