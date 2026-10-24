@@ -59,7 +59,7 @@ public class VectorBenchmark {
    * that cannot reach 1.0 is a budget below the working set, and the latency of every query after
    * it is the latency of an eviction rather than of a search.
    */
-  private static void reportCoverage(String base, List<String> indexNames) {
+  private static void reportCoverage(SparkSession spark) {
     for (Row row : spark.sql("CALL hms.system.index_cache_status()").collectAsList()) {
       emit(
           "COVERAGE {\"executor\":\"" + row.getString(0) + "\",\"mode\":\"" + row.getString(3)
@@ -275,7 +275,7 @@ public class VectorBenchmark {
       // one query is enough: it loads the arm's files on every executor, which is what the status
       // call then reports. The budget is already decided by the time this runs, so what it covers
       // is what any later query would get.
-      reportCoverage(base, indexNames);
+      reportCoverage(spark);
     } else if ("procedure".equals(mode)) {
       for (int q = warmup; q < warmup + measured; q++) {
         for (String indexName : indexNames) {
