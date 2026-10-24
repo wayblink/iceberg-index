@@ -21,7 +21,6 @@ package org.apache.iceberg.lance;
 import java.io.File;
 import java.io.IOException;
 import java.nio.file.Path;
-import java.util.List;
 import java.util.Random;
 import org.apache.iceberg.FileContent;
 import org.apache.iceberg.Files;
@@ -53,13 +52,10 @@ class TestLanceEncodingSizes {
   }
 
   private long write(
-      Types.NestedField vectorField,
-      java.util.function.IntFunction<Object> vectorOf,
-      String label)
+      Types.NestedField vectorField, java.util.function.IntFunction<Object> vectorOf, String label)
       throws IOException {
     Schema schema =
-        new Schema(
-            Types.NestedField.required(1, "pk", Types.LongType.get()), vectorField);
+        new Schema(Types.NestedField.required(1, "pk", Types.LongType.get()), vectorField);
     LanceFormatModel<Record, Void> model = model();
     File file = tempDir.resolve("vec_" + label + ".lance").toFile();
     EncryptedOutputFile out = EncryptedFiles.plainAsEncryptedOutput(Files.localOutput(file));
@@ -125,7 +121,8 @@ class TestLanceEncodingSizes {
               },
               names[t]);
       System.out.printf(
-          "%-11s %-14s %10d bytes  %.3f B/value%n", names[t], type, bytes, bytes * 1.0 / valuesTotal);
+          "%-11s %-14s %10d bytes  %.3f B/value%n",
+          names[t], type, bytes, bytes * 1.0 / valuesTotal);
     }
   }
 }

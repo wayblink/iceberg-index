@@ -170,8 +170,7 @@ public class LanceSchemaUtil {
     } else if (icebergField.type().isMapType()) {
       Types.MapType mapType = icebergField.type().asMapType();
       Field keyField = convertField(mapType.fields().get(0), leafMetadata, applyEncodingDefaults);
-      Field valueField =
-          convertField(mapType.fields().get(1), leafMetadata, applyEncodingDefaults);
+      Field valueField = convertField(mapType.fields().get(1), leafMetadata, applyEncodingDefaults);
       List<Field> entryChildren = Lists.newArrayList();
       entryChildren.add(keyField);
       entryChildren.add(valueField);

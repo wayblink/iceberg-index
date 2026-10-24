@@ -173,10 +173,9 @@ public class SparkLanceRowReader {
         return value;
     }
   }
+
   private static org.apache.spark.sql.catalyst.util.GenericArrayData readSparkList(
-      org.apache.arrow.vector.complex.ListVector listVector,
-      int rowIdx,
-      Types.NestedField field) {
+      org.apache.arrow.vector.complex.ListVector listVector, int rowIdx, Types.NestedField field) {
     int start = listVector.getOffsetBuffer().getInt((long) rowIdx * 4);
     int end = listVector.getOffsetBuffer().getInt((long) (rowIdx + 1) * 4);
     FieldVector dataVector = listVector.getDataVector();
@@ -184,7 +183,8 @@ public class SparkLanceRowReader {
 
     Object[] elements = new Object[end - start];
     for (int i = start; i < end; i++) {
-      elements[i - start] = dataVector.isNull(i) ? null : readSparkValue(dataVector, i, elementField);
+      elements[i - start] =
+          dataVector.isNull(i) ? null : readSparkValue(dataVector, i, elementField);
     }
     return new org.apache.spark.sql.catalyst.util.GenericArrayData(elements);
   }

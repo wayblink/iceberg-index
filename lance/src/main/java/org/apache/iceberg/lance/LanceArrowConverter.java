@@ -34,6 +34,7 @@ import org.apache.arrow.vector.BigIntVector;
 import org.apache.arrow.vector.BitVector;
 import org.apache.arrow.vector.DateDayVector;
 import org.apache.arrow.vector.DecimalVector;
+import org.apache.arrow.vector.FieldVector;
 import org.apache.arrow.vector.FixedSizeBinaryVector;
 import org.apache.arrow.vector.Float4Vector;
 import org.apache.arrow.vector.Float8Vector;
@@ -43,7 +44,6 @@ import org.apache.arrow.vector.TimeStampMicroTZVector;
 import org.apache.arrow.vector.TimeStampMicroVector;
 import org.apache.arrow.vector.VarBinaryVector;
 import org.apache.arrow.vector.VarCharVector;
-import org.apache.arrow.vector.FieldVector;
 import org.apache.arrow.vector.VectorSchemaRoot;
 import org.apache.arrow.vector.complex.ListVector;
 import org.apache.arrow.vector.complex.writer.BaseWriter;
@@ -321,10 +321,15 @@ class LanceArrowConverter {
     long nanoAdjustment = Math.floorMod(micros, 1_000_000) * 1000L;
     return OffsetDateTime.ofInstant(Instant.ofEpochSecond(seconds, nanoAdjustment), ZoneOffset.UTC);
   }
+
   /** Writes a Java list into an Arrow list vector, one element type at a time. */
   @SuppressWarnings("unchecked")
   private static void writeListValue(
-      VectorSchemaRoot batch, String vectorName, Types.NestedField field, int rowIndex, Object value) {
+      VectorSchemaRoot batch,
+      String vectorName,
+      Types.NestedField field,
+      int rowIndex,
+      Object value) {
     ListVector listVector = (ListVector) batch.getVector(vectorName);
     Types.NestedField elementField = field.type().asListType().fields().get(0);
     List<Object> elements = (List<Object>) value;
@@ -384,8 +389,7 @@ class LanceArrowConverter {
         elements.add(null);
         continue;
       }
-      elements.add(
-          readListElement(elementVector, elementField, i, elementVector.getMinorType()));
+      elements.add(readListElement(elementVector, elementField, i, elementVector.getMinorType()));
     }
     return elements;
   }
@@ -407,7 +411,11 @@ class LanceArrowConverter {
         return new String(((VarCharVector) elementVector).get(index), StandardCharsets.UTF_8);
       default:
         throw new UnsupportedOperationException(
-            "Unsupported list element type: " + elementField.type().typeId() + " (" + minorType + ")");
+            "Unsupported list element type: "
+                + elementField.type().typeId()
+                + " ("
+                + minorType
+                + ")");
     }
   }
 }

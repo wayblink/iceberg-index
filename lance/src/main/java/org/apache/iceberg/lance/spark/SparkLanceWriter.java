@@ -98,9 +98,9 @@ public class SparkLanceWriter {
             "Unsupported type for Spark writer: " + field.type().typeId());
     }
   }
+
   /** Converts a Spark array into the Java list the Arrow list writer expects. */
-  private static List<Object> extractList(
-      InternalRow row, int ordinal, Types.NestedField field) {
+  private static List<Object> extractList(InternalRow row, int ordinal, Types.NestedField field) {
     org.apache.spark.sql.catalyst.util.ArrayData array = row.getArray(ordinal);
     if (array == null) {
       return null;

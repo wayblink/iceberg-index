@@ -22,12 +22,9 @@ import java.io.File;
 import java.nio.file.Path;
 import java.util.Map;
 import java.util.Random;
-import org.apache.iceberg.Files;
 import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.memory.RootAllocator;
 import org.apache.arrow.vector.BigIntVector;
-import org.apache.arrow.vector.IntVector;
-import org.apache.arrow.vector.Float4Vector;
 import org.apache.arrow.vector.VectorSchemaRoot;
 import org.apache.arrow.vector.complex.ListVector;
 import org.apache.arrow.vector.complex.writer.BaseWriter;
@@ -36,16 +33,17 @@ import org.apache.arrow.vector.types.pojo.ArrowType;
 import org.apache.arrow.vector.types.pojo.Field;
 import org.apache.arrow.vector.types.pojo.FieldType;
 import org.apache.arrow.vector.types.pojo.Schema;
+import org.apache.iceberg.FileContent;
+import org.apache.iceberg.Files;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableMap;
 import org.apache.iceberg.relocated.com.google.common.collect.Lists;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
-import org.apache.iceberg.FileContent;
 import org.lance.file.LanceFileWriter;
 
 /**
- * What the stable (2.1) file format can do for a SIFT-like vector column: the column type
- * (integers bitpack) and the per-field compression metadata that is off by default.
+ * What the stable (2.1) file format can do for a SIFT-like vector column: the column type (integers
+ * bitpack) and the per-field compression metadata that is off by default.
  */
 class TestLanceCompressionOptions {
 
@@ -54,7 +52,8 @@ class TestLanceCompressionOptions {
   private static final int BATCH = 20_000;
   @TempDir Path tempDir;
 
-  private long write(String label, boolean integers, Map<String, String> encoding) throws Exception {
+  private long write(String label, boolean integers, Map<String, String> encoding)
+      throws Exception {
     File file = tempDir.resolve(label + ".lance").toFile();
     try (BufferAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
       Field element =
@@ -62,7 +61,9 @@ class TestLanceCompressionOptions {
               "element",
               new FieldType(
                   false,
-                  integers ? new ArrowType.Int(32, true) : new ArrowType.FloatingPoint(FloatingPointPrecision.SINGLE),
+                  integers
+                      ? new ArrowType.Int(32, true)
+                      : new ArrowType.FloatingPoint(FloatingPointPrecision.SINGLE),
                   null,
                   encoding),
               null);
@@ -72,9 +73,7 @@ class TestLanceCompressionOptions {
               new FieldType(true, ArrowType.List.INSTANCE, null, encoding),
               Lists.newArrayList(element));
       Schema schema =
-          new Schema(
-              Lists.newArrayList(
-                  Field.nullable("pk", new ArrowType.Int(64, true)), list));
+          new Schema(Lists.newArrayList(Field.nullable("pk", new ArrowType.Int(64, true)), list));
 
       Random random = new Random(0);
       try (LanceFileWriter writer = LanceFileWriter.open(file.getAbsolutePath(), allocator, null)) {
@@ -180,14 +179,11 @@ class TestLanceCompressionOptions {
       }
     }
 
-    long byDefault = writeThroughModel(model, schema, values, rows, java.util.Collections.emptyMap());
+    long byDefault =
+        writeThroughModel(model, schema, values, rows, java.util.Collections.emptyMap());
     long plain =
         writeThroughModel(
-            model,
-            schema,
-            values,
-            rows,
-            ImmutableMap.of("lance.encoding.compression", "none"));
+            model, schema, values, rows, ImmutableMap.of("lance.encoding.compression", "none"));
     long zstd =
         writeThroughModel(
             model, schema, values, rows, ImmutableMap.of("lance.encoding.compression", "zstd"));
@@ -197,10 +193,16 @@ class TestLanceCompressionOptions {
 
     long valuesTotal = (long) rows * DIM;
     System.out.printf("rows=%d dim=%d values=%d%n", rows, DIM, valuesTotal);
-    System.out.printf("model float32 default    %9d bytes  %.3f B/value%n", byDefault, byDefault * 1.0 / valuesTotal);
-    System.out.printf("model float32 compression=none %9d bytes  %.3f B/value%n", plain, plain * 1.0 / valuesTotal);
-    System.out.printf("model float32 + zstd     %9d bytes  %.3f B/value%n", zstd, zstd * 1.0 / valuesTotal);
-    System.out.printf("model float32 + lz4      %9d bytes  %.3f B/value%n", lz4, lz4 * 1.0 / valuesTotal);
+    System.out.printf(
+        "model float32 default    %9d bytes  %.3f B/value%n",
+        byDefault, byDefault * 1.0 / valuesTotal);
+    System.out.printf(
+        "model float32 compression=none %9d bytes  %.3f B/value%n",
+        plain, plain * 1.0 / valuesTotal);
+    System.out.printf(
+        "model float32 + zstd     %9d bytes  %.3f B/value%n", zstd, zstd * 1.0 / valuesTotal);
+    System.out.printf(
+        "model float32 + lz4      %9d bytes  %.3f B/value%n", lz4, lz4 * 1.0 / valuesTotal);
   }
 
   private long writeThroughModel(
@@ -239,10 +241,7 @@ class TestLanceCompressionOptions {
     // the file still reads back through the same model
     int read = 0;
     try (org.apache.iceberg.io.CloseableIterable<org.apache.iceberg.data.Record> records =
-        model
-            .readBuilder(Files.localInput(file))
-            .project(schema)
-            .build()) {
+        model.readBuilder(Files.localInput(file)).project(schema).build()) {
       for (org.apache.iceberg.data.Record ignored : records) {
         read++;
       }

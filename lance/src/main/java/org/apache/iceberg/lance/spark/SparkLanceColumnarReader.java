@@ -66,8 +66,7 @@ public class SparkLanceColumnarReader {
           if (field.fieldId() == org.apache.iceberg.MetadataColumns.ROW_POSITION.fieldId()) {
             // _pos varies per row: the constant carries the batch's first file offset
             columns.add(
-                new PositionColumnVector(
-                    ((Number) idToConstant.get(field.fieldId())).longValue()));
+                new PositionColumnVector(((Number) idToConstant.get(field.fieldId())).longValue()));
           } else {
             columns.add(
                 new ConstantColumnVector(sparkType, rowCount, idToConstant.get(field.fieldId())));
