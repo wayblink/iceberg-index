@@ -294,6 +294,10 @@ public class VectorBenchmark {
       }
 
       reportCoverage(spark);
+      emit(SUMMARY + "{\"kind\":\"done\"}");
+      file.close();
+      spark.stop();
+      return;
     } else if ("procedure".equals(mode)) {
       for (int q = warmup; q < warmup + measured; q++) {
         for (String indexName : indexNames) {
