@@ -22,6 +22,7 @@ import java.io.Serializable;
 import java.util.ArrayList;
 import java.util.Iterator;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -553,7 +554,20 @@ final class ExecutorIndexCache {
 
   // room promised to loads in flight, and the budget those promises are against
   private long reservedBytes = 0;
-  private volatile long budgetBytes = Long.MAX_VALUE;
+  private final Set<Reservation> reservations = new LinkedHashSet<>();
+  private final Map<String, Long> reservedByOwner = new LinkedHashMap<>();
+
+  private static final class Reservation {
+    private final String owner;
+    private final long bytes;
+    private final long budget;
+
+    private Reservation(String owner, long bytes, long budget) {
+      this.owner = owner;
+      this.bytes = bytes;
+      this.budget = budget;
+    }
+  }
 
   // what each table holds, so a share of the budget can be reserved per table
   private final Map<String, Long> bytesByOwner = new LinkedHashMap<>();
@@ -581,7 +595,6 @@ final class ExecutorIndexCache {
       return loader.load();
     }
 
-    budgetBytes = config.maxBytes();
     String cacheKey = config.owner() + "|" + key + "|" + location;
     sweepIfDue(config);
     CachedFile hit = lookup(cacheKey);
@@ -603,45 +616,24 @@ final class ExecutorIndexCache {
           return loader.load();
         }
 
-        long start = System.nanoTime();
-        // the size is not known until the payload is prepared, so the room held is what the entry
-        // limit allows; it goes back as soon as the load finishes
-        long reservation = Math.min(config.maxEntryBytes(), config.maxBytes());
-        long held = reserve(reservation);
-
-        CachedFile loaded;
+        Reservation reservation = reserve(config);
         try {
-          loaded = loader.load();
-        } catch (RuntimeException | Error e) {
-          releaseReservation(reservation);
-          throw e;
-        }
+          CachedFile loaded = loader.load();
+          loads.incrementAndGet();
+          if (loaded.bytes() > config.maxEntryBytes()) {
+            skippedTooLarge.incrementAndGet();
+            LOG.debug(
+                "Not caching {}: {} bytes is over the {} byte entry limit",
+                location,
+                loaded.bytes(),
+                config.maxEntryBytes());
+            return loaded;
+          }
 
-        loads.incrementAndGet();
-        // the load has finished, so the reservation goes back whether or not the entry is kept
-        releaseReservation(reservation);
-        if (loaded.bytes() > config.maxEntryBytes()) {
-          // a file larger than the per-entry limit is not worth evicting the rest for
-          skippedTooLarge.incrementAndGet();
-          LOG.debug(
-              "Not caching {}: {} bytes is over the {} byte entry limit",
-              location,
-              loaded.bytes(),
-              config.maxEntryBytes());
-          return loaded;
+          return put(cacheKey, loaded, config, reservation);
+        } finally {
+          releaseReservation(reservation);
         }
-        CachedFile stored = put(cacheKey, loaded, config, askedTwice);
-        if (stored != loaded) {
-          // the cached copy carries the owner; a caller should see the entry it will hit next time
-          return stored;
-        }
-        LOG.debug(
-            "Cached {} in {} ms ({} bytes, mode {})",
-            location,
-            java.util.concurrent.TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - start),
-            loaded.bytes(),
-            config.mode());
-        return loaded;
       } finally {
         loading.remove(cacheKey, monitor);
       }
@@ -680,8 +672,20 @@ final class ExecutorIndexCache {
     }
   }
 
-  private CachedFile put(String cacheKey, CachedFile file, Config config, boolean askedTwice) {
+  private CachedFile put(String cacheKey, CachedFile file, Config config, Reservation reservation) {
     synchronized (mapLock) {
+      long capacity = budget(config.maxBytes());
+      // Reclaim any extra room before admitting the measured entry. Other loads keep their
+      // promises.
+      long otherReservations = reservedBytes - reservation.bytes;
+      long available = Math.max(0L, capacity - otherReservations);
+      evict(Math.max(0L, available - file.bytes()), capacity, reservation, file.bytes());
+      if (file.bytes() > available - bytes) {
+        LOG.debug("Not caching {}: no room within the {} byte budget", cacheKey, capacity);
+        return file;
+      }
+
+      releaseReservation(reservation);
       CachedFile previous = protectedFiles.remove(cacheKey);
       if (previous == null) {
         previous = probation.remove(cacheKey);
@@ -705,18 +709,7 @@ final class ExecutorIndexCache {
       bytes += file.bytes();
       bytesByOwner.merge(file.owner(), file.bytes(), Long::sum);
       entriesByOwner.merge(file.owner(), 1, Integer::sum);
-      evict(config.maxBytes());
-
-      if (bytes > config.maxBytes()) {
-        // everything left is either pinned or being searched, so this file is not kept at all
-        // rather than being added to a budget that is already over
-        if (protectedFiles.remove(cacheKey) != null || probation.remove(cacheKey) != null) {
-          release(file);
-        }
-
-        return file;
-      }
-
+      LOG.debug("Cached {} ({} bytes, mode {})", cacheKey, file.bytes(), config.mode());
       return file;
     }
   }
@@ -728,12 +721,14 @@ final class ExecutorIndexCache {
    * so evicting one would mean the fit was wrong, and the caller learns that from a budget warning
    * rather than from a cache that quietly does nothing.
    */
-  private void evict(long maxBytes) {
+  private void evict(
+      long maxBytes, long fairnessBudget, Reservation reservation, long incomingBytes) {
     boolean warned = false;
     while (bytes > maxBytes) {
       // the table holding the most beyond its fair share goes first, so one large index cannot
       // crowd out a small one that is also being queried
-      Map.Entry<String, CachedFile> victim = mostOverQuota(maxBytes);
+      Map.Entry<String, CachedFile> victim =
+          mostOverQuota(fairnessBudget, reservation, incomingBytes);
       if (victim == null) {
         victim = oldestEvictable(probation, false);
       }
@@ -771,12 +766,17 @@ final class ExecutorIndexCache {
    * tables come and go: a table that borrows room another table is not using keeps it until that
    * table asks for it back, which is what "borrowed" means here.
    */
-  private Map.Entry<String, CachedFile> mostOverQuota(long maxBytes) {
-    int owners = Math.max(1, bytesByOwner.size());
-    long quota = maxBytes / owners;
+  private Map.Entry<String, CachedFile> mostOverQuota(
+      long fairnessBudget, Reservation reservation, long incomingBytes) {
+    Map<String, Long> occupied = new LinkedHashMap<>(bytesByOwner);
+    reservedByOwner.forEach((owner, held) -> occupied.merge(owner, held, Long::sum));
+    // The arriving entry replaces its own promise, not another table's share.
+    occupied.merge(reservation.owner, incomingBytes - reservation.bytes, Long::sum);
+    int owners = Math.max(1, occupied.size());
+    long quota = fairnessBudget / owners;
     String worst = null;
     long worstExcess = 0;
-    for (Map.Entry<String, Long> entry : bytesByOwner.entrySet()) {
+    for (Map.Entry<String, Long> entry : occupied.entrySet()) {
       long excess = entry.getValue() - quota;
       if (excess > worstExcess) {
         worst = entry.getKey();
@@ -810,45 +810,55 @@ final class ExecutorIndexCache {
   }
 
   /**
-   * Takes room for an entry that is about to be loaded, or refuses when taking it would exceed the
-   * budget.
+   * Reserves unused cache room for one load. Loads wait rather than spend another load's promise.
    *
-   * <p>Loading first and measuring afterwards is what makes a budget porous: two tasks that each
-   * load a file both see room until one of them finishes. The reservation is the room that has been
-   * promised to a load in flight, and it is what makes "we will not exceed the budget" true rather
-   * than usually true.
+   * <p>The loader's size is unknown until preparation finishes. When only resident entries remain,
+   * a load may hold less than the entry limit; admission then reclaims evictable entries or serves
+   * the file without retaining it. This bounds cache accounting, not the heap used by arbitrary
+   * loaders or uncached searches.
    */
-  /**
-   * Holds room for an entry that is about to be loaded, taking what is spare.
-   *
-   * <p>Loading first and measuring afterwards is what makes a budget porous: two tasks that each
-   * load a file both see room until one of them finishes, and the second is the one that overflows.
-   * The reservation is the room promised to a load in flight, which is the only thing eviction
-   * cannot reclaim because neither load has been put yet.
-   *
-   * <p>Returns what it actually held, which is what has to be handed back.
-   *
-   * <p>It is deliberately not a refusal. A file whose own size exceeds the budget still gets cached
-   * when it is the only entry, which is what a single-index query needs, and the entry limit is
-   * what refuses those. When there is no room to spare the load simply reserves nothing and
-   * eviction makes room afterwards, as it always did.
-   */
-  private long reserve(long bytes) {
+  private Reservation reserve(Config config) {
     synchronized (mapLock) {
-      long spare = budgetBytes - this.bytes - reservedBytes;
-      long held = Math.min(bytes, Math.max(0L, spare));
-      reservedBytes += held;
-      return held;
+      long requested = Math.min(config.maxEntryBytes(), config.maxBytes());
+      while (true) {
+        long capacity = budget(config.maxBytes());
+        long spare = Math.max(0L, capacity - bytes - reservedBytes);
+        if (spare >= requested || reservations.isEmpty()) {
+          long held = Math.min(requested, spare);
+          Reservation reservation = new Reservation(config.owner(), held, config.maxBytes());
+          reservations.add(reservation);
+          reservedBytes += held;
+          reservedByOwner.merge(config.owner(), held, Long::sum);
+          return reservation;
+        }
+
+        try {
+          mapLock.wait();
+        } catch (InterruptedException e) {
+          Thread.currentThread().interrupt();
+          throw new IllegalStateException("Interrupted while reserving index cache room", e);
+        }
+      }
     }
   }
 
-  private void releaseReservation(long bytes) {
-    if (bytes <= 0) {
-      return;
+  private long budget(long configured) {
+    long capacity = configured;
+    for (Reservation reservation : reservations) {
+      capacity = Math.min(capacity, reservation.budget);
     }
+    return capacity;
+  }
 
+  private void releaseReservation(Reservation reservation) {
     synchronized (mapLock) {
-      reservedBytes = Math.max(0L, reservedBytes - bytes);
+      if (reservations.remove(reservation)) {
+        reservedBytes -= reservation.bytes;
+        reservedByOwner.computeIfPresent(
+            reservation.owner,
+            (owner, held) -> held - reservation.bytes == 0 ? null : held - reservation.bytes);
+        mapLock.notifyAll();
+      }
     }
   }
 
@@ -906,7 +916,7 @@ final class ExecutorIndexCache {
         continue;
       }
 
-      bytes -= file.bytes();
+      release(file);
       entries.remove();
       unloaded += 1;
     }
@@ -961,8 +971,9 @@ final class ExecutorIndexCache {
       probation.clear();
       protectedFiles.clear();
       asked.clear();
+      bytesByOwner.clear();
+      entriesByOwner.clear();
       bytes = 0;
-      reservedBytes = 0;
       hits.set(0);
       misses.set(0);
       loads.set(0);
@@ -984,6 +995,12 @@ final class ExecutorIndexCache {
    */
   static CachedFile loaded(byte[] payload, IndexAdapter.PreparedSearch prepared) {
     long preparedBytes = prepared.estimatedBytes();
+    if (preparedBytes <= 0) {
+      LOG.debug(
+          "Index cache size is estimated: prepared structure did not report its size; "
+              + "using {} payload bytes as the fallback",
+          payload.length);
+    }
     long bytes = payload.length + (preparedBytes > 0 ? preparedBytes : payload.length);
     return new CachedFile("", payload, prepared, bytes);
   }

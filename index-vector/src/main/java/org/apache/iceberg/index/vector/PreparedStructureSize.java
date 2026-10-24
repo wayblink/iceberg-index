@@ -18,105 +18,106 @@
  */
 package org.apache.iceberg.index.vector;
 
+import java.util.Collections;
+import java.util.IdentityHashMap;
+import java.util.Set;
 import org.apache.iceberg.relocated.com.google.common.base.Preconditions;
 
 /**
- * What a prepared structure holds, in bytes, counted from the payload it was read from.
+ * Structural estimates of retained heap on a 64-bit JVM with compressed references, 8-byte
+ * alignment and compact strings. These are not heap measurements or allocation-peak limits.
  *
- * <p>A cache that charges a payload twice for the structure built from it charges the wrong amount:
- * a graph costs more than the vectors it indexes, and a quantized list costs far less than the
- * vectors it replaced. Guessing one factor for both is what keeps a budget from covering the files
- * a query reads, and the number is not observable after the fact -- a Java object does not report
- * its own weight, and guessing from the heap afterwards answers a different question.
- *
- * <p>So it is counted from the payload, which is authoritative: the payload says how many entries
- * there are, how wide they are and how many connections each node has. The result is an estimate of
- * the live object graph, including object headers and array padding, and it is checked in tests
- * against the sizes the structures actually report.
+ * <p>Payload buffers and query scratch space are excluded. Object headers and collection slack are
+ * conservative approximations; different JVM layouts and disabled compact strings can change the
+ * result. References belong to their containing objects or arrays, not to their targets.
  */
 final class PreparedStructureSize {
 
-  /** Bytes an array or object costs before its contents, on a 64-bit JVM with compressed oops. */
   static final int HEADER_BYTES = 16;
-
-  /** Arrays are padded to a multiple of this. */
-  private static final int ALIGNMENT = 8;
-
-  /** A reference to another object, which is what a list slot costs. */
   static final int REFERENCE_BYTES = 4;
-
-  /** An {@code ArrayList} slot in a {@code List<List<...>>}. */
-  private static final int ARRAY_LIST_BYTES = HEADER_BYTES + 2 * REFERENCE_BYTES + 4;
-
-  /** A {@code LinkedHashMap} entry, which a hash-based collection costs per key. */
-  private static final int MAP_ENTRY_BYTES = 40 + REFERENCE_BYTES;
+  private static final int ALIGNMENT = 8;
+  private static final int STRING_OBJECT_BYTES = 24;
+  private static final int MAP_ENTRY_BYTES = 40;
 
   private PreparedStructureSize() {}
 
-  /** Rounds a raw byte count the way the JVM lays an array out. */
+  static long object(long fields) {
+    return align(HEADER_BYTES + fields);
+  }
+
   static long array(long bytes) {
     Preconditions.checkArgument(bytes >= 0, "Array size is negative: %s", bytes);
     return align(HEADER_BYTES + bytes);
   }
 
-  /** The cost of a {@code float[]} of this length. */
+  static long references(int length) {
+    return array((long) length * REFERENCE_BYTES);
+  }
+
   static long floats(int length) {
     return array((long) length * Float.BYTES);
   }
 
-  /** The cost of a {@code byte[]} of this length. */
   static long bytes(int length) {
     return array(length);
   }
 
-  /** The cost of a {@code long[]} of this length. */
   static long longs(int length) {
     return array((long) length * Long.BYTES);
   }
 
-  /** The cost of an {@code int[]} of this length. */
   static long ints(int length) {
     return array((long) length * Integer.BYTES);
   }
 
-  /** The cost of a {@code String} holding this many characters. */
-  static long string(int length) {
-    // 16 bytes of header, then the compressed latin-1 contents when they fit
-    return HEADER_BYTES + align(length + 3L) + REFERENCE_BYTES;
-  }
-
-  /**
-   * What one entry of a structure costs: a reference to it from the list that holds it, the object
-   * itself, and whatever it points at.
-   */
-  static long entry(long ownFields, long... arrays) {
-    long total = HEADER_BYTES + ownFields + REFERENCE_BYTES;
-    for (long array : arrays) {
-      total += array;
+  /** One String object and its separate backing byte array, without an incoming reference. */
+  static long string(CharSequence value) {
+    long bytes = value.length();
+    for (int i = 0; i < value.length(); i++) {
+      if (value.charAt(i) > 0xFF) {
+        bytes *= 2;
+        break;
+      }
     }
-
-    return align(total);
+    return STRING_OBJECT_BYTES + array(bytes);
   }
 
-  /** What one element of a nested list costs, including the list object that holds it. */
-  static long nestedList(long elements, long elementBytes) {
-    return align(ARRAY_LIST_BYTES + array(REFERENCE_BYTES + elements * REFERENCE_BYTES))
-        + elements * elementBytes
-        + MAP_ENTRY_BYTES;
-  }
-
-  /** What a hash-set of strings of these lengths costs. */
-  static long stringSet(long[] lengths, long tableCapacity) {
-    long total = align(HEADER_BYTES + REFERENCE_BYTES) + tableCapacity * REFERENCE_BYTES;
-    for (long length : lengths) {
-      total += string((int) length) + MAP_ENTRY_BYTES;
+  /** Counts retained String objects by identity; equal values need not share storage. */
+  static long distinctStrings(Iterable<String> values) {
+    Set<String> seen = Collections.newSetFromMap(new IdentityHashMap<>());
+    long total = 0;
+    for (String value : values) {
+      if (seen.add(value)) {
+        total += string(value);
+      }
     }
-
     return total;
   }
 
+  /** Conservative hash-map allowance including table slack and separately retained keys/values. */
+  static long map(long entries, long keyBytes, long valueBytes) {
+    return object(4L * REFERENCE_BYTES + 2L * Integer.BYTES)
+        + array(2L * entries * REFERENCE_BYTES)
+        + entries * (MAP_ENTRY_BYTES + keyBytes + valueBytes);
+  }
+
+  /** Object fields and retained arrays; incoming references are counted by the caller. */
+  static long entry(long ownFields, long... arrays) {
+    long total = object(ownFields);
+    for (long array : arrays) {
+      total += array;
+    }
+    return total;
+  }
+
+  /** An exactly sized ArrayList backing array and its elements. */
+  static long nestedList(long elements, long elementBytes) {
+    return object(2L * REFERENCE_BYTES + 2L * Integer.BYTES)
+        + array(elements * REFERENCE_BYTES)
+        + elements * elementBytes;
+  }
+
   private static long align(long bytes) {
-    long remainder = bytes % ALIGNMENT;
-    return remainder == 0 ? bytes : bytes + (ALIGNMENT - remainder);
+    return (bytes + ALIGNMENT - 1) / ALIGNMENT * ALIGNMENT;
   }
 }

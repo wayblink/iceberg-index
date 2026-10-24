@@ -25,6 +25,7 @@ import java.io.DataOutputStream;
 import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.nio.ByteBuffer;
+import java.util.IdentityHashMap;
 import java.util.List;
 import org.apache.iceberg.index.IndexAdapter.PreparedSearch;
 import org.apache.iceberg.index.IndexEntry;
@@ -105,6 +106,10 @@ public final class BruteforceKernel implements VectorKernel {
 
   @Override
   public List<IndexEntry> entries(ByteBuffer payload) {
+    return decodeEntries(payload).entries;
+  }
+
+  private DecodedEntries decodeEntries(ByteBuffer payload) {
     Preconditions.checkNotNull(payload, "Entry payload is null");
     byte[] bytes = VectorPayloads.toBytes(payload);
     try (DataInputStream in = new DataInputStream(new ByteArrayInputStream(bytes))) {
@@ -120,6 +125,7 @@ public final class BruteforceKernel implements VectorKernel {
       int entryCount = in.readInt();
       Preconditions.checkArgument(entryCount >= 0, "Invalid vector entry count: %s", entryCount);
       List<IndexEntry> entries = Lists.newArrayListWithCapacity(entryCount);
+      long retainedPayloadBytes = 0;
       for (int i = 0; i < entryCount; i++) {
         int dataFileIndex = in.readInt();
         Preconditions.checkArgument(
@@ -134,9 +140,10 @@ public final class BruteforceKernel implements VectorKernel {
         byte[] entryPayload = new byte[payloadLength];
         in.readFully(entryPayload);
         entries.add(IndexEntry.of(dataFiles[dataFileIndex], rowPosition, entryPayload));
+        retainedPayloadBytes += PreparedStructureSize.bytes(payloadLength);
       }
 
-      return ImmutableList.copyOf(entries);
+      return new DecodedEntries(ImmutableList.copyOf(entries), retainedPayloadBytes);
     } catch (IOException e) {
       throw new UncheckedIOException("Failed to decode vector index entries", e);
     }
@@ -145,27 +152,38 @@ public final class BruteforceKernel implements VectorKernel {
   @Override
   public PreparedSearch prepare(ByteBuffer payload) {
     // the entries are decoded once, so a batch pays the decode per index file instead of per query
-    List<IndexEntry> entries = entries(payload);
-    long bytes = preparedBytes(entries);
-    return new EntrySearcher(entries, bytes);
+    DecodedEntries decoded = decodeEntries(payload);
+    return new EntrySearcher(decoded.entries, preparedBytes(decoded));
   }
 
-  /**
-   * What the decoded entries cost: one object per entry, its data file String, and the vector it
-   * was written with. A cache that charged the payload twice would over-charge this kernel.
-   */
-  private static long preparedBytes(List<IndexEntry> entries) {
+  /** Estimates retained entries without cloning their immutable payloads to obtain lengths. */
+  private static long preparedBytes(DecodedEntries decoded) {
+    List<IndexEntry> entries = decoded.entries;
     long total =
-        PreparedStructureSize.array((long) PreparedStructureSize.REFERENCE_BYTES * entries.size());
+        PreparedStructureSize.references(entries.size())
+            + PreparedStructureSize.object(2L * PreparedStructureSize.REFERENCE_BYTES)
+            + PreparedStructureSize.object(2L * PreparedStructureSize.REFERENCE_BYTES + Long.BYTES)
+            + decoded.payloadBytes;
+    IdentityHashMap<String, Boolean> seen = new IdentityHashMap<>();
     for (IndexEntry entry : entries) {
+      if (seen.put(entry.dataFile(), Boolean.TRUE) == null) {
+        total += PreparedStructureSize.string(entry.dataFile());
+      }
+      // Both dataFile and payload references are fields, even though the path is shared.
       total +=
-          PreparedStructureSize.entry(
-              Long.BYTES,
-              PreparedStructureSize.string(entry.dataFile().length()),
-              PreparedStructureSize.bytes(entry.payload().length));
+          PreparedStructureSize.object(Long.BYTES + 2L * PreparedStructureSize.REFERENCE_BYTES);
     }
-
     return total;
+  }
+
+  private static final class DecodedEntries {
+    private final List<IndexEntry> entries;
+    private final long payloadBytes;
+
+    private DecodedEntries(List<IndexEntry> entries, long payloadBytes) {
+      this.entries = entries;
+      this.payloadBytes = payloadBytes;
+    }
   }
 
   /** A prepared search that reports what it holds. */

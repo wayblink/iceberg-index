@@ -566,15 +566,10 @@ public final class DistributedIndexSearch {
 
     long bytes;
     try {
-      // the header, not the whole file: what a structure costs is decided by its shape, so the
-      // measurement reads the same bytes on the driver that it charges the executor for
+      // Use the same retained-state charge as executor admission, including the payload buffer.
       byte[] content = readPayload(io, location);
       IndexAdapter.PreparedSearch prepared = prepareFile(content, adapter);
-      bytes = prepared.estimatedBytes();
-      if (bytes <= 0) {
-        // a structure that cannot say what it holds costs at least the payload it was read from
-        bytes = content.length;
-      }
+      bytes = ExecutorIndexCache.loaded(content, prepared).bytes();
     } catch (RuntimeException e) {
       // a size only sizes a budget: an index file this build cannot read is reported elsewhere, and
       // failing the query here would turn an unreadable index into an unanswerable query

@@ -370,6 +370,14 @@ public final class RaBitQQuantizer implements java.io.Serializable {
     return level;
   }
 
+  /** Estimates the retained center, padded signs and quantizer fields without copying arrays. */
+  long estimatedBytes() {
+    return PreparedStructureSize.entry(
+        3L * Integer.BYTES + Long.BYTES + 2L * PreparedStructureSize.REFERENCE_BYTES,
+        PreparedStructureSize.floats(center.length),
+        PreparedStructureSize.floats(signs.length));
+  }
+
   private static int nextPowerOfTwo(int value) {
     int padded = 1;
     while (padded < value) {

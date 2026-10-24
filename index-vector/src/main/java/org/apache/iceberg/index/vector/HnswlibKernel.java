@@ -30,6 +30,7 @@ import java.io.DataOutputStream;
 import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.nio.ByteBuffer;
+import java.util.Arrays;
 import java.util.List;
 import org.apache.iceberg.index.IndexAdapter.PreparedSearch;
 import org.apache.iceberg.index.IndexEntry;
@@ -57,6 +58,9 @@ public final class HnswlibKernel implements VectorKernel {
   public static final String NAME = "hnswlib";
 
   private static final int FORMAT_VERSION = 1;
+
+  // Index, searcher, serializers, comparators, locks and empty map/queue objects.
+  private static final int INDEX_OVERHEAD_BYTES = 1024;
 
   private static final ProgressListener NO_PROGRESS = (workDone, max) -> {};
 
@@ -205,7 +209,9 @@ public final class HnswlibKernel implements VectorKernel {
       HnswIndex<Long, float[], VectorItem, Float> index =
           HnswIndex.load(new ByteArrayInputStream(graph));
       index.setEf(options.efSearch());
-      long preparedBytes = preparedBytes(mappingCount, dimension, index.getM());
+      long preparedBytes =
+          preparedBytes(
+              dataFiles, positions, index.size(), dimension, index.getM(), index.getMaxItemCount());
       return new GraphSearcher(index, dataFiles, positions, mappingCount, preparedBytes);
     } catch (IOException e) {
       throw new UncheckedIOException("Failed to load the HNSW index payload", e);
@@ -213,28 +219,52 @@ public final class HnswlibKernel implements VectorKernel {
   }
 
   /**
-   * What a loaded graph costs: one node with its connection lists per vector, the vector itself,
-   * the id and position tables, and the visited-set scratch the traversal keeps.
+   * Estimates a loaded hnswlib-core 1.1.0 graph without walking its private node graph.
    *
-   * <p>A graph is the case a payload-relative estimate gets most wrong: its connections are a
-   * separate int list per layer per node, so a dense graph holds several times the payload it was
-   * read from.
+   * <p>Level zero allocates 2M ints per node. One additional M-sized layer is budgeted per node,
+   * including list objects and the connections reference array. The geometric level distribution
+   * has only 1/(M-1) upper layers per node on average, so this is deliberately conservative, not a
+   * measurement or a strict upper bound for unusual level distributions. JVM layout and primitive
+   * map capacity also introduce error; there is no guaranteed percentage error bound.
+   *
+   * <p>Node slots and the CPU-sized visited pool use allocated maxItemCount, not mapping length.
+   * Mapping arrays and distinct retained paths are charged separately and only once. Query scratch
+   * allocations and serialized payload buffers are excluded.
    */
-  private static long preparedBytes(int nodes, int dimension, int m) {
-    // level 0 allows twice the connections of a higher layer, and few nodes reach a higher one
-    long connectionsPerNode =
-        (long) 2 * m * Integer.BYTES + 2L * PreparedStructureSize.HEADER_BYTES;
-    long node =
+  private static long preparedBytes(
+      String[] dataFiles, long[] positions, int nodes, int dimension, int m, int maxCount) {
+    long listFields = Integer.BYTES + PreparedStructureSize.REFERENCE_BYTES;
+    long connections =
+        PreparedStructureSize.references(2)
+            + PreparedStructureSize.entry(
+                listFields, PreparedStructureSize.array(2L * m * Integer.BYTES))
+            + PreparedStructureSize.entry(
+                listFields, PreparedStructureSize.array((long) m * Integer.BYTES));
+    long item =
         PreparedStructureSize.entry(
-            Integer.BYTES + PreparedStructureSize.REFERENCE_BYTES,
-            PreparedStructureSize.floats(dimension),
-            // the id map and the position table, one slot per node
-            (long) nodes * (Long.BYTES + Integer.BYTES));
+            Long.BYTES + PreparedStructureSize.REFERENCE_BYTES,
+            PreparedStructureSize.floats(dimension));
+    long node =
+        PreparedStructureSize.object(
+                Integer.BYTES + Byte.BYTES + 2L * PreparedStructureSize.REFERENCE_BYTES)
+            + item
+            + connections;
+    long total = INDEX_OVERHEAD_BYTES + (long) nodes * node;
+    total += PreparedStructureSize.references(maxCount);
+    // ObjectIntHashMap stores boxed Long keys and primitive int values. A general hash-map
+    // allowance covers its open-addressing slack without inspecting the library's private tables.
+    total +=
+        PreparedStructureSize.map(nodes, PreparedStructureSize.object(Long.BYTES), Integer.BYTES);
+    total += PreparedStructureSize.references(dataFiles.length);
+    total += PreparedStructureSize.longs(positions.length);
+    total += PreparedStructureSize.distinctStrings(Arrays.asList(dataFiles));
 
-    long total = nodes * (node + connectionsPerNode);
-    // the lookup table, the visited bitset and the candidate set the traversal reuses
-    total += (long) nodes * 4L * Integer.BYTES;
-    total += PreparedStructureSize.array((long) nodes / 8L);
+    int processors = Runtime.getRuntime().availableProcessors();
+    long bitset =
+        PreparedStructureSize.entry(
+            PreparedStructureSize.REFERENCE_BYTES, PreparedStructureSize.ints((maxCount >> 5) + 1));
+    total += (processors + 1L) * bitset;
+    total += PreparedStructureSize.references(processors);
     return total;
   }
 

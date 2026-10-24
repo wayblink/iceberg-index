@@ -25,6 +25,7 @@ import java.io.DataOutputStream;
 import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.nio.ByteBuffer;
+import java.util.IdentityHashMap;
 import java.util.List;
 import org.apache.iceberg.index.IndexAdapter.PreparedSearch;
 import org.apache.iceberg.index.IndexEntry;
@@ -241,17 +242,34 @@ public final class IvfKernel implements VectorKernel {
    * bytes each where an unquantized entry holds a whole vector.
    */
   private long preparedBytes(Loaded loaded) {
-    long total = 0;
+    long total =
+        PreparedStructureSize.object(4L * PreparedStructureSize.REFERENCE_BYTES)
+            + PreparedStructureSize.object(2L * PreparedStructureSize.REFERENCE_BYTES + Long.BYTES)
+            + PreparedStructureSize.references(loaded.centroids.length)
+            + PreparedStructureSize.nestedList(loaded.lists.size(), 0);
     for (float[] centroid : loaded.centroids) {
-      total += PreparedStructureSize.array((long) centroid.length * Float.BYTES);
+      total += PreparedStructureSize.floats(centroid.length);
     }
 
-    for (int list = 0; list < loaded.lists.size(); list++) {
-      List<IvfEntry> members = loaded.lists.get(list);
-      total += PreparedStructureSize.nestedList(members.size(), entryBytes());
+    // the payload carries a dictionary of data files and every entry points at the one decoded
+    // string for its file, so the strings are counted once for the payload rather than once per
+    // entry: a long path is one kilobyte, not one kilobyte per vector
+    IdentityHashMap<String, Boolean> dataFiles = new IdentityHashMap<>();
+    for (List<IvfEntry> members : loaded.lists) {
+      for (IvfEntry entry : members) {
+        if (dataFiles.put(entry.dataFile, Boolean.TRUE) == null) {
+          total += PreparedStructureSize.string(entry.dataFile);
+        }
+      }
+    }
+
+    long entryBytes = entryBytes();
+    for (List<IvfEntry> members : loaded.lists) {
+      total += PreparedStructureSize.nestedList(members.size(), entryBytes);
     }
 
     if (loaded.listCenters != null) {
+      total += PreparedStructureSize.references(loaded.listCenters.length);
       for (float[] center : loaded.listCenters) {
         if (center != null) {
           total += PreparedStructureSize.array((long) center.length * Float.BYTES);
@@ -260,26 +278,26 @@ public final class IvfKernel implements VectorKernel {
     }
 
     if (loaded.listQuantizers != null) {
-      // a quantizer holds its own copy of the centre it scores against
-      total += (long) loaded.listQuantizers.length * listQuantizerBytes();
+      total += PreparedStructureSize.references(loaded.listQuantizers.length);
+      for (RaBitQQuantizer listQuantizer : loaded.listQuantizers) {
+        if (listQuantizer != null) {
+          total += listQuantizer.estimatedBytes();
+        }
+      }
     }
 
     return total;
   }
 
-  /** What one entry costs beyond its list slot: the reference, the fields, and the payload. */
+  /** Object fields and payload retained by an entry; its list slot is counted separately. */
   private long entryBytes() {
     long payload =
         isQuantized()
             ? PreparedStructureSize.bytes(quantizer.codeBytes())
                 + PreparedStructureSize.floats(RaBitQQuantizer.FACTORS)
             : PreparedStructureSize.floats(dimension);
-    return PreparedStructureSize.entry(Long.BYTES, PreparedStructureSize.string(64), payload);
-  }
-
-  /** What one per-list quantizer costs: object header, its centre, and the scalar it carries. */
-  private long listQuantizerBytes() {
-    return PreparedStructureSize.entry(16, PreparedStructureSize.floats(dimension));
+    return PreparedStructureSize.entry(
+        Long.BYTES + 4L * PreparedStructureSize.REFERENCE_BYTES, payload);
   }
 
   /** A prepared search over the decoded lists, which reports what it holds. */

@@ -183,37 +183,41 @@ class TestExecutorIndexCache {
 
   @Test
   void twoLoadsInFlightReserveTheirRoomInsteadOfBothSeeingItFree() throws Exception {
-    // a budget of 250 fits exactly two entries of 100. Three loads started together must not all
-    // conclude that there is room: the third is the one that would push the cache over, and
-    // eviction cannot fix it because none of them has been put yet
-    ExecutorIndexCache.Config enabled = config(250, 250);
-    CountDownLatch allStarted = new CountDownLatch(3);
+    // Two 100-byte loads can hold room at once; the third must wait for a reservation to finish.
+    ExecutorIndexCache.Config enabled = config(250, 100);
+    CountDownLatch allStarted = new CountDownLatch(2);
     CountDownLatch mayFinish = new CountDownLatch(1);
     ExecutorService pool = Executors.newFixedThreadPool(3);
+    List<Future<?>> futures = new java.util.ArrayList<>();
     try {
       for (String name : ImmutableList.of("a", "b", "c")) {
-        pool.submit(
-            () -> {
-              cache.file(
-                  "s3://bucket/" + name + ".puffin",
-                  enabled,
-                  "adapter",
-                  () -> {
-                    allStarted.countDown();
-                    try {
-                      mayFinish.await(30, TimeUnit.SECONDS);
-                    } catch (InterruptedException e) {
-                      Thread.currentThread().interrupt();
-                    }
-                    return ExecutorIndexCache.loaded(new byte[100], EMPTY, 100);
-                  });
-              return null;
-            });
+        futures.add(
+            pool.submit(
+                () -> {
+                  cache.file(
+                      "s3://bucket/" + name + ".puffin",
+                      enabled,
+                      "adapter",
+                      () -> {
+                        allStarted.countDown();
+                        try {
+                          mayFinish.await(30, TimeUnit.SECONDS);
+                        } catch (InterruptedException e) {
+                          Thread.currentThread().interrupt();
+                        }
+                        return ExecutorIndexCache.loaded(new byte[100], EMPTY, 100);
+                      });
+                  return null;
+                }));
       }
 
       assertThat(allStarted.await(30, TimeUnit.SECONDS)).isTrue();
       mayFinish.countDown();
+      for (Future<?> future : futures) {
+        future.get(30, TimeUnit.SECONDS);
+      }
     } finally {
+      mayFinish.countDown();
       pool.shutdown();
       assertThat(pool.awaitTermination(30, TimeUnit.SECONDS)).isTrue();
     }
