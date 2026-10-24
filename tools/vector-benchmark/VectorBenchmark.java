@@ -52,6 +52,25 @@ public class VectorBenchmark {
   private static Writer file;
   private static org.apache.hadoop.fs.FSDataOutputStream stream;
 
+  /**
+   * Prints what the index cache holds, one line per executor plus the summary.
+   *
+   * <p>Coverage is the fraction of a query's index files that stayed resident. A derived budget
+   * that cannot reach 1.0 is a budget below the working set, and the latency of every query after
+   * it is the latency of an eviction rather than of a search.
+   */
+  private static void reportCoverage(String base, List<String> indexNames) {
+    for (Row row : spark.sql("CALL hms.system.index_cache_status()").collectAsList()) {
+      emit(
+          "COVERAGE {\"executor\":\"" + row.getString(0) + "\",\"mode\":\"" + row.getString(3)
+              + "\",\"entries\":" + row.getLong(4) + ",\"bytes\":" + row.getLong(5)
+              + ",\"hits\":" + row.getLong(6) + ",\"misses\":" + row.getLong(7)
+              + ",\"evictions\":" + row.getLong(9) + ",\"coverage\":" + row.getDouble(10)
+              + ",\"workingSetBytes\":" + row.getLong(11) + ",\"stale\":" + row.getBoolean(14)
+              + "}");
+    }
+  }
+
   /** Prints a line and appends it to the run's output file, so a lost log loses no measurement. */
   private static void emit(String line) {
     System.out.println(line);
@@ -132,6 +151,14 @@ public class VectorBenchmark {
             + "],\"sparkVersion\":\""
             + spark.version()
             + "\"}");
+    // with the registry in a table property, a catalog that caches the table answers from the
+    // metadata it first loaded; an index built minutes ago is invisible until the table is refreshed
+    try {
+      spark.catalog().refreshTable(base);
+    } catch (RuntimeException e) {
+      // a catalog that cannot refresh still lets the run continue against what it has
+    }
+
     List<Row> listed =
         spark.sql("CALL hms.system.list_indexes(table => '" + shortName(base) + "')")
             .collectAsList();
@@ -244,7 +271,12 @@ public class VectorBenchmark {
     }
 
     int measured = Math.min(queries, vectors.size() - warmup);
-    if ("procedure".equals(mode)) {
+    if ("coverage".equals(mode)) {
+      // one query is enough: it loads the arm's files on every executor, which is what the status
+      // call then reports. The budget is already decided by the time this runs, so what it covers
+      // is what any later query would get.
+      reportCoverage(base, indexNames);
+    } else if ("procedure".equals(mode)) {
       for (int q = warmup; q < warmup + measured; q++) {
         for (String indexName : indexNames) {
           String label = indexName.contains("#")
@@ -252,11 +284,12 @@ public class VectorBenchmark {
           for (int repeat = 1; repeat <= repeats; repeat++) {
             long start = System.nanoTime();
             List<Row> hits =
+                // positional, because the named form is resolved differently by some versions and
+                // the only thing this call needs to be is unambiguous
                 spark
                     .sql(
-                        "CALL hms.system.vector_search(table => '" + shortName(base)
-                            + "', column => '" + column + "', index => '" + label
-                            + "', query => " + vectors.get(q) + ", k => " + topK + ")")
+                        "CALL hms.system.vector_search('" + shortName(base) + "', '" + column
+                            + "', " + vectors.get(q) + ", " + topK + ", '" + label + "')")
                     .collectAsList();
             long millis = (System.nanoTime() - start) / 1_000_000;
 
