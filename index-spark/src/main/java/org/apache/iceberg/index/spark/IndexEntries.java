@@ -993,7 +993,7 @@ public final class IndexEntries {
    * same and a delete would remove both. Refusing the query says so; guessing would remove a live
    * row and say nothing.
    */
-  private static void refuseNanosKeys(
+  static void refuseNanosKeys(
       List<Types.NestedField> keyFields, Collection<DeleteFile> deleteFiles) {
     for (Types.NestedField field : keyFields) {
       if (field.type().typeId() == Type.TypeID.TIMESTAMP_NANO) {
