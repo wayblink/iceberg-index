@@ -271,7 +271,26 @@ public class VectorBenchmark {
     }
 
     int measured = Math.min(queries, vectors.size() - warmup);
-    if ("coverage".equals(mode)) {
+    if ("probe".equals(mode)) {
+      // a diagnostic mode: what the status procedure actually returns, without guessing at column
+      // positions. The search comes first because the status call reports what the executors last
+      // told the driver, and a session that has not searched has told it nothing.
+      spark
+          .sql(
+              "SELECT pk FROM " + base + " ORDER BY vec_distance(" + column + ", "
+                  + vectors.get(warmup) + ") LIMIT " + topK)
+          .collectAsList();
+      org.apache.spark.sql.Dataset<Row> status =
+          spark.sql("CALL hms.system.index_cache_status()");
+      System.out.println("PROBE schema: " + status.schema().treeString());
+      for (Row row : status.collectAsList()) {
+        System.out.println("PROBE row: " + row);
+      }
+
+      file.close();
+      spark.stop();
+      return;
+    } else if ("coverage".equals(mode)) {
       // a search first, because the status call reports what the executors last told the driver and
       // without a search they have told it nothing. The budget is decided before the search, so
       // what it leaves resident is what any later query would get.
@@ -294,6 +313,7 @@ public class VectorBenchmark {
       }
 
       reportCoverage(spark);
+      System.out.flush();
       emit(SUMMARY + "{\"kind\":\"done\"}");
       file.close();
       spark.stop();
