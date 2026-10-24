@@ -105,7 +105,7 @@ assertThat(built.memory().preparedBytes())
 
 **Files:** 新建 `index-spark/src/main/java/org/apache/iceberg/index/spark/IndexResidencyPolicy.java`、同目录 `IndexCacheOwnership.java`；修改同目录 `ExecutorIndexCache.java`；新测试 `index-spark/src/test/java/org/apache/iceberg/index/spark/TestIndexResidencyPolicy.java`、同目录 `TestIndexCacheOwnership.java`，扩展同目录 `TestExecutorIndexCacheReservations.java`。
 
-**Interfaces:** Consumes：现有Config/CachedFile及B3预算记账；Produces：`IndexResidencyPolicy.parse(String)`：null表示参数省略；值接受0/正数s,m,h,d/forever，使用checked转换纳秒。policy提供`forever()`、`durationNanos()`；deadline在driver赋值。`IndexCacheOwnership.applyTarget(String indexUuid,long epoch,Set<String> cacheKeys)`、`offload(String,long)`、`mayAdmit(String,long,String)`、`release(String,long)`（解除所有权，不提前计空闲）。缓存新增package-private `acquireManaged(String indexUuid,long epoch,String cacheKey) -> ExecutorIndexCache.Lease`（miss返回null）、`installManaged(String indexUuid,long epoch,String cacheKey,Config,Loader) -> CachedFile`与`releaseIndex(String indexUuid,long epoch) -> void`；嵌套Lease implements AutoCloseable，提供`file()`与幂等`close()`。在查找缓存时原子获取使用引用，调用者try-with-resources包围整个searching，不能先返回裸CachedFile再补pin；不公开缓存实现。
+**Interfaces:** Consumes：现有Config/CachedFile及B3预算记账；Produces：`IndexResidencyPolicy.parse(String)`：null表示参数省略；值接受0/正数s,m,h,d/forever，使用checked转换纳秒。policy提供`forever()`、`durationNanos()`；deadline在driver赋值。`IndexCacheOwnership.applyTarget(String indexUuid,long epoch,Set<String> cacheKeys)`、`offload(String,long)`、`mayAdmit(String,long,String)`、`release(String,long)`（解除所有权，不提前计空闲）。缓存新增package-private `acquireManaged(String indexUuid,long epoch,String cacheKey) -> ExecutorIndexCache.Lease`（miss返回null）、`installManaged(String indexUuid,long epoch,String cacheKey,Config,Loader) -> CachedFile`与`releaseIndex(String indexUuid,long epoch) -> void`；嵌套Lease implements AutoCloseable，提供`file()`与幂等`close()`。在查找缓存时原子获取使用引用，调用者try-with-resources包围整个searching，不能先返回裸CachedFile再补pin；不公开缓存实现。额外提供package-private `recordIndexAttribution(String indexUuid,Set<String> cacheKeys)`与`indexAttribution() -> Map<String,Set<String>>`：只登记当时驻留文件的可选table-qualified索引归属，返回深不可变快照；不授予managed ownership、不改变table公平份额、访问时间或驱逐，文件实际移除时清理归属。
 
 - [ ] **RED:** parse(null)为null，parse("0")非null，30m=1800s，forever；拒绝-1/1x/溢出。`oldLoadCannotPublishAfterOffload`用latch停loader，offload后放行仍不准入；`sharedFileKeepsOtherIndexOwner`卸A不清B；`releaseWaitsForSearch`仅使用结束后空闲增加；`leaseBeforeSearchingBlocksRelease`在查找取得Lease后、实际searching前暂停，offload仍不得提前计空闲。
 
@@ -119,7 +119,7 @@ ownership.offload("index-A", 2L);
 assertThat(ownership.mayAdmit("index-A", 1L, "file-A")).isFalse();
 ```
 - [ ] **Run RED:** `./gradlew -DsparkVersions=3.5 -DscalaVersion=2.12 :iceberg-index-spark:test --tests '*TestIndexResidencyPolicy' --tests '*TestIndexCacheOwnership' --tests '*TestExecutorIndexCacheReservations'`。
-- [ ] **Implement:** 原子同步epoch检查/准入/所有权转移；保持B3精确预留释放，固定锁顺序；高水位tombstone防旧加载回填。已管理文件不受原idle sweep、公平份额file驱逐或查询自主插入破坏保护/规划；未管理项维持原行为但有可上报索引归属。索引policy不是本地file TTL。
+- [ ] **Implement:** 原子同步epoch检查/准入/所有权转移；保持B3精确预留释放，固定锁顺序；高水位tombstone防旧加载回填。已管理文件不受原idle sweep、公平份额file驱逐或查询自主插入破坏保护/规划；未管理项维持原行为但有可上报索引归属。索引policy不是本地file TTL。托管复用也检查本次max-entry与预算（含其他未释放预留），拒绝返回null且不释放已有Lease或其他owner。legacy的两次命中查找都须与managed检查同锁；首次收编前已经发出的裸引用仍需调用者完成迁移/等待旧查询结束，不能据此宣称原API全生命周期安全。
 - [ ] **GREEN:** 上述并发确定性测试全通过；关闭缓存、旧file(loader)契约和现有预算测试不回归。尚未接入调用者时，只提供经测试内部能力，不提前改变所有查询。
 - [ ] **Commit/review:** 精确add，`Index: Fence managed cache ownership and safe release`；独立审核任何释放不能破坏正在使用或其他所有者引用。
 
@@ -177,7 +177,7 @@ assertThat(offloadedSearchRows).containsExactlyElementsOf(uncachedSearchRows);
 assertThat(otherIndexResidentBytes).isEqualTo(beforeOffloadOtherIndexBytes);
 ```
 - [ ] **Run RED:** `./gradlew -DsparkVersions=3.5 -DscalaVersion=2.12 :iceberg-spark:iceberg-spark-extensions-3.5_2.12:test --tests '*TestIndexResidencyProcedures' --tests '*TestIndexCacheStatus'`。
-- [ ] **Implement:** 接入现有3.5 BaseProcedure参数/结果模式与注册；generic index resolver不只vector；共享facade转换内部DTO。查询传index identity/epoch，只使用确认holders和本地acquireManaged使用租约，miss仍搜索捕获全部file但不驻留；登记实际索引使用；status不更新访问，不依赖旧accumulator做预算。无需重写fetch-back或搜索算法。
+- [ ] **Implement:** 接入现有3.5 BaseProcedure参数/结果模式与注册；generic index resolver不只vector；共享facade转换内部DTO。查询传index identity/epoch，只使用确认holders和本地acquireManaged使用租约，miss仍搜索捕获全部file但不驻留；登记实际索引使用；未管理缓存读取后可用捕获的cache keys登记纯索引归属，不能将其当managed readiness或访问更新。首次收编须阻止新增旧裸引用路径并等待已发出引用的旧查询结束（或升级为原子Lease路径），之后才应用托管目标。status不更新访问，不依赖旧accumulator做预算。无需重写fetch-back或搜索算法。
 - [ ] **GREEN:** `vector_search`及batch、ORDER BY改写现有回归与新增cache-miss/offload/delete查询结果一致。不能只测SQL解析不测缓存状态。
 - [ ] **Commit/review:** 精确add，`Spark: Add explicit index load and offload procedures`；检查本地STREAM/disabled预算：load明确拒绝不可驻留，offload仍能安全释放已有项，retain不改变预算。
 

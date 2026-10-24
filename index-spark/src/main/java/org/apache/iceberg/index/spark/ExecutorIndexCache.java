@@ -550,6 +550,8 @@ final class ExecutorIndexCache {
   private final Object mapLock = new Object();
   private final IndexCacheOwnership ownership = new IndexCacheOwnership();
   private final Set<String> pendingReleases = new LinkedHashSet<>();
+  // Observational associations do not confer residency ownership or protection.
+  private final Map<String, Set<String>> attribution = new LinkedHashMap<>();
   private long generation;
   // Registered waiters keep the same monitor alive until every caller has left.
   private final ConcurrentHashMap<String, LoadMonitor> loading = new ConcurrentHashMap<>();
@@ -611,17 +613,18 @@ final class ExecutorIndexCache {
     }
 
     String cacheKey = config.owner() + "|" + key + "|" + location;
+    sweepIfDue(config);
     boolean managed;
+    CachedFile hit;
     synchronized (mapLock) {
       managed = ownership.isManagedKey(cacheKey);
+      hit = managed ? null : lookup(cacheKey);
     }
     // This legacy API has no index epoch or lease; managed queries must use acquireManaged.
     if (managed) {
       return loader.load();
     }
 
-    sweepIfDue(config);
-    CachedFile hit = lookup(cacheKey);
     if (hit != null) {
       return hit;
     }
@@ -629,7 +632,13 @@ final class ExecutorIndexCache {
     LoadMonitor monitor = loadingMonitor(cacheKey);
     synchronized (monitor) {
       try {
-        hit = lookup(cacheKey);
+        synchronized (mapLock) {
+          managed = ownership.isManagedKey(cacheKey);
+          hit = managed ? null : lookup(cacheKey);
+        }
+        if (managed) {
+          return loader.load();
+        }
         if (hit != null) {
           return hit;
         }
@@ -661,6 +670,29 @@ final class ExecutorIndexCache {
       } finally {
         releaseLoadingMonitor(cacheKey, monitor);
       }
+    }
+  }
+
+  /** Records optional index associations for files that are currently resident. */
+  void recordIndexAttribution(String indexUuid, Set<String> cacheKeys) {
+    Preconditions.checkArgument(
+        indexUuid != null && !indexUuid.isBlank(), "Index identity is empty");
+    Preconditions.checkArgument(cacheKeys != null, "Index attribution keys are null");
+    synchronized (mapLock) {
+      for (String key : cacheKeys) {
+        if (probation.containsKey(key) || protectedFiles.containsKey(key)) {
+          attribution.computeIfAbsent(key, ignored -> new LinkedHashSet<>()).add(indexUuid);
+        }
+      }
+    }
+  }
+
+  /** Returns recorded associations, not managed ownership or load readiness. */
+  Map<String, Set<String>> indexAttribution() {
+    synchronized (mapLock) {
+      Map<String, Set<String>> snapshot = new LinkedHashMap<>();
+      attribution.forEach((key, indexes) -> snapshot.put(key, Set.copyOf(indexes)));
+      return Map.copyOf(snapshot);
     }
   }
 
@@ -700,6 +732,9 @@ final class ExecutorIndexCache {
           }
           CachedFile existing = find(cacheKey);
           if (existing != null) {
+            if (!canReuse(existing, config, null)) {
+              return null;
+            }
             pendingReleases.remove(cacheKey);
             return existing;
           }
@@ -814,6 +849,12 @@ final class ExecutorIndexCache {
         && ownership.mayAdmit(load.indexUuid(), load.epoch(), load.cacheKey());
   }
 
+  private boolean canReuse(CachedFile file, Config config, Reservation reservation) {
+    long otherReservations = reservedBytes - (reservation == null ? 0 : reservation.bytes);
+    return file.bytes() <= config.maxEntryBytes()
+        && bytes <= budget(config.maxBytes()) - otherReservations;
+  }
+
   private CachedFile find(String cacheKey) {
     CachedFile file = protectedFiles.get(cacheKey);
     return file == null ? probation.get(cacheKey) : file;
@@ -832,6 +873,7 @@ final class ExecutorIndexCache {
     } else {
       protectedFiles.remove(cacheKey);
       probation.remove(cacheKey);
+      attribution.remove(cacheKey);
       pendingReleases.remove(cacheKey);
       release(file);
     }
@@ -889,7 +931,7 @@ final class ExecutorIndexCache {
       }
       CachedFile existing = find(cacheKey);
       if (existing != null) {
-        return existing;
+        return load == null || canReuse(existing, config, reservation) ? existing : null;
       }
       long capacity = budget(config.maxBytes());
       // Reclaim any extra room before admitting the measured entry. Other loads keep their
@@ -952,6 +994,7 @@ final class ExecutorIndexCache {
       }
 
       release(victim.getValue());
+      attribution.remove(victim.getKey());
       if (protectedFiles.remove(victim.getKey()) == null) {
         probation.remove(victim.getKey());
       }
@@ -1137,6 +1180,7 @@ final class ExecutorIndexCache {
       }
 
       release(file);
+      attribution.remove(entry.getKey());
       entries.remove();
       unloaded += 1;
     }

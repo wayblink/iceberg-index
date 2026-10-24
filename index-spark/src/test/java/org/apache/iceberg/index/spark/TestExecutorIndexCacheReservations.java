@@ -22,6 +22,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 import java.lang.reflect.Field;
+import java.lang.reflect.Method;
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
 import java.util.List;
@@ -40,6 +41,7 @@ import org.apache.iceberg.index.IndexSearchResult;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
 import org.junit.jupiter.params.provider.EnumSource;
 import org.junit.jupiter.params.provider.ValueSource;
 
@@ -938,6 +940,187 @@ class TestExecutorIndexCacheReservations {
       pool.shutdownNow();
       assertThat(pool.awaitTermination(10, TimeUnit.SECONDS)).isTrue();
     }
+  }
+
+  @Test
+  void legacyHitAfterControlCannotReturnManagedObject() throws Exception {
+    String key = "table|adapter|managed";
+    ExecutorIndexCache.Config config =
+        ExecutorIndexCache.Config.of(true, 100, 100).withOwner("table");
+    ExecutorIndexCache.CachedFile ephemeral = ExecutorIndexCache.loaded(new byte[10], EMPTY);
+    Method acquireMonitor =
+        ExecutorIndexCache.class.getDeclaredMethod("loadingMonitor", String.class);
+    acquireMonitor.setAccessible(true);
+    Object monitor = acquireMonitor.invoke(cache, key);
+    Method releaseMonitor =
+        ExecutorIndexCache.class.getDeclaredMethod(
+            "releaseLoadingMonitor", String.class, monitor.getClass());
+    releaseMonitor.setAccessible(true);
+    ExecutorService pool = Executors.newSingleThreadExecutor();
+    AtomicReference<Thread> legacyThread = new AtomicReference<>();
+    try {
+      Future<ExecutorIndexCache.CachedFile> legacy;
+      synchronized (monitor) {
+        legacy =
+            pool.submit(
+                () -> {
+                  legacyThread.set(Thread.currentThread());
+                  return cache.file("managed", config, "adapter", () -> ephemeral);
+                });
+        awaitState(legacyThread, Thread.State.BLOCKED);
+        install("A", 1, key, config);
+      }
+      assertThat(legacy.get(10, TimeUnit.SECONDS)).isSameAs(ephemeral);
+      cache.releaseIndex("A", 2);
+      assertThat(cache.stats().bytes()).isZero();
+    } finally {
+      pool.shutdownNow();
+      try {
+        assertThat(pool.awaitTermination(10, TimeUnit.SECONDS)).isTrue();
+      } finally {
+        releaseMonitor.invoke(cache, key, monitor);
+      }
+    }
+  }
+
+  @ParameterizedTest
+  @CsvSource({"100,10", "10,100", "10,10"})
+  void reuseRespectsNewLimitsWithoutReleasingSharedLease(long budget, long entryLimit)
+      throws Exception {
+    String key = "table|adapter|managed";
+    ExecutorIndexCache.Config original =
+        ExecutorIndexCache.Config.of(true, 100, 100).withOwner("table");
+    install("A", 1, key, original);
+    cache.applyTarget("B", 1, Set.of(key));
+    try (ExecutorIndexCache.Lease lease = cache.acquireManaged("B", 1, key)) {
+      assertThat(lease).isNotNull();
+      cache.applyTarget("A", 2, Set.of(key));
+      ExecutorIndexCache.Config limited =
+          ExecutorIndexCache.Config.of(true, budget, entryLimit).withOwner("table");
+      assertThat(
+              cache.installManaged(
+                  "A",
+                  2,
+                  key,
+                  limited,
+                  () -> {
+                    throw new AssertionError("Rejected reuse must not reload");
+                  }))
+          .isNull();
+      cache.releaseIndex("A", 3);
+      assertThat(cache.stats().bytes()).isEqualTo(20);
+      assertThat(lease.file().bytes()).isEqualTo(20);
+      assertThat(reserved()).isZero();
+    }
+    cache.releaseIndex("B", 2);
+    assertThat(cache.stats().bytes()).isZero();
+  }
+
+  @Test
+  void reuseCannotAcknowledgeWhenOccupancyExceedsNewBudget() {
+    String a = "table|adapter|a";
+    String b = "table|adapter|b";
+    ExecutorIndexCache.Config original =
+        ExecutorIndexCache.Config.of(true, 100, 100).withOwner("table");
+    install("A", 1, a, original);
+    install("B", 1, b, original);
+    cache.applyTarget("A", 2, Set.of(a));
+    assertThat(
+            cache.installManaged(
+                "A",
+                2,
+                a,
+                ExecutorIndexCache.Config.of(true, 30, 100).withOwner("table"),
+                () -> {
+                  throw new AssertionError("Rejected reuse must not reload");
+                }))
+        .isNull();
+    assertThat(cache.stats().bytes()).isEqualTo(40);
+    assertThat(cache.residentKeys()).containsExactlyInAnyOrder(a, b);
+  }
+
+  @Test
+  void optionalAttributionPreservesLazySharedFileBehavior() {
+    String key = "table|adapter|unmanaged";
+    ExecutorIndexCache.Config config =
+        ExecutorIndexCache.Config.of(true, 100, 100).withOwner("table");
+    ExecutorIndexCache.CachedFile file =
+        cache.file(
+            "unmanaged", config, "adapter", () -> ExecutorIndexCache.loaded(new byte[10], EMPTY));
+    cache.recordIndexAttribution("table#A", Set.of(key));
+    cache.recordIndexAttribution("table#B", Set.of(key));
+    Map<String, Set<String>> snapshot = cache.indexAttribution();
+    assertThat(snapshot.get(key)).containsExactlyInAnyOrder("table#A", "table#B");
+    assertThatThrownBy(() -> snapshot.put("other", Set.of("table#C")))
+        .isInstanceOf(UnsupportedOperationException.class);
+    assertThatThrownBy(() -> snapshot.get(key).clear())
+        .isInstanceOf(UnsupportedOperationException.class);
+    assertThat(
+            cache.file(
+                "unmanaged",
+                config,
+                "adapter",
+                () -> {
+                  throw new AssertionError("Attribution must not disable lazy hits");
+                }))
+        .isSameAs(file);
+    assertThat(cache.acquireManaged("table#A", 1, key)).isNull();
+    assertThat(cache.stats().bytes()).isEqualTo(20);
+  }
+
+  @Test
+  void attributionDoesNotRenewAccessOrProtectIdleFile() throws Exception {
+    String key = "table|adapter|unmanaged";
+    ExecutorIndexCache.Config config =
+        ExecutorIndexCache.Config.of(
+                true, 100, 100, ExecutorIndexCache.Mode.PIN_ALL, TimeUnit.MINUTES.toMillis(30))
+            .withOwner("table");
+    ExecutorIndexCache.CachedFile file =
+        cache.file(
+            "unmanaged", config, "adapter", () -> ExecutorIndexCache.loaded(new byte[10], EMPTY));
+    Field lastAccess = file.getClass().getDeclaredField("lastAccessNanos");
+    lastAccess.setAccessible(true);
+    long expired = System.nanoTime() - TimeUnit.MINUTES.toNanos(31);
+    lastAccess.setLong(file, expired);
+    long hitsBefore = cache.stats().hits();
+    cache.recordIndexAttribution("table#A", Set.of(key));
+    assertThat(cache.indexAttribution()).containsKey(key);
+    assertThat(lastAccess.getLong(file)).isEqualTo(expired);
+    assertThat(cache.stats().hits()).isEqualTo(hitsBefore);
+    try {
+      ExecutorIndexCache.sweepIntervalForTests(0);
+      cache.file("fresh", config, "adapter", () -> ExecutorIndexCache.loaded(new byte[10], EMPTY));
+      assertThat(cache.residentKeys()).doesNotContain(key);
+      assertThat(cache.indexAttribution()).doesNotContainKey(key);
+      assertThat(cache.stats().bytes()).isEqualTo(20);
+    } finally {
+      ExecutorIndexCache.sweepIntervalForTests(TimeUnit.SECONDS.toNanos(30));
+    }
+  }
+
+  @Test
+  void attributionDoesNotChangeFairShareEviction() {
+    ExecutorIndexCache.Config a =
+        ExecutorIndexCache.Config.of(true, 100, 100, ExecutorIndexCache.Mode.PIN_HOT, 0)
+            .withOwner("A");
+    ExecutorIndexCache.Config b = a.withOwner("B");
+    askTwice("a-old", a, 40);
+    askTwice("b", b, 60);
+    cache.recordIndexAttribution("table#A", Set.of("A|adapter|a-old"));
+    cache.recordIndexAttribution("table#B", Set.of("A|adapter|a-old", "B|adapter|b"));
+    assertThat(cache.indexAttribution().get("A|adapter|a-old"))
+        .containsExactlyInAnyOrder("table#A", "table#B");
+    askTwice("a-new", a, 40);
+    assertThat(cache.residentKeys()).containsExactlyInAnyOrder("B|adapter|b", "A|adapter|a-new");
+    assertThat(cache.indexAttribution()).doesNotContainKey("A|adapter|a-old");
+    assertThat(cache.stats().bytes()).isEqualTo(100);
+  }
+
+  @Test
+  void attributionCannotReportNonResidentFiles() {
+    cache.recordIndexAttribution("table#A", Set.of("table|adapter|missing"));
+    assertThat(cache.indexAttribution()).isEmpty();
+    assertThat(cache.stats().entries()).isZero();
   }
 
   private static void awaitState(AtomicReference<Thread> thread, Thread.State state) {
