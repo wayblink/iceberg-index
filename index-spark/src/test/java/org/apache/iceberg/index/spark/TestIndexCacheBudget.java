@@ -28,16 +28,16 @@ class TestIndexCacheBudget {
   private static final long GB = 1024L * MB;
 
   @Test
-  void derivesABudgetThatHoldsOneExecutorsShareOfWhatThePayloadsBecome() {
-    // the working set a caller passes is already what its payloads become once prepared, so the
-    // budget only has to spread that across the executors and leave a little room on top
+  void derivesABudgetThatHoldsTheWholeWorkingSetOnEveryExecutor() {
+    // a search can be sent to any executor, so the budget has to hold every file rather than an
+    // even slice of them: a budget of one executor's share read 33 of 39 files, because the files
+    // did not happen to land evenly
     long preparedWorkingSet = 38 * 120 * MB;
     long budget = ExecutorIndexCache.Config.derive(null, 0, preparedWorkingSet, 3, 64 * GB, 0.25);
 
-    long share = preparedWorkingSet / 3;
     assertThat(budget)
-        .as("the budget has to cover one executor's share of the prepared working set")
-        .isGreaterThanOrEqualTo(share);
+        .as("the budget has to cover the whole prepared working set, not a share of it")
+        .isGreaterThanOrEqualTo(preparedWorkingSet);
   }
 
   @Test

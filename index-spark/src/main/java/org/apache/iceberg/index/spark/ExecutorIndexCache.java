@@ -229,7 +229,8 @@ final class ExecutorIndexCache {
      * loaded, so that case is reported rather than silently left to thrash.
      *
      * <p>Without a configured budget the budget is the smaller of a share of the executor's heap
-     * and the bytes one executor has to hold, which is the whole of what a resident cache needs.
+     * and what the whole working set becomes once prepared, which is what a resident cache needs to
+     * hold every file a query can be sent.
      */
     static long derive(
         String configuredValue,
@@ -238,17 +239,22 @@ final class ExecutorIndexCache {
         int executors,
         long heapBytes,
         double heapFraction) {
-      // the working set a caller passes is what the payloads become once prepared, which is what
-      // this budget has to hold; multiplying the file sizes into that is the guess this replaced
-      long perExecutor = workingSetBytes > 0 ? ceilDiv(workingSetBytes, Math.max(1, executors)) : 0;
+      // The whole working set, not a share of it. A file that only some executors hold is served by
+      // the ones that do, which is what the location hints are for, but a budget that assumes every
+      // executor gets an even slice is one file away from evicting: a search read 33 of 39 files
+      // with a budget of one executor's share. Holding the whole set on every executor costs memory
+      // the query was not using and makes the cache independent of how the scheduler distributes
+      // tasks.
+      long perExecutor = workingSetBytes;
       long heapBudget = (long) (heapBytes * heapFraction);
       if (configuredValue != null) {
         Preconditions.checkArgument(configuredBytes > 0, "The cache budget must be positive");
         if (perExecutor > 0 && configuredBytes < (long) (perExecutor * 0.9)) {
           LOG.warn(
-              "The index cache budget of {} bytes is below the {} bytes one executor has to hold "
-                  + "(working set {} over {} executors); the cache will evict what it just loaded "
-                  + "and a repeated query will not be served from it. Raise {} or leave it unset.",
+              "The index cache budget of {} bytes is below the {} bytes the query's index files "
+                  + "become once prepared (a working set of {} bytes over {} executors); the cache "
+                  + "will evict what it just loaded and a repeated query will not be served from "
+                  + "it. Raise {} or leave it unset.",
               configuredBytes,
               perExecutor,
               workingSetBytes,
