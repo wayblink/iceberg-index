@@ -41,6 +41,15 @@ export SPARK_HOME=/opt/spark
 export KUBECONFIG=/home/wanganyang/workspace/k8s-config/a-spark-ops-amdin-kubeconfig
 API=https://10.130.17.1:6443
 IMG=${IMG:-hub.i.basemind.com/spark/sparkann-e2e:20261021b}
+
+# How much each executor may hold. A run has to fit the largest index it is asked to measure, and
+# the largest one is the graph: at 100M it is 23.67 GB over six executors, which is 3.95 GB each.
+# That is more than a heap-relative budget can derive, so the budget is given explicitly -- a run
+# sized for the smaller arms would report the graph as an uncached scan of its own files.
+EXECUTORS=${EXECUTORS:-6}
+EXECUTOR_MEMORY=${EXECUTOR_MEMORY:-12g}
+EXECUTOR_OVERHEAD=${EXECUTOR_OVERHEAD:-4g}
+CACHE_BYTES=${CACHE_BYTES:-6g}
 NN=hdfs://hdfs-namenode-0001.host.platform.basemind.com:8020
 HERE=$(cd "$(dirname "$0")" && pwd)
 RESULTS=$HERE/results
@@ -70,10 +79,11 @@ nohup "$SPARK_HOME/bin/spark-submit" \
   --conf spark.kubernetes.container.image.pullPolicy=IfNotPresent \
   --conf spark.kubernetes.driver.label.app=sparkann-e2e \
   --conf spark.kubernetes.executor.label.app=sparkann-e2e \
-  --conf spark.executor.instances=6 \
+  --conf spark.executor.instances="$EXECUTORS" \
   --conf spark.executor.cores=1 \
-  --conf spark.executor.memory=5g \
-  --conf spark.executor.memoryOverhead=2g \
+  --conf spark.executor.memory="$EXECUTOR_MEMORY" \
+  --conf spark.executor.memoryOverhead="$EXECUTOR_OVERHEAD" \
+  --conf spark.iceberg.index.cache.bytes="$CACHE_BYTES" \
   --conf spark.driver.memory=6g \
   --conf spark.driver.cores=2 \
   --conf spark.hadoop.fs.defaultFS="$NN" \
