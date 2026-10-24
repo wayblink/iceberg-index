@@ -112,6 +112,26 @@ final class ExecutorIndexCache {
       this.owner = owner;
     }
 
+    /**
+     * Reads a setting, from the session configuration or from the one the application was started
+     * with.
+     *
+     * <p>A cache setting is often set with {@code --conf}, which lands in the application's {@link
+     * org.apache.spark.SparkConf} and never in the session's SQL configuration. Reading only the
+     * session made every such run look like it had the cache turned off, and the coverage this
+     * cache reports was then unobservable exactly when it was the thing under test.
+     */
+    private static String setting(
+        org.apache.spark.sql.SparkSession spark, String key, String fallback) {
+      String fromSession = spark.conf().get(key, null);
+      if (fromSession != null && !fromSession.isEmpty()) {
+        return fromSession;
+      }
+
+      String fromApplication = spark.sparkContext().getConf().get(key, null);
+      return fromApplication != null && !fromApplication.isEmpty() ? fromApplication : fallback;
+    }
+
     static Config disabled() {
       return DISABLED;
     }
@@ -149,14 +169,14 @@ final class ExecutorIndexCache {
      */
     static Config from(
         org.apache.spark.sql.SparkSession spark, long workingSetBytes, String owner) {
-      boolean enabled = Boolean.parseBoolean(spark.conf().get(ENABLED, "false"));
+      boolean enabled = Boolean.parseBoolean(setting(spark, ENABLED, "false"));
       if (!enabled) {
         return DISABLED;
       }
 
-      String configured = spark.conf().get(BYTES, null);
+      String configured = setting(spark, BYTES, null);
       long configuredBytes = configured != null ? parseBytes(configured, BYTES) : 0L;
-      long maxEntryBytes = parseBytes(spark.conf().get(MAX_ENTRY_BYTES, "256m"), MAX_ENTRY_BYTES);
+      long maxEntryBytes = parseBytes(setting(spark, MAX_ENTRY_BYTES, "256m"), MAX_ENTRY_BYTES);
       int executors = executors(spark);
       long budget =
           derive(
@@ -166,8 +186,8 @@ final class ExecutorIndexCache {
               executors,
               heapBytes(spark),
               heapFraction(spark));
-      Mode mode = mode(spark.conf().get(MODE, "auto"), workingSetBytes, budget, executors);
-      long idleTtlMillis = durationMillis(spark.conf().get(IDLE_TTL, "30m"), IDLE_TTL);
+      Mode mode = mode(setting(spark, MODE, "auto"), workingSetBytes, budget, executors);
+      long idleTtlMillis = durationMillis(setting(spark, IDLE_TTL, "30m"), IDLE_TTL);
       long effectiveEntryLimit = Math.min(maxEntryBytes, budget);
       return new Config(
           true, budget, effectiveEntryLimit, mode, idleTtlMillis, owner == null ? "" : owner);
@@ -242,7 +262,7 @@ final class ExecutorIndexCache {
 
     /** The executors a stage runs on, which is what a working set is shared between. */
     private static int executors(org.apache.spark.sql.SparkSession spark) {
-      String instances = spark.conf().get("spark.executor.instances", "1");
+      String instances = setting(spark, "spark.executor.instances", "1");
       try {
         return Math.max(1, Integer.parseInt(instances.trim()));
       } catch (NumberFormatException e) {
@@ -251,11 +271,11 @@ final class ExecutorIndexCache {
     }
 
     private static long heapBytes(org.apache.spark.sql.SparkSession spark) {
-      return parseBytes(spark.conf().get("spark.executor.memory", "1g"), "spark.executor.memory");
+      return parseBytes(setting(spark, "spark.executor.memory", "1g"), "spark.executor.memory");
     }
 
     private static double heapFraction(org.apache.spark.sql.SparkSession spark) {
-      String value = spark.conf().get(HEAP_FRACTION, "0.25");
+      String value = setting(spark, HEAP_FRACTION, "0.25");
       try {
         double fraction = Double.parseDouble(value.trim());
         Preconditions.checkArgument(
