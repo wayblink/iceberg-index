@@ -17,6 +17,7 @@ import argparse
 import glob
 import json
 import os
+import re
 import statistics
 import sys
 from datetime import datetime
@@ -63,6 +64,28 @@ def parse(path):
                         run.setdefault("summaries", []).append(data)
                 break
     return run
+
+
+def summarise_definition(definition):
+    """A table's index definition is a long uuid-and-flags string. For the run summary all that
+    matters is what the arm is: structure, quantiser, bit width and the properties that change
+    behaviour. The full string still appears under the raw measurements."""
+    structure = re.search(r"'structure':\s*'(\w+)'", definition)
+    quantiser = re.search(r"'quantizer':\s*'(\w+)'", definition)
+    properties = re.search(r"'properties':\s*\{([^}]*)\}", definition)
+    name = re.search(r",([^,\[\]]+)\]\s*$", definition.strip())
+    bits = re.search(r"rabitq-bits':\s*'(\d+)'", definition)
+    parts = []
+    if structure:
+        parts.append(structure.group(1))
+    if quantiser and quantiser.group(1) != "NONE":
+        parts.append(quantiser.group(1) + (f"·{bits.group(1)}bit" if bits else ""))
+    elif structure and structure.group(1) != "FLAT":
+        parts.append("未量化")
+    if properties and properties.group(1).strip():
+        parts.append(properties.group(1).replace("'", "").replace(", ", " "))
+    label = name.group(1).strip() if name else ""
+    return label, " ".join(parts)
 
 
 def index_sizes():
@@ -434,6 +457,58 @@ class Chart:
 # ---------------------------------------------------------------- report
 
 
+def cheapest_full_recall(runs):
+    """Per (scale, format, arm): the narrowest candidate list that still reaches the recall the
+    exact arms already have, and what that over-sample costs. A fixed over-sample hides arms that
+    need a wider list to catch up, which is exactly the 1-bit case."""
+    ceilings = {}
+    for run in runs:
+        per_over = by_over(run)
+        if not per_over:
+            continue
+        ceiling = max(statistics.mean(entry["recall"]) for entry in per_over.values())
+        key = cell_of(run)
+        ceilings[key] = max(ceilings.get(key, 0.0), ceiling)
+    cheapest = {}
+    for run in runs:
+        key = cell_of(run)
+        per_over = by_over(run)
+        for over in sorted(per_over):
+            entry = per_over[over]
+            if statistics.mean(entry["recall"]) >= ceilings[key] - 0.001:
+                cheapest[(key[0], key[1], arm_of(run))] = (
+                    over, statistics.median(entry["ms"]))
+                break
+    return ceilings, cheapest
+
+
+def tables_of(runs):
+    """One row per table: what it costs to reach exact recall, and what the two references cost."""
+    ceilings, cheapest = cheapest_full_recall(runs)
+    rows = []
+    for key in sorted(ceilings, reverse=True):
+        scale, data_format = key
+        group = [run for run in runs if cell_of(run) == key]
+        scans = [row["ms"] for run in group for row in run["scans"] if not row.get("warmup")]
+        arms = {arm: value for (s, f, arm), value in cheapest.items() if (s, f) == key}
+        indexed = {arm: value for arm, value in arms.items() if arm != "FLAT（暴力）"}
+        best = min(indexed.items(), key=lambda item: item[1][1]) if indexed else None
+        graph = [run for run in group if arm_of(run) == "HNSW"]
+        graph_fastest = None
+        if graph:
+            per_over = by_over(graph[0])
+            fastest_over = min(per_over, key=lambda o: statistics.median(per_over[o]["ms"]))
+            graph_fastest = (fastest_over, statistics.median(per_over[fastest_over]["ms"]))
+        rows.append({
+            "scale": scale, "format": data_format, "ceiling": ceilings[key],
+            "scan": statistics.median(scans) if scans else None,
+            "best": best,
+            "flat": arms.get("FLAT（暴力）"),
+            "hnsw": graph_fastest,
+        })
+    return rows
+
+
 def build(runs, title, note=""):
     stamp = datetime.now().strftime("%Y-%m-%d %H:%M")
     parts = [f"""<!doctype html>
@@ -499,18 +574,28 @@ def build(runs, title, note=""):
 
     # ---- what was measured
     parts.append("<h2>被测对象</h2><div class=\"card\"><table><thead><tr>"
-                 "<th>run</th><th>表</th><th>索引定义</th><th>topK</th>"
+                 "<th>run</th><th>表</th><th>测了哪些臂（结构 / 量化 / 参数）</th><th>topK</th>"
                  "<th>查询数</th><th>重复</th><th>over-sample 取值</th>"
                  "</tr></thead><tbody>")
     for run in runs:
         meta = run["meta"]
-        index = " ".join(run["index"]) if run["index"] else "—"
+        definitions = {}
+        for definition in run["index"]:
+            label, summary = summarise_definition(definition)
+            if label:
+                definitions[label] = summary
+        for arm, definition in run.get("arms", {}).items():
+            definitions[arm] = summarise_definition(definition)[1]
+        measured = sorted({row.get("index", "") for row in run["results"]})
+        arms = "<br>".join(
+            f"<code>{esc(arm)}</code> <span class='sub-value'>"
+            f"{esc(definitions.get(arm, ''))}</span>"
+            for arm in measured) or "—"
         parts.append(
             "<tr>"
             f"<td>{esc(run['name'])}</td>"
-            f"<td><code>{esc(meta.get('base', '?'))}</code></td>"
-            f"<td class=\"definition\" style=\"text-align:left;font-size:12.5px\">"
-            f"{esc(index)}</td>"
+            f"<td><code>{esc(meta.get('base', '?').split('.')[-1])}</code></td>"
+            f"<td class=\"definition\" style=\"text-align:left;font-size:12.5px\">{arms}</td>"
             f"<td>{meta.get('topK', '?')}</td>"
             f"<td>{meta.get('measuredQueries', '?')}</td>"
             f"<td>{meta.get('repeats', '?')}</td>"
@@ -524,31 +609,44 @@ def build(runs, title, note=""):
                      f'{esc(", ".join(incomplete))}</p>')
     parts.append("</div>")
 
-    # ---- KPI cards: the extremes of each run
-    parts.append('<h2>结论速览</h2><div class="cards">')
-    for run in runs:
-        per_over = by_over(run)
-        if not per_over:
-            continue
-        baseline = scan_latencies(run)
-        scan_median = statistics.median(baseline) if baseline else 0
-        best = max(per_over.items(), key=lambda item: statistics.mean(item[1]["recall"]))
-        fastest = min(per_over.items(), key=lambda item: statistics.median(item[1]["ms"]))
+    # ---- one row per table: with this many runs, a card per run buries the comparison
+    summary = tables_of(runs)
+    if summary:
+        parts.append("<h2>结论速览</h2><div class=\"card\"><table><thead><tr>"
+                     "<th>规模 / 数据格式</th><th>最优臂（已到精确 recall）</th>"
+                     "<th>该臂延迟</th><th>全表扫描</th><th>相对扫描</th>"
+                     "<th>暴力搜索</th><th>相对暴力</th><th>HNSW（最快取值）</th>"
+                     "</tr></thead><tbody>")
+        for row in summary:
+            best = row["best"]
+            if best:
+                arm, (over, best_ms) = best
+                best_text = (f"<code>{esc(arm)}</code>"
+                             + (f" · over {over}" if over else " · 直接调用"))
+            else:
+                best_ms, best_text = None, "—"
+            scan = row["scan"]
+            flat = row["flat"][1] if row["flat"] else None
+            hnsw = row["hnsw"][1] if row["hnsw"] else None
+
+            def seconds(value):
+                return f"{value / 1000:.1f} s" if value else "—"
+
+            parts.append(
+                "<tr>"
+                f"<td><b>{esc(row['scale'])}</b> · {esc(row['format'])}</td>"
+                f"<td style=\"text-align:left\">{best_text}</td>"
+                f"<td>{seconds(best_ms)}</td>"
+                f"<td>{seconds(scan)}</td>"
+                f"<td>{(f'{scan / best_ms:.1f}×' if scan and best_ms else '—')}</td>"
+                f"<td>{seconds(flat)}</td>"
+                f"<td>{(f'{flat / best_ms:.1f}×' if flat and best_ms else '—')}</td>"
+                f"<td>{seconds(hnsw)}</td>"
+                "</tr>")
         parts.append(
-            f'<div class="kpi"><div class="label">{esc(run["name"])} · 最高 recall</div>'
-            f'<div class="value">{statistics.mean(best[1]["recall"]):.4f}</div>'
-            f'<div class="note">over-sample {best[0]} · 中位延迟 '
-            f'{statistics.median(best[1]["ms"]):.0f} ms</div></div>')
-        parts.append(
-            f'<div class="kpi"><div class="label">{esc(run["name"])} · 最低中位延迟</div>'
-            f'<div class="value">{statistics.median(fastest[1]["ms"]):.0f} ms</div>'
-            f'<div class="note">over-sample {fastest[0]} · recall '
-            f'{statistics.mean(fastest[1]["recall"]):.4f}</div></div>')
-        parts.append(
-            f'<div class="kpi"><div class="label">{esc(run["name"])} · 全表扫描</div>'
-            f'<div class="value">{scan_median:.0f} ms</div>'
-            f'<div class="note">中位数，{len(baseline)} 次</div></div>')
-    parts.append("</div>")
+            "</tbody></table>"
+            '<p class="note">"最优臂"是在所有测过的 over-sample 里挑出能到精确 recall 的最便宜组合，'
+            '不是固定某个 over-sample 的结果；"相对扫描 / 相对暴力"是同一张表内的倍数。</p></div>')
 
     # ---- the factorial matrix: every combination of the dimensions being compared
     reference_over = int(os.environ.get("BENCH_REFERENCE_OVER", "10"))
@@ -606,6 +704,38 @@ def build(runs, title, note=""):
             f'<p class="note">每格三行：<b>recall@10</b> / <b>中位查询延迟</b> / <b>索引体积</b>'
             f'（＝索引文件字节数之和，与数据格式无关的部分也照实显示）。"--" 表示这一格还没测：'
             f'HNSW 不支持 RaBitQ（没有这样的 kernel），其余未测格见文末的补齐计划。</p></div>')
+
+    # ---- the question the fixed-over matrix cannot answer: how wide do the candidates have to be
+    # before an arm reaches the recall the exact arms already have? Cheapest over that gets there.
+    if cells:
+        ceilings, cheapest = cheapest_full_recall(runs)
+        ceilings = {(scale, data_format): value
+                    for (scale, data_format), value in ceilings.items()}
+
+        parts.append('<h2>达到满 recall 的最小 over-sample</h2><div class="card">'
+                     '<table><thead><tr><th>规模 / 数据格式</th>'
+                     + "".join(f"<th>{esc(arm)}</th>" for arm in arms)
+                     + "</tr></thead><tbody>")
+        for scale in scales:
+            for data_format in data_formats:
+                ceiling = ceilings.get((scale, data_format), 0.0)
+                parts.append(f'<tr><td><b>{esc(scale)}</b> · {esc(data_format)}'
+                             f'<br><span class="sub-value">天花板 {ceiling:.4f}</span></td>')
+                for arm in arms:
+                    found = cheapest.get((scale, data_format, arm))
+                    if not found:
+                        parts.append('<td class="missing">—</td>')
+                        continue
+                    over, ms = found
+                    label = "直接调用" if over == 0 else f"over {over}"
+                    parts.append(f"<td>{label}<br>"
+                                 f"<span class='sub-value'>{ms / 1000:.1f} s</span></td>")
+                parts.append("</tr>")
+        parts.append(
+            "</tbody></table>"
+            '<p class="note">"天花板"是同表里精确臂（暴力搜索或未量化 IVF）已经达到的 recall，'
+            '其余臂按它对齐；"--" 表示把所有测过的 over 都开到头仍然没到。这一列才是选型的依据：'
+            '固定 over=10 会掩盖 1bit 那种需要更宽候选才追平的臂。</p></div>')
 
     # ---- charts, one pair per table: five arms on one axis is readable, twenty is not
     groups = {}
