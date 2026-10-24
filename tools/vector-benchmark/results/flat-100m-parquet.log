@@ -1,0 +1,17 @@
+BENCHMETA {"base":"hms.sparkann.sift100m_base","queries":"hms.sparkann.sift100m_query","column":"vector","topK":10,"measuredQueries":2,"warmupQueries":1,"repeats":2,"overSamples":[1],"indexes":["flat"],"sparkVersion":"3.5.7-STEP-rc2"}
+BENCHMETA {"index":"[aeeec9a8-5e44-4db1-9c75-054a0491d894,vector,vector,4934587624767666810,PUBLISHED,256,100000000,{'field-id':2,'dimension':128,'metric':'EUCLIDEAN','structure':'IVF','quantizer':'RABITQ','properties':{'nprobe':'32','rabitq-bits':'1','nlist':'0'}},null]"}
+BENCHMETA {"index":"[9ec8fc80-b6cf-41d8-a44d-57c1126cc9f4,vector,vector,4934587624767666810,PUBLISHED,256,100000000,{'field-id':2,'dimension':128,'metric':'EUCLIDEAN','structure':'IVF','quantizer':'RABITQ','properties':{'nprobe':'32','rabitq-bits':'4','nlist':'0'}},b4_np32]"}
+BENCHMETA {"index":"[d172bbe8-617e-4011-8bde-43f901bcee8a,vector,vector,4934587624767666810,PUBLISHED,256,100000000,{'field-id':2,'dimension':128,'metric':'EUCLIDEAN','structure':'IVF','quantizer':'RABITQ','properties':{'nprobe':'32','rabitq-bits':'3'}},b3_np32]"}
+BENCHMETA {"index":"[a44420fd-7b3a-44bc-9a05-dcee97056456,vector,vector,4934587624767666810,PUBLISHED,256,100000000,{'field-id':2,'dimension':128,'metric':'EUCLIDEAN','structure':'IVF','quantizer':'NONE','properties':{'nprobe':'32'}},ivf_none_np32]"}
+BENCHMETA {"index":"[ca10aeb6-9c62-4e6c-82a1-dddc4b9d8bcd,vector,vector,4934587624767666810,PUBLISHED,256,100000000,{'field-id':2,'dimension':128,'metric':'EUCLIDEAN','structure':'HNSW','quantizer':'NONE','properties':{'max-m':'16','ef-construction':'200','ef-search':'50'}},hnsw]"}
+BENCHMETA {"index":"[b10e1cc1-0dc0-4f00-ab50-d7c2edd26ff2,vector,vector,4934587624767666810,PUBLISHED,256,100000000,{'field-id':2,'dimension':128,'metric':'EUCLIDEAN','structure':'FLAT','quantizer':'NONE'},flat]"}
+BENCHMETA {"arm":"flat","definition":"[b10e1cc1-0dc0-4f00-ab50-d7c2edd26ff2,vector,vector,4934587624767666810,PUBLISHED,256,100000000,{'field-id':2,'dimension':128,'metric':'EUCLIDEAN','structure':'FLAT','quantizer':'NONE'},flat]","indexBytes":15590888495,"indexFiles":256,"structure":"FLAT","quantizer":"NONE","properties":"{}"}
+BENCHSCAN {"query":0,"warmup":true,"ms":170508,"hits":10,"pks":[38189121,60537235,3317710,3113152,60537397,8834769,20995506,63730781,84537317,19436435]}
+BENCHSCAN {"query":1,"warmup":false,"ms":623168,"hits":10,"pks":[26755808,34080910,3236088,15610118,95728429,66524798,72823982,27594517,37556745,26786213]}
+BENCHSCAN {"query":2,"warmup":false,"ms":555420,"hits":10,"pks":[71015134,33470137,21282510,6626649,71010508,21324282,96440577,38613912,71106199,76697998]}
+BENCHRESULT {"index":"flat","path":"procedure","over":0,"repeat":1,"query":1,"ms":149854,"hits":10,"found":10,"recall":1.000000}
+BENCHRESULT {"index":"flat","path":"procedure","over":0,"repeat":2,"query":1,"ms":102524,"hits":10,"found":10,"recall":1.000000}
+BENCHRESULT {"index":"flat","path":"procedure","over":0,"repeat":1,"query":2,"ms":93431,"hits":10,"found":10,"recall":1.000000}
+BENCHRESULT {"index":"flat","path":"procedure","over":0,"repeat":2,"query":2,"ms":85655,"hits":10,"found":10,"recall":1.000000}
+BENCHSUMMARY {"kind":"scan","median":623168,"min":555420,"p25":555420,"p75":623168,"max":623168,"mean":589294,"count":2,"queries":2}
+BENCHSUMMARY {"kind":"done"}
