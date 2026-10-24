@@ -155,7 +155,7 @@ public final class DistributedIndexSearch {
     Broadcast<ExecutorIndexCache.Config> cacheRef =
         context.broadcast(ExecutorIndexCache.Config.from(spark, workingSet, table.location()));
     String cacheKey = cacheKey(adapter);
-    List<String> cacheKeys = cacheKeys(cacheKey, locations);
+    List<String> cacheKeys = cacheKeys(table.location(), cacheKey, locations);
     // what each executor holds, so a task can be sent to one that already has its file
     IndexCacheLocations locationsTable = IndexCacheLocations.forContext(context.sc());
     boolean locality = localityEnabled(spark);
@@ -292,7 +292,7 @@ public final class DistributedIndexSearch {
     Broadcast<ExecutorIndexCache.Config> cacheRef =
         context.broadcast(ExecutorIndexCache.Config.from(spark, workingSet, table.location()));
     String cacheKey = cacheKey(adapter);
-    List<String> cacheKeys = cacheKeys(cacheKey, locations);
+    List<String> cacheKeys = cacheKeys(table.location(), cacheKey, locations);
     IndexCacheLocations locationsTable = IndexCacheLocations.forContext(context.sc());
     boolean locality = localityEnabled(spark);
     // captured by the task directly: an accumulator only reports through the copy it was created
@@ -512,10 +512,17 @@ public final class DistributedIndexSearch {
     }
   }
 
-  private static List<String> cacheKeys(String adapterKey, List<String> locations) {
+  /**
+   * The keys the cache stores an index file under, which is how a covered file is counted.
+   *
+   * <p>The owner is part of the key the cache writes, so leaving it out here means no stored entry
+   * ever matches and the coverage a run reports is always zero -- the one number a budget is judged
+   * by, reporting that nothing was cached no matter what was.
+   */
+  private static List<String> cacheKeys(String owner, String adapterKey, List<String> locations) {
     List<String> keys = Lists.newArrayListWithCapacity(locations.size());
     for (String location : locations) {
-      keys.add(adapterKey + "|" + location);
+      keys.add(owner + "|" + adapterKey + "|" + location);
     }
 
     return keys;
