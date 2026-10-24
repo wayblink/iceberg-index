@@ -90,6 +90,7 @@ nohup "$SPARK_HOME/bin/spark-submit" \
   --conf spark.driver.cores=2 \
   --conf spark.hadoop.fs.defaultFS="$NN" \
   ${CACHE_BYTES:+--conf spark.iceberg.index.cache.bytes=$CACHE_BYTES} \
+  --conf spark.iceberg.index.cache.enabled="${CACHE_ENABLED:-true}" \
   --conf spark.driver.extraJavaOptions=--add-opens=java.base/java.nio=ALL-UNNAMED \
   --conf spark.executor.extraJavaOptions=--add-opens=java.base/java.nio=ALL-UNNAMED \
   "$HERE/vector-benchmark.jar" \
