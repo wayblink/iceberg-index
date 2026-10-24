@@ -20,6 +20,7 @@ package org.apache.iceberg.index.spark;
 
 import java.io.IOException;
 import java.io.UncheckedIOException;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -29,9 +30,11 @@ import org.apache.iceberg.Snapshot;
 import org.apache.iceberg.Table;
 import org.apache.iceberg.index.IndexAdapter;
 import org.apache.iceberg.index.IndexBlob;
+import org.apache.iceberg.index.IndexBuildResult;
 import org.apache.iceberg.index.IndexEntry;
 import org.apache.iceberg.index.IndexFile;
 import org.apache.iceberg.index.IndexFileContainer;
+import org.apache.iceberg.index.IndexFileMemory;
 import org.apache.iceberg.index.IndexManifest;
 import org.apache.iceberg.index.IndexManifestList;
 import org.apache.iceberg.index.IndexManifestList.ManifestRef;
@@ -46,6 +49,7 @@ import org.apache.iceberg.io.FileIO;
 import org.apache.iceberg.relocated.com.google.common.collect.Lists;
 import org.apache.iceberg.relocated.com.google.common.collect.Maps;
 import org.apache.iceberg.relocated.com.google.common.collect.Sets;
+import org.apache.iceberg.util.ByteBuffers;
 import org.apache.spark.SparkContext;
 import org.apache.spark.api.java.JavaRDD;
 import org.apache.spark.sql.Row;
@@ -365,20 +369,28 @@ public final class SparkIndexBuilder {
                           + "-"
                           + UUID.randomUUID();
                   String blobType;
-                  byte[] payload;
+                  IndexBuildResult built;
                   IndexFile.Kind kind;
                   if (writesAuxiliary) {
                     blobType = adapter.auxiliaryBlobType();
-                    payload = adapter.encodeAuxiliaryPayload(groupEntries, buildThreads).array();
+                    built = adapter.encodeAuxiliaryPayloadWithMemory(groupEntries, buildThreads);
                     kind = IndexFile.Kind.AUXILIARY;
                   } else {
                     blobType = adapter.entryBlobType();
-                    payload = adapter.encodeEntries(groupEntries).array();
+                    built = adapter.encodeEntriesWithMemory(groupEntries);
                     kind = IndexFile.Kind.ENTRY_BEARING;
                   }
+                  IndexFileMemory memory = built.memory();
                   try {
                     fileContainer.write(
-                        fileIO.newOutputFile(location), List.of(IndexBlob.of(blobType, payload)));
+                        fileIO.newOutputFile(location),
+                        List.of(IndexBlob.of(blobType, ByteBuffers.toByteArray(built.payload()))));
+                    if (memory != null) {
+                      memory =
+                          memory.toBuilder()
+                              .fileBytes(fileIO.newInputFile(location).getLength())
+                              .build();
+                    }
                   } catch (RuntimeException | Error e) {
                     filesFailed.add(1);
                     throw e;
@@ -401,7 +413,8 @@ public final class SparkIndexBuilder {
                               (long) groupEntries.size(),
                               Lists.newArrayList(covered),
                               kind.name(),
-                              blobType))
+                              blobType,
+                              memoryRow(memory)))
                       .iterator();
                 },
                 true)
@@ -424,6 +437,7 @@ public final class SparkIndexBuilder {
               .blobType(row.getString(4))
               .entryCount(row.getLong(1))
               .coveredDataFiles(row.getAs(2))
+              .memory(memoryFromRow(row.getStruct(5)))
               .build());
     }
 
@@ -437,6 +451,37 @@ public final class SparkIndexBuilder {
         System.currentTimeMillis() - buildStartedMillis);
 
     return indexFiles;
+  }
+
+  private static Row memoryRow(IndexFileMemory memory) {
+    if (memory == null) {
+      return null;
+    }
+
+    return RowFactory.create(
+        memory.fileBytes(),
+        memory.payloadBytes(),
+        memory.preparedBytes(),
+        memory.modelVersion(),
+        memory.readerId(),
+        memory.runtimeProfile(),
+        new HashMap<>(memory.structure()));
+  }
+
+  private static IndexFileMemory memoryFromRow(Row memory) {
+    if (memory == null) {
+      return null;
+    }
+
+    return IndexFileMemory.builder()
+        .fileBytes(memory.getLong(0))
+        .payloadBytes(memory.getLong(1))
+        .preparedBytes(memory.getLong(2))
+        .modelVersion(memory.getInt(3))
+        .readerId(memory.getString(4))
+        .runtimeProfile(memory.getString(5))
+        .structure(memory.getAs(6))
+        .build();
   }
 
   private static final String BUILT_ACCUMULATOR = "iceberg.index.build.files-built";

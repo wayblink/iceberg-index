@@ -35,7 +35,7 @@ final class PreparedStructureSize {
 
   static final int HEADER_BYTES = 16;
   static final int REFERENCE_BYTES = 4;
-  private static final int ALIGNMENT = 8;
+  static final int ALIGNMENT = 8;
   private static final int STRING_OBJECT_BYTES = 24;
   private static final int MAP_ENTRY_BYTES = 40;
 

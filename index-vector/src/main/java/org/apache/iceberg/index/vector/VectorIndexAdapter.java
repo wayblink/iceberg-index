@@ -23,6 +23,7 @@ import java.util.Comparator;
 import java.util.List;
 import java.util.Set;
 import org.apache.iceberg.index.IndexAdapter;
+import org.apache.iceberg.index.IndexBuildResult;
 import org.apache.iceberg.index.IndexDefinition;
 import org.apache.iceberg.index.IndexEntry;
 import org.apache.iceberg.index.IndexSearchResult;
@@ -139,6 +140,11 @@ public final class VectorIndexAdapter implements IndexAdapter, java.io.Serializa
   }
 
   @Override
+  public IndexBuildResult encodeEntriesWithMemory(List<IndexEntry> entries) {
+    return kernel.buildWithMemory(entries, 1);
+  }
+
+  @Override
   public List<IndexEntry> decodeEntries(ByteBuffer payload) {
     return kernel.entries(payload);
   }
@@ -161,6 +167,12 @@ public final class VectorIndexAdapter implements IndexAdapter, java.io.Serializa
   @Override
   public ByteBuffer encodeAuxiliaryPayload(List<IndexEntry> entries, int parallelism) {
     return kernel.build(entries, parallelism);
+  }
+
+  @Override
+  public IndexBuildResult encodeAuxiliaryPayloadWithMemory(
+      List<IndexEntry> entries, int parallelism) {
+    return kernel.buildWithMemory(entries, parallelism);
   }
 
   @Override

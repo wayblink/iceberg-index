@@ -48,6 +48,11 @@ public interface IndexAdapter {
   /** Encodes entries into the payload of an entry-bearing index file. */
   ByteBuffer encodeEntries(List<IndexEntry> entries);
 
+  /** Encodes entries with a memory estimate, or an unknown estimate for legacy adapters. */
+  default IndexBuildResult encodeEntriesWithMemory(List<IndexEntry> entries) {
+    return IndexBuildResult.of(encodeEntries(entries), null);
+  }
+
   /** Decodes the payload of an entry-bearing index file into entries. */
   List<IndexEntry> decodeEntries(ByteBuffer payload);
 
@@ -254,6 +259,12 @@ public interface IndexAdapter {
    */
   default ByteBuffer encodeAuxiliaryPayload(List<IndexEntry> entries, int parallelism) {
     return encodeAuxiliaryPayload(entries);
+  }
+
+  /** Encodes an auxiliary payload with a memory estimate, or an unknown estimate. */
+  default IndexBuildResult encodeAuxiliaryPayloadWithMemory(
+      List<IndexEntry> entries, int parallelism) {
+    return IndexBuildResult.of(encodeAuxiliaryPayload(entries, parallelism), null);
   }
 
   /**

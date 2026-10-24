@@ -27,7 +27,9 @@ import java.io.UncheckedIOException;
 import java.nio.ByteBuffer;
 import java.util.IdentityHashMap;
 import java.util.List;
+import java.util.Map;
 import org.apache.iceberg.index.IndexAdapter.PreparedSearch;
+import org.apache.iceberg.index.IndexBuildResult;
 import org.apache.iceberg.index.IndexEntry;
 import org.apache.iceberg.index.IndexSearchResult;
 import org.apache.iceberg.relocated.com.google.common.base.Preconditions;
@@ -107,6 +109,11 @@ public final class IvfKernel implements VectorKernel {
 
   @Override
   public ByteBuffer build(List<IndexEntry> entries, int parallelism) {
+    return buildWithMemory(entries, parallelism).payload();
+  }
+
+  @Override
+  public IndexBuildResult buildWithMemory(List<IndexEntry> entries, int parallelism) {
     Preconditions.checkNotNull(entries, "Index entries are null");
     List<IndexEntry> materialized = Lists.newArrayList(entries);
     int count = materialized.size();
@@ -117,7 +124,13 @@ public final class IvfKernel implements VectorKernel {
     int listCount = options.nlistFor(count);
     float[][] centroids = listCount == 0 ? new float[0][] : train(vectors, listCount);
     int[][] assignments = assign(vectors, centroids);
+    long memberListsBytes = 0;
+    long entryBytes = entryBytes();
+    for (int[] members : assignments) {
+      memberListsBytes += PreparedStructureSize.nestedList(members.length, entryBytes);
+    }
 
+    long quantizerBytes = 0;
     ByteArrayOutputStream payload = new ByteArrayOutputStream();
     try (DataOutputStream out = new DataOutputStream(payload)) {
       VectorPayloads.writeHeader(out, NAME, payloadVersion());
@@ -142,7 +155,7 @@ public final class IvfKernel implements VectorKernel {
       for (int list = 0; list < centroids.length; list++) {
         int[] members = assignments[list];
         if (isQuantized()) {
-          writeQuantizedList(out, dataFiles, materialized, vectors, members);
+          quantizerBytes += writeQuantizedList(out, dataFiles, materialized, vectors, members);
         } else {
           out.writeInt(members.length);
           for (int member : members) {
@@ -158,7 +171,31 @@ public final class IvfKernel implements VectorKernel {
       throw new UncheckedIOException("Failed to encode the IVF index payload", e);
     }
 
-    return ByteBuffer.wrap(payload.toByteArray());
+    long dictionaryBytes = VectorMemoryEstimates.dictionaryBytes(dataFiles);
+    return VectorMemoryEstimates.result(
+        this,
+        ByteBuffer.wrap(payload.toByteArray()),
+        preparedBytes(centroids.length, memberListsBytes, dictionaryBytes, quantizerBytes),
+        Runtime.getRuntime().availableProcessors(),
+        Map.of(
+            "entry-count",
+            (long) count,
+            "dimension",
+            (long) dimension,
+            "list-count",
+            (long) centroids.length,
+            "data-file-count",
+            (long) dataFiles.size(),
+            "data-file-string-bytes",
+            dictionaryBytes,
+            "member-list-bytes",
+            memberListsBytes,
+            "quantizer-bytes",
+            quantizerBytes,
+            "quantizer-bits",
+            isQuantized() ? (long) quantizer.bits() : 0L,
+            "code-bytes",
+            isQuantized() ? (long) quantizer.codeBytes() : 0L));
   }
 
   /** The vectors of the entries, checked against what this index can store. */
@@ -186,7 +223,7 @@ public final class IvfKernel implements VectorKernel {
    * when the residuals it codes are small, and the residuals of a partition are smaller than those
    * of the file it came from.
    */
-  private void writeQuantizedList(
+  private long writeQuantizedList(
       DataOutputStream out,
       List<String> dataFiles,
       List<IndexEntry> entries,
@@ -219,6 +256,8 @@ public final class IvfKernel implements VectorKernel {
         out.writeFloat(factor);
       }
     }
+
+    return listQuantizer.estimatedBytes();
   }
 
   @Override
@@ -243,50 +282,47 @@ public final class IvfKernel implements VectorKernel {
    * bytes each where an unquantized entry holds a whole vector.
    */
   private long preparedBytes(Loaded loaded) {
+    long dictionaryBytes = 0;
+    long memberListsBytes = 0;
+    long entryBytes = entryBytes();
+    // Decoded entries share dictionary strings, regardless of the identity of the build inputs.
+    IdentityHashMap<String, Boolean> dataFiles = new IdentityHashMap<>();
+    for (List<IvfEntry> members : loaded.lists) {
+      memberListsBytes += PreparedStructureSize.nestedList(members.size(), entryBytes);
+      for (IvfEntry entry : members) {
+        if (dataFiles.put(entry.dataFile, Boolean.TRUE) == null) {
+          dictionaryBytes += PreparedStructureSize.string(entry.dataFile);
+        }
+      }
+    }
+
+    long quantizerBytes = 0;
+    if (loaded.listQuantizers != null) {
+      for (RaBitQQuantizer listQuantizer : loaded.listQuantizers) {
+        quantizerBytes += listQuantizer.estimatedBytes();
+      }
+    }
+
+    return preparedBytes(
+        loaded.centroids.length, memberListsBytes, dictionaryBytes, quantizerBytes);
+  }
+
+  private long preparedBytes(
+      int listCount, long memberListsBytes, long dictionaryBytes, long quantizerBytes) {
     long total =
         PreparedStructureSize.object(4L * PreparedStructureSize.REFERENCE_BYTES)
             + PreparedStructureSize.object(
                 2L * PreparedStructureSize.REFERENCE_BYTES + 2L * Integer.BYTES + Long.BYTES)
             + PreparedStructureSize.object(PreparedStructureSize.REFERENCE_BYTES)
-            + PreparedStructureSize.references(loaded.centroids.length)
-            + PreparedStructureSize.nestedList(loaded.lists.size(), 0);
-    for (float[] centroid : loaded.centroids) {
-      total += PreparedStructureSize.floats(centroid.length);
-    }
-
-    // the payload carries a dictionary of data files and every entry points at the one decoded
-    // string for its file, so the strings are counted once for the payload rather than once per
-    // entry: a long path is one kilobyte, not one kilobyte per vector
-    IdentityHashMap<String, Boolean> dataFiles = new IdentityHashMap<>();
-    for (List<IvfEntry> members : loaded.lists) {
-      for (IvfEntry entry : members) {
-        if (dataFiles.put(entry.dataFile, Boolean.TRUE) == null) {
-          total += PreparedStructureSize.string(entry.dataFile);
-        }
-      }
-    }
-
-    long entryBytes = entryBytes();
-    for (List<IvfEntry> members : loaded.lists) {
-      total += PreparedStructureSize.nestedList(members.size(), entryBytes);
-    }
-
-    if (loaded.listCenters != null) {
-      total += PreparedStructureSize.references(loaded.listCenters.length);
-      for (float[] center : loaded.listCenters) {
-        if (center != null) {
-          total += PreparedStructureSize.array((long) center.length * Float.BYTES);
-        }
-      }
-    }
-
-    if (loaded.listQuantizers != null) {
-      total += PreparedStructureSize.references(loaded.listQuantizers.length);
-      for (RaBitQQuantizer listQuantizer : loaded.listQuantizers) {
-        if (listQuantizer != null) {
-          total += listQuantizer.estimatedBytes();
-        }
-      }
+            + PreparedStructureSize.references(listCount)
+            + (long) listCount * PreparedStructureSize.floats(dimension)
+            + PreparedStructureSize.nestedList(listCount, 0)
+            + memberListsBytes
+            + dictionaryBytes
+            + PreparedStructureSize.references(listCount);
+    if (isQuantized()) {
+      total += (long) listCount * PreparedStructureSize.floats(dimension);
+      total += PreparedStructureSize.references(listCount) + quantizerBytes;
     }
 
     return total;

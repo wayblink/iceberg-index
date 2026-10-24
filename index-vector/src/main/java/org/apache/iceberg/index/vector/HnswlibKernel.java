@@ -32,7 +32,9 @@ import java.io.UncheckedIOException;
 import java.nio.ByteBuffer;
 import java.util.Arrays;
 import java.util.List;
+import java.util.Map;
 import org.apache.iceberg.index.IndexAdapter.PreparedSearch;
+import org.apache.iceberg.index.IndexBuildResult;
 import org.apache.iceberg.index.IndexEntry;
 import org.apache.iceberg.index.IndexSearchResult;
 import org.apache.iceberg.relocated.com.google.common.base.Preconditions;
@@ -100,6 +102,11 @@ public final class HnswlibKernel implements VectorKernel {
 
   @Override
   public ByteBuffer build(List<IndexEntry> entries, int parallelism) {
+    return buildWithMemory(entries, parallelism).payload();
+  }
+
+  @Override
+  public IndexBuildResult buildWithMemory(List<IndexEntry> entries, int parallelism) {
     Preconditions.checkNotNull(entries, "Index entries are null");
     Preconditions.checkArgument(parallelism >= 1, "Parallelism must be at least one");
     List<IndexEntry> materialized = Lists.newArrayList(entries);
@@ -141,6 +148,7 @@ public final class HnswlibKernel implements VectorKernel {
       throw new UncheckedIOException("Failed to serialize the HNSW index", e);
     }
 
+    List<String> dataFiles = VectorPayloads.dataFilesOf(materialized);
     ByteArrayOutputStream payload = new ByteArrayOutputStream();
     try (DataOutputStream out = new DataOutputStream(payload)) {
       VectorPayloads.writeHeader(out, NAME, FORMAT_VERSION);
@@ -148,7 +156,6 @@ public final class HnswlibKernel implements VectorKernel {
       out.writeInt(graphBytes.length);
       out.write(graphBytes);
       // the same dictionary the entries use: a graph node refers to its data file by position
-      List<String> dataFiles = VectorPayloads.dataFilesOf(materialized);
       out.writeInt(dataFiles.size());
       for (String dataFile : dataFiles) {
         out.writeUTF(dataFile);
@@ -162,7 +169,28 @@ public final class HnswlibKernel implements VectorKernel {
     } catch (IOException e) {
       throw new UncheckedIOException("Failed to encode the HNSW index payload", e);
     }
-    return ByteBuffer.wrap(payload.toByteArray());
+    int processors = Runtime.getRuntime().availableProcessors();
+    long dictionaryBytes = VectorMemoryEstimates.dictionaryBytes(dataFiles);
+    return VectorMemoryEstimates.result(
+        this,
+        ByteBuffer.wrap(payload.toByteArray()),
+        preparedBytes(
+            materialized.size(),
+            dictionaryBytes,
+            index.size(),
+            dimension,
+            index.getM(),
+            index.getMaxItemCount(),
+            processors),
+        processors,
+        Map.of(
+            "mapping-count", (long) materialized.size(),
+            "node-count", (long) index.size(),
+            "dimension", (long) dimension,
+            "max-m", (long) index.getM(),
+            "max-count", (long) index.getMaxItemCount(),
+            "data-file-count", (long) dataFiles.size(),
+            "data-file-string-bytes", dictionaryBytes));
   }
 
   @Override
@@ -211,7 +239,13 @@ public final class HnswlibKernel implements VectorKernel {
       index.setEf(options.efSearch());
       long preparedBytes =
           preparedBytes(
-              dataFiles, positions, index.size(), dimension, index.getM(), index.getMaxItemCount());
+              mappingCount,
+              PreparedStructureSize.distinctStrings(Arrays.asList(dataFiles)),
+              index.size(),
+              dimension,
+              index.getM(),
+              index.getMaxItemCount(),
+              Runtime.getRuntime().availableProcessors());
       return new GraphSearcher(index, dataFiles, positions, mappingCount, preparedBytes);
     } catch (IOException e) {
       throw new UncheckedIOException("Failed to load the HNSW index payload", e);
@@ -231,8 +265,14 @@ public final class HnswlibKernel implements VectorKernel {
    * Mapping arrays and distinct retained paths are charged separately and only once. Query scratch
    * allocations and serialized payload buffers are excluded.
    */
-  private static long preparedBytes(
-      String[] dataFiles, long[] positions, int nodes, int dimension, int m, int maxCount) {
+  static long preparedBytes(
+      int mappingCount,
+      long dictionaryBytes,
+      int nodes,
+      int dimension,
+      int m,
+      int maxCount,
+      int processors) {
     long listFields = Integer.BYTES + PreparedStructureSize.REFERENCE_BYTES;
     long connections =
         PreparedStructureSize.references(2)
@@ -255,11 +295,10 @@ public final class HnswlibKernel implements VectorKernel {
     // allowance covers its open-addressing slack without inspecting the library's private tables.
     total +=
         PreparedStructureSize.map(nodes, PreparedStructureSize.object(Long.BYTES), Integer.BYTES);
-    total += PreparedStructureSize.references(dataFiles.length);
-    total += PreparedStructureSize.longs(positions.length);
-    total += PreparedStructureSize.distinctStrings(Arrays.asList(dataFiles));
+    total += PreparedStructureSize.references(mappingCount);
+    total += PreparedStructureSize.longs(mappingCount);
+    total += dictionaryBytes;
 
-    int processors = Runtime.getRuntime().availableProcessors();
     long bitset =
         PreparedStructureSize.entry(
             PreparedStructureSize.REFERENCE_BYTES, PreparedStructureSize.ints((maxCount >> 5) + 1));

@@ -35,7 +35,7 @@ import org.apache.iceberg.relocated.com.google.common.collect.Lists;
  * A minimal {@link IndexAdapter} used by core tests: entry payloads are a single int value, search
  * scores by that value in descending order, and no auxiliary payloads are used.
  */
-public final class TestingIndexAdapter implements IndexAdapter {
+public class TestingIndexAdapter implements IndexAdapter {
 
   /** Blob type of testing index files. */
   public static final String BLOB_TYPE = "iceberg-testing-entries-v1";

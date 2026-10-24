@@ -23,8 +23,10 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 import java.io.File;
 import java.io.IOException;
+import java.nio.ByteBuffer;
 import java.nio.file.Path;
 import java.util.List;
+import java.util.Map;
 import java.util.stream.Collectors;
 import org.apache.iceberg.TestTables.LocalFileIO;
 import org.apache.iceberg.index.IndexManifestList.ManifestRef;
@@ -32,6 +34,8 @@ import org.apache.iceberg.relocated.com.google.common.collect.Lists;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 
 /**
  * Tests the attempt ledger: the write-ahead record that lets a failed or killed build be cleaned up
@@ -324,6 +328,106 @@ class TestIndexSnapshotWriterAttempts {
                 .timestampMillis(30)
                 .build());
     assertThat(updated.snapshots()).hasSize(1);
+  }
+
+  @ParameterizedTest
+  @ValueSource(booleans = {false, true})
+  void persistsBuildMemoryWithActualContainerSize(boolean auxiliary, @TempDir Path tempDir)
+      throws IOException {
+    LocalFileIO fileIO = new LocalFileIO();
+    PuffinIndexFileContainer container = new PuffinIndexFileContainer();
+    IndexSnapshotWriter writer = new IndexSnapshotWriter(fileIO, container, 10);
+    String indexLocation = tempDir.resolve("indexes/index-uuid").toString();
+    MemoryAdapter adapter = new MemoryAdapter(auxiliary);
+    try {
+      List<IndexFile> files =
+          writer.writeIndexFiles(
+              indexLocation,
+              1,
+              adapter,
+              List.of(IndexEntry.of("data.parquet", 7, TestingIndexAdapter.valuePayload(10))));
+      assertThat(files).hasSize(1);
+      IndexFile file = files.get(0);
+      assertThat(file.memory()).isNotNull();
+      assertThat(file.memory())
+          .isEqualTo(
+              adapter.memory.toBuilder()
+                  .fileBytes(fileIO.newInputFile(file.location()).getLength())
+                  .build());
+      assertThat(file.kind())
+          .isEqualTo(auxiliary ? IndexFile.Kind.AUXILIARY : IndexFile.Kind.ENTRY_BEARING);
+      assertThat(file.coveredDataFiles()).containsExactly("data.parquet");
+      assertThat(file.entryCount()).isEqualTo(1);
+      IndexBlob blob = container.read(fileIO.newInputFile(file.location())).get(0);
+      assertThat(blob.type()).isEqualTo(file.blobType());
+      assertThat(blob.payload().length).isEqualTo(file.memory().payloadBytes());
+      List<IndexEntry> decoded = adapter.decodeEntries(ByteBuffer.wrap(blob.payload()));
+      assertThat(decoded).extracting(IndexEntry::rowPosition).containsExactly(7L);
+      assertThat(TestingIndexAdapter.payloadValue(decoded.get(0).payload())).isEqualTo(10);
+      String manifestList = writer.writeManifestList(indexLocation, 1, files);
+      ManifestRef manifest =
+          IndexManifestList.read(fileIO.newInputFile(manifestList)).manifests().get(0);
+      assertThat(IndexManifest.read(fileIO.newInputFile(manifest.location())).indexFiles())
+          .containsExactly(file);
+    } finally {
+      writer.abortAttempt(indexLocation);
+    }
+  }
+
+  private static final class MemoryAdapter extends TestingIndexAdapter {
+    private final boolean auxiliary;
+    private IndexFileMemory memory;
+
+    private MemoryAdapter(boolean auxiliary) {
+      super(TestingIndexDefinition.of(4));
+      this.auxiliary = auxiliary;
+    }
+
+    @Override
+    public boolean writesAuxiliaryFiles() {
+      return auxiliary;
+    }
+
+    @Override
+    public String auxiliaryBlobType() {
+      return "testing-auxiliary";
+    }
+
+    @Override
+    public ByteBuffer encodeAuxiliaryPayload(List<IndexEntry> entries) {
+      return super.encodeEntries(entries);
+    }
+
+    @Override
+    public IndexBuildResult encodeEntriesWithMemory(List<IndexEntry> entries) {
+      ByteBuffer payload = super.encodeEntries(entries).asReadOnlyBuffer();
+      this.memory =
+          IndexFileMemory.builder()
+              .payloadBytes(payload.remaining())
+              .preparedBytes(73)
+              .modelVersion(1)
+              .readerId("testing/1")
+              .runtimeProfile("fixture")
+              .structure(Map.of("entry-count", (long) entries.size()))
+              .build();
+      return IndexBuildResult.of(payload, memory);
+    }
+
+    @Override
+    public IndexBuildResult encodeAuxiliaryPayloadWithMemory(
+        List<IndexEntry> entries, int parallelism) {
+      return encodeEntriesWithMemory(entries);
+    }
+
+    @Override
+    public PreparedSearch prepare(ByteBuffer payload) {
+      throw new AssertionError("Building must not prepare a second retained structure");
+    }
+
+    @Override
+    public PreparedSearch prepareAuxiliary(ByteBuffer payload) {
+      throw new AssertionError("Building must not prepare a second retained structure");
+    }
   }
 
   private static List<IndexFile> writeFiles(IndexSnapshotWriter writer, String indexLocation)

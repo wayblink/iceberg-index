@@ -21,6 +21,7 @@ package org.apache.iceberg.index.vector;
 import java.nio.ByteBuffer;
 import java.util.List;
 import org.apache.iceberg.index.IndexAdapter.PreparedSearch;
+import org.apache.iceberg.index.IndexBuildResult;
 import org.apache.iceberg.index.IndexEntry;
 import org.apache.iceberg.index.IndexSearchResult;
 
@@ -88,6 +89,11 @@ public interface VectorKernel extends java.io.Serializable {
    * @param parallelism how many threads this call may use, taken from the cores the task reserved
    */
   ByteBuffer build(List<IndexEntry> entries, int parallelism);
+
+  /** Builds a payload with a memory estimate, or an unknown estimate for legacy kernels. */
+  default IndexBuildResult buildWithMemory(List<IndexEntry> entries, int parallelism) {
+    return IndexBuildResult.of(build(entries, parallelism), null);
+  }
 
   /**
    * Decodes the entries of an entry-bearing payload, for an index type that stores them as they are

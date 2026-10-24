@@ -27,7 +27,9 @@ import java.io.UncheckedIOException;
 import java.nio.ByteBuffer;
 import java.util.IdentityHashMap;
 import java.util.List;
+import java.util.Map;
 import org.apache.iceberg.index.IndexAdapter.PreparedSearch;
+import org.apache.iceberg.index.IndexBuildResult;
 import org.apache.iceberg.index.IndexEntry;
 import org.apache.iceberg.index.IndexSearchResult;
 import org.apache.iceberg.relocated.com.google.common.base.Preconditions;
@@ -74,16 +76,22 @@ public final class BruteforceKernel implements VectorKernel {
 
   @Override
   public ByteBuffer build(List<IndexEntry> entries, int parallelism) {
+    return buildWithMemory(entries, parallelism).payload();
+  }
+
+  @Override
+  public IndexBuildResult buildWithMemory(List<IndexEntry> entries, int parallelism) {
     // a flat list has nothing to build, so the threads a caller offers go unused; the capability
     // says so rather than letting the hint disappear silently
     Preconditions.checkNotNull(entries, "Index entries are null");
+    List<String> dataFiles = VectorPayloads.dataFilesOf(entries);
+    long retainedPayloadBytes = 0;
     ByteArrayOutputStream bytes = new ByteArrayOutputStream();
     try (DataOutputStream out = new DataOutputStream(bytes)) {
       VectorPayloads.writeHeader(out, NAME, FORMAT_VERSION);
       // the data files an entry points at are written once, as a dictionary, and an entry refers to
       // one by position: a path is long and every entry of a file repeats it, which is most of the
       // payload once there are many entries per file
-      List<String> dataFiles = VectorPayloads.dataFilesOf(entries);
       out.writeInt(dataFiles.size());
       for (String dataFile : dataFiles) {
         out.writeUTF(dataFile);
@@ -97,11 +105,24 @@ public final class BruteforceKernel implements VectorKernel {
         byte[] payload = entry.payload();
         out.writeInt(payload.length);
         out.write(payload);
+        retainedPayloadBytes =
+            Math.addExact(retainedPayloadBytes, PreparedStructureSize.bytes(payload.length));
       }
     } catch (IOException e) {
       throw new UncheckedIOException("Failed to encode vector index entries", e);
     }
-    return ByteBuffer.wrap(bytes.toByteArray());
+    long dictionaryBytes = VectorMemoryEstimates.dictionaryBytes(dataFiles);
+    return VectorMemoryEstimates.result(
+        this,
+        ByteBuffer.wrap(bytes.toByteArray()),
+        preparedBytes(entries.size(), retainedPayloadBytes, dictionaryBytes),
+        Runtime.getRuntime().availableProcessors(),
+        Map.of(
+            "entry-count", (long) entries.size(),
+            "dimension", (long) dimension,
+            "data-file-count", (long) dataFiles.size(),
+            "data-file-string-bytes", dictionaryBytes,
+            "entry-payload-array-bytes", retainedPayloadBytes));
   }
 
   @Override
@@ -158,22 +179,26 @@ public final class BruteforceKernel implements VectorKernel {
 
   /** Estimates retained entries without cloning their immutable payloads to obtain lengths. */
   private static long preparedBytes(DecodedEntries decoded) {
-    List<IndexEntry> entries = decoded.entries;
-    long total =
-        PreparedStructureSize.references(entries.size())
-            + PreparedStructureSize.object(2L * PreparedStructureSize.REFERENCE_BYTES)
-            + PreparedStructureSize.object(2L * PreparedStructureSize.REFERENCE_BYTES + Long.BYTES)
-            + decoded.payloadBytes;
+    long dictionaryBytes = 0;
     IdentityHashMap<String, Boolean> seen = new IdentityHashMap<>();
-    for (IndexEntry entry : entries) {
+    for (IndexEntry entry : decoded.entries) {
       if (seen.put(entry.dataFile(), Boolean.TRUE) == null) {
-        total += PreparedStructureSize.string(entry.dataFile());
+        dictionaryBytes += PreparedStructureSize.string(entry.dataFile());
       }
-      // Both dataFile and payload references are fields, even though the path is shared.
-      total +=
-          PreparedStructureSize.object(Long.BYTES + 2L * PreparedStructureSize.REFERENCE_BYTES);
     }
-    return total;
+
+    return preparedBytes(decoded.entries.size(), decoded.payloadBytes, dictionaryBytes);
+  }
+
+  private static long preparedBytes(int count, long payloadBytes, long dictionaryBytes) {
+    // Both dataFile and payload references are fields, even though the path is shared.
+    return PreparedStructureSize.references(count)
+        + PreparedStructureSize.object(2L * PreparedStructureSize.REFERENCE_BYTES)
+        + PreparedStructureSize.object(2L * PreparedStructureSize.REFERENCE_BYTES + Long.BYTES)
+        + (long) count
+            * PreparedStructureSize.object(Long.BYTES + 2L * PreparedStructureSize.REFERENCE_BYTES)
+        + payloadBytes
+        + dictionaryBytes;
   }
 
   private static final class DecodedEntries {

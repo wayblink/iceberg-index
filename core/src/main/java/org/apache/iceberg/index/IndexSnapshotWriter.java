@@ -31,6 +31,7 @@ import org.apache.iceberg.relocated.com.google.common.base.Preconditions;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableList;
 import org.apache.iceberg.relocated.com.google.common.collect.Lists;
 import org.apache.iceberg.relocated.com.google.common.collect.Sets;
+import org.apache.iceberg.util.ByteBuffers;
 
 /**
  * Writes the files of an index snapshot: entry-bearing index files, the index manifest that lists
@@ -235,25 +236,34 @@ public final class IndexSnapshotWriter {
             indexLocation,
             FILE_MARKER_PREFIX + seq,
             DATA_DIR + "/index-file-" + snapshotId + "-" + seq + "-" + newId());
-    IndexBlob blob;
+    IndexBuildResult built;
+    String blobType;
     IndexFile.Kind kind;
     if (adapter.writesAuxiliaryFiles()) {
-      String auxiliaryBlobType = adapter.auxiliaryBlobType();
+      blobType = adapter.auxiliaryBlobType();
       Preconditions.checkState(
-          auxiliaryBlobType != null, "Adapter writes auxiliary files without a blob type");
-      blob = IndexBlob.of(auxiliaryBlobType, adapter.encodeAuxiliaryPayload(batch).array());
+          blobType != null, "Adapter writes auxiliary files without a blob type");
+      built = adapter.encodeAuxiliaryPayloadWithMemory(batch, 1);
       kind = IndexFile.Kind.AUXILIARY;
     } else {
-      blob = IndexBlob.of(adapter.entryBlobType(), adapter.encodeEntries(batch).array());
+      blobType = adapter.entryBlobType();
+      built = adapter.encodeEntriesWithMemory(batch);
       kind = IndexFile.Kind.ENTRY_BEARING;
     }
+    IndexBlob blob = IndexBlob.of(blobType, ByteBuffers.toByteArray(built.payload()));
     write(location, out -> container.write(out, ImmutableList.of(blob)));
+    IndexFileMemory memory = built.memory();
+    if (memory != null) {
+      memory = memory.toBuilder().fileBytes(fileIO.newInputFile(location).getLength()).build();
+    }
+
     return IndexFile.builder()
         .location(location)
         .kind(kind)
         .blobType(blob.type())
         .entryCount(batch.size())
         .coveredDataFiles(coveredDataFiles(batch))
+        .memory(memory)
         .build();
   }
 
