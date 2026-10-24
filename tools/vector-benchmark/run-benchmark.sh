@@ -40,7 +40,7 @@ export HADOOP_CONF_DIR=/opt/hadoop-3.3.1/etc/hadoop
 export SPARK_HOME=/opt/spark
 export KUBECONFIG=/home/wanganyang/workspace/k8s-config/a-spark-ops-amdin-kubeconfig
 API=https://10.130.17.1:6443
-IMG=${IMG:-hub.i.basemind.com/spark/sparkann-e2e:20261021b}
+IMG=${IMG:-hub.i.basemind.com/spark/sparkann-e2e:20261023b}
 
 # How much each executor may hold. A run has to fit the largest index it is asked to measure, and
 # the largest one is the graph: at 100M it is 23.67 GB over six executors, which is 3.95 GB each.
