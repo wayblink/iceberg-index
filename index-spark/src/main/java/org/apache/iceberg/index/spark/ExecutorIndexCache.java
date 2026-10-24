@@ -1003,7 +1003,7 @@ final class ExecutorIndexCache {
               + "using {} payload bytes as the fallback",
           payload.length);
     }
-    long bytes = payload.length + (preparedBytes > 0 ? preparedBytes : payload.length);
+    long bytes = IndexCacheMemory.residentBytes(payload.length, preparedBytes);
     return new CachedFile("", payload, prepared, bytes);
   }
 

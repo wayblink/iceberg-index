@@ -192,11 +192,7 @@ public final class DistributedIndexSearch {
                                     location,
                                     cacheConfig,
                                     cacheKey,
-                                    () -> {
-                                      byte[] content = readPayload(fileIO, location);
-                                      return ExecutorIndexCache.loaded(
-                                          content, prepareFile(content, fileAdapter));
-                                    });
+                                    () -> loadFile(fileIO, location, fileAdapter));
                         long readNanos = System.nanoTime() - readStart;
                         long searchStart = System.nanoTime();
                         for (IndexSearchResult hit :
@@ -324,11 +320,7 @@ public final class DistributedIndexSearch {
                                     location,
                                     cacheConfig,
                                     cacheKey,
-                                    () -> {
-                                      byte[] content = readPayload(fileIO, location);
-                                      return ExecutorIndexCache.loaded(
-                                          content, prepareFile(content, fileAdapter));
-                                    });
+                                    () -> loadFile(fileIO, location, fileAdapter));
                         long readNanos = System.nanoTime() - readStart;
 
                         long searchStart = System.nanoTime();
@@ -558,6 +550,11 @@ public final class DistributedIndexSearch {
   private static final Map<String, Long> KNOWN_PREPARED_BYTES =
       new java.util.concurrent.ConcurrentHashMap<>();
 
+  static ExecutorIndexCache.CachedFile loadFile(FileIO io, String location, IndexAdapter adapter) {
+    byte[] content = readPayload(io, location);
+    return ExecutorIndexCache.loaded(content, prepareFile(content, adapter));
+  }
+
   private static long preparedBytesOf(FileIO io, String location, IndexAdapter adapter) {
     Long known = KNOWN_PREPARED_BYTES.get(location);
     if (known != null) {
@@ -567,9 +564,7 @@ public final class DistributedIndexSearch {
     long bytes;
     try {
       // Use the same retained-state charge as executor admission, including the payload buffer.
-      byte[] content = readPayload(io, location);
-      IndexAdapter.PreparedSearch prepared = prepareFile(content, adapter);
-      bytes = ExecutorIndexCache.loaded(content, prepared).bytes();
+      bytes = loadFile(io, location, adapter).bytes();
     } catch (RuntimeException e) {
       // a size only sizes a budget: an index file this build cannot read is reported elsewhere, and
       // failing the query here would turn an unreadable index into an unanswerable query

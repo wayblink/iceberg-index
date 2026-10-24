@@ -64,7 +64,7 @@
 
 **Files:** 新建 `core/src/main/java/org/apache/iceberg/index/IndexFileMemory.java`；修改同目录 `IndexFile.java`、`IndexManifest.java`；测试 `core/src/test/java/org/apache/iceberg/index/TestIndexFileMemory.java`、现有 `TestIndexManifestFiles.java`。
 
-**Interfaces:** Consumes：现有IndexFile/manifest；Produces：`IndexFileMemory.builder()`；getter `Long fileBytes()`（构建阶段可缺，写入manifest前必须填实际容器长度）、`long payloadBytes()`、`long preparedBytes()`、`int modelVersion()`、`String readerId()`、`String runtimeProfile()`、`Map<String,Long> structure()`；`toBuilder()`。`IndexFile.memory()` nullable，`IndexFile.Builder.memory(IndexFileMemory)`；resident估计用checked payload+prepared求和，不把容器长度重复计费。
+**Interfaces:** Consumes：现有IndexFile/manifest；Produces：`IndexFileMemory.builder()`；getter `Long fileBytes()`（构建阶段可缺，写入manifest前必须填实际容器长度）、`long payloadBytes()`、`long preparedBytes()`、`int modelVersion()`、`String readerId()`、`String runtimeProfile()`、`Map<String,Long> structure()`；`toBuilder()`。`IndexFile.memory()` nullable，`IndexFile.Builder.memory(IndexFileMemory)`；blob-buffer驻留估计用checked payload+prepared求和；当前Spark持有整个Puffin容器时，由Task2转换成checked fileBytes+prepared，不同时加容器和blob。
 
 - [ ] **RED:** `memoryRoundTrip`断言各字段往返相等；`legacyManifestHasNoMemory`使用手工v1 fixture，断言memory为null且原字段不变；`invalidSizesAndUnknownManifestVersion`拒绝负值、溢出及format=99；模型未知版本可读但不可直接准入。
 
@@ -82,9 +82,9 @@ assertThatThrownBy(() -> IndexFileMemory.builder().payloadBytes(-1L).build())
 
 ## Task 2 / #2406：构建估计与传播
 
-**Files:** 新建 `core/src/main/java/org/apache/iceberg/index/IndexBuildResult.java`；修改同目录 `IndexAdapter.java`、`IndexSnapshotWriter.java`；修改 `index-vector/src/main/java/org/apache/iceberg/index/vector/{VectorKernel,VectorIndexAdapter,BruteforceKernel,HnswlibKernel,IvfKernel,PreparedStructureSize}.java`；必要时新建同目录 `VectorMemoryEstimates.java`；修改 `index-spark/src/main/java/org/apache/iceberg/index/spark/SparkIndexBuilder.java`。
+**Files:** 新建 `core/src/main/java/org/apache/iceberg/index/IndexBuildResult.java`；修改同目录 `IndexAdapter.java`、`IndexSnapshotWriter.java`；修改 `index-vector/src/main/java/org/apache/iceberg/index/vector/{VectorKernel,VectorIndexAdapter,BruteforceKernel,HnswlibKernel,IvfKernel,PreparedStructureSize}.java`；必要时新建同目录 `VectorMemoryEstimates.java`；修改 `index-spark/src/main/java/org/apache/iceberg/index/spark/SparkIndexBuilder.java`；新建同目录内部 `IndexCacheMemory.java`，修改 `ExecutorIndexCache.java` 与 `DistributedIndexSearch.java` 统一实际容器记账/加载路径；新建同包测试 `TestIndexCacheMemory.java`。
 
-**Interfaces:** Consumes：Task1的IndexFileMemory；Produces：`IndexBuildResult.of(ByteBuffer payload, IndexFileMemory memory)`（memory允许null），`payload()`、`memory()`；`IndexAdapter`新增default `encodeEntriesWithMemory(List<IndexEntry>)`和`encodeAuxiliaryPayloadWithMemory(List<IndexEntry>,int)`，旧方法保持；`VectorKernel`新增default `buildWithMemory(List<IndexEntry>,int)`。各default仅委托旧编码并返回null估计。VectorIndexAdapter转发kernel结果，writer补实际fileBytes。
+**Interfaces:** Consumes：Task1的IndexFileMemory；Produces：`IndexBuildResult.of(ByteBuffer payload, IndexFileMemory memory)`（memory允许null），`payload()`、`memory()`；`IndexAdapter`新增default `encodeEntriesWithMemory(List<IndexEntry>)`和`encodeAuxiliaryPayloadWithMemory(List<IndexEntry>,int)`，旧方法保持；`VectorKernel`新增default `buildWithMemory(List<IndexEntry>,int)`。各default仅委托旧编码并返回null估计。VectorIndexAdapter转发kernel结果，writer补实际fileBytes。`payloadBytes`保持encoded blob window长度；内部`IndexCacheMemory.residentBytes(IndexFileMemory)`在调用者已匹配reader/model/profile且fileBytes已知后，将其转换为当前整个容器缓存的checked fileBytes+prepared计费，与`ExecutorIndexCache.loaded`复用求和及原prepared未知回退；不得重复计入blob。未知fileBytes不能按0使用。
 
 - [ ] **RED:** 新 `index-vector/src/test/java/org/apache/iceberg/index/vector/TestVectorBuildMemory.java`：各kernel产物prepare后的`estimatedBytes`与同profile构建prepared估计一致；assert payload.remaining与payloadBytes相等；Flat共享路径、IVF量化bits/分区、HNSW M/maxCount/CPU profile分别改变正确项；旧adapter default不要求实现新增方法。
 
@@ -97,6 +97,7 @@ assertThat(built.memory().preparedBytes())
 - [ ] **Run RED:** `./gradlew -DsparkVersions=3.5 -DscalaVersion=2.12 :iceberg-index-vector:test --tests '*TestVectorBuildMemory' :iceberg-core:test --tests '*TestIndexSnapshotWriterAttempts'`。
 - [ ] **Implement:** 在已有build结构可用时生成模型version1、reader/kernel格式标识、profile（引用宽度/8字节对齐/compact strings/CPU数）及模型所需结构计数；build和prepare复用估计模型，不把输入对象或构建临时缓冲计为loaded结构。旧`build`仍只返回payload，避免新旧委托递归。
 - [ ] **Propagation tests:** `IndexSnapshotWriter`和SparkIndexBuilder executor输出将memory结构完整传回driver；扩大Row schema但不得丢旧五字段。用新 `spark/v3.5/spark-extensions/src/test/java/org/apache/iceberg/spark/extensions/TestIndexBuildMemory.java`证明SQL构建后的manifest实际有memory；构建不得调用prepare来“测量”。
+- [ ] **Container contract tests:** 四种向量索引 × NONE/ZSTD，真实写入并读取manifest/Puffin，转换后的规划值须等于真实`CachedFile.bytes()`、缓存stats及现有working-set计费；未知容器长度与溢出必须拒绝。RaBitQ增加dimension17、bits1/8的独立4/32-byte code及每条24-byte prepared差值断言，以共同模型忽略bits的受控mutation验证测试能失败；此mutation不是原实现缺陷。
 - [ ] **GREEN:** 上述测试及 `:iceberg-spark:iceberg-spark-extensions-3.5_2.12:test --tests '*TestIndexBuildMemory'`全通过。
 - [ ] **Commit/review:** 精确add修改文件，`Index: Estimate retained index memory while building`；审查不能用序列化长度倍数代替结构模型、不能额外完整prepare。
 
@@ -126,7 +127,7 @@ assertThat(ownership.mayAdmit("index-A", 1L, "file-A")).isFalse();
 
 **Files:** 新建 `index-spark/src/main/java/org/apache/iceberg/index/spark/IndexCacheProtocol.java`、同目录 `IndexPlacementPlanner.java`、`IndexResidencyCoordinator.java`；测试 `index-spark/src/test/java/org/apache/iceberg/index/spark/TestIndexPlacementPlanner.java`、同目录 `TestIndexResidencyCoordinator.java`。
 
-**Interfaces:** Consumes：Task1容量信息与Task3保护策略；Produces：Protocol拥有Serializable嵌套DTO `NodeReport`（session/id/incarnation/sequence/budget/used/reserved/releasing/profile/holders/accessAge）、`Target`（indexUuid/snapshotId/files/definition/FileIO读取上下文）、`Command`（session/incarnation/indexUuid/epoch/planId/commandId/type/file/estimate）、`Reply`（ACK/commands）、`Result`（状态/覆盖/缺口/节点/驱逐迁移）。全部builder创建，collection defensive copy。planner `plan(Target,List<NodeReport>) -> Plan`。coordinator `acceptLoad(Target,IndexResidencyPolicy,long nowNanos) -> String planId`、`acceptOffload(String indexUuid,long nowNanos) -> String planId`、`report(NodeReport) -> Reply`、`ack(Ack) -> void`、`result(String planId) -> Result`。Ack、Plan及枚举亦由本任务定义，不由后续plugin重定义。Plan提供`Map<String,String> placements()`（file→executor）、`Map<String,String> rejected()`（file→reason）；Ack提供`commandId()`、`epoch()`、`status()`、`bytes()`与reason，状态枚举包含LOADED/RELEASED/REJECTED/FAILED。
+**Interfaces:** Consumes：Task1容量信息经Task2转换后的容器计费与Task3保护策略；Produces：Protocol拥有Serializable嵌套DTO `NodeReport`（session/id/incarnation/sequence/budget/used/reserved/releasing/profile/holders/accessAge）、`Target`（indexUuid/snapshotId/files/definition/FileIO读取上下文）、`Command`（session/incarnation/indexUuid/epoch/planId/commandId/type/file/estimate）、`Reply`（ACK/commands）、`Result`（状态/覆盖/缺口/节点/驱逐迁移）。全部builder创建，collection defensive copy。planner `plan(Target,List<NodeReport>) -> Plan`。coordinator `acceptLoad(Target,IndexResidencyPolicy,long nowNanos) -> String planId`、`acceptOffload(String indexUuid,long nowNanos) -> String planId`、`report(NodeReport) -> Reply`、`ack(Ack) -> void`、`result(String planId) -> Result`。Ack、Plan及枚举亦由本任务定义，不由后续plugin重定义。Plan提供`Map<String,String> placements()`（file→executor）、`Map<String,String> rejected()`（file→reason）；Ack提供`commandId()`、`epoch()`、`status()`、`bytes()`与reason，状态枚举包含LOADED/RELEASED/REJECTED/FAILED。
 
 - [ ] **RED planner:** 等预算节点6/2/2/0已有占用，新2GiB先放空节点；异预算按比例；所有文件只一个目标；总量够但单file过大报FILE_TOO_LARGE；释放未ACK仍不可用；有双份空间才迁移，优先大file且稳定tie-break。
 
@@ -145,7 +146,7 @@ assertThat(plan.placements()).hasSize(target.files().size());
 
 **Files:** 新建 `index-spark/src/main/java/org/apache/iceberg/index/spark/IndexCachePlugin.java`（public SparkPlugin入口）、同目录 `ExecutorIndexCacheWorker.java`（internal）；复用Task4的Protocol/Coordinator；必要修改 `build.gradle` 的index-spark测试依赖，仅使用已有Spark版本catalog；新 `index-spark/src/test/java/org/apache/iceberg/index/spark/TestIndexCachePlugin.java`、同目录 `TestExecutorIndexCacheWorker.java`。
 
-**Interfaces:** Consumes：Task2构建估计/adapter、Task3缓存准入、Task4所有protocol DTO/协调器；Produces：`IndexCachePlugin.driverPlugin()`/`executorPlugin()`公共Spark接口；driver.receive(Object)处理注册/report/ACK；executor PluginContext.ask请求Reply。worker `execute(Command) -> Ack`、`close()`；读取Target所带FileIO及definition，经existing prepare路径产生CachedFile，调用Task3 installManaged；driver不转发payload。对外控制门面留Task6。
+**Interfaces:** Consumes：Task2构建估计/adapter及`IndexCacheMemory`容器转换、Task3缓存准入、Task4所有protocol DTO/协调器；Produces：`IndexCachePlugin.driverPlugin()`/`executorPlugin()`公共Spark接口；driver.receive(Object)处理注册/report/ACK；executor PluginContext.ask请求Reply。worker `execute(Command) -> Ack`、`close()`；读取Target所带FileIO及definition，经existing prepare路径产生CachedFile，调用Task3 installManaged；driver不转发payload。对外控制门面留Task6。
 
 - [ ] **RED:** fake PluginContext重复命令只加载一次；慢loader时状态上报仍能响应；ID复用拒绝旧command；关闭停止线程；控制ACK仅携带状态不含payload/凭证。旧model/profile走安全限并发探测，不允许prepare在driver；无法安全估计返回SIZE_UNKNOWN。
 

@@ -123,7 +123,7 @@ executor 直接使用原 FileIO 从原存储读取文件。命令需包含或引
 
 每个 IndexFile 的 manifest 条目保存可选容量信息，而不是只保存索引总量：实际序列化文件字节数、prepared 驻留估计、估计模型版本、读取/kernel 格式与实现标识、估计环境 profile。精确字段名和二进制编码交给实现计划，但这些概念不能省略。
 
-驻留口径与 `ExecutorIndexCache.loaded(content, prepared).bytes()` 对齐。缓存保留 payload buffer 时计入 buffer，不保留时不重复计入。Puffin 容器字节数与实际保留 payload 长度应分开识别，不能盲目相加。
+驻留口径与 `ExecutorIndexCache.loaded(content, prepared).bytes()` 对齐。`payloadBytes` 是传入容器前的 encoded blob window 长度，不能将其视为所有读取方式的长期保留 buffer。当前 Spark 缓存保留整个 Puffin 容器，因此将已知 `fileBytes` 替代 blob-buffer 项，以 checked `fileBytes + preparedBytes` 规划并与实际缓存记账对齐；若读取方式真正保留 blob buffer，则使用 checked `payloadBytes + preparedBytes`。容器和 blob 不是两项累加费用。当前缓存对未提供正数 prepared 估计的旧 reader 保留原 buffer-size 回退；该保守记账不代表未知结构的实际占用已知，也不能跳过未知模型/profile 的安全回退。
 
 估计要利用构建中已知的维度、条目数、连接参数、量化参数、实际结构统计等。复用结构模型，不采用全 JVM 构建前后堆差、不把构建峰值当驻留，不为了估计而默认完整反序列化一次刚构建的大索引。不同 builder 的适配方式由实现者决定；新 interface 能力必须提供 default，兼容不提供该信息的旧 adapter。
 

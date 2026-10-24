@@ -84,6 +84,39 @@ class TestVectorBuildMemory {
         adapter, buildWithPreparationForbidden(adapter, entries(adapter, 100, i -> "data")));
   }
 
+  @Test
+  void quantizedCodeStorageCrossesAlignmentBoundary() {
+    int dimension = 17;
+    int count = 100;
+    VectorIndexAdapter oneBit =
+        adapter(
+            VectorStructure.IVF,
+            VectorQuantizer.RABITQ,
+            Map.of("nlist", "1", "nprobe", "1", "rabitq-bits", "1"),
+            dimension);
+    VectorIndexAdapter eightBits =
+        adapter(
+            VectorStructure.IVF,
+            VectorQuantizer.RABITQ,
+            Map.of("nlist", "1", "nprobe", "1", "rabitq-bits", "8"),
+            dimension);
+    List<IndexEntry> entries = entries(oneBit, count, i -> "data", dimension);
+    IndexBuildResult low = buildWithPreparationForbidden(oneBit, entries);
+    IndexBuildResult high = buildWithPreparationForbidden(eightBits, entries);
+    // Dimension 17 pads to 32 coordinates: one-bit codes use 4 bytes, eight-bit codes use 32.
+    assertThat(low.memory().structure())
+        .containsEntry("quantizer-bits", 1L)
+        .containsEntry("code-bytes", 4L);
+    assertThat(high.memory().structure())
+        .containsEntry("quantizer-bits", 8L)
+        .containsEntry("code-bytes", 32L);
+    // With a 16-byte header and 8-byte alignment, the code arrays retain 24 and 48 bytes.
+    assertThat(high.memory().preparedBytes() - low.memory().preparedBytes())
+        .isEqualTo(count * (48L - 24L));
+    assertEstimate(oneBit, low);
+    assertEstimate(eightBits, high);
+  }
+
   @ParameterizedTest
   @EnumSource(VectorStructure.class)
   void estimatesEmptyPayloads(VectorStructure structure) {
@@ -217,10 +250,18 @@ class TestVectorBuildMemory {
 
   private static VectorIndexAdapter adapter(
       VectorStructure structure, VectorQuantizer quantizer, Map<String, String> options) {
+    return adapter(structure, quantizer, options, DIMENSION);
+  }
+
+  private static VectorIndexAdapter adapter(
+      VectorStructure structure,
+      VectorQuantizer quantizer,
+      Map<String, String> options,
+      int dimension) {
     return new VectorIndexAdapter(
         VectorIndexDefinition.builder()
             .fieldId(1)
-            .dimension(DIMENSION)
+            .dimension(dimension)
             .metric(Metric.EUCLIDEAN)
             .structure(structure)
             .quantizer(quantizer)
@@ -230,10 +271,15 @@ class TestVectorBuildMemory {
 
   private static List<IndexEntry> entries(
       VectorIndexAdapter adapter, int count, IntFunction<String> path) {
+    return entries(adapter, count, path, DIMENSION);
+  }
+
+  private static List<IndexEntry> entries(
+      VectorIndexAdapter adapter, int count, IntFunction<String> path, int dimension) {
     List<IndexEntry> entries = new ArrayList<>();
     for (int i = 0; i < count; i++) {
-      float[] vector = new float[DIMENSION];
-      for (int d = 0; d < DIMENSION; d++) {
+      float[] vector = new float[dimension];
+      for (int d = 0; d < dimension; d++) {
         vector[d] = (i + d) % 127;
       }
 

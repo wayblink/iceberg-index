@@ -94,7 +94,7 @@ public final class IndexFileMemory {
     return fileBytes;
   }
 
-  /** Returns the retained payload-buffer estimate in bytes. */
+  /** Returns the encoded blob-buffer size before container compression. */
   public long payloadBytes() {
     return payloadBytes;
   }
