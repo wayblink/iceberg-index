@@ -49,7 +49,10 @@ IMG=${IMG:-hub.i.basemind.com/spark/sparkann-e2e:20261021b}
 EXECUTORS=${EXECUTORS:-6}
 EXECUTOR_MEMORY=${EXECUTOR_MEMORY:-12g}
 EXECUTOR_OVERHEAD=${EXECUTOR_OVERHEAD:-4g}
-CACHE_BYTES=${CACHE_BYTES:-6g}
+# An empty CACHE_BYTES leaves the budget to be derived from the working set and the heap, which is
+# what a user who never configures it gets; setting it is what a run needs when the largest index
+# would not fit otherwise.
+CACHE_BYTES=${CACHE_BYTES:-}
 NN=hdfs://hdfs-namenode-0001.host.platform.basemind.com:8020
 HERE=$(cd "$(dirname "$0")" && pwd)
 RESULTS=$HERE/results
@@ -83,10 +86,10 @@ nohup "$SPARK_HOME/bin/spark-submit" \
   --conf spark.executor.cores=1 \
   --conf spark.executor.memory="$EXECUTOR_MEMORY" \
   --conf spark.executor.memoryOverhead="$EXECUTOR_OVERHEAD" \
-  --conf spark.iceberg.index.cache.bytes="$CACHE_BYTES" \
   --conf spark.driver.memory=6g \
   --conf spark.driver.cores=2 \
   --conf spark.hadoop.fs.defaultFS="$NN" \
+  ${CACHE_BYTES:+--conf spark.iceberg.index.cache.bytes=$CACHE_BYTES} \
   --conf spark.driver.extraJavaOptions=--add-opens=java.base/java.nio=ALL-UNNAMED \
   --conf spark.executor.extraJavaOptions=--add-opens=java.base/java.nio=ALL-UNNAMED \
   "$HERE/vector-benchmark.jar" \
