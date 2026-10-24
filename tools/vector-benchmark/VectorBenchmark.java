@@ -272,9 +272,27 @@ public class VectorBenchmark {
 
     int measured = Math.min(queries, vectors.size() - warmup);
     if ("coverage".equals(mode)) {
-      // one query is enough: it loads the arm's files on every executor, which is what the status
-      // call then reports. The budget is already decided by the time this runs, so what it covers
-      // is what any later query would get.
+      // a search first, because the status call reports what the executors last told the driver and
+      // without a search they have told it nothing. The budget is decided before the search, so
+      // what it leaves resident is what any later query would get.
+      spark
+          .sql(
+              "SELECT pk FROM " + base + " ORDER BY vec_distance(" + column + ", "
+                  + vectors.get(warmup) + ") LIMIT " + topK)
+          .collectAsList();
+      for (String indexName : indexNames) {
+        String label = indexName.contains("#")
+            ? indexName.substring(indexName.indexOf('#') + 1) : indexName.trim();
+        if (!"-".equals(label)) {
+          // a named arm is searched directly so that the arm asked about is the one that loaded
+          spark
+              .sql(
+                  "CALL hms.system.vector_search('" + shortName(base) + "', '" + column + "', "
+                      + vectors.get(warmup) + ", " + topK + ", '" + label + "')")
+              .collectAsList();
+        }
+      }
+
       reportCoverage(spark);
     } else if ("procedure".equals(mode)) {
       for (int q = warmup; q < warmup + measured; q++) {
