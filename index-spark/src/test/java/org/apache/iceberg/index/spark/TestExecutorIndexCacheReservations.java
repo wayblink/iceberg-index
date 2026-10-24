@@ -26,7 +26,9 @@ import java.nio.ByteBuffer;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
@@ -38,6 +40,7 @@ import org.apache.iceberg.index.IndexSearchResult;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.EnumSource;
 import org.junit.jupiter.params.provider.ValueSource;
 
 class TestExecutorIndexCacheReservations {
@@ -480,6 +483,481 @@ class TestExecutorIndexCacheReservations {
         assertThat(pool.awaitTermination(10, TimeUnit.SECONDS)).isTrue();
       }
     }
+  }
+
+  @Test
+  void oldLoadCannotPublishAfterOffload() throws Exception {
+    String key = "table|adapter|managed";
+    ExecutorIndexCache.Config config =
+        ExecutorIndexCache.Config.of(true, 100, 100).withOwner("table");
+    cache.applyTarget("A", 1, Set.of(key));
+    ExecutorService pool = Executors.newSingleThreadExecutor();
+    CountDownLatch started = new CountDownLatch(1);
+    CountDownLatch finish = new CountDownLatch(1);
+    try {
+      Future<ExecutorIndexCache.CachedFile> load =
+          pool.submit(
+              () ->
+                  cache.installManaged(
+                      "A",
+                      1,
+                      key,
+                      config,
+                      () -> {
+                        started.countDown();
+                        await(finish);
+                        return ExecutorIndexCache.loaded(new byte[10], EMPTY);
+                      }));
+      assertThat(started.await(10, TimeUnit.SECONDS)).isTrue();
+      cache.releaseIndex("A", 2);
+      finish.countDown();
+      assertThat(load.get(10, TimeUnit.SECONDS)).isNull();
+      assertThat(cache.stats().bytes()).isZero();
+      assertThat(reserved()).isZero();
+    } finally {
+      finish.countDown();
+      pool.shutdownNow();
+      assertThat(pool.awaitTermination(10, TimeUnit.SECONDS)).isTrue();
+    }
+  }
+
+  @Test
+  void sharedFileKeepsOtherIndexOwner() {
+    String key = "table|adapter|managed";
+    ExecutorIndexCache.Config config =
+        ExecutorIndexCache.Config.of(true, 100, 100).withOwner("table");
+    ExecutorIndexCache.CachedFile file = install("A", 1, key, config);
+    cache.applyTarget("B", 1, Set.of(key));
+    assertThat(
+            cache.installManaged(
+                "B",
+                1,
+                key,
+                config,
+                () -> {
+                  throw new AssertionError("Shared file must be reused");
+                }))
+        .isSameAs(file);
+    cache.releaseIndex("A", 2);
+    assertThat(cache.stats().bytes()).isEqualTo(file.bytes());
+    try (ExecutorIndexCache.Lease lease = cache.acquireManaged("B", 1, key)) {
+      assertThat(lease).isNotNull();
+      cache.releaseIndex("B", 2);
+      assertThat(cache.stats().bytes()).isEqualTo(file.bytes());
+    }
+    assertThat(cache.stats().bytes()).isZero();
+  }
+
+  @Test
+  void releaseWaitsForSearch() throws Exception {
+    String key = "table|adapter|managed";
+    ExecutorIndexCache.Config config =
+        ExecutorIndexCache.Config.of(true, 100, 100).withOwner("table");
+    ExecutorIndexCache.CachedFile file = install("A", 1, key, config);
+    ExecutorService pool = Executors.newSingleThreadExecutor();
+    CountDownLatch started = new CountDownLatch(1);
+    CountDownLatch finish = new CountDownLatch(1);
+    try {
+      Future<?> search =
+          pool.submit(
+              () -> {
+                try (ExecutorIndexCache.Lease lease = cache.acquireManaged("A", 1, key)) {
+                  assertThat(lease).isNotNull();
+                  lease
+                      .file()
+                      .searching(
+                          prepared -> {
+                            started.countDown();
+                            await(finish);
+                            return List.of();
+                          });
+                }
+              });
+      assertThat(started.await(10, TimeUnit.SECONDS)).isTrue();
+      cache.releaseIndex("A", 2);
+      assertThat(cache.stats().bytes()).isEqualTo(file.bytes());
+      finish.countDown();
+      search.get(10, TimeUnit.SECONDS);
+      assertThat(cache.stats().bytes()).isZero();
+    } finally {
+      finish.countDown();
+      pool.shutdownNow();
+      assertThat(pool.awaitTermination(10, TimeUnit.SECONDS)).isTrue();
+    }
+  }
+
+  @Test
+  void leaseBeforeSearchingBlocksRelease() {
+    String key = "table|adapter|managed";
+    ExecutorIndexCache.Config config =
+        ExecutorIndexCache.Config.of(true, 100, 100).withOwner("table");
+    ExecutorIndexCache.CachedFile file = install("A", 1, key, config);
+    try (ExecutorIndexCache.Lease lease = cache.acquireManaged("A", 1, key)) {
+      assertThat(lease).isNotNull();
+      cache.releaseIndex("A", 2);
+      assertThat(cache.acquireManaged("A", 1, key)).isNull();
+      assertThat(cache.stats().bytes()).isEqualTo(file.bytes());
+      List<IndexSearchResult> results =
+          lease.file().searching(prepared -> prepared.search(ByteBuffer.allocate(0), 1));
+      assertThat(results).isEmpty();
+    }
+    assertThat(cache.stats().bytes()).isZero();
+  }
+
+  @Test
+  void oldLeaseCloseCannotReleaseNewOwnerAndCloseIsIdempotent() {
+    String key = "table|adapter|managed";
+    ExecutorIndexCache.Config config =
+        ExecutorIndexCache.Config.of(true, 100, 100).withOwner("table");
+    ExecutorIndexCache.CachedFile file = install("A", 1, key, config);
+    ExecutorIndexCache.Lease lease = cache.acquireManaged("A", 1, key);
+    try {
+      assertThat(lease).isNotNull();
+      cache.releaseIndex("A", 2);
+      cache.applyTarget("A", 3, Set.of(key));
+      assertThat(
+              cache.installManaged(
+                  "A",
+                  3,
+                  key,
+                  config,
+                  () -> {
+                    throw new AssertionError("Leased file must be reused");
+                  }))
+          .isSameAs(file);
+      lease.close();
+      lease.close();
+      assertThat(cache.stats().bytes()).isEqualTo(file.bytes());
+      cache.releaseIndex("A", 4);
+      assertThat(cache.stats().bytes()).isZero();
+    } finally {
+      if (lease != null) {
+        lease.close();
+      }
+    }
+  }
+
+  @Test
+  void targetReplacementDefersOnlyOldUniqueFile() {
+    String old = "table|adapter|old";
+    String common = "table|adapter|common";
+    String next = "table|adapter|next";
+    ExecutorIndexCache.Config config =
+        ExecutorIndexCache.Config.of(true, 100, 100).withOwner("table");
+    cache.applyTarget("A", 1, Set.of(old, common));
+    ExecutorIndexCache.CachedFile oldFile =
+        cache.installManaged(
+            "A", 1, old, config, () -> ExecutorIndexCache.loaded(new byte[10], EMPTY));
+    ExecutorIndexCache.CachedFile commonFile =
+        cache.installManaged(
+            "A", 1, common, config, () -> ExecutorIndexCache.loaded(new byte[10], EMPTY));
+    try (ExecutorIndexCache.Lease lease = cache.acquireManaged("A", 1, old)) {
+      assertThat(lease).isNotNull();
+      cache.applyTarget("A", 2, Set.of(common, next));
+      assertThat(cache.stats().bytes()).isEqualTo(oldFile.bytes() + commonFile.bytes());
+      assertThat(cache.acquireManaged("A", 1, common)).isNull();
+    }
+    assertThat(cache.stats().bytes()).isEqualTo(commonFile.bytes());
+    assertThat(cache.residentKeys()).containsExactly(common);
+  }
+
+  @Test
+  void managedKeyCannotBeFilledByLegacyLazyQuery() {
+    String key = "table|adapter|managed";
+    ExecutorIndexCache.Config config =
+        ExecutorIndexCache.Config.of(true, 100, 100).withOwner("table");
+    cache.applyTarget("A", 1, Set.of(key));
+    assertThat(
+            cache.file(
+                "managed", config, "adapter", () -> ExecutorIndexCache.loaded(new byte[10], EMPTY)))
+        .isNotNull();
+    assertThat(cache.stats().entries()).isZero();
+    cache.releaseIndex("A", 2);
+    cache.file("managed", config, "adapter", () -> ExecutorIndexCache.loaded(new byte[10], EMPTY));
+    assertThat(cache.stats().entries()).isZero();
+  }
+
+  @Test
+  void managedEntryIsNotAnIdleOrFairShareVictim() throws Exception {
+    String key = "A|adapter|managed";
+    ExecutorIndexCache.Config config =
+        ExecutorIndexCache.Config.of(true, 40, 20, ExecutorIndexCache.Mode.PIN_HOT, 1)
+            .withOwner("A");
+    ExecutorIndexCache.CachedFile file = install("A", 1, key, config);
+    Field lastAccess = file.getClass().getDeclaredField("lastAccessNanos");
+    lastAccess.setAccessible(true);
+    lastAccess.setLong(file, System.nanoTime() - TimeUnit.MINUTES.toNanos(31));
+    try {
+      ExecutorIndexCache.sweepIntervalForTests(0);
+      askTwice("other", config.withOwner("B"), 20);
+      askTwice("new", config.withOwner("B"), 20);
+      assertThat(cache.residentKeys()).contains(key);
+      assertThat(cache.stats().bytes()).isLessThanOrEqualTo(config.maxBytes());
+    } finally {
+      ExecutorIndexCache.sweepIntervalForTests(TimeUnit.SECONDS.toNanos(30));
+    }
+  }
+
+  @Test
+  void failedOrOversizedManagedLoadReleasesItsReservation() throws Exception {
+    String key = "table|adapter|managed";
+    ExecutorIndexCache.Config config =
+        ExecutorIndexCache.Config.of(true, 100, 10).withOwner("table");
+    cache.applyTarget("A", 1, Set.of(key));
+    assertThatThrownBy(
+            () ->
+                cache.installManaged(
+                    "A",
+                    1,
+                    key,
+                    config,
+                    () -> {
+                      throw new IllegalArgumentException("Cannot prepare index");
+                    }))
+        .hasMessage("Cannot prepare index");
+    assertThat(reserved()).isZero();
+    assertThat(
+            cache.installManaged(
+                "A", 1, key, config, () -> ExecutorIndexCache.loaded(new byte[10], EMPTY)))
+        .isNull();
+    assertThat(reserved()).isZero();
+    assertThat(cache.stats().bytes()).isZero();
+  }
+
+  @Test
+  void disabledManagedLoadDoesNotRunLoader() {
+    String key = "table|adapter|managed";
+    cache.applyTarget("A", 1, Set.of(key));
+    assertThat(
+            cache.installManaged(
+                "A",
+                1,
+                key,
+                ExecutorIndexCache.Config.disabled(),
+                () -> {
+                  throw new AssertionError("Disabled cache must not load");
+                }))
+        .isNull();
+  }
+
+  @ParameterizedTest
+  @EnumSource(ExecutorIndexCache.Mode.class)
+  void explicitInstallationDoesNotInheritLazyAdmissionMode(ExecutorIndexCache.Mode mode) {
+    String key = "table|adapter|managed";
+    ExecutorIndexCache.Config config =
+        ExecutorIndexCache.Config.of(true, 100, 100, mode, 0).withOwner("table");
+    assertThat(install("A", 1, key, config).bytes()).isEqualTo(cache.stats().bytes());
+  }
+
+  @Test
+  void closedLeaseDoesNotRetainFile() throws Exception {
+    String key = "table|adapter|managed";
+    install("A", 1, key, ExecutorIndexCache.Config.of(true, 100, 100).withOwner("table"));
+    ExecutorIndexCache.Lease lease = cache.acquireManaged("A", 1, key);
+    assertThat(lease).isNotNull();
+    lease.close();
+    assertThatThrownBy(lease::file).hasMessage("Index file lease is closed");
+    Field retained = lease.getClass().getDeclaredField("file");
+    retained.setAccessible(true);
+    assertThat(retained.get(lease)).isNull();
+  }
+
+  @Test
+  void clearKeepsLeasedBytesUntilClose() {
+    String key = "table|adapter|managed";
+    ExecutorIndexCache.CachedFile file =
+        install("A", 1, key, ExecutorIndexCache.Config.of(true, 100, 100).withOwner("table"));
+    try (ExecutorIndexCache.Lease lease = cache.acquireManaged("A", 1, key)) {
+      assertThat(lease).isNotNull();
+      cache.clear();
+      assertThat(cache.stats().bytes()).isEqualTo(file.bytes());
+    }
+    assertThat(cache.stats().bytes()).isZero();
+  }
+
+  @Test
+  void reservationWaiterIsCancelledByOffload() throws Exception {
+    String a = "table|adapter|a";
+    String b = "table|adapter|b";
+    ExecutorIndexCache.Config config =
+        ExecutorIndexCache.Config.of(true, 20, 20).withOwner("table");
+    cache.applyTarget("A", 1, Set.of(a));
+    cache.applyTarget("B", 1, Set.of(b));
+    ExecutorService pool = Executors.newFixedThreadPool(2);
+    CountDownLatch started = new CountDownLatch(1);
+    CountDownLatch finish = new CountDownLatch(1);
+    AtomicReference<Thread> waiter = new AtomicReference<>();
+    try {
+      Future<?> first =
+          pool.submit(
+              () ->
+                  cache.installManaged(
+                      "A",
+                      1,
+                      a,
+                      config,
+                      () -> {
+                        started.countDown();
+                        await(finish);
+                        return ExecutorIndexCache.loaded(new byte[10], EMPTY);
+                      }));
+      assertThat(started.await(10, TimeUnit.SECONDS)).isTrue();
+      Future<ExecutorIndexCache.CachedFile> second =
+          pool.submit(
+              () -> {
+                waiter.set(Thread.currentThread());
+                return cache.installManaged(
+                    "B",
+                    1,
+                    b,
+                    config,
+                    () -> {
+                      throw new AssertionError("Offloaded waiter must not load");
+                    });
+              });
+      awaitState(waiter, Thread.State.WAITING);
+      cache.releaseIndex("B", 2);
+      assertThat(second.get(10, TimeUnit.SECONDS)).isNull();
+      assertThat(reserved()).isEqualTo(20);
+      finish.countDown();
+      first.get(10, TimeUnit.SECONDS);
+      assertThat(reserved()).isZero();
+    } finally {
+      finish.countDown();
+      pool.shutdownNow();
+      assertThat(pool.awaitTermination(10, TimeUnit.SECONDS)).isTrue();
+    }
+  }
+
+  @Test
+  void legacyLoadStartedBeforeManagementCannotPublish() throws Exception {
+    String key = "table|adapter|managed";
+    ExecutorIndexCache.Config config =
+        ExecutorIndexCache.Config.of(true, 100, 100).withOwner("table");
+    ExecutorService pool = Executors.newSingleThreadExecutor();
+    CountDownLatch started = new CountDownLatch(1);
+    CountDownLatch finish = new CountDownLatch(1);
+    try {
+      Future<?> load =
+          pool.submit(
+              () ->
+                  cache.file(
+                      "managed",
+                      config,
+                      "adapter",
+                      () -> {
+                        started.countDown();
+                        await(finish);
+                        return ExecutorIndexCache.loaded(new byte[10], EMPTY);
+                      }));
+      assertThat(started.await(10, TimeUnit.SECONDS)).isTrue();
+      cache.applyTarget("A", 1, Set.of(key));
+      finish.countDown();
+      load.get(10, TimeUnit.SECONDS);
+      assertThat(cache.stats().bytes()).isZero();
+      assertThat(reserved()).isZero();
+    } finally {
+      finish.countDown();
+      pool.shutdownNow();
+      assertThat(pool.awaitTermination(10, TimeUnit.SECONDS)).isTrue();
+    }
+  }
+
+  @Test
+  void sameFileWaitersKeepOneMonitorAfterFailure() throws Exception {
+    String key = "table|adapter|managed";
+    ExecutorIndexCache.Config config =
+        ExecutorIndexCache.Config.of(true, 100, 20).withOwner("table");
+    for (String index : List.of("A", "B", "C")) {
+      cache.applyTarget(index, 1, Set.of(key));
+    }
+    ExecutorService pool = Executors.newFixedThreadPool(3);
+    CountDownLatch firstStarted = new CountDownLatch(1);
+    CountDownLatch failFirst = new CountDownLatch(1);
+    CountDownLatch secondStarted = new CountDownLatch(1);
+    CountDownLatch finishSecond = new CountDownLatch(1);
+    AtomicReference<Thread> secondThread = new AtomicReference<>();
+    AtomicReference<Thread> thirdThread = new AtomicReference<>();
+    try {
+      Future<?> first =
+          pool.submit(
+              () ->
+                  cache.installManaged(
+                      "A",
+                      1,
+                      key,
+                      config,
+                      () -> {
+                        firstStarted.countDown();
+                        await(failFirst);
+                        throw new IllegalArgumentException("Cannot prepare index");
+                      }));
+      assertThat(firstStarted.await(10, TimeUnit.SECONDS)).isTrue();
+      Future<ExecutorIndexCache.CachedFile> second =
+          pool.submit(
+              () -> {
+                secondThread.set(Thread.currentThread());
+                return cache.installManaged(
+                    "B",
+                    1,
+                    key,
+                    config,
+                    () -> {
+                      secondStarted.countDown();
+                      await(finishSecond);
+                      return ExecutorIndexCache.loaded(new byte[10], EMPTY);
+                    });
+              });
+      awaitState(secondThread, Thread.State.BLOCKED);
+      failFirst.countDown();
+      assertThatThrownBy(() -> first.get(10, TimeUnit.SECONDS))
+          .isInstanceOf(ExecutionException.class)
+          .hasCauseInstanceOf(IllegalArgumentException.class);
+      assertThat(secondStarted.await(10, TimeUnit.SECONDS)).isTrue();
+      Future<ExecutorIndexCache.CachedFile> third =
+          pool.submit(
+              () -> {
+                thirdThread.set(Thread.currentThread());
+                return cache.installManaged(
+                    "C",
+                    1,
+                    key,
+                    config,
+                    () -> {
+                      throw new AssertionError("Waiter must reuse shared file");
+                    });
+              });
+      awaitState(thirdThread, Thread.State.BLOCKED);
+      finishSecond.countDown();
+      assertThat(third.get(10, TimeUnit.SECONDS)).isSameAs(second.get(10, TimeUnit.SECONDS));
+      assertThat(cache.stats().bytes()).isEqualTo(20);
+      assertThat(reserved()).isZero();
+    } finally {
+      failFirst.countDown();
+      finishSecond.countDown();
+      pool.shutdownNow();
+      assertThat(pool.awaitTermination(10, TimeUnit.SECONDS)).isTrue();
+    }
+  }
+
+  private static void awaitState(AtomicReference<Thread> thread, Thread.State state) {
+    long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+    while ((thread.get() == null || thread.get().getState() != state)
+        && System.nanoTime() < deadline) {
+      Thread.yield();
+    }
+    assertThat(thread.get()).isNotNull();
+    assertThat(thread.get().getState()).isEqualTo(state);
+  }
+
+  private ExecutorIndexCache.CachedFile install(
+      String index, long epoch, String key, ExecutorIndexCache.Config config) {
+    cache.applyTarget(index, epoch, Set.of(key));
+    ExecutorIndexCache.CachedFile file =
+        cache.installManaged(
+            index, epoch, key, config, () -> ExecutorIndexCache.loaded(new byte[10], EMPTY));
+    assertThat(file).isNotNull();
+    return file;
   }
 
   private void askTwice(String key, ExecutorIndexCache.Config config, int bytes) {

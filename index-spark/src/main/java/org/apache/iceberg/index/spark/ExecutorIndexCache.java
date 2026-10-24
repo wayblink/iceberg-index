@@ -56,6 +56,10 @@ import org.slf4j.LoggerFactory;
  * entry can be asked for by two threads at once; {@link CachedFile#searching} holds a lock for the
  * duration of a search rather than duplicating the structure per thread.
  *
+ * <p>Explicitly managed index targets use controller epochs and query leases. Their entries are
+ * released by the controller rather than local file eviction; a lease keeps a file charged until
+ * the query relinquishes it, including the interval before its search begins.
+ *
  * <h2>Three admission modes</h2>
  *
  * <p>A query over an index whose working set fits the budget can simply keep every file ({@link
@@ -383,6 +387,8 @@ final class ExecutorIndexCache {
     private final long bytes;
     private final ReentrantLock searchLock = new ReentrantLock();
     private int uses;
+    // Updated under mapLock; also observed by the search/eviction guards.
+    private volatile int leases;
     // a PIN_ALL entry: the working set fits, so it is never evicted to make room
     private boolean pinned;
     // a 2Q entry: asked for twice, so it outranks an entry seen once
@@ -411,9 +417,9 @@ final class ExecutorIndexCache {
       }
     }
 
-    /** Whether a search is running against this file, which makes it unsafe to unload. */
+    /** Whether a query lease or an active search prevents this file from being released. */
     boolean inUse() {
-      if (searchLock.isHeldByCurrentThread()) {
+      if (leases > 0 || searchLock.isHeldByCurrentThread()) {
         return true;
       }
 
@@ -542,8 +548,17 @@ final class ExecutorIndexCache {
         }
       };
   private final Object mapLock = new Object();
-  // one monitor per location, so two tasks asking for the same file prepare it once
-  private final ConcurrentHashMap<String, Object> loading = new ConcurrentHashMap<>();
+  private final IndexCacheOwnership ownership = new IndexCacheOwnership();
+  private final Set<String> pendingReleases = new LinkedHashSet<>();
+  private long generation;
+  // Registered waiters keep the same monitor alive until every caller has left.
+  private final ConcurrentHashMap<String, LoadMonitor> loading = new ConcurrentHashMap<>();
+
+  private static final class LoadMonitor {
+    private int callers;
+  }
+
+  private record ManagedLoad(String indexUuid, long epoch, String cacheKey, long generation) {}
 
   private final AtomicLong hits = new AtomicLong();
   private final AtomicLong misses = new AtomicLong();
@@ -596,13 +611,22 @@ final class ExecutorIndexCache {
     }
 
     String cacheKey = config.owner() + "|" + key + "|" + location;
+    boolean managed;
+    synchronized (mapLock) {
+      managed = ownership.isManagedKey(cacheKey);
+    }
+    // This legacy API has no index epoch or lease; managed queries must use acquireManaged.
+    if (managed) {
+      return loader.load();
+    }
+
     sweepIfDue(config);
     CachedFile hit = lookup(cacheKey);
     if (hit != null) {
       return hit;
     }
 
-    Object monitor = loading.computeIfAbsent(cacheKey, ignored -> new Object());
+    LoadMonitor monitor = loadingMonitor(cacheKey);
     synchronized (monitor) {
       try {
         hit = lookup(cacheKey);
@@ -635,7 +659,188 @@ final class ExecutorIndexCache {
           releaseReservation(reservation);
         }
       } finally {
-        loading.remove(cacheKey, monitor);
+        releaseLoadingMonitor(cacheKey, monitor);
+      }
+    }
+  }
+
+  /** Applies a controller-supplied, table-qualified index identity and target atomically. */
+  void applyTarget(String indexUuid, long epoch, Set<String> cacheKeys) {
+    synchronized (mapLock) {
+      Set<String> previous = ownership.keys(indexUuid);
+      ownership.applyTarget(indexUuid, epoch, cacheKeys);
+      for (String key : previous) {
+        releaseIfUnowned(key);
+      }
+      mapLock.notifyAll();
+    }
+  }
+
+  /** Returns only a retained current-epoch entry; rejection never constitutes a load ACK. */
+  CachedFile installManaged(
+      String indexUuid, long epoch, String cacheKey, Config config, Loader loader) {
+    if (!config.enabled()) {
+      return null;
+    }
+
+    ManagedLoad load;
+    synchronized (mapLock) {
+      load = new ManagedLoad(indexUuid, epoch, cacheKey, generation);
+      if (!current(load)) {
+        return null;
+      }
+    }
+
+    LoadMonitor monitor = loadingMonitor(cacheKey);
+    synchronized (monitor) {
+      try {
+        synchronized (mapLock) {
+          if (!current(load)) {
+            return null;
+          }
+          CachedFile existing = find(cacheKey);
+          if (existing != null) {
+            pendingReleases.remove(cacheKey);
+            return existing;
+          }
+        }
+        Reservation reservation = reserve(config, load);
+        if (reservation == null) {
+          return null;
+        }
+        try {
+          CachedFile loaded = loader.load();
+          loads.incrementAndGet();
+          if (loaded.bytes() > config.maxEntryBytes()) {
+            skippedTooLarge.incrementAndGet();
+            return null;
+          }
+          CachedFile retained = put(cacheKey, loaded, config, reservation, load);
+          synchronized (mapLock) {
+            return current(load) && find(cacheKey) == retained ? retained : null;
+          }
+        } finally {
+          releaseReservation(reservation);
+        }
+      } finally {
+        releaseLoadingMonitor(cacheKey, monitor);
+      }
+    }
+  }
+
+  Lease acquireManaged(String indexUuid, long epoch, String cacheKey) {
+    synchronized (mapLock) {
+      if (!ownership.mayAdmit(indexUuid, epoch, cacheKey)) {
+        return null;
+      }
+      CachedFile file = lookup(cacheKey);
+      if (file == null) {
+        return null;
+      }
+      file.leases = Math.incrementExact(file.leases);
+      return new Lease(cacheKey, file);
+    }
+  }
+
+  void releaseIndex(String indexUuid, long epoch) {
+    synchronized (mapLock) {
+      Set<String> keys = ownership.keys(indexUuid);
+      ownership.offload(indexUuid, epoch);
+      ownership.release(indexUuid, epoch);
+      for (String key : keys) {
+        releaseIfUnowned(key);
+      }
+      mapLock.notifyAll();
+    }
+  }
+
+  final class Lease implements AutoCloseable {
+    private final String cacheKey;
+    private CachedFile file;
+    private boolean closed;
+
+    private Lease(String cacheKey, CachedFile file) {
+      this.cacheKey = cacheKey;
+      this.file = file;
+    }
+
+    CachedFile file() {
+      synchronized (mapLock) {
+        Preconditions.checkState(!closed, "Index file lease is closed");
+        return file;
+      }
+    }
+
+    @Override
+    public void close() {
+      synchronized (mapLock) {
+        if (!closed) {
+          closed = true;
+          CachedFile released = file;
+          this.file = null;
+          released.leases -= 1;
+          if (pendingReleases.contains(cacheKey)) {
+            releaseIfUnowned(cacheKey);
+          }
+          mapLock.notifyAll();
+        }
+      }
+    }
+  }
+
+  private LoadMonitor loadingMonitor(String cacheKey) {
+    return loading.compute(
+        cacheKey,
+        (ignored, existing) -> {
+          LoadMonitor monitor = existing == null ? new LoadMonitor() : existing;
+          monitor.callers = Math.incrementExact(monitor.callers);
+          return monitor;
+        });
+  }
+
+  private void releaseLoadingMonitor(String cacheKey, LoadMonitor monitor) {
+    loading.computeIfPresent(
+        cacheKey,
+        (ignored, existing) -> {
+          Preconditions.checkState(
+              existing == monitor, "Index loading monitor changed: %s", cacheKey);
+          existing.callers -= 1;
+          return existing.callers == 0 ? null : existing;
+        });
+  }
+
+  private boolean current(ManagedLoad load) {
+    return generation == load.generation()
+        && ownership.mayAdmit(load.indexUuid(), load.epoch(), load.cacheKey());
+  }
+
+  private CachedFile find(String cacheKey) {
+    CachedFile file = protectedFiles.get(cacheKey);
+    return file == null ? probation.get(cacheKey) : file;
+  }
+
+  private void releaseIfUnowned(String cacheKey) {
+    if (ownership.isOwned(cacheKey)) {
+      pendingReleases.remove(cacheKey);
+      return;
+    }
+    CachedFile file = find(cacheKey);
+    if (file == null) {
+      pendingReleases.remove(cacheKey);
+    } else if (file.inUse()) {
+      pendingReleases.add(cacheKey);
+    } else {
+      protectedFiles.remove(cacheKey);
+      probation.remove(cacheKey);
+      pendingReleases.remove(cacheKey);
+      release(file);
+    }
+  }
+
+  private void drainPendingReleases() {
+    if (!pendingReleases.isEmpty()) {
+      for (String key : new ArrayList<>(pendingReleases)) {
+        releaseIfUnowned(key);
       }
     }
   }
@@ -673,7 +878,19 @@ final class ExecutorIndexCache {
   }
 
   private CachedFile put(String cacheKey, CachedFile file, Config config, Reservation reservation) {
+    return put(cacheKey, file, config, reservation, null);
+  }
+
+  private CachedFile put(
+      String cacheKey, CachedFile file, Config config, Reservation reservation, ManagedLoad load) {
     synchronized (mapLock) {
+      if (load == null ? ownership.isManagedKey(cacheKey) : !current(load)) {
+        return file;
+      }
+      CachedFile existing = find(cacheKey);
+      if (existing != null) {
+        return existing;
+      }
       long capacity = budget(config.maxBytes());
       // Reclaim any extra room before admitting the measured entry. Other loads keep their
       // promises.
@@ -686,14 +903,6 @@ final class ExecutorIndexCache {
       }
 
       releaseReservation(reservation);
-      CachedFile previous = protectedFiles.remove(cacheKey);
-      if (previous == null) {
-        previous = probation.remove(cacheKey);
-      }
-
-      if (previous != null) {
-        release(previous);
-      }
 
       // the loader does not know which table it is loading for, so the entry is stamped here
       file = file.withOwner(config.owner());
@@ -797,7 +1006,7 @@ final class ExecutorIndexCache {
       Map<String, CachedFile> segment, String owner, boolean skipPinned) {
     for (Map.Entry<String, CachedFile> entry : segment.entrySet()) {
       CachedFile file = entry.getValue();
-      if (skipPinned && file.pinned) {
+      if (ownership.isOwned(entry.getKey()) || (skipPinned && file.pinned)) {
         continue;
       }
 
@@ -818,9 +1027,17 @@ final class ExecutorIndexCache {
    * loaders or uncached searches.
    */
   private Reservation reserve(Config config) {
+    return reserve(config, null);
+  }
+
+  private Reservation reserve(Config config, ManagedLoad load) {
     synchronized (mapLock) {
       long requested = Math.min(config.maxEntryBytes(), config.maxBytes());
       while (true) {
+        if (load != null && !current(load)) {
+          return null;
+        }
+        drainPendingReleases();
         long capacity = budget(config.maxBytes());
         long spare = Math.max(0L, capacity - bytes - reservedBytes);
         if (spare >= requested || reservations.isEmpty()) {
@@ -874,7 +1091,7 @@ final class ExecutorIndexCache {
       Map<String, CachedFile> segment, boolean skipPinned) {
     for (Map.Entry<String, CachedFile> entry : segment.entrySet()) {
       CachedFile file = entry.getValue();
-      if (skipPinned && file.pinned) {
+      if (ownership.isOwned(entry.getKey()) || (skipPinned && file.pinned)) {
         continue;
       }
 
@@ -913,7 +1130,9 @@ final class ExecutorIndexCache {
     while (entries.hasNext()) {
       Map.Entry<String, CachedFile> entry = entries.next();
       CachedFile file = entry.getValue();
-      if (file.lastAccessNanos > deadlineNanos || file.inUse()) {
+      if (ownership.isOwned(entry.getKey())
+          || file.lastAccessNanos > deadlineNanos
+          || file.inUse()) {
         continue;
       }
 
@@ -927,6 +1146,7 @@ final class ExecutorIndexCache {
 
   Stats stats() {
     synchronized (mapLock) {
+      drainPendingReleases();
       return new Stats(
           hits.get(),
           misses.get(),
@@ -966,15 +1186,17 @@ final class ExecutorIndexCache {
         System.currentTimeMillis());
   }
 
-  /** Forgets every entry and every counter, so a test starts from a known executor. */
+  /** Resets the cache for tests, deferring release of entries that are still in use. */
   void clear() {
     synchronized (mapLock) {
-      probation.clear();
-      protectedFiles.clear();
+      generation = Math.incrementExact(generation);
+      ownership.clear();
+      Set<String> keys = new LinkedHashSet<>(probation.keySet());
+      keys.addAll(protectedFiles.keySet());
+      for (String key : keys) {
+        releaseIfUnowned(key);
+      }
       asked.clear();
-      bytesByOwner.clear();
-      entriesByOwner.clear();
-      bytes = 0;
       hits.set(0);
       misses.set(0);
       loads.set(0);
