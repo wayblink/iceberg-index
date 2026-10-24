@@ -32,10 +32,13 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicReference;
 import org.apache.iceberg.index.IndexAdapter;
 import org.apache.iceberg.index.IndexSearchResult;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 
 class TestExecutorIndexCacheReservations {
   private static final IndexAdapter.PreparedSearch EMPTY = (query, topK) -> List.of();
@@ -320,6 +323,163 @@ class TestExecutorIndexCacheReservations {
     ownerEntries.setAccessible(true);
     assertThat((Map<?, ?>) ownerBytes.get(cache)).isEmpty();
     assertThat((Map<?, ?>) ownerEntries.get(cache)).isEmpty();
+  }
+
+  @ParameterizedTest
+  @ValueSource(booleans = {false, true})
+  void releasedResidentRoomWakesReservationWaiter(boolean clear) throws Exception {
+    ExecutorIndexCache.Config config = ExecutorIndexCache.Config.of(true, 140, 40);
+    ExecutorIndexCache.CachedFile resident =
+        cache.file(
+            "resident",
+            config,
+            "adapter",
+            () -> ExecutorIndexCache.loaded(new byte[40], EMPTY, 40));
+    cache.file(
+        "fresh", config, "adapter", () -> ExecutorIndexCache.loaded(new byte[40], EMPTY, 40));
+    ExecutorService pool = Executors.newFixedThreadPool(2);
+    CountDownLatch firstStarted = new CountDownLatch(1);
+    CountDownLatch finishFirst = new CountDownLatch(1);
+    CountDownLatch secondStarted = new CountDownLatch(1);
+    AtomicReference<Thread> waiter = new AtomicReference<>();
+    Future<?> first = null;
+    Future<?> second = null;
+    try {
+      first =
+          pool.submit(
+              () ->
+                  cache.file(
+                      "in-flight",
+                      config,
+                      "adapter",
+                      () -> {
+                        firstStarted.countDown();
+                        await(finishFirst);
+                        return ExecutorIndexCache.loaded(new byte[40], EMPTY, 40);
+                      }));
+      assertThat(firstStarted.await(10, TimeUnit.SECONDS)).isTrue();
+      second =
+          pool.submit(
+              () -> {
+                waiter.set(Thread.currentThread());
+                return cache.file(
+                    "waiting",
+                    config,
+                    "adapter",
+                    () -> {
+                      secondStarted.countDown();
+                      return ExecutorIndexCache.loaded(new byte[40], EMPTY, 40);
+                    });
+              });
+      long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+      while ((waiter.get() == null || waiter.get().getState() != Thread.State.WAITING)
+          && System.nanoTime() < deadline) {
+        Thread.yield();
+      }
+      assertThat(waiter.get().getState()).isEqualTo(Thread.State.WAITING);
+      assertThat(reserved()).isEqualTo(40);
+      if (clear) {
+        cache.clear();
+      } else {
+        Field lastAccess = resident.getClass().getDeclaredField("lastAccessNanos");
+        lastAccess.setAccessible(true);
+        lastAccess.setLong(resident, System.nanoTime() - TimeUnit.MINUTES.toNanos(31));
+        ExecutorIndexCache.sweepIntervalForTests(0);
+        cache.file(
+            "fresh",
+            config,
+            "adapter",
+            () -> {
+              throw new AssertionError("Fresh entry must remain a cache hit");
+            });
+      }
+      assertThat(cache.residentKeys()).doesNotContain("|adapter|resident");
+      assertThat(secondStarted.await(2, TimeUnit.SECONDS))
+          .as("60 bytes are now free, enough to grant the waiting 40-byte request")
+          .isTrue();
+      second.get(10, TimeUnit.SECONDS);
+      assertThat(reserved()).as("The unfinished first load still owns its token").isEqualTo(40);
+      assertThat(cache.stats().bytes() + reserved()).isLessThanOrEqualTo(140);
+    } finally {
+      ExecutorIndexCache.sweepIntervalForTests(TimeUnit.SECONDS.toNanos(30));
+      finishFirst.countDown();
+      try {
+        if (first != null) {
+          first.get(10, TimeUnit.SECONDS);
+        }
+        if (second != null) {
+          second.get(10, TimeUnit.SECONDS);
+        }
+      } finally {
+        pool.shutdownNow();
+        assertThat(pool.awaitTermination(10, TimeUnit.SECONDS)).isTrue();
+      }
+    }
+  }
+
+  @Test
+  void interruptedWaitKeepsOtherToken() throws Exception {
+    ExecutorIndexCache.Config config = ExecutorIndexCache.Config.of(true, 100, 100);
+    ExecutorService pool = Executors.newFixedThreadPool(2);
+    CountDownLatch firstStarted = new CountDownLatch(1);
+    CountDownLatch finishFirst = new CountDownLatch(1);
+    AtomicReference<Thread> waiter = new AtomicReference<>();
+    Future<?> first = null;
+    try {
+      first =
+          pool.submit(
+              () ->
+                  cache.file(
+                      "held",
+                      config,
+                      "adapter",
+                      () -> {
+                        firstStarted.countDown();
+                        await(finishFirst);
+                        return ExecutorIndexCache.loaded(new byte[40], EMPTY, 40);
+                      }));
+      assertThat(firstStarted.await(10, TimeUnit.SECONDS)).isTrue();
+      Future<?> second =
+          pool.submit(
+              () -> {
+                waiter.set(Thread.currentThread());
+                assertThatThrownBy(
+                        () ->
+                            cache.file(
+                                "interrupted",
+                                config,
+                                "adapter",
+                                () -> {
+                                  throw new AssertionError(
+                                      "Interrupted waiter must not start its loader");
+                                }))
+                    .isInstanceOf(IllegalStateException.class)
+                    .hasMessage("Interrupted while reserving index cache room");
+                assertThat(Thread.currentThread().isInterrupted()).isTrue();
+              });
+      long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+      while ((waiter.get() == null || waiter.get().getState() != Thread.State.WAITING)
+          && System.nanoTime() < deadline) {
+        Thread.yield();
+      }
+      assertThat(waiter.get().getState()).isEqualTo(Thread.State.WAITING);
+      waiter.get().interrupt();
+      second.get(10, TimeUnit.SECONDS);
+      assertThat(reserved()).isEqualTo(100);
+      finishFirst.countDown();
+      first.get(10, TimeUnit.SECONDS);
+      assertThat(reserved()).isZero();
+    } finally {
+      finishFirst.countDown();
+      try {
+        if (first != null) {
+          first.get(10, TimeUnit.SECONDS);
+        }
+      } finally {
+        pool.shutdownNow();
+        assertThat(pool.awaitTermination(10, TimeUnit.SECONDS)).isTrue();
+      }
+    }
   }
 
   private void askTwice(String key, ExecutorIndexCache.Config config, int bytes) {

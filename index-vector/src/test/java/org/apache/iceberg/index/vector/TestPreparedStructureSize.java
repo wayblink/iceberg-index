@@ -24,6 +24,7 @@ import com.github.jelmerk.knn.hnsw.HnswIndex;
 import java.io.ByteArrayOutputStream;
 import java.io.DataOutputStream;
 import java.lang.reflect.Field;
+import java.lang.reflect.Modifier;
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
 import java.util.IdentityHashMap;
@@ -39,6 +40,8 @@ import org.apache.iceberg.relocated.com.google.common.collect.ImmutableMap;
 import org.apache.iceberg.relocated.com.google.common.collect.Lists;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 
 /**
  * Pins the size a prepared structure reports.
@@ -284,6 +287,58 @@ class TestPreparedStructureSize {
     assertThat(longPath - shortPath)
         .as("one dictionary String, not 1000 copies")
         .isBetween(1000L, 1040L);
+  }
+
+  @ParameterizedTest
+  @ValueSource(ints = {0, 1})
+  void sparseQuantizedIvfCoversAllRetainedPayloadArrays(int count) throws Exception {
+    VectorIndexAdapter quantized =
+        sizedAdapter(
+            VectorStructure.IVF, VectorQuantizer.RABITQ, 1024, Map.of("nlist", "1", "nprobe", "1"));
+    IndexAdapter.PreparedSearch prepared = prepare(quantized, count, 1024, i -> "a");
+    long lowerBound = retainedPayloadArrays(prepared, new IdentityHashMap<>());
+    assertThat(prepared.estimatedBytes())
+        .as("All reachable payload arrays, including any retained kernel state")
+        .isGreaterThanOrEqualTo(lowerBound);
+  }
+
+  private static long retainedPayloadArrays(Object instance, Map<Object, Boolean> seen)
+      throws Exception {
+    if (instance == null || seen.put(instance, true) != null) {
+      return 0;
+    }
+    if (instance instanceof float[]) {
+      return retainedArrayBytes(((float[]) instance).length * 4L);
+    }
+    if (instance instanceof byte[]) {
+      return retainedArrayBytes(((byte[]) instance).length);
+    }
+    if (instance instanceof Object[]) {
+      Object[] values = (Object[]) instance;
+      long bytes = retainedArrayBytes(values.length * 4L);
+      for (Object value : values) {
+        bytes += retainedPayloadArrays(value, seen);
+      }
+      return bytes;
+    }
+    if (instance instanceof Iterable<?>) {
+      long bytes = 0;
+      for (Object value : (Iterable<?>) instance) {
+        bytes += retainedPayloadArrays(value, seen);
+      }
+      return bytes;
+    }
+    if (!instance.getClass().getPackageName().equals("org.apache.iceberg.index.vector")) {
+      return 0;
+    }
+    long bytes = 0;
+    for (Field field : instance.getClass().getDeclaredFields()) {
+      if (!Modifier.isStatic(field.getModifiers()) && !field.getType().isPrimitive()) {
+        field.setAccessible(true);
+        bytes += retainedPayloadArrays(field.get(instance), seen);
+      }
+    }
+    return bytes;
   }
 
   private static Object field(Object instance, String name) throws Exception {

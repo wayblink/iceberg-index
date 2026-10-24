@@ -230,7 +230,8 @@ public final class IvfKernel implements VectorKernel {
   @Override
   public PreparedSearch prepare(ByteBuffer payload) {
     Loaded loaded = load(VectorPayloads.toBytes(payload));
-    return new ListSearcher(loaded);
+    return new ListSearcher(
+        loaded, dimension, options.nprobe(), scoring.metric(), preparedBytes(loaded));
   }
 
   /**
@@ -244,7 +245,9 @@ public final class IvfKernel implements VectorKernel {
   private long preparedBytes(Loaded loaded) {
     long total =
         PreparedStructureSize.object(4L * PreparedStructureSize.REFERENCE_BYTES)
-            + PreparedStructureSize.object(2L * PreparedStructureSize.REFERENCE_BYTES + Long.BYTES)
+            + PreparedStructureSize.object(
+                2L * PreparedStructureSize.REFERENCE_BYTES + 2L * Integer.BYTES + Long.BYTES)
+            + PreparedStructureSize.object(PreparedStructureSize.REFERENCE_BYTES)
             + PreparedStructureSize.references(loaded.centroids.length)
             + PreparedStructureSize.nestedList(loaded.lists.size(), 0);
     for (float[] centroid : loaded.centroids) {
@@ -301,13 +304,20 @@ public final class IvfKernel implements VectorKernel {
   }
 
   /** A prepared search over the decoded lists, which reports what it holds. */
-  private final class ListSearcher implements PreparedSearch {
+  private static final class ListSearcher implements PreparedSearch {
     private final Loaded loaded;
+    private final int dimension;
+    private final int nprobe;
+    private final VectorScoring scoring;
     private final long bytes;
 
-    private ListSearcher(Loaded loaded) {
+    private ListSearcher(
+        Loaded loaded, int dimension, int nprobe, VectorIndexDefinition.Metric metric, long bytes) {
       this.loaded = loaded;
-      this.bytes = preparedBytes(loaded);
+      this.dimension = dimension;
+      this.nprobe = nprobe;
+      this.scoring = new VectorScoring(metric);
+      this.bytes = bytes;
     }
 
     @Override
@@ -325,11 +335,11 @@ public final class IvfKernel implements VectorKernel {
       float[] queryVector =
           VectorPayloads.decodeVector(VectorPayloads.toBytes(query), dimension, "Query");
       // the partitions worth visiting, chosen by the same measure the vectors were partitioned by
-      int visited = Math.min(options.nprobe(), loaded.centroids.length);
+      int visited = Math.min(nprobe, loaded.centroids.length);
       List<IndexSearchResult> results = Lists.newArrayList();
-      for (int list : nearestCentroids(queryVector, loaded.centroids, visited)) {
-        if (isQuantized()) {
-          scoreQuantizedList(queryVector, loaded, list, results);
+      for (int list : nearestCentroids(queryVector, loaded.centroids, visited, scoring)) {
+        if (loaded.listQuantizers != null) {
+          scoreQuantizedList(queryVector, loaded, list, results, scoring);
         } else {
           for (IvfEntry entry : loaded.lists.get(list)) {
             results.add(
@@ -477,8 +487,13 @@ public final class IvfKernel implements VectorKernel {
    * between the vectors themselves. The code is a candidate generator: it orders a wide set well
    * and the top of it badly, so what it returns is meant to be re-scored exactly.
    */
-  private void scoreQuantizedList(
-      float[] queryVector, Loaded loaded, int list, List<IndexSearchResult> results) {
+  private static void scoreQuantizedList(
+      float[] queryVector,
+      Loaded loaded,
+      int list,
+      List<IndexSearchResult> results,
+      VectorScoring scoring) {
+    int dimension = queryVector.length;
     RaBitQQuantizer listQuantizer = loaded.listQuantizers[list];
     float[] rotatedQuery = listQuantizer.rotateQuery(queryVector);
     double queryLengthSquared = 0.0;
@@ -527,7 +542,8 @@ public final class IvfKernel implements VectorKernel {
   }
 
   /** The indexes of the {@code count} centroids closest to the query, best first. */
-  private int[] nearestCentroids(float[] query, float[][] centroids, int count) {
+  private static int[] nearestCentroids(
+      float[] query, float[][] centroids, int count, VectorScoring scoring) {
     double[] scores = new double[centroids.length];
     Integer[] order = new Integer[centroids.length];
     for (int list = 0; list < centroids.length; list++) {

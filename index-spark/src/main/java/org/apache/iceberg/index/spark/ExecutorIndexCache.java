@@ -867,6 +867,7 @@ final class ExecutorIndexCache {
     bytesByOwner.computeIfPresent(
         file.owner(), (owner, held) -> held - file.bytes() <= 0 ? null : held - file.bytes());
     entriesByOwner.computeIfPresent(file.owner(), (owner, held) -> held <= 1 ? null : held - 1);
+    mapLock.notifyAll();
   }
 
   private Map.Entry<String, CachedFile> oldestEvictable(
@@ -980,6 +981,7 @@ final class ExecutorIndexCache {
       evictions.set(0);
       skippedTooLarge.set(0);
       lastSweepNanos = System.nanoTime();
+      mapLock.notifyAll();
     }
   }
 
