@@ -23,8 +23,11 @@ import java.io.DataOutputStream;
 import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.util.Arrays;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
+import java.util.TreeSet;
 import org.apache.iceberg.io.InputFile;
 import org.apache.iceberg.io.OutputFile;
 import org.apache.iceberg.io.PositionOutputStream;
@@ -49,7 +52,9 @@ import org.apache.iceberg.relocated.com.google.common.collect.Sets;
 public final class IndexManifest {
 
   /** Format version of this encoding. */
-  public static final int FORMAT_VERSION = 1;
+  public static final int FORMAT_VERSION = 2;
+
+  private static final int LEGACY_FORMAT_VERSION = 1;
 
   private static final byte[] MAGIC = new byte[] {'I', 'C', 'E', 'I', 'M', 'N', '1', 0};
 
@@ -62,6 +67,13 @@ public final class IndexManifest {
   public static void write(OutputFile outputFile, List<IndexFile> indexFiles) throws IOException {
     Preconditions.checkNotNull(outputFile, "Output file is null");
     Preconditions.checkNotNull(indexFiles, "Index files are null");
+    for (IndexFile indexFile : indexFiles) {
+      Preconditions.checkArgument(
+          indexFile.memory() == null || indexFile.memory().fileBytes() != null,
+          "Index file bytes are not set: %s",
+          indexFile.location());
+    }
+
     try (PositionOutputStream raw = outputFile.create();
         DataOutputStream out = new DataOutputStream(raw)) {
       out.write(MAGIC);
@@ -77,6 +89,8 @@ public final class IndexManifest {
         for (String dataFile : coveredDataFiles) {
           out.writeUTF(dataFile);
         }
+
+        writeMemory(out, indexFile.memory());
       }
     }
   }
@@ -90,7 +104,9 @@ public final class IndexManifest {
       Preconditions.checkArgument(Arrays.equals(MAGIC, magic), "Invalid index manifest magic");
       int version = in.readInt();
       Preconditions.checkArgument(
-          version == FORMAT_VERSION, "Unsupported index manifest format version: %s", version);
+          version == LEGACY_FORMAT_VERSION || version == FORMAT_VERSION,
+          "Unsupported index manifest format version: %s",
+          version);
       int indexFileCount = in.readInt();
       Preconditions.checkArgument(
           indexFileCount >= 0, "Invalid index file count: %s", indexFileCount);
@@ -114,12 +130,59 @@ public final class IndexManifest {
                 .blobType(blobType)
                 .entryCount(entryCount)
                 .coveredDataFiles(coveredDataFiles)
+                .memory(version == LEGACY_FORMAT_VERSION ? null : readMemory(in))
                 .build());
       }
       return new IndexManifest(indexFiles);
     } catch (IOException e) {
       throw new UncheckedIOException("Failed to read index manifest", e);
     }
+  }
+
+  private static void writeMemory(DataOutputStream out, IndexFileMemory memory) throws IOException {
+    out.writeBoolean(memory != null);
+    if (memory == null) {
+      return;
+    }
+
+    out.writeLong(memory.fileBytes());
+    out.writeLong(memory.payloadBytes());
+    out.writeLong(memory.preparedBytes());
+    out.writeInt(memory.modelVersion());
+    out.writeUTF(memory.readerId());
+    out.writeUTF(memory.runtimeProfile());
+    out.writeInt(memory.structure().size());
+    for (String key : new TreeSet<>(memory.structure().keySet())) {
+      out.writeUTF(key);
+      out.writeLong(memory.structure().get(key));
+    }
+  }
+
+  private static IndexFileMemory readMemory(DataInputStream in) throws IOException {
+    if (!in.readBoolean()) {
+      return null;
+    }
+
+    IndexFileMemory.Builder builder =
+        IndexFileMemory.builder()
+            .fileBytes(in.readLong())
+            .payloadBytes(in.readLong())
+            .preparedBytes(in.readLong())
+            .modelVersion(in.readInt())
+            .readerId(in.readUTF())
+            .runtimeProfile(in.readUTF());
+    int structureCount = in.readInt();
+    Preconditions.checkArgument(
+        structureCount >= 0, "Invalid index memory structure count: %s", structureCount);
+    Map<String, Long> structure = new HashMap<>();
+    for (int i = 0; i < structureCount; i++) {
+      String key = in.readUTF();
+      Preconditions.checkArgument(
+          !structure.containsKey(key), "Duplicate index memory structure key: %s", key);
+      structure.put(key, in.readLong());
+    }
+
+    return builder.structure(structure).build();
   }
 
   /** Returns the index files listed by this manifest. */

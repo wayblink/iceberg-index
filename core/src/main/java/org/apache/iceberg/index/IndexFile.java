@@ -19,6 +19,8 @@
 package org.apache.iceberg.index;
 
 import java.util.List;
+import java.util.Objects;
+import javax.annotation.Nullable;
 import org.apache.iceberg.relocated.com.google.common.base.MoreObjects;
 import org.apache.iceberg.relocated.com.google.common.base.Preconditions;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableList;
@@ -48,9 +50,15 @@ public final class IndexFile {
   private final String blobType;
   private final long entryCount;
   private final List<String> coveredDataFiles;
+  private final IndexFileMemory memory;
 
   private IndexFile(
-      String location, Kind kind, String blobType, long entryCount, List<String> coveredDataFiles) {
+      String location,
+      Kind kind,
+      String blobType,
+      long entryCount,
+      List<String> coveredDataFiles,
+      IndexFileMemory memory) {
     Preconditions.checkArgument(
         location != null && !location.isEmpty(), "Index file location is empty");
     Preconditions.checkNotNull(kind, "Index file kind is null");
@@ -67,6 +75,7 @@ public final class IndexFile {
     this.blobType = blobType;
     this.entryCount = entryCount;
     this.coveredDataFiles = ImmutableList.copyOf(coveredDataFiles);
+    this.memory = memory;
   }
 
   public static Builder builder() {
@@ -94,6 +103,12 @@ public final class IndexFile {
     return coveredDataFiles;
   }
 
+  /** Returns the file's memory estimate, or null when it is unknown. */
+  @Nullable
+  public IndexFileMemory memory() {
+    return memory;
+  }
+
   @Override
   public boolean equals(Object other) {
     if (this == other) {
@@ -107,7 +122,8 @@ public final class IndexFile {
         && location.equals(that.location)
         && kind == that.kind
         && blobType.equals(that.blobType)
-        && coveredDataFiles.equals(that.coveredDataFiles);
+        && coveredDataFiles.equals(that.coveredDataFiles)
+        && Objects.equals(memory, that.memory);
   }
 
   @Override
@@ -117,6 +133,7 @@ public final class IndexFile {
     result = 31 * result + blobType.hashCode();
     result = 31 * result + Long.hashCode(entryCount);
     result = 31 * result + coveredDataFiles.hashCode();
+    result = 31 * result + Objects.hashCode(memory);
     return result;
   }
 
@@ -128,6 +145,7 @@ public final class IndexFile {
         .add("blobType", blobType)
         .add("entryCount", entryCount)
         .add("coveredDataFiles", coveredDataFiles)
+        .add("memory", memory)
         .toString();
   }
 
@@ -137,6 +155,7 @@ public final class IndexFile {
     private String blobType;
     private Long entryCount;
     private final ImmutableList.Builder<String> coveredDataFiles = ImmutableList.builder();
+    private IndexFileMemory memory;
 
     private Builder() {}
 
@@ -170,12 +189,17 @@ public final class IndexFile {
       return this;
     }
 
+    public Builder memory(@Nullable IndexFileMemory newMemory) {
+      this.memory = newMemory;
+      return this;
+    }
+
     public IndexFile build() {
       Preconditions.checkNotNull(location, "Index file location is not set");
       Preconditions.checkNotNull(kind, "Index file kind is not set");
       Preconditions.checkNotNull(blobType, "Index file blob type is not set");
       Preconditions.checkNotNull(entryCount, "Index file entry count is not set");
-      return new IndexFile(location, kind, blobType, entryCount, coveredDataFiles.build());
+      return new IndexFile(location, kind, blobType, entryCount, coveredDataFiles.build(), memory);
     }
   }
 }
