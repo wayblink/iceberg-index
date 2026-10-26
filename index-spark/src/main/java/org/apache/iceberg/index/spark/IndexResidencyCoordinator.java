@@ -407,6 +407,40 @@ final class IndexResidencyCoordinator {
     return plan.planId;
   }
 
+  /**
+   * Records that a query used this index. The driver sees every search of the application, so this
+   * is the access record the index LRU orders by; a status read never calls it.
+   */
+  void recordAccess(String indexUuid, long nowNanos) {
+    IndexState index = indexes.get(indexUuid);
+    if (index == null) {
+      // An index nobody loaded is not worth remembering: there is nothing to evict.
+      return;
+    }
+
+    index.accessed(0, nowNanos);
+  }
+
+  /** Executor reports as last received, for the status procedure. */
+  Map<String, IndexCacheProtocol.NodeReport> nodeReports() {
+    Map<String, IndexCacheProtocol.NodeReport> reports = new LinkedHashMap<>();
+    for (Map.Entry<String, NodeState> entry : nodes.entrySet()) {
+      reports.put(entry.getKey(), entry.getValue().report);
+    }
+
+    return reports;
+  }
+
+  /** How old each executor report is, so a caller can tell a live report from a stale one. */
+  Map<String, Long> nodeReportAgeNanos(long nowNanos) {
+    Map<String, Long> ages = new LinkedHashMap<>();
+    for (Map.Entry<String, NodeState> entry : nodes.entrySet()) {
+      ages.put(entry.getKey(), Math.max(0, nowNanos - entry.getValue().reportTimeNanos));
+    }
+
+    return ages;
+  }
+
   /** The protection each managed index currently has, keyed by index identity. */
   Map<String, IndexCacheProtocol.Protection> protectedIndexes() {
     Map<String, IndexCacheProtocol.Protection> protections = new LinkedHashMap<>();

@@ -865,6 +865,38 @@ class TestIndexResidencyCoordinator {
   }
 
   @Test
+  void aRecordedQueryAccessMakesTheIndexTheMostRecentlyUsed() {
+    coordinator.report(node("a", "a-1", 1, 100, 0));
+    String old =
+        coordinator.acceptLoad(
+            target("old", "o1", 40), IndexResidencyPolicy.parse("0"), clock.now());
+    ackFile(old, "o1", IndexCacheProtocol.AckStatus.LOADED);
+    coordinator.report(holding("a", "a-1", 2, 100, 40, "adapter|old|o1", 40));
+    clock.advance(SECOND);
+    String hot =
+        coordinator.acceptLoad(
+            target("hot", "h1", 40), IndexResidencyPolicy.parse("0"), clock.now());
+    ackFile(hot, "h1", IndexCacheProtocol.AckStatus.LOADED);
+    coordinator.report(holding("a", "a-1", 3, 100, 80, "adapter|hot|h1", 40));
+
+    // The old index is used again after the hot one was loaded.
+    clock.advance(SECOND);
+    coordinator.recordAccess("old", clock.now());
+
+    clock.advance(SECOND);
+    String plan =
+        coordinator.acceptLoad(
+            target("new", "n1", 50), IndexResidencyPolicy.parse("0"), clock.now());
+    assertThat(coordinator.result(plan).evictedIndexes()).containsExactly("hot");
+  }
+
+  @Test
+  void recordingAccessForAnUnmanagedIndexChangesNothing() {
+    coordinator.recordAccess("never-loaded", clock.now());
+    assertThat(coordinator.protectedIndexes()).isEmpty();
+  }
+
+  @Test
   void missingIncarnationAckCannotClaimCoverage() {
     coordinator.report(node("a", "a-1", 1, 100, 0));
     String plan =

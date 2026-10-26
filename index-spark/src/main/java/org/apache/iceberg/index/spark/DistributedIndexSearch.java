@@ -122,6 +122,8 @@ public final class DistributedIndexSearch {
    */
   public static SearchOutcome search(
       SparkSession spark, IndexMetadata metadata, Table table, IndexQuery query) {
+    // A search is what makes an index hot, so this is where the LRU learns about it.
+    IndexCacheControl.recordAccess(spark, metadata.indexUuid());
     IndexAdapter adapter =
         IndexTypes.fromType(metadata.indexType()).createAdapter(metadata.definition());
     if (adapter.searchesAllPayloadsTogether()) {
@@ -246,6 +248,7 @@ public final class DistributedIndexSearch {
       return ImmutableList.of();
     }
 
+    IndexCacheControl.recordAccess(spark, metadata.indexUuid());
     IndexAdapter adapter =
         IndexTypes.fromType(metadata.indexType()).createAdapter(metadata.definition());
     if (adapter.searchesAllPayloadsTogether()) {

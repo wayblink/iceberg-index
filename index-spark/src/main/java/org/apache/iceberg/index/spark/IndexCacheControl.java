@@ -51,6 +51,58 @@ public final class IndexCacheControl {
     return Result.from(control, protocol);
   }
 
+  /**
+   * Records that a query used this index, which is what the index LRU orders by. A no-op when the
+   * plugin is not enabled, so a query never fails because of residency bookkeeping.
+   */
+  public static void recordAccess(SparkSession spark, String indexUuid) {
+    IndexCacheDriverControl control =
+        IndexCacheDriverRegistry.find(spark.sparkContext().applicationId());
+    if (control != null) {
+      control.coordinator().recordAccess(indexUuid, System.nanoTime());
+    }
+  }
+
+  /**
+   * What each executor last reported about residency. {@code refresh} is accepted for symmetry with
+   * the query statistics procedure: the control channel polls on its own, so a read cannot force a
+   * new report without waiting for the next poll.
+   */
+  public static List<Status> status(SparkSession spark, boolean refresh) {
+    return statusOf(controlOf(spark), System.nanoTime());
+  }
+
+  /** Residency rows built from the last reports; no executor is contacted. */
+  static List<Status> statusOf(IndexCacheDriverControl control, long nowNanos) {
+    Map<String, Long> ages = control.coordinator().nodeReportAgeNanos(nowNanos);
+    List<String> managed = new ArrayList<>(control.coordinator().protectedIndexes().keySet());
+    managed.sort(String::compareTo);
+
+    List<Status> rows = new ArrayList<>();
+    for (IndexCacheProtocol.NodeReport report : control.coordinator().nodeReports().values()) {
+      long ageNanos = ages.getOrDefault(report.executorId(), 0L);
+      rows.add(
+          new Status(
+              report.executorId(),
+              report.session(),
+              report.incarnation(),
+              report.sequence(),
+              report.budgetBytes(),
+              report.usedBytes(),
+              report.reservedBytes(),
+              report.releasingBytes(),
+              report.holders().size(),
+              ageNanos / 1_000_000L,
+              ageNanos > STALE_AFTER_NANOS,
+              managed));
+    }
+
+    return rows;
+  }
+
+  /** A report older than this no longer describes the present. */
+  static final long STALE_AFTER_NANOS = java.time.Duration.ofSeconds(10).toNanos();
+
   /** The protection the index currently has, or an empty list when nothing is managed. */
   public static List<String> managedIndexes(SparkSession spark) {
     return new ArrayList<>(controlOf(spark).coordinator().protectedIndexes().keySet());
@@ -58,6 +110,99 @@ public final class IndexCacheControl {
 
   private static IndexCacheDriverControl controlOf(SparkSession spark) {
     return IndexCacheDriverRegistry.require(spark.sparkContext().applicationId());
+  }
+
+  /** What one executor last reported: its budget, occupancy, and the indexes the app manages. */
+  public static final class Status {
+    private final String executorId;
+    private final String session;
+    private final String incarnation;
+    private final long sequence;
+    private final long budgetBytes;
+    private final long usedBytes;
+    private final long reservedBytes;
+    private final long releasingBytes;
+    private final int holders;
+    private final long ageMillis;
+    private final boolean stale;
+    private final List<String> managedIndexes;
+
+    private Status(
+        String executorId,
+        String session,
+        String incarnation,
+        long sequence,
+        long budgetBytes,
+        long usedBytes,
+        long reservedBytes,
+        long releasingBytes,
+        int holders,
+        long ageMillis,
+        boolean stale,
+        List<String> managedIndexes) {
+      this.executorId = executorId;
+      this.session = session;
+      this.incarnation = incarnation;
+      this.sequence = sequence;
+      this.budgetBytes = budgetBytes;
+      this.usedBytes = usedBytes;
+      this.reservedBytes = reservedBytes;
+      this.releasingBytes = releasingBytes;
+      this.holders = holders;
+      this.ageMillis = ageMillis;
+      this.stale = stale;
+      this.managedIndexes = List.copyOf(managedIndexes);
+    }
+
+    public String executorId() {
+      return executorId;
+    }
+
+    public String session() {
+      return session;
+    }
+
+    public String incarnation() {
+      return incarnation;
+    }
+
+    public long sequence() {
+      return sequence;
+    }
+
+    public long budgetBytes() {
+      return budgetBytes;
+    }
+
+    public long usedBytes() {
+      return usedBytes;
+    }
+
+    public long reservedBytes() {
+      return reservedBytes;
+    }
+
+    public long releasingBytes() {
+      return releasingBytes;
+    }
+
+    /** How many files this executor reports as resident; a count, not a readiness claim. */
+    public int holders() {
+      return holders;
+    }
+
+    public long ageMillis() {
+      return ageMillis;
+    }
+
+    public boolean stale() {
+      return stale;
+    }
+
+    /** Indexes the application manages; the report does not attribute files to them. */
+    public List<String> managedIndexes() {
+      return managedIndexes;
+    }
   }
 
   /** One file of a plan: where it was sent and what happened to it. */

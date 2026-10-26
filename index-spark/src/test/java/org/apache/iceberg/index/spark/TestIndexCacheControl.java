@@ -150,6 +150,26 @@ class TestIndexCacheControl {
   }
 
   @Test
+  void statusReportsEachExecutorsOccupancyAndManagedIndexes() {
+    TestIndexFixtures.BuiltIndex built =
+        TestIndexFixtures.build(tempDir, "idx-1", "data-1.parquet");
+    IndexResidencyCoordinator coordinator = new IndexResidencyCoordinator(() -> BASE);
+    IndexCacheDriverControl control = new IndexCacheDriverControl(coordinator);
+    control.receive(node());
+    IndexCacheController.load(control, built.table(), built.metadata(), "30m", BASE);
+
+    List<IndexCacheControl.Status> status = IndexCacheControl.statusOf(control, BASE);
+
+    assertThat(status).hasSize(1);
+    IndexCacheControl.Status row = status.get(0);
+    assertThat(row.executorId()).isEqualTo("executor-1");
+    assertThat(row.incarnation()).isEqualTo("executor-1#1");
+    assertThat(row.budgetBytes()).isEqualTo(1_000_000L);
+    assertThat(row.managedIndexes()).containsExactly("idx-1");
+    assertThat(row.stale()).isFalse();
+  }
+
+  @Test
   void missingControlChannelNamesThePlugin() {
     assertThatThrownBy(() -> IndexCacheDriverRegistry.require("no-such-application"))
         .isInstanceOf(IllegalArgumentException.class)

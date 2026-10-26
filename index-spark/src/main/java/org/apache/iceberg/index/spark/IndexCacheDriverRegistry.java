@@ -44,6 +44,11 @@ final class IndexCacheDriverRegistry {
     }
   }
 
+  /** The channel of this application, or null when the plugin is not enabled. */
+  static IndexCacheDriverControl find(String applicationId) {
+    return applicationId == null ? null : CONTROLS.get(applicationId);
+  }
+
   /** The control channel of this application, or a message that says the plugin is not enabled. */
   static IndexCacheDriverControl require(String applicationId) {
     IndexCacheDriverControl control = applicationId == null ? null : CONTROLS.get(applicationId);
