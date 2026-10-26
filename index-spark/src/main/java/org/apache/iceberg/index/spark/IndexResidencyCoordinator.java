@@ -101,6 +101,7 @@ final class IndexResidencyCoordinator {
     private final String planId;
     private final String indexUuid;
     private final long epoch;
+    private long snapshotId;
     private final IndexCacheProtocol.Status terminalStatus;
     private final List<IndexCacheProtocol.File> files = new ArrayList<>();
     private final Map<String, String> rejected = new LinkedHashMap<>();
@@ -340,6 +341,7 @@ final class IndexResidencyCoordinator {
 
     PlanState plan = new PlanState("plan-" + (++planCount), target.indexUuid(), index.epoch, null);
     plan.files.addAll(target.files());
+    plan.snapshotId = target.snapshotId();
     plans.put(plan.planId, plan);
     lastPlanId = plan.planId;
     materialize(plan, target, index, previous);
@@ -403,6 +405,35 @@ final class IndexResidencyCoordinator {
     }
 
     return plan.planId;
+  }
+
+  /** The protection each managed index currently has, keyed by index identity. */
+  Map<String, IndexCacheProtocol.Protection> protectedIndexes() {
+    Map<String, IndexCacheProtocol.Protection> protections = new LinkedHashMap<>();
+    for (IndexState index : indexedStates()) {
+      if (index.protection != null) {
+        protections.put(index.indexUuid, index.protection);
+      }
+    }
+
+    return protections;
+  }
+
+  /** The executor each planned file was sent to, for the driver's own reporting. */
+  Map<String, String> placements(String planId) {
+    PlanState plan = plans.get(planId);
+    if (plan == null) {
+      return Map.of();
+    }
+
+    Map<String, String> placements = new LinkedHashMap<>();
+    for (PlanFile command : plan.commands.values()) {
+      if (command.type == IndexCacheProtocol.CommandType.LOAD) {
+        placements.putIfAbsent(command.location, command.executorId);
+      }
+    }
+
+    return placements;
   }
 
   String lastPlanId() {
@@ -1602,6 +1633,7 @@ final class IndexResidencyCoordinator {
     return IndexCacheProtocol.Result.builder()
         .planId(plan.planId)
         .indexUuid(plan.indexUuid)
+        .snapshotId(plan.snapshotId)
         .epoch(plan.epoch)
         .status(status)
         .protection(protection)
