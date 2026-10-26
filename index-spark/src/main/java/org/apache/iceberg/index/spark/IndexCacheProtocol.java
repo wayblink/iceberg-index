@@ -891,6 +891,9 @@ final class IndexCacheProtocol {
     private final List<File> files;
 
     private Plan(Builder builder) {
+      Preconditions.checkArgument(
+          builder.indexUuid != null && !builder.indexUuid.isEmpty(),
+          "Plan index identity is missing");
       this.planId = builder.planId;
       this.indexUuid = builder.indexUuid;
       this.snapshotId = builder.snapshotId;

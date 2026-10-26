@@ -93,6 +93,7 @@ final class IndexResidencyCoordinator {
     private final Map<String, String> migrationNotices = new LinkedHashMap<>();
     private final Map<String, String> migrationSources = new LinkedHashMap<>();
     private final Set<String> released = new LinkedHashSet<>();
+    private final Set<String> orphansReleased = new LinkedHashSet<>();
     private final List<String> evicted = new ArrayList<>();
     private int nextAttempt = 1;
     private boolean expired;
@@ -136,6 +137,7 @@ final class IndexResidencyCoordinator {
     private final String incarnation;
     private final long bytes;
     private final IndexCacheProtocol.CommandType type;
+    private final long epoch;
 
     private PlanFile(
         String location,
@@ -143,13 +145,15 @@ final class IndexResidencyCoordinator {
         String executorId,
         String incarnation,
         long bytes,
-        IndexCacheProtocol.CommandType type) {
+        IndexCacheProtocol.CommandType type,
+        long epoch) {
       this.location = location;
       this.cacheKey = cacheKey;
       this.executorId = executorId;
       this.incarnation = incarnation;
       this.bytes = bytes;
       this.type = type;
+      this.epoch = epoch;
     }
   }
 
@@ -158,7 +162,8 @@ final class IndexResidencyCoordinator {
     private long reportTimeNanos;
     private final List<IndexCacheProtocol.Command> queue = new ArrayList<>();
     private final List<IndexCacheProtocol.Command> issued = new ArrayList<>();
-    private final Map<String, Long> reserved = new LinkedHashMap<>();
+    private final Map<String, Long> reservedByCommand = new LinkedHashMap<>();
+    private final Map<String, String> planOfCommand = new LinkedHashMap<>();
     private final Set<String> commands = new LinkedHashSet<>();
 
     private void issued(String commandId) {
@@ -180,26 +185,41 @@ final class IndexResidencyCoordinator {
     }
 
     private long reservedBytes() {
-      return reserved.values().stream().mapToLong(Long::longValue).sum();
+      return reservedByCommand.values().stream().mapToLong(Long::longValue).sum();
     }
 
-    private void reserve(String planId, long bytes) {
-      Long current = reserved.get(planId);
-      reserved.put(planId, Math.addExact(current == null ? 0 : current, bytes));
+    private long reservedBytesFor(String planId) {
+      long total = 0;
+      for (Map.Entry<String, Long> reservation : reservedByCommand.entrySet()) {
+        if (planId.equals(planOfCommand.get(reservation.getKey()))) {
+          total = Math.addExact(total, reservation.getValue());
+        }
+      }
+
+      return total;
     }
 
-    private void settle(String planId, long bytes) {
-      Long current = reserved.get(planId);
-      if (current == null) {
-        return;
+    private Map<String, Long> reservedByPlan() {
+      Map<String, Long> byPlan = new LinkedHashMap<>();
+      for (Map.Entry<String, Long> reservation : reservedByCommand.entrySet()) {
+        String planId = planOfCommand.get(reservation.getKey());
+        if (planId != null) {
+          byPlan.merge(planId, reservation.getValue(), Long::sum);
+        }
       }
 
-      long remaining = current - bytes;
-      if (remaining > 0) {
-        reserved.put(planId, remaining);
-      } else {
-        reserved.remove(planId);
-      }
+      return byPlan;
+    }
+
+    private void reserve(String planId, String commandId, long bytes) {
+      reservedByCommand.put(commandId, bytes);
+      planOfCommand.put(commandId, planId);
+    }
+
+    /** Releases exactly the promise made by this command; other commands keep theirs. */
+    private void settle(String commandId) {
+      reservedByCommand.remove(commandId);
+      planOfCommand.remove(commandId);
     }
 
     /** Acknowledged work is delivered: it is no longer pending in the reply queue. */
@@ -387,6 +407,7 @@ final class IndexResidencyCoordinator {
         plan.terminalStatus == null
             && !plan.expired
             && !plan.fenced.contains(command.cacheKey)
+            && command.incarnation.equals(ack.incarnation())
             && index != null
             && index.epoch == plan.epoch;
 
@@ -396,7 +417,7 @@ final class IndexResidencyCoordinator {
         plan.loaded.remove(command.cacheKey);
       }
 
-      node.settle(plan.planId, command.bytes);
+      node.settle(ack.commandId());
       return;
     }
 
@@ -406,7 +427,7 @@ final class IndexResidencyCoordinator {
         releaseOrphan(plan, node, command);
       }
 
-      node.settle(plan.planId, command.bytes);
+      node.settle(ack.commandId());
       return;
     }
 
@@ -416,23 +437,25 @@ final class IndexResidencyCoordinator {
         return;
       }
 
+      // A report may already list the copy; only the part the report is missing gets charged here.
+      long delta = node.report.holders().containsKey(command.cacheKey) ? 0 : command.bytes;
       Map<String, Long> holders = new LinkedHashMap<>(node.report.holders());
       holders.put(command.cacheKey, command.bytes);
       node.report =
           node.report
               .copy()
               .holders(holders)
-              .usedBytes(Math.addExact(node.report.usedBytes(), command.bytes))
+              .usedBytes(Math.addExact(node.report.usedBytes(), delta))
               .build();
       plan.loaded.put(command.cacheKey, command);
       plan.failed.remove(command.location);
       // The reservation becomes retained bytes; keeping it would charge the copy twice.
-      node.settle(plan.planId, command.bytes);
+      node.settle(ack.commandId());
       releaseMigratedCopy(plan, command, ack.executorId());
     } else if (ack.status() == IndexCacheProtocol.AckStatus.REJECTED
         || ack.status() == IndexCacheProtocol.AckStatus.FAILED) {
       plan.failed.put(command.location, ack.reason() == null ? ack.status().name() : ack.reason());
-      node.settle(plan.planId, command.bytes);
+      node.settle(ack.commandId());
     }
   }
 
@@ -503,7 +526,11 @@ final class IndexResidencyCoordinator {
     NodeState node = nodes.get(executorId);
     return node == null || !node.report.incarnation().equals(incarnation)
         ? null
-        : node.report.copy().reservedBytes(node.reservedBytes()).build();
+        : node.report
+            .copy()
+            .reservedBytes(node.reservedBytes())
+            .reservedByPlan(node.reservedByPlan())
+            .build();
   }
 
   /** Marks nodes whose reports are older than {@link #STALE_AFTER_NANOS} as unknown. */
@@ -621,7 +648,7 @@ final class IndexResidencyCoordinator {
       // Only files carrying an index-scoped identity issued by this plan are routable.
       if (target.indexUuid() == null || !cacheKeyBelongsTo(file, target.indexUuid())) {
         plan.rejected.put(file.location(), "CACHE_KEY_NOT_OWNED");
-      } else if (index.retains(file.cacheKey()) && confirmedAnywhere(file.cacheKey())) {
+      } else if (!index.paused && confirmedAnywhere(file.cacheKey())) {
         // A shared file already has one confirmed copy in this target; no second load is needed.
         plan.reused.add(file.cacheKey());
         reusable.add(file.location());
@@ -650,7 +677,13 @@ final class IndexResidencyCoordinator {
             .io(target.io())
             .build();
     IndexCacheProtocol.Plan placement = planner.plan(pending, reportsFor(plan.planId));
-    plan.rejected.putAll(placement.rejected());
+    for (Map.Entry<String, String> rejection : placement.rejected().entrySet()) {
+      plan.rejected.put(
+          rejection.getKey(),
+          "NO_EXECUTORS".equals(rejection.getValue()) && !nodes.isEmpty()
+              ? "CACHE_DISABLED"
+              : rejection.getValue());
+    }
     for (Map.Entry<String, String> entry : placement.placements().entrySet()) {
       IndexCacheProtocol.File file = file(target, entry.getKey());
       String executorId = entry.getValue();
@@ -712,14 +745,26 @@ final class IndexResidencyCoordinator {
    */
   private void planMigrations(
       PlanState plan, IndexCacheProtocol.Target target, IndexState index, Set<String> reusable) {
+    List<IndexCacheProtocol.File> files = new ArrayList<>();
     for (String location : reusable) {
-      IndexCacheProtocol.File file = file(target, location);
+      files.add(file(target, location));
+    }
+
+    // Large files first, matching the placement order, so the same target set is chosen twice.
+    files.sort(
+        Comparator.comparing(
+                IndexCacheProtocol.File::estimatedBytes,
+                Comparator.nullsLast(Comparator.reverseOrder()))
+            .thenComparing(IndexCacheProtocol.File::location));
+    for (IndexCacheProtocol.File file : files) {
       List<Holder> holders = holdersOfKey(file.cacheKey());
       if (holders.isEmpty() || file.estimatedBytes() == null) {
         continue;
       }
 
+      holders.sort(Comparator.comparing(Holder::executorId));
       Holder current = holders.get(0);
+      String location = file.location();
       NodeState holderNode = nodes.get(current.executorId());
       if (holderNode == null || holderNode.report.budgetBytes() <= 0) {
         continue;
@@ -767,16 +812,21 @@ final class IndexResidencyCoordinator {
   }
 
   private boolean lessOccupied(NodeState left, NodeState right) {
-    return BigInteger.valueOf(left.report.usedBytes())
+    return BigInteger.valueOf(occupied(left))
             .multiply(BigInteger.valueOf(right.report.budgetBytes()))
             .compareTo(
-                BigInteger.valueOf(right.report.usedBytes())
+                BigInteger.valueOf(occupied(right))
                     .multiply(BigInteger.valueOf(left.report.budgetBytes())))
         < 0;
   }
 
+  /** Occupancy used for comparisons; the planner charges the same two fields. */
+  private long occupied(NodeState node) {
+    return Math.addExact(node.report.usedBytes(), node.reservedBytes());
+  }
+
   private boolean hasRoomForSecondCopy(NodeState node, IndexCacheProtocol.File file) {
-    long free = node.report.budgetBytes() - node.report.usedBytes() - node.reservedBytes();
+    long free = node.report.budgetBytes() - occupied(node);
     return free >= file.estimatedBytes();
   }
 
@@ -1064,9 +1114,10 @@ final class IndexResidencyCoordinator {
             node.report.executorId(),
             node.report.incarnation(),
             bytes,
-            type));
+            type,
+            epoch));
     if (type == IndexCacheProtocol.CommandType.LOAD) {
-      node.reserve(plan.planId, bytes);
+      node.reserve(plan.planId, commandId, bytes);
     }
 
     // Registration is by the queue itself, so a command cannot be marked issued before it exists.
@@ -1089,12 +1140,7 @@ final class IndexResidencyCoordinator {
   private List<IndexCacheProtocol.NodeReport> reportsFor(String planId) {
     List<IndexCacheProtocol.NodeReport> reports = new ArrayList<>();
     for (NodeState node : nodes.values()) {
-      long others = 0;
-      for (Map.Entry<String, Long> reservation : node.reserved.entrySet()) {
-        if (!reservation.getKey().equals(planId)) {
-          others = Math.addExact(others, reservation.getValue());
-        }
-      }
+      long others = Math.subtractExact(node.reservedBytes(), node.reservedBytesFor(planId));
 
       // Occupancy includes retained copies plus every other plan's unresolved promise; the
       // planner adds this plan's own placements to that baseline.
@@ -1207,7 +1253,11 @@ final class IndexResidencyCoordinator {
     return holders.isEmpty() ? 0 : holders.get(0).bytes();
   }
 
-  /** Drops every confirmed copy held by an incarnation that no longer exists. */
+  /**
+   * Drops every trace of an incarnation that no longer exists: confirmed copies stop counting and
+   * outstanding commands can never be delivered, so they are fenced instead of leaving the plan 等待
+   * forever.
+   */
   private void forgetIncarnation(String executorId, String incarnation) {
     for (PlanState plan : plans.values()) {
       for (PlanFile loaded : new ArrayList<>(plan.loaded.values())) {
@@ -1216,26 +1266,45 @@ final class IndexResidencyCoordinator {
           plan.failed.put(loaded.location, "NODE_LOST");
         }
       }
+
+      for (PlanFile planned : plan.commands.values()) {
+        if (!planned.executorId.equals(executorId)
+            || !planned.incarnation.equals(incarnation)
+            || planned.type != IndexCacheProtocol.CommandType.LOAD
+            || plan.loaded.containsKey(planned.cacheKey)
+            || plan.failed.containsKey(planned.location)) {
+          continue;
+        }
+
+        plan.fenced.add(planned.cacheKey);
+        plan.failed.put(planned.location, "NODE_LOST");
+      }
     }
   }
 
-  /** Releases a copy whose owning plan can no longer use it, so the executor does not keep it. */
+  /**
+   * Releases a copy whose owning plan can no longer use it. The tombstone keeps the epoch under
+   * which the copy was installed, so an executor can never confuse it with authority over a newer
+   * load of the same key, and the same directory may only be released once per plan.
+   */
   private void releaseOrphan(PlanState plan, NodeState node, PlanFile orphan) {
-    IndexState index = indexes.get(plan.indexUuid);
-    long epoch = index == null ? plan.epoch : index.epoch;
+    if (!plan.orphansReleased.add(orphan.cacheKey)) {
+      return;
+    }
+
     enqueue(
         plan,
         node,
         "ORPHAN_RELEASE",
         IndexCacheProtocol.CommandType.RELEASE,
         plan.indexUuid,
-        "OTHER",
+        "ORPHAN",
         IndexCacheProtocol.File.builder()
             .location(orphan.location)
             .cacheKey(orphan.cacheKey)
             .build(),
         orphan.bytes,
-        epoch);
+        orphan.epoch);
   }
 
   private List<Holder> holdersOfKeys(Set<String> cacheKeys) {

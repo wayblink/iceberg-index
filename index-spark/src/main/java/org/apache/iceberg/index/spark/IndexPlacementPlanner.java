@@ -89,7 +89,13 @@ final class IndexPlacementPlanner {
       }
     }
 
-    return IndexCacheProtocol.Plan.builder().placements(placements).rejected(rejected).build();
+    return IndexCacheProtocol.Plan.builder()
+        .indexUuid(target.indexUuid())
+        .snapshotId(target.snapshotId())
+        .files(files)
+        .placements(placements)
+        .rejected(rejected)
+        .build();
   }
 
   private static WorkingNode best(

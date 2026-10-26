@@ -162,13 +162,13 @@ class TestIndexResidencyCoordinator {
         coordinator.acceptLoad(target("A", "f1", 10), IndexResidencyPolicy.parse("0"), clock.now());
     IndexCacheProtocol.Command command = loadCommand(plan);
     coordinator.report(node("a", "a-2", 6, 100, 0));
-    // A stale report still claiming the old incarnation must not confirm the command.
-    coordinator.ack(ack(plan, "a", "a-1", command, IndexCacheProtocol.AckStatus.LOADED));
-    assertThat(coordinator.result(plan).status()).isEqualTo(IndexCacheProtocol.Status.PENDING);
+    // The command was issued to a-1, so neither a-2 nor a returning a-1 can confirm it.
+    coordinator.ack(ack(plan, "a", "a-2", command, IndexCacheProtocol.AckStatus.LOADED));
+    assertThat(coordinator.result(plan).status()).isEqualTo(IndexCacheProtocol.Status.FAILED);
     coordinator.report(node("a", "a-1", 7, 100, 0));
     coordinator.ack(ack(plan, "a", "a-1", command, IndexCacheProtocol.AckStatus.LOADED));
-    coordinator.ack(ack(plan, "a", "a-1", command, IndexCacheProtocol.AckStatus.LOADED));
-    assertThat(coordinator.result(plan).status()).isEqualTo(IndexCacheProtocol.Status.COMPLETE);
+    assertThat(coordinator.result(plan).status()).isEqualTo(IndexCacheProtocol.Status.FAILED);
+    assertThat(coordinator.state("a", "a-1").holders()).isEmpty();
   }
 
   @Test
@@ -515,6 +515,108 @@ class TestIndexResidencyCoordinator {
   }
 
   @Test
+  void inFlightLoadToRestartedIncarnationIsFenced() {
+    coordinator.report(node("a", "a-1", 1, 100, 0));
+    String plan =
+        coordinator.acceptLoad(
+            target("A", "f1", 10), IndexResidencyPolicy.parse("forever"), clock.now());
+
+    // The executor restarts before answering; its command will never be delivered.
+    coordinator.report(node("a", "a-2", 1, 100, 0));
+
+    assertThat(coordinator.result(plan).status()).isEqualTo(IndexCacheProtocol.Status.FAILED);
+    assertThat(coordinator.result(plan).uncovered()).containsEntry("f1", "NODE_LOST");
+    String reload =
+        coordinator.acceptLoad(
+            target("A", "f1", 10), IndexResidencyPolicy.parse("forever"), clock.now());
+    assertThat(coordinator.result(reload).status()).isNotEqualTo(IndexCacheProtocol.Status.QUEUED);
+  }
+
+  @Test
+  void releasingInAPlanKeepsItsOwnLoadReservation() {
+    coordinator.report(node("a", "a-1", 1, 100, 0));
+    String first =
+        coordinator.acceptLoad(
+            target("A", "old", 40), IndexResidencyPolicy.parse("forever"), clock.now());
+    ackFile(first, "old", IndexCacheProtocol.AckStatus.LOADED);
+    coordinator.report(holding("a", "a-1", 2, 100, 40, "adapter|A|old", 40));
+
+    // Replacing the target both loads a new file and releases the old one.
+    String replace =
+        coordinator.acceptLoad(
+            target("A", "new", 40), IndexResidencyPolicy.parse("forever"), clock.now());
+    IndexCacheProtocol.Command release =
+        coordinator.commands("a", "a-1").stream()
+            .filter(
+                c ->
+                    c.planId().equals(replace)
+                        && c.type() == IndexCacheProtocol.CommandType.RELEASE)
+            .findFirst()
+            .orElseThrow();
+    coordinator.ack(ack(replace, "a", "a-1", release, IndexCacheProtocol.AckStatus.RELEASED));
+
+    assertThat(coordinator.state("a", "a-1").reservedBytesFor(replace)).isEqualTo(40);
+  }
+
+  @Test
+  void orphanReleaseKeepsTheEpochThatLoadedTheCopy() {
+    coordinator.report(node("a", "a-1", 1, 100, 0));
+    String load =
+        coordinator.acceptLoad(
+            target("A", "f1", 10, "f2", 10), IndexResidencyPolicy.parse("forever"), clock.now());
+    IndexCacheProtocol.Command f2 = loadCommand(load, "f2");
+    coordinator.acceptOffload("A", clock.now());
+    coordinator.ack(ack(load, "a", "a-1", f2, IndexCacheProtocol.AckStatus.LOADED));
+
+    IndexCacheProtocol.Command orphan =
+        coordinator.commands("a", "a-1").stream()
+            .filter(
+                c ->
+                    c.type() == IndexCacheProtocol.CommandType.RELEASE
+                        && "f2".equals(c.file().location()))
+            .findFirst()
+            .orElseThrow();
+    // A tombstone must not be mistaken for authority over a newer load of the same key.
+    assertThat(orphan.epoch()).isEqualTo(f2.epoch());
+    assertThat(orphan.mode()).isEqualTo("ORPHAN");
+  }
+
+  @Test
+  void repeatedLateAcknowledgementEnqueuesOneRelease() {
+    coordinator.report(node("a", "a-1", 1, 100, 0));
+    String load =
+        coordinator.acceptLoad(
+            target("A", "f1", 10, "f2", 10), IndexResidencyPolicy.parse("forever"), clock.now());
+    IndexCacheProtocol.Command f2 = loadCommand(load, "f2");
+    coordinator.acceptOffload("A", clock.now());
+    IndexCacheProtocol.Ack late = ack(load, "a", "a-1", f2, IndexCacheProtocol.AckStatus.LOADED);
+    coordinator.ack(late);
+    coordinator.ack(late);
+
+    assertThat(coordinator.commands("a", "a-1"))
+        .filteredOn(
+            c ->
+                c.type() == IndexCacheProtocol.CommandType.RELEASE
+                    && "f2".equals(c.file().location()))
+        .hasSize(1);
+  }
+
+  @Test
+  void acknowledgementFromANewIncarnationCannotConfirmAnOldCommand() {
+    coordinator.report(node("a", "a-1", 1, 100, 0));
+    String plan =
+        coordinator.acceptLoad(
+            target("A", "f1", 10), IndexResidencyPolicy.parse("forever"), clock.now());
+    IndexCacheProtocol.Command command = loadCommand(plan);
+    coordinator.report(node("a", "a-2", 1, 100, 0));
+
+    coordinator.ack(ack(plan, "a", "a-2", command, IndexCacheProtocol.AckStatus.LOADED));
+
+    assertThat(coordinator.result(plan).status()).isEqualTo(IndexCacheProtocol.Status.FAILED);
+    assertThat(coordinator.state("a", "a-2").holders()).isEmpty();
+  }
+
+  @Test
   void missingIncarnationAckCannotClaimCoverage() {
     coordinator.report(node("a", "a-1", 1, 100, 0));
     String plan =
@@ -579,6 +681,7 @@ class TestIndexResidencyCoordinator {
       String incarnation,
       IndexCacheProtocol.Command command,
       IndexCacheProtocol.AckStatus status) {
+    Long bytes = command.file().estimatedBytes();
     return ack(
         planId,
         executor,
@@ -586,7 +689,7 @@ class TestIndexResidencyCoordinator {
         command.sequence(),
         command.commandId(),
         status,
-        command.file().estimatedBytes());
+        bytes == null ? 0 : bytes);
   }
 
   private static IndexCacheProtocol.Ack ack(
