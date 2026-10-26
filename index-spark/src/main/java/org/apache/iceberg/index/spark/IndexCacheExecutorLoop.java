@@ -96,14 +96,16 @@ final class IndexCacheExecutorLoop implements AutoCloseable {
     try {
       // Acknowledgements are sent from the control thread: Spark's ask must run there.
       IndexCacheProtocol.Ack ack;
-      while ((ack = pendingAcks.poll()) != null) {
+      // Peek first: if the round trip fails the acknowledgement stays queued and the command stays
+      // in flight, so the driver's re-send is answered instead of being skipped forever.
+      while ((ack = pendingAcks.peek()) != null) {
         channel.ask(ack);
-        // The driver knows about this command now; a later reply may ask for it again after a loss.
+        pendingAcks.poll();
         submitted.remove(ack.commandId());
       }
 
       IndexCacheProtocol.NodeReport report =
-          worker.report("", ++sequence, budgetBytes, 0L, 0L, Map.of());
+          worker.report("", ++sequence, budgetBytes, worker.reservedBytes(), 0L, Map.of());
       Object response = channel.ask(report);
       if (!(response instanceof IndexCacheProtocol.Reply reply)) {
         return;
@@ -126,7 +128,13 @@ final class IndexCacheExecutorLoop implements AutoCloseable {
         // Loading runs on its own bounded pool so a slow prepare never delays the next poll.
         loaders.submit(
             () -> {
-              IndexCacheProtocol.Ack done = worker.execute(command);
+              IndexCacheProtocol.Ack done;
+              try {
+                done = worker.execute(command);
+              } catch (RuntimeException e) {
+                done = worker.failure(command, e);
+              }
+
               // The driver decides coverage; the executor only reports what it did.
               pendingAcks.offer(done);
             });

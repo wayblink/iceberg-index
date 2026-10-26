@@ -113,6 +113,75 @@ class TestIndexCachePlugin {
   }
 
   @Test
+  void aReplyCarriesOnlyOneBatchAndTheRestFollowsLater() {
+    IndexResidencyCoordinator bounded = new IndexResidencyCoordinator(() -> now, 2);
+    IndexCacheDriverControl boundedControl = new IndexCacheDriverControl(bounded);
+    boundedControl.receive(report(1, 1_000, 0));
+    bounded.acceptLoad(target("A", "f1", "f2", "f3"), IndexResidencyPolicy.parse("forever"), now);
+
+    IndexCacheProtocol.Reply first = boundedControl.receive(report(2, 1_000, 0));
+
+    assertThat(first.commands()).hasSize(2);
+    assertThat(first.commands().get(0).definition()).isNotNull();
+    assertThat(first.commands().get(0).io()).isNotNull();
+  }
+
+  @Test
+  void aFailedAcknowledgementRoundTripIsRetriedInsteadOfDropped() {
+    control.receive(report(1, 1_000, 0));
+    String plan =
+        coordinator.acceptLoad(target("A", "f1"), IndexResidencyPolicy.parse("forever"), now);
+    java.util.concurrent.atomic.AtomicBoolean failOnce =
+        new java.util.concurrent.atomic.AtomicBoolean(true);
+    List<Object> sent = new ArrayList<>();
+    IndexCacheRunner runner =
+        runner(
+            message -> {
+              if (message instanceof IndexCacheProtocol.Ack && failOnce.getAndSet(false)) {
+                throw new java.io.IOException("control channel hiccup");
+              }
+              return control.receive(message);
+            },
+            sent);
+    runner.loop.pollOnce();
+    for (int i = 0;
+        i < 100 && coordinator.result(plan).status() != IndexCacheProtocol.Status.COMPLETE;
+        i++) {
+      runner.loop.pollOnce();
+      sleepQuietly(20);
+    }
+
+    // The acknowledgement is retried, and the command is not executed a second time.
+    assertThat(coordinator.result(plan).status()).isEqualTo(IndexCacheProtocol.Status.COMPLETE);
+    assertThat(loaderCalls.get()).isEqualTo(1);
+  }
+
+  @Test
+  void aBusyExecutorKeepsTheFilePendingInsteadOfFailingIt() {
+    control.receive(report(1, 1_000, 0));
+    String plan =
+        coordinator.acceptLoad(target("A", "f1"), IndexResidencyPolicy.parse("forever"), now);
+    IndexCacheProtocol.Command command = control.receive(report(2, 1_000, 0)).commands().get(0);
+
+    control.receive(
+        IndexCacheProtocol.Ack.builder()
+            .session(SESSION)
+            .planId(plan)
+            .commandId(command.commandId())
+            .executorId(EXECUTOR)
+            .incarnation(INCARNATION)
+            .epoch(command.epoch())
+            .sequence(command.sequence())
+            .status(IndexCacheProtocol.AckStatus.REJECTED)
+            .bytes(0)
+            .reason("BUSY")
+            .build());
+
+    assertThat(coordinator.result(plan).uncovered()).containsEntry("f1", "PENDING");
+    assertThat(coordinator.result(plan).status()).isEqualTo(IndexCacheProtocol.Status.PENDING);
+  }
+
+  @Test
   void executorHonoursTheReplyBatchLimit() {
     control.receive(report(1, 10_000, 0));
     String plan =

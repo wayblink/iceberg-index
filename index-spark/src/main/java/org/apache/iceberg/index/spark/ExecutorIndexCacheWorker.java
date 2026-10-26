@@ -50,6 +50,7 @@ final class ExecutorIndexCacheWorker implements AutoCloseable {
   private final Map<String, Installed> installed = new LinkedHashMap<>();
   private final Map<String, Set<String>> targetKeys = new LinkedHashMap<>();
   private final Map<String, Long> targetEpoch = new LinkedHashMap<>();
+  private final Map<String, Long> promised = new LinkedHashMap<>();
   private final AtomicBoolean closed = new AtomicBoolean(false);
   private final Object stateLock = new Object();
   private final Map<String, Object> locks = new ConcurrentHashMap<>();
@@ -124,18 +125,36 @@ final class ExecutorIndexCacheWorker implements AutoCloseable {
     return ack;
   }
 
-  /** Makes the cache accept this key for the plan's epoch before the load is admitted. */
-  private void ensureTarget(String indexUuid, long epoch, String cacheKey) {
+  /**
+   * Makes the cache accept this key for the plan's epoch before the load is admitted.
+   *
+   * <p>A newer epoch replaces the target instead of growing it: files the new plan no longer wants
+   * lose their owner and leave the cache. An older epoch is refused, so a delayed command cannot
+   * roll the target back.
+   */
+  private boolean ensureTarget(String indexUuid, long epoch, String cacheKey) {
     synchronized (stateLock) {
-      Set<String> keys = targetKeys.computeIfAbsent(indexUuid, ignored -> new LinkedHashSet<>());
-      keys.add(cacheKey);
       Long applied = targetEpoch.get(indexUuid);
-      if (applied == null || applied != epoch) {
+      if (applied != null && epoch < applied) {
+        return false;
+      }
+
+      if (applied == null || epoch > applied) {
+        Set<String> keys = new LinkedHashSet<>();
+        keys.add(cacheKey);
+        targetKeys.put(indexUuid, keys);
         cache.applyTarget(indexUuid, epoch, keys);
         targetEpoch.put(indexUuid, epoch);
+        // Files the new target no longer lists lose their owner and are released by the cache, so
+        // they must stop appearing in this worker's report as well.
+        installed.keySet().removeIf(key -> !keys.contains(key));
       } else {
+        Set<String> keys = targetKeys.computeIfAbsent(indexUuid, ignored -> new LinkedHashSet<>());
+        keys.add(cacheKey);
         cache.addManagedKeys(indexUuid, epoch, Set.of(cacheKey));
       }
+
+      return true;
     }
   }
 
@@ -151,7 +170,14 @@ final class ExecutorIndexCacheWorker implements AutoCloseable {
       return reject(command, "STALE_EPOCH");
     }
 
-    ensureTarget(command.indexUuid(), command.epoch(), cacheKey);
+    if (!ensureTarget(command.indexUuid(), command.epoch(), cacheKey)) {
+      return reject(command, "STALE_EPOCH");
+    }
+
+    synchronized (stateLock) {
+      // The estimate is promised to the driver while the load runs; it is not free space.
+      promised.put(command.commandId(), estimate);
+    }
 
     long startedAt = System.nanoTime();
     RuntimeException last = null;
@@ -168,17 +194,28 @@ final class ExecutorIndexCacheWorker implements AutoCloseable {
                 cacheConfig,
                 () -> loader.load(command));
         if (file == null) {
-          return reject(command, "REJECTED");
+          // Admission refused: either this entry can never fit, or the space is momentarily taken.
+          synchronized (stateLock) {
+            promised.remove(command.commandId());
+          }
+
+          return reject(
+              command, estimate > cacheConfig.maxEntryBytes() ? "ENTRY_TOO_LARGE" : "BUSY");
         }
 
         synchronized (stateLock) {
           installed.put(cacheKey, new Installed(command.epoch(), file.bytes()));
+          promised.remove(command.commandId());
         }
 
         return ack(command, IndexCacheProtocol.AckStatus.LOADED, file.bytes(), null);
       } catch (RuntimeException e) {
         last = e;
       }
+    }
+
+    synchronized (stateLock) {
+      promised.remove(command.commandId());
     }
 
     long elapsedMillis = (System.nanoTime() - startedAt) / 1_000_000L;
@@ -199,7 +236,9 @@ final class ExecutorIndexCacheWorker implements AutoCloseable {
     }
 
     if (copy == null) {
-      // Nothing to release is already the desired state; a retry must stay idempotent.
+      // Nothing is retained under this key. Withdraw any pending admission so a load that is still
+      // preparing cannot publish after its release, then report the desired state.
+      cache.releaseCopy(command.indexUuid(), command.epoch(), cacheKey);
       return ack(command, IndexCacheProtocol.AckStatus.RELEASED, 0, null);
     }
 
@@ -208,7 +247,11 @@ final class ExecutorIndexCacheWorker implements AutoCloseable {
       return reject(command, "STALE_EPOCH");
     }
 
-    cache.releaseCopy(command.indexUuid(), copy.epoch(), cacheKey);
+    if (!cache.releaseCopy(command.indexUuid(), command.epoch(), cacheKey)) {
+      // The target moved on and still owns this file, so its bytes are still in use.
+      return reject(command, "STILL_OWNED");
+    }
+
     synchronized (stateLock) {
       installed.remove(cacheKey);
     }
@@ -253,6 +296,18 @@ final class ExecutorIndexCacheWorker implements AutoCloseable {
         .build();
   }
 
+  /** Bytes promised to loads that have not finished yet. */
+  long reservedBytes() {
+    synchronized (stateLock) {
+      long reserved = 0;
+      for (long bytes : promised.values()) {
+        reserved = Math.addExact(reserved, bytes);
+      }
+
+      return reserved;
+    }
+  }
+
   Map<String, Long> holders() {
     synchronized (stateLock) {
       Map<String, Long> holders = new LinkedHashMap<>();
@@ -289,6 +344,11 @@ final class ExecutorIndexCacheWorker implements AutoCloseable {
   public void close() {
     closed.set(true);
     completed.clear();
+  }
+
+  /** Acknowledgement for a command that failed outside the loader, for example admission code. */
+  IndexCacheProtocol.Ack failure(IndexCacheProtocol.Command command, RuntimeException error) {
+    return ack(command, IndexCacheProtocol.AckStatus.FAILED, 0, message(error));
   }
 
   private IndexCacheProtocol.Ack reject(IndexCacheProtocol.Command command, String reason) {

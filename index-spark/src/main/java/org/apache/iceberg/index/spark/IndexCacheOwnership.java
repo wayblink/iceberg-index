@@ -98,11 +98,11 @@ final class IndexCacheOwnership {
   }
 
   /** Withdraws one key from an index's target; other keys and owners stay untouched. */
-  void releaseKey(String indexUuid, long epoch, String cacheKey) {
+  boolean releaseKey(String indexUuid, long epoch, String cacheKey) {
     validate(indexUuid, epoch);
     Target target = targets.get(indexUuid);
     if (target == null || target.epoch() != epoch || !target.keys().contains(cacheKey)) {
-      return;
+      return false;
     }
 
     Set<String> keys = new HashSet<>(target.keys());
@@ -114,6 +114,7 @@ final class IndexCacheOwnership {
           owners.remove(indexUuid);
           return owners.isEmpty() ? null : owners;
         });
+    return true;
   }
 
   Set<String> owners(String cacheKey) {

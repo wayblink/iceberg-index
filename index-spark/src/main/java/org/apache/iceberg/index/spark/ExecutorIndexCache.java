@@ -786,11 +786,12 @@ final class ExecutorIndexCache {
   }
 
   /** Releases one file of an index; other files and other indexes keep their ownership. */
-  void releaseCopy(String indexUuid, long epoch, String cacheKey) {
+  boolean releaseCopy(String indexUuid, long epoch, String cacheKey) {
     synchronized (mapLock) {
-      ownership.releaseKey(indexUuid, epoch, cacheKey);
+      boolean released = ownership.releaseKey(indexUuid, epoch, cacheKey);
       releaseIfUnowned(cacheKey);
       mapLock.notifyAll();
+      return released;
     }
   }
 

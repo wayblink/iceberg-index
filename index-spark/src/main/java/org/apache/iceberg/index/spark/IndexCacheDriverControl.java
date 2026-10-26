@@ -18,6 +18,7 @@
  */
 package org.apache.iceberg.index.spark;
 
+import java.util.List;
 import java.util.Objects;
 import org.apache.iceberg.relocated.com.google.common.base.Preconditions;
 
@@ -32,14 +33,19 @@ final class IndexCacheDriverControl {
     this.coordinator = Objects.requireNonNull(coordinator, "Coordinator is null");
   }
 
-  /** Returns a reply for a report, and nothing for an ACK. */
-  IndexCacheProtocol.Reply receive(Object message) {
+  /**
+   * Returns a reply for a report, and an empty reply for an ACK.
+   *
+   * <p>Spark delivers plugin messages from a pool of driver threads, so this is the serialization
+   * point for the coordinator's state machine.
+   */
+  synchronized IndexCacheProtocol.Reply receive(Object message) {
     Preconditions.checkArgument(message != null, "Control message is null");
     if (message instanceof IndexCacheProtocol.NodeReport report) {
       return coordinator.report(report);
     } else if (message instanceof IndexCacheProtocol.Ack ack) {
       coordinator.ack(ack);
-      return IndexCacheProtocol.Reply.builder().commands(java.util.List.of()).build();
+      return IndexCacheProtocol.Reply.builder().commands(List.of()).build();
     }
 
     throw new IllegalArgumentException(

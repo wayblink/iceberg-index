@@ -347,6 +347,110 @@ class TestExecutorIndexCacheWorker {
   }
 
   @Test
+  void releasingAFileTheNewTargetDroppedIsANoOpThatDoesNotResurrectIt() {
+    worker.execute(load("A", "f1", 4));
+    // A newer target for the same index arrives before the release of the old file, and it does
+    // not list f1 any more.
+    worker.execute(load("A", "f2", 5));
+
+    IndexCacheProtocol.Ack ack = worker.execute(release("A", "f1", 5));
+
+    assertThat(ack.status()).isEqualTo(IndexCacheProtocol.AckStatus.RELEASED);
+    assertThat(worker.holders()).doesNotContainKey("adapter|A|f1");
+    assertThat(worker.holders()).containsKey("adapter|A|f2");
+  }
+
+  @Test
+  void aNewTargetDropsFilesItNoLongerContains() {
+    worker.execute(load("A", "f1", 4));
+    // The replacement plan only wants f2, so f1 loses its owner and leaves the cache.
+    worker.execute(load("A", "f2", 5));
+
+    assertThat(worker.holders()).doesNotContainKey("adapter|A|f1");
+    assertThat(worker.holders()).containsKey("adapter|A|f2");
+  }
+
+  @Test
+  void releaseThatArrivesBeforeTheLoadPublishesLeavesNoCopy() throws Exception {
+    CountDownLatch loading = new CountDownLatch(1);
+    CountDownLatch release = new CountDownLatch(1);
+    worker.close();
+    worker =
+        newWorker(
+            command -> {
+              loading.countDown();
+              try {
+                release.await(30, TimeUnit.SECONDS);
+              } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+              }
+              return loaded(command);
+            });
+
+    IndexCacheProtocol.Command load = load("A", "f1", 4);
+    Thread loadingThread = new Thread(() -> worker.execute(load));
+    loadingThread.start();
+    assertThat(awaitLatch(loading)).isTrue();
+
+    // The driver gives up on this file while the executor is still preparing it.
+    worker.execute(release("A", "f1", 4));
+    release.countDown();
+    loadingThread.join(30_000);
+
+    assertThat(worker.holders()).doesNotContainKey("adapter|A|f1");
+  }
+
+  @Test
+  void anOlderEpochTargetDoesNotRollBackANewerOne() {
+    worker.execute(load("A", "f1", 5));
+
+    IndexCacheProtocol.Ack stale = worker.execute(load("A", "f2", 4));
+
+    assertThat(stale.status()).isEqualTo(IndexCacheProtocol.AckStatus.REJECTED);
+    assertThat(stale.reason()).isEqualTo("STALE_EPOCH");
+    assertThat(worker.holders()).containsKey("adapter|A|f1");
+  }
+
+  @Test
+  void aRejectedAdmissionIsReportedAsRetryable() {
+    worker.close();
+    worker =
+        new ExecutorIndexCacheWorker(
+            SESSION,
+            EXECUTOR,
+            INCARNATION,
+            cache,
+            // Only 100 bytes of budget: the 120-byte file cannot be admitted right now.
+            ExecutorIndexCache.Config.of(true, 100L, 1_000L),
+            countingLoader(),
+            IndexCacheWorkerConfig.parse(Map.of()));
+
+    IndexCacheProtocol.Ack ack = worker.execute(load("A", "f1", 1));
+
+    assertThat(ack.status()).isEqualTo(IndexCacheProtocol.AckStatus.REJECTED);
+    assertThat(ack.reason()).isEqualTo("BUSY");
+  }
+
+  @Test
+  void anEntryLargerThanTheCacheLimitIsPermanent() {
+    worker.close();
+    worker =
+        new ExecutorIndexCacheWorker(
+            SESSION,
+            EXECUTOR,
+            INCARNATION,
+            cache,
+            ExecutorIndexCache.Config.of(true, 1_000_000L, 100L),
+            countingLoader(),
+            IndexCacheWorkerConfig.parse(Map.of()));
+
+    IndexCacheProtocol.Ack ack = worker.execute(load("A", "f1", 1));
+
+    assertThat(ack.status()).isEqualTo(IndexCacheProtocol.AckStatus.REJECTED);
+    assertThat(ack.reason()).isEqualTo("ENTRY_TOO_LARGE");
+  }
+
+  @Test
   void workerConfigurationRejectsNonPositiveValues() {
     assertThatThrownBy(
             () ->
@@ -364,6 +468,15 @@ class TestExecutorIndexCacheWorker {
     assertThat(IndexCacheWorkerConfig.parse(Map.of()).maxCommands()).isEqualTo(64);
     assertThat(IndexCacheWorkerConfig.parse(Map.of()).operationTimeoutMillis())
         .isEqualTo(TimeUnit.MINUTES.toMillis(10));
+  }
+
+  private static boolean awaitLatch(CountDownLatch latch) {
+    try {
+      return latch.await(30, TimeUnit.SECONDS);
+    } catch (InterruptedException e) {
+      Thread.currentThread().interrupt();
+      return false;
+    }
   }
 
   private ExecutorIndexCacheWorker newWorker(ExecutorIndexCacheWorker.Loader loader) {

@@ -72,23 +72,51 @@ public class IndexCachePlugin implements SparkPlugin {
     private static final Logger LOG = LoggerFactory.getLogger(IndexCacheExecutorPlugin.class);
     private IndexCacheExecutorLoop loop;
 
+    /**
+     * Spark fills {@code extraConf} from {@code spark.plugins.internal.conf.<plugin class>.<key>},
+     * so the settings documented as {@code spark.iceberg.index.cache.*} arrive here under that
+     * prefix. Nothing is derived from a session, because executors do not have one.
+     */
     @Override
     public void init(PluginContext pluginContext, Map<String, String> extraConf) {
       IndexCacheWorkerConfig config = IndexCacheWorkerConfig.parse(extraConf);
+      long budget = budgetBytes(pluginContext.conf());
       IndexCacheControlChannel channel = pluginContext::ask;
       ExecutorIndexCacheWorker worker =
           new ExecutorIndexCacheWorker(
               pluginContext.conf().get("spark.app.id", ""),
               pluginContext.executorID(),
-              pluginContext.executorID()
-                  + "#"
-                  + pluginContext.conf().get("spark.app.startTime", ""),
+              incarnation(pluginContext),
               ExecutorIndexCache.get(),
-              ExecutorIndexCache.Config.of(true, Long.MAX_VALUE / 4, Long.MAX_VALUE / 8),
+              ExecutorIndexCache.Config.of(true, Math.max(1L, budget), Math.max(1L, budget / 2)),
               new IndexCacheReadContext(),
               config);
-      loop = new IndexCacheExecutorLoop(channel, worker, config, Long.MAX_VALUE / 4);
+      loop = new IndexCacheExecutorLoop(channel, worker, config, budget);
       loop.start();
+    }
+
+    /** The control channel only advertises space when the cache budget is configured. */
+    private static long budgetBytes(org.apache.spark.SparkConf conf) {
+      String configured = conf.get(ExecutorIndexCache.Config.BYTES, null);
+      if (configured == null || configured.isBlank()) {
+        return 0L;
+      }
+
+      try {
+        return Math.max(0L, Long.parseLong(configured.trim()));
+      } catch (NumberFormatException e) {
+        LOG.warn("Ignoring invalid {}: {}", ExecutorIndexCache.Config.BYTES, configured);
+        return 0L;
+      }
+    }
+
+    private static String incarnation(PluginContext pluginContext) {
+      // The application identity keeps a reused executor id from two applications apart.
+      return pluginContext.executorID()
+          + "#"
+          + pluginContext.conf().get("spark.app.id", "")
+          + "#"
+          + pluginContext.conf().get("spark.app.startTime", "");
     }
 
     @Override

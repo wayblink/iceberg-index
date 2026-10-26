@@ -32,6 +32,7 @@ import java.util.Objects;
 import java.util.Set;
 import org.apache.iceberg.index.IndexDefinition;
 import org.apache.iceberg.io.FileIO;
+import org.apache.iceberg.relocated.com.google.common.base.Preconditions;
 
 /**
  * Driver-side residency bookkeeping: protection policy, confirmed coverage, index LRU and plan
@@ -268,8 +269,20 @@ final class IndexResidencyCoordinator {
   private long planCount;
   private String lastPlanId;
 
+  /** Commands carried by one reply; the rest stay queued for the next poll. */
+  static final int DEFAULT_MAX_COMMANDS_PER_REPLY = 64;
+
+  private final int maxCommandsPerReply;
+
   IndexResidencyCoordinator(Clock clock) {
+    this(clock, DEFAULT_MAX_COMMANDS_PER_REPLY);
+  }
+
+  IndexResidencyCoordinator(Clock clock, int maxCommandsPerReply) {
+    Preconditions.checkArgument(
+        maxCommandsPerReply > 0, "Invalid reply batch size: %s", maxCommandsPerReply);
     this.clock = Objects.requireNonNull(clock, "Clock is null");
+    this.maxCommandsPerReply = maxCommandsPerReply;
   }
 
   String acceptLoad(IndexCacheProtocol.Target target, IndexResidencyPolicy policy, long nowNanos) {
@@ -400,8 +413,14 @@ final class IndexResidencyCoordinator {
       }
     }
 
+    // One reply is bounded: every command now carries a read context, so shipping a whole plan in
+    // a single message would copy credentials-sized state once per poll.
+    List<IndexCacheProtocol.Command> batch =
+        node.queue.size() <= maxCommandsPerReply
+            ? new ArrayList<>(node.queue)
+            : new ArrayList<>(node.queue.subList(0, maxCommandsPerReply));
     return IndexCacheProtocol.Reply.builder()
-        .commands(new ArrayList<>(node.queue))
+        .commands(batch)
         .nextSequence(report.sequence())
         .build();
   }
@@ -484,6 +503,12 @@ final class IndexResidencyCoordinator {
       releaseMigratedCopy(plan, command, ack.executorId());
     } else if (ack.status() == IndexCacheProtocol.AckStatus.REJECTED
         || ack.status() == IndexCacheProtocol.AckStatus.FAILED) {
+      if ("BUSY".equals(ack.reason())) {
+        // Transient: the executor could not admit the file right now. Keep the promise and let the
+        // next poll retry instead of failing the file for the rest of the plan.
+        return;
+      }
+
       plan.failed.put(command.location, ack.reason() == null ? ack.status().name() : ack.reason());
       node.settle(ack.commandId());
     }
