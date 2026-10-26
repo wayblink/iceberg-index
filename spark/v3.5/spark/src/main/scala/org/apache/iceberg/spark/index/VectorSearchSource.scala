@@ -38,16 +38,42 @@ private[spark] case class VectorSearchSource(context: VectorSearchContext, key: 
   override protected def otherCopyArgs: Seq[AnyRef] = output :: Nil
 
   override protected def stringArgs: Iterator[Any] = {
-    val resolved = if (context.budget == null) "" else s", budget=${context.budget.initial}"
+    val parameters = context.parameters
+    val overSample =
+      if (parameters == null) {
+        "overSample=unset"
+      } else {
+        val details = new StringBuilder(parameters.overSampleOrigin)
+        if (parameters.overSampleLocked) {
+          details.append(", locked")
+        }
+        if (parameters.overSampleReason != null) {
+          details.append(", ").append(parameters.overSampleReason)
+        }
+        if (parameters.overSampleShadowedOrigin != null) {
+          details.append(", overrides ").append(parameters.overSampleShadowedOrigin)
+        }
+        s"overSample=${parameters.overSample} [$details]"
+      }
+    val budget =
+      if (context.budget == null) {
+        "requestedCandidates=unset, initialCandidates=unset"
+      } else {
+        s"requestedCandidates=${context.budget.requested}, " +
+          s"initialCandidates=${context.budget.initial}"
+      }
     Iterator(
       s"contract=${context.request.input.contract.name}",
       s"column=${context.request.input.column}",
       s"k=${context.request.input.topK}",
+      s"metric=${context.inputs.definition.metric()}",
+      overSample,
+      budget,
       s"index=${context.inputs.indexMetadata.indexUuid()}",
       s"tableSnapshot=${context.inputs.tableSnapshot.snapshotId()}",
       s"indexSnapshot=${context.inputs.indexSnapshot.snapshotId}",
       s"uncoveredFiles=${context.inputs.uncoveredDataFiles.size}",
-      s"driverMaterialization=true$resolved")
+      "driverMaterialization=true")
   }
 
   override def simpleString(maxFields: Int): String =

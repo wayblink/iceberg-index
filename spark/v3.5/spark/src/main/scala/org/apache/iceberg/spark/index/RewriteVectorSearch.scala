@@ -18,6 +18,8 @@
  */
 package org.apache.iceberg.spark.index
 
+import java.lang.{Long => JLong}
+
 import scala.collection.mutable
 
 import org.apache.iceberg.spark.source.SparkTable
@@ -107,6 +109,7 @@ case class RewriteVectorSearch(spark: SparkSession) extends Rule[LogicalPlan] {
       .orNull
     val contract = VectorResultContract.TableLiveTopK.name
 
+    val bindStart = System.nanoTime()
     VectorSearchRequest
       .forTable(
         sparkTable.table(),
@@ -120,6 +123,7 @@ case class RewriteVectorSearch(spark: SparkSession) extends Rule[LogicalPlan] {
       case request =>
         BindVectorSearch.bind(spark, request) match {
           case BoundVectorSearch(context) =>
+            val bindMillis = (System.nanoTime() - bindStart) / 1000000L
             val resolved = bindDecisions(context, k)
             if (resolved == null) {
               None
@@ -135,6 +139,13 @@ case class RewriteVectorSearch(spark: SparkSession) extends Rule[LogicalPlan] {
                   node.copy(order =
                     node.order.map(order => order.copy(child = distance.copy(metric = metric))))
               }
+              logger.info(
+                "vector search plan: bind={}ms overSample={}[{}] uncoveredFiles={}",
+                Array[Object](
+                  JLong.valueOf(bindMillis),
+                  JLong.valueOf(resolved.parameters.overSample),
+                  resolved.parameters.overSampleOrigin,
+                  Integer.valueOf(resolved.inputs.uncoveredDataFiles.size)): _*)
               logger.info("rewrote a vector query into {}", source.simpleString(100))
               Some(lowered)
             }
