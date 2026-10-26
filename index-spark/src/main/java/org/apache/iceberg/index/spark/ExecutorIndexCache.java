@@ -763,6 +763,27 @@ final class ExecutorIndexCache {
     }
   }
 
+  /**
+   * Leases a resident managed copy by cache key alone, for a query that does not know the index
+   * epoch. Returns null when the key is not managed, no index admits loads, or nothing is resident,
+   * and the caller then reads the file without retaining it.
+   */
+  Lease acquireManagedKey(String cacheKey) {
+    synchronized (mapLock) {
+      if (!ownership.admits(cacheKey)) {
+        return null;
+      }
+
+      CachedFile file = lookup(cacheKey);
+      if (file == null) {
+        return null;
+      }
+
+      file.leases = Math.incrementExact(file.leases);
+      return new Lease(cacheKey, file);
+    }
+  }
+
   Lease acquireManaged(String indexUuid, long epoch, String cacheKey) {
     synchronized (mapLock) {
       if (!ownership.mayAdmit(indexUuid, epoch, cacheKey)) {

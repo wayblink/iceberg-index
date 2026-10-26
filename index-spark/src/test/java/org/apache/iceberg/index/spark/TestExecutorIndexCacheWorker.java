@@ -507,25 +507,39 @@ class TestExecutorIndexCacheWorker {
   }
 
   @Test
-  void aNewTargetWaitsForReferencesAQueryAlreadyHolds() {
+  void theFirstManagedTargetWaitsForReferencesAQueryAlreadyHolds() {
     IndexCacheProtocol.Command first = load("A", "f1", 1);
     assertThat(worker.execute(first).status()).isEqualTo(IndexCacheProtocol.AckStatus.LOADED);
 
-    // A query is still using the copy the executor already handed out.
+    // A query is still using the copy the executor handed out.
     ExecutorIndexCache.Lease lease = cache.acquireManaged("A", 1, "adapter|A|f1");
     assertThat(lease).isNotNull();
     try {
-      IndexCacheProtocol.Ack blocked = worker.execute(load("A", "f2", 2));
-      assertThat(blocked.reason()).isEqualTo("BUSY");
-      assertThat(worker.holders()).doesNotContainKey("adapter|A|f2");
+      // Taking over another index for the first time must not change what that query is using.
+      IndexCacheProtocol.Ack blocked = worker.execute(load("B", "g1", 1));
+      assertThat(blocked.reason()).isEqualTo("WAIT_REFERENCES");
+      assertThat(worker.holders()).doesNotContainKey("adapter|B|g1");
     } finally {
       lease.close();
     }
 
-    // Once that query is done, the new target is applied and the file loads.
-    assertThat(worker.execute(load("A", "f2", 2)).status())
+    assertThat(worker.execute(load("B", "g1", 1)).status())
         .isEqualTo(IndexCacheProtocol.AckStatus.LOADED);
-    assertThat(worker.holders()).containsKey("adapter|A|f2");
+    assertThat(worker.holders()).containsKey("adapter|B|g1");
+  }
+
+  @Test
+  void aLaterEpochOfTheSameIndexIsNotBlockedByAQuery() {
+    assertThat(worker.execute(load("A", "f1", 1)).status())
+        .isEqualTo(IndexCacheProtocol.AckStatus.LOADED);
+    ExecutorIndexCache.Lease lease = cache.acquireManaged("A", 1, "adapter|A|f1");
+    try {
+      // A newer epoch keeps the same managed copies valid, so a re-load proceeds.
+      assertThat(worker.execute(load("A", "f2", 2)).status())
+          .isEqualTo(IndexCacheProtocol.AckStatus.LOADED);
+    } finally {
+      lease.close();
+    }
   }
 
   @Test

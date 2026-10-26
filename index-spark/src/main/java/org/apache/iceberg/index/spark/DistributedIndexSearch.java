@@ -188,20 +188,31 @@ public final class DistributedIndexSearch {
                       while (locations1.hasNext()) {
                         String location = locations1.next();
                         long readStart = System.nanoTime();
+                        ExecutorIndexCache cache = ExecutorIndexCache.get();
+                        // A file residency management owns is leased, so a release waits for this
+                        // query; anything else keeps the old lazy behaviour.
+                        ExecutorIndexCache.Lease lease = cache.acquireManagedKey(cacheKey);
                         ExecutorIndexCache.CachedFile file =
-                            ExecutorIndexCache.get()
-                                .file(
+                            lease != null
+                                ? lease.file()
+                                : cache.file(
                                     location,
                                     cacheConfig,
                                     cacheKey,
                                     () -> loadFile(fileIO, location, fileAdapter));
                         long readNanos = System.nanoTime() - readStart;
                         long searchStart = System.nanoTime();
-                        for (IndexSearchResult hit :
-                            file.searching(
-                                prepared -> prepared.search(fileQuery.duplicate(), localTopK))) {
-                          fileHits.add(
-                              new Tuple3<>(hit.dataFile(), hit.rowPosition(), hit.score()));
+                        try {
+                          for (IndexSearchResult hit :
+                              file.searching(
+                                  prepared -> prepared.search(fileQuery.duplicate(), localTopK))) {
+                            fileHits.add(
+                                new Tuple3<>(hit.dataFile(), hit.rowPosition(), hit.score()));
+                          }
+                        } finally {
+                          if (lease != null) {
+                            lease.close();
+                          }
                         }
                         LOG.debug(
                             "index file {} read {} ms, search {} ms",

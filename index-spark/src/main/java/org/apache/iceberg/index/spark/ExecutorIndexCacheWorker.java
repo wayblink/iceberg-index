@@ -36,6 +36,9 @@ final class ExecutorIndexCacheWorker implements AutoCloseable {
   /** Reason of a refusal that the driver may retry; the same word is used by the coordinator. */
   static final String BUSY = "BUSY";
 
+  /** A reference is still in use; the driver retries without spending a transient attempt. */
+  static final String WAIT_REFERENCES = "WAIT_REFERENCES";
+
   interface Loader {
     ExecutorIndexCache.CachedFile load(IndexCacheProtocol.Command command);
   }
@@ -45,7 +48,7 @@ final class ExecutorIndexCacheWorker implements AutoCloseable {
   private enum TargetDecision {
     APPLIED,
     STALE,
-    BUSY
+    WAIT_REFERENCES
   }
 
   private final String session;
@@ -130,7 +133,7 @@ final class ExecutorIndexCacheWorker implements AutoCloseable {
 
   private IndexCacheProtocol.Ack remember(
       IndexCacheProtocol.Command command, IndexCacheProtocol.Ack ack) {
-    if (!BUSY.equals(ack.reason())) {
+    if (!BUSY.equals(ack.reason()) && !WAIT_REFERENCES.equals(ack.reason())) {
       // A transient refusal must stay retryable: caching it would make every re-send a no-op.
       completed.put(command.commandId(), ack);
     }
@@ -153,12 +156,10 @@ final class ExecutorIndexCacheWorker implements AutoCloseable {
         return TargetDecision.STALE;
       }
 
-      if (applied == null || epoch > applied) {
-        // Taking over a new target while a query still holds a copy would change what that query
-        // is using mid-search, so the first managed target waits for those references to finish.
-        if (cache.hasReferencesInUse()) {
-          return TargetDecision.BUSY;
-        }
+      // Only the first takeover has to wait: later epochs keep the same managed copies valid, so
+      // re-applying a target does not invalidate what a query already holds.
+      if (applied == null && cache.hasReferencesInUse()) {
+        return TargetDecision.WAIT_REFERENCES;
       }
 
       Set<String> keys = targetKeys.computeIfAbsent(indexUuid, ignored -> new LinkedHashSet<>());
@@ -189,8 +190,8 @@ final class ExecutorIndexCacheWorker implements AutoCloseable {
     TargetDecision decision = ensureTarget(command.indexUuid(), command.epoch(), cacheKey);
     if (decision == TargetDecision.STALE) {
       return reject(command, "STALE_EPOCH");
-    } else if (decision == TargetDecision.BUSY) {
-      return reject(command, BUSY);
+    } else if (decision == TargetDecision.WAIT_REFERENCES) {
+      return reject(command, WAIT_REFERENCES);
     }
 
     if (estimate > cacheConfig.maxEntryBytes()) {

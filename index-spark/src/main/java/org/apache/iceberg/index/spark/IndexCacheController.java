@@ -37,16 +37,62 @@ import org.apache.iceberg.relocated.com.google.common.base.Preconditions;
 final class IndexCacheController {
   private IndexCacheController() {}
 
+  /** How long a control call waits for its files to reach a terminal state. */
+  static final long DEFAULT_WAIT_NANOS = java.time.Duration.ofSeconds(60).toNanos();
+
+  /**
+   * Waits until every file of the plan is terminal or the deadline passes. A cluster with no
+   * executor cannot answer, so that case returns at once instead of blocking the caller.
+   */
+  static IndexCacheProtocol.Result await(
+      IndexCacheDriverControl control, String planId, long deadlineNanos) {
+    IndexCacheProtocol.Result result = control.result(planId);
+    while (!terminal(result.status()) && control.hasExecutors()) {
+      if (System.nanoTime() >= deadlineNanos) {
+        break;
+      }
+
+      try {
+        Thread.sleep(50L);
+      } catch (InterruptedException e) {
+        Thread.currentThread().interrupt();
+        break;
+      }
+
+      result = control.result(planId);
+    }
+
+    return result;
+  }
+
+  private static boolean terminal(IndexCacheProtocol.Status status) {
+    return status == IndexCacheProtocol.Status.COMPLETE
+        || status == IndexCacheProtocol.Status.PARTIAL
+        || status == IndexCacheProtocol.Status.FAILED
+        || status == IndexCacheProtocol.Status.CANCELLED
+        || status == IndexCacheProtocol.Status.OFFLOADED;
+  }
+
   static IndexCacheProtocol.Result load(
       IndexCacheDriverControl control,
       Table table,
       IndexMetadata metadata,
       String retainFor,
       long nowNanos) {
+    return load(control, table, metadata, retainFor, nowNanos, nowNanos + DEFAULT_WAIT_NANOS);
+  }
+
+  static IndexCacheProtocol.Result load(
+      IndexCacheDriverControl control,
+      Table table,
+      IndexMetadata metadata,
+      String retainFor,
+      long nowNanos,
+      long deadlineNanos) {
     IndexCacheProtocol.Target target = target(table, metadata);
     IndexResidencyPolicy policy = IndexResidencyPolicy.parse(retainFor);
-    String planId = control.coordinator().acceptLoad(target, policy, nowNanos);
-    return control.coordinator().result(planId);
+    String planId = control.acceptLoad(target, policy, nowNanos);
+    return await(control, planId, deadlineNanos);
   }
 
   static IndexCacheProtocol.Result offload(
@@ -57,8 +103,15 @@ final class IndexCacheController {
         metadata.indexUuid(),
         metadata.tableUuid(),
         table.uuid());
-    String planId = control.coordinator().acceptOffload(metadata.indexUuid(), nowNanos);
-    return control.coordinator().result(planId);
+
+    Preconditions.checkArgument(
+        metadata.tableLocation() == null || metadata.tableLocation().equals(table.location()),
+        "Index %s records table location %s but the table is at %s",
+        metadata.indexUuid(),
+        metadata.tableLocation(),
+        table.location());
+    String planId = control.acceptOffload(metadata.indexUuid(), nowNanos);
+    return control.result(planId);
   }
 
   /** The plan target for the index snapshot covering the table's current snapshot. */
@@ -85,7 +138,7 @@ final class IndexCacheController {
       planned.add(
           IndexCacheProtocol.File.builder()
               .location(file.location())
-              .cacheKey(cacheKey(metadata, file.location()))
+              .cacheKey(cacheKey(table, metadata, file.location()))
               .kind(file.kind().name())
               .blobType(file.blobType())
               .estimatedBytes(estimate(file))
@@ -102,8 +155,10 @@ final class IndexCacheController {
         .build();
   }
 
-  private static String cacheKey(IndexMetadata metadata, String location) {
-    return metadata.tableLocation() + "|" + adapterKey(metadata) + "|" + location;
+  private static String cacheKey(Table table, IndexMetadata metadata, String location) {
+    // The owner segment must be the table location the search path uses, not the copy recorded in
+    // the index metadata: the two can differ after a table is moved.
+    return table.location() + "|" + adapterKey(metadata) + "|" + location;
   }
 
   private static String adapterKey(IndexMetadata metadata) {
@@ -123,6 +178,6 @@ final class IndexCacheController {
   }
 
   static Map<String, String> placements(IndexCacheDriverControl control, String planId) {
-    return control.coordinator().placements(planId);
+    return control.placements(planId);
   }
 }

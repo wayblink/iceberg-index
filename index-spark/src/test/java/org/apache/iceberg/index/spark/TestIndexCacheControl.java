@@ -41,7 +41,7 @@ class TestIndexCacheControl {
     control.receive(node());
 
     IndexCacheProtocol.Result result =
-        IndexCacheController.load(control, built.table(), built.metadata(), "30m", BASE);
+        IndexCacheController.load(control, built.table(), built.metadata(), "30m", BASE, BASE);
 
     assertThat(result.status()).isEqualTo(IndexCacheProtocol.Status.PENDING);
     assertThat(result.protection().deadlineNanos())
@@ -69,13 +69,13 @@ class TestIndexCacheControl {
     control.receive(node());
 
     IndexCacheProtocol.Result first =
-        IndexCacheController.load(control, built.table(), built.metadata(), "30m", BASE);
+        IndexCacheController.load(control, built.table(), built.metadata(), "30m", BASE, BASE);
     IndexCacheProtocol.Result repeated =
-        IndexCacheController.load(control, built.table(), built.metadata(), null, BASE);
+        IndexCacheController.load(control, built.table(), built.metadata(), null, BASE, BASE);
     assertThat(repeated.protection().deadlineNanos()).isEqualTo(first.protection().deadlineNanos());
 
     IndexCacheProtocol.Result zero =
-        IndexCacheController.load(control, built.table(), built.metadata(), "0", BASE);
+        IndexCacheController.load(control, built.table(), built.metadata(), "0", BASE, BASE);
     assertThat(zero.protection().permanent()).isFalse();
     assertThat(zero.protection().deadlineNanos()).isZero();
   }
@@ -89,7 +89,7 @@ class TestIndexCacheControl {
     control.receive(node());
 
     IndexCacheProtocol.Result result =
-        IndexCacheController.load(control, built.table(), built.metadata(), "forever", BASE);
+        IndexCacheController.load(control, built.table(), built.metadata(), "forever", BASE, BASE);
 
     assertThat(result.protection().permanent()).isTrue();
     assertThat(result.protection().text()).isEqualTo("forever");
@@ -102,7 +102,7 @@ class TestIndexCacheControl {
     IndexResidencyCoordinator coordinator = new IndexResidencyCoordinator(() -> BASE);
     IndexCacheDriverControl control = new IndexCacheDriverControl(coordinator);
     control.receive(node());
-    IndexCacheController.load(control, built.table(), built.metadata(), "forever", BASE);
+    IndexCacheController.load(control, built.table(), built.metadata(), "forever", BASE, BASE);
 
     IndexCacheProtocol.Result first =
         IndexCacheController.offload(control, built.table(), built.metadata(), BASE);
@@ -123,7 +123,7 @@ class TestIndexCacheControl {
     IndexCacheDriverControl control = new IndexCacheDriverControl(coordinator);
     control.receive(node());
     IndexCacheProtocol.Result protocol =
-        IndexCacheController.load(control, built.table(), built.metadata(), "30m", BASE);
+        IndexCacheController.load(control, built.table(), built.metadata(), "30m", BASE, BASE);
 
     IndexCacheControl.Result result = IndexCacheControl.Result.from(control, protocol);
 
@@ -144,7 +144,7 @@ class TestIndexCacheControl {
     IndexResidencyCoordinator coordinator = new IndexResidencyCoordinator(() -> BASE);
     IndexCacheDriverControl control = new IndexCacheDriverControl(coordinator);
     control.receive(node());
-    IndexCacheController.load(control, built.table(), built.metadata(), "0", BASE);
+    IndexCacheController.load(control, built.table(), built.metadata(), "0", BASE, BASE);
 
     assertThat(coordinator.protectedIndexes()).containsKey("idx-1");
   }
@@ -156,7 +156,7 @@ class TestIndexCacheControl {
     IndexResidencyCoordinator coordinator = new IndexResidencyCoordinator(() -> BASE);
     IndexCacheDriverControl control = new IndexCacheDriverControl(coordinator);
     control.receive(node());
-    IndexCacheController.load(control, built.table(), built.metadata(), "30m", BASE);
+    IndexCacheController.load(control, built.table(), built.metadata(), "30m", BASE, BASE);
 
     List<IndexCacheControl.Status> status = IndexCacheControl.statusOf(control, BASE);
 
@@ -167,6 +167,95 @@ class TestIndexCacheControl {
     assertThat(row.budgetBytes()).isEqualTo(1_000_000L);
     assertThat(row.managedIndexes()).containsExactly("idx-1");
     assertThat(row.stale()).isFalse();
+  }
+
+  @Test
+  void aLoadWaitsForTheAcknowledgementsInsteadOfReturningPending() throws Exception {
+    TestIndexFixtures.BuiltIndex built =
+        TestIndexFixtures.build(tempDir, "idx-1", "data-1.parquet");
+    IndexResidencyCoordinator coordinator = new IndexResidencyCoordinator(() -> BASE);
+    IndexCacheDriverControl control = new IndexCacheDriverControl(coordinator);
+    control.receive(node());
+
+    Thread acknowledger =
+        new Thread(
+            () -> {
+              sleep(200);
+              // The driver hands the command out on the next report, then the executor answers.
+              IndexCacheProtocol.Reply reply = control.receive(node(2L));
+              for (IndexCacheProtocol.Command command : reply.commands()) {
+                control.receive(
+                    IndexCacheProtocol.Ack.builder()
+                        .session("application-1")
+                        .planId(command.planId())
+                        .commandId(command.commandId())
+                        .executorId("executor-1")
+                        .incarnation("executor-1#1")
+                        .epoch(command.epoch())
+                        .sequence(command.sequence())
+                        .status(IndexCacheProtocol.AckStatus.LOADED)
+                        .bytes(
+                            command.file().estimatedBytes() == null
+                                ? 0
+                                : command.file().estimatedBytes())
+                        .build());
+              }
+            });
+    acknowledger.start();
+
+    IndexCacheProtocol.Result result =
+        IndexCacheController.load(
+            control,
+            built.table(),
+            built.metadata(),
+            "30m",
+            BASE,
+            System.nanoTime() + 10_000_000_000L);
+    acknowledger.join(10_000);
+
+    assertThat(result.status()).isEqualTo(IndexCacheProtocol.Status.COMPLETE);
+    assertThat(result.residentBytes()).isPositive();
+  }
+
+  @Test
+  void fileRowsCarryThePlannedBytes() {
+    TestIndexFixtures.BuiltIndex built =
+        TestIndexFixtures.build(tempDir, "idx-1", "data-1.parquet");
+    IndexCacheDriverControl control =
+        new IndexCacheDriverControl(new IndexResidencyCoordinator(() -> BASE));
+    control.receive(node());
+    IndexCacheProtocol.Result protocol =
+        IndexCacheController.load(control, built.table(), built.metadata(), "30m", BASE, BASE);
+
+    IndexCacheControl.Result result = IndexCacheControl.Result.from(control, protocol);
+
+    assertThat(result.files()).allSatisfy(row -> assertThat(row.bytes()).isPositive());
+  }
+
+  @Test
+  void anIndexOfAnotherTableIsRejected() {
+    TestIndexFixtures.BuiltIndex built =
+        TestIndexFixtures.build(tempDir, "idx-1", "data-1.parquet");
+    TestIndexFixtures.BuiltIndex other =
+        TestIndexFixtures.build(new File(tempDir, "other"), "idx-2", "data-1.parquet");
+    IndexCacheDriverControl control =
+        new IndexCacheDriverControl(new IndexResidencyCoordinator(() -> BASE));
+    control.receive(node());
+
+    assertThatThrownBy(
+            () ->
+                IndexCacheController.load(
+                    control, other.table(), built.metadata(), "0", BASE, BASE))
+        .isInstanceOf(IllegalArgumentException.class)
+        .hasMessageContaining("belongs to table");
+  }
+
+  private static void sleep(long millis) {
+    try {
+      Thread.sleep(millis);
+    } catch (InterruptedException e) {
+      Thread.currentThread().interrupt();
+    }
   }
 
   @Test
@@ -211,11 +300,15 @@ class TestIndexCacheControl {
   }
 
   private static IndexCacheProtocol.NodeReport node() {
+    return node(1L);
+  }
+
+  private static IndexCacheProtocol.NodeReport node(long sequence) {
     return IndexCacheProtocol.NodeReport.builder()
         .session("application-1")
         .executorId("executor-1")
         .incarnation("executor-1#1")
-        .sequence(1)
+        .sequence(sequence)
         .budgetBytes(1_000_000L)
         .usedBytes(0L)
         .build();

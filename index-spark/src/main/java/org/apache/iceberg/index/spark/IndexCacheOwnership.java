@@ -133,6 +133,18 @@ final class IndexCacheOwnership {
     return ownersByKey.containsKey(cacheKey);
   }
 
+  /** True when some index owns this key and none of them has paused admission. */
+  boolean admits(String cacheKey) {
+    for (String owner : ownersByKey.getOrDefault(cacheKey, Set.of())) {
+      Target target = targets.get(owner);
+      if (target != null && !target.paused()) {
+        return true;
+      }
+    }
+
+    return false;
+  }
+
   boolean isManagedKey(String cacheKey) {
     return managedKeys.contains(cacheKey);
   }

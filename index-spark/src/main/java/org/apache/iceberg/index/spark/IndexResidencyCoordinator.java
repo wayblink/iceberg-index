@@ -441,6 +441,23 @@ final class IndexResidencyCoordinator {
     return ages;
   }
 
+  /** The retained bytes each planned file was charged at planning time. */
+  Map<String, Long> plannedBytes(String planId) {
+    PlanState plan = plans.get(planId);
+    if (plan == null) {
+      return Map.of();
+    }
+
+    Map<String, Long> bytes = new LinkedHashMap<>();
+    for (PlanFile command : plan.commands.values()) {
+      if (command.type == IndexCacheProtocol.CommandType.LOAD) {
+        bytes.putIfAbsent(command.location, command.bytes);
+      }
+    }
+
+    return bytes;
+  }
+
   /** The protection each managed index currently has, keyed by index identity. */
   Map<String, IndexCacheProtocol.Protection> protectedIndexes() {
     Map<String, IndexCacheProtocol.Protection> protections = new LinkedHashMap<>();
@@ -541,6 +558,14 @@ final class IndexResidencyCoordinator {
     }
 
     IndexState index = indexes.get(plan.indexUuid);
+    if ("WAIT_REFERENCES".equals(ack.reason())
+        && command.type == IndexCacheProtocol.CommandType.LOAD) {
+      // Waiting for an in-flight search is not a failure of this command: requeue it and let the
+      // plan deadline decide, rather than spending the transient attempt budget.
+      node.requeue(command.commandId);
+      return;
+    }
+
     if ("BUSY".equals(ack.reason()) && command.type == IndexCacheProtocol.CommandType.LOAD) {
       int attempt = plan.attempts.merge(command.commandId, 1, Integer::sum);
       if (attempt < maxCommandAttempts) {

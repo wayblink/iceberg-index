@@ -59,7 +59,7 @@ public final class IndexCacheControl {
     IndexCacheDriverControl control =
         IndexCacheDriverRegistry.find(spark.sparkContext().applicationId());
     if (control != null) {
-      control.coordinator().recordAccess(indexUuid, System.nanoTime());
+      control.recordAccess(indexUuid, System.nanoTime());
     }
   }
 
@@ -72,14 +72,20 @@ public final class IndexCacheControl {
     return statusOf(controlOf(spark), System.nanoTime());
   }
 
+  /** The outcome of a plan a caller already started, without re-planning it. */
+  public static Result result(SparkSession spark, String planId) {
+    IndexCacheDriverControl control = controlOf(spark);
+    return Result.from(control, control.result(planId));
+  }
+
   /** Residency rows built from the last reports; no executor is contacted. */
   static List<Status> statusOf(IndexCacheDriverControl control, long nowNanos) {
-    Map<String, Long> ages = control.coordinator().nodeReportAgeNanos(nowNanos);
-    List<String> managed = new ArrayList<>(control.coordinator().protectedIndexes().keySet());
+    Map<String, Long> ages = control.reportAges(nowNanos);
+    List<String> managed = new ArrayList<>(control.protectedIndexes().keySet());
     managed.sort(String::compareTo);
 
     List<Status> rows = new ArrayList<>();
-    for (IndexCacheProtocol.NodeReport report : control.coordinator().nodeReports().values()) {
+    for (IndexCacheProtocol.NodeReport report : control.nodeReports()) {
       long ageNanos = ages.getOrDefault(report.executorId(), 0L);
       rows.add(
           new Status(
@@ -105,7 +111,7 @@ public final class IndexCacheControl {
 
   /** The protection the index currently has, or an empty list when nothing is managed. */
   public static List<String> managedIndexes(SparkSession spark) {
-    return new ArrayList<>(controlOf(spark).coordinator().protectedIndexes().keySet());
+    return new ArrayList<>(controlOf(spark).protectedIndexes().keySet());
   }
 
   private static IndexCacheDriverControl controlOf(SparkSession spark) {
@@ -275,13 +281,17 @@ public final class IndexCacheControl {
     }
 
     static Result from(IndexCacheDriverControl control, IndexCacheProtocol.Result result) {
-      Map<String, String> placements = control.coordinator().placements(result.planId());
+      Map<String, String> placements = control.placements(result.planId());
+      Map<String, Long> plannedBytes = control.plannedBytes(result.planId());
       IndexCacheProtocol.Protection protection = result.protection();
       List<FileResult> files = new ArrayList<>();
       for (String location : result.targetFiles()) {
         files.add(
             new FileResult(
-                location, placements.get(location), null, result.uncovered().get(location)));
+                location,
+                placements.get(location),
+                plannedBytes.get(location),
+                result.uncovered().get(location)));
       }
 
       return new Result(

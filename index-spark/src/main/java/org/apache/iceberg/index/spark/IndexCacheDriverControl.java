@@ -19,6 +19,7 @@
 package org.apache.iceberg.index.spark;
 
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
 import org.apache.iceberg.relocated.com.google.common.base.Preconditions;
 
@@ -52,6 +53,51 @@ final class IndexCacheDriverControl {
         "Unsupported control message: " + message.getClass().getName());
   }
 
+  // Every state-machine entry point is serialized here: Spark delivers reports and ACKs on a pool
+  // of driver threads while a SQL call or a query may touch the same coordinator.
+
+  synchronized String acceptLoad(
+      IndexCacheProtocol.Target target, IndexResidencyPolicy policy, long nowNanos) {
+    return coordinator.acceptLoad(target, policy, nowNanos);
+  }
+
+  synchronized String acceptOffload(String indexUuid, long nowNanos) {
+    return coordinator.acceptOffload(indexUuid, nowNanos);
+  }
+
+  synchronized IndexCacheProtocol.Result result(String planId) {
+    return coordinator.result(planId);
+  }
+
+  synchronized void recordAccess(String indexUuid, long nowNanos) {
+    coordinator.recordAccess(indexUuid, nowNanos);
+  }
+
+  synchronized Map<String, String> placements(String planId) {
+    return coordinator.placements(planId);
+  }
+
+  synchronized Map<String, Long> plannedBytes(String planId) {
+    return coordinator.plannedBytes(planId);
+  }
+
+  synchronized Map<String, IndexCacheProtocol.Protection> protectedIndexes() {
+    return coordinator.protectedIndexes();
+  }
+
+  synchronized List<IndexCacheProtocol.NodeReport> nodeReports() {
+    return List.copyOf(coordinator.nodeReports().values());
+  }
+
+  synchronized Map<String, Long> reportAges(long nowNanos) {
+    return coordinator.nodeReportAgeNanos(nowNanos);
+  }
+
+  synchronized boolean hasExecutors() {
+    return !coordinator.nodeReports().isEmpty();
+  }
+
+  /** Only for tests: production paths must use the synchronized entry points above. */
   IndexResidencyCoordinator coordinator() {
     return coordinator;
   }
