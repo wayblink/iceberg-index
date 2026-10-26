@@ -92,9 +92,15 @@ Lance 上 14.9 s、Parquet 上 60–93 s。</p>
 延迟构成会变。</li>
 <li><b>索引常驻</b>——这里没有显式设置缓存预算（沿用按工作集与堆推导的默认值，6 执行器 × 12 GB 堆），
 常驻策略在 #2391 里单独推进。</li>
-</ul></div><h2>交叉验证</h2><div class="card"><table><thead><tr><th>run</th><th>臂</th><th>over</th><th>recall</th><th>中位延迟</th><th>轮次</th></tr></thead><tbody><tr><td>confirm-100m-lance-b1</td><td class='arm'><code>IVF·1bit</code></td><td>10</td><td>0.800</td><td>7.0 s</td><td>6</td></tr><tr><td>confirm-100m-lance-b1</td><td class='arm'><code>IVF·1bit</code></td><td>100</td><td>1.000</td><td>11.3 s</td><td>6</td></tr><tr><td>confirm-100m-lance-b3</td><td class='arm'><code>IVF·3bit</code></td><td>10</td><td>1.000</td><td>53.0 s</td><td>6</td></tr><tr><td>confirm-100m-lance-b3</td><td class='arm'><code>IVF·3bit</code></td><td>100</td><td>1.000</td><td>20.7 s</td><td>6</td></tr></tbody></table><p class="note">100M Lance 的 1bit 与 3bit 各跑一次，每次只测一个索引、独立 JVM，用来排除同一轮内缓存顺序造成的假象；两个数都与网格一致。</p></div><h2>材料</h2><div class="card">
+</ul>
+<p class="note"><b>一个已经决定不去追的问题</b>：100M Parquet 上 1bit@100 与 3bit@10 谁更快，
+两轮跑给出相反排序（93.3 vs 51.7 s，60.0 vs 70.3 s），差额在 20% 以内。要把它压成有方向的结论，
+需要在独占集群上重测约 3 小时（固定 6 查询、反转臂顺序以抵掉冷启动的位置效应）。这个代价能买到的
+只是一句"谁快 20%"，而两种配置都远快于全表扫描（140 s），且 3bit@10 的成本不依赖那个随查询翻倍
+抖动的回表单价——所以这里按<b>相当</b>收口，把时间留给上一项的 nprobe 曲线。</p></div><h2>交叉验证</h2><div class="card"><table><thead><tr><th>run</th><th>臂</th><th>over</th><th>recall</th><th>中位延迟</th><th>轮次</th></tr></thead><tbody><tr><td>confirm-100m-lance-b1</td><td class='arm'><code>IVF·1bit</code></td><td>10</td><td>0.800</td><td>7.0 s</td><td>6</td></tr><tr><td>confirm-100m-lance-b1</td><td class='arm'><code>IVF·1bit</code></td><td>100</td><td>1.000</td><td>11.3 s</td><td>6</td></tr><tr><td>confirm-100m-lance-b3</td><td class='arm'><code>IVF·3bit</code></td><td>10</td><td>1.000</td><td>53.0 s</td><td>6</td></tr><tr><td>confirm-100m-lance-b3</td><td class='arm'><code>IVF·3bit</code></td><td>100</td><td>1.000</td><td>20.7 s</td><td>6</td></tr></tbody></table><p class="note">100M Lance 的 1bit 与 3bit 各跑一次，每次只测一个索引、独立 JVM，用来排除同一轮内缓存顺序造成的假象；两个数都与网格一致。</p></div><h2>材料</h2><div class="card">
 <ul>
 <li>详细报告（全部曲线、每次查询的值、四分位汇总）：<code>reports/vector-index-benchmark.html</code></li>
+<li>本页的权威副本：<code>docs/sift-vector-index-benchmark.html</code>（提交进仓库；memory docs 里那份与之逐字节相同）</li>
 <li>原始日志：<code>tools/vector-benchmark/results/grid-*.log</code>、<code>flat-*.log</code></li>
 <li>复现方式：<code>tools/vector-benchmark/README.md</code>（<code>run-benchmark.sh</code> +
 <code>build-report.py</code> + <code>build-summary.py</code>）</li>

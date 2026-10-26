@@ -96,9 +96,15 @@ per-query spread), the summary table, the method and its caveats, and every raw 
 ## Summarising a card
 
 ```bash
-./build-summary.py                       # results/grid-*.log + results/flat-*.log
+./build-summary.py                       # writes ../../docs/sift-vector-index-benchmark.html
 ./build-summary.py results/grid-10m-parquet.log -o /tmp/one-table.html
 ```
+
+The summary is a decision document, so its default output is `docs/` and it is committed: that copy
+is the authoritative one, and the memory store keeps a byte-identical copy
+(`umem upsert-doc --doc <name>.html --text-stdin < ../../docs/sift-vector-index-benchmark.html`).
+Check the two with sha256 rather than trusting the copy. The detailed report stays in `reports/` —
+it is regenerated evidence, not a document.
 
 The detailed report is too big to answer "what should we ship" at a glance, so this renders one page
 that does: the recommendation per table, the full matrix, the narrowest candidate list each arm needs

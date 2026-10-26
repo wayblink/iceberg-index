@@ -624,7 +624,12 @@ Lance 上 14.9 s、Parquet 上 60–93 s。</p>
 延迟构成会变。</li>
 <li><b>索引常驻</b>——这里没有显式设置缓存预算（沿用按工作集与堆推导的默认值，6 执行器 × 12 GB 堆），
 常驻策略在 #2391 里单独推进。</li>
-</ul></div>""")
+</ul>
+<p class="note"><b>一个已经决定不去追的问题</b>：100M Parquet 上 1bit@100 与 3bit@10 谁更快，
+两轮跑给出相反排序（93.3 vs 51.7 s，60.0 vs 70.3 s），差额在 20% 以内。要把它压成有方向的结论，
+需要在独占集群上重测约 3 小时（固定 6 查询、反转臂顺序以抵掉冷启动的位置效应）。这个代价能买到的
+只是一句"谁快 20%"，而两种配置都远快于全表扫描（140 s），且 3bit@10 的成本不依赖那个随查询翻倍
+抖动的回表单价——所以这里按<b>相当</b>收口，把时间留给上一项的 nprobe 曲线。</p></div>""")
 
     if confirmations:
         parts.append('<h2>交叉验证</h2><div class="card"><table><thead><tr>'
@@ -647,6 +652,7 @@ Lance 上 14.9 s、Parquet 上 60–93 s。</p>
     parts.append(f"""<h2>材料</h2><div class="card">
 <ul>
 <li>详细报告（全部曲线、每次查询的值、四分位汇总）：<code>reports/vector-index-benchmark.html</code></li>
+<li>本页的权威副本：<code>docs/sift-vector-index-benchmark.html</code>（提交进仓库；memory docs 里那份与之逐字节相同）</li>
 <li>原始日志：<code>tools/vector-benchmark/results/grid-*.log</code>、<code>flat-*.log</code></li>
 <li>复现方式：<code>tools/vector-benchmark/README.md</code>（<code>run-benchmark.sh</code> +
 <code>build-report.py</code> + <code>build-summary.py</code>）</li>
@@ -660,8 +666,10 @@ Lance 上 14.9 s、Parquet 上 60–93 s。</p>
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("logs", nargs="*", help="benchmark logs; defaults to the whole grid")
-    parser.add_argument("-o", "--out", default=os.path.join(HERE, "..", "..", "reports",
-                                                           "vector-index-1948-summary.html"))
+    # the summary is a decision document, so it lives under docs/ (committed, and mirrored into the
+    # memory store byte for byte); the detailed report stays in reports/ as generated evidence
+    parser.add_argument("-o", "--out", default=os.path.join(HERE, "..", "..", "docs",
+                                                           "sift-vector-index-benchmark.html"))
     parser.add_argument("--title", default="Iceberg 向量索引基准 · 结论摘要（SIFT 10M / 100M）")
     parser.add_argument("--confirmations", nargs="*", default=None,
                         help="logs of the isolated single-arm runs, shown as cross-checks")
