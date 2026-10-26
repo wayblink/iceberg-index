@@ -93,6 +93,22 @@ The report is one HTML file with inline CSS and inline SVG: no network, no JavaS
 It carries the charts (recall and latency against the setting, the recall/latency trade-off, the
 per-query spread), the summary table, the method and its caveats, and every raw measurement.
 
+## Summarising a card
+
+```bash
+./build-summary.py                       # results/grid-*.log + results/flat-*.log
+./build-summary.py results/grid-10m-parquet.log -o /tmp/one-table.html
+```
+
+The detailed report is too big to answer "what should we ship" at a glance, so this renders one page
+that does: the recommendation per table, the full matrix, the narrowest candidate list each arm needs
+to reach exact recall, the same numbers as a log-scale bar chart, the build cost, the caveats that
+make a single number untrustworthy, and what is still unmeasured. It reads the same logs through
+`build-report.py`, so the two cannot drift; the build times come from `results/build-times.json`,
+which is the one input that has to be written by hand because HDFS file timestamps are not in the
+logs. Isolated single-arm runs named `results/confirm-*.log` are picked up as cross-checks rather
+than mixed into the matrix, since they were measured with a different cache state.
+
 ## Failing a run that got worse
 
 `../vector-index-gate.py` reads two logs and exits non-zero when a setting regressed by more than
