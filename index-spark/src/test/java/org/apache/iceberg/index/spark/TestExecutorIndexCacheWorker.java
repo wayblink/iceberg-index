@@ -507,6 +507,28 @@ class TestExecutorIndexCacheWorker {
   }
 
   @Test
+  void aNewTargetWaitsForReferencesAQueryAlreadyHolds() {
+    IndexCacheProtocol.Command first = load("A", "f1", 1);
+    assertThat(worker.execute(first).status()).isEqualTo(IndexCacheProtocol.AckStatus.LOADED);
+
+    // A query is still using the copy the executor already handed out.
+    ExecutorIndexCache.Lease lease = cache.acquireManaged("A", 1, "adapter|A|f1");
+    assertThat(lease).isNotNull();
+    try {
+      IndexCacheProtocol.Ack blocked = worker.execute(load("A", "f2", 2));
+      assertThat(blocked.reason()).isEqualTo("BUSY");
+      assertThat(worker.holders()).doesNotContainKey("adapter|A|f2");
+    } finally {
+      lease.close();
+    }
+
+    // Once that query is done, the new target is applied and the file loads.
+    assertThat(worker.execute(load("A", "f2", 2)).status())
+        .isEqualTo(IndexCacheProtocol.AckStatus.LOADED);
+    assertThat(worker.holders()).containsKey("adapter|A|f2");
+  }
+
+  @Test
   void workerConfigurationRejectsNonPositiveValues() {
     assertThatThrownBy(
             () ->

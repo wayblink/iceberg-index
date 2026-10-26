@@ -42,6 +42,12 @@ final class ExecutorIndexCacheWorker implements AutoCloseable {
 
   private record Installed(long epoch, long bytes) {}
 
+  private enum TargetDecision {
+    APPLIED,
+    STALE,
+    BUSY
+  }
+
   private final String session;
   private final String executorId;
   private final String incarnation;
@@ -140,11 +146,19 @@ final class ExecutorIndexCacheWorker implements AutoCloseable {
    * commands, not by guessing a whole target from one command. A delayed older epoch is refused so
    * it cannot roll the target back.
    */
-  private boolean ensureTarget(String indexUuid, long epoch, String cacheKey) {
+  private TargetDecision ensureTarget(String indexUuid, long epoch, String cacheKey) {
     synchronized (stateLock) {
       Long applied = targetEpoch.get(indexUuid);
       if (applied != null && epoch < applied) {
-        return false;
+        return TargetDecision.STALE;
+      }
+
+      if (applied == null || epoch > applied) {
+        // Taking over a new target while a query still holds a copy would change what that query
+        // is using mid-search, so the first managed target waits for those references to finish.
+        if (cache.hasReferencesInUse()) {
+          return TargetDecision.BUSY;
+        }
       }
 
       Set<String> keys = targetKeys.computeIfAbsent(indexUuid, ignored -> new LinkedHashSet<>());
@@ -156,7 +170,7 @@ final class ExecutorIndexCacheWorker implements AutoCloseable {
         cache.addManagedKeys(indexUuid, epoch, Set.of(cacheKey));
       }
 
-      return true;
+      return TargetDecision.APPLIED;
     }
   }
 
@@ -172,8 +186,11 @@ final class ExecutorIndexCacheWorker implements AutoCloseable {
       return reject(command, "STALE_EPOCH");
     }
 
-    if (!ensureTarget(command.indexUuid(), command.epoch(), cacheKey)) {
+    TargetDecision decision = ensureTarget(command.indexUuid(), command.epoch(), cacheKey);
+    if (decision == TargetDecision.STALE) {
       return reject(command, "STALE_EPOCH");
+    } else if (decision == TargetDecision.BUSY) {
+      return reject(command, BUSY);
     }
 
     if (estimate > cacheConfig.maxEntryBytes()) {

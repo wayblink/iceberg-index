@@ -777,6 +777,28 @@ final class ExecutorIndexCache {
     }
   }
 
+  /**
+   * True while any cached file is held by a running search or lease. A managed target may only be
+   * applied once the references a query already received have finished.
+   */
+  boolean hasReferencesInUse() {
+    synchronized (mapLock) {
+      for (CachedFile file : probation.values()) {
+        if (file.inUse()) {
+          return true;
+        }
+      }
+
+      for (CachedFile file : protectedFiles.values()) {
+        if (file.inUse()) {
+          return true;
+        }
+      }
+
+      return false;
+    }
+  }
+
   /** Adds keys to an index's current target, so a plan can arrive file by file. */
   void addManagedKeys(String indexUuid, long epoch, Set<String> cacheKeys) {
     synchronized (mapLock) {
