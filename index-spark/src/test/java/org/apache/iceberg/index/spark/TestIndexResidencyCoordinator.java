@@ -965,8 +965,9 @@ class TestIndexResidencyCoordinator {
             .holders(Map.of("adapter|stale|s1", 40L, "adapter|fresh|f1", 20L))
             .accessAgeNanos(Map.of("stale", Long.MAX_VALUE - 1, "fresh", SECOND))
             .build());
-    // Time must pass after the report, otherwise an overflowing addition never happens.
-    clock.advance(10 * SECOND);
+    // Time must pass after the report, otherwise an overflowing addition never happens. One second
+    // is enough and stays away from the ten-second staleness boundary.
+    clock.advance(SECOND);
 
     String plan =
         coordinator.acceptLoad(

@@ -107,7 +107,7 @@ final class IndexResidencyCoordinator {
     private final Set<String> reused = new LinkedHashSet<>();
     private final Map<String, String> migrationTargets = new LinkedHashMap<>();
     private final Map<String, String> migrationNotices = new LinkedHashMap<>();
-    private final Map<String, String> migrationSources = new LinkedHashMap<>();
+    private final Map<String, Holder> migrationSources = new LinkedHashMap<>();
     private final Set<String> released = new LinkedHashSet<>();
     private boolean superseded;
     private final Set<String> orphansReleased = new LinkedHashSet<>();
@@ -316,6 +316,7 @@ final class IndexResidencyCoordinator {
     for (PlanState open : plans.values()) {
       if (open.indexUuid.equals(indexUuid) && !open.finalized()) {
         fencePlan(open, "OFFLOADED");
+        open.superseded = true;
       }
     }
 
@@ -600,7 +601,7 @@ final class IndexResidencyCoordinator {
   void expire(String planId, long nowNanos) {
     PlanState plan = plans.get(planId);
     if (plan != null) {
-      fencePlan(plan, "CANCELLED");
+      fencePlan(plan, "TIMED_OUT");
     }
   }
 
@@ -854,7 +855,7 @@ final class IndexResidencyCoordinator {
           file,
           file.estimatedBytes());
       plan.migrationTargets.put(location, destination.report.executorId());
-      plan.migrationSources.put(file.cacheKey(), current.executorId());
+      plan.migrationSources.put(file.cacheKey(), current);
     }
   }
 
@@ -879,22 +880,18 @@ final class IndexResidencyCoordinator {
 
   /** Releases the previous node's copy of a migrated file once the replacement is confirmed. */
   private void releaseMigratedCopy(PlanState plan, PlanFile migrated, String executorId) {
-    String source = plan.migrationSources.get(migrated.cacheKey);
-    if (source == null || source.equals(executorId) || !plan.released.add(migrated.cacheKey)) {
+    // The source holder was captured when the migration was planned, so a node that went silent
+    // cannot turn the release into a copy-less command.
+    Holder source = plan.migrationSources.get(migrated.cacheKey);
+    if (source == null
+        || source.executorId().equals(executorId)
+        || !plan.released.add(migrated.cacheKey)) {
       return;
     }
 
-    NodeState node = nodes.get(source);
+    NodeState node = nodes.get(source.executorId());
     if (node == null) {
       return;
-    }
-
-    String installedBy = null;
-    for (Holder holder : holdersOfKey(migrated.cacheKey)) {
-      if (holder.executorId().equals(source)) {
-        installedBy = holder.installedBy();
-        break;
-      }
     }
 
     enqueue(
@@ -910,7 +907,7 @@ final class IndexResidencyCoordinator {
             .build(),
         migrated.bytes,
         plan.epoch,
-        installedBy);
+        source.installedBy());
   }
 
   /**
@@ -1221,6 +1218,8 @@ final class IndexResidencyCoordinator {
   private List<IndexCacheProtocol.NodeReport> reportsFor(String planId) {
     List<IndexCacheProtocol.NodeReport> reports = new ArrayList<>();
     for (NodeState node : nodes.values()) {
+      // reservedBytesFor is a subset of reservedBytes, so this is non-negative; clamp anyway so a
+      // silent overflow cannot turn into a negative occupancy that hides a capacity problem.
       long others = Math.max(0, node.reservedBytes() - node.reservedBytesFor(planId));
 
       // Occupancy includes retained copies plus every other plan's unresolved promise; the
