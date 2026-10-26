@@ -248,7 +248,39 @@ def candidate_prices(runs, wide=100, narrow=10, limit=10):
     return prices
 
 
-def build(runs, confirmations, build_times, title):
+def paired_comparison(runs, arm_a, over_a, arm_b, over_b):
+    """Per query, the warm repeat of two arms, compared inside the same table.
+
+    The logs are split per index, so an arm and its rival live in different run dicts; they are
+    regrouped by table here. Taking the last repeat matters: each arm pays its payload load on its
+    first touch, and that cold number is 5-10x the warm one.
+    """
+    # only a run that measured both arms can be paired, and only inside that run: merging two runs
+    # would compare a warm cell of one against a cold cell of the other
+    warm = {}
+    for run in runs:
+        log = run["name"].split(" · ")[0]
+        for row in run["results"]:
+            key = (log, row.get("index"), row.get("over"), row.get("query"))
+            warm.setdefault(key, []).append((row.get("repeat", 0), row["ms"]))
+    pairs = {}
+    logs = sorted({log for (log, _, _, _) in warm})
+    for log in logs:
+        table = {}
+        for query in sorted({q for (l, _, _, q) in warm if l == log}):
+            a = warm.get((log, arm_a, over_a, query))
+            b = warm.get((log, arm_b, over_b, query))
+            if not a or not b:
+                continue
+            # the highest repeat number is the warmest: repeat 1 of a cell can be the run's
+            # first touch of that payload
+            table[query] = (sorted(a)[-1][1], sorted(b)[-1][1])
+        if table:
+            pairs[log] = table
+    return pairs
+
+
+def build(runs, confirmations, replications, build_times, title):
     ceilings, cheapest = cheapest_full_recall(runs)
     summary = tables_of(runs)
     sizes = {}
@@ -341,12 +373,15 @@ benchmark 日志，与详细报告同源，未经二次加工</p>
 <i>达到精确 recall 所需的最窄候选</i>摊开比较，1bit 反而最快：它的索引只有 3bit 的一半
 （323 vs 630 MB，3.21 vs 6.28 GB），每个候选只有 16 字节量化码、打分是 popcount，
 多买一个数量级的候选比多读一倍索引便宜得多。</p>
-<p>唯一的例外是 100M Parquet，那一格必须用 3bit + over=10（51.7 s）。原因不在索引而在回表：
-同一份 3.21 GB 的 1bit 索引、同样 1000 个候选，Lance 上 13.5 s、Parquet 上 93.3 s——
-Parquet 的行级随机读按页取数，候选放宽十倍就按十倍付费。但这个"Lance 更快"只对<b>按候选回表</b>
-的臂成立：不按候选回表的臂上两种格式相当甚至 Parquet 更快（100M 的 FLAT 是 98.0 vs 121.8 s，
-IVF 未量化 353.6 vs 366.2 s，HNSW 139.4 vs 134.9 s；10M 的全表扫描中位也是 Parquet 14.0 s
-比 Lance 18.4 s 快）。</p>
+<p>100M Parquet 是唯一说不清明细的一格，而且两次跑给出相反的排序：2 查询那次 3bit@10 是
+51.7 s、1bit@100 是 93.3 s；补做的 6 查询复核里 1bit@100 变成 60.0 s、3bit@10 是 70.3 s，
+逐查询配对看 1bit 赢 4/6、中位只快 1.2 倍，但 q4 上它反过来慢一倍（123.6 vs 62.9 s）。
+所以这一格应当当作<b>两者相当</b>，落地时选 3bit@10：它的成本不依赖"一个候选多少钱"这个
+既贵又随查询抖动的项。原因不在索引而在回表——同一份 3.21 GB 的 1bit 索引、同样 1000 个候选，
+Lance 上 14.9 s、Parquet 上 60–93 s。</p>
+<p>这个"Lance 更快"只对<b>按候选回表</b>的臂成立：不按候选回表的臂上两种格式相当甚至 Parquet
+更快（100M 的 FLAT 是 98.0 vs 121.8 s，IVF 未量化 353.6 vs 366.2 s，HNSW 139.4 vs 134.9 s；
+10M 的全表扫描中位也是 Parquet 14.0 s 比 Lance 18.4 s 快）。</p>
 <p>还有个容易被漏掉的事实：收紧候选宽度这件"优化"在 10M 上完全免费，在 100M 上却很贵，
 而且贵多少由格式决定。下一节把它单独量了出来。</p>
 </div>""")
@@ -489,6 +524,58 @@ IVF 未量化 353.6 vs 366.2 s，HNSW 139.4 vs 134.9 s；10M 的全表扫描中�
                  "横轴是 over-sample（最左为直接调用/暴力）。</p>"
                  f'<div class="panels">{"".join(panels)}</div>')
 
+    # ---- the replication that decides how far the 100M ranking can be pushed
+    if replications:
+        pairs = paired_comparison(replications, "ivf_1bit", 100, "ivf_3bit", 10)
+        if pairs:
+            parts.append('<h2>补测：100M 用 6 个查询复核</h2><div class="card">'
+                         '<p class="note" style="margin-top:0">原网格每张 100M 表只测了 2 个查询，'
+                         '不足以支撑"1bit 比 3bit 快多少"。这轮只测三个量化臂、每个臂 10 与 100 两个候选宽度、'
+                         '6 个查询 × 2 轮，两张表各一次、串行执行。下表是<b>逐查询配对</b>的结果：'
+                         "同一查询下 1bit@100 与 3bit@10 的暖态耗时，查询之间的难度差异因此被消掉。</p>"
+                         '<table><thead><tr><th>规模 / 数据格式</th>'
+                         + "".join(f"<th>q{q}</th>" for q in range(1, 7))
+                         + "<th>中位比值</th></tr></thead><tbody>")
+            for key in sorted(pairs, reverse=True):
+                table = pairs[key]
+                ratios = [b / a for a, b in table.values() if a]
+                cells_ = "".join(
+                    f"<td>{table[q][1] / table[q][0]:.2f}×</td>" if q in table else "<td>—</td>"
+                    for q in range(1, 7))
+                tail = key.replace("cmp-", "").replace("-q6", "")
+                label = ("100M · " + tail.split("-")[-1].capitalize()) if "100m" in tail else tail
+                parts.append(
+                    f"<tr><td><b>{esc(label)}</b></td>{cells_}"
+                    f"<td><b>{statistics.median(ratios):.2f}×</b>"
+                    f"<br><span class='sub-value'>{sum(1 for r in ratios if r > 1)}/{len(ratios)} 个查询</span>"
+                    "</td></tr>")
+            parts.append("</tbody></table>"
+                         '<p class="note">比值 &gt;1 表示 1bit@100 更快，&lt;1 表示 3bit@10 更快。'
+                         "<b>Lance 上 6 个查询全胜</b>，中位 2.5 倍，与前面两轮独立复现一致；"
+                         "<b>Parquet 上只赢 4/6</b>，中位 1.2 倍，q4 上反而慢一倍——"
+                         "所以那一格只能算相当：候选越宽，对「一个候选多少钱」这个最抖的项依赖越重。</p>"
+                         "</div>")
+
+            # the same runs, unpaired: what each cell costs in absolute terms
+            parts.append('<div class="card"><table><thead><tr>'
+                         "<th>run</th><th>臂</th><th>over</th><th>recall</th>"
+                         "<th>中位延迟</th><th>测量次数</th></tr></thead><tbody>")
+            for run in replications:
+                per_over = by_over(run)
+                for over in sorted(per_over):
+                    entry = per_over[over]
+                    parts.append(
+                        f"<tr><td>{esc(run['name'])}</td>"
+                        f"<td class='arm'><code>{esc(arm_of(run))}</code></td>"
+                        f"<td>{over}</td><td>{statistics.mean(entry['recall']):.3f}</td>"
+                        f"<td>{statistics.median(entry['ms']) / 1000:.1f} s</td>"
+                        f"<td>{len(entry['ms'])}</td></tr>")
+            parts.append("</tbody></table>"
+                         '<p class="note">这一轮与另一份 benchmark 有重叠时段，绝对值可能偏高'
+                         "（同一格子另一轮是 13.5 s / 51.7 s）；同一查询的三个臂连续测，"
+                         "所以配对比值不受影响。另一处细节：每个臂第一次被触碰时是冷的"
+                         "（q1 首轮 522.9 / 506.1 / 395.4 s），配对比值取的是暖态那一轮。</p></div>")
+
     # ---- build cost
     if build_times:
         parts.append('<h2>构建耗时</h2><div class="card"><table><thead><tr>'
@@ -517,7 +604,11 @@ IVF 未量化 353.6 vs 366.2 s，HNSW 139.4 vs 134.9 s；10M 的全表扫描中�
 2 个查询 × 2 轮（每格 4 次），因为 100M 单次查询从 8 s 到 900 s 不等，多查询会把一轮拉到几十小时。
 所以 100M 的结论比 10M 脆：同一张表上 3bit 在网格里是查询 1 约 33–44 s、查询 2 约 36–44 s，
 而在单臂隔离复现里是 76–97 s 与 13–20 s，两个查询的相对难度会随缓存状态翻转；
-"1bit 比 3bit 快"这个方向两次跑都成立，但"快 2.8 倍"不该当常数用。</li>
+"1bit 比 3bit 快"这个方向在三次跑里都成立，但倍数从 2.5 到 4.7 不等。</li>
+<li><b>100M 另做了一轮 6 查询复核</b>（只测三个量化臂、两格式各一轮，串行）：Lance 上 1bit@100
+在 6 个查询上全胜、中位 2.5 倍；Parquet 上 1bit 只赢 4/6、中位 1.2 倍且 q4 慢一倍，
+与 2 查询那轮的排序相反——所以 Parquet 那一格按"相当"处理。复核跑与另一份 benchmark 有重叠时段，
+绝对值可能偏高，但同一查询的三臂是连续测的，配对比值不受影响。</li>
 <li><b>nprobe 没有系统扫。</b>10M 全用 150、100M 全用 32，只有两个点。已有的独立测量显示
 10M 上从 150 降到 32 还能快约 2.2 倍而 recall 几乎不变，所以 10M 的绝对延迟还有余量没算进来。</li>
 <li><b>构建耗时只能读到分钟。</b>按索引元数据 g1→gN 的时间戳计算，含 driver 启动约 1 分钟，
@@ -591,7 +682,15 @@ def main():
     confirm_paths = options.confirmations
     if confirm_paths is None:
         confirm_paths = sorted(glob.glob(os.path.join(HERE, "results", "confirm-*.log")))
+        replication_paths = sorted(glob.glob(os.path.join(HERE, "results", "cmp-*.log")))
+    else:
+        # an explicit list may hold either kind; the filename says which
+        replication_paths = [path for path in confirm_paths
+                             if os.path.basename(path).startswith("cmp-")]
+        confirm_paths = [path for path in confirm_paths
+                         if not os.path.basename(path).startswith("cmp-")]
     confirmations = load(confirm_paths) if confirm_paths else []
+    replications = load(replication_paths) if replication_paths else []
 
     build_times = {}
     if options.build_times and os.path.exists(options.build_times):
@@ -599,7 +698,7 @@ def main():
             build_times = json.load(handle)
 
     with open(options.out, "w", encoding="utf-8") as handle:
-        handle.write(build(runs, confirmations, build_times, options.title))
+        handle.write(build(runs, confirmations, replications, build_times, options.title))
     print(f"wrote {os.path.normpath(options.out)}")
 
 
