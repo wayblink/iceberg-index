@@ -189,7 +189,7 @@ public final class DistributedIndexSearch {
                         String location = locations1.next();
                         long readStart = System.nanoTime();
                         ExecutorIndexCache cache = ExecutorIndexCache.get();
-                        String managedKey = cacheKey(cacheConfig, cacheKey, location);
+                        String managedKey = cacheKey(cacheConfig.owner(), cacheKey, location);
                         // A file residency management owns is leased, so a release waits for this
                         // query; anything else keeps the old lazy behaviour.
                         ExecutorIndexCache.Lease lease = cache.acquireManagedKey(managedKey);
@@ -329,9 +329,13 @@ public final class DistributedIndexSearch {
                       while (locations1.hasNext()) {
                         String location = locations1.next();
                         long readStart = System.nanoTime();
+                        ExecutorIndexCache cache = ExecutorIndexCache.get();
+                        String managedKey = cacheKey(cacheConfig.owner(), cacheKey, location);
+                        ExecutorIndexCache.Lease lease = cache.acquireManagedKey(managedKey);
                         ExecutorIndexCache.CachedFile file =
-                            ExecutorIndexCache.get()
-                                .file(
+                            lease != null
+                                ? lease.file()
+                                : cache.file(
                                     location,
                                     cacheConfig,
                                     cacheKey,
@@ -339,21 +343,28 @@ public final class DistributedIndexSearch {
                         long readNanos = System.nanoTime() - readStart;
 
                         long searchStart = System.nanoTime();
-                        file.searching(
-                            prepared -> {
-                              for (int queryId = 0; queryId < fileQueries.size(); queryId++) {
-                                for (IndexSearchResult hit :
-                                    prepared.search(
-                                        ByteBuffer.wrap(fileQueries.get(queryId)), localTopK)) {
-                                  batchHits.add(
-                                      new Tuple2<>(
-                                          queryId,
-                                          new Tuple3<>(
-                                              hit.dataFile(), hit.rowPosition(), hit.score())));
+                        try {
+                          file.searching(
+                              prepared -> {
+                                for (int queryId = 0; queryId < fileQueries.size(); queryId++) {
+                                  for (IndexSearchResult hit :
+                                      prepared.search(
+                                          ByteBuffer.wrap(fileQueries.get(queryId)), localTopK)) {
+                                    batchHits.add(
+                                        new Tuple2<>(
+                                            queryId,
+                                            new Tuple3<>(
+                                                hit.dataFile(), hit.rowPosition(), hit.score())));
+                                  }
                                 }
-                              }
-                              return null;
-                            });
+                                return null;
+                              });
+                        } finally {
+                          if (lease != null) {
+                            lease.close();
+                          }
+                        }
+
                         LOG.debug(
                             "index file {} read {} ms, batch search of {} queries {} ms",
                             location.substring(location.lastIndexOf('/') + 1),
@@ -522,22 +533,18 @@ public final class DistributedIndexSearch {
   /**
    * The keys the cache stores an index file under, which is how a covered file is counted.
    *
-   * <p>The owner is part of the key the cache writes, so leaving it out here means no stored entry
-   * ever matches and the coverage a run reports is always zero -- the one number a budget is judged
-   * by, reporting that nothing was cached no matter what was.
+   * <p>/** The full cache key of one file: owner (the table location), adapter identity, and the
+   * file. Residency management plans its targets in exactly this shape, so a query must look up the
+   * same string; both builders go through this method.
    */
-  /**
-   * The full cache key of one file: table location, adapter identity, and the file. Residency
-   * management plans its targets in exactly this shape, so a query must look up the same string.
-   */
-  static String cacheKey(ExecutorIndexCache.Config config, String adapterKey, String location) {
-    return config.owner() + "|" + adapterKey + "|" + location;
+  static String cacheKey(String owner, String adapterKey, String location) {
+    return owner + "|" + adapterKey + "|" + location;
   }
 
   private static List<String> cacheKeys(String owner, String adapterKey, List<String> locations) {
     List<String> keys = Lists.newArrayListWithCapacity(locations.size());
     for (String location : locations) {
-      keys.add(owner + "|" + adapterKey + "|" + location);
+      keys.add(cacheKey(owner, adapterKey, location));
     }
 
     return keys;

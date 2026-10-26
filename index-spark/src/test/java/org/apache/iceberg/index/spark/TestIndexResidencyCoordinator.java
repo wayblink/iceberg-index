@@ -126,7 +126,8 @@ class TestIndexResidencyCoordinator {
     ackNode("a", "a-1");
     coordinator.report(node("a", "a-1", 3, 100, 20));
     String plan = coordinator.acceptOffload("A", clock.now());
-    assertThat(coordinator.result(plan).status()).isEqualTo(IndexCacheProtocol.Status.OFFLOADED);
+    // A is still resident, so the offload has one release to confirm.
+    assertThat(coordinator.result(plan).status()).isEqualTo(IndexCacheProtocol.Status.RELEASING);
     assertThat(coordinator.commands("a", "a-1"))
         .filteredOn(c -> c.type() == IndexCacheProtocol.CommandType.RELEASE)
         .isNotEmpty();
@@ -270,7 +271,7 @@ class TestIndexResidencyCoordinator {
     String offload = coordinator.acceptOffload("A", clock.now());
     // The executor answers the fenced file after the pause was published.
     ackFile(load, "f2", IndexCacheProtocol.AckStatus.LOADED);
-    assertThat(coordinator.result(offload).status()).isEqualTo(IndexCacheProtocol.Status.OFFLOADED);
+    assertThat(coordinator.result(offload).status()).isEqualTo(IndexCacheProtocol.Status.RELEASING);
     assertThat(coordinator.state("a", "a-1").holders()).doesNotContainKey("adapter|A|f2");
     assertThat(coordinator.commands("a", "a-1"))
         .filteredOn(c -> c.type() == IndexCacheProtocol.CommandType.RELEASE)

@@ -327,6 +327,7 @@ public final class IndexCacheControl {
     private final List<String> evictedIndexes;
     private final List<String> reusedFiles;
     private final Map<String, String> migrations;
+    private final Map<String, String> releasePending;
 
     private Result(
         String status,
@@ -341,7 +342,8 @@ public final class IndexCacheControl {
         Map<String, String> uncovered,
         List<String> evictedIndexes,
         List<String> reusedFiles,
-        Map<String, String> migrations) {
+        Map<String, String> migrations,
+        Map<String, String> releasePending) {
       this.status = status;
       this.planId = planId;
       this.indexUuid = indexUuid;
@@ -355,6 +357,7 @@ public final class IndexCacheControl {
       this.evictedIndexes = List.copyOf(evictedIndexes);
       this.reusedFiles = List.copyOf(reusedFiles);
       this.migrations = Map.copyOf(migrations);
+      this.releasePending = Map.copyOf(releasePending);
     }
 
     static Result from(IndexCacheDriverControl control, IndexCacheProtocol.Result result) {
@@ -384,7 +387,8 @@ public final class IndexCacheControl {
           result.uncovered(),
           result.evictedIndexes(),
           result.reusedFiles(),
-          result.migrations());
+          result.migrations(),
+          result.releasePending());
     }
 
     public String status() {
@@ -440,6 +444,11 @@ public final class IndexCacheControl {
     /** Files this plan moves to another executor first, then releases on the old one. */
     public Map<String, String> migrations() {
       return migrations;
+    }
+
+    /** Copies an offload asked an executor to release and has not seen acknowledged. */
+    public Map<String, String> releasePending() {
+      return releasePending;
     }
   }
 }

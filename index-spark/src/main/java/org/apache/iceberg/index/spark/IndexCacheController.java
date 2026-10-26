@@ -107,8 +107,17 @@ final class IndexCacheController {
 
     // No location check here: releasing an index only needs its identity, and a moved table must
     // still be able to offload what it loaded.
+    return offload(control, table, metadata, nowNanos, nowNanos + DEFAULT_WAIT_NANOS);
+  }
+
+  static IndexCacheProtocol.Result offload(
+      IndexCacheDriverControl control,
+      Table table,
+      IndexMetadata metadata,
+      long nowNanos,
+      long deadlineNanos) {
     String planId = control.acceptOffload(metadata.indexUuid(), nowNanos);
-    return control.result(planId);
+    return await(control, planId, deadlineNanos);
   }
 
   /** The plan target for the index snapshot covering the table's current snapshot. */

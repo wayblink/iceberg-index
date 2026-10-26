@@ -105,9 +105,9 @@ class TestIndexCacheControl {
     IndexCacheController.load(control, built.table(), built.metadata(), "forever", BASE, BASE);
 
     IndexCacheProtocol.Result first =
-        IndexCacheController.offload(control, built.table(), built.metadata(), BASE);
+        IndexCacheController.offload(control, built.table(), built.metadata(), BASE, BASE);
     IndexCacheProtocol.Result second =
-        IndexCacheController.offload(control, built.table(), built.metadata(), BASE);
+        IndexCacheController.offload(control, built.table(), built.metadata(), BASE, BASE);
 
     assertThat(first.status()).isEqualTo(IndexCacheProtocol.Status.OFFLOADED);
     assertThat(second.status()).isEqualTo(IndexCacheProtocol.Status.OFFLOADED);
@@ -305,11 +305,33 @@ class TestIndexCacheControl {
             .build());
 
     IndexCacheProtocol.Result offload =
-        IndexCacheController.offload(control, built.table(), built.metadata(), BASE);
+        IndexCacheController.offload(control, built.table(), built.metadata(), BASE, BASE);
 
-    assertThat(offload.status()).isEqualTo(IndexCacheProtocol.Status.OFFLOADED);
+    // A copy was acknowledged, so the release has to be confirmed before this is done.
+    assertThat(offload.status()).isEqualTo(IndexCacheProtocol.Status.RELEASING);
     assertThat(offload.targetFiles()).isNotEmpty();
-    assertThat(offload.uncovered().values()).containsOnly("RELEASING");
+    assertThat(offload.releasePending().values()).containsOnly("RELEASE_PENDING");
+
+    IndexCacheProtocol.Command release =
+        coordinator.commands("executor-1", "executor-1#1").stream()
+            .filter(c -> c.type() == IndexCacheProtocol.CommandType.RELEASE)
+            .findFirst()
+            .orElseThrow();
+    control.receive(
+        IndexCacheProtocol.Ack.builder()
+            .session("application-1")
+            .planId(offload.planId())
+            .commandId(release.commandId())
+            .executorId("executor-1")
+            .incarnation("executor-1#1")
+            .epoch(release.epoch())
+            .sequence(release.sequence())
+            .status(IndexCacheProtocol.AckStatus.RELEASED)
+            .bytes(0)
+            .build());
+
+    assertThat(control.result(offload.planId()).status())
+        .isEqualTo(IndexCacheProtocol.Status.OFFLOADED);
   }
 
   @Test

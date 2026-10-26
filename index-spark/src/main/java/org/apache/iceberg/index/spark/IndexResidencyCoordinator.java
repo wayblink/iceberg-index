@@ -65,6 +65,7 @@ final class IndexResidencyCoordinator {
     private boolean paused;
     private IndexCacheProtocol.Protection protection;
     private long snapshotId;
+    private boolean hasAccess;
     private long accessAgeNanos = Long.MAX_VALUE;
     private long accessObservedAtNanos;
     private Set<String> targetCacheKeys = new LinkedHashSet<>();
@@ -76,6 +77,7 @@ final class IndexResidencyCoordinator {
     private void accessed(long ageNanos, long observedAtNanos) {
       this.accessAgeNanos = ageNanos;
       this.accessObservedAtNanos = observedAtNanos;
+      this.hasAccess = true;
     }
 
     /** Age at {@code nowNanos}; larger means staler. Independent of any absolute clock epoch. */
@@ -115,6 +117,8 @@ final class IndexResidencyCoordinator {
     private final Map<String, String> migrationNotices = new LinkedHashMap<>();
     private final Map<String, Holder> migrationSources = new LinkedHashMap<>();
     private final Set<String> released = new LinkedHashSet<>();
+    private final Set<String> migrated = new LinkedHashSet<>();
+    private boolean offload;
     private boolean superseded;
     private final Set<String> orphansReleased = new LinkedHashSet<>();
     private final Map<String, Integer> attempts = new LinkedHashMap<>();
@@ -347,6 +351,7 @@ final class IndexResidencyCoordinator {
     plan.snapshotId = target.snapshotId();
     plans.put(plan.planId, plan);
     lastPlanId = plan.planId;
+    prunePlans();
     materialize(plan, target, index, previous);
     return plan.planId;
   }
@@ -366,9 +371,8 @@ final class IndexResidencyCoordinator {
       }
     }
 
-    PlanState plan =
-        new PlanState(
-            "plan-" + (++planCount), indexUuid, index.epoch, IndexCacheProtocol.Status.OFFLOADED);
+    PlanState plan = new PlanState("plan-" + (++planCount), indexUuid, index.epoch, null);
+    plan.offload = true;
     plans.put(plan.planId, plan);
     lastPlanId = plan.planId;
     List<Holder> toRelease = holders(indexUuid);
@@ -474,7 +478,8 @@ final class IndexResidencyCoordinator {
   Map<String, Long> accessAges(long nowNanos) {
     Map<String, Long> ages = new LinkedHashMap<>();
     for (IndexState index : indexedStates()) {
-      ages.put(index.indexUuid, index.ageAt(nowNanos));
+      // -1 means "no search has used this index", which a saturated age must not be confused with.
+      ages.put(index.indexUuid, index.hasAccess ? index.ageAt(nowNanos) : -1L);
     }
 
     return ages;
@@ -675,6 +680,35 @@ final class IndexResidencyCoordinator {
     }
   }
 
+  /**
+   * Keeps only a bounded window of finished plans, so a long-lived driver does not grow forever.
+   */
+  private void prunePlans() {
+    int finished = 0;
+    for (PlanState plan : plans.values()) {
+      if (plan.finalized()) {
+        finished++;
+      }
+    }
+
+    while (finished > 64) {
+      String oldest = null;
+      for (Map.Entry<String, PlanState> entry : plans.entrySet()) {
+        if (entry.getValue().finalized()) {
+          oldest = entry.getKey();
+          break;
+        }
+      }
+
+      if (oldest == null) {
+        return;
+      }
+
+      plans.remove(oldest);
+      finished--;
+    }
+  }
+
   IndexCacheProtocol.Result result(String planId) {
     return result0(planId);
   }
@@ -687,6 +721,21 @@ final class IndexResidencyCoordinator {
 
     IndexState index = indexes.get(plan.indexUuid);
     IndexCacheProtocol.Protection protection = index == null ? null : index.protection;
+    if (plan.offload) {
+      Map<String, String> pending = new LinkedHashMap<>();
+      for (IndexCacheProtocol.File file : plan.files) {
+        if (!plan.released.contains(file.cacheKey())) {
+          pending.put(file.location(), "RELEASE_PENDING");
+        }
+      }
+
+      IndexCacheProtocol.Status status =
+          pending.isEmpty()
+              ? IndexCacheProtocol.Status.OFFLOADED
+              : IndexCacheProtocol.Status.RELEASING;
+      return resultOf(plan, status, protection, Map.of(), plan.evicted, pending);
+    }
+
     if (plan.terminalStatus != null) {
       Map<String, String> releasing = new LinkedHashMap<>();
       for (IndexCacheProtocol.File file : plan.files) {
@@ -1088,7 +1137,7 @@ final class IndexResidencyCoordinator {
     Holder source = plan.migrationSources.get(migrated.cacheKey);
     if (source == null
         || source.executorId().equals(executorId)
-        || !plan.released.add(migrated.cacheKey)) {
+        || !plan.migrated.add(migrated.cacheKey)) {
       return;
     }
 
@@ -1728,6 +1777,16 @@ final class IndexResidencyCoordinator {
       IndexCacheProtocol.Protection protection,
       Map<String, String> uncovered,
       List<String> evicted) {
+    return resultOf(plan, status, protection, uncovered, evicted, Map.of());
+  }
+
+  private IndexCacheProtocol.Result resultOf(
+      PlanState plan,
+      IndexCacheProtocol.Status status,
+      IndexCacheProtocol.Protection protection,
+      Map<String, String> uncovered,
+      List<String> evicted,
+      Map<String, String> releasePending) {
     long resident = 0;
     for (PlanFile loaded : plan.loaded.values()) {
       resident = Math.addExact(resident, loaded.bytes);
@@ -1745,6 +1804,7 @@ final class IndexResidencyCoordinator {
         .residentBytes(resident)
         .evictedIndexes(evicted)
         .reusedFiles(plan.reused.stream().map(this::locationOfKey).toList())
+        .releasePending(releasePending)
         .migrations(plan.migrationTargets)
         .migrationNotices(plan.migrationNotices)
         .build();

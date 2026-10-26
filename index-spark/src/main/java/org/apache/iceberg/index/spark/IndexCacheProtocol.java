@@ -53,6 +53,7 @@ final class IndexCacheProtocol {
     COMPLETE,
     PARTIAL,
     FAILED,
+    RELEASING,
     OFFLOADED,
     CANCELLED
   }
@@ -1101,6 +1102,7 @@ final class IndexCacheProtocol {
     private final List<String> evictedIndexes;
     private final List<String> reusedFiles;
     private final Map<String, String> migrations;
+    private final Map<String, String> releasePending;
     private final Map<String, String> migrationNotices;
 
     private Result(Builder builder) {
@@ -1118,6 +1120,7 @@ final class IndexCacheProtocol {
       this.evictedIndexes = List.copyOf(builder.evictedIndexes);
       this.reusedFiles = List.copyOf(builder.reusedFiles);
       this.migrations = immutableMap(builder.migrations);
+      this.releasePending = immutableMap(builder.releasePending);
       this.migrationNotices = immutableMap(builder.migrationNotices);
     }
 
@@ -1175,6 +1178,11 @@ final class IndexCacheProtocol {
       return migrations;
     }
 
+    /** Copies this offload has asked an executor to release and has not seen acknowledged. */
+    Map<String, String> releasePending() {
+      return releasePending;
+    }
+
     /** Files that could not be rebalanced, with the reason, for example a missing second copy. */
     Map<String, String> migrationNotices() {
       return migrationNotices;
@@ -1193,6 +1201,7 @@ final class IndexCacheProtocol {
       private List<String> evictedIndexes = List.of();
       private List<String> reusedFiles = List.of();
       private Map<String, String> migrations = Map.of();
+      private Map<String, String> releasePending = Map.of();
       private Map<String, String> migrationNotices = Map.of();
 
       Builder planId(String value) {
@@ -1252,6 +1261,11 @@ final class IndexCacheProtocol {
 
       Builder migrations(Map<String, String> value) {
         this.migrations = value;
+        return this;
+      }
+
+      Builder releasePending(Map<String, String> value) {
+        this.releasePending = value;
         return this;
       }
 
