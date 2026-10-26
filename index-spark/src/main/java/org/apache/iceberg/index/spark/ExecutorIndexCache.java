@@ -786,9 +786,9 @@ final class ExecutorIndexCache {
   }
 
   /** Releases one file of an index; other files and other indexes keep their ownership. */
-  boolean releaseCopy(String indexUuid, long epoch, String cacheKey) {
+  boolean releaseCopy(String indexUuid, String cacheKey) {
     synchronized (mapLock) {
-      boolean released = ownership.releaseKey(indexUuid, epoch, cacheKey);
+      boolean released = ownership.releaseKey(indexUuid, cacheKey);
       releaseIfUnowned(cacheKey);
       mapLock.notifyAll();
       return released;

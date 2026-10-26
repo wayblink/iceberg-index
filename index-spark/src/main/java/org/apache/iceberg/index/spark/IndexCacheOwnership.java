@@ -97,13 +97,21 @@ final class IndexCacheOwnership {
     }
   }
 
-  /** Withdraws one key from an index's target; other keys and owners stay untouched. */
-  boolean releaseKey(String indexUuid, long epoch, String cacheKey) {
-    validate(indexUuid, epoch);
+  /**
+   * Withdraws one key from an index's current target; other keys and owners stay untouched.
+   *
+   * <p>The caller names the index and the file, not the epoch: a release is about ownership of a
+   * file, and the target the executor holds may already be newer than the plan that asked for the
+   * release.
+   */
+  boolean releaseKey(String indexUuid, String cacheKey) {
+    validate(indexUuid, 0L);
     Target target = targets.get(indexUuid);
-    if (target == null || target.epoch() != epoch || !target.keys().contains(cacheKey)) {
+    if (target == null || !target.keys().contains(cacheKey)) {
       return false;
     }
+
+    long epoch = target.epoch();
 
     Set<String> keys = new HashSet<>(target.keys());
     keys.remove(cacheKey);

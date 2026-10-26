@@ -18,6 +18,7 @@
  */
 package org.apache.iceberg.index.spark;
 
+import java.util.List;
 import java.util.Map;
 import org.apache.spark.SparkContext;
 import org.apache.spark.api.plugin.DriverPlugin;
@@ -52,8 +53,43 @@ public class IndexCachePlugin implements SparkPlugin {
 
     @Override
     public Map<String, String> init(SparkContext sc, PluginContext pluginContext) {
-      control = new IndexCacheDriverControl(new IndexResidencyCoordinator(System::nanoTime));
+      IndexCacheWorkerConfig config =
+          IndexCacheWorkerConfig.parse(pluginSettings(pluginContext.conf()));
+      control =
+          new IndexCacheDriverControl(
+              new IndexResidencyCoordinator(
+                  System::nanoTime, config.maxCommands(), config.maxAttempts()));
       return Map.of();
+    }
+
+    /**
+     * Spark stores per-plugin configuration under {@code spark.plugins.internal.conf.<plugin
+     * class>.<key>} for the executor; the driver reads the same names and falls back to the plain
+     * key for applications that set it directly.
+     */
+    private static Map<String, String> pluginSettings(org.apache.spark.SparkConf conf) {
+      Map<String, String> settings = new java.util.LinkedHashMap<>();
+      for (String key :
+          List.of(
+              IndexCacheWorkerConfig.POLL_INTERVAL,
+              IndexCacheWorkerConfig.STALE_AFTER,
+              IndexCacheWorkerConfig.MAX_COMMANDS,
+              IndexCacheWorkerConfig.MAX_CONCURRENT,
+              IndexCacheWorkerConfig.TIMEOUT,
+              IndexCacheWorkerConfig.MAX_ATTEMPTS)) {
+        String prefixed =
+            "spark.plugins.internal.conf." + IndexCachePlugin.class.getName() + "." + key;
+        String value = conf.get(prefixed, null);
+        if (value == null) {
+          value = conf.get(key, null);
+        }
+
+        if (value != null) {
+          settings.put(key, value);
+        }
+      }
+
+      return settings;
     }
 
     @Override

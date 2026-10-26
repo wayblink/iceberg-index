@@ -95,7 +95,7 @@ class TestExecutorIndexCacheWorker {
             .commandId("plan-1#1-LOAD")
             .type(IndexCacheProtocol.CommandType.LOAD)
             .mode("adapter")
-            .file(file("f1"))
+            .file(file("A", "f1"))
             .definition(DEFINITION)
             .io(
                 new org.apache.iceberg.hadoop.HadoopFileIO(
@@ -122,7 +122,7 @@ class TestExecutorIndexCacheWorker {
             .commandId("plan-1#1-LOAD")
             .type(IndexCacheProtocol.CommandType.LOAD)
             .mode("adapter")
-            .file(file("f1"))
+            .file(file("A", "f1"))
             .definition(DEFINITION)
             .io(
                 new org.apache.iceberg.hadoop.HadoopFileIO(
@@ -347,27 +347,38 @@ class TestExecutorIndexCacheWorker {
   }
 
   @Test
-  void releasingAFileTheNewTargetDroppedIsANoOpThatDoesNotResurrectIt() {
+  void aReleaseFromANewerPlanWithdrawsTheOldCopy() {
     worker.execute(load("A", "f1", 4));
-    // A newer target for the same index arrives before the release of the old file, and it does
-    // not list f1 any more.
+    // The replacement plan at epoch 5 wants f2 and withdraws f1, whose copy was installed at 4.
     worker.execute(load("A", "f2", 5));
 
     IndexCacheProtocol.Ack ack = worker.execute(release("A", "f1", 5));
 
+    // The release is authoritative for this index even though the copy is older than the command.
     assertThat(ack.status()).isEqualTo(IndexCacheProtocol.AckStatus.RELEASED);
-    assertThat(worker.holders()).doesNotContainKey("adapter|A|f1");
-    assertThat(worker.holders()).containsKey("adapter|A|f2");
+    assertThat(worker.holders()).containsOnlyKeys("adapter|A|f2");
   }
 
   @Test
-  void aNewTargetDropsFilesItNoLongerContains() {
+  void aNewTargetKeepsItsOtherFilesAndOtherIndexes() {
     worker.execute(load("A", "f1", 4));
-    // The replacement plan only wants f2, so f1 loses its owner and leaves the cache.
+    worker.execute(load("B", "g1", 4));
+    // A newer epoch for A adds f2; nothing it did not mention may be dropped, because an executor
+    // only ever sees one file at a time and the driver is the one that decides what to withdraw.
     worker.execute(load("A", "f2", 5));
 
-    assertThat(worker.holders()).doesNotContainKey("adapter|A|f1");
-    assertThat(worker.holders()).containsKey("adapter|A|f2");
+    assertThat(worker.holders()).containsKeys("adapter|A|f1", "adapter|A|f2", "adapter|B|g1");
+  }
+
+  @Test
+  void aWithdrawnFileLeavesOnlyWhenTheDriverReleasesIt() {
+    worker.execute(load("A", "f1", 4));
+    worker.execute(load("A", "f2", 4));
+
+    IndexCacheProtocol.Ack ack = worker.execute(release("A", "f1", 4));
+
+    assertThat(ack.status()).isEqualTo(IndexCacheProtocol.AckStatus.RELEASED);
+    assertThat(worker.holders()).containsOnlyKeys("adapter|A|f2");
   }
 
   @Test
@@ -506,7 +517,7 @@ class TestExecutorIndexCacheWorker {
         .commandId("plan-" + epoch + "#" + location + "-LOAD")
         .type(IndexCacheProtocol.CommandType.LOAD)
         .mode("adapter")
-        .file(file(location))
+        .file(file(indexUuid, location))
         .definition(DEFINITION)
         .io(new org.apache.iceberg.hadoop.HadoopFileIO(new org.apache.hadoop.conf.Configuration()))
         .build();
@@ -531,10 +542,10 @@ class TestExecutorIndexCacheWorker {
         .build();
   }
 
-  private static IndexCacheProtocol.File file(String location) {
+  private static IndexCacheProtocol.File file(String indexUuid, String location) {
     return IndexCacheProtocol.File.builder()
         .location(location)
-        .cacheKey("adapter|A|" + location)
+        .cacheKey("adapter|" + indexUuid + "|" + location)
         .estimatedBytes(120L)
         .memory(MEMORY)
         .build();

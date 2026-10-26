@@ -157,7 +157,7 @@ class TestIndexCachePlugin {
   }
 
   @Test
-  void aBusyExecutorKeepsTheFilePendingInsteadOfFailingIt() {
+  void aBusyExecutorIsAskedAgainAndTheLimitIsEnforced() {
     control.receive(report(1, 1_000, 0));
     String plan =
         coordinator.acceptLoad(target("A", "f1"), IndexResidencyPolicy.parse("forever"), now);
@@ -177,8 +177,31 @@ class TestIndexCachePlugin {
             .reason("BUSY")
             .build());
 
+    // The command is put back, so the next poll carries it again instead of dropping it.
     assertThat(coordinator.result(plan).uncovered()).containsEntry("f1", "PENDING");
-    assertThat(coordinator.result(plan).status()).isEqualTo(IndexCacheProtocol.Status.PENDING);
+    assertThat(control.receive(report(3, 1_000, 0)).commands())
+        .extracting(IndexCacheProtocol.Command::commandId)
+        .containsExactly(command.commandId());
+
+    // After the attempt limit the file is a real failure rather than an endless retry.
+    for (long sequence = 4; sequence < 4 + 3; sequence++) {
+      control.receive(
+          IndexCacheProtocol.Ack.builder()
+              .session(SESSION)
+              .planId(plan)
+              .commandId(command.commandId())
+              .executorId(EXECUTOR)
+              .incarnation(INCARNATION)
+              .epoch(command.epoch())
+              .sequence(command.sequence())
+              .status(IndexCacheProtocol.AckStatus.REJECTED)
+              .bytes(0)
+              .reason("BUSY")
+              .build());
+      control.receive(report(sequence, 1_000, 0));
+    }
+
+    assertThat(coordinator.result(plan).uncovered()).containsEntry("f1", "BUSY_EXHAUSTED");
   }
 
   @Test

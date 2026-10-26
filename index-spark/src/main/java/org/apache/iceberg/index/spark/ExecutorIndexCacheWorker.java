@@ -128,9 +128,10 @@ final class ExecutorIndexCacheWorker implements AutoCloseable {
   /**
    * Makes the cache accept this key for the plan's epoch before the load is admitted.
    *
-   * <p>A newer epoch replaces the target instead of growing it: files the new plan no longer wants
-   * lose their owner and leave the cache. An older epoch is refused, so a delayed command cannot
-   * roll the target back.
+   * <p>An executor only ever sees individual files, so the target per index is the union of the
+   * keys it was told about; files the new plan no longer wants are removed by the explicit release
+   * commands, not by guessing a whole target from one command. A delayed older epoch is refused so
+   * it cannot roll the target back.
    */
   private boolean ensureTarget(String indexUuid, long epoch, String cacheKey) {
     synchronized (stateLock) {
@@ -139,18 +140,12 @@ final class ExecutorIndexCacheWorker implements AutoCloseable {
         return false;
       }
 
+      Set<String> keys = targetKeys.computeIfAbsent(indexUuid, ignored -> new LinkedHashSet<>());
+      keys.add(cacheKey);
       if (applied == null || epoch > applied) {
-        Set<String> keys = new LinkedHashSet<>();
-        keys.add(cacheKey);
-        targetKeys.put(indexUuid, keys);
         cache.applyTarget(indexUuid, epoch, keys);
         targetEpoch.put(indexUuid, epoch);
-        // Files the new target no longer lists lose their owner and are released by the cache, so
-        // they must stop appearing in this worker's report as well.
-        installed.keySet().removeIf(key -> !keys.contains(key));
       } else {
-        Set<String> keys = targetKeys.computeIfAbsent(indexUuid, ignored -> new LinkedHashSet<>());
-        keys.add(cacheKey);
         cache.addManagedKeys(indexUuid, epoch, Set.of(cacheKey));
       }
 
@@ -235,28 +230,25 @@ final class ExecutorIndexCacheWorker implements AutoCloseable {
       copy = installed.get(cacheKey);
     }
 
-    if (copy == null) {
-      // Nothing is retained under this key. Withdraw any pending admission so a load that is still
-      // preparing cannot publish after its release, then report the desired state.
-      cache.releaseCopy(command.indexUuid(), command.epoch(), cacheKey);
-      return ack(command, IndexCacheProtocol.AckStatus.RELEASED, 0, null);
-    }
-
-    if (copy.epoch() > command.epoch()) {
+    if (copy != null && copy.epoch() > command.epoch()) {
       // A newer load installed this copy; an older release must not delete it.
       return reject(command, "STALE_EPOCH");
     }
 
-    if (!cache.releaseCopy(command.indexUuid(), command.epoch(), cacheKey)) {
-      // The target moved on and still owns this file, so its bytes are still in use.
-      return reject(command, "STILL_OWNED");
-    }
+    // A release withdraws this index's claim at whatever epoch the executor currently holds, and
+    // also removes a pending admission so a load that is still preparing cannot publish afterwards.
+    cache.releaseCopy(command.indexUuid(), cacheKey);
 
     synchronized (stateLock) {
-      installed.remove(cacheKey);
+      // The physical copy may still be shared with another index, so only stop reporting it when
+      // the cache no longer holds it at all.
+      if (!cache.residentKeys().contains(cacheKey)) {
+        installed.remove(cacheKey);
+      }
     }
 
-    return ack(command, IndexCacheProtocol.AckStatus.RELEASED, copy.bytes(), null);
+    return ack(
+        command, IndexCacheProtocol.AckStatus.RELEASED, copy == null ? 0 : copy.bytes(), null);
   }
 
   /**

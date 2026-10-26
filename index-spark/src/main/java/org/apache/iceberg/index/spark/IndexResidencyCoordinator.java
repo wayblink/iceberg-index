@@ -114,6 +114,7 @@ final class IndexResidencyCoordinator {
     private final Set<String> released = new LinkedHashSet<>();
     private boolean superseded;
     private final Set<String> orphansReleased = new LinkedHashSet<>();
+    private final Map<String, Integer> attempts = new LinkedHashMap<>();
     private final List<String> evicted = new ArrayList<>();
     private int nextAttempt = 1;
     private boolean expired;
@@ -248,6 +249,19 @@ final class IndexResidencyCoordinator {
       planOfCommand.remove(commandId);
     }
 
+    /** Puts a command back at the head of the queue after a transient refusal. */
+    private void requeue(String commandId) {
+      for (IndexCacheProtocol.Command command : issued) {
+        if (command.commandId().equals(commandId)) {
+          if (!queue.contains(command)) {
+            queue.add(0, command);
+          }
+
+          return;
+        }
+      }
+    }
+
     /** Acknowledged work is delivered: it is no longer pending in the reply queue. */
     private void delivered(String commandId) {
       queue.removeIf(command -> command.commandId().equals(commandId));
@@ -272,17 +286,28 @@ final class IndexResidencyCoordinator {
   /** Commands carried by one reply; the rest stay queued for the next poll. */
   static final int DEFAULT_MAX_COMMANDS_PER_REPLY = 64;
 
+  /** How often one command may come back as BUSY before the file is reported as failed. */
+  static final int DEFAULT_MAX_ATTEMPTS = 3;
+
   private final int maxCommandsPerReply;
+  private final int maxCommandAttempts;
 
   IndexResidencyCoordinator(Clock clock) {
     this(clock, DEFAULT_MAX_COMMANDS_PER_REPLY);
   }
 
   IndexResidencyCoordinator(Clock clock, int maxCommandsPerReply) {
+    this(clock, maxCommandsPerReply, DEFAULT_MAX_ATTEMPTS);
+  }
+
+  IndexResidencyCoordinator(Clock clock, int maxCommandsPerReply, int maxCommandAttempts) {
     Preconditions.checkArgument(
         maxCommandsPerReply > 0, "Invalid reply batch size: %s", maxCommandsPerReply);
+    Preconditions.checkArgument(
+        maxCommandAttempts > 0, "Invalid command attempt limit: %s", maxCommandAttempts);
     this.clock = Objects.requireNonNull(clock, "Clock is null");
     this.maxCommandsPerReply = maxCommandsPerReply;
+    this.maxCommandAttempts = maxCommandAttempts;
   }
 
   String acceptLoad(IndexCacheProtocol.Target target, IndexResidencyPolicy policy, long nowNanos) {
@@ -449,8 +474,22 @@ final class IndexResidencyCoordinator {
       return;
     }
 
-    node.delivered(ack.commandId());
     IndexState index = indexes.get(plan.indexUuid);
+    if ("BUSY".equals(ack.reason()) && command.type == IndexCacheProtocol.CommandType.LOAD) {
+      int attempt = plan.attempts.merge(command.commandId, 1, Integer::sum);
+      if (attempt < maxCommandAttempts) {
+        // Put the command back in front so the next poll retries it instead of starving the file.
+        node.requeue(command.commandId);
+        return;
+      }
+
+      node.delivered(ack.commandId());
+      plan.failed.put(command.location, "BUSY_EXHAUSTED");
+      node.settle(ack.commandId());
+      return;
+    }
+
+    node.delivered(ack.commandId());
     boolean ownsCommand =
         plan.terminalStatus == null
             && !plan.expired
@@ -503,12 +542,6 @@ final class IndexResidencyCoordinator {
       releaseMigratedCopy(plan, command, ack.executorId());
     } else if (ack.status() == IndexCacheProtocol.AckStatus.REJECTED
         || ack.status() == IndexCacheProtocol.AckStatus.FAILED) {
-      if ("BUSY".equals(ack.reason())) {
-        // Transient: the executor could not admit the file right now. Keep the promise and let the
-        // next poll retry instead of failing the file for the rest of the plan.
-        return;
-      }
-
       plan.failed.put(command.location, ack.reason() == null ? ack.status().name() : ack.reason());
       node.settle(ack.commandId());
     }
