@@ -55,15 +55,15 @@ final class IndexResidencyCoordinator {
     private long epoch;
     private boolean paused;
     private IndexCacheProtocol.Protection protection;
-    private long accessOrder;
-    private java.util.Set<String> targetCacheKeys = new LinkedHashSet<>();
+    private long lastAccessNanos;
+    private Set<String> targetCacheKeys = new LinkedHashSet<>();
 
     private IndexState(String indexUuid) {
       this.indexUuid = indexUuid;
     }
 
-    private void accessed(long order) {
-      this.accessOrder = order;
+    private void accessedAt(long accessNanos) {
+      this.lastAccessNanos = accessNanos;
     }
 
     private boolean retains(String cacheKey) {
@@ -71,7 +71,8 @@ final class IndexResidencyCoordinator {
     }
 
     private boolean protectedNow(long nowNanos) {
-      return protection == null || protection.permanent() || protection.deadlineNanos() > nowNanos;
+      return protection != null
+          && (protection.permanent() || protection.deadlineNanos() > nowNanos);
     }
   }
 
@@ -220,7 +221,6 @@ final class IndexResidencyCoordinator {
   private final Map<String, IndexState> indexes = new HashMap<>();
   private final Map<String, PlanState> plans = new LinkedHashMap<>();
   private long planCount;
-  private long accessOrder;
   private String lastPlanId;
 
   IndexResidencyCoordinator(Clock clock) {
@@ -232,11 +232,14 @@ final class IndexResidencyCoordinator {
     IndexState index = indexes.computeIfAbsent(target.indexUuid(), IndexState::new);
     index.epoch = index.epoch + 1;
     index.paused = false;
-    index.accessed(++accessOrder);
+    index.accessedAt(nowNanos);
     Set<String> previous = new LinkedHashSet<>(index.targetCacheKeys);
     // A supplied policy always restarts protection; a repeated load without one keeps its deadline.
     if (policy != null) {
       index.protection = protection(policy, nowNanos);
+    } else if (index.protection == null) {
+      // Omitting retention on the first load means no protection, not permanent protection.
+      index.protection = protection(IndexResidencyPolicy.parse("0"), nowNanos);
     }
 
     for (PlanState open : plans.values()) {
@@ -324,18 +327,27 @@ final class IndexResidencyCoordinator {
     if (node == null) {
       node = new NodeState(report, clock.nowNanos());
       nodes.put(report.executorId(), node);
+    } else if (!node.report.session().equals(report.session())) {
+      // Another application reusing the executor ID starts from scratch.
+      forgetIncarnation(node.report.executorId(), node.report.incarnation());
+      node = new NodeState(report, clock.nowNanos());
+      nodes.put(report.executorId(), node);
     } else if (!node.report.incarnation().equals(report.incarnation())) {
-      // A new incarnation replaces the old node and all of its outstanding work.
+      // A restarted executor has an empty cache, so its old copies stop being confirmed coverage.
+      forgetIncarnation(node.report.executorId(), node.report.incarnation());
       node = new NodeState(report, clock.nowNanos());
       nodes.put(report.executorId(), node);
     } else if (report.sequence() >= node.report.sequence()) {
       node.observe(report, clock.nowNanos());
     }
 
+    // Reports carry relative ages, so the driver converts them to its own clock. The report arrival
+    // time must not reset the order; only an actual access does.
+    long receivedAt = clock.nowNanos();
     for (Map.Entry<String, Long> access : report.accessAgeNanos().entrySet()) {
       IndexState index = indexes.get(access.getKey());
       if (index != null) {
-        index.accessed(++accessOrder);
+        index.accessedAt(Math.max(0, receivedAt - Math.max(0, access.getValue())));
       }
     }
 
@@ -353,17 +365,14 @@ final class IndexResidencyCoordinator {
   void ack(IndexCacheProtocol.Ack ack) {
     Objects.requireNonNull(ack, "ACK is null");
     NodeState node = nodes.get(ack.executorId());
-    if (node == null || !node.report.incarnation().equals(ack.incarnation())) {
+    if (node == null
+        || !node.report.incarnation().equals(ack.incarnation())
+        || !node.report.session().equals(ack.session())) {
       return;
     }
 
     PlanState plan = plans.get(ack.planId());
     if (plan == null) {
-      return;
-    }
-
-    IndexState index = indexes.get(plan.indexUuid);
-    if (index == null || index.epoch != plan.epoch) {
       return;
     }
 
@@ -373,21 +382,28 @@ final class IndexResidencyCoordinator {
     }
 
     node.delivered(ack.commandId());
-    if (plan.terminalStatus != null) {
-      node.settle(plan.planId, command.bytes);
-      return;
-    }
-
-    // A late ACK for a timed-out plan keeps its success; files already fenced stay uncovered.
-    if (plan.expired && plan.fenced.contains(command.cacheKey)) {
-      node.settle(plan.planId, command.bytes);
-      return;
-    }
+    IndexState index = indexes.get(plan.indexUuid);
+    boolean ownsCommand =
+        plan.terminalStatus == null
+            && !plan.expired
+            && !plan.fenced.contains(command.cacheKey)
+            && index != null
+            && index.epoch == plan.epoch;
 
     if (command.type == IndexCacheProtocol.CommandType.RELEASE) {
       if (ack.status() == IndexCacheProtocol.AckStatus.RELEASED) {
         plan.dropped.add(command.cacheKey);
         plan.loaded.remove(command.cacheKey);
+      }
+
+      node.settle(plan.planId, command.bytes);
+      return;
+    }
+
+    if (!ownsCommand) {
+      // A copy whose plan or epoch no longer exists has no owner: release it instead of leaking it.
+      if (ack.status() == IndexCacheProtocol.AckStatus.LOADED) {
+        releaseOrphan(plan, node, command);
       }
 
       node.settle(plan.planId, command.bytes);
@@ -410,6 +426,8 @@ final class IndexResidencyCoordinator {
               .build();
       plan.loaded.put(command.cacheKey, command);
       plan.failed.remove(command.location);
+      // The reservation becomes retained bytes; keeping it would charge the copy twice.
+      node.settle(plan.planId, command.bytes);
       releaseMigratedCopy(plan, command, ack.executorId());
     } else if (ack.status() == IndexCacheProtocol.AckStatus.REJECTED
         || ack.status() == IndexCacheProtocol.AckStatus.FAILED) {
@@ -419,9 +437,7 @@ final class IndexResidencyCoordinator {
   }
 
   IndexCacheProtocol.Result result(String planId) {
-    IndexCacheProtocol.Result r = result0(planId);
-    PlanState dbg = plans.get(planId);
-    return r;
+    return result0(planId);
   }
 
   private IndexCacheProtocol.Result result0(String planId) {
@@ -666,7 +682,7 @@ final class IndexResidencyCoordinator {
     planMigrations(plan, target, index, reusable);
 
     // Evict whole indexes only while the local plan still has uncovered routable files.
-    tryEvict(plan, placement);
+    tryEvict(plan, placement, pendingFiles);
 
     for (Holder holder : holdersOfKeys(previousKeys)) {
       if (!stillHeldBy(holder.cacheKey(), target.files())) {
@@ -795,13 +811,15 @@ final class IndexResidencyCoordinator {
    * protection, no in-flight load) is chosen, and its space is not treated as free until release is
    * acknowledged, so rejected files stay uncovered here.
    */
-  private void tryEvict(PlanState plan, IndexCacheProtocol.Plan placement) {
-    if (needsEviction(placement) && !plan.evicted.isEmpty()) {
+  private void tryEvict(
+      PlanState plan, IndexCacheProtocol.Plan placement, List<IndexCacheProtocol.File> pending) {
+    if (!plan.evicted.isEmpty()) {
       return;
     }
 
-    Set<String> before = new LinkedHashSet<>(plan.rejected.keySet());
-    if (!needsEviction(placement)) {
+    Map<String, Long> deficits = capacityDeficits(placement, pending);
+    if (deficits.isEmpty()) {
+      // Either nothing was rejected for capacity, or the gap is a file no node could ever hold.
       return;
     }
 
@@ -812,14 +830,14 @@ final class IndexResidencyCoordinator {
         continue;
       }
 
-      // Only resident indexes that this plan can actually reclaim are victims.
-      if (!hasInFlightLoad(other.indexUuid) && !holders(other.indexUuid).isEmpty()) {
+      // Only an index whose copies sit on a short node and cover its gap can help this plan.
+      if (!hasInFlightLoad(other.indexUuid) && canFree(other, deficits)) {
         candidates.add(other);
       }
     }
 
     candidates.sort(
-        Comparator.comparingLong((IndexState state) -> state.accessOrder)
+        Comparator.comparingLong((IndexState state) -> state.lastAccessNanos)
             .thenComparing(state -> state.indexUuid));
     if (candidates.isEmpty()) {
       return;
@@ -850,18 +868,70 @@ final class IndexResidencyCoordinator {
     }
 
     plan.evicted.add(victim.indexUuid);
-    for (String location : before) {
-      plan.rejected.put(location, "INSUFFICIENT_CAPACITY_PENDING_EVICTION");
+    for (Map.Entry<String, String> rejection : placement.rejected().entrySet()) {
+      // Only capacity gaps wait for the eviction; other reasons stay as they are.
+      if ("INSUFFICIENT_CAPACITY".equals(rejection.getValue())) {
+        plan.rejected.put(rejection.getKey(), "INSUFFICIENT_CAPACITY_PENDING_EVICTION");
+      }
     }
   }
 
-  /**
-   * A plan is queued while another plan still owns capacity-affecting work on every node it needs.
-   */
-  /**
-   * A load is queued when capacity-affecting work of an earlier, still unfinished plan is
-   * outstanding on any node this plan was placed on. The two never reserve the same space.
-   */
+  /** Free bytes each short node still needs, derived from the files that could not be placed. */
+  private Map<String, Long> capacityDeficits(
+      IndexCacheProtocol.Plan placement, List<IndexCacheProtocol.File> pending) {
+    Map<String, Long> deficits = new LinkedHashMap<>();
+    for (Map.Entry<String, String> rejection : placement.rejected().entrySet()) {
+      if (!"INSUFFICIENT_CAPACITY".equals(rejection.getValue())) {
+        continue;
+      }
+
+      Long bytes = bytesOfPending(pending, rejection.getKey());
+      if (bytes == null) {
+        continue;
+      }
+
+      for (NodeState node : nodes.values()) {
+        long budget = node.report.budgetBytes();
+        if (budget <= 0 || bytes > budget) {
+          continue;
+        }
+
+        long free = budget - node.report.usedBytes() - node.report.reservedBytes();
+        if (free < bytes) {
+          deficits.merge(node.report.executorId(), bytes - free, Math::max);
+        }
+      }
+    }
+
+    return deficits;
+  }
+
+  private static Long bytesOfPending(List<IndexCacheProtocol.File> pending, String location) {
+    for (IndexCacheProtocol.File file : pending) {
+      if (file.location().equals(location)) {
+        return file.estimatedBytes();
+      }
+    }
+
+    return null;
+  }
+
+  private boolean canFree(IndexState victim, Map<String, Long> deficits) {
+    Map<String, Long> reclaimable = new LinkedHashMap<>();
+    for (Holder holder : holders(victim.indexUuid)) {
+      reclaimable.merge(holder.executorId(), holder.bytes(), Long::sum);
+    }
+
+    for (Map.Entry<String, Long> deficit : deficits.entrySet()) {
+      if (reclaimable.getOrDefault(deficit.getKey(), 0L) >= deficit.getValue()) {
+        return true;
+      }
+    }
+
+    return false;
+  }
+
+  /** Nodes that could take part in a plan that has not been placed yet. */
   private Set<String> queuedTargets(PlanState plan) {
     Set<String> executors = new LinkedHashSet<>();
     for (NodeState node : nodes.values()) {
@@ -873,17 +943,17 @@ final class IndexResidencyCoordinator {
     return executors;
   }
 
+  /**
+   * A load is queued when capacity-affecting work of an earlier, still unfinished plan is
+   * outstanding on any node this plan was placed on. The two never reserve the same space.
+   */
   private boolean queued(String planId) {
     PlanState plan = plans.get(planId);
     if (plan == null) {
       return false;
     }
 
-    Set<String> executors = new LinkedHashSet<>();
-    for (String executorId : plan.loadExecutors()) {
-      executors.add(executorId);
-    }
-
+    Set<String> executors = new LinkedHashSet<>(plan.loadExecutors());
     if (executors.isEmpty()) {
       // A plan blocked before placement was never issued; it still waits for work already in
       // flight on any node it would have used, so it cannot jump the queue on a re-plan.
@@ -910,6 +980,7 @@ final class IndexResidencyCoordinator {
     return false;
   }
 
+  /** True when every issued load already has a terminal result, so nothing is still awaited. */
   private static boolean allIssuedLoadsAnswered(PlanState plan, Set<String> lost) {
     for (PlanFile planned : plan.commands.values()) {
       if (planned.type != IndexCacheProtocol.CommandType.LOAD) {
@@ -929,17 +1000,6 @@ final class IndexResidencyCoordinator {
     return true;
   }
 
-  private static boolean needsEviction(IndexCacheProtocol.Plan placement) {
-    for (String reason : placement.rejected().values()) {
-      if (!"SIZE_UNKNOWN".equals(reason)) {
-        return true;
-      }
-    }
-
-    return false;
-  }
-
-  /** True while an index still has unconfirmed load commands, so it is never evicted mid-load. */
   private boolean hasInFlightLoad(String indexUuid) {
     for (PlanState plan : plans.values()) {
       if (!plan.indexUuid.equals(indexUuid) || plan.finalized()) {
@@ -968,6 +1028,19 @@ final class IndexResidencyCoordinator {
       String mode,
       IndexCacheProtocol.File file,
       long bytes) {
+    enqueue(plan, node, label, type, indexUuid, mode, file, bytes, plan.epoch);
+  }
+
+  private void enqueue(
+      PlanState plan,
+      NodeState node,
+      String label,
+      IndexCacheProtocol.CommandType type,
+      String indexUuid,
+      String mode,
+      IndexCacheProtocol.File file,
+      long bytes,
+      long epoch) {
     String commandId = plan.planId + "#" + (plan.nextAttempt++) + "-" + label;
     IndexCacheProtocol.Command command =
         IndexCacheProtocol.Command.builder()
@@ -975,7 +1048,7 @@ final class IndexResidencyCoordinator {
             .executorId(node.report.executorId())
             .incarnation(node.report.incarnation())
             .indexUuid(indexUuid)
-            .epoch(plan.epoch)
+            .epoch(epoch)
             .planId(plan.planId)
             .commandId(commandId)
             .type(type)
@@ -1134,6 +1207,37 @@ final class IndexResidencyCoordinator {
     return holders.isEmpty() ? 0 : holders.get(0).bytes();
   }
 
+  /** Drops every confirmed copy held by an incarnation that no longer exists. */
+  private void forgetIncarnation(String executorId, String incarnation) {
+    for (PlanState plan : plans.values()) {
+      for (PlanFile loaded : new ArrayList<>(plan.loaded.values())) {
+        if (loaded.executorId.equals(executorId) && loaded.incarnation.equals(incarnation)) {
+          plan.loaded.remove(loaded.cacheKey);
+          plan.failed.put(loaded.location, "NODE_LOST");
+        }
+      }
+    }
+  }
+
+  /** Releases a copy whose owning plan can no longer use it, so the executor does not keep it. */
+  private void releaseOrphan(PlanState plan, NodeState node, PlanFile orphan) {
+    IndexState index = indexes.get(plan.indexUuid);
+    long epoch = index == null ? plan.epoch : index.epoch;
+    enqueue(
+        plan,
+        node,
+        "ORPHAN_RELEASE",
+        IndexCacheProtocol.CommandType.RELEASE,
+        plan.indexUuid,
+        "OTHER",
+        IndexCacheProtocol.File.builder()
+            .location(orphan.location)
+            .cacheKey(orphan.cacheKey)
+            .build(),
+        orphan.bytes,
+        epoch);
+  }
+
   private List<Holder> holdersOfKeys(Set<String> cacheKeys) {
     List<Holder> holders = new ArrayList<>();
     for (String cacheKey : cacheKeys) {
@@ -1145,9 +1249,12 @@ final class IndexResidencyCoordinator {
 
   private List<Holder> holdersOfKey(String cacheKey) {
     List<Holder> holders = new ArrayList<>();
+    Set<String> lost = lostIncarnations();
     for (PlanState plan : plans.values()) {
       PlanFile loaded = plan.loaded.get(cacheKey);
-      if (loaded != null && !plan.dropped.contains(cacheKey)) {
+      if (loaded != null
+          && !plan.dropped.contains(cacheKey)
+          && !lost.contains(loaded.incarnation)) {
         holders.add(
             new Holder(
                 loaded.location,

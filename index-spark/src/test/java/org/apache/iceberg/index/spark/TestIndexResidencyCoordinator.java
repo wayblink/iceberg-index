@@ -21,6 +21,8 @@ package org.apache.iceberg.index.spark;
 import static org.assertj.core.api.Assertions.assertThat;
 
 import java.time.Duration;
+import java.util.LinkedHashMap;
+import java.util.Map;
 import org.junit.jupiter.api.Test;
 
 class TestIndexResidencyCoordinator {
@@ -86,9 +88,10 @@ class TestIndexResidencyCoordinator {
     coordinator.report(node("a", "a-1", 3, 100, 60));
     clock.advance(10 * SECOND);
     coordinator.report(withAccess(node("a", "a-1", 3, 100, 60), "hot", 9));
+    // 60 used + 50 new exceeds the 100-byte budget, so the oldest index has to go.
     String plan =
         coordinator.acceptLoad(
-            target("new", "n1", 30), IndexResidencyPolicy.parse("0"), clock.now());
+            target("new", "n1", 50), IndexResidencyPolicy.parse("0"), clock.now());
     assertThat(coordinator.result(plan).evictedIndexes()).containsExactly("old");
   }
 
@@ -340,6 +343,175 @@ class TestIndexResidencyCoordinator {
         .filteredOn(c -> c.type() == IndexCacheProtocol.CommandType.RELEASE)
         .isEmpty();
     assertThat(coordinator.state("a", "a-1").holders()).containsKey("adapter|A|f");
+  }
+
+  @Test
+  void restartedIncarnationDropsPreviouslyConfirmedCoverage() {
+    coordinator.report(node("a", "a-1", 1, 100, 0));
+    String plan =
+        coordinator.acceptLoad(
+            target("A", "f1", 10), IndexResidencyPolicy.parse("forever"), clock.now());
+    ackFile(plan, "f1", IndexCacheProtocol.AckStatus.LOADED);
+    assertThat(coordinator.result(plan).status()).isEqualTo(IndexCacheProtocol.Status.COMPLETE);
+
+    // The executor restarts with an empty local cache.
+    coordinator.report(node("a", "a-2", 1, 100, 0));
+
+    assertThat(coordinator.result(plan).status()).isEqualTo(IndexCacheProtocol.Status.FAILED);
+    assertThat(coordinator.result(plan).uncovered()).containsEntry("f1", "NODE_LOST");
+    String reload =
+        coordinator.acceptLoad(
+            target("A", "f1", 10), IndexResidencyPolicy.parse("forever"), clock.now());
+    assertThat(coordinator.result(reload).reusedFiles()).isEmpty();
+    assertThat(coordinator.commands("a", "a-2"))
+        .filteredOn(c -> c.type() == IndexCacheProtocol.CommandType.LOAD)
+        .extracting(c -> c.file().location())
+        .containsExactly("f1");
+  }
+
+  @Test
+  void completedLoadReleasesItsReservation() {
+    coordinator.report(node("a", "a-1", 1, 100, 0));
+    String plan =
+        coordinator.acceptLoad(
+            target("A", "f1", 10), IndexResidencyPolicy.parse("forever"), clock.now());
+    ackFile(plan, "f1", IndexCacheProtocol.AckStatus.LOADED);
+
+    assertThat(coordinator.state("a", "a-1").reservedBytesFor(plan)).isZero();
+    assertThat(coordinator.state("a", "a-1").usedBytes()).isEqualTo(10);
+    // The confirmed copy must not be charged a second time through a stale reservation.
+    String next =
+        coordinator.acceptLoad(target("B", "g1", 90), IndexResidencyPolicy.parse("0"), clock.now());
+    assertThat(coordinator.result(next).uncovered()).containsEntry("g1", "PENDING");
+  }
+
+  @Test
+  void firstLoadWithoutRetentionIsEvictableAndReported() {
+    coordinator.report(node("a", "a-1", 1, 100, 0));
+    String old = coordinator.acceptLoad(target("old", "o1", 40), null, clock.now());
+    ackFile(old, "o1", IndexCacheProtocol.AckStatus.LOADED);
+    coordinator.report(holding("a", "a-1", 2, 100, 40, "adapter|old|o1", 40));
+    clock.advance(5 * SECOND);
+    String hot = coordinator.acceptLoad(target("hot", "h1", 40), null, clock.now());
+    ackFile(hot, "h1", IndexCacheProtocol.AckStatus.LOADED);
+    coordinator.report(holding("a", "a-1", 3, 100, 80, "adapter|hot|h1", 40));
+
+    String plan = coordinator.acceptLoad(target("new", "n1", 30), null, clock.now());
+
+    assertThat(coordinator.result(plan).evictedIndexes()).containsExactly("old");
+    assertThat(coordinator.result(old).protection()).isNotNull();
+    assertThat(coordinator.result(old).protection().permanent()).isFalse();
+  }
+
+  @Test
+  void lruOrderFollowsAccessAgeNotReportOrder() {
+    coordinator.report(node("a", "a-1", 1, 100, 0));
+    String old =
+        coordinator.acceptLoad(
+            target("old", "o1", 40), IndexResidencyPolicy.parse("0"), clock.now());
+    ackFile(old, "o1", IndexCacheProtocol.AckStatus.LOADED);
+    coordinator.report(holding("a", "a-1", 2, 100, 40, "adapter|old|o1", 40));
+    String hot =
+        coordinator.acceptLoad(
+            target("hot", "h1", 40), IndexResidencyPolicy.parse("0"), clock.now());
+    ackFile(hot, "h1", IndexCacheProtocol.AckStatus.LOADED);
+
+    // One report lists the hot index first, but its recorded access is far more recent.
+    Map<String, Long> ages = new LinkedHashMap<>();
+    ages.put("hot", SECOND);
+    ages.put("old", 20 * SECOND);
+    coordinator.report(
+        node("a", "a-1", 3, 100, 80)
+            .copy()
+            .holders(Map.of("adapter|old|o1", 40L, "adapter|hot|h1", 40L))
+            .accessAgeNanos(ages)
+            .build());
+
+    String plan =
+        coordinator.acceptLoad(
+            target("new", "n1", 30), IndexResidencyPolicy.parse("0"), clock.now());
+    assertThat(coordinator.result(plan).evictedIndexes()).containsExactly("old");
+  }
+
+  @Test
+  void oversizedFileDoesNotEvictAnotherIndex() {
+    coordinator.report(node("a", "a-1", 1, 100, 0));
+    String victim =
+        coordinator.acceptLoad(target("V", "v1", 40), IndexResidencyPolicy.parse("0"), clock.now());
+    ackFile(victim, "v1", IndexCacheProtocol.AckStatus.LOADED);
+    coordinator.report(holding("a", "a-1", 2, 100, 40, "adapter|V|v1", 40));
+    coordinator.report(node("b", "b-1", 1, 100, 100));
+
+    // No node can hold a 200-byte file, so evicting anything cannot help.
+    String plan =
+        coordinator.acceptLoad(
+            target("W", "big", 200), IndexResidencyPolicy.parse("0"), clock.now());
+
+    assertThat(coordinator.result(plan).uncovered()).containsEntry("big", "FILE_TOO_LARGE");
+    assertThat(coordinator.result(plan).evictedIndexes()).isEmpty();
+    assertThat(coordinator.state("a", "a-1").holders()).containsKey("adapter|V|v1");
+  }
+
+  @Test
+  void capacityEvictionKeepsOtherRejectionReasons() {
+    coordinator.report(node("a", "a-1", 1, 100, 0));
+    String victim =
+        coordinator.acceptLoad(target("V", "v1", 40), IndexResidencyPolicy.parse("0"), clock.now());
+    ackFile(victim, "v1", IndexCacheProtocol.AckStatus.LOADED);
+    coordinator.report(holding("a", "a-1", 2, 100, 40, "adapter|V|v1", 40));
+
+    String plan =
+        coordinator.acceptLoad(
+            target("W", "big", 200, "small", 70), IndexResidencyPolicy.parse("0"), clock.now());
+
+    assertThat(coordinator.result(plan).uncovered()).containsEntry("big", "FILE_TOO_LARGE");
+    assertThat(coordinator.result(plan).uncovered())
+        .containsEntry("small", "INSUFFICIENT_CAPACITY_PENDING_EVICTION");
+    assertThat(coordinator.result(plan).evictedIndexes()).containsExactly("V");
+  }
+
+  @Test
+  void lateLoadAfterOffloadIsReleasedInsteadOfLeaked() {
+    coordinator.report(node("a", "a-1", 1, 100, 0));
+    String load =
+        coordinator.acceptLoad(
+            target("A", "f1", 10, "f2", 10), IndexResidencyPolicy.parse("forever"), clock.now());
+    ackFile(load, "f1", IndexCacheProtocol.AckStatus.LOADED);
+    coordinator.acceptOffload("A", clock.now());
+
+    IndexCacheProtocol.Command late = loadCommand(load, "f2");
+    coordinator.ack(ack(load, "a", "a-1", late, IndexCacheProtocol.AckStatus.LOADED));
+
+    assertThat(coordinator.commands("a", "a-1"))
+        .filteredOn(c -> c.type() == IndexCacheProtocol.CommandType.RELEASE)
+        .extracting(c -> c.file().location())
+        .contains("f2");
+    assertThat(coordinator.state("a", "a-1").holders()).doesNotContainKey("adapter|A|f2");
+  }
+
+  @Test
+  void acknowledgementFromAnotherApplicationSessionIsIgnored() {
+    coordinator.report(node("a", "a-1", 1, 100, 0));
+    String plan =
+        coordinator.acceptLoad(
+            target("A", "f1", 10), IndexResidencyPolicy.parse("forever"), clock.now());
+    IndexCacheProtocol.Command command = loadCommand(plan);
+
+    coordinator.ack(
+        IndexCacheProtocol.Ack.builder()
+            .session("another-application")
+            .planId(plan)
+            .commandId(command.commandId())
+            .executorId("a")
+            .incarnation("a-1")
+            .epoch(command.epoch())
+            .sequence(command.sequence())
+            .status(IndexCacheProtocol.AckStatus.LOADED)
+            .bytes(10)
+            .build());
+
+    assertThat(coordinator.result(plan).status()).isEqualTo(IndexCacheProtocol.Status.PENDING);
+    assertThat(coordinator.state("a", "a-1").holders()).isEmpty();
   }
 
   @Test
