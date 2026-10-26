@@ -112,19 +112,20 @@ class CheckIndexesProcedure extends BaseProcedure {
     List<InternalRow> rows = Lists.newArrayList();
 
     String tableName = input.asString(TABLE_PARAM, null);
-    Table table;
-    try {
-      table = org.apache.iceberg.spark.Spark3Util.loadIcebergTable(spark(), tableName);
-      checkTable(tableCatalog().name(), table, tableName, rows);
-    } catch (org.apache.spark.sql.catalyst.parser.ParseException e) {
-      throw new IllegalArgumentException("Not a table identifier: " + tableName, e);
-    } catch (org.apache.spark.sql.catalyst.analysis.NoSuchTableException e) {
-      throw new IllegalArgumentException("No such table: " + tableName, e);
-    } catch (java.io.IOException e) {
-      throw new java.io.UncheckedIOException("Failed to read index payloads", e);
-    }
 
-    return rows.toArray(new InternalRow[0]);
+    // resolved through the catalog the call names, so that the table of `CALL local.system...` is
+    // the one checked even when the session's current catalog is another one
+    return withIcebergTable(
+        input.ident(TABLE_PARAM),
+        table -> {
+          try {
+            checkTable(tableCatalog().name(), table, tableName, rows);
+          } catch (java.io.IOException e) {
+            throw new java.io.UncheckedIOException("Failed to read index payloads", e);
+          }
+
+          return rows.toArray(new InternalRow[0]);
+        });
   }
 
   private void checkTable(String catalog, Table table, String tableName, List<InternalRow> rows)

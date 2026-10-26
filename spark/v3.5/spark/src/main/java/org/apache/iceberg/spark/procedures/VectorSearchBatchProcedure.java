@@ -160,7 +160,11 @@ class VectorSearchBatchProcedure extends BaseProcedure {
   private List<float[]> queriesFromTable(ProcedureInput input) {
     String queryTable = input.asString(QUERY_TABLE_PARAM);
     String vectorColumn = input.asString(VECTOR_COLUMN_PARAM, "vector");
-    String sql = "SELECT `" + vectorColumn + "` FROM " + queryTable;
+    // the query table is looked for in the catalog the call names, which is the one the indexed
+    // table came from; a name the caller already qualified is left exactly as it was
+    String qualified =
+        queryTable.split("\\.").length >= 3 ? queryTable : tableCatalog().name() + "." + queryTable;
+    String sql = "SELECT `" + vectorColumn + "` FROM " + qualified;
     if (input.isProvided(QUERY_ID_COLUMN_PARAM)) {
       // a stable order, so the query ids the results carry line up with the table's own ids
       sql = sql + " ORDER BY `" + input.asString(QUERY_ID_COLUMN_PARAM) + "`";

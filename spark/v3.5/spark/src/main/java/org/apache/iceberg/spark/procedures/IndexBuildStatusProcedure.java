@@ -116,35 +116,31 @@ class IndexBuildStatusProcedure extends BaseProcedure {
     String tableName = input.asString(TABLE_PARAM);
     List<InternalRow> rows = Lists.newArrayList();
 
-    Table table;
-    try {
-      table = org.apache.iceberg.spark.Spark3Util.loadIcebergTable(spark(), tableName);
-    } catch (org.apache.spark.sql.catalyst.parser.ParseException e) {
-      throw new IllegalArgumentException("Not a table identifier: " + tableName, e);
-    } catch (org.apache.spark.sql.catalyst.analysis.NoSuchTableException e) {
-      throw new IllegalArgumentException("No such table: " + tableName, e);
-    }
+    // the table is resolved through the catalog the call names, so that a status call reads the
+    // table of `CALL local.system...` even when the session's current catalog is another one
+    return withIcebergTable(
+        input.ident(TABLE_PARAM),
+        table -> {
+          long now = System.currentTimeMillis();
+          java.util.Set<String> reported = new java.util.LinkedHashSet<>();
+          for (IndexMetadata metadata : VectorIndexes.indexesOf(table)) {
+            rows.add(row(tableName, table, metadata, now));
+            reported.add(metadata.indexUuid());
+          }
 
-    long now = System.currentTimeMillis();
-    java.util.Set<String> reported = new java.util.LinkedHashSet<>();
-    for (IndexMetadata metadata : VectorIndexes.indexesOf(table)) {
-      rows.add(row(tableName, table, metadata, now));
-      reported.add(metadata.indexUuid());
-    }
+          // a build that failed is rolled back, registration included, so the only trace of it is
+          // the report its column kept. Those are added here, or the failure that made the user
+          // look would be the one thing this could not show
+          for (IndexBuildStatus failed : rolledBack(table, reported)) {
+            rows.add(row(tableName, failed, now));
+          }
 
-    // a build that failed is rolled back, registration included, so the only trace of it is the
-    // report its column kept. Those are added here, or the failure that made the user look would be
-    // the one thing this could not show.
-    for (IndexBuildStatus failed : rolledBack(table, tableName, reported, now)) {
-      rows.add(row(tableName, failed, now));
-    }
-
-    return rows.toArray(new InternalRow[0]);
+          return rows.toArray(new InternalRow[0]);
+        });
   }
 
   /** The failed attempts whose index no longer exists, one per column. */
-  private List<IndexBuildStatus> rolledBack(
-      Table table, String tableName, java.util.Set<String> reported, long now) {
+  private List<IndexBuildStatus> rolledBack(Table table, java.util.Set<String> reported) {
     List<IndexBuildStatus> attempts = Lists.newArrayList();
     for (org.apache.iceberg.types.Types.NestedField field : table.schema().columns()) {
       IndexBuildStatus report =
