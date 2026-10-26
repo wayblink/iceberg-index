@@ -337,6 +337,44 @@ class TestRewriteVectorSearch {
   }
 
   @Test
+  public void followsTheMetricOfTheIndexThatAnswersIt() {
+    // cosine and euclidean disagree about which row is nearest: a far row on the query's own ray
+    // has cosine 1, while a close row off the ray has the smaller euclidean distance. Ordering by
+    // the metric the function starts with would answer a euclidean query with the cosine winner
+    String table = "db.docs_metric";
+    spark.sql(String.format("CREATE TABLE local.%s %s", table, COLUMNS));
+    spark.sql(
+        String.format(
+            "INSERT INTO local.%s VALUES "
+                + "(1, 'far-on-the-ray', array(10.0d, 0.0d)), "
+                + "(2, 'near-off-the-ray', array(1.0d, 0.1d))",
+            table));
+    spark.sql(
+        String.format(
+            "CALL local.system.build_vector_index("
+                + "table => '%s', column => 'embedding', dimension => 2, metric => 'euclidean', "
+                + "structure => 'flat')",
+            table));
+
+    List<Row> hits =
+        spark
+            .sql(
+                String.format(
+                    "SELECT id FROM local.%s "
+                        + "ORDER BY vec_distance(embedding, array(1.0d, 0.0d)) LIMIT 1",
+                    table))
+            .collectAsList();
+    assertThat(hits).hasSize(1);
+    assertThat(hits.get(0).getLong(0)).isEqualTo(2L);
+    assertThat(
+            planOf(
+                table,
+                "SELECT id FROM local.%s "
+                    + "ORDER BY vec_distance(embedding, array(1.0d, 0.0d)) LIMIT 1"))
+        .contains("vec_distance(EUCLIDEAN");
+  }
+
+  @Test
   public void leavesThePlanAloneWithoutAnIndex() {
     String table = table("docs_no_index");
     assertThat(
