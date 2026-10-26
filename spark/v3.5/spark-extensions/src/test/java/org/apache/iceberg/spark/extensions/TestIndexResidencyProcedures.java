@@ -38,9 +38,7 @@ public class TestIndexResidencyProcedures extends ExtensionsTestBase {
   @BeforeEach
   public void createIndexedTable() {
     sql("CREATE TABLE %s (id bigint, embedding array<double>) USING iceberg", tableName);
-    sql(
-        "INSERT INTO %s VALUES (1, array(1.0, 0.0)), (2, array(0.0, 1.0))",
-        tableName);
+    sql("INSERT INTO %s VALUES (1, array(1.0, 0.0)), (2, array(0.0, 1.0))", tableName);
     sql(
         "CALL %s.system.build_vector_index(table => '%s', column => 'embedding', dimension => 2, metric => 'cosine')",
         catalogName, tableName);
@@ -90,16 +88,12 @@ public class TestIndexResidencyProcedures extends ExtensionsTestBase {
                     catalogName, tableName, indexUuid()))
         .hasMessageContaining("spark.plugins");
 
-    List<Object[]> rows =
-        sql(
-            "CALL %s.system.list_indexes(table => '%s')",
-            catalogName, tableName);
+    List<Object[]> rows = sql("CALL %s.system.list_indexes(table => '%s')", catalogName, tableName);
     org.assertj.core.api.Assertions.assertThat(rows).hasSize(1);
   }
 
   private String indexUuid() {
-    List<Object[]> rows =
-        sql("CALL %s.system.list_indexes(table => '%s')", catalogName, tableName);
+    List<Object[]> rows = sql("CALL %s.system.list_indexes(table => '%s')", catalogName, tableName);
     return rows.get(0)[0].toString();
   }
 }
