@@ -547,6 +547,8 @@ final class IndexCacheProtocol {
     private final CommandType type;
     private final String mode;
     private final File file;
+    private final IndexDefinition definition;
+    private final FileIO io;
     private final long sequence;
 
     private Command(Builder builder) {
@@ -560,6 +562,14 @@ final class IndexCacheProtocol {
       Preconditions.checkArgument(builder.commandId != null, "Command identity is missing");
       Preconditions.checkArgument(builder.type != null, "Command type is missing");
       Preconditions.checkArgument(builder.file != null, "Command file is missing");
+      if (builder.type == CommandType.LOAD) {
+        Preconditions.checkArgument(
+            builder.definition != null,
+            "Command definition is missing: an executor cannot decode the file without it");
+        Preconditions.checkArgument(
+            builder.io != null,
+            "Command FileIO is missing: an executor cannot read the file without a read context");
+      }
       this.session = builder.session;
       this.executorId = builder.executorId;
       this.incarnation = builder.incarnation;
@@ -570,6 +580,8 @@ final class IndexCacheProtocol {
       this.type = builder.type;
       this.mode = builder.mode;
       this.file = builder.file;
+      this.definition = builder.definition;
+      this.io = builder.io;
       this.sequence = builder.sequence;
     }
 
@@ -625,6 +637,16 @@ final class IndexCacheProtocol {
       return sequence;
     }
 
+    /** Read context for a LOAD; never logged or copied into a status report. */
+    IndexDefinition definition() {
+      return definition;
+    }
+
+    /** Read context for a LOAD; the executor reads storage directly and never returns payloads. */
+    FileIO io() {
+      return io;
+    }
+
     static final class Builder {
       private String session;
       private String executorId;
@@ -636,6 +658,8 @@ final class IndexCacheProtocol {
       private CommandType type;
       private String mode;
       private File file;
+      private IndexDefinition definition;
+      private FileIO io;
       private long sequence;
 
       Builder session(String value) {
@@ -685,6 +709,16 @@ final class IndexCacheProtocol {
 
       Builder file(File value) {
         this.file = value;
+        return this;
+      }
+
+      Builder definition(IndexDefinition value) {
+        this.definition = value;
+        return this;
+      }
+
+      Builder io(FileIO value) {
+        this.io = value;
         return this;
       }
 

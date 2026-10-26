@@ -777,6 +777,23 @@ final class ExecutorIndexCache {
     }
   }
 
+  /** Adds keys to an index's current target, so a plan can arrive file by file. */
+  void addManagedKeys(String indexUuid, long epoch, Set<String> cacheKeys) {
+    synchronized (mapLock) {
+      ownership.addKeys(indexUuid, epoch, cacheKeys);
+      mapLock.notifyAll();
+    }
+  }
+
+  /** Releases one file of an index; other files and other indexes keep their ownership. */
+  void releaseCopy(String indexUuid, long epoch, String cacheKey) {
+    synchronized (mapLock) {
+      ownership.releaseKey(indexUuid, epoch, cacheKey);
+      releaseIfUnowned(cacheKey);
+      mapLock.notifyAll();
+    }
+  }
+
   void releaseIndex(String indexUuid, long epoch) {
     synchronized (mapLock) {
       Set<String> keys = ownership.keys(indexUuid);

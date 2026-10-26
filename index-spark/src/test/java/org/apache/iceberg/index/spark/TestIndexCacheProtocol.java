@@ -106,6 +106,8 @@ class TestIndexCacheProtocol {
             .type(IndexCacheProtocol.CommandType.LOAD)
             .mode("adapter")
             .file(file("f1", 2_560L))
+            .definition(DEFINITION)
+            .io(new HadoopFileIO(new Configuration()))
             .sequence(11)
             .build();
 

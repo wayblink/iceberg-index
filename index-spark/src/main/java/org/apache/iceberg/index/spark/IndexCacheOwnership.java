@@ -76,6 +76,46 @@ final class IndexCacheOwnership {
     }
   }
 
+  /**
+   * Adds keys to an existing target at the same epoch. A target replacement uses a newer epoch; a
+   * growing target is how one plan's files arrive as separate commands.
+   */
+  void addKeys(String indexUuid, long epoch, Set<String> cacheKeys) {
+    validate(indexUuid, epoch);
+    Preconditions.checkArgument(cacheKeys != null, "Index target keys are null");
+    Target target = targets.get(indexUuid);
+    if (target == null || target.epoch() != epoch) {
+      return;
+    }
+
+    Set<String> keys = new HashSet<>(target.keys());
+    keys.addAll(cacheKeys);
+    targets.put(indexUuid, new Target(epoch, target.paused(), Set.copyOf(keys)));
+    managedKeys.addAll(cacheKeys);
+    for (String key : cacheKeys) {
+      ownersByKey.computeIfAbsent(key, ignored -> new HashSet<>()).add(indexUuid);
+    }
+  }
+
+  /** Withdraws one key from an index's target; other keys and owners stay untouched. */
+  void releaseKey(String indexUuid, long epoch, String cacheKey) {
+    validate(indexUuid, epoch);
+    Target target = targets.get(indexUuid);
+    if (target == null || target.epoch() != epoch || !target.keys().contains(cacheKey)) {
+      return;
+    }
+
+    Set<String> keys = new HashSet<>(target.keys());
+    keys.remove(cacheKey);
+    targets.put(indexUuid, new Target(epoch, target.paused(), Set.copyOf(keys)));
+    ownersByKey.computeIfPresent(
+        cacheKey,
+        (ignored, owners) -> {
+          owners.remove(indexUuid);
+          return owners.isEmpty() ? null : owners;
+        });
+  }
+
   Set<String> owners(String cacheKey) {
     return Set.copyOf(ownersByKey.getOrDefault(cacheKey, Set.of()));
   }

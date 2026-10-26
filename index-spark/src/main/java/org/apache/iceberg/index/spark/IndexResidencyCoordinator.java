@@ -30,6 +30,8 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
+import org.apache.iceberg.index.IndexDefinition;
+import org.apache.iceberg.io.FileIO;
 
 /**
  * Driver-side residency bookkeeping: protection policy, confirmed coverage, index LRU and plan
@@ -754,7 +756,11 @@ final class IndexResidencyCoordinator {
             target.indexUuid(),
             modeFor(file.cacheKey()),
             file,
-            file.estimatedBytes());
+            file.estimatedBytes(),
+            plan.epoch,
+            null,
+            target.definition(),
+            target.io());
       }
     }
 
@@ -853,7 +859,11 @@ final class IndexResidencyCoordinator {
           index.indexUuid,
           modeFor(file.cacheKey()),
           file,
-          file.estimatedBytes());
+          file.estimatedBytes(),
+          plan.epoch,
+          null,
+          target.definition(),
+          target.io());
       plan.migrationTargets.put(location, destination.report.executorId());
       plan.migrationSources.put(file.cacheKey(), current);
     }
@@ -1167,6 +1177,34 @@ final class IndexResidencyCoordinator {
       long bytes,
       long epoch,
       String releasesCommandId) {
+    enqueue(
+        plan,
+        node,
+        label,
+        type,
+        indexUuid,
+        mode,
+        file,
+        bytes,
+        epoch,
+        releasesCommandId,
+        null,
+        null);
+  }
+
+  private void enqueue(
+      PlanState plan,
+      NodeState node,
+      String label,
+      IndexCacheProtocol.CommandType type,
+      String indexUuid,
+      String mode,
+      IndexCacheProtocol.File file,
+      long bytes,
+      long epoch,
+      String releasesCommandId,
+      IndexDefinition definition,
+      FileIO io) {
     String commandId = plan.planId + "#" + (plan.nextAttempt++) + "-" + label;
     IndexCacheProtocol.Command command =
         IndexCacheProtocol.Command.builder()
@@ -1180,6 +1218,8 @@ final class IndexResidencyCoordinator {
             .type(type)
             .mode(mode)
             .file(file)
+            .definition(definition)
+            .io(io)
             .sequence(plan.nextAttempt)
             .build();
     plan.commands.put(
