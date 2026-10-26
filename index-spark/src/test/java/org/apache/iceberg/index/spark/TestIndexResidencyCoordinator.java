@@ -617,6 +617,88 @@ class TestIndexResidencyCoordinator {
   }
 
   @Test
+  void migrationReleaseKeepsTheNewCopyConfirmed() {
+    coordinator.report(node("a", "a-1", 1, 100, 0));
+    String first =
+        coordinator.acceptLoad(
+            target("A", "f", 40), IndexResidencyPolicy.parse("forever"), clock.now());
+    ackFile(first, "f", IndexCacheProtocol.AckStatus.LOADED);
+    coordinator.report(holding("a", "a-1", 2, 100, 40, "adapter|A|f", 40));
+    coordinator.report(node("b", "b-1", 1, 100, 0));
+
+    String plan =
+        coordinator.acceptLoad(
+            target("A", "f", 40), IndexResidencyPolicy.parse("forever"), clock.now());
+    IndexCacheProtocol.Command migrate = loadCommand(plan, "f", "b");
+    coordinator.ack(ack(plan, "b", "b-1", migrate, IndexCacheProtocol.AckStatus.LOADED));
+    IndexCacheProtocol.Command release =
+        coordinator.commands("a", "a-1").stream()
+            .filter(
+                c -> c.planId().equals(plan) && c.type() == IndexCacheProtocol.CommandType.RELEASE)
+            .findFirst()
+            .orElseThrow();
+    coordinator.ack(ack(plan, "a", "a-1", release, IndexCacheProtocol.AckStatus.RELEASED));
+
+    // The old copy is gone, but the migrated one must still count as confirmed coverage.
+    assertThat(coordinator.result(plan).status()).isEqualTo(IndexCacheProtocol.Status.COMPLETE);
+    assertThat(coordinator.state("b", "b-1").holders()).containsKey("adapter|A|f");
+    assertThat(coordinator.result(plan).residentBytes()).isEqualTo(40);
+  }
+
+  @Test
+  void fencedPlanDoesNotBlockAnotherIndex() {
+    coordinator.report(node("a", "a-1", 1, 100, 0));
+    coordinator.acceptLoad(
+        target("A", "f1", 10), IndexResidencyPolicy.parse("forever"), clock.now());
+    // The executor restarts before answering, which fences the outstanding command.
+    coordinator.report(node("a", "a-2", 1, 100, 0));
+
+    String other =
+        coordinator.acceptLoad(target("B", "g1", 10), IndexResidencyPolicy.parse("0"), clock.now());
+
+    assertThat(coordinator.result(other).status()).isNotEqualTo(IndexCacheProtocol.Status.QUEUED);
+    assertThat(coordinator.state("a", "a-2").reservedBytesFor(other)).isEqualTo(10);
+  }
+
+  @Test
+  void timedOutPlanDoesNotHoldItsReservationForever() {
+    coordinator.report(node("a", "a-1", 1, 100, 0));
+    String plan =
+        coordinator.acceptLoad(target("A", "f1", 40), IndexResidencyPolicy.parse("0"), clock.now());
+    coordinator.expire(plan, clock.now());
+
+    assertThat(coordinator.state("a", "a-1").reservedBytesFor(plan)).isZero();
+  }
+
+  @Test
+  void lruComparesAccessAgesOnTheObservationClock() {
+    coordinator.report(node("a", "a-1", 1, 100, 0));
+    String old =
+        coordinator.acceptLoad(
+            target("old", "o1", 40), IndexResidencyPolicy.parse("0"), clock.now());
+    ackFile(old, "o1", IndexCacheProtocol.AckStatus.LOADED);
+    coordinator.report(holding("a", "a-1", 2, 100, 40, "adapter|old|o1", 40));
+    // 30 seconds old when reported.
+    coordinator.report(
+        holding("a", "a-1", 3, 100, 40, "adapter|old|o1", 40)
+            .copy()
+            .accessAgeNanos(Map.of("old", 30 * SECOND))
+            .build());
+
+    clock.advance(60 * SECOND);
+    String hot =
+        coordinator.acceptLoad(
+            target("hot", "h1", 40), IndexResidencyPolicy.parse("0"), clock.now());
+    ackFile(hot, "h1", IndexCacheProtocol.AckStatus.LOADED);
+    coordinator.report(holding("a", "a-1", 4, 100, 80, "adapter|hot|h1", 40));
+
+    String plan =
+        coordinator.acceptLoad(
+            target("new", "n1", 50), IndexResidencyPolicy.parse("0"), clock.now());
+    assertThat(coordinator.result(plan).evictedIndexes()).containsExactly("old");
+  }
+
+  @Test
   void missingIncarnationAckCannotClaimCoverage() {
     coordinator.report(node("a", "a-1", 1, 100, 0));
     String plan =

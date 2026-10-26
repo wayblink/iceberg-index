@@ -158,6 +158,7 @@ assertThat(worker.execute(oldIncarnationCommand).status().name()).isEqualTo("REJ
 ```
 - [ ] **Run RED:** `./gradlew -DsparkVersions=3.5 -DscalaVersion=2.12 :iceberg-index-spark:test --tests '*TestIndexCachePlugin' --tests '*TestExecutorIndexCacheWorker'`。
 - [ ] **Implement:** 默认poll=1s、stale-after=10s、max commands/reply=64、每executor max concurrent loads=1、operation timeout=10m、单命令最多3次；配置分别为 `spark.iceberg.index.cache.control.poll-interval`、`.control.stale-after`、`.control.max-commands`、`.load.max-concurrent`、`.load.timeout`、`.load.max-attempts`（后五项使用同一前缀），验证非正值。控制与加载线程分离，有界队列；临时内存额外预留。查询scratch不可与load峰值混为resident size。
+- 释放语义（Task4 移交）：命令携带其安装时的 `epoch`；执行器只释放"本地副本记录 epoch ≤ 命令 epoch"的同一 cacheKey，绝不因旧 epoch 释放更高 epoch 安装的副本。`mode=ORPHAN` 的墓碑用于已无归属的迟到副本，必须走同一 epoch 规则并允许重复投递（幂等）。命令携带受限读取上下文（definition + 受控 FileIO 还原），不得把 FileIO 或凭证写入状态日志，也不得广播 `IndexCacheProtocol.Target`。
 - [ ] **GREEN:** fake transport及引用延迟释放测试通过；真实SparkPlugin local-cluster测试归Task7，不能用fake宣称节点定向保证已完成。
 - [ ] **Commit/review:** 精确add，`Index: Execute planned cache commands through SparkPlugin`；核查目标3.5公共API与shutdown/FileIO传播，不依赖Spark private RPC。
 

@@ -55,15 +55,24 @@ final class IndexResidencyCoordinator {
     private long epoch;
     private boolean paused;
     private IndexCacheProtocol.Protection protection;
-    private long lastAccessNanos;
+    private long accessAgeNanos = Long.MAX_VALUE;
+    private long accessObservedAtNanos;
     private Set<String> targetCacheKeys = new LinkedHashSet<>();
 
     private IndexState(String indexUuid) {
       this.indexUuid = indexUuid;
     }
 
-    private void accessedAt(long accessNanos) {
-      this.lastAccessNanos = accessNanos;
+    private void accessed(long ageNanos, long observedAtNanos) {
+      this.accessAgeNanos = ageNanos;
+      this.accessObservedAtNanos = observedAtNanos;
+    }
+
+    /** Age at {@code nowNanos}; larger means staler. Independent of any absolute clock epoch. */
+    private long ageAt(long nowNanos) {
+      return accessAgeNanos == Long.MAX_VALUE
+          ? Long.MAX_VALUE
+          : Math.addExact(accessAgeNanos, Math.max(0, nowNanos - accessObservedAtNanos));
     }
 
     private boolean retains(String cacheKey) {
@@ -252,7 +261,7 @@ final class IndexResidencyCoordinator {
     IndexState index = indexes.computeIfAbsent(target.indexUuid(), IndexState::new);
     index.epoch = index.epoch + 1;
     index.paused = false;
-    index.accessedAt(nowNanos);
+    index.accessed(0, nowNanos);
     Set<String> previous = new LinkedHashSet<>(index.targetCacheKeys);
     // A supplied policy always restarts protection; a repeated load without one keeps its deadline.
     if (policy != null) {
@@ -367,7 +376,7 @@ final class IndexResidencyCoordinator {
     for (Map.Entry<String, Long> access : report.accessAgeNanos().entrySet()) {
       IndexState index = indexes.get(access.getKey());
       if (index != null) {
-        index.accessedAt(Math.max(0, receivedAt - Math.max(0, access.getValue())));
+        index.accessed(Math.max(0, access.getValue()), receivedAt);
       }
     }
 
@@ -413,8 +422,14 @@ final class IndexResidencyCoordinator {
 
     if (command.type == IndexCacheProtocol.CommandType.RELEASE) {
       if (ack.status() == IndexCacheProtocol.AckStatus.RELEASED) {
+        PlanFile copy = plan.loaded.get(command.cacheKey);
         plan.dropped.add(command.cacheKey);
-        plan.loaded.remove(command.cacheKey);
+        // A migration releases the same key on the old node; the new copy must stay confirmed.
+        if (copy != null
+            && copy.executorId.equals(command.executorId)
+            && copy.incarnation.equals(command.incarnation)) {
+          plan.loaded.remove(command.cacheKey);
+        }
       }
 
       node.settle(ack.commandId());
@@ -584,6 +599,26 @@ final class IndexResidencyCoordinator {
       plan.fenced.add(planned.cacheKey);
       plan.failed.put(planned.location, "CANCELLED");
     }
+
+    for (NodeState node : nodes.values()) {
+      for (PlanFile planned : plan.commands.values()) {
+        // Reservations of fenced commands are released here; their ACKs may never arrive.
+        if (plan.fenced.contains(planned.cacheKey)) {
+          node.settle(commandIdOf(plan, planned));
+        }
+      }
+    }
+  }
+
+  /** Command identity is derived from the plan and the command's stable position in it. */
+  private static String commandIdOf(PlanState plan, PlanFile command) {
+    for (Map.Entry<String, PlanFile> entry : plan.commands.entrySet()) {
+      if (entry.getValue() == command) {
+        return entry.getKey();
+      }
+    }
+
+    return "";
   }
 
   List<String> expiredProtections() {
@@ -648,7 +683,7 @@ final class IndexResidencyCoordinator {
       // Only files carrying an index-scoped identity issued by this plan are routable.
       if (target.indexUuid() == null || !cacheKeyBelongsTo(file, target.indexUuid())) {
         plan.rejected.put(file.location(), "CACHE_KEY_NOT_OWNED");
-      } else if (!index.paused && confirmedAnywhere(file.cacheKey())) {
+      } else if (confirmedAnywhere(file.cacheKey())) {
         // A shared file already has one confirmed copy in this target; no second load is needed.
         plan.reused.add(file.cacheKey());
         reusable.add(file.location());
@@ -689,10 +724,9 @@ final class IndexResidencyCoordinator {
       String executorId = entry.getValue();
       NodeState node = nodes.get(executorId);
       // Only an acknowledged copy counts; a report on its own grants nothing.
-      boolean shared = confirmedOn(node.report.executorId(), file.cacheKey());
       if (node == null) {
         plan.rejected.put(file.location(), "NODE_LOST");
-      } else if (shared) {
+      } else if (confirmedOn(node.report.executorId(), file.cacheKey())) {
         // A confirmed copy on this node already covers the file; no second load is planned.
         continue;
       } else if (file.estimatedBytes() == null) {
@@ -886,8 +920,10 @@ final class IndexResidencyCoordinator {
       }
     }
 
+    long schedulingNanos = clock.nowNanos();
     candidates.sort(
-        Comparator.comparingLong((IndexState state) -> state.lastAccessNanos)
+        Comparator.comparingLong((IndexState state) -> state.ageAt(schedulingNanos))
+            .reversed()
             .thenComparing(state -> state.indexUuid));
     if (candidates.isEmpty()) {
       return;
@@ -1019,9 +1055,13 @@ final class IndexResidencyCoordinator {
       }
 
       for (PlanFile inFlight : other.commands.values()) {
-        // Ownership of a node starts at planning time, not when a copy is confirmed.
+        // Ownership of a node starts at planning time, not when a copy is confirmed, but a command
+        // that already failed, was fenced, or is confirmed holds no space any more.
         if (inFlight.type == IndexCacheProtocol.CommandType.LOAD
-            && executors.contains(inFlight.executorId)) {
+            && executors.contains(inFlight.executorId)
+            && !other.loaded.containsKey(inFlight.cacheKey)
+            && !other.fenced.contains(inFlight.cacheKey)
+            && !other.failed.containsKey(inFlight.location)) {
           return true;
         }
       }
@@ -1255,8 +1295,8 @@ final class IndexResidencyCoordinator {
 
   /**
    * Drops every trace of an incarnation that no longer exists: confirmed copies stop counting and
-   * outstanding commands can never be delivered, so they are fenced instead of leaving the plan 等待
-   * forever.
+   * outstanding commands can never be delivered, so they are fenced instead of leaving the plan
+   * waiting forever.
    */
   private void forgetIncarnation(String executorId, String incarnation) {
     for (PlanState plan : plans.values()) {
