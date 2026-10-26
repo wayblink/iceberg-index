@@ -161,17 +161,15 @@ final class IndexCacheController {
         .build();
   }
 
-  private static String cacheKey(Table table, IndexMetadata metadata, String location) {
+  static String cacheKey(Table table, IndexMetadata metadata, String location) {
     // The owner segment must be the table location the search path uses, not the copy recorded in
     // the index metadata: the two can differ after a table is moved.
-    return table.location() + "|" + adapterKey(metadata) + "|" + location;
+    return DistributedIndexSearch.cacheKey(table.location(), adapterKey(metadata), location);
   }
 
   private static String adapterKey(IndexMetadata metadata) {
-    var adapter = IndexTypes.fromType(metadata.indexType()).createAdapter(metadata.definition());
-    return adapter.getClass().getName()
-        + "|"
-        + (adapter.writesAuxiliaryFiles() ? adapter.auxiliaryBlobType() : adapter.entryBlobType());
+    return DistributedIndexSearch.adapterKey(
+        IndexTypes.fromType(metadata.indexType()).createAdapter(metadata.definition()));
   }
 
   private static Long estimate(IndexFile file) {

@@ -172,14 +172,15 @@ public final class IndexCacheControl {
     for (Map.Entry<String, IndexCacheProtocol.Protection> entry :
         control.protectedIndexes().entrySet()) {
       IndexCacheProtocol.Protection protection = entry.getValue();
-      long age = ages.getOrDefault(entry.getKey(), Long.MAX_VALUE);
+      Long observed = ages.get(entry.getKey());
+      long age = observed == null ? -1L : observed;
       rows.add(
           new IndexStatus(
               entry.getKey(),
               protection.text(),
               protection.deadlineNanos(),
               protection.permanent(),
-              age == Long.MAX_VALUE ? -1L : age / 1_000_000L));
+              age < 0 ? -1L : age / 1_000_000L));
     }
 
     rows.sort(java.util.Comparator.comparing(IndexStatus::indexUuid));
@@ -279,6 +280,11 @@ public final class IndexCacheControl {
     }
   }
 
+  private static String reasonFor(IndexCacheProtocol.Result result, String location) {
+    String reason = result.uncovered().get(location);
+    return reason != null ? reason : result.releasePending().get(location);
+  }
+
   /** One file of a plan: where it was sent and what happened to it. */
   public static final class FileResult {
     private final String fileLocation;
@@ -371,7 +377,7 @@ public final class IndexCacheControl {
                 location,
                 placements.get(location),
                 plannedBytes.get(location),
-                result.uncovered().get(location)));
+                reasonFor(result, location)));
       }
 
       return new Result(

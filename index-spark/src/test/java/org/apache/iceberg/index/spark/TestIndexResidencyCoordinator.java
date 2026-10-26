@@ -619,6 +619,60 @@ class TestIndexResidencyCoordinator {
   }
 
   @Test
+  void finishedPlansAreKeptInABoundedWindow() {
+    coordinator.report(node("a", "a-1", 1, 1_000_000, 0));
+    for (int i = 0; i < 70; i++) {
+      String plan =
+          coordinator.acceptLoad(
+              target("A", "f" + i, 1), IndexResidencyPolicy.parse("forever"), clock.now());
+      ackFile(plan, "f" + i, IndexCacheProtocol.AckStatus.LOADED);
+      coordinator.result(plan);
+    }
+
+    // Every plan here is superseded, so the window drops the oldest instead of growing forever.
+    assertThat(coordinator.planCount()).isLessThanOrEqualTo(64);
+  }
+
+  @Test
+  void offloadWaitsForEveryCopyOfAFileNotJustTheFirst() {
+    coordinator.report(node("a", "a-1", 1, 100, 0));
+    String first =
+        coordinator.acceptLoad(
+            target("A", "f", 40), IndexResidencyPolicy.parse("forever"), clock.now());
+    ackFile(first, "f", IndexCacheProtocol.AckStatus.LOADED);
+    coordinator.report(holding("a", "a-1", 2, 100, 40, "adapter|A|f", 40));
+    coordinator.report(node("b", "b-1", 1, 100, 0));
+
+    String plan =
+        coordinator.acceptLoad(
+            target("A", "f", 40), IndexResidencyPolicy.parse("forever"), clock.now());
+    coordinator.ack(
+        ack(plan, "b", "b-1", loadCommand(plan, "f", "b"), IndexCacheProtocol.AckStatus.LOADED));
+
+    String offload = coordinator.acceptOffload("A", clock.now());
+    assertThat(coordinator.result(offload).status()).isEqualTo(IndexCacheProtocol.Status.RELEASING);
+
+    IndexCacheProtocol.Command releaseOnA =
+        coordinator.commands("a", "a-1").stream()
+            .filter(c -> c.type() == IndexCacheProtocol.CommandType.RELEASE)
+            .findFirst()
+            .orElseThrow();
+    coordinator.ack(ack(offload, "a", "a-1", releaseOnA, IndexCacheProtocol.AckStatus.RELEASED));
+
+    // The migrated copy on b is still resident, so one acknowledged release is not the end.
+    assertThat(coordinator.result(offload).status()).isEqualTo(IndexCacheProtocol.Status.RELEASING);
+
+    IndexCacheProtocol.Command releaseOnB =
+        coordinator.commands("b", "b-1").stream()
+            .filter(c -> c.type() == IndexCacheProtocol.CommandType.RELEASE)
+            .findFirst()
+            .orElseThrow();
+    coordinator.ack(ack(offload, "b", "b-1", releaseOnB, IndexCacheProtocol.AckStatus.RELEASED));
+
+    assertThat(coordinator.result(offload).status()).isEqualTo(IndexCacheProtocol.Status.OFFLOADED);
+  }
+
+  @Test
   void migrationReleaseKeepsTheNewCopyConfirmed() {
     coordinator.report(node("a", "a-1", 1, 100, 0));
     String first =

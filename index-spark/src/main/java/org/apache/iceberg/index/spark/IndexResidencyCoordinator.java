@@ -24,6 +24,7 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Comparator;
 import java.util.HashMap;
+import java.util.Iterator;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
@@ -80,6 +81,12 @@ final class IndexResidencyCoordinator {
       this.hasAccess = true;
     }
 
+    /** Marks the index as seen now without claiming a query used it. */
+    private void touched(long observedAtNanos) {
+      this.accessAgeNanos = 0;
+      this.accessObservedAtNanos = observedAtNanos;
+    }
+
     /** Age at {@code nowNanos}; larger means staler. Independent of any absolute clock epoch. */
     private long ageAt(long nowNanos) {
       if (accessAgeNanos == Long.MAX_VALUE) {
@@ -105,7 +112,7 @@ final class IndexResidencyCoordinator {
     private final String indexUuid;
     private final long epoch;
     private long snapshotId;
-    private final IndexCacheProtocol.Status terminalStatus;
+    private IndexCacheProtocol.Status terminalStatus;
     private final List<IndexCacheProtocol.File> files = new ArrayList<>();
     private final Map<String, String> rejected = new LinkedHashMap<>();
     private final Map<String, String> failed = new LinkedHashMap<>();
@@ -297,6 +304,8 @@ final class IndexResidencyCoordinator {
   /** How often one command may come back as BUSY before the file is reported as failed. */
   static final int DEFAULT_MAX_ATTEMPTS = 3;
 
+  private static final int PLAN_WINDOW = 64;
+
   private final int maxCommandsPerReply;
   private final int maxCommandAttempts;
 
@@ -323,7 +332,7 @@ final class IndexResidencyCoordinator {
     IndexState index = indexes.computeIfAbsent(target.indexUuid(), IndexState::new);
     index.epoch = index.epoch + 1;
     index.paused = false;
-    index.accessed(0, nowNanos);
+    index.touched(nowNanos);
     Set<String> previous = new LinkedHashSet<>(index.targetCacheKeys);
     // A supplied policy always restarts protection; a repeated load without one keeps its deadline.
     if (policy != null) {
@@ -375,6 +384,7 @@ final class IndexResidencyCoordinator {
     plan.offload = true;
     plans.put(plan.planId, plan);
     lastPlanId = plan.planId;
+    prunePlans();
     List<Holder> toRelease = holders(indexUuid);
     for (String cacheKey : previous) {
       for (Holder holder : holdersOfKey(cacheKey)) {
@@ -474,7 +484,9 @@ final class IndexResidencyCoordinator {
     return bytes;
   }
 
-  /** How long ago each managed index was last used, in nanoseconds; MAX when never used. */
+  /**
+   * How long ago each managed index was last used, in nanoseconds; -1 when a search never used it.
+   */
   Map<String, Long> accessAges(long nowNanos) {
     Map<String, Long> ages = new LinkedHashMap<>();
     for (IndexState index : indexedStates()) {
@@ -517,6 +529,10 @@ final class IndexResidencyCoordinator {
   /** The clock this coordinator compares deadlines and report ages with. */
   long nowNanos() {
     return clock.nowNanos();
+  }
+
+  int planCount() {
+    return plans.size();
   }
 
   String lastPlanId() {
@@ -632,7 +648,7 @@ final class IndexResidencyCoordinator {
 
     if (command.type == IndexCacheProtocol.CommandType.RELEASE) {
       if (ack.status() == IndexCacheProtocol.AckStatus.RELEASED) {
-        plan.released.add(command.cacheKey);
+        plan.released.add(replicaKey(command.cacheKey, command.executorId));
         // Only the copy on that node stops counting; a migrated copy of the same key survives.
         forgetCopy(
             command.cacheKey, command.executorId, command.incarnation, command.releasesCommandId);
@@ -683,30 +699,41 @@ final class IndexResidencyCoordinator {
   /**
    * Keeps only a bounded window of finished plans, so a long-lived driver does not grow forever.
    */
+  /**
+   * Keeps a bounded window of finished plans. A load that reported COMPLETE counts as finished even
+   * though nothing overwrites its state: only the last {@value #PLAN_WINDOW} plans are kept, so a
+   * long-lived driver does not accumulate every plan it ever ran.
+   */
   private void prunePlans() {
-    int finished = 0;
-    for (PlanState plan : plans.values()) {
-      if (plan.finalized()) {
-        finished++;
-      }
+    if (plans.size() <= PLAN_WINDOW) {
+      return;
     }
 
-    while (finished > 64) {
-      String oldest = null;
-      for (Map.Entry<String, PlanState> entry : plans.entrySet()) {
-        if (entry.getValue().finalized()) {
-          oldest = entry.getKey();
-          break;
-        }
-      }
-
-      if (oldest == null) {
+    Iterator<Map.Entry<String, PlanState>> entries = plans.entrySet().iterator();
+    while (plans.size() > PLAN_WINDOW && entries.hasNext()) {
+      PlanState plan = entries.next().getValue();
+      if (plan.planId.equals(lastPlanId)) {
         return;
       }
 
-      plans.remove(oldest);
-      finished--;
+      if (!settled(plan)) {
+        continue;
+      }
+
+      entries.remove();
     }
+  }
+
+  private boolean settled(PlanState plan) {
+    if (plan.finalized()) {
+      return true;
+    }
+
+    IndexCacheProtocol.Status status = result0(plan.planId).status();
+    return status == IndexCacheProtocol.Status.COMPLETE
+        || status == IndexCacheProtocol.Status.FAILED
+        || status == IndexCacheProtocol.Status.CANCELLED
+        || status == IndexCacheProtocol.Status.OFFLOADED;
   }
 
   IndexCacheProtocol.Result result(String planId) {
@@ -716,17 +743,33 @@ final class IndexResidencyCoordinator {
   private IndexCacheProtocol.Result result0(String planId) {
     PlanState plan = planId == null ? null : plans.get(planId);
     if (plan == null) {
-      throw new IllegalArgumentException("Unknown residency plan: " + planId);
+      // A pruned or unknown plan is reported, not thrown: a caller polling a finished plan must not
+      // fail its query because the driver forgot an old id.
+      return IndexCacheProtocol.Result.builder()
+          .planId(String.valueOf(planId))
+          .status(IndexCacheProtocol.Status.FAILED)
+          .uncovered(Map.of("plan", "UNKNOWN_PLAN"))
+          .build();
     }
 
     IndexState index = indexes.get(plan.indexUuid);
     IndexCacheProtocol.Protection protection = index == null ? null : index.protection;
     if (plan.offload) {
       Map<String, String> pending = new LinkedHashMap<>();
+      Set<String> released = new java.util.HashSet<>();
+      for (String replica : plan.released) {
+        released.add(replica.substring(0, replica.lastIndexOf('@')));
+      }
+
       for (IndexCacheProtocol.File file : plan.files) {
-        if (!plan.released.contains(file.cacheKey())) {
+        if (!released.contains(file.cacheKey())) {
           pending.put(file.location(), "RELEASE_PENDING");
         }
+      }
+
+      if (pending.isEmpty()) {
+        // Nothing is left to release, so this plan is finished and may be pruned later.
+        plan.terminalStatus = IndexCacheProtocol.Status.OFFLOADED;
       }
 
       IndexCacheProtocol.Status status =
@@ -1743,6 +1786,11 @@ final class IndexResidencyCoordinator {
    */
   private static boolean cacheKeyBelongsTo(IndexCacheProtocol.File file) {
     return file.cacheKey().endsWith("|" + file.location());
+  }
+
+  /** A release is confirmed per executor copy, not once per file. */
+  private static String replicaKey(String cacheKey, String executorId) {
+    return cacheKey + "@" + executorId;
   }
 
   private static String modeFor(String cacheKey) {

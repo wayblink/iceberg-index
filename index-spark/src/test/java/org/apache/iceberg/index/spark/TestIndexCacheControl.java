@@ -260,25 +260,59 @@ class TestIndexCacheControl {
 
   @Test
   void aSearchKeyIsTheSameStringThePlanUses() {
-    // This is the bug the review found: the search path used to lease with the adapter segment
-    // alone, so it never matched the planned key and always fell back to reading storage.
+    // The search path leases with this key, so it has to be the key the plan stored. Both now build
+    // it through the same method; this compares the two strings rather than a constructor.
     TestIndexFixtures.BuiltIndex built =
         TestIndexFixtures.build(tempDir, "idx-1", "data-1.parquet");
-    TestIndexFixtures.BuiltIndex other =
-        TestIndexFixtures.build(new File(tempDir, "other"), "idx-2", "data-1.parquet");
     IndexCacheDriverControl control =
         new IndexCacheDriverControl(new IndexResidencyCoordinator(() -> BASE));
     control.receive(node());
-    IndexCacheProtocol.Result protocol =
-        IndexCacheController.load(control, other.table(), other.metadata(), "forever", BASE, BASE);
-    IndexCacheProtocol.Result unused =
+    IndexCacheProtocol.Result load =
         IndexCacheController.load(control, built.table(), built.metadata(), "forever", BASE, BASE);
 
-    assertThat(protocol.targetFiles())
-        .allSatisfy(
-            file ->
-                assertThat(ExecutorIndexCache.Config.of(true, 1_000_000L, 1_000_000L)).isNotNull());
-    assertThat(unused.indexUuid()).isEqualTo("idx-1");
+    String searchKey =
+        DistributedIndexSearch.cacheKey(
+            built.table().location(),
+            TestIndexFixtures.adapterKeyFor(built.metadata()),
+            load.targetFiles().get(0));
+
+    String planKey =
+        IndexCacheController.cacheKey(built.table(), built.metadata(), load.targetFiles().get(0));
+    assertThat(searchKey).isEqualTo(planKey);
+    assertThat(searchKey).isEqualTo(planKey);
+  }
+
+  @Test
+  void aFileBeingReleasedSaysSoInThePublicRows() {
+    // RELEASING has no uncovered reason of its own; without this fallback the row a caller sees
+    // would say nothing about the file it is still waiting for.
+    TestIndexFixtures.BuiltIndex built =
+        TestIndexFixtures.build(tempDir, "idx-1", "data-1.parquet");
+    IndexResidencyCoordinator coordinator = new IndexResidencyCoordinator(() -> BASE);
+    IndexCacheDriverControl control = new IndexCacheDriverControl(coordinator);
+    control.receive(node());
+    IndexCacheProtocol.Result load =
+        IndexCacheController.load(control, built.table(), built.metadata(), "forever", BASE, BASE);
+    IndexCacheProtocol.Command command =
+        coordinator.commands("executor-1", "executor-1#1").stream()
+            .filter(c -> c.type() == IndexCacheProtocol.CommandType.LOAD)
+            .findFirst()
+            .orElseThrow();
+    control.receive(
+        ack(
+            load.planId(),
+            command,
+            IndexCacheProtocol.AckStatus.LOADED,
+            command.file().estimatedBytes()));
+
+    IndexCacheProtocol.Result offload =
+        IndexCacheController.offload(control, built.table(), built.metadata(), BASE, BASE);
+    IndexCacheControl.Result rows = IndexCacheControl.Result.from(control, offload);
+
+    assertThat(rows.status()).isEqualTo("RELEASING");
+    assertThat(rows.files()).isNotEmpty();
+    assertThat(rows.files())
+        .allSatisfy(row -> assertThat(row.reason()).isEqualTo("RELEASE_PENDING"));
   }
 
   @Test
@@ -342,14 +376,30 @@ class TestIndexCacheControl {
         new IndexCacheDriverControl(new IndexResidencyCoordinator(() -> BASE));
     control.receive(node());
     IndexCacheController.load(control, built.table(), built.metadata(), "forever", BASE, BASE);
-    control.recordAccess("idx-1", BASE);
+    control.recordAccess("idx-1", BASE + 5_000_000L);
 
-    List<IndexCacheControl.IndexStatus> rows = IndexCacheControl.indexStatusOf(control, BASE);
+    List<IndexCacheControl.IndexStatus> rows =
+        IndexCacheControl.indexStatusOf(control, BASE + 5_000_000L);
 
     assertThat(rows).hasSize(1);
     assertThat(rows.get(0).indexUuid()).isEqualTo("idx-1");
     assertThat(rows.get(0).permanent()).isTrue();
     assertThat(rows.get(0).accessAgeMillis()).isZero();
+  }
+
+  @Test
+  void anIndexNoQueryHasUsedReportsNoAccessAge() {
+    TestIndexFixtures.BuiltIndex built =
+        TestIndexFixtures.build(tempDir, "idx-1", "data-1.parquet");
+    IndexCacheDriverControl control =
+        new IndexCacheDriverControl(new IndexResidencyCoordinator(() -> BASE));
+    control.receive(node());
+    IndexCacheController.load(control, built.table(), built.metadata(), "forever", BASE, BASE);
+
+    List<IndexCacheControl.IndexStatus> rows = IndexCacheControl.indexStatusOf(control, BASE);
+
+    // -1 means "never used"; 0 would claim a query used it on this very clock tick.
+    assertThat(rows.get(0).accessAgeMillis()).isEqualTo(-1L);
   }
 
   @Test
@@ -391,6 +441,54 @@ class TestIndexCacheControl {
             .stream()
             .map(org.apache.iceberg.index.IndexFile::location)
             .toList();
+  }
+
+  private static IndexCacheProtocol.Ack ack(
+      String planId,
+      IndexCacheProtocol.Command command,
+      IndexCacheProtocol.AckStatus status,
+      long bytes) {
+    return ack(command.executorId(), command.incarnation(), planId, command, status, bytes);
+  }
+
+  private static IndexCacheProtocol.Ack ack(
+      String executorId,
+      String incarnation,
+      String planId,
+      IndexCacheProtocol.Command command,
+      IndexCacheProtocol.AckStatus status) {
+    return ack(executorId, incarnation, planId, command, status, 0L);
+  }
+
+  private static IndexCacheProtocol.Ack ack(
+      String executorId,
+      String incarnation,
+      String planId,
+      IndexCacheProtocol.Command command,
+      IndexCacheProtocol.AckStatus status,
+      long bytes) {
+    return IndexCacheProtocol.Ack.builder()
+        .session("application-1")
+        .planId(planId)
+        .commandId(command.commandId())
+        .executorId(executorId)
+        .incarnation(incarnation)
+        .epoch(command.epoch())
+        .sequence(command.sequence())
+        .status(status)
+        .bytes(bytes)
+        .build();
+  }
+
+  private static IndexCacheProtocol.NodeReport nodeFor(String executorId, long sequence) {
+    return IndexCacheProtocol.NodeReport.builder()
+        .session("application-1")
+        .executorId(executorId)
+        .incarnation(executorId + "#1")
+        .sequence(sequence)
+        .budgetBytes(1_000_000L)
+        .usedBytes(0L)
+        .build();
   }
 
   private static IndexCacheProtocol.NodeReport node() {

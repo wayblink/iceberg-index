@@ -124,6 +124,12 @@ final class TestIndexFixtures {
         .build();
   }
 
+  /** The adapter segment of the cache key: adapter class and the blob type it writes. */
+  static String adapterKeyFor(IndexMetadata metadata) {
+    String[] parts = cacheKeyFor(metadata, "").split("\\|");
+    return parts[1] + "|" + parts[2];
+  }
+
   /** The cache key the search path builds for this index: table|adapter|blobType|file. */
   static String cacheKeyFor(IndexMetadata metadata, String fileLocation) {
     VectorIndexAdapter adapter =

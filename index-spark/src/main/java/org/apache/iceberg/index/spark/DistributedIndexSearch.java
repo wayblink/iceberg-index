@@ -156,7 +156,7 @@ public final class DistributedIndexSearch {
     long workingSet = workingSetBytes(table.io(), files, adapter);
     Broadcast<ExecutorIndexCache.Config> cacheRef =
         context.broadcast(ExecutorIndexCache.Config.from(spark, workingSet, table.location()));
-    String cacheKey = cacheKey(adapter);
+    String cacheKey = adapterKey(adapter);
     List<String> cacheKeys = cacheKeys(table.location(), cacheKey, locations);
     // what each executor holds, so a task can be sent to one that already has its file
     IndexCacheLocations locationsTable = IndexCacheLocations.forContext(context.sc());
@@ -302,7 +302,7 @@ public final class DistributedIndexSearch {
     long workingSet = workingSetBytes(table.io(), files, adapter);
     Broadcast<ExecutorIndexCache.Config> cacheRef =
         context.broadcast(ExecutorIndexCache.Config.from(spark, workingSet, table.location()));
-    String cacheKey = cacheKey(adapter);
+    String cacheKey = adapterKey(adapter);
     List<String> cacheKeys = cacheKeys(table.location(), cacheKey, locations);
     IndexCacheLocations locationsTable = IndexCacheLocations.forContext(context.sc());
     boolean locality = localityEnabled(spark);
@@ -533,9 +533,9 @@ public final class DistributedIndexSearch {
   /**
    * The keys the cache stores an index file under, which is how a covered file is counted.
    *
-   * <p>/** The full cache key of one file: owner (the table location), adapter identity, and the
-   * file. Residency management plans its targets in exactly this shape, so a query must look up the
-   * same string; both builders go through this method.
+   * <p>The key is the owner (the table location), the adapter identity, and the file. Residency
+   * management plans its targets in exactly this shape, so a query has to look up the same string;
+   * the plan and the query both build it here.
    */
   static String cacheKey(String owner, String adapterKey, String location) {
     return owner + "|" + adapterKey + "|" + location;
@@ -714,7 +714,7 @@ public final class DistributedIndexSearch {
    * blob of the file it takes. Two definitions that read different payload formats produce
    * different payloads, so they do not need to be told apart here.
    */
-  private static String cacheKey(IndexAdapter adapter) {
+  static String adapterKey(IndexAdapter adapter) {
     return adapter.getClass().getName()
         + "|"
         + (adapter.writesAuxiliaryFiles() ? adapter.auxiliaryBlobType() : adapter.entryBlobType());
