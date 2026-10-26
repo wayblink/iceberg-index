@@ -641,8 +641,15 @@ class TestIndexResidencyCoordinator {
 
     // The old copy is gone, but the migrated one must still count as confirmed coverage.
     assertThat(coordinator.result(plan).status()).isEqualTo(IndexCacheProtocol.Status.COMPLETE);
-    assertThat(coordinator.state("b", "b-1").holders()).containsKey("adapter|A|f");
     assertThat(coordinator.result(plan).residentBytes()).isEqualTo(40);
+
+    // Offload must find the live copy on b and must not chase the released copy on a.
+    coordinator.acceptOffload("A", clock.now());
+    assertThat(coordinator.pendingCommands("b", "b-1"))
+        .flatExtracting(IndexCacheProtocol.Plan::files)
+        .extracting(IndexCacheProtocol.File::cacheKey)
+        .contains("adapter|A|f");
+    assertThat(coordinator.pendingCommands("a", "a-1")).isEmpty();
   }
 
   @Test
@@ -865,10 +872,67 @@ class TestIndexResidencyCoordinator {
         .build();
   }
 
+  @Test
+  void lruKeepsOrderAfterTheDriverClockRestarts() {
+    coordinator.report(node("a", "a-1", 1, 100, 0));
+    String old =
+        coordinator.acceptLoad(
+            target("old", "o1", 40), IndexResidencyPolicy.parse("0"), clock.now());
+    ackFile(old, "o1", IndexCacheProtocol.AckStatus.LOADED);
+    coordinator.report(
+        holding("a", "a-1", 2, 100, 40, "adapter|old|o1", 40)
+            .copy()
+            .accessAgeNanos(Map.of("old", 5 * SECOND))
+            .build());
+    clock.advance(1000 * SECOND);
+
+    // The driver restarts: the monotonic clock starts near zero while executors keep reporting
+    // ages.
+    clock.reset(SECOND);
+    String hot =
+        coordinator.acceptLoad(
+            target("hot", "h1", 40), IndexResidencyPolicy.parse("0"), clock.now());
+    ackFile(hot, "h1", IndexCacheProtocol.AckStatus.LOADED);
+    coordinator.report(holding("a", "a-1", 3, 100, 80, "adapter|hot|h1", 40));
+
+    String plan =
+        coordinator.acceptLoad(
+            target("new", "n1", 50), IndexResidencyPolicy.parse("0"), clock.now());
+    assertThat(coordinator.result(plan).evictedIndexes()).containsExactly("old");
+  }
+
+  @Test
+  void extremeReportedAgeDoesNotOverflowTheOrdering() {
+    coordinator.report(node("a", "a-1", 1, 100, 0));
+    String stale =
+        coordinator.acceptLoad(
+            target("stale", "s1", 40), IndexResidencyPolicy.parse("0"), clock.now());
+    ackFile(stale, "s1", IndexCacheProtocol.AckStatus.LOADED);
+    String fresh =
+        coordinator.acceptLoad(
+            target("fresh", "f1", 20), IndexResidencyPolicy.parse("0"), clock.now());
+    ackFile(fresh, "f1", IndexCacheProtocol.AckStatus.LOADED);
+    coordinator.report(
+        node("a", "a-1", 2, 100, 60)
+            .copy()
+            .holders(Map.of("adapter|stale|s1", 40L, "adapter|fresh|f1", 20L))
+            .accessAgeNanos(Map.of("stale", Long.MAX_VALUE - 1, "fresh", SECOND))
+            .build());
+
+    String plan =
+        coordinator.acceptLoad(
+            target("new", "n1", 60), IndexResidencyPolicy.parse("0"), clock.now());
+    assertThat(coordinator.result(plan).evictedIndexes()).containsExactly("stale");
+  }
+
   private static final class FakeClock implements IndexResidencyCoordinator.Clock {
     private long now;
 
     private FakeClock(long now) {
+      this.now = now;
+    }
+
+    private void reset(long now) {
       this.now = now;
     }
 

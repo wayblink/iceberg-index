@@ -70,9 +70,12 @@ final class IndexResidencyCoordinator {
 
     /** Age at {@code nowNanos}; larger means staler. Independent of any absolute clock epoch. */
     private long ageAt(long nowNanos) {
-      return accessAgeNanos == Long.MAX_VALUE
-          ? Long.MAX_VALUE
-          : Math.addExact(accessAgeNanos, Math.max(0, nowNanos - accessObservedAtNanos));
+      if (accessAgeNanos == Long.MAX_VALUE) {
+        return Long.MAX_VALUE;
+      }
+
+      long elapsed = Math.max(0, nowNanos - accessObservedAtNanos);
+      return accessAgeNanos > Long.MAX_VALUE - elapsed ? Long.MAX_VALUE : accessAgeNanos + elapsed;
     }
 
     private boolean retains(String cacheKey) {
@@ -96,7 +99,6 @@ final class IndexResidencyCoordinator {
     private final Map<String, PlanFile> commands = new LinkedHashMap<>();
     private final Map<String, PlanFile> loaded = new LinkedHashMap<>();
     private final Set<String> fenced = new LinkedHashSet<>();
-    private final Set<String> dropped = new LinkedHashSet<>();
     private final Set<String> reused = new LinkedHashSet<>();
     private final Map<String, String> migrationTargets = new LinkedHashMap<>();
     private final Map<String, String> migrationNotices = new LinkedHashMap<>();
@@ -147,6 +149,7 @@ final class IndexResidencyCoordinator {
     private final long bytes;
     private final IndexCacheProtocol.CommandType type;
     private final long epoch;
+    private final String commandId;
 
     private PlanFile(
         String location,
@@ -155,7 +158,8 @@ final class IndexResidencyCoordinator {
         String incarnation,
         long bytes,
         IndexCacheProtocol.CommandType type,
-        long epoch) {
+        long epoch,
+        String commandId) {
       this.location = location;
       this.cacheKey = cacheKey;
       this.executorId = executorId;
@@ -163,6 +167,7 @@ final class IndexResidencyCoordinator {
       this.bytes = bytes;
       this.type = type;
       this.epoch = epoch;
+      this.commandId = commandId;
     }
   }
 
@@ -273,7 +278,7 @@ final class IndexResidencyCoordinator {
 
     for (PlanState open : plans.values()) {
       if (open.indexUuid.equals(target.indexUuid()) && !open.finalized()) {
-        open.expired = true;
+        fencePlan(open, "SUPERSEDED");
       }
     }
 
@@ -300,7 +305,7 @@ final class IndexResidencyCoordinator {
     index.targetCacheKeys.clear();
     for (PlanState open : plans.values()) {
       if (open.indexUuid.equals(indexUuid) && !open.finalized()) {
-        open.expired = true;
+        fencePlan(open, "OFFLOADED");
       }
     }
 
@@ -422,14 +427,8 @@ final class IndexResidencyCoordinator {
 
     if (command.type == IndexCacheProtocol.CommandType.RELEASE) {
       if (ack.status() == IndexCacheProtocol.AckStatus.RELEASED) {
-        PlanFile copy = plan.loaded.get(command.cacheKey);
-        plan.dropped.add(command.cacheKey);
-        // A migration releases the same key on the old node; the new copy must stay confirmed.
-        if (copy != null
-            && copy.executorId.equals(command.executorId)
-            && copy.incarnation.equals(command.incarnation)) {
-          plan.loaded.remove(command.cacheKey);
-        }
+        // Only the copy on that node stops counting; a migrated copy of the same key survives.
+        forgetCopy(command.cacheKey, command.executorId, command.incarnation);
       }
 
       node.settle(ack.commandId());
@@ -499,14 +498,12 @@ final class IndexResidencyCoordinator {
         continue;
       }
 
+      // Confirmed copies live in plan.loaded; a release removes exactly the copy it acknowledged,
+      // so a migrated copy of the same key stays counted here.
       PlanFile loaded = plan.loaded.get(file.cacheKey());
-      if (loaded != null
-          && !lost.contains(loaded.incarnation)
-          && !plan.dropped.contains(file.cacheKey())) {
+      if (loaded != null && !lost.contains(loaded.incarnation)) {
         counted.putIfAbsent(file.cacheKey(), loaded.bytes);
-      } else if (!plan.loaded.containsKey(file.cacheKey())
-          || lost.contains(loaded.incarnation)
-          || plan.dropped.contains(file.cacheKey())) {
+      } else {
         uncovered.putIfAbsent(file.location(), reason(plan, file, lost));
       }
     }
@@ -572,6 +569,8 @@ final class IndexResidencyCoordinator {
             plan.failed.put(loaded.location, "NODE_LOST");
           }
         }
+
+        fenceOn(plan, node.report.executorId(), node.report.incarnation(), "NODE_LOST");
       }
     }
   }
@@ -582,43 +581,37 @@ final class IndexResidencyCoordinator {
    */
   void expire(String planId, long nowNanos) {
     PlanState plan = plans.get(planId);
-    if (plan == null || plan.finalized()) {
+    if (plan != null) {
+      fencePlan(plan, "CANCELLED");
+    }
+  }
+
+  /**
+   * Fences every unanswered load of a plan and releases the space it promised. Timeouts, superseded
+   * targets, offload, and lost incarnations all go through here so no path leaves a reservation
+   * behind.
+   */
+  private void fencePlan(PlanState plan, String reason) {
+    if (plan.terminalStatus != null) {
       return;
     }
 
     plan.expired = true;
-    // Already confirmed files stay; only work without an answer is fenced.
-    Set<String> answered = new LinkedHashSet<>(plan.failed.keySet());
     for (PlanFile planned : plan.commands.values()) {
       if (planned.type != IndexCacheProtocol.CommandType.LOAD
           || plan.loaded.containsKey(planned.cacheKey)
-          || answered.contains(planned.location)) {
+          || plan.failed.containsKey(planned.location)
+          || plan.fenced.contains(planned.cacheKey)) {
         continue;
       }
 
       plan.fenced.add(planned.cacheKey);
-      plan.failed.put(planned.location, "CANCELLED");
-    }
-
-    for (NodeState node : nodes.values()) {
-      for (PlanFile planned : plan.commands.values()) {
-        // Reservations of fenced commands are released here; their ACKs may never arrive.
-        if (plan.fenced.contains(planned.cacheKey)) {
-          node.settle(commandIdOf(plan, planned));
-        }
+      plan.failed.put(planned.location, reason);
+      NodeState node = nodes.get(planned.executorId);
+      if (node != null) {
+        node.settle(planned.commandId);
       }
     }
-  }
-
-  /** Command identity is derived from the plan and the command's stable position in it. */
-  private static String commandIdOf(PlanState plan, PlanFile command) {
-    for (Map.Entry<String, PlanFile> entry : plan.commands.entrySet()) {
-      if (entry.getValue() == command) {
-        return entry.getKey();
-      }
-    }
-
-    return "";
   }
 
   List<String> expiredProtections() {
@@ -1155,7 +1148,8 @@ final class IndexResidencyCoordinator {
             node.report.incarnation(),
             bytes,
             type,
-            epoch));
+            epoch,
+            commandId));
     if (type == IndexCacheProtocol.CommandType.LOAD) {
       node.reserve(plan.planId, commandId, bytes);
     }
@@ -1245,7 +1239,7 @@ final class IndexResidencyCoordinator {
       for (PlanFile loaded : plan.loaded.values()) {
         // A copy released by a later plan, or no longer part of the current target, is not a
         // holder any more; a paused index still holds its files until release is acknowledged.
-        if (plan.dropped.contains(loaded.cacheKey) || !index.retains(loaded.cacheKey)) {
+        if (!index.retains(loaded.cacheKey)) {
           continue;
         }
 
@@ -1294,6 +1288,42 @@ final class IndexResidencyCoordinator {
   }
 
   /**
+   * Drops the confirmed copy that a release acknowledged, on that node and incarnation only. A
+   * migration releases the same key elsewhere, so matching by key alone would hide a live copy.
+   */
+  private void forgetCopy(String cacheKey, String executorId, String incarnation) {
+    for (PlanState plan : plans.values()) {
+      PlanFile copy = plan.loaded.get(cacheKey);
+      if (copy != null
+          && copy.executorId.equals(executorId)
+          && copy.incarnation.equals(incarnation)) {
+        plan.loaded.remove(cacheKey);
+      }
+    }
+  }
+
+  /** Fences a plan's unanswered loads issued to one incarnation and releases their promises. */
+  private void fenceOn(PlanState plan, String executorId, String incarnation, String reason) {
+    for (PlanFile planned : plan.commands.values()) {
+      if (!planned.executorId.equals(executorId)
+          || !planned.incarnation.equals(incarnation)
+          || planned.type != IndexCacheProtocol.CommandType.LOAD
+          || plan.loaded.containsKey(planned.cacheKey)
+          || plan.failed.containsKey(planned.location)
+          || plan.fenced.contains(planned.cacheKey)) {
+        continue;
+      }
+
+      plan.fenced.add(planned.cacheKey);
+      plan.failed.put(planned.location, reason);
+      NodeState node = nodes.get(executorId);
+      if (node != null) {
+        node.settle(planned.commandId);
+      }
+    }
+  }
+
+  /**
    * Drops every trace of an incarnation that no longer exists: confirmed copies stop counting and
    * outstanding commands can never be delivered, so they are fenced instead of leaving the plan
    * waiting forever.
@@ -1307,18 +1337,7 @@ final class IndexResidencyCoordinator {
         }
       }
 
-      for (PlanFile planned : plan.commands.values()) {
-        if (!planned.executorId.equals(executorId)
-            || !planned.incarnation.equals(incarnation)
-            || planned.type != IndexCacheProtocol.CommandType.LOAD
-            || plan.loaded.containsKey(planned.cacheKey)
-            || plan.failed.containsKey(planned.location)) {
-          continue;
-        }
-
-        plan.fenced.add(planned.cacheKey);
-        plan.failed.put(planned.location, "NODE_LOST");
-      }
+      fenceOn(plan, executorId, incarnation, "NODE_LOST");
     }
   }
 
@@ -1361,9 +1380,7 @@ final class IndexResidencyCoordinator {
     Set<String> lost = lostIncarnations();
     for (PlanState plan : plans.values()) {
       PlanFile loaded = plan.loaded.get(cacheKey);
-      if (loaded != null
-          && !plan.dropped.contains(cacheKey)
-          && !lost.contains(loaded.incarnation)) {
+      if (loaded != null && !lost.contains(loaded.incarnation)) {
         holders.add(
             new Holder(
                 loaded.location,

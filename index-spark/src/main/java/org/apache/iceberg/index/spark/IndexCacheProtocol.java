@@ -259,6 +259,11 @@ final class IndexCacheProtocol {
       return snapshotId;
     }
 
+    /**
+     * Files this message considered. In a planner result these are the candidates, including the
+     * rejected ones; in a reply they are the files a command should act on. Neither is a claim that
+     * a replica is resident.
+     */
     List<File> files() {
       return files;
     }
@@ -603,7 +608,10 @@ final class IndexCacheProtocol {
       return type;
     }
 
-    /** Routing scope: {@code LOAD}, {@code EVICT}, or {@code OTHER}; never a protection signal. */
+    /**
+     * Routing scope for the executor, for example {@code LOAD}, {@code EVICT}, or {@code ORPHAN}
+     * for a tombstone releasing a copy no plan owns. It is never a protection or ownership signal.
+     */
     String mode() {
       return mode;
     }
