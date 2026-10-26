@@ -19,7 +19,7 @@ under the License.
 
 # #2023：向量查询的共享优化规则与物理规划
 
-状态：用户已于2026-10-26授权开始阶段A开发；产品实现与验收尚未完成。代码核对基线：`d2e2727591f47abeffb96c0847475be7cb042450`（2026-10-26）。本设计取代卡片原来的“成本过高就让开全扫”方向。
+状态：用户已于2026-10-26授权阶段A开发。阶段A已实现并合入 main（共享参数决策、冻结绑定、SQL 逻辑/物理计划分离、CALL/TVF 共用计划），其上的可观察性与执行机制（EXPLAIN 决策、Spark metrics、补候选去重）已补齐并测试。代码核对基线：`d2e2727591f47abeffb96c0847475be7cb042450`（2026-10-26）；本轮实现基线 `a1477fa64`。本设计取代卡片原来的“成本过高就让开全扫”方向。阶段B（自动倍数调优、校准与质量目标）仍未开始。
 
 ## 1. 推荐方案与边界
 
@@ -208,6 +208,10 @@ contract=TABLE_LIVE_TOPK, driverMaterialization=true
 
 未设置则显示 `overSample=1 [COMPAT_DEFAULT, no-calibrated-policy]`。不在日志/explain 输出查询向量或完整业务行。
 
+阶段A已落地为 `VectorSearchSource` 的计划文本：`contract`、`column`、`k`、`metric`、`overSample=<值> [<来源>]`（用户显式设置时带 `locked`）、`requestedCandidates`、`initialCandidates`、`index`、`tableSnapshot`、`indexSnapshot`、`uncoveredFiles`、`driverMaterialization=true`。
+
+物理算子 `VectorSearchSourceExec` 以 Spark metrics 报告：`numCandidates`（首轮请求）、`numCandidateRequests`（末轮累计请求）、`numCandidateRounds`、`numLiveCandidates`、`numDeletedOrInvisibleHits`（按 `(file,pos)` 每位置只计一次）、`numHitsOutsideSnapshot`（命中指向冻结快照已没有的数据文件，例如建索引后做了 compaction；同样每位置只计一次）、`numRowsAtFiles`（去重后的回表文件数，不是轮次累计）、`numResidualFiles`、`numIndexUnderfilled`、`numOutputRows`（source 产出的行数，在 Sort/Limit 之前，不等于最终查询结果行数）。`numIndexUnderfilled` 只表示**索引分支**在最后一轮仍不足 K（残差扫描可能已补齐完整答案），不是整条查询结果不足；整条查询的输出行数由 `numOutputRows` 与结果本身给出。underfill 的具体原因（`satisfied`/`kernel_exhausted`/`entry_bound_reached`/`underfilled_retry_limit`/`budget_not_representable`/`empty_request`）写在执行日志里，因为 Spark metric 只能携带数值；规划（绑定耗时）与执行（候选、残差耗时）分开记录。
+
 当前 parser 只接管以 CALL 开头的语句，不能承诺 `EXPLAIN CALL` 已被支持；即使补解析，外层 CallExec 也不会自动展开执行时创建的内层计划。首期 CALL 在内层执行前记录相同的计划摘要，测试直接对 bridge 的内层 QueryExecution 检查。不新增 explain procedure，不把 SQL EXPLAIN CALL 的 parser 改造混入本期。
 
 运行 metrics 至少包括：候选数、存活/删除/不可见候选数、补候选轮次、回表文件数、残差文件数、输出数、underfill原因。规划耗时与搜索/回表耗时分别记录。
@@ -245,6 +249,10 @@ contract=TABLE_LIVE_TOPK, driverMaterialization=true
 | SQL 资格 | 在计划里找第一个 scan | 白名单：单表、单一升序距离、可折叠正数 LIMIT、只有投影/别名/向量列 `IsNotNull` 过滤；Join/Aggregate/Window/Offset/任意过滤/多排序不改写 |
 | CALL 与 TVF | 自己解析倍数、构造时可能已搜索 | 与 SQL 共用同一参数决策与绑定；TVF 只返回请求，搜索发生在物理执行 |
 | CALL 读取快照 | 搜索后回表时才取 currentSnapshot | 规划时同时固定索引快照与表快照 |
+| 可观察性 | 规则日志只有改写结果，执行量不可见 | EXPLAIN 显示参数值/来源/锁定、metric、请求与实际候选预算、两个快照、覆盖分支、driver barrier；执行以 Spark metrics 报告候选、轮次、活/失效命中、回表与残差文件、underfill |
+| 补候选计数 | 每轮独立推导，失效命中会跨轮重复计数 | 复用优化阶段推导的预算；每轮累计请求；`(file,pos)` 每位置只计一次，失效命中不再重复计入 |
+| underfill 口径 | 无 | `numIndexUnderfilled` 只报告索引分支不足 K，不冒充整条查询结果不足；残差分支补齐答案时该值仍为 1 |
+| 快照外命中 | 静默丢弃 | `numHitsOutsideSnapshot` 计数（compaction 后索引条目指向已被替换的文件），答案仍由残差分支补齐 |
 
 `CALL` 的输出合同没有变：仍是原始索引 score、nullable row、只返回索引命中，不扫未覆盖文件、不精确重排。倍数调大可能改变候选集合，因此不保证与旧 `C=K` 逐条一致。
 

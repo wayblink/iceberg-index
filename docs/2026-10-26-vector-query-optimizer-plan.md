@@ -162,4 +162,6 @@ under the License.
 
 任务共享接口已核对：Task1的参数/预算由Task2/3/4消费；Task2统一request/context由Task3/4消费；Task3的strategy/exec由Task4补INDEX_HITS完成步骤；Task5只验收，不另造接口。SQL资格、快照失败时机、NULL、非前缀候选、TVF/空请求均对应Review Focus的测试项。
 
-目前只有隔离环境、89项基线和实施计划；尚未新增产品实现或测试代码。按计划先做Task1，再依次集成，最终独立复审。不将阶段A框架交付称为阶段B自动最优倍数。
+状态（2026-10-26）：Task1、Task2 已由 `card/2023-inline` 实现并合入 main（参数来源/预算、绑定冻结、SQL 逻辑与物理计划分离、CALL/TVF 接入共享决策）。Task3 的剩余部分——参数/预算/metric/两个快照进入 EXPLAIN，物理算子以 Spark metrics 报告候选、轮次、活/失效/快照外命中、去重回表文件与残差文件、索引分支 underfill，补候选复用优化阶段预算且 `(file,pos)` 每位置只计一次，规划与执行耗时分开记录——已由分支 `card/2023-finish` 的提交 `Index: Report what a vector query decided and what it moved` 交付，并新增 `TestVectorSearchExecution` 覆盖规划纯度、双分支形状、删除后补轮、underfill、三 metric 与全扫一致、branch/time travel、快照过期仍可执行、数据文件与索引 payload 被删时的首次物理读失败。Task4 的入口一致性（SQL/CALL/TVF 同参数决策、raw score/nullable row、批次统一回表、TVF 规划无 job）由 `TestVectorSearchSharedRules`、`TestIndexTableFunctions`、`TestVectorIndexSearchBatch` 覆盖。Task5 的全量回归与独立复审结果记录在工作目录 `iceberg-reviews/2023/`。
+
+未完成且不能宣称：阶段B的自动倍数调优（校准数据、质量目标、候选倍数集合）不在本期；首期未设置倍数仍是兼容基线 1（`COMPAT_DEFAULT(no-calibrated-policy)`），不是自动最优；`CALL` 不扫未覆盖文件、不精确重排，合同未变；driver barrier 仍在，未承诺硬内存上限。
