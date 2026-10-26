@@ -72,6 +72,29 @@ object IndexRewriteSupport {
     }
   }
 
+  /**
+   * The query vector of a distance expression, as floats.
+   *
+   * <p>The expression's array is read element by element, because the element type is whatever the
+   * query wrote and not necessarily a double.
+   */
+  def queryOf(distance: VectorDistanceExpression): Option[Array[Float]] = {
+    if (!distance.query.foldable) {
+      return None
+    }
+    distance.query.eval(EmptyRow) match {
+      case values: ArrayData =>
+        try {
+          Some(toFloats(
+            values,
+            distance.query.dataType.asInstanceOf[org.apache.spark.sql.types.ArrayType].elementType))
+        } catch {
+          case _: IllegalArgumentException => None
+        }
+      case _ => None
+    }
+  }
+
   /** The first Iceberg scan of a plan, which is the one the indexed column belongs to. */
   def findIcebergScan(plan: LogicalPlan): Option[DataSourceV2Relation] = {
     plan.collectFirst {

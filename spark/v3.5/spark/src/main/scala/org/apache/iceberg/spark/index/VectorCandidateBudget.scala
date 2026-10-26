@@ -51,6 +51,30 @@ private[spark] object VectorCandidateBudget {
     nextBudget
   }
 
+  /**
+   * The next cumulative budget, or null when it cannot be expressed.
+   *
+   * <p>A retry loop treats a budget it cannot represent as the end of its retries rather than a
+   * reason to fail a query that already has candidates: it returns what it found and says why it
+   * stopped.
+   */
+  def nextOrNull(current: Int, live: Int, k: Int, entryUpperBound: JLong): VectorCandidateBudget = {
+    if (current < 0 || live < 0 || k <= 0) {
+      return null
+    }
+    val requested = current.toLong + math.max(1L, k.toLong - live.toLong)
+    val effective = if (entryUpperBound == null) {
+      requested
+    } else {
+      math.min(requested, entryUpperBound.longValue())
+    }
+    if (effective <= current || effective > Int.MaxValue) {
+      null
+    } else {
+      VectorCandidateBudget(requested, effective.toInt, entryUpperBound)
+    }
+  }
+
   private def bounded(requested: Long, entryUpperBound: JLong): Int = {
     val effective = if (entryUpperBound == null) {
       requested

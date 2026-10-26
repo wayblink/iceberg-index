@@ -68,6 +68,11 @@ class IcebergSparkSessionExtensions extends (SparkSessionExtensions => Unit) {
     extensions.injectOptimizerRule { spark =>
       org.apache.iceberg.spark.index.RewriteVectorSearch(spark)
     }
+    // the physical side of that rewrite: the source it lowers to is planned here, and the search
+    // happens when that operator runs
+    extensions.injectPlannerStrategy { spark =>
+      org.apache.iceberg.spark.index.VectorSearchStrategy(spark)
+    }
 
     // text score and match, which a rule binds to the statistics of the index it finds, for the
     // same reason a vector distance is bound to the metric of its index

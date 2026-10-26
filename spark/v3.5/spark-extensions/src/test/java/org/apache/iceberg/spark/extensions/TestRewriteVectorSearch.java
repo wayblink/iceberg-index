@@ -19,6 +19,7 @@
 package org.apache.iceberg.spark.extensions;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 import java.nio.file.Path;
 import java.util.Comparator;
@@ -108,7 +109,7 @@ class TestRewriteVectorSearch {
             planOf(
                 table,
                 "SELECT id FROM local.%s ORDER BY vec_distance(embedding, array(0.9d, 0.1d)) LIMIT 2"))
-        .contains("LocalRelation");
+        .contains("VectorSearchSource");
   }
 
   @Test
@@ -125,7 +126,7 @@ class TestRewriteVectorSearch {
     List<Row> withIndex = spark.sql(String.format(query, indexed)).collectAsList();
 
     assertThat(withIndex).containsExactlyElementsOf(withoutIndex);
-    assertThat(planOf(indexed, String.format(query, indexed))).contains("LocalRelation");
+    assertThat(planOf(indexed, String.format(query, indexed))).contains("VectorSearchSource");
   }
 
   @Test
@@ -221,13 +222,14 @@ class TestRewriteVectorSearch {
             .containsExactlyElementsOf(widenedOnce);
       }
 
-      // a value that means nothing falls back to asking for what the query wants, rather than
-      // failing a query over a configuration
+      // a value that cannot be a multiplier is reported rather than quietly replaced: a setting
+      // the query asked for is not something the rule may rewrite, and turning 0 into 1 would hide
+      // the mistake instead of naming it
       for (String nonsense : new String[] {"0", "-3"}) {
         spark.conf().set("spark.iceberg.index.vector.over-sample", nonsense);
-        assertThat(spark.sql(String.format(query, indexed)).collectAsList())
-            .as("a usable answer for the configured value %s", nonsense)
-            .containsExactlyElementsOf(widenedOnce);
+        assertThatThrownBy(() -> spark.sql(String.format(query, indexed)).collectAsList())
+            .as("the configured value %s is rejected", nonsense)
+            .hasMessageContaining("spark.iceberg.index.vector.over-sample");
       }
     } finally {
       spark.conf().unset("spark.iceberg.index.vector.over-sample");
@@ -281,9 +283,10 @@ class TestRewriteVectorSearch {
   }
 
   @Test
-  public void leavesAnExactIndexAloneAndScans() {
-    // an exact index repacks the vector column with a row reference and is searched by walking
-    // every entry, which is the work a scan does over a payload larger than the column itself
+  public void usesAnExactIndexInsteadOfScanning() {
+    // a flat index is the vector column repacked with a row reference; the old rule stood aside
+    // because searching it walks every entry, which is a cost decision rather than a correctness
+    // one, and a cost decision is not what decides whether a query may use an index
     String table = tableWithIndex("docs_exact_only", "exact");
 
     assertThat(
@@ -292,9 +295,8 @@ class TestRewriteVectorSearch {
                 String.format(
                     "SELECT id FROM local.%s ORDER BY vec_distance(embedding, array(0.9d, 0.1d)) LIMIT 2",
                     table)))
-        .doesNotContain("LocalRelation");
+        .contains("VectorSearchSource");
 
-    // the answers are still right, they just come from a scan
     List<Row> hits = search(table, 2);
     assertThat(hits).hasSize(2);
     assertThat(hits.get(0).getLong(0)).isEqualTo(1L);
@@ -331,7 +333,7 @@ class TestRewriteVectorSearch {
     assertThat(hits).hasSize(2);
     assertThat(hits.get(0).getLong(0)).isEqualTo(1L);
     assertThat(hits.get(1).getLong(0)).isEqualTo(3L);
-    assertThat(planOf(table, query)).contains("LocalRelation");
+    assertThat(planOf(table, query)).contains("VectorSearchSource");
   }
 
   @Test
@@ -343,7 +345,7 @@ class TestRewriteVectorSearch {
                 String.format(
                     "SELECT id FROM local.%s ORDER BY vec_distance(embedding, array(0.9d, 0.1d)) LIMIT 2",
                     table)))
-        .doesNotContain("LocalRelation");
+        .doesNotContain("VectorSearchSource");
   }
 
   @Test
@@ -351,7 +353,7 @@ class TestRewriteVectorSearch {
     String table = tableWithIndex("docs_hnsw", "hnsw");
 
     // an approximate index is used too: its candidates are re-scored exactly before the limit
-    assertThat(planOf(table, nearestNeighbour(table, 2))).contains("LocalRelation");
+    assertThat(planOf(table, nearestNeighbour(table, 2))).contains("VectorSearchSource");
 
     // the table is small enough for the graph to hold every vector, so the re-ranked candidates are
     // the ones a full scan gives
@@ -367,7 +369,7 @@ class TestRewriteVectorSearch {
     spark.sql(String.format("INSERT INTO local.%s VALUES (5, 'echo', array(2.0d, 1.0d))", table));
 
     // the index is still used, and the data file it does not cover is scanned on the side
-    assertThat(planOf(table, nearestNeighbour(table, 2))).contains("LocalRelation");
+    assertThat(planOf(table, nearestNeighbour(table, 2))).contains("VectorSearchSource");
 
     // the indexed row is the closest one, and the new row comes from the scan of the data file the
     // index does not cover
@@ -381,7 +383,7 @@ class TestRewriteVectorSearch {
     String table = tableWithIndex("docs_deleted", "hnsw");
     spark.sql(String.format("DELETE FROM local.%s WHERE id = 1", table));
 
-    assertThat(planOf(table, nearestNeighbour(table, 3))).contains("LocalRelation");
+    assertThat(planOf(table, nearestNeighbour(table, 3))).contains("VectorSearchSource");
 
     // the deleted row is the closest one to the query, so it leaves a hole the next hit fills
     List<Row> hits = search(table, 3);
@@ -413,7 +415,7 @@ class TestRewriteVectorSearch {
             "CALL local.system.rollback_to_snapshot(table => '%s', snapshot_id => %s)",
             table, snapshots.get(0).getLong(0)));
 
-    assertThat(planOf(table, nearestNeighbour(table, 2))).doesNotContain("LocalRelation");
+    assertThat(planOf(table, nearestNeighbour(table, 2))).doesNotContain("VectorSearchSource");
     assertThat(search(table, 2)).isEqualTo(fullScan(table, 2));
   }
 
@@ -428,11 +430,11 @@ class TestRewriteVectorSearch {
                 String.format(
                     "SELECT id FROM local.%s ORDER BY vec_distance(embedding, array(0.9d, 0.1d)) DESC LIMIT 2",
                     table)))
-        .doesNotContain("LocalRelation");
+        .doesNotContain("VectorSearchSource");
 
     // a filter without an order and limit is not the shape either
     assertThat(planOf(table, String.format("SELECT id FROM local.%s WHERE id > 1", table)))
-        .doesNotContain("LocalRelation");
+        .doesNotContain("VectorSearchSource");
   }
 
   @Test
@@ -453,7 +455,7 @@ class TestRewriteVectorSearch {
             table));
 
     // the partition column is not in the data file, its value comes from the path
-    assertThat(planOf(table, nearestNeighbour(table, 2))).contains("LocalRelation");
+    assertThat(planOf(table, nearestNeighbour(table, 2))).contains("VectorSearchSource");
     assertThat(partitionRows(table)).isEqualTo(partitionScan(table));
   }
 
@@ -473,7 +475,7 @@ class TestRewriteVectorSearch {
             table));
 
     // the bucket number is in the path but the column value is not, so the rows cannot be read back
-    assertThat(planOf(table, nearestNeighbour(table, 2))).doesNotContain("LocalRelation");
+    assertThat(planOf(table, nearestNeighbour(table, 2))).doesNotContain("VectorSearchSource");
   }
 
   private static List<Row> partitionRows(String table) {
@@ -516,7 +518,10 @@ class TestRewriteVectorSearch {
   }
 
   private static String planOf(String table, String query) {
-    return spark.sql(String.format(query, table)).queryExecution().optimizedPlan().toString();
+    var execution = spark.sql(String.format(query, table)).queryExecution();
+    // both plans are inspected: a rewrite shows up in the optimization, and the physical plan is
+    // what actually runs the search
+    return execution.optimizedPlan().toString() + execution.executedPlan().toString();
   }
 
   private static String nearestNeighbour(String table, int limit) {
