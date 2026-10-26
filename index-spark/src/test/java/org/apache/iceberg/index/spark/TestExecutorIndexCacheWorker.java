@@ -462,6 +462,51 @@ class TestExecutorIndexCacheWorker {
   }
 
   @Test
+  void aRetryableRefusalIsNotMemoized() {
+    worker.close();
+    // The cache only has room for one file of this size.
+    worker =
+        new ExecutorIndexCacheWorker(
+            SESSION,
+            EXECUTOR,
+            INCARNATION,
+            cache,
+            ExecutorIndexCache.Config.of(true, 130L, 1_000L),
+            countingLoader(),
+            IndexCacheWorkerConfig.parse(Map.of()));
+
+    IndexCacheProtocol.Command first = load("A", "f1", 1);
+    IndexCacheProtocol.Command second = load("A", "f2", 1);
+    assertThat(worker.execute(first).status()).isEqualTo(IndexCacheProtocol.AckStatus.LOADED);
+    IndexCacheProtocol.Ack refused = worker.execute(second);
+    assertThat(refused.reason()).isEqualTo("BUSY");
+    int afterRefusal = loaderCalls.get();
+
+    // Free the space and retry the very same command: it must run, not replay the cached refusal.
+    IndexCacheProtocol.Ack released = worker.execute(release("A", "f1", 1));
+    assertThat(released.status()).isEqualTo(IndexCacheProtocol.AckStatus.RELEASED);
+    assertThat(cache.stats().bytes()).as("released bytes").isZero();
+    IndexCacheProtocol.Ack retried = worker.execute(second);
+
+    assertThat(retried.reason()).isNull();
+    assertThat(retried.status()).isEqualTo(IndexCacheProtocol.AckStatus.LOADED);
+    assertThat(afterRefusal).as("a refusal must not read the file").isEqualTo(1);
+    assertThat(loaderCalls.get()).isEqualTo(2);
+  }
+
+  @Test
+  void aCopyEvictedByTheCacheStopsBeingReported() {
+    worker.execute(load("A", "f1", 1));
+    assertThat(worker.holders()).containsKey("adapter|A|f1");
+
+    // The cache can drop a copy on its own, for example for idle time or another index's pressure.
+    cache.releaseCopy("A", "adapter|A|f1");
+
+    assertThat(worker.holders()).doesNotContainKey("adapter|A|f1");
+    assertThat(worker.report("p", 1, 1_000L, 0L, 0L, Map.of()).usedBytes()).isZero();
+  }
+
+  @Test
   void workerConfigurationRejectsNonPositiveValues() {
     assertThatThrownBy(
             () ->

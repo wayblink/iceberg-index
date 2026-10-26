@@ -121,7 +121,11 @@ final class ExecutorIndexCacheWorker implements AutoCloseable {
 
   private IndexCacheProtocol.Ack remember(
       IndexCacheProtocol.Command command, IndexCacheProtocol.Ack ack) {
-    completed.put(command.commandId(), ack);
+    if (!"BUSY".equals(ack.reason())) {
+      // A transient refusal must stay retryable: caching it would make every re-send a no-op.
+      completed.put(command.commandId(), ack);
+    }
+
     return ack;
   }
 
@@ -169,8 +173,16 @@ final class ExecutorIndexCacheWorker implements AutoCloseable {
       return reject(command, "STALE_EPOCH");
     }
 
+    // Free space is checked before this command promises its own estimate: a first load must not
+    // see its own reservation as if it were already used.
+    long free = cacheConfig.maxBytes() - cache.stats().bytes() - reservedBytes();
+    if (estimate > free) {
+      // Refuse before reading the file: a prepare that cannot be admitted only wastes I/O and the
+      // temporary memory the driver is trying to protect.
+      return reject(command, "BUSY");
+    }
+
     synchronized (stateLock) {
-      // The estimate is promised to the driver while the load runs; it is not free space.
       promised.put(command.commandId(), estimate);
     }
 
@@ -240,6 +252,13 @@ final class ExecutorIndexCacheWorker implements AutoCloseable {
     cache.releaseCopy(command.indexUuid(), cacheKey);
 
     synchronized (stateLock) {
+      Set<String> keys = targetKeys.get(command.indexUuid());
+      if (keys != null) {
+        keys.remove(cacheKey);
+      }
+    }
+
+    synchronized (stateLock) {
       // The physical copy may still be shared with another index, so only stop reporting it when
       // the cache no longer holds it at all.
       if (!cache.residentKeys().contains(cacheKey)) {
@@ -262,15 +281,10 @@ final class ExecutorIndexCacheWorker implements AutoCloseable {
       long reservedBytes,
       long releasingBytes,
       Map<String, Long> accessAgeNanos) {
-    Map<String, Long> holders;
-    long used;
-    synchronized (stateLock) {
-      holders = new LinkedHashMap<>();
-      used = 0;
-      for (Map.Entry<String, Installed> entry : installed.entrySet()) {
-        holders.put(entry.getKey(), entry.getValue().bytes());
-        used = Math.addExact(used, entry.getValue().bytes());
-      }
+    Map<String, Long> holders = holders();
+    long used = 0;
+    for (long bytes : holders.values()) {
+      used = Math.addExact(used, bytes);
     }
 
     return IndexCacheProtocol.NodeReport.builder()
@@ -300,11 +314,19 @@ final class ExecutorIndexCacheWorker implements AutoCloseable {
     }
   }
 
+  /**
+   * Files this executor still holds, from its own bookkeeping filtered by what the cache really
+   * has. A copy evicted by the cache, or released after its last lease closed, stops being
+   * reported.
+   */
   Map<String, Long> holders() {
+    Set<String> resident = cache.residentKeys();
     synchronized (stateLock) {
       Map<String, Long> holders = new LinkedHashMap<>();
       for (Map.Entry<String, Installed> entry : installed.entrySet()) {
-        holders.put(entry.getKey(), entry.getValue().bytes());
+        if (resident.contains(entry.getKey())) {
+          holders.put(entry.getKey(), entry.getValue().bytes());
+        }
       }
 
       return holders;
@@ -336,6 +358,10 @@ final class ExecutorIndexCacheWorker implements AutoCloseable {
   public void close() {
     closed.set(true);
     completed.clear();
+    synchronized (stateLock) {
+      // Nothing will be admitted any more, so the promised space must not keep inflating reports.
+      promised.clear();
+    }
   }
 
   /** Acknowledgement for a command that failed outside the loader, for example admission code. */

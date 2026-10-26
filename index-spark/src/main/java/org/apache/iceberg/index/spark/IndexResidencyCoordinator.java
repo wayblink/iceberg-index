@@ -56,7 +56,8 @@ final class IndexResidencyCoordinator {
       String executorId,
       String incarnation,
       long bytes,
-      String installedBy) {}
+      String installedBy,
+      long epoch) {}
 
   private static final class IndexState {
     private final String indexUuid;
@@ -397,7 +398,7 @@ final class IndexResidencyCoordinator {
           modeFor(cacheKey),
           IndexCacheProtocol.File.builder().location(location).cacheKey(cacheKey).build(),
           holder.bytes(),
-          plan.epoch,
+          holder.epoch(),
           holder.installedBy());
     }
 
@@ -843,7 +844,7 @@ final class IndexResidencyCoordinator {
                   .cacheKey(holder.cacheKey())
                   .build(),
               holder.bytes(),
-              plan.epoch,
+              holder.epoch(),
               holder.installedBy());
         }
       }
@@ -974,7 +975,7 @@ final class IndexResidencyCoordinator {
             .cacheKey(migrated.cacheKey)
             .build(),
         migrated.bytes,
-        plan.epoch,
+        source.epoch(),
         source.installedBy());
   }
 
@@ -1038,7 +1039,7 @@ final class IndexResidencyCoordinator {
                 .cacheKey(holder.cacheKey())
                 .build(),
             holder.bytes(),
-            plan.epoch,
+            holder.epoch(),
             holder.installedBy());
       }
     }
@@ -1393,7 +1394,8 @@ final class IndexResidencyCoordinator {
                     loaded.executorId,
                     loaded.incarnation,
                     loaded.bytes,
-                    loaded.commandId));
+                    loaded.commandId,
+                    loaded.epoch));
       }
     }
 
@@ -1533,7 +1535,8 @@ final class IndexResidencyCoordinator {
                 loaded.executorId,
                 loaded.incarnation,
                 loaded.bytes,
-                loaded.commandId));
+                loaded.commandId,
+                loaded.epoch));
       }
     }
 

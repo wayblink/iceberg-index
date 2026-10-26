@@ -753,6 +753,35 @@ class TestIndexResidencyCoordinator {
   }
 
   @Test
+  void evictionReleaseCarriesTheVictimCopyEpochNotTheRequesters() {
+    coordinator.report(node("a", "a-1", 1, 100, 0));
+    String victim =
+        coordinator.acceptLoad(target("V", "v1", 40), IndexResidencyPolicy.parse("0"), clock.now());
+    ackFile(victim, "v1", IndexCacheProtocol.AckStatus.LOADED);
+    coordinator.report(holding("a", "a-1", 2, 100, 40, "adapter|V|v1", 40));
+    // Several plans later the requesting index has a much larger epoch.
+    for (int i = 0; i < 3; i++) {
+      clock.advance(SECOND);
+      coordinator.acceptLoad(
+          target("other" + i, "o" + i, 1), IndexResidencyPolicy.parse("forever"), clock.now());
+    }
+
+    String plan =
+        coordinator.acceptLoad(
+            target("W", "big", 200, "small", 70), IndexResidencyPolicy.parse("0"), clock.now());
+
+    IndexCacheProtocol.Command release =
+        coordinator.commands("a", "a-1").stream()
+            .filter(
+                c -> c.planId().equals(plan) && c.type() == IndexCacheProtocol.CommandType.RELEASE)
+            .findFirst()
+            .orElseThrow();
+    // The executor compares this epoch with the epoch that installed the victim's copy.
+    assertThat(release.epoch()).isEqualTo(1);
+    assertThat(coordinator.result(plan).evictedIndexes()).containsExactly("V");
+  }
+
+  @Test
   void missingIncarnationAckCannotClaimCoverage() {
     coordinator.report(node("a", "a-1", 1, 100, 0));
     String plan =
