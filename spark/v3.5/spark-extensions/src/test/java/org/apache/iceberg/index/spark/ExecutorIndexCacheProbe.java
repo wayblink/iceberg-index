@@ -22,6 +22,11 @@ package org.apache.iceberg.index.spark;
 public final class ExecutorIndexCacheProbe {
   private ExecutorIndexCacheProbe() {}
 
+  /** Empties the cache, so a test counts only the files its own query read. */
+  public static void clear() {
+    ExecutorIndexCache.get().clear();
+  }
+
   public static ExecutorIndexCache.Stats stats() {
     return ExecutorIndexCache.get().stats();
   }
