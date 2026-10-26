@@ -119,6 +119,7 @@ public final class SparkIndexBuilder {
               spark,
               table,
               indexLocation,
+              currentMetadata.indexUuid(),
               snapshotId,
               sourceTableSnapshotId,
               vectorColumn,
@@ -226,6 +227,7 @@ public final class SparkIndexBuilder {
               spark,
               table,
               indexLocation,
+              currentMetadata.indexUuid(),
               snapshotId,
               sourceTableSnapshotId,
               vectorColumn,
@@ -255,10 +257,70 @@ public final class SparkIndexBuilder {
   }
 
   /**
+   * Runs the build of the index files and reports how far it has got.
+   *
+   * <p>The report is an observation, so it may never decide the outcome: a build that cannot write
+   * one still builds, and the counters keep being published until the attempt ends, which is what
+   * makes a build that stopped rather than finished visible afterwards.
+   */
+  private static List<IndexFile> buildIndexFiles(
+      SparkSession spark,
+      Table table,
+      String indexLocation,
+      String indexUuid,
+      long snapshotId,
+      long sourceTableSnapshotId,
+      String vectorColumn,
+      IndexAdapter adapter,
+      Set<String> onlyFiles,
+      long maxEntriesPerIndexFile,
+      IndexSnapshotWriter writer) {
+    // the counters are driver-side accumulators, which the reporter can read at any moment; how
+    // many index files this attempt will write is only known once the data files are grouped, so
+    // the total is filled in from inside
+    BuildProgress progress = new BuildProgress(spark);
+    IndexBuildReporter reporter =
+        IndexBuildReporter.start(
+            table.io(),
+            IndexBuildStatus.statusDirFor(indexLocation),
+            indexUuid,
+            vectorColumn,
+            sourceTableSnapshotId,
+            progress::filesTotal,
+            progress::filesBuilt,
+            progress::filesFailed,
+            progress::rows);
+
+    try {
+      List<IndexFile> indexFiles =
+          buildIndexFilesUnreported(
+              spark,
+              table,
+              indexLocation,
+              snapshotId,
+              sourceTableSnapshotId,
+              vectorColumn,
+              adapter,
+              onlyFiles,
+              maxEntriesPerIndexFile,
+              writer,
+              progress,
+              reporter);
+      reporter.succeeded();
+      return indexFiles;
+    } catch (RuntimeException | Error e) {
+      reporter.failed(e);
+      throw e;
+    } finally {
+      reporter.close();
+    }
+  }
+
+  /**
    * Writes one index file per data file (restricted to {@code onlyFiles} when non-null) and returns
    * the index files without writing a manifest or snapshot.
    */
-  private static List<IndexFile> buildIndexFiles(
+  private static List<IndexFile> buildIndexFilesUnreported(
       SparkSession spark,
       Table table,
       String indexLocation,
@@ -268,7 +330,9 @@ public final class SparkIndexBuilder {
       IndexAdapter adapter,
       Set<String> onlyFiles,
       long maxEntriesPerIndexFile,
-      IndexSnapshotWriter writer) {
+      IndexSnapshotWriter writer,
+      BuildProgress progress,
+      IndexBuildReporter reporter) {
     if (onlyFiles != null && onlyFiles.isEmpty()) {
       return Lists.newArrayList();
     }
@@ -334,14 +398,17 @@ public final class SparkIndexBuilder {
 
     // A build of a large table runs for tens of minutes and reports nothing until it ends, which
     // makes a stuck one indistinguishable from a slow one. The counters are what the progress lines
-    // are printed from: how many index files of how many, and how many have failed. A group that
-    // fails costs its own index file and the build carries on, so the failed count is real news and
-    // not simply the exception that ended the attempt.
-    SparkContext context = spark.sparkContext();
-    LongAccumulator filesBuilt = context.longAccumulator(BUILT_ACCUMULATOR);
-    LongAccumulator filesFailed = context.longAccumulator(FAILED_ACCUMULATOR);
-    LongAccumulator rowsWritten = context.longAccumulator(ENTRIES_ACCUMULATOR);
+    // are printed from, and the same ones the report publishes: how many index files of how many,
+    // and how many have failed. A group that fails costs its own index file and the build carries
+    // on, so the failed count is real news and not simply the exception that ended the attempt.
+    LongAccumulator filesBuilt = progress.built;
+    LongAccumulator filesFailed = progress.failed;
+    LongAccumulator rowsWritten = progress.rows;
     int totalGroups = groups.size();
+    progress.total.set(totalGroups);
+    // the total is only now known, and a caller polling during the build should see it before the
+    // next heartbeat rather than up to one interval later
+    reporter.publishProgress();
     long buildStartedMillis = System.currentTimeMillis();
 
     List<Row> indexFileRows =
@@ -482,6 +549,38 @@ public final class SparkIndexBuilder {
         .runtimeProfile(memory.getString(5))
         .structure(memory.getAs(6))
         .build();
+  }
+
+  /** The counters of one attempt, shared by the build that fills them and the report that reads. */
+  private static final class BuildProgress {
+    private final LongAccumulator built;
+    private final LongAccumulator failed;
+    private final LongAccumulator rows;
+    private final java.util.concurrent.atomic.AtomicLong total =
+        new java.util.concurrent.atomic.AtomicLong(0L);
+
+    private BuildProgress(SparkSession spark) {
+      SparkContext context = spark.sparkContext();
+      this.built = context.longAccumulator(BUILT_ACCUMULATOR);
+      this.failed = context.longAccumulator(FAILED_ACCUMULATOR);
+      this.rows = context.longAccumulator(ENTRIES_ACCUMULATOR);
+    }
+
+    private long filesTotal() {
+      return total.get();
+    }
+
+    private long filesBuilt() {
+      return built.value();
+    }
+
+    private long filesFailed() {
+      return failed.value();
+    }
+
+    private long rows() {
+      return rows.value();
+    }
   }
 
   private static final String BUILT_ACCUMULATOR = "iceberg.index.build.files-built";

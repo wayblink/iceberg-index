@@ -20,10 +20,12 @@ package org.apache.iceberg.spark.procedures;
 
 import java.util.Map;
 import java.util.UUID;
+import org.apache.iceberg.Table;
 import org.apache.iceberg.index.CreateIndexRequest;
 import org.apache.iceberg.index.IndexMetadata;
 import org.apache.iceberg.index.IndexSnapshot;
 import org.apache.iceberg.index.SidecarIndexCatalog;
+import org.apache.iceberg.index.spark.IndexBuildStatus;
 import org.apache.iceberg.index.spark.SparkIndexBuilder;
 import org.apache.iceberg.index.vector.VectorIndexDefinition;
 import org.apache.iceberg.index.vector.VectorIndexDefinition.Metric;
@@ -39,6 +41,8 @@ import org.apache.spark.sql.types.Metadata;
 import org.apache.spark.sql.types.StructField;
 import org.apache.spark.sql.types.StructType;
 import org.apache.spark.unsafe.types.UTF8String;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 /**
  * Builds a full vector index for a table snapshot and registers it.
@@ -49,6 +53,8 @@ import org.apache.spark.unsafe.types.UTF8String;
  * }</pre>
  */
 class BuildVectorIndexProcedure extends BaseProcedure {
+  private static final Logger LOG = LoggerFactory.getLogger(BuildVectorIndexProcedure.class);
+
   private static final ProcedureParameter TABLE_PARAM =
       requiredInParameter("table", DataTypes.StringType);
   private static final ProcedureParameter COLUMN_PARAM =
@@ -201,10 +207,15 @@ class BuildVectorIndexProcedure extends BaseProcedure {
             // name it, so the registration and whatever it wrote are removed before the failure is
             // reported. The failure is caught as an Exception because a Spark job reports its
             // failure as a SparkException, which a RuntimeException catch does not see.
+            IndexBuildStatus report =
+                IndexBuildStatus.read(
+                    table.io(), IndexBuildStatus.statusDirFor(created.location()));
             catalog.dropIndex(table.location(), indexUuid, true);
+            keepFailedAttempt(table, fieldId, column, indexUuid, report, e);
             throw e instanceof RuntimeException ? (RuntimeException) e : new RuntimeException(e);
           }
 
+          forgetFailedAttempt(table, fieldId);
           catalog.updateIndex(updated);
 
           IndexSnapshot snapshot = updated.latestSnapshot();
@@ -217,14 +228,63 @@ class BuildVectorIndexProcedure extends BaseProcedure {
   }
 
   /**
+   * Keeps the report of a failed attempt where the rollback does not delete it.
+   *
+   * <p>The report a build writes about itself lives inside the index tree, and a failed build drops
+   * that tree, so the run that ended is the one nobody could look up afterwards. This copies what
+   * the failed attempt said to a location keyed by the column it was for, which is what a later
+   * status call reads when the index it describes is gone.
+   */
+  private static void keepFailedAttempt(
+      Table table,
+      int fieldId,
+      String column,
+      String indexUuid,
+      IndexBuildStatus report,
+      Exception failure) {
+    IndexBuildStatus failed =
+        report == null
+            ? IndexBuildStatus.builder()
+                .state(IndexBuildStatus.State.FAILED)
+                .indexUuid(indexUuid)
+                .column(column)
+                .sourceSnapshotId(
+                    table.currentSnapshot() == null ? -1L : table.currentSnapshot().snapshotId())
+                .startedAtMillis(System.currentTimeMillis())
+                .error(IndexBuildStatus.describeFailure(failure))
+                .build()
+            : report.failed(IndexBuildStatus.describeFailure(failure), System.currentTimeMillis());
+
+    try {
+      IndexBuildStatus.write(
+          table.io(), IndexBuildStatus.rolledBackStatusDir(table.location(), fieldId), failed);
+    } catch (RuntimeException e) {
+      // the build has already failed, and the report is an observation: reporting that the report
+      // could not be written would replace the failure that matters with one that does not
+      LOG.warn("Failed to record the failed index build of {}", column, e);
+    }
+  }
+
+  /** Drops the report of a failed attempt once a later attempt of the same column succeeds. */
+  private static void forgetFailedAttempt(Table table, int fieldId) {
+    try {
+      IndexBuildStatus.delete(
+          table.io(), IndexBuildStatus.rolledBackStatusDir(table.location(), fieldId));
+    } catch (RuntimeException e) {
+      // a stale failure in the report is a smaller problem than a build that worked reporting
+      // that it did not
+      LOG.warn("Failed to clear the failed index build report of column {}", fieldId, e);
+    }
+  }
+
+  /**
    * Refuses a build that would make the column ambiguous, unless the caller named the index.
    *
    * <p>One index per column is what search and refresh assume when no name is given, so a second
    * unnamed index is refused; a named one is a new index over the same column, which is how the
    * parameters of two arms are compared side by side.
    */
-  private static void checkCanBuild(
-      org.apache.iceberg.Table table, String column, String tableName, String name) {
+  private static void checkCanBuild(Table table, String column, String tableName, String name) {
     java.util.List<org.apache.iceberg.index.IndexMetadata> existing =
         org.apache.iceberg.index.spark.VectorIndexes.indexesFor(table, column, "vector");
     if (name == null) {
