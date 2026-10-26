@@ -19,7 +19,6 @@
 package org.apache.iceberg.spark.procedures;
 
 import java.util.List;
-import org.apache.iceberg.index.spark.VectorIndexSearch;
 import org.apache.iceberg.relocated.com.google.common.base.Preconditions;
 import org.apache.iceberg.relocated.com.google.common.collect.Lists;
 import org.apache.iceberg.spark.procedures.SparkProcedures.ProcedureBuilder;
@@ -131,15 +130,13 @@ class VectorSearchBatchProcedure extends BaseProcedure {
             return new InternalRow[0];
           }
 
-          List<Row> hits =
-              VectorIndexSearch.search(
-                      spark(),
-                      table,
-                      column,
-                      VectorIndexProcedures.resolveIndex(table, column, INDEX_PARAM, input),
-                      queryVectors,
-                      topK)
-                  .collectAsList();
+          // one plan for the whole batch: the same parameter decision as the other entry points,
+          // and one row resolution per hit file rather than one per query
+          String indexArgument = input.isProvided(INDEX_PARAM) ? input.asString(INDEX_PARAM) : null;
+          org.apache.iceberg.spark.index.VectorSearchHitsPlan plan =
+              org.apache.iceberg.spark.index.VectorSearchCalls.plan(
+                  spark(), table, column, indexArgument, queryVectors, topK, true);
+          List<Row> hits = org.apache.iceberg.spark.index.VectorSearchCalls.search(plan, spark());
 
           List<InternalRow> rows = Lists.newArrayListWithCapacity(hits.size());
           for (Row hit : hits) {

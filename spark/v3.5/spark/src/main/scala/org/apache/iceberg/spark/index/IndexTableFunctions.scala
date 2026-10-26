@@ -82,16 +82,11 @@ object IndexTableFunctions {
     val query = doubleArrayArg(args, 2)
     val topK = intArg(args, 3)
 
-    IndexSearch
-      .search(
-        spark,
-        Spark3Util.loadIcebergTable(spark, tableName),
-        column,
-        "vector",
-        vectorPayload(spark, tableName, column, query),
-        topK)
-      .queryExecution
-      .analyzed
+    // the function builds the request and stops there: a search runs when the plan is executed,
+    // not while the plan is being built, and not while it is optimized
+    val queries = new java.util.ArrayList[Array[Float]]()
+    queries.add(query.map(_.toFloat))
+    VectorSearchCalls.planOf(tableName, column, null, queries, topK, batch = false)
   }
 
   private def vectorIndexSearchBatch(args: Seq[Expression]): LogicalPlan = {
@@ -103,11 +98,10 @@ object IndexTableFunctions {
     val queries = stringArrayArg(args, 2)
     val topK = intArg(args, 3)
 
-    val vectors = queries.map(IndexTableFunctions.parseVector).asJava
-    VectorIndexSearch
-      .search(spark, Spark3Util.loadIcebergTable(spark, tableName), column, vectors, topK)
-      .queryExecution
-      .analyzed
+    val vectors = new java.util.ArrayList[Array[Float]]()
+    queries.foreach(query => vectors.add(IndexTableFunctions.parseVector(query)))
+    // as with the single-query form, the function returns a request and never searches
+    VectorSearchCalls.planOf(tableName, column, null, vectors, topK, batch = true)
   }
 
   private def textIndexSearch(args: Seq[Expression]): LogicalPlan = {

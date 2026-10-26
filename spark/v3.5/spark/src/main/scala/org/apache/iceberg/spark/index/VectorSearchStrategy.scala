@@ -42,8 +42,35 @@ case class VectorSearchStrategy(spark: SparkSession) extends Strategy {
   // node and drop the operators above it, including the limit
   override def apply(plan: LogicalPlan): Seq[SparkPlan] = plan match {
     case source: VectorSearchSource => VectorSearchSourceExec(spark, source) :: Nil
+    case hits: VectorSearchHitsRequest => VectorSearchHitsRequestExec(spark, hits) :: Nil
     case _ => Nil
   }
+}
+
+/** Runs an index-hit request, keeping the index's own ranked scores. */
+private[spark] case class VectorSearchHitsRequestExec(
+    spark: SparkSession,
+    request: VectorSearchHitsRequest)
+    extends LeafExecNode {
+
+  override def output: Seq[Attribute] = request.output
+
+  override protected def doExecute(): RDD[InternalRow] = {
+    val rows = VectorSearchCalls.searchRequested(spark, request)
+    val schema =
+      if (request.batch) {
+        org.apache.iceberg.index.spark.IndexSearch.RESULT_SCHEMA
+      } else {
+        org.apache.iceberg.index.spark.IndexSearch.SINGLE_RESULT_SCHEMA
+      }
+    spark.createDataFrame(rows, schema).queryExecution.toRdd.map(row => row.copy())
+  }
+
+  override def outputPartitioning: Partitioning = UnknownPartitioning(0)
+
+  override def outputOrdering: Seq[org.apache.spark.sql.catalyst.expressions.SortOrder] = Nil
+
+  override def simpleString(maxFields: Int): String = request.simpleString(maxFields)
 }
 
 private[spark] case class VectorSearchSourceExec(spark: SparkSession, source: VectorSearchSource)

@@ -19,7 +19,6 @@
 package org.apache.iceberg.spark.procedures;
 
 import java.util.List;
-import org.apache.iceberg.index.spark.VectorIndexSearch;
 import org.apache.iceberg.relocated.com.google.common.collect.Lists;
 import org.apache.iceberg.spark.procedures.SparkProcedures.ProcedureBuilder;
 import org.apache.spark.sql.catalyst.InternalRow;
@@ -105,24 +104,30 @@ class VectorSearchProcedure extends BaseProcedure {
             return new InternalRow[0];
           }
 
+          // the same planning and parameter decisions the other vector entry points use: an
+          // explicit setting is kept, and only an unset multiplier is decided here
+          String indexArgument = input.isProvided(INDEX_PARAM) ? input.asString(INDEX_PARAM) : null;
+          org.apache.iceberg.spark.index.VectorSearchHitsPlan plan =
+              org.apache.iceberg.spark.index.VectorSearchCalls.plan(
+                  spark(),
+                  table,
+                  column,
+                  indexArgument,
+                  List.of(toFloats(queryDoubles)),
+                  topK,
+                  false);
           List<org.apache.spark.sql.Row> hits =
-              VectorIndexSearch.search(
-                      spark(),
-                      table,
-                      column,
-                      VectorIndexProcedures.resolveIndex(table, column, INDEX_PARAM, input),
-                      List.of(toFloats(queryDoubles)),
-                      topK)
-                  .collectAsList();
+              org.apache.iceberg.spark.index.VectorSearchCalls.search(plan, spark());
 
           List<InternalRow> rows = Lists.newArrayListWithCapacity(hits.size());
           for (org.apache.spark.sql.Row hit : hits) {
+            // the single-query form of the hit schema has no query id column
             rows.add(
                 newInternalRow(
-                    UTF8String.fromString(hit.getString(1)),
-                    hit.getLong(2),
-                    hit.getDouble(3),
-                    hit.isNullAt(4) ? null : UTF8String.fromString(hit.getString(4))));
+                    UTF8String.fromString(hit.getString(0)),
+                    hit.getLong(1),
+                    hit.getDouble(2),
+                    hit.isNullAt(3) ? null : UTF8String.fromString(hit.getString(3))));
           }
 
           return rows.toArray(new InternalRow[0]);
