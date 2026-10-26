@@ -22,6 +22,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 
 import java.time.Duration;
 import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Map;
 import org.junit.jupiter.api.Test;
 
@@ -783,6 +784,84 @@ class TestIndexResidencyCoordinator {
     assertThat(planEpoch(plan)).isGreaterThan(1);
     assertThat(release.epoch()).isEqualTo(1);
     assertThat(coordinator.result(plan).evictedIndexes()).containsExactly("V");
+  }
+
+  @Test
+  void aTableScopedCacheKeyFromTheQueryPathIsRoutable() {
+    coordinator.report(node("a", "a-1", 1, 1_000, 0));
+    IndexCacheProtocol.File file =
+        IndexCacheProtocol.File.builder()
+            .location("f1")
+            .cacheKey("s3://bucket/table|Adapter|vector-hnsw|f1")
+            .estimatedBytes(10L)
+            .build();
+    IndexCacheProtocol.Target target =
+        IndexCacheProtocol.Target.builder()
+            .indexUuid("table#A")
+            .snapshotId(1)
+            .files(List.of(file))
+            .definition(
+                new org.apache.iceberg.index.IndexDefinition() {
+                  @Override
+                  public String type() {
+                    return "vector";
+                  }
+
+                  @Override
+                  public int fieldId() {
+                    return 1;
+                  }
+                })
+            .io(
+                new org.apache.iceberg.hadoop.HadoopFileIO(
+                    new org.apache.hadoop.conf.Configuration()))
+            .build();
+
+    String plan =
+        coordinator.acceptLoad(target, IndexResidencyPolicy.parse("forever"), clock.now());
+
+    assertThat(coordinator.result(plan).uncovered()).doesNotContainKey("CACHE_KEY_NOT_OWNED");
+    assertThat(coordinator.commands("a", "a-1"))
+        .filteredOn(c -> c.type() == IndexCacheProtocol.CommandType.LOAD)
+        .extracting(c -> c.file().cacheKey())
+        .containsExactly("s3://bucket/table|Adapter|vector-hnsw|f1");
+  }
+
+  @Test
+  void aCacheKeyThatNamesAnotherFileIsRejected() {
+    coordinator.report(node("a", "a-1", 1, 1_000, 0));
+    IndexCacheProtocol.File file =
+        IndexCacheProtocol.File.builder()
+            .location("f1")
+            .cacheKey("s3://bucket/table|Adapter|vector-hnsw|f2")
+            .estimatedBytes(10L)
+            .build();
+    IndexCacheProtocol.Target target =
+        IndexCacheProtocol.Target.builder()
+            .indexUuid("table#A")
+            .snapshotId(1)
+            .files(List.of(file))
+            .definition(
+                new org.apache.iceberg.index.IndexDefinition() {
+                  @Override
+                  public String type() {
+                    return "vector";
+                  }
+
+                  @Override
+                  public int fieldId() {
+                    return 1;
+                  }
+                })
+            .io(
+                new org.apache.iceberg.hadoop.HadoopFileIO(
+                    new org.apache.hadoop.conf.Configuration()))
+            .build();
+
+    String plan =
+        coordinator.acceptLoad(target, IndexResidencyPolicy.parse("forever"), clock.now());
+
+    assertThat(coordinator.result(plan).uncovered()).containsEntry("f1", "CACHE_KEY_NOT_OWNED");
   }
 
   @Test

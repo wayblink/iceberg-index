@@ -754,7 +754,7 @@ final class IndexResidencyCoordinator {
     Set<String> reusable = new LinkedHashSet<>();
     for (IndexCacheProtocol.File file : target.files()) {
       // Only files carrying an index-scoped identity issued by this plan are routable.
-      if (target.indexUuid() == null || !cacheKeyBelongsTo(file, target.indexUuid())) {
+      if (target.indexUuid() == null || !cacheKeyBelongsTo(file)) {
         plan.rejected.put(file.location(), "CACHE_KEY_NOT_OWNED");
       } else if (confirmedAnywhere(file.cacheKey())) {
         // A shared file already has one confirmed copy in this target; no second load is needed.
@@ -1553,9 +1553,13 @@ final class IndexResidencyCoordinator {
     return false;
   }
 
-  private static boolean cacheKeyBelongsTo(IndexCacheProtocol.File file, String indexUuid) {
-    String[] parts = file.cacheKey().split("\\|", 3);
-    return parts.length == 3 && parts[1].equals(indexUuid) && parts[2].equals(file.location());
+  /**
+   * The cache key is opaque to the driver: the query path builds {@code
+   * tableLocation|adapter|blobType|fileLocation}. What matters is that the key names this file; the
+   * index identity comes from the command.
+   */
+  private static boolean cacheKeyBelongsTo(IndexCacheProtocol.File file) {
+    return file.cacheKey().endsWith("|" + file.location());
   }
 
   private static String modeFor(String cacheKey) {
