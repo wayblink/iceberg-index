@@ -50,6 +50,7 @@ public class IndexCachePlugin implements SparkPlugin {
   static final class IndexCacheDriverPlugin implements DriverPlugin {
     private static final Logger LOG = LoggerFactory.getLogger(IndexCacheDriverPlugin.class);
     private IndexCacheDriverControl control;
+    private String applicationId;
 
     @Override
     public Map<String, String> init(SparkContext sc, PluginContext pluginContext) {
@@ -59,6 +60,9 @@ public class IndexCachePlugin implements SparkPlugin {
           new IndexCacheDriverControl(
               new IndexResidencyCoordinator(
                   System::nanoTime, config.maxCommands(), config.maxAttempts()));
+      // The facade and the procedures reach this application's channel through the registry.
+      applicationId = sc.applicationId();
+      IndexCacheDriverRegistry.register(applicationId, control);
       return Map.of();
     }
 
@@ -99,6 +103,7 @@ public class IndexCachePlugin implements SparkPlugin {
 
     @Override
     public void shutdown() {
+      IndexCacheDriverRegistry.unregister(applicationId);
       control = null;
     }
   }
