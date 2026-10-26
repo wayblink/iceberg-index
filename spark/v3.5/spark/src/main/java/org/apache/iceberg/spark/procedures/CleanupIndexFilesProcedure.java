@@ -210,6 +210,19 @@ class CleanupIndexFilesProcedure extends BaseProcedure {
   }
 
   /**
+   * The file a location names, without the part of the spelling that varies.
+   *
+   * <p>One file is written several ways: {@code file:/a/b} in metadata that recorded the table
+   * location as the user wrote it, {@code file:///a/b} from a directory listing, {@code /a/b} for a
+   * path that names no scheme at all. The scheme and an empty authority are the parts that differ,
+   * so the key is the path the URI holds: every file of one index tree is under one location, which
+   * makes the path enough to tell them apart.
+   */
+  private static String locationKey(Path path) {
+    return path.toUri().normalize().getPath();
+  }
+
+  /**
    * Lists the files under the index tree's {@code data/} and {@code snapshots/} directories that
    * are not referenced by a retained snapshot, with their sizes.
    */
@@ -220,6 +233,15 @@ class CleanupIndexFilesProcedure extends BaseProcedure {
       Configuration conf = spark().sessionState().newHadoopConf();
       Path indexDir = new Path(metadata.location());
       FileSystem fileSystem = indexDir.getFileSystem(conf);
+      // the metadata records a location the way the table location was written, which for a table
+      // under a URI carries the scheme while a listing hands back paths that do not: comparing the
+      // two as strings finds nothing referenced and deletes the index this was asked to tidy, so
+      // both sides are compared by the file they name rather than by how it is spelled
+      Set<String> referencedPaths = Sets.newHashSet();
+      for (String location : referenced) {
+        referencedPaths.add(locationKey(new Path(location)));
+      }
+
       for (String dir :
           new String[] {SidecarIndexCatalog.SNAPSHOTS_DIR, SidecarIndexCatalog.DATA_DIR}) {
         Path directory = new Path(indexDir, dir);
@@ -230,8 +252,7 @@ class CleanupIndexFilesProcedure extends BaseProcedure {
         RemoteIterator<LocatedFileStatus> files = fileSystem.listFiles(directory, true);
         while (files.hasNext()) {
           LocatedFileStatus status = files.next();
-          String location = status.getPath().toUri().getPath();
-          if (!referenced.contains(location) && !referenced.contains(status.getPath().toString())) {
+          if (!referencedPaths.contains(locationKey(status.getPath()))) {
             orphans.put(status.getPath().toString(), status.getLen());
           }
         }
