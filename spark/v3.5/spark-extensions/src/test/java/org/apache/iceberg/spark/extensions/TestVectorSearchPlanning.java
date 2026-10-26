@@ -253,7 +253,8 @@ class TestVectorSearchPlanning {
         "CREATE TABLE local.db."
             + name
             + " (id bigint, embedding array<double> NOT NULL) USING iceberg");
-    spark.sql("INSERT INTO local.db." + name + " VALUES (1, array(1.0d, 0.0d)), (2, array(0.0d, 1.0d))");
+    spark.sql(
+        "INSERT INTO local.db." + name + " VALUES (1, array(1.0d, 0.0d)), (2, array(0.0d, 1.0d))");
     spark.sql(
         "CALL local.system.build_vector_index(table => 'db."
             + name

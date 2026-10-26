@@ -27,9 +27,9 @@ import java.util.List;
 import org.apache.iceberg.Table;
 import org.apache.iceberg.index.vector.VectorIndexTypes;
 import org.apache.iceberg.spark.Spark3Util;
-import org.apache.iceberg.spark.index.VectorSearchBridge;
 import org.apache.iceberg.spark.index.BoundVectorSearch;
 import org.apache.iceberg.spark.index.VectorBindingResult;
+import org.apache.iceberg.spark.index.VectorSearchBridge;
 import org.apache.iceberg.spark.index.VectorSearchContext;
 import org.apache.spark.sql.Row;
 import org.apache.spark.sql.SparkSession;
@@ -39,13 +39,14 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
 /**
- * The three vector entry points share one parameter decision and one execution boundary: the index's
- * own hits contract keeps its raw scores and its nullable rows, and a value the caller set is never
- * replaced.
+ * The three vector entry points share one parameter decision and one execution boundary: the
+ * index's own hits contract keeps its raw scores and its nullable rows, and a value the caller set
+ * is never replaced.
  */
 class TestVectorSearchSharedRules {
   private static final String OVER_SAMPLE = "spark.iceberg.index.vector.over-sample";
-  private static final String COLUMNS = "(id bigint, embedding array<double> NOT NULL) USING iceberg";
+  private static final String COLUMNS =
+      "(id bigint, embedding array<double> NOT NULL) USING iceberg";
   private static SparkSession spark;
 
   @BeforeAll
@@ -100,8 +101,7 @@ class TestVectorSearchSharedRules {
     Table table = tableWithIndex("shared_invalid");
     try {
       spark.conf().set(OVER_SAMPLE, "0");
-      assertThatThrownBy(() -> plan(table, "TABLE_LIVE_TOPK"))
-          .hasMessageContaining(OVER_SAMPLE);
+      assertThatThrownBy(() -> plan(table, "TABLE_LIVE_TOPK")).hasMessageContaining(OVER_SAMPLE);
       assertThatThrownBy(() -> plan(table, "INDEX_HITS")).hasMessageContaining(OVER_SAMPLE);
       assertThatThrownBy(
               () ->
@@ -112,7 +112,8 @@ class TestVectorSearchSharedRules {
           .hasMessageContaining(OVER_SAMPLE);
       assertThatThrownBy(
               () ->
-                  spark.sql(
+                  spark
+                      .sql(
                           "SELECT * FROM vector_index_search("
                               + "'local.db.shared_invalid', 'embedding', array(1.0d, 0.0d), 2)")
                       .collectAsList())
@@ -146,8 +147,7 @@ class TestVectorSearchSharedRules {
                     + "column => 'embedding', queries => array('1.0,0.0', '0.0,1.0'), k => 2)")
             .collectAsList();
     assertThat(batch).isNotEmpty();
-    assertThat(batch.stream().map(row -> row.getInt(0)).distinct().sorted())
-        .containsExactly(0, 1);
+    assertThat(batch.stream().map(row -> row.getInt(0)).distinct().sorted()).containsExactly(0, 1);
   }
 
   @Test
@@ -236,7 +236,8 @@ class TestVectorSearchSharedRules {
     // an index is only ever built over rows that have a vector, so a covered file holds no null.
     // A null appended later is in an uncovered file, reaches the answer through the scan branch,
     // and keeps the ordering Spark gives it: first, for an ascending distance
-    spark.sql("CREATE TABLE local.db.shared_nullable (id bigint, embedding array<double>) USING iceberg");
+    spark.sql(
+        "CREATE TABLE local.db.shared_nullable (id bigint, embedding array<double>) USING iceberg");
     spark.sql(
         "INSERT INTO local.db.shared_nullable VALUES (1, array(1.0d, 0.0d)), "
             + "(2, array(0.0d, 1.0d))");
@@ -252,7 +253,8 @@ class TestVectorSearchSharedRules {
         .contains("VectorSearchSource");
 
     // the same query without the index, which is the answer the rewrite has to reproduce
-    spark.sql("CREATE TABLE local.db.shared_nullable_plain (id bigint, embedding array<double>) USING iceberg");
+    spark.sql(
+        "CREATE TABLE local.db.shared_nullable_plain (id bigint, embedding array<double>) USING iceberg");
     spark.sql(
         "INSERT INTO local.db.shared_nullable_plain VALUES (1, array(1.0d, 0.0d)), "
             + "(2, array(0.0d, 1.0d)), (3, null)");
@@ -361,9 +363,7 @@ class TestVectorSearchSharedRules {
     spark.sql("CREATE NAMESPACE IF NOT EXISTS local.db");
     spark.sql("CREATE TABLE local.db." + name + " " + COLUMNS);
     spark.sql(
-        "INSERT INTO local.db."
-            + name
-            + " VALUES (1, array(1.0d, 0.0d)), (2, array(0.0d, 1.0d))");
+        "INSERT INTO local.db." + name + " VALUES (1, array(1.0d, 0.0d)), (2, array(0.0d, 1.0d))");
     spark.sql(
         "CALL local.system.build_vector_index(table => 'db."
             + name
