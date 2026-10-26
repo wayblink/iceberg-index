@@ -87,8 +87,11 @@ case class RewriteVectorSearch(spark: SparkSession) extends Rule[LogicalPlan] {
       return None
     }
 
-    val (scan, guard) = eligibleChain(limit, column).getOrElse(return None)
+    val scan = eligibleChain(limit, column).getOrElse(return None)
     val sparkTable = IndexRewriteSupport.icebergTable(scan).getOrElse(return None)
+    if (sparkTable.table().schema().findField(column) == null) {
+      return None
+    }
     // a data file does not carry the values of its partition columns, but the ones an identity
     // partition puts in the path are recovered from it, so only the other transforms are a reason
     // to stand aside
@@ -153,21 +156,24 @@ case class RewriteVectorSearch(spark: SparkSession) extends Rule[LogicalPlan] {
     context.copy(parameters = parameters, budget = budget)
   }
 
-  /** The scan of an eligible plan, and the optional {@code IsNotNull} guard above it. */
-  private def eligibleChain(
-      limit: GlobalLimit,
-      column: String): Option[(DataSourceV2Relation, Option[Filter])] = {
+  /**
+   * The scan of an eligible plan, if everything between the limit and it keeps rows as they are.
+   *
+   * <p>A {@code IsNotNull} guard on the vector column is one of them: it stays above the source and
+   * filters both branches, so it needs no special handling. A null vector row is not a gap in the
+   * answer either way: an index is only ever built over rows whose vector exists (the build refuses
+   * a null), so a covered file holds no null, and a null appended later sits in an uncovered file
+   * and reaches the answer through the scan branch, which Spark orders as it always does.
+   */
+  private def eligibleChain(limit: GlobalLimit, column: String): Option[DataSourceV2Relation] = {
     val allowed = mutable.ListBuffer.empty[LogicalPlan]
     var node: LogicalPlan = limit.child
-    var guard: Option[Filter] = None
     var scans: Option[DataSourceV2Relation] = None
     while (scans.isEmpty) {
       node match {
         case relation: DataSourceV2Relation =>
           scans = Some(relation)
-        case filter @ Filter(condition, child)
-            if isVectorGuard(condition, column) && guard.isEmpty =>
-          guard = Some(filter)
+        case filter @ Filter(condition, child) if isVectorGuard(condition, column) =>
           allowed += filter
           node = child
         case project @ Project(_, child) =>
@@ -191,7 +197,7 @@ case class RewriteVectorSearch(spark: SparkSession) extends Rule[LogicalPlan] {
     if (sortCount != 1) {
       return None
     }
-    scans.map(scan => (scan, guard))
+    scans
   }
 
   /** Whether a filter is a non-null guard on the vector column, which both branches can apply. */
@@ -204,11 +210,14 @@ case class RewriteVectorSearch(spark: SparkSession) extends Rule[LogicalPlan] {
 
   /** The global sort of a limit node, if its ordering is a single ascending vector distance. */
   private def globalSort(limit: GlobalLimit): Option[Sort] = {
+    // a sort over more than the distance is not a nearest-neighbour query: the second key decides
+    // ties, and a candidate set ordered by the index cannot reproduce it
+    def single(sort: Sort): Option[Sort] = if (sort.order.size == 1) Some(sort) else None
     limit.child match {
-      case sort: Sort if sort.order.size == 1 && sort.global => Some(sort)
+      case sort: Sort if sort.global => single(sort)
       case _ =>
         // Spark puts a local limit between the global limit and the global sort
-        limit.child.collectFirst { case sort: Sort if sort.global => sort }
+        limit.child.collectFirst { case sort: Sort if sort.global => sort }.flatMap(single)
     }
   }
 

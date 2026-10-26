@@ -194,6 +194,154 @@ class TestVectorSearchSharedRules {
   }
 
   /** The shared decision both entry points go through, before anything is searched. */
+  @Test
+  void aCallStillReturnsAtMostKPerQueryWhenTheMultiplierIsLarger() throws Exception {
+    Table table = tableWithFourRows("shared_topk");
+    try {
+      spark.conf().set(OVER_SAMPLE, "10");
+      List<Row> single =
+          spark
+              .sql(
+                  "CALL local.system.vector_search(table => 'db.shared_topk', "
+                      + "column => 'embedding', query => array(1.0d, 0.0d), k => 2)")
+              .collectAsList();
+      assertThat(single).as("one query returns exactly k rows").hasSize(2);
+
+      List<Row> batch =
+          spark
+              .sql(
+                  "CALL local.system.vector_search_batch(table => 'db.shared_topk', "
+                      + "column => 'embedding', queries => array('1.0d,0.0d', '0.0d,1.0d'), "
+                      + "k => 2)")
+              .collectAsList();
+      assertThat(batch).hasSize(4);
+      assertThat(batch.stream().filter(row -> row.getInt(0) == 0).count()).isEqualTo(2L);
+      assertThat(batch.stream().filter(row -> row.getInt(0) == 1).count()).isEqualTo(2L);
+
+      List<Row> tvf =
+          spark
+              .sql(
+                  "SELECT * FROM vector_index_search("
+                      + "'local.db.shared_topk', 'embedding', array(1.0d, 0.0d), 2)")
+              .collectAsList();
+      assertThat(tvf).hasSize(2);
+    } finally {
+      spark.conf().unset(OVER_SAMPLE);
+      assertThat(table.name()).isNotEmpty();
+    }
+  }
+
+  @Test
+  void aNullVectorAppendedAfterTheIndexIsStillAnswered() throws Exception {
+    // an index is only ever built over rows that have a vector, so a covered file holds no null.
+    // A null appended later is in an uncovered file, reaches the answer through the scan branch,
+    // and keeps the ordering Spark gives it: first, for an ascending distance
+    spark.sql("CREATE TABLE local.db.shared_nullable (id bigint, embedding array<double>) USING iceberg");
+    spark.sql(
+        "INSERT INTO local.db.shared_nullable VALUES (1, array(1.0d, 0.0d)), "
+            + "(2, array(0.0d, 1.0d))");
+    spark.sql(
+        "CALL local.system.build_vector_index(table => 'db.shared_nullable', "
+            + "column => 'embedding', dimension => 2, metric => 'euclidean', structure => 'flat')");
+    spark.sql("INSERT INTO local.db.shared_nullable VALUES (3, null)");
+
+    String query =
+        "SELECT id FROM local.db.shared_nullable "
+            + "ORDER BY vec_distance(embedding, array(1.0d, 0.0d)) LIMIT 3";
+    assertThat(spark.sql(query).queryExecution().optimizedPlan().toString())
+        .contains("VectorSearchSource");
+
+    // the same query without the index, which is the answer the rewrite has to reproduce
+    spark.sql("CREATE TABLE local.db.shared_nullable_plain (id bigint, embedding array<double>) USING iceberg");
+    spark.sql(
+        "INSERT INTO local.db.shared_nullable_plain VALUES (1, array(1.0d, 0.0d)), "
+            + "(2, array(0.0d, 1.0d)), (3, null)");
+    String plain =
+        "SELECT id FROM local.db.shared_nullable_plain "
+            + "ORDER BY vec_distance(embedding, array(1.0d, 0.0d)) LIMIT 3";
+    assertThat(spark.sql(query).collectAsList())
+        .containsExactlyElementsOf(spark.sql(plain).collectAsList());
+
+    // a guard on the vector column removes that row from both branches alike
+    String guarded =
+        "SELECT id FROM local.db.shared_nullable WHERE embedding IS NOT NULL "
+            + "ORDER BY vec_distance(embedding, array(1.0d, 0.0d)) LIMIT 3";
+    assertThat(spark.sql(guarded).queryExecution().optimizedPlan().toString())
+        .contains("VectorSearchSource");
+    assertThat(spark.sql(guarded).collectAsList()).hasSize(2);
+  }
+
+  @Test
+  void aQueryWithASecondaryOrderIsLeftAlone() throws Exception {
+    tableWithIndex("shared_secondary_order");
+    String query =
+        "SELECT id FROM local.db.shared_secondary_order "
+            + "ORDER BY vec_distance(embedding, array(1.0d, 0.0d)), id LIMIT 2";
+    assertThat(spark.sql(query).queryExecution().optimizedPlan().toString())
+        .doesNotContain("VectorSearchSource");
+    assertThat(spark.sql(query).collectAsList()).hasSize(2);
+  }
+
+  @Test
+  void aHitWhoseFileIsGoneStaysWithANullRow() throws Exception {
+    Table table = tableWithIndex("shared_replaced_files");
+    spark.sql(
+        "INSERT OVERWRITE local.db.shared_replaced_files "
+            + "VALUES (10, array(1.0d, 0.0d)), (11, array(0.0d, 1.0d))");
+    table.refresh();
+
+    List<Row> hits =
+        spark
+            .sql(
+                "CALL local.system.vector_search(table => 'db.shared_replaced_files', "
+                    + "column => 'embedding', query => array(1.0d, 0.0d), k => 2)")
+            .collectAsList();
+    // the hits point at files this snapshot no longer has: the contract keeps them and reports the
+    // missing row, rather than dropping them and answering with a shorter list
+    assertThat(hits).hasSize(2);
+    assertThat(hits).allMatch(row -> row.isNullAt(3));
+  }
+
+  @Test
+  void anEmptyRequestIsAnsweredWithoutJudgingTheParameters() throws Exception {
+    tableWithIndex("shared_empty");
+    try {
+      spark.conf().set(OVER_SAMPLE, "0");
+      assertThat(
+              spark
+                  .sql(
+                      "SELECT * FROM vector_index_search("
+                          + "'local.db.shared_empty', 'embedding', array(1.0d, 0.0d), 0)")
+                  .collectAsList())
+          .isEmpty();
+      assertThat(
+              spark
+                  .sql(
+                      "CALL local.system.vector_search(table => 'db.shared_empty', "
+                          + "column => 'embedding', query => array(1.0d, 0.0d), k => 0)")
+                  .collectAsList())
+          .isEmpty();
+    } finally {
+      spark.conf().unset(OVER_SAMPLE);
+    }
+  }
+
+  private static Table tableWithFourRows(String name) throws Exception {
+    spark.sql("CREATE NAMESPACE IF NOT EXISTS local.db");
+    spark.sql("CREATE TABLE local.db." + name + " " + COLUMNS);
+    spark.sql(
+        "INSERT INTO local.db."
+            + name
+            + " VALUES (1, array(1.0d, 0.0d)), (2, array(0.0d, 1.0d)), "
+            + "(3, array(0.7d, 0.7d)), (4, array(0.0d, -1.0d))");
+    spark.sql(
+        "CALL local.system.build_vector_index(table => 'db."
+            + name
+            + "', column => 'embedding', dimension => 2, metric => 'euclidean', "
+            + "structure => 'flat')");
+    return Spark3Util.loadIcebergTable(spark, "local.db." + name);
+  }
+
   private static VectorSearchContext plan(Table table, String contract) {
     VectorBindingResult result =
         VectorSearchBridge.plan(

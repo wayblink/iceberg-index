@@ -68,23 +68,20 @@ private[spark] object VectorSearchBridge {
       batch)
     BindVectorSearch.bind(spark, request) match {
       case BoundVectorSearch(context) =>
+        // a request that asks for nothing is answered with nothing: its parameters are not judged
+        // against a search that will not happen
+        if (k <= 0 || queries.isEmpty) {
+          return BoundVectorSearch(
+            context.copy(
+              parameters = null,
+              budget = VectorCandidateBudget(0L, 0, context.inputs.entryUpperBound)))
+        }
         val parameters = VectorQueryParameters.decide(context.rawParameters)
-        // a search that asks for nothing is answered without a budget: the parameters of an empty
-        // request are not validated against a search that will not happen
-        val resolved =
-          if (k <= 0 || queries.isEmpty) {
-            context.copy(
-              parameters = parameters,
-              budget = VectorCandidateBudget(0L, 0, context.inputs.entryUpperBound))
-          } else {
-            context.copy(
-              parameters = parameters,
-              budget = VectorCandidateBudget.derive(
-                k,
-                parameters.overSample,
-                context.inputs.entryUpperBound))
-          }
-        BoundVectorSearch(resolved)
+        BoundVectorSearch(
+          context.copy(
+            parameters = parameters,
+            budget = VectorCandidateBudget
+              .derive(k, parameters.overSample, context.inputs.entryUpperBound)))
       case other => other
     }
   }
@@ -98,10 +95,14 @@ private[spark] object VectorSearchBridge {
       return spark.createDataFrame(new java.util.ArrayList[Row](), schema).collectAsList()
     }
 
+    // every query is searched first, then all of their hits are resolved in one pass, so a data
+    // file that several queries hit is read once for the whole batch
+    val hitsPerQuery = request.queries.map(query => searchHits(spark, context, query.toArray))
+    val allHits = hitsPerQuery.flatten
+    val json = resolveRows(spark, context, allHits)
+
     val rows = mutable.ListBuffer.empty[Row]
-    request.queries.zipWithIndex.foreach { case (query, queryId) =>
-      val hits = searchHits(spark, context, query.toArray)
-      val json = resolveRows(spark, context, hits)
+    hitsPerQuery.zipWithIndex.foreach { case (hits, queryId) =>
       hits.foreach { hit =>
         val row = Option(json.get(hit.dataFile()))
           .flatMap(byPosition => Option(byPosition.get(JLong.valueOf(hit.rowPosition()))))
@@ -156,10 +157,11 @@ private[spark] object VectorSearchBridge {
         IndexQuery
           .of(inputs.indexSnapshot.sourceTableSnapshotId(), payload, budget.initial)
           .withConsistency(Consistency.AT_OR_BEFORE))
+      // a hit whose file this snapshot no longer has is kept: the caller sees the hit with a null
+      // row, which is what this contract reports, instead of a shorter answer
       outcome
         .hits()
         .asScala
-        .filter(hit => inputs.dataFiles.contains(hit.dataFile()))
         .foreach(hit => hits.getOrElseUpdate((hit.dataFile(), hit.rowPosition()), hit))
       if (!outcome.moreHits() || hits.size >= k || budget.initial == 0) {
         done = true
@@ -173,7 +175,9 @@ private[spark] object VectorSearchBridge {
         }
       }
     }
-    hits.values.toSeq
+    // the search asked for k times the multiplier, but this contract still answers one query with
+    // at most k hits, in the index's own order
+    hits.values.take(k).toSeq
   }
 
   /** The JSON of each hit's live row, keyed by data file and then by position. */
