@@ -53,7 +53,8 @@ final class IndexCacheProtocol {
     COMPLETE,
     PARTIAL,
     FAILED,
-    OFFLOADED
+    OFFLOADED,
+    CANCELLED
   }
 
   static final class File implements Serializable {

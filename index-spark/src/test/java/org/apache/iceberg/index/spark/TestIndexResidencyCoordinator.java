@@ -706,6 +706,53 @@ class TestIndexResidencyCoordinator {
   }
 
   @Test
+  void lateReleaseCannotForgetAReloadedCopy() {
+    coordinator.report(node("a", "a-1", 1, 100, 0));
+    String first =
+        coordinator.acceptLoad(
+            target("A", "f", 40), IndexResidencyPolicy.parse("forever"), clock.now());
+    ackFile(first, "f", IndexCacheProtocol.AckStatus.LOADED);
+    coordinator.report(holding("a", "a-1", 2, 100, 40, "adapter|A|f", 40));
+
+    // Offload issues a release that the executor has not answered yet.
+    String offload = coordinator.acceptOffload("A", clock.now());
+    IndexCacheProtocol.Command release =
+        coordinator.commands("a", "a-1").stream()
+            .filter(
+                c ->
+                    c.planId().equals(offload)
+                        && c.type() == IndexCacheProtocol.CommandType.RELEASE)
+            .findFirst()
+            .orElseThrow();
+
+    // A new load puts a fresh copy of the same key on the same node and incarnation.
+    String reload =
+        coordinator.acceptLoad(
+            target("A", "f", 40), IndexResidencyPolicy.parse("forever"), clock.now());
+    ackFile(reload, "f", IndexCacheProtocol.AckStatus.LOADED);
+    assertThat(coordinator.result(reload).status()).isEqualTo(IndexCacheProtocol.Status.COMPLETE);
+
+    // The stale release finally arrives; it must not forget the copy that replaced it.
+    coordinator.ack(ack(offload, "a", "a-1", release, IndexCacheProtocol.AckStatus.RELEASED));
+
+    assertThat(coordinator.result(reload).status()).isEqualTo(IndexCacheProtocol.Status.COMPLETE);
+    assertThat(coordinator.result(reload).uncovered()).isEmpty();
+  }
+
+  @Test
+  void replacedTargetReportsCancelledRatherThanFailed() {
+    coordinator.report(node("a", "a-1", 1, 100, 0));
+    String first =
+        coordinator.acceptLoad(
+            target("A", "old", 10), IndexResidencyPolicy.parse("forever"), clock.now());
+    // A repeat load replaces the target before the first plan ever answered.
+    coordinator.acceptLoad(
+        target("A", "new", 10), IndexResidencyPolicy.parse("forever"), clock.now());
+
+    assertThat(coordinator.result(first).status()).isEqualTo(IndexCacheProtocol.Status.CANCELLED);
+  }
+
+  @Test
   void missingIncarnationAckCannotClaimCoverage() {
     coordinator.report(node("a", "a-1", 1, 100, 0));
     String plan =
@@ -918,6 +965,8 @@ class TestIndexResidencyCoordinator {
             .holders(Map.of("adapter|stale|s1", 40L, "adapter|fresh|f1", 20L))
             .accessAgeNanos(Map.of("stale", Long.MAX_VALUE - 1, "fresh", SECOND))
             .build());
+    // Time must pass after the report, otherwise an overflowing addition never happens.
+    clock.advance(10 * SECOND);
 
     String plan =
         coordinator.acceptLoad(

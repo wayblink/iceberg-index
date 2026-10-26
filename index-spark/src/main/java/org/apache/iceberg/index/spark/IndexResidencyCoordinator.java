@@ -48,7 +48,12 @@ final class IndexResidencyCoordinator {
   }
 
   private record Holder(
-      String location, String cacheKey, String executorId, String incarnation, long bytes) {}
+      String location,
+      String cacheKey,
+      String executorId,
+      String incarnation,
+      long bytes,
+      String installedBy) {}
 
   private static final class IndexState {
     private final String indexUuid;
@@ -104,6 +109,7 @@ final class IndexResidencyCoordinator {
     private final Map<String, String> migrationNotices = new LinkedHashMap<>();
     private final Map<String, String> migrationSources = new LinkedHashMap<>();
     private final Set<String> released = new LinkedHashSet<>();
+    private boolean superseded;
     private final Set<String> orphansReleased = new LinkedHashSet<>();
     private final List<String> evicted = new ArrayList<>();
     private int nextAttempt = 1;
@@ -150,6 +156,7 @@ final class IndexResidencyCoordinator {
     private final IndexCacheProtocol.CommandType type;
     private final long epoch;
     private final String commandId;
+    private final String releasesCommandId;
 
     private PlanFile(
         String location,
@@ -159,7 +166,8 @@ final class IndexResidencyCoordinator {
         long bytes,
         IndexCacheProtocol.CommandType type,
         long epoch,
-        String commandId) {
+        String commandId,
+        String releasesCommandId) {
       this.location = location;
       this.cacheKey = cacheKey;
       this.executorId = executorId;
@@ -168,6 +176,7 @@ final class IndexResidencyCoordinator {
       this.type = type;
       this.epoch = epoch;
       this.commandId = commandId;
+      this.releasesCommandId = releasesCommandId;
     }
   }
 
@@ -279,6 +288,7 @@ final class IndexResidencyCoordinator {
     for (PlanState open : plans.values()) {
       if (open.indexUuid.equals(target.indexUuid()) && !open.finalized()) {
         fencePlan(open, "SUPERSEDED");
+        open.superseded = true;
       }
     }
 
@@ -345,7 +355,9 @@ final class IndexResidencyCoordinator {
           indexUuid,
           modeFor(cacheKey),
           IndexCacheProtocol.File.builder().location(location).cacheKey(cacheKey).build(),
-          holder.bytes());
+          holder.bytes(),
+          plan.epoch,
+          holder.installedBy());
     }
 
     return plan.planId;
@@ -428,7 +440,8 @@ final class IndexResidencyCoordinator {
     if (command.type == IndexCacheProtocol.CommandType.RELEASE) {
       if (ack.status() == IndexCacheProtocol.AckStatus.RELEASED) {
         // Only the copy on that node stops counting; a migrated copy of the same key survives.
-        forgetCopy(command.cacheKey, command.executorId, command.incarnation);
+        forgetCopy(
+            command.cacheKey, command.executorId, command.incarnation, command.releasesCommandId);
       }
 
       node.settle(ack.commandId());
@@ -529,6 +542,11 @@ final class IndexResidencyCoordinator {
       status = IndexCacheProtocol.Status.PARTIAL;
     } else {
       status = IndexCacheProtocol.Status.PENDING;
+    }
+
+    if (plan.superseded && status != IndexCacheProtocol.Status.COMPLETE) {
+      // A replaced target is not a failure of this plan; the newer target owns the index now.
+      status = IndexCacheProtocol.Status.CANCELLED;
     }
 
     return resultOf(plan, status, protection, uncovered, plan.evicted);
@@ -759,7 +777,9 @@ final class IndexResidencyCoordinator {
                   .location(holder.location())
                   .cacheKey(holder.cacheKey())
                   .build(),
-              holder.bytes());
+              holder.bytes(),
+              plan.epoch,
+              holder.installedBy());
         }
       }
     }
@@ -869,6 +889,14 @@ final class IndexResidencyCoordinator {
       return;
     }
 
+    String installedBy = null;
+    for (Holder holder : holdersOfKey(migrated.cacheKey)) {
+      if (holder.executorId().equals(source)) {
+        installedBy = holder.installedBy();
+        break;
+      }
+    }
+
     enqueue(
         plan,
         node,
@@ -880,7 +908,9 @@ final class IndexResidencyCoordinator {
             .location(migrated.location)
             .cacheKey(migrated.cacheKey)
             .build(),
-        migrated.bytes);
+        migrated.bytes,
+        plan.epoch,
+        installedBy);
   }
 
   /**
@@ -942,7 +972,9 @@ final class IndexResidencyCoordinator {
                 .location(holder.location())
                 .cacheKey(holder.cacheKey())
                 .build(),
-            holder.bytes());
+            holder.bytes(),
+            plan.epoch,
+            holder.installedBy());
       }
     }
 
@@ -1111,7 +1143,7 @@ final class IndexResidencyCoordinator {
       String mode,
       IndexCacheProtocol.File file,
       long bytes) {
-    enqueue(plan, node, label, type, indexUuid, mode, file, bytes, plan.epoch);
+    enqueue(plan, node, label, type, indexUuid, mode, file, bytes, plan.epoch, null);
   }
 
   private void enqueue(
@@ -1124,6 +1156,20 @@ final class IndexResidencyCoordinator {
       IndexCacheProtocol.File file,
       long bytes,
       long epoch) {
+    enqueue(plan, node, label, type, indexUuid, mode, file, bytes, epoch, null);
+  }
+
+  private void enqueue(
+      PlanState plan,
+      NodeState node,
+      String label,
+      IndexCacheProtocol.CommandType type,
+      String indexUuid,
+      String mode,
+      IndexCacheProtocol.File file,
+      long bytes,
+      long epoch,
+      String releasesCommandId) {
     String commandId = plan.planId + "#" + (plan.nextAttempt++) + "-" + label;
     IndexCacheProtocol.Command command =
         IndexCacheProtocol.Command.builder()
@@ -1149,7 +1195,8 @@ final class IndexResidencyCoordinator {
             bytes,
             type,
             epoch,
-            commandId));
+            commandId,
+            releasesCommandId));
     if (type == IndexCacheProtocol.CommandType.LOAD) {
       node.reserve(plan.planId, commandId, bytes);
     }
@@ -1174,7 +1221,7 @@ final class IndexResidencyCoordinator {
   private List<IndexCacheProtocol.NodeReport> reportsFor(String planId) {
     List<IndexCacheProtocol.NodeReport> reports = new ArrayList<>();
     for (NodeState node : nodes.values()) {
-      long others = Math.subtractExact(node.reservedBytes(), node.reservedBytesFor(planId));
+      long others = Math.max(0, node.reservedBytes() - node.reservedBytesFor(planId));
 
       // Occupancy includes retained copies plus every other plan's unresolved promise; the
       // planner adds this plan's own placements to that baseline.
@@ -1221,12 +1268,9 @@ final class IndexResidencyCoordinator {
   }
 
   /**
-   * Holders that still belong to an index's current target, so a released or superseded file is not
-   * handed to offload or eviction twice.
-   */
-  /**
-   * Copies belonging to an index, including those in plans that have already finished. Without this
-   * an offload or target replacement would never see copies loaded by an earlier plan.
+   * Confirmed copies that still belong to an index's current target. Copies loaded by earlier plans
+   * must stay visible, otherwise offload or target replacement would miss them; a copy whose
+   * release was acknowledged is already gone from {@code plan.loaded}.
    */
   private Map<String, List<Holder>> holdersByCacheKey() {
     Map<String, List<Holder>> byKey = new LinkedHashMap<>();
@@ -1251,7 +1295,8 @@ final class IndexResidencyCoordinator {
                     loaded.cacheKey,
                     loaded.executorId,
                     loaded.incarnation,
-                    loaded.bytes));
+                    loaded.bytes,
+                    loaded.commandId));
       }
     }
 
@@ -1291,12 +1336,14 @@ final class IndexResidencyCoordinator {
    * Drops the confirmed copy that a release acknowledged, on that node and incarnation only. A
    * migration releases the same key elsewhere, so matching by key alone would hide a live copy.
    */
-  private void forgetCopy(String cacheKey, String executorId, String incarnation) {
+  private void forgetCopy(
+      String cacheKey, String executorId, String incarnation, String releasesCommandId) {
     for (PlanState plan : plans.values()) {
       PlanFile copy = plan.loaded.get(cacheKey);
       if (copy != null
           && copy.executorId.equals(executorId)
-          && copy.incarnation.equals(incarnation)) {
+          && copy.incarnation.equals(incarnation)
+          && (releasesCommandId == null || releasesCommandId.equals(copy.commandId))) {
         plan.loaded.remove(cacheKey);
       }
     }
@@ -1363,7 +1410,8 @@ final class IndexResidencyCoordinator {
             .cacheKey(orphan.cacheKey)
             .build(),
         orphan.bytes,
-        orphan.epoch);
+        orphan.epoch,
+        orphan.commandId);
   }
 
   private List<Holder> holdersOfKeys(Set<String> cacheKeys) {
@@ -1387,7 +1435,8 @@ final class IndexResidencyCoordinator {
                 loaded.cacheKey,
                 loaded.executorId,
                 loaded.incarnation,
-                loaded.bytes));
+                loaded.bytes,
+                loaded.commandId));
       }
     }
 
