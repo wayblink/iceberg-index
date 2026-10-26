@@ -637,6 +637,8 @@ class TestIndexResidencyCoordinator {
                 c -> c.planId().equals(plan) && c.type() == IndexCacheProtocol.CommandType.RELEASE)
             .findFirst()
             .orElseThrow();
+    // The released copy was installed under an earlier plan, so the tombstone names that epoch.
+    assertThat(release.epoch()).isLessThan(planEpoch(plan));
     coordinator.ack(ack(plan, "a", "a-1", release, IndexCacheProtocol.AckStatus.RELEASED));
 
     // The old copy is gone, but the migrated one must still count as confirmed coverage.
@@ -759,11 +761,11 @@ class TestIndexResidencyCoordinator {
         coordinator.acceptLoad(target("V", "v1", 40), IndexResidencyPolicy.parse("0"), clock.now());
     ackFile(victim, "v1", IndexCacheProtocol.AckStatus.LOADED);
     coordinator.report(holding("a", "a-1", 2, 100, 40, "adapter|V|v1", 40));
-    // Several plans later the requesting index has a much larger epoch.
-    for (int i = 0; i < 3; i++) {
+    // The requesting index itself advances to epoch 3 before it needs to evict.
+    for (int i = 0; i < 2; i++) {
       clock.advance(SECOND);
       coordinator.acceptLoad(
-          target("other" + i, "o" + i, 1), IndexResidencyPolicy.parse("forever"), clock.now());
+          target("W", "warm" + i, 1), IndexResidencyPolicy.parse("forever"), clock.now());
     }
 
     String plan =
@@ -776,7 +778,9 @@ class TestIndexResidencyCoordinator {
                 c -> c.planId().equals(plan) && c.type() == IndexCacheProtocol.CommandType.RELEASE)
             .findFirst()
             .orElseThrow();
-    // The executor compares this epoch with the epoch that installed the victim's copy.
+    // The executor compares this epoch with the epoch that installed the victim's copy, so the
+    // eviction must carry 1 even though the requesting plan is much later.
+    assertThat(planEpoch(plan)).isGreaterThan(1);
     assertThat(release.epoch()).isEqualTo(1);
     assertThat(coordinator.result(plan).evictedIndexes()).containsExactly("V");
   }
@@ -789,6 +793,11 @@ class TestIndexResidencyCoordinator {
     coordinator.ack(
         ack(plan, "ghost", "ghost-1", 0, "plan-1#0", IndexCacheProtocol.AckStatus.LOADED, 10));
     assertThat(coordinator.result(plan).status()).isEqualTo(IndexCacheProtocol.Status.PENDING);
+  }
+
+  /** The policy epoch the plan was accepted under. */
+  private long planEpoch(String plan) {
+    return coordinator.result(plan).epoch();
   }
 
   private IndexCacheProtocol.Result result(String plan) {

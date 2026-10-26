@@ -33,6 +33,9 @@ import org.apache.iceberg.relocated.com.google.common.base.Preconditions;
  * released by a command at least as new as the one that installed it.
  */
 final class ExecutorIndexCacheWorker implements AutoCloseable {
+  /** Reason of a refusal that the driver may retry; the same word is used by the coordinator. */
+  static final String BUSY = "BUSY";
+
   interface Loader {
     ExecutorIndexCache.CachedFile load(IndexCacheProtocol.Command command);
   }
@@ -121,7 +124,7 @@ final class ExecutorIndexCacheWorker implements AutoCloseable {
 
   private IndexCacheProtocol.Ack remember(
       IndexCacheProtocol.Command command, IndexCacheProtocol.Ack ack) {
-    if (!"BUSY".equals(ack.reason())) {
+    if (!BUSY.equals(ack.reason())) {
       // A transient refusal must stay retryable: caching it would make every re-send a no-op.
       completed.put(command.commandId(), ack);
     }
@@ -173,13 +176,18 @@ final class ExecutorIndexCacheWorker implements AutoCloseable {
       return reject(command, "STALE_EPOCH");
     }
 
+    if (estimate > cacheConfig.maxEntryBytes()) {
+      // A size that can never fit is permanent, so it must not be retried as transient pressure.
+      return reject(command, "ENTRY_TOO_LARGE");
+    }
+
     // Free space is checked before this command promises its own estimate: a first load must not
     // see its own reservation as if it were already used.
     long free = cacheConfig.maxBytes() - cache.stats().bytes() - reservedBytes();
     if (estimate > free) {
       // Refuse before reading the file: a prepare that cannot be admitted only wastes I/O and the
       // temporary memory the driver is trying to protect.
-      return reject(command, "BUSY");
+      return reject(command, BUSY);
     }
 
     synchronized (stateLock) {
