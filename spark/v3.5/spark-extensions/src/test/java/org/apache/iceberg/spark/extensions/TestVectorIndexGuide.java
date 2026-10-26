@@ -190,19 +190,21 @@ class TestVectorIndexGuide {
                     "CALL local.system.vector_search(table => 'db.two', column => 'embedding', "
                         + "query => array(0.95d, 0.05d), k => 2)"))
         .isInstanceOf(RuntimeException.class)
+        .hasMessageContaining("several indexes exist")
         .hasMessageContaining("flat_second");
   }
 
   /** §3.1 and §4.1 · which structures the automatic rewrite uses. */
   @Test
-  void theRewriteUsesApproximateStructuresAndSkipsFlat() {
+  void theRewriteUsesWhateverStructureTheIndexHas() {
     createTable("flat_idx", 8);
     spark.sql(
         "CALL local.system.build_vector_index("
             + "table => 'db.flat_idx', column => 'embedding', dimension => 2)");
+    // cost is not what decides the plan: the column has a usable index, so it answers
     assertThat(planOf("db.flat_idx"))
-        .as("an exact FLAT index scores every entry, so the scan is left alone")
-        .doesNotContain("LocalRelation");
+        .as("an exact FLAT index answers too, it just scores every entry")
+        .contains("VectorSearchSource");
 
     createTable("ivf_idx", 8);
     spark.sql(
@@ -211,7 +213,7 @@ class TestVectorIndexGuide {
             + "quantizer => 'RABITQ')");
     assertThat(planOf("db.ivf_idx"))
         .as("an approximate index is used, with the candidates wide enough to re-score")
-        .contains("LocalRelation");
+        .contains("VectorSearchSource");
   }
 
   /** §2 · only identity partitioning is rewritten. */
@@ -230,7 +232,7 @@ class TestVectorIndexGuide {
 
     assertThat(planOf("db.bucketed"))
         .as("a bucket partition has no value in the path to recover")
-        .doesNotContain("LocalRelation");
+        .doesNotContain("VectorSearchSource");
 
     // the explicit entry point does not care about partitioning
     assertThat(

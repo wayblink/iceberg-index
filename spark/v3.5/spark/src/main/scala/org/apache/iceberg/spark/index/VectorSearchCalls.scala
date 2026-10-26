@@ -23,6 +23,7 @@ import java.util.{List => JList}
 import scala.collection.JavaConverters._
 
 import org.apache.iceberg.Table
+import org.apache.iceberg.index.spark.VectorIndexes
 import org.apache.iceberg.spark.Spark3Util
 import org.apache.spark.sql.{Row, SparkSession}
 import org.apache.spark.sql.catalyst.plans.logical.LogicalPlan
@@ -51,9 +52,15 @@ private[spark] object VectorSearchCalls {
         throw new IllegalArgumentException(
           s"No vector index exists for column $column of table ${table.name()}")
       case AmbiguousVectorIndex =>
+        // the names are what the caller has to choose between, so they are part of the message
+        val available = VectorIndexes
+          .indexesFor(table, column, "vector")
+          .asScala
+          .map(metadata => if (metadata.name() == null) "<unnamed>" else metadata.name())
+          .mkString(", ")
         throw new IllegalArgumentException(
           s"No vector index can be chosen for column $column of table ${table.name()}: " +
-            "several indexes exist, pass index => '...' to choose one")
+            s"several indexes exist ($available), pass index => '...' to choose one")
     }
   }
 

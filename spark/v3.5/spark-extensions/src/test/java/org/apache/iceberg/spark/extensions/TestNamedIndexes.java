@@ -101,7 +101,7 @@ public class TestNamedIndexes extends ExtensionsTestBase {
                     "CALL %s.system.vector_search(table => '%s', column => 'embedding', "
                         + "query => array(0.0d, 10.0d), k => 3)",
                     catalogName, table))
-        .hasMessageContaining("has 2 vector indexes")
+        .hasMessageContaining("several indexes exist")
         .hasMessageContaining("flat_bruteforce");
   }
 
@@ -200,19 +200,20 @@ public class TestNamedIndexes extends ExtensionsTestBase {
         catalogName, table);
 
     String query = "SELECT id FROM %s ORDER BY vec_distance(embedding, array(0.0d, 10.0d)) LIMIT 3";
+    String ivf = uuidOf(table, "ivf");
+    String flat = uuidOf(table, "flat_bruteforce");
     try {
-      // the name decides which arm answers: the IVF index is rewritable, the exact one is not, so
-      // the plan says which one the rule resolved
+      // either arm answers when it is named, and the plan says which index was resolved
       spark.conf().set("spark.iceberg.index.vector.name", "ivf");
-      assertThat(planOf(query, table)).contains("LocalRelation");
+      assertThat(planOf(query, table)).contains("VectorSearchSource").contains("index=" + ivf);
       assertThat(sql(query, table)).hasSize(3);
 
       spark.conf().set("spark.iceberg.index.vector.name", "flat_bruteforce");
-      assertThat(planOf(query, table)).doesNotContain("LocalRelation");
+      assertThat(planOf(query, table)).contains("VectorSearchSource").contains("index=" + flat);
 
       // two indexes and no name is not a guess: the query scans, and still answers
       spark.conf().unset("spark.iceberg.index.vector.name");
-      assertThat(planOf(query, table)).doesNotContain("LocalRelation");
+      assertThat(planOf(query, table)).doesNotContain("VectorSearchSource");
       assertThat(sql(query, table)).hasSize(3);
     } finally {
       spark.conf().unset("spark.iceberg.index.vector.name");
