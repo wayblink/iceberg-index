@@ -189,9 +189,10 @@ public final class DistributedIndexSearch {
                         String location = locations1.next();
                         long readStart = System.nanoTime();
                         ExecutorIndexCache cache = ExecutorIndexCache.get();
+                        String managedKey = cacheKey(cacheConfig, cacheKey, location);
                         // A file residency management owns is leased, so a release waits for this
                         // query; anything else keeps the old lazy behaviour.
-                        ExecutorIndexCache.Lease lease = cache.acquireManagedKey(cacheKey);
+                        ExecutorIndexCache.Lease lease = cache.acquireManagedKey(managedKey);
                         ExecutorIndexCache.CachedFile file =
                             lease != null
                                 ? lease.file()
@@ -525,6 +526,14 @@ public final class DistributedIndexSearch {
    * ever matches and the coverage a run reports is always zero -- the one number a budget is judged
    * by, reporting that nothing was cached no matter what was.
    */
+  /**
+   * The full cache key of one file: table location, adapter identity, and the file. Residency
+   * management plans its targets in exactly this shape, so a query must look up the same string.
+   */
+  static String cacheKey(ExecutorIndexCache.Config config, String adapterKey, String location) {
+    return config.owner() + "|" + adapterKey + "|" + location;
+  }
+
   private static List<String> cacheKeys(String owner, String adapterKey, List<String> locations) {
     List<String> keys = Lists.newArrayListWithCapacity(locations.size());
     for (String location : locations) {

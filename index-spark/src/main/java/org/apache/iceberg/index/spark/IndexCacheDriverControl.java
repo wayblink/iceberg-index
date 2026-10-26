@@ -81,6 +81,10 @@ final class IndexCacheDriverControl {
     return coordinator.plannedBytes(planId);
   }
 
+  synchronized Map<String, Long> accessAges(long nowNanos) {
+    return coordinator.accessAges(nowNanos);
+  }
+
   synchronized Map<String, IndexCacheProtocol.Protection> protectedIndexes() {
     return coordinator.protectedIndexes();
   }
@@ -93,8 +97,19 @@ final class IndexCacheDriverControl {
     return coordinator.nodeReportAgeNanos(nowNanos);
   }
 
-  synchronized boolean hasExecutors() {
-    return !coordinator.nodeReports().isEmpty();
+  synchronized long nowNanos() {
+    return coordinator.nowNanos();
+  }
+
+  /** True when at least one executor reported recently enough to answer a command. */
+  synchronized boolean hasLiveExecutors(long nowNanos) {
+    for (long age : coordinator.nodeReportAgeNanos(nowNanos).values()) {
+      if (age <= IndexResidencyCoordinator.STALE_AFTER_NANOS) {
+        return true;
+      }
+    }
+
+    return false;
   }
 
   /** Only for tests: production paths must use the synchronized entry points above. */

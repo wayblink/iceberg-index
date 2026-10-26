@@ -118,6 +118,74 @@ public final class IndexCacheControl {
     return IndexCacheDriverRegistry.require(spark.sparkContext().applicationId());
   }
 
+  /** One managed index: its protection and how long ago a query last used it. */
+  public static final class IndexStatus {
+    private final String indexUuid;
+    private final String protection;
+    private final long deadlineNanos;
+    private final boolean permanent;
+    private final long accessAgeMillis;
+
+    private IndexStatus(
+        String indexUuid,
+        String protection,
+        long deadlineNanos,
+        boolean permanent,
+        long accessAgeMillis) {
+      this.indexUuid = indexUuid;
+      this.protection = protection;
+      this.deadlineNanos = deadlineNanos;
+      this.permanent = permanent;
+      this.accessAgeMillis = accessAgeMillis;
+    }
+
+    public String indexUuid() {
+      return indexUuid;
+    }
+
+    public String protection() {
+      return protection;
+    }
+
+    public long deadlineNanos() {
+      return deadlineNanos;
+    }
+
+    public boolean permanent() {
+      return permanent;
+    }
+
+    /** Age of the last recorded search access; -1 when the index was never used. */
+    public long accessAgeMillis() {
+      return accessAgeMillis;
+    }
+  }
+
+  /** The protection and access age of every managed index. */
+  public static List<IndexStatus> indexes(SparkSession spark) {
+    return indexStatusOf(controlOf(spark), System.nanoTime());
+  }
+
+  static List<IndexStatus> indexStatusOf(IndexCacheDriverControl control, long nowNanos) {
+    Map<String, Long> ages = control.accessAges(nowNanos);
+    List<IndexStatus> rows = new ArrayList<>();
+    for (Map.Entry<String, IndexCacheProtocol.Protection> entry :
+        control.protectedIndexes().entrySet()) {
+      IndexCacheProtocol.Protection protection = entry.getValue();
+      long age = ages.getOrDefault(entry.getKey(), Long.MAX_VALUE);
+      rows.add(
+          new IndexStatus(
+              entry.getKey(),
+              protection.text(),
+              protection.deadlineNanos(),
+              protection.permanent(),
+              age == Long.MAX_VALUE ? -1L : age / 1_000_000L));
+    }
+
+    rows.sort(java.util.Comparator.comparing(IndexStatus::indexUuid));
+    return rows;
+  }
+
   /** What one executor last reported: its budget, occupancy, and the indexes the app manages. */
   public static final class Status {
     private final String executorId;
@@ -256,6 +324,9 @@ public final class IndexCacheControl {
     private final long residentBytes;
     private final List<FileResult> files;
     private final Map<String, String> uncovered;
+    private final List<String> evictedIndexes;
+    private final List<String> reusedFiles;
+    private final Map<String, String> migrations;
 
     private Result(
         String status,
@@ -267,7 +338,10 @@ public final class IndexCacheControl {
         boolean permanent,
         long residentBytes,
         List<FileResult> files,
-        Map<String, String> uncovered) {
+        Map<String, String> uncovered,
+        List<String> evictedIndexes,
+        List<String> reusedFiles,
+        Map<String, String> migrations) {
       this.status = status;
       this.planId = planId;
       this.indexUuid = indexUuid;
@@ -278,6 +352,9 @@ public final class IndexCacheControl {
       this.residentBytes = residentBytes;
       this.files = List.copyOf(files);
       this.uncovered = Map.copyOf(uncovered);
+      this.evictedIndexes = List.copyOf(evictedIndexes);
+      this.reusedFiles = List.copyOf(reusedFiles);
+      this.migrations = Map.copyOf(migrations);
     }
 
     static Result from(IndexCacheDriverControl control, IndexCacheProtocol.Result result) {
@@ -304,7 +381,10 @@ public final class IndexCacheControl {
           protection != null && protection.permanent(),
           result.residentBytes(),
           files,
-          result.uncovered());
+          result.uncovered(),
+          result.evictedIndexes(),
+          result.reusedFiles(),
+          result.migrations());
     }
 
     public String status() {
@@ -345,6 +425,21 @@ public final class IndexCacheControl {
 
     public Map<String, String> uncovered() {
       return uncovered;
+    }
+
+    /** Indexes this plan reclaimed by LRU, so a caller can see what it displaced. */
+    public List<String> evictedIndexes() {
+      return evictedIndexes;
+    }
+
+    /** Files a plan reused from an existing copy instead of loading again. */
+    public List<String> reusedFiles() {
+      return reusedFiles;
+    }
+
+    /** Files this plan moves to another executor first, then releases on the old one. */
+    public Map<String, String> migrations() {
+      return migrations;
     }
   }
 }

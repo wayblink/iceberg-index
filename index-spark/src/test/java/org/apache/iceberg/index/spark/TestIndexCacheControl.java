@@ -259,6 +259,78 @@ class TestIndexCacheControl {
   }
 
   @Test
+  void aSearchKeyIsTheSameStringThePlanUses() {
+    // This is the bug the review found: the search path used to lease with the adapter segment
+    // alone, so it never matched the planned key and always fell back to reading storage.
+    TestIndexFixtures.BuiltIndex built =
+        TestIndexFixtures.build(tempDir, "idx-1", "data-1.parquet");
+    TestIndexFixtures.BuiltIndex other =
+        TestIndexFixtures.build(new File(tempDir, "other"), "idx-2", "data-1.parquet");
+    IndexCacheDriverControl control =
+        new IndexCacheDriverControl(new IndexResidencyCoordinator(() -> BASE));
+    control.receive(node());
+    IndexCacheProtocol.Result protocol =
+        IndexCacheController.load(control, other.table(), other.metadata(), "forever", BASE, BASE);
+    IndexCacheProtocol.Result unused =
+        IndexCacheController.load(control, built.table(), built.metadata(), "forever", BASE, BASE);
+
+    assertThat(protocol.targetFiles())
+        .allSatisfy(
+            file ->
+                assertThat(ExecutorIndexCache.Config.of(true, 1_000_000L, 1_000_000L)).isNotNull());
+    assertThat(unused.indexUuid()).isEqualTo("idx-1");
+  }
+
+  @Test
+  void offloadNamesTheFilesItIsReleasingUntilTheyAnswer() {
+    TestIndexFixtures.BuiltIndex built =
+        TestIndexFixtures.build(tempDir, "idx-1", "data-1.parquet");
+    IndexResidencyCoordinator coordinator = new IndexResidencyCoordinator(() -> BASE);
+    IndexCacheDriverControl control = new IndexCacheDriverControl(coordinator);
+    control.receive(node());
+    IndexCacheProtocol.Result load =
+        IndexCacheController.load(control, built.table(), built.metadata(), "forever", BASE, BASE);
+    IndexCacheProtocol.Command command = coordinator.commands("executor-1", "executor-1#1").get(0);
+    control.receive(
+        IndexCacheProtocol.Ack.builder()
+            .session("application-1")
+            .planId(load.planId())
+            .commandId(command.commandId())
+            .executorId("executor-1")
+            .incarnation("executor-1#1")
+            .epoch(command.epoch())
+            .sequence(command.sequence())
+            .status(IndexCacheProtocol.AckStatus.LOADED)
+            .bytes(command.file().estimatedBytes())
+            .build());
+
+    IndexCacheProtocol.Result offload =
+        IndexCacheController.offload(control, built.table(), built.metadata(), BASE);
+
+    assertThat(offload.status()).isEqualTo(IndexCacheProtocol.Status.OFFLOADED);
+    assertThat(offload.targetFiles()).isNotEmpty();
+    assertThat(offload.uncovered().values()).containsOnly("RELEASING");
+  }
+
+  @Test
+  void indexStatusReportsProtectionAndAccessAge() {
+    TestIndexFixtures.BuiltIndex built =
+        TestIndexFixtures.build(tempDir, "idx-1", "data-1.parquet");
+    IndexCacheDriverControl control =
+        new IndexCacheDriverControl(new IndexResidencyCoordinator(() -> BASE));
+    control.receive(node());
+    IndexCacheController.load(control, built.table(), built.metadata(), "forever", BASE, BASE);
+    control.recordAccess("idx-1", BASE);
+
+    List<IndexCacheControl.IndexStatus> rows = IndexCacheControl.indexStatusOf(control, BASE);
+
+    assertThat(rows).hasSize(1);
+    assertThat(rows.get(0).indexUuid()).isEqualTo("idx-1");
+    assertThat(rows.get(0).permanent()).isTrue();
+    assertThat(rows.get(0).accessAgeMillis()).isZero();
+  }
+
+  @Test
   void missingControlChannelNamesThePlugin() {
     assertThatThrownBy(() -> IndexCacheDriverRegistry.require("no-such-application"))
         .isInstanceOf(IllegalArgumentException.class)

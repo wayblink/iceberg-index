@@ -47,8 +47,8 @@ final class IndexCacheController {
   static IndexCacheProtocol.Result await(
       IndexCacheDriverControl control, String planId, long deadlineNanos) {
     IndexCacheProtocol.Result result = control.result(planId);
-    while (!terminal(result.status()) && control.hasExecutors()) {
-      if (System.nanoTime() >= deadlineNanos) {
+    while (!terminal(result.status()) && control.hasLiveExecutors(control.nowNanos())) {
+      if (control.nowNanos() >= deadlineNanos) {
         break;
       }
 
@@ -56,7 +56,8 @@ final class IndexCacheController {
         Thread.sleep(50L);
       } catch (InterruptedException e) {
         Thread.currentThread().interrupt();
-        break;
+        throw new IllegalStateException(
+            "Interrupted while waiting for index residency plan " + planId, e);
       }
 
       result = control.result(planId);
@@ -104,12 +105,8 @@ final class IndexCacheController {
         metadata.tableUuid(),
         table.uuid());
 
-    Preconditions.checkArgument(
-        metadata.tableLocation() == null || metadata.tableLocation().equals(table.location()),
-        "Index %s records table location %s but the table is at %s",
-        metadata.indexUuid(),
-        metadata.tableLocation(),
-        table.location());
+    // No location check here: releasing an index only needs its identity, and a moved table must
+    // still be able to offload what it loaded.
     String planId = control.acceptOffload(metadata.indexUuid(), nowNanos);
     return control.result(planId);
   }

@@ -64,6 +64,7 @@ final class IndexResidencyCoordinator {
     private long epoch;
     private boolean paused;
     private IndexCacheProtocol.Protection protection;
+    private long snapshotId;
     private long accessAgeNanos = Long.MAX_VALUE;
     private long accessObservedAtNanos;
     private Set<String> targetCacheKeys = new LinkedHashSet<>();
@@ -117,6 +118,7 @@ final class IndexResidencyCoordinator {
     private boolean superseded;
     private final Set<String> orphansReleased = new LinkedHashSet<>();
     private final Map<String, Integer> attempts = new LinkedHashMap<>();
+    private final Map<String, Integer> waits = new LinkedHashMap<>();
     private final List<String> evicted = new ArrayList<>();
     private int nextAttempt = 1;
     private boolean expired;
@@ -334,6 +336,7 @@ final class IndexResidencyCoordinator {
       }
     }
 
+    index.snapshotId = target.snapshotId();
     index.targetCacheKeys.clear();
     for (IndexCacheProtocol.File file : target.files()) {
       index.targetCacheKeys.add(file.cacheKey());
@@ -377,6 +380,15 @@ final class IndexResidencyCoordinator {
           toRelease.add(holder);
         }
       }
+    }
+
+    plan.snapshotId = index.snapshotId;
+    for (Holder holder : toRelease) {
+      plan.files.add(
+          IndexCacheProtocol.File.builder()
+              .location(holder.location())
+              .cacheKey(holder.cacheKey())
+              .build());
     }
 
     index.paused = true;
@@ -458,6 +470,16 @@ final class IndexResidencyCoordinator {
     return bytes;
   }
 
+  /** How long ago each managed index was last used, in nanoseconds; MAX when never used. */
+  Map<String, Long> accessAges(long nowNanos) {
+    Map<String, Long> ages = new LinkedHashMap<>();
+    for (IndexState index : indexedStates()) {
+      ages.put(index.indexUuid, index.ageAt(nowNanos));
+    }
+
+    return ages;
+  }
+
   /** The protection each managed index currently has, keyed by index identity. */
   Map<String, IndexCacheProtocol.Protection> protectedIndexes() {
     Map<String, IndexCacheProtocol.Protection> protections = new LinkedHashMap<>();
@@ -485,6 +507,11 @@ final class IndexResidencyCoordinator {
     }
 
     return placements;
+  }
+
+  /** The clock this coordinator compares deadlines and report ages with. */
+  long nowNanos() {
+    return clock.nowNanos();
   }
 
   String lastPlanId() {
@@ -560,9 +587,18 @@ final class IndexResidencyCoordinator {
     IndexState index = indexes.get(plan.indexUuid);
     if ("WAIT_REFERENCES".equals(ack.reason())
         && command.type == IndexCacheProtocol.CommandType.LOAD) {
-      // Waiting for an in-flight search is not a failure of this command: requeue it and let the
-      // plan deadline decide, rather than spending the transient attempt budget.
-      node.requeue(command.commandId);
+      // Waiting for an in-flight search is not transient pressure, but it cannot be unbounded:
+      // after
+      // its own budget the file is reported instead of circulating forever.
+      int waited = plan.waits.merge(command.commandId, 1, Integer::sum);
+      if (waited < maxCommandAttempts) {
+        node.requeue(command.commandId);
+        return;
+      }
+
+      node.delivered(ack.commandId());
+      plan.failed.put(command.location, "REFERENCES_IN_USE");
+      node.settle(ack.commandId());
       return;
     }
 
@@ -591,6 +627,7 @@ final class IndexResidencyCoordinator {
 
     if (command.type == IndexCacheProtocol.CommandType.RELEASE) {
       if (ack.status() == IndexCacheProtocol.AckStatus.RELEASED) {
+        plan.released.add(command.cacheKey);
         // Only the copy on that node stops counting; a migrated copy of the same key survives.
         forgetCopy(
             command.cacheKey, command.executorId, command.incarnation, command.releasesCommandId);
@@ -651,7 +688,14 @@ final class IndexResidencyCoordinator {
     IndexState index = indexes.get(plan.indexUuid);
     IndexCacheProtocol.Protection protection = index == null ? null : index.protection;
     if (plan.terminalStatus != null) {
-      return resultOf(plan, plan.terminalStatus, protection, Map.of(), plan.evicted);
+      Map<String, String> releasing = new LinkedHashMap<>();
+      for (IndexCacheProtocol.File file : plan.files) {
+        if (!plan.released.contains(file.cacheKey())) {
+          releasing.put(file.location(), "RELEASING");
+        }
+      }
+
+      return resultOf(plan, plan.terminalStatus, protection, releasing, plan.evicted);
     }
 
     Set<String> lost = lostIncarnations();
