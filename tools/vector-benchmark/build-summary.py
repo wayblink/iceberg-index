@@ -226,6 +226,28 @@ def curve_chart(title, runs, arms, height=260, width=430):
     return "".join(parts)
 
 
+def candidate_prices(runs, wide=100, narrow=10, limit=10):
+    """What one more candidate costs on the exact re-rank, per table and arm.
+
+    The kernel truncates after sorting every visited list, so widening the candidate list buys no
+    extra scanning -- the only thing it adds is rows to re-score exactly. Dividing the latency
+    difference between two over-sample values by the extra candidates prices that fetch, which is
+    the term the two data formats disagree about.
+    """
+    prices = {}
+    for run in runs:
+        per_over = by_over(run)
+        if wide not in per_over or narrow not in per_over:
+            continue
+        extra = limit * (wide - narrow)
+        delta = (statistics.median(per_over[wide]["ms"])
+                 - statistics.median(per_over[narrow]["ms"]))
+        prices[(cell_of(run)[0], cell_of(run)[1], arm_of(run))] = (
+            delta / extra, statistics.median(per_over[narrow]["ms"]),
+            statistics.median(per_over[wide]["ms"]), extra)
+    return prices
+
+
 def build(runs, confirmations, build_times, title):
     ceilings, cheapest = cheapest_full_recall(runs)
     summary = tables_of(runs)
@@ -321,8 +343,12 @@ benchmark 日志，与详细报告同源，未经二次加工</p>
 多买一个数量级的候选比多读一倍索引便宜得多。</p>
 <p>唯一的例外是 100M Parquet，那一格必须用 3bit + over=10（51.7 s）。原因不在索引而在回表：
 同一份 3.21 GB 的 1bit 索引、同样 1000 个候选，Lance 上 13.5 s、Parquet 上 93.3 s——
-Parquet 的行级随机读按页取数，候选放宽十倍就按十倍付费。这也是整轮里唯一"免费"的优化：
-同一套索引参数换成 Lance，1.4–9 倍。</p>
+Parquet 的行级随机读按页取数，候选放宽十倍就按十倍付费。但这个"Lance 更快"只对<b>按候选回表</b>
+的臂成立：不按候选回表的臂上两种格式相当甚至 Parquet 更快（100M 的 FLAT 是 98.0 vs 121.8 s，
+IVF 未量化 353.6 vs 366.2 s，HNSW 139.4 vs 134.9 s；10M 的全表扫描中位也是 Parquet 14.0 s
+比 Lance 18.4 s 快）。</p>
+<p>还有个容易被漏掉的事实：收紧候选宽度这件"优化"在 10M 上完全免费，在 100M 上却很贵，
+而且贵多少由格式决定。下一节把它单独量了出来。</p>
 </div>""")
 
     # ---- the recommendation, table by table
@@ -416,6 +442,37 @@ Parquet 的行级随机读按页取数，候选放宽十倍就按十倍付费。
                  "1bit 在四张表里都要开满 100 倍候选才追平，追平之后它是最快的；"
                  "4bit 从来没有比 3bit 好——recall 不需要它，体积也不占优。</p></div>")
 
+    # ---- the term the two formats actually disagree about
+    prices = candidate_prices(runs)
+    if prices:
+        parts.append('<h2>一个候选值多少钱</h2><div class="card">'
+                     '<p class="note" style="margin-top:0">kernel 是把访问到的列表条目全部打分、'
+                     "排序之后才截断到 <code>limit × over-sample</code>，所以放宽候选<b>不增加扫描量</b>；"
+                     "它唯一增加的是交给精确重排的行数。用 over=10 与 over=100 的延迟差除以多出来的 "
+                     "900 个候选，就把这笔回表单价单独量了出来。</p>"
+                     '<table><thead><tr><th>规模 / 数据格式</th><th>IVF·1bit</th><th>IVF·3bit</th>'
+                     "<th>IVF·4bit</th></tr></thead><tbody>")
+        for key in sorted(ceilings, reverse=True):
+            scale, data_format = key
+            row = []
+            for arm in ("IVF·1bit", "IVF·3bit", "IVF·4bit"):
+                found = prices.get((scale, data_format, arm))
+                if not found:
+                    row.append("—")
+                    continue
+                price, narrow_ms, wide_ms, extra = found
+                row.append("≈ 0" if abs(price) < 4 else f"{price:.0f} ms")
+            parts.append(
+                f"<tr><td><b>{esc(scale)}</b> · {esc(data_format)}</td>"
+                + "".join(f"<td>{esc(cell)}</td>" for cell in row)
+                + "</tr>")
+        parts.append("</tbody></table>"
+                     '<p class="note">10M 上两种格式都近似免费（差值在 ±0.1 s 内，写 ≈ 0），'
+                     "所以那里「1bit + 100 倍候选」没有任何额外代价；100M 上同一个候选在 Parquet 上"
+                     "（34–47 ms）比 Lance 上（6–12 ms）贵约 6 倍，这才是两个格式在索引臂上拉开差距的地方。"
+                     "3bit 在 100M Lance 上写 ≈ 0，是它 38 s 的基数把 5 s 的变化淹在噪声里，"
+                     "不是真的免费。</p></div>")
+
     # ---- the shape of the trade-off
     panels = []
     for key in sorted(ceilings, reverse=True):
@@ -456,8 +513,11 @@ Parquet 的行级随机读按页取数，候选放宽十倍就按十倍付费。
 差 6 倍；查询之间的差异远大于臂之间、格式之间的差异。表里用的是中位数。</li>
 <li><b>第一格永远是冷启动。</b>100M Lance 上 HNSW 首次 1093.7 s、IVF 未量化首次 2227.2 s、
 3bit 首次 765.3 s、1bit 首次 356.0 s。这些值说明了冷缓存的真实体验，但没有进入中位数。</li>
-<li><b>每张表只有 2 个查询 × 2 轮</b>（100M Lance 的 1bit/3bit 另做单臂单 JVM、3 轮隔离复现）。
-100M 单次查询从 8 s 到 900 s 不等，多查询会把一轮拉到几十小时。</li>
+<li><b>两张规模用的查询数不同</b>：10M 是 6 个查询 × 2 轮（每格 12 次测量），100M 只有
+2 个查询 × 2 轮（每格 4 次），因为 100M 单次查询从 8 s 到 900 s 不等，多查询会把一轮拉到几十小时。
+所以 100M 的结论比 10M 脆：同一张表上 3bit 在网格里是查询 1 约 33–44 s、查询 2 约 36–44 s，
+而在单臂隔离复现里是 76–97 s 与 13–20 s，两个查询的相对难度会随缓存状态翻转；
+"1bit 比 3bit 快"这个方向两次跑都成立，但"快 2.8 倍"不该当常数用。</li>
 <li><b>nprobe 没有系统扫。</b>10M 全用 150、100M 全用 32，只有两个点。已有的独立测量显示
 10M 上从 150 降到 32 还能快约 2.2 倍而 recall 几乎不变，所以 10M 的绝对延迟还有余量没算进来。</li>
 <li><b>构建耗时只能读到分钟。</b>按索引元数据 g1→gN 的时间戳计算，含 driver 启动约 1 分钟，
