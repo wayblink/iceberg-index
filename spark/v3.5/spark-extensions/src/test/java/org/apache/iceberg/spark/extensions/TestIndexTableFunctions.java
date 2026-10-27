@@ -185,6 +185,47 @@ class TestIndexTableFunctions {
     assertThat(explain).doesNotContain("vector_index_search");
   }
 
+  /**
+   * A table with columns named like the ones a search returns is searched like any other: a
+   * resolved row is serialised from the schema it was read with, so no column name of the row is
+   * parsed as a SQL reference and none of them collides with the columns of the answer.
+   */
+  @Test
+  public void searchResolvesColumnsNamedLikeTheOutputColumns() {
+    spark.sql("DROP TABLE IF EXISTS local.db.clashing");
+    spark.sql(
+        "CREATE TABLE local.db.clashing (id bigint, pos bigint, data_file string,"
+            + " embedding array<double>) USING iceberg");
+    spark.sql(
+        "INSERT INTO local.db.clashing VALUES"
+            + " (1, 10, 'mine-a', array(1.0d, 0.0d)),"
+            + " (2, 20, 'mine-b', array(0.0d, 1.0d)),"
+            + " (3, 30, 'mine-c', array(0.7d, 0.7d))");
+    spark.sql(
+        "CALL local.system.build_vector_index(table => 'db.clashing', column => 'embedding',"
+            + " dimension => 2)");
+
+    List<String> rows =
+        spark
+            .sql(
+                "CALL local.system.vector_search(table => 'db.clashing', column => 'embedding',"
+                    + " query => array(1.0d, 0.0d), k => 3)")
+            .collectAsList()
+            .stream()
+            .map(hit -> hit.getString(3))
+            .collect(Collectors.toList());
+
+    assertThat(rows).hasSize(3);
+    assertThat(rows)
+        .as("the columns of the row come back under their own names")
+        .anySatisfy(
+            json ->
+                assertThat(json)
+                    .contains("\"id\":1")
+                    .contains("\"pos\":10")
+                    .contains("\"data_file\":\"mine-a\""));
+  }
+
   @Test
   public void rejectsNonConstantArguments() {
     // a column reference cannot be folded, so the function refuses to plan

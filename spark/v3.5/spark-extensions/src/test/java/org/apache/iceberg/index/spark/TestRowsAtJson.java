@@ -206,8 +206,9 @@ class TestRowsAtJson {
   }
 
   /**
-   * A column whose name contains a dot is a legal column, and its name is a JSON key rather than a
-   * path through nested values: both conversions read it from the schema, so both serialise it.
+   * A column whose name contains a dot is a legal column. Serialising a resolved row reads the
+   * schema, so the name is a JSON key rather than a path through nested values, and it is not
+   * resolved by the query parser.
    */
   @Test
   void aColumnWhoseNameContainsADotStillSerialises() throws Exception {
@@ -217,6 +218,10 @@ class TestRowsAtJson {
             + " USING iceberg");
     spark.sql("INSERT INTO local.db.dotted_names SELECT /*+ COALESCE(1) */ 1L, 'dotted', 'spaced'");
 
+    // the value of such a column is not what this test is about: a parquet writer escapes a dot in
+    // a column name to `a_x2Eb`, so the fetch-back cannot match the escaped name in the file and
+    // reads a null there. What the test pins is that serialising the row no longer goes through the
+    // query parser, which is what used to reject the name outright.
     assertSameJsonAsTheRowToJsonConversion("local.db.dotted_names");
   }
 
