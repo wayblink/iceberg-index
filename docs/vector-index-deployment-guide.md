@@ -51,7 +51,7 @@ CALL prod.system.build_vector_index(
 | SIFT 10M～100M，默认 | IVF + RaBitQ **1bit**，`nprobe=32`，over-sample **100** | 10M 4.4 s、100M 13.5 s，均为精确 recall；比全表扫描快 4.3×／9.9× |
 | 表是 Parquet 且 ≥100M | IVF + 3bit，`nprobe=32`，over-sample 10 | 1bit 在 Parquet 上每个候选要贵 34–47 ms，宽候选付不起；3bit 只需 10 倍候选 |
 | 表 < 10M 且索引能常驻 | HNSW 可用 | 10M 上 HNSW 最快 10–13 s，仍比 1bit 慢 2 倍；100M 上等于全表扫描，**不要用** |
-| 需要"不走索引"的对照 | FLAT | 只作标尺；改写规则会故意拒绝 FLAT，查询走扫描 |
+| 需要"不走索引"的对照 | FLAT | 只作标尺；但注意它现在也会被改写成索引路径，做对照要自己写不命中改写的表达式（如距离后加 `+ 0.0d`） |
 
 `4bit` 在四张实测表上没有一处优于 3bit（recall 不需要它、体积最大），**不建议作为默认**。
 
@@ -71,7 +71,7 @@ LIMIT 10;
 1. 该列上存在向量索引；
 2. 至少有一个数据文件被索引覆盖（未覆盖的部分仍会残余扫描，所以索引落后于快照也能用）。
 
-用户手册（`docs/docs/spark-procedures.md:1555`）另外声明"索引不能是 `FLAT`"——理由是 FLAT 每个条目都要打分、代价等同扫描。这一条我**没有在代码里找到对应实现**（`RewriteVectorSearch` 与 `BindVectorSearch` 里都没有按 structure 过滤），实测中 FLAT 也确实只能用 `vector_search` 过程测（走 `ORDER BY` 拿不到结果）。所以：**文档与实测一致、代码路径待核实**，见 §7 第 8 条。运维上按"FLAT 不参与自动改写"来规划即可，不要依赖它。
+**FLAT 也参与改写。** 早先的规则因为"FLAT 每个条目都要打分、代价等同扫描"把精确索引排除在改写之外；现在这条成本判断已被移除——能不能用索引只看正确性，不看代价（`TestVectorIndexGuide.theRewriteUsesWhateverStructureTheIndexHas` 断言了 `EXPLAIN` 里出现 `VectorSearchSource`）。所以 `ORDER BY` 自动改写对 FLAT 也生效，只是它省不了多少开销：候选就是全部条目，重排后仍然是全量打分。用户手册里"索引不能是 FLAT"的说法属于旧行为，以本条为准。
 
 一个列上有多个索引时，`ORDER BY` 里没地方写索引名字，必须用配置指定，否则规则不动手（避免猜）：
 
@@ -80,7 +80,9 @@ SET spark.iceberg.index.vector.name = docs_ivf_1bit;
 SET spark.iceberg.index.vector.over-sample = 100;
 ```
 
-`over-sample` 的含义是"向索引要 k×over 个候选，再精确重排取前 k"。它是唯一在查询时能调的召回/延迟旋钮：一次设成 100 是安全的默认（实测 10M/100M 的 1bit 都要 100 倍候选才追平精确召回）。
+`over-sample` 的含义是"向索引要 k×over 个候选，再取前 k"。对 `ORDER BY` 的自动改写，取前 k 之前会**精确重排**，所以放大倍数提高的是**召回**；对 `CALL vector_search` / 两个向量 TVF，结果合同是"索引自己的原始分数、按索引顺序取前 k、删掉的行以 `row = null` 保留"，**不精确重排、不扫未覆盖文件**，因此放大倍数只扩大候选范围、不会让结果变成"精确 Top-K"（近似 kernel 扩大范围后候选集本身可能变，但不保证与旧 `C=k` 逐条一致）。
+
+它是唯一在查询时能调的召回/延迟旋钮：一次设成 100 是安全的默认（实测 10M/100M 的 1bit 都要 100 倍候选才追平精确召回）。未设置时用兼容基线 1，并在计划里标成 `COMPAT_DEFAULT(no-calibrated-policy)`——那不是"已-calibrated 的最优值"。显式设置（包括显式写 1）一律保留；空串、非整数、0、负数会报错而不是被静默改成 1。
 
 **注意度量**：`vec_distance` 默认算余弦，只有在被改写命中时才特化成索引的 metric。所以"手写一个不走索引的对照查询"时，`vec_distance(...) + 0.0d` 这种写法其实是余弦排序——若索引是 EUCLIDEAN，两者排序不同，会出现"精确索引也差一行"的假象。做对照必须自己写 L2 表达式。
 
@@ -200,7 +202,7 @@ docker push hub.i.basemind.com/spark/sparkann-e2e:<tag>
 | 症状 | 最可能原因 | 处置 |
 |---|---|---|
 | `list_indexes` 抛 `Unsupported index manifest format version: 2` | 镜像里的 `IndexManifest` 旧于构建器（#2756） | 重建镜像；**不要手改清单文件** |
-| 查询没走索引、计划里是扫描 | 列上无索引 / 索引是 FLAT / 没有文件被覆盖 / 一列多索引但没设 `spark.iceberg.index.vector.name` | 按 §2.2 的三条命中条件逐条查 |
+| 查询没走索引、计划里是扫描 | 列上无索引 / 索引快照对读快照没有覆盖 / 一列多索引但没设 `spark.iceberg.index.vector.name` / 形状不命中白名单（Join、聚合、窗口、OFFSET、多排序键、非纯属性投影） | 先看 `EXPLAIN EXTENDED` 里有没有 `VectorSearchSource`，再按 §2.2 的命中条件逐条查 |
 | 结果比全表扫描少几行 | 用了 `vec_distance` 的默认余弦做对照，而索引是 EUCLIDEAN | 用 L2 表达式做对照（§2.2 末尾） |
 | 构建中断后索引"存在但查不到" | 早期版本会留下空注册 | 已修（失败构建会 `dropIndex(..., true)`），仍建议跑 `cleanup_index_files` |
 | 100M 级查询退化成扫描速度 | 索引装不进缓存（HNSW 典型） | 换 IVF + 量化；或提高缓存预算 |
@@ -226,7 +228,7 @@ docker push hub.i.basemind.com/spark/sparkann-e2e:<tag>
 3. **nprobe 未系统扫**。10M 只测了 150、100M 只测了 32；已有独立测量显示 10M 从 150 降到 32 还能快约 2 倍而 recall 几乎不变——**默认值很可能偏保守**，这是上线后第一个该调的旋钮。
 4. **只在 Hive catalog 上验证过**。REST catalog 的元数据更新路径（`MetadataUpdate` 序列化）有单测覆盖，但没有端到端跑过；用 REST catalog 上线前要单独验收。
 5. **无 DDL**。所有索引操作是 `CALL` 过程，用户文档要按过程写，不要承诺 `CREATE INDEX`。
-6. **`FLAT` 不作为生产查询手段**，且它是否被改写规则拒绝**待核实**。用户手册写明改写要求"索引不是 FLAT"，但我在 `RewriteVectorSearch` / `BindVectorSearch` / `VectorIndexes` 里没有找到按 structure 过滤的代码；实测 FLAT 走 `ORDER BY` 也无结果（因此 benchmark 用 `vector_search` 过程测它）。要么过滤在别处（未定位），要么文档已过期。上线前应当确认，避免"以为规则会跳过 FLAT、实际不跳过"或反过来的误判。
+6. **`FLAT` 不作为生产查询手段**（它在规模上省不了开销），但它**不再被改写规则拒绝**：旧规则里"FLAT 代价等同扫描所以跳过"的判断已删除，`TestVectorIndexGuide.theRewriteUsesWhateverStructureTheIndexHas` 断言 FLAT 也会生成 `VectorSearchSource`。早先"FLAT 走 `ORDER BY` 拿不到结果"的观察对应旧行为；用户手册里"索引不能是 `FLAT`"一句已过期，改文档时以本条为准。
 7. **删除表/删除行的边界**：equality delete 的多键集已支持，`timestamp_nano` 键被明确拒绝（避免同微秒多行误删）；带删除的表上建索引前请确认删除文件格式（跟随数据格式，Lance 表是 `.lance`）。
 
 ---
