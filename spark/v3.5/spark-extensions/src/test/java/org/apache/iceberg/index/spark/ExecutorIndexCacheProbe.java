@@ -42,11 +42,6 @@ public final class ExecutorIndexCacheProbe {
 
   public static String config(org.apache.spark.sql.SparkSession spark) {
     ExecutorIndexCache.Config config = ExecutorIndexCache.Config.from(spark, 0L);
-    return "enabled="
-        + config.enabled()
-        + " bytes="
-        + config.maxBytes()
-        + " maxEntry="
-        + config.maxEntryBytes();
+    return "enabled=" + config.enabled() + " bytes=" + config.maxBytes();
   }
 }
