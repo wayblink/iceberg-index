@@ -59,7 +59,6 @@ import org.apache.spark.api.java.function.Function;
 import org.apache.spark.api.java.function.PairFlatMapFunction;
 import org.apache.spark.api.java.function.PairFunction;
 import org.apache.spark.broadcast.Broadcast;
-import org.apache.spark.sql.Column;
 import org.apache.spark.sql.Dataset;
 import org.apache.spark.sql.Row;
 import org.apache.spark.sql.RowFactory;
@@ -98,6 +97,7 @@ public final class IndexEntries {
   public static final String VECTOR_COLUMN = "vector";
 
   private static final String JSON_COLUMN = "row_json";
+  private static final String ROW_COLUMN = "resolved_row";
 
   public static final StructType SCHEMA =
       new StructType()
@@ -294,39 +294,24 @@ public final class IndexEntries {
       return jsonByFile;
     }
 
-    List<Column> requested = Lists.newArrayListWithCapacity(columns.size());
-    for (String column : columns) {
-      requested.add(functions.col(column));
-    }
-
-    // the positions travel with the rows instead of being recovered from an order: a row's JSON is
-    // keyed by the position it answers, so nothing here depends on how the rows are partitioned
+    // the row travels as one value of its own type rather than as one column per name: its JSON
+    // then comes from the schema the read was given, so a column called `pos` or `data_file`, or
+    // one whose name contains a dot, serialises like any other and never goes through the query
+    // parser. The position travels with the row, so nothing depends on the order of the answers.
     int readTasks = readTaskCount(tasks.size());
-    int width = columns.size();
     Dataset<Row> json =
         spark
             .createDataFrame(
                 rows.coalesce(readTasks)
                     .map(
                         (Function<Tuple2<String, Tuple2<Long, Row>>, Row>)
-                            entry -> {
-                              Object[] values = new Object[width + 2];
-                              values[0] = entry._1();
-                              values[1] = entry._2()._1();
-                              Row row = entry._2()._2();
-                              for (int i = 0; i < width; i++) {
-                                values[i + 2] = row.get(i);
-                              }
-
-                              return RowFactory.create(values);
-                            }),
+                            entry ->
+                                RowFactory.create(entry._1(), entry._2()._1(), entry._2()._2())),
                 schemaOf(columns, readSchema))
             .select(
                 functions.col(DATA_FILE_COLUMN),
                 functions.col(POSITION_COLUMN),
-                functions
-                    .to_json(functions.struct(requested.toArray(new Column[0])))
-                    .as(JSON_COLUMN));
+                functions.to_json(functions.col(ROW_COLUMN)).as(JSON_COLUMN));
 
     for (Row row : json.collectAsList()) {
       jsonByFile
@@ -803,13 +788,14 @@ public final class IndexEntries {
    * requested columns.
    */
   private static StructType schemaOf(List<String> columns, StructType readSchema) {
-    StructType requested = schemaFor(columns, readSchema);
-    List<StructField> fields = Lists.newArrayListWithCapacity(columns.size() + 2);
+    // the requested columns are nested under one field: a top-level field per column would have to
+    // share the space with the file and the position, and a caller's column of the same name would
+    // make every reference to it ambiguous
+    List<StructField> fields = Lists.newArrayListWithCapacity(3);
     fields.add(new StructField(DATA_FILE_COLUMN, DataTypes.StringType, false, Metadata.empty()));
     fields.add(new StructField(POSITION_COLUMN, DataTypes.LongType, false, Metadata.empty()));
-    for (StructField field : requested.fields()) {
-      fields.add(field);
-    }
+    fields.add(
+        new StructField(ROW_COLUMN, schemaFor(columns, readSchema), false, Metadata.empty()));
 
     return new StructType(fields.toArray(new StructField[0]));
   }

@@ -30,6 +30,7 @@ import org.apache.iceberg.FileScanTask;
 import org.apache.iceberg.Table;
 import org.apache.iceberg.relocated.com.google.common.collect.Lists;
 import org.apache.iceberg.spark.Spark3Util;
+import org.apache.iceberg.types.Types;
 import org.apache.iceberg.spark.SparkSchemaUtil;
 import org.apache.spark.scheduler.SparkListener;
 import org.apache.spark.scheduler.SparkListenerJobStart;
@@ -136,14 +137,24 @@ class TestRowsAtJson {
 
     // the delete removed one row of the file that held two, so that file answers only the row
     // after it, which is the one whose other columns are null: the comparison above therefore
-    // covers the null rendering and not only the populated columns. Which file that is does not
-    // depend on the order the tasks are listed in.
-    Map<Long, String> partiallyDeleted =
-        json.values().stream().filter(answered -> answered.size() == 1).findFirst().orElseThrow();
-    assertThat(partiallyDeleted.keySet()).as("the row the delete left").containsExactly(1L);
+    // covers the null rendering and not only the populated columns. Which file that is, and where
+    // inside it the surviving row sits, is read from the file rather than from the order the
+    // answers come back in: another file also answers a single row.
+    String partiallyDeletedFile = null;
+    for (FileScanTask task : tasks) {
+      if (task.file().recordCount() == 2) {
+        partiallyDeletedFile = task.file().location().toString();
+      }
+    }
+
+    assertThat(partiallyDeletedFile).as("the file that held two rows").isNotNull();
+    Map<Long, String> partiallyDeleted = json.get(partiallyDeletedFile);
+    assertThat(partiallyDeleted).as("the rows the delete left").hasSize(1);
     // the null columns are dropped exactly as the row-to-JSON conversion drops them, rather than
     // rendered as a null literal
-    assertThat(partiallyDeleted.get(1L)).contains("\"id\":3").doesNotContain("\"name\"");
+    assertThat(partiallyDeleted.values())
+        .as("the row the delete left")
+        .allSatisfy(value -> assertThat(value).contains("\"id\":3").doesNotContain("\"name\""));
   }
 
   /**
@@ -176,6 +187,37 @@ class TestRowsAtJson {
     } finally {
       spark.conf().set("spark.sql.jsonGenerator.ignoreNullFields", Boolean.toString(previous));
     }
+  }
+
+  /**
+   * A table may have a column of its own named like the two the fetch-back carries next to the
+   * row. Those travel outside the row, so the caller's column keeps its name and its value.
+   */
+  @Test
+  void aColumnNamedLikeAnAuxiliaryColumnStillSerialises() throws Exception {
+    spark.sql("DROP TABLE IF EXISTS local.db.auxiliary_names");
+    spark.sql(
+        "CREATE TABLE local.db.auxiliary_names (id bigint, pos bigint, data_file string)"
+            + " USING iceberg");
+    spark.sql(
+        "INSERT INTO local.db.auxiliary_names SELECT /*+ COALESCE(1) */ 1L, 42L, 'mine'");
+
+    assertSameJsonAsTheRowToJsonConversion("local.db.auxiliary_names");
+  }
+
+  /**
+   * A column whose name contains a dot is a legal column, and its name is a JSON key rather than a
+   * path through nested values: both conversions read it from the schema, so both serialise it.
+   */
+  @Test
+  void aColumnWhoseNameContainsADotStillSerialises() throws Exception {
+    spark.sql("DROP TABLE IF EXISTS local.db.dotted_names");
+    spark.sql(
+        "CREATE TABLE local.db.dotted_names (`id` bigint, `a.b` string, `c d` string)"
+            + " USING iceberg");
+    spark.sql("INSERT INTO local.db.dotted_names SELECT /*+ COALESCE(1) */ 1L, 'dotted', 'spaced'");
+
+    assertSameJsonAsTheRowToJsonConversion("local.db.dotted_names");
   }
 
   @Test
@@ -211,6 +253,30 @@ class TestRowsAtJson {
             "jobs to collect the rows and then serialise them (%d for the fetch-back alone)",
             fetchBackJobs)
         .isGreaterThan(fetchBackJobs);
+  }
+
+  /** Both conversions of every row of a table, checked to agree. */
+  private void assertSameJsonAsTheRowToJsonConversion(String tableName) throws Exception {
+    Table table = Spark3Util.loadIcebergTable(spark, tableName);
+    List<String> columns = Lists.newArrayList();
+    for (Types.NestedField field : table.schema().columns()) {
+      columns.add(field.name());
+    }
+
+    StructType readSchema = SparkSchemaUtil.convert(table.schema());
+    List<FileScanTask> tasks = IndexEntries.scanTasks(table, table.currentSnapshot().snapshotId());
+    Map<String, java.util.Collection<Long>> positions = positionsOfDeleted(tasks);
+
+    Map<String, Map<Long, String>> json =
+        IndexEntries.rowsAtJson(spark, table, positions, columns, readSchema, tasks);
+    Map<String, Map<Long, String>> expected =
+        legacyJson(
+            IndexEntries.rowsAt(spark, table, positions, columns, readSchema, tasks), readSchema);
+
+    assertThat(json).as("the JSON of every row of %s", tableName).isEqualTo(expected);
+    assertThat(json.values().stream().flatMap(byPosition -> byPosition.values().stream()))
+        .as("the rows %s answered", tableName)
+        .isNotEmpty();
   }
 
   private static List<String> allColumns() {
