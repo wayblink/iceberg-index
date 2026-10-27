@@ -17,179 +17,217 @@ specific language governing permissions and limitations
 under the License.
 -->
 
-# 索引发布验收套件：分层用例、基线与门禁
+# 索引发布验收套件：用例、结果合同、基线与门禁
 
-状态：**设计稿，待人工确认。** 本轮只写设计与建卡，不跑集群、不改产品代码。源码核对基线 `2ae5d556f`。对应伞卡 #2020 之外的新伞卡「发布验收套件」，取代 #1632、#1924、#2760、#2411、#2296 五张卡的独立验收口径——它们的范围作为本套件的 case 来源，卡本身按用户要求关闭。
+状态：**复审修订稿，待确认；不是已实现套件。** 对应 #2787，子卡 #2788–#2792；本次修订落实评审 #3095。源码核对基线为产品 `a682bc368`，工具来源为独立仓库 `iceberg-tools`。本文中的执行规则是拟实现合同；资源、时间和性能均不得冒充实测。固定厂内 Spark 3.5 / Scala 2.12，不讨论其他 Spark 主版本。
 
-## 1. 问题
+## 1. 意图与范围
 
-索引能力现在由五张独立的验收卡分别验证：参数曲线（#1632）、数据格式对照（#1924）、自动预算覆盖率（#2760）、驻留故障与并发（#2411）、100M 大索引放置与均衡（#2296）。它们各有各的执行脚本、资源规格、判定口径，导致三个具体后果：
+把分散在 #1632、#1924、#2760、#2411、#2296 的验收要求合并为可重跑套件：一条命令生成原始证据、机器可读判定和报告；发布前检查功能、质量与驻留行为；通过且经确认的结果成为下一版基线。旧卡按用户要求关闭仅代表**范围转移**，不表示它们未完成的检查或 RED 回归已解决。
 
-1. **同一件事重复付集群时间**。五张卡里至少三张要独占集群跑 10M/100M 查询（`#1632` 曲线、`#2760` 覆盖率、`#2296` 放置），却各自 30 min–5 h 起算，且都没有"这次已经跑过、直接复用"的概念。
-2. **结论无法跨版本比较**。每次跑完结论落在卡片的 note 或 `reviews/` 目录里，格式是人读的 Markdown。要回答"这版比上版快还是慢"，只能靠人对两份报告，历史上就是这样漏掉的：`dfc68c45c` 之后 100M Parquet 的"1bit vs 3bit 谁快"被推翻过一次，卡片正文与报告矛盾一个月没人发现。
-3. **验收没有出口**。`#2411` 已合入代码，但独立审查判 `Ready to close No`（两条行为回归 RED）；`#2296` 从未跑过；`#2760` 的 100M 口径从未跑过。三者都不是"做完了没验收"，而是"没有一套能一次性判定整条链路可发布的规程"。
+产品实现和方案文档留在 Iceberg 仓库；提交/探针/报告生成/门禁脚本在 `iceberg-tools` 仓库，不能回流产品仓 `tools/`。不新建调度框架、CI 服务或多集群编排；不借验收实现后台再平衡、跨应用持久化、自动故障修复。不修改产品默认值以令验收达标。
 
-所以需要的不是又一张验收卡，而是一套**可重跑的发布验收套件**：一条命令跑完、一份机器可读结果、一道能挡住回归的门，并且每版跑完把结果写成下一版的基线。
+现有报告只能作历史参考：10M 的 `0.9833` 已确认来自余弦真值与 EUCLIDEAN 搜索错配，不能作质量天花板；100M Parquet 的 1bit/3bit 排名曾在不同运行中翻转，不能固定“谁必须更快”；旧大表磁盘体积不能等同实际驻留内存。
 
-## 2. 目标与非目标
+## 2. 两个结果合同，分别验收
 
-目标：
+| 入口 | 产品合同 | 正确断言 |
+|---|---|---|
+| `CALL vector_search[_batch]` 与向量 TVF | `INDEX_HITS`：索引原始命中/原始 score；已删除或已不存在行的命中可保留为 `row=null`；不扫描未覆盖文件 | 同一索引/查询/参数/冻结快照下 CALL 与对应 TVF 的行数、顺序、score、JSON/null 一致；对照索引参考实现，而不是完整表答案 |
+| 普通 `ORDER BY vec_distance(...) LIMIT k` | `TABLE_LIVE_TOPK`：候选回表、删除过滤、精确打分重排、未覆盖文件残差扫描 | 以完整表相同 metric 的精确答案衡量召回；返回行必须存活、无重复、符合精确排名与约定质量目标 |
 
-- 每版发布前用**一条命令**在真实集群上跑完 L0–L3，产出可归因的结果目录与两份报告（详细 + 摘要）。
-- 用 `baseline.json` 把"这版不比上版差"变成机器判定，覆盖 recall、覆盖率、结果一致性这些确定性指标；延迟只记录不判定（理由见 §7）。
-- 把五张旧卡的验收内容吸收成 case，且**不丢任何一条未完成项**（逐条去向见 §6）。
-- 跑不成（集群被占、镜像不全、表缺失）时输出 `blocked` 并以非零退出，**不允许以"跳过"代替通过**。
+**禁止**把三入口的 `(data_file,pos,score,row)` 一概断言相等。普通 SQL 默认输出也不是 CALL 的四列 schema。量化近似 score、删除命中和残差文件都能导致合法差异。
 
-非目标：
+跨合同比较只在专门的精确 fixture 上进行：完整覆盖、无删除、精确 kernel，并投影共同的行身份/值，重新计算同 metric 的距离；不把原始近似 score 当精确 score。不兼容 payload 的明确拒绝与缺少索引时的合法扫描回退也要分别断言。
 
-- 不新建调度框架、不引入 CI 服务、不做多集群并行。套件是 shell + 现有四个脚本 + 一个 Python 门禁的组合。
-- 不做后台/周期再平衡、自动预热、跨应用持久化——这些是 #2391 的明确非目标，本套件也不引入。
-- 不追求"一个 Spark 应用跑完全部 case"（理由见 §3.2）。
-- 不重新设计索引本身；套件只观测与判定。
+## 3. 输入冻结与真值
 
-## 3. 设计决定
+每个 run 固定：产品 SHA、工具 SHA、镜像 digest、JVM/Spark/Scala、codec、executor 规格、缓存/插件参数，以及 table UUID、table snapshot、index UUID、index snapshot、definition hash。输入资产包含查询 ID 和向量内容 hash（按 ID 排序、规范编码）、topK、metric、seed、真值算法版本。并发 append/refresh 不得改变已规划的向量TABLE_LIVE_TOPK/INDEX_HITS查询读取的快照；用独立 fixture 验证此行为。文本入口按§6 L1.7的统计/回表合同单独检查，不把向量规划合同自动套用到文本。
 
-### D1：粒度是"多个互相隔离的 run"，不是"一个长 run"
+大表可复用冻结 snapshot，但不得自动写、删除或重建共享索引。需要新 writer 验证时用 run 命名空间内的小表；若大表索引必须重建，需要显式资产授权或独立副本。资产变更不得静默写入旧比较序列。
 
-套件入口按顺序提交若干独立 Spark 应用，每个 case 一个 `run-id`、一个日志、一份结果行；彼此只共享输入资产与输出目录。
+真值是**当前冻结完整表**在**同一 metric**下的精确 topK。EUCLIDEAN 必须显式计算 L2，不能用默认余弦的 `vec_distance(...) + 0.0d`。参考表达式不得被改写成索引计划，需记录 executed plan 并检查；可用共享的精确算分参考工具以避免接口歧义。COSINE、DOT_PRODUCT、零向量、null、数值精度均有单独 fixture。
 
-### D2：为什么不能合成一个应用（三个已发生的反例）
+不默认使用 SIFT 11M 的 gt 过滤后当作 10M 精确 top10；过滤可能不足 k，且度量不一致。外部 gt 只在提供生成算法、metric、源数据 snapshot/hash、topK 和查询集映射，并逐项核对后可用。
 
-1. **冷热互相破坏**。`load_index` 会把索引钉到 executor 上。若在同一应用里先驻留后测 100M 曲线，`1bit@over100` 就不再是 13.5 s 而是几秒，与历史基线不可比；反过来先测后驻留，就看不到"每轮首次触碰 payload 是冷的"这类极值——`#2679` 正是踩了这个坑：用 `max(repeat)` 配对算出 8.6× 差异，取暖态轮后实际 0.88×。
-2. **预算口径互斥**。`#2760` 的验收对象是"不设 `cache.bytes` 时的自动推导覆盖率"；`#1948` 的 100M 曲线要显式预算覆盖 7.49 GB 才谈得上稳态。同一个 JVM 只能选一个。
-3. **规格不同**。10M 测 `6×7g` 足够；100M HNSW 是 23.67 GB、必须 `4×16g`，而 `#2296` 的验收前提恰恰是"索引装不进单节点"。合并规格会直接消灭这一档。
+### 3.1 度量定义
 
-### D3：四层 + 一个按需层
+- 精确路径：结果集合与同度量真值相同，要求 recall=1.0；若 topK 边界同距，采用 tie-aware 判定：所有严格优于第 k 距离的行必须存在，其余结果距离不得超过边界，数量为 min(k,有效行数)，身份不得重复。容差固定在 spec 并有边界 fixture，不能按本轮结果调大。
+- 近似路径：逐查询记 `found`、`returned_ids`、`truth_ids`、`eligible_count`、边界距离与 recall；分母为 min(k,有效行数)，空真值时 recall 为 null，单独断言无返回行，不虚构 recall=1。汇总记录 query-mean、worst-query、样本数，不能用重复同查询的轮次冒充更多查询。
+- 推荐配置质量门：每个固定查询达到配置目标；初始目标采用同度量修正后的认可数据，不硬编码历史错误数字。近似算法不因“默认推荐”就对任意数据保证满召回。
+- 曲线格子：低 over 本来用于展示量化损失，**不要求所有格子满召回**；与同键认可基线比较逐查询命中及质量指标。允许下降的命中数/容差按配置写入 spec，精确 fixture 容差为0。首版没有可比较数据时标明首次观测，由人工认可后建立基线，不假装完成跨版不退化验证。
 
-L0 环境自检、L1 功能正确性（10M）、L2 曲线与格式、L3 驻留与容量；L2' 为"按需补齐"（全参数网格、nprobe 曲线、100M 稳态延迟）。分层依据是**失败时能定位到哪一层**：L1 红说明结果错，L2 红说明取舍变差，L3 红说明容量/故障行为坏了。
+## 4. 执行与资源
 
-### D4：两个节奏，不是一个
+### 4.1 明确的两档节奏（本修订的推荐）
 
-- **每版必跑**：L0 + L1 + L2 骨架 + L3 精简档（10M），约 2–3 h 集群独占。
-- **大版本/参数变更**：L2' 全量 + L3 的 100M 档（放置、覆盖率），约 5–10 h，其中 100M HNSW 索引复用既有产物、不重建。
+| 档位 | 必跑内容 | 说明 |
+|---|---|---|
+| `standard` 每版 | L0、L1 小数据全构建/合同检查、L2.1 10M骨架、L3.1–L3.4 10M驻留、G与报告 | 100M 不在此档必跑集合；无100M新数据就不生成本版100M取舍倍数 |
+| `extended` 重大改动/大版本 | standard + L2.2 100M两格式推荐对照 + L3.5/L3.6 | payload/reader、内存模型、放置机制发生变化必须用此档；选择记录在本次 release manifest，不能运行中因排不上而降档 |
+| 探索 case | L2.4/L2.5，通常的L2.6/L2.7 | `--only` 显式选用；内存/加载重大变更时L2.6加入extended必跑，HNSW变更时L2.7的HNSW查询实例加入extended必跑。最终expected集合在启动前展开写入manifest，不能运行中删掉 |
 
-### D5：基线是滚动文件，不是报告
+档位及触发条件尚待整体设计确认；预计数小时仅用于排队规划，不作验收SLA。`--only L0,L1` 或 `--only L1.3` 是诊断运行，不是完整发版验收。
 
-`baseline.json` 每个 case 一条记录，键为 `case_id` + 臂标识（表/格式/结构/量化/over/nprobe）。它保存判定用的确定性指标与"仅供参考"的性能数字；每版通过后整份写回下一版，历史版本目录保留不覆盖。
+每个 case 一个逻辑 run-id；需要冷热、插件启停或异预算时，case 内可有多个独立 Spark 应用，分别记录身份。曲线 run 可把同表多个臂按查询交错测，保持可比较性；驻留状态测试不与曲线混在同一应用。存在跨臂固定顺序和冷热影响时记录顺序并做轮次轮换；不能用“同轮”断言负载影响已抵消。
 
-### D6：延迟不做硬门禁，只做同轮相对比较
-
-理由与反例见 §7.1。延迟进报告、进告警，不进失败判定；判定只用 recall、覆盖率、逐行一致性、缺口清单完整性。
-
-### D7：跑不成 = `blocked`，不等于通过
-
-L0 判定集群不空闲（存在其他 `sparkann-*` 应用）时，套件输出 `blocked` 并退出非零：历史证据是 `grid2-100m-lance` 那轮被别家 benchmark 拖慢 1.4–1.8×（1bit@100 19.2 s vs 13.5 s、scan 403 s vs 133 s），这种数据一旦被写进基线，后面每版都会拿它当参照。
-
-## 4. 资源规格
-
-固定三个 profile，所有 case 必须显式声明用哪一个，禁止在脚本里临时改：
-
-| profile | executors | heap | overhead | `cache.bytes` | 用于 |
-|---|---|---|---|---|---|
-| `P10` | 6 | 7g | 2g | 不设（自动推导） | L1、L2 的 10M、L3.1–L3.4 |
-| `P100-CURVE` | 4 | 16g | 4g | 8g（显式） | L2 的 100M 推荐臂、L2' 稳态延迟 |
-| `P100-NOCACHE` | 4 | 16g | 4g | 不设 | L3.5、L3.6 的 100M 自动预算验收 |
-
-`P100-NOCACHE` 是 `#2760`/`#2296` 的验收口径：不设预算、看自动推导结果。任何"显式给了 8g 才达标"的结论必须单独标注，不能冒充自动推导通过。
-
-## 5. case 清单
-
-每行是一个可单独重跑的 case，`case_id` 即 `baseline.json` 的主键前缀。成本为集群独占估算。
-
-### L0 环境自检（每版，分钟级）
-
-| id | 内容 | 断言 | 来源 |
-|---|---|---|---|
-| `L0.1` | 产物身份：镜像 tag + digest、产品 build SHA、镜像内 jar 清单 sha256、工具仓 SHA | 全部入档；jar 清单与 `cluster/list-jars.txt` 的记录一致 | #2757 的 provenance 做法 |
-| `L0.2` | 集群独占：`kubectl -n spark get pods` 无其他 `sparkann-*`/`spark-*-bench` 应用；提交后 executor 全部 Ready | 不满足则 `blocked` 退出 | `grid2` 污染事故 |
-| `L0.3` | 资产自检：四张目标表存在、行数/文件数与基线一致；索引 metadata 的 payload 版本；`check_indexes` 结论 | 出现"需重建"时，套件必须改用重建后的臂并记录 | #2022 |
-| `L0.4` | 查询集与 gt：`sift10m_query`/`sift100m_query` 文件 sha256、gt 的 id 过滤口径 | 与基线不一致即 `blocked`（否则 recall 不可比） | #1957 的 gt 陷阱 |
-
-### L1 功能正确性（10M，每版，10–20 min）
-
-| id | 内容 | 断言 | 来源 |
-|---|---|---|---|
-| `L1.1` | 两种格式各新建一个索引（IVF·3bit np32），验证写入链路 | 构建成功、体积落在基线 ±5%、`list_indexes` 可见 | #1632/#1924 |
-| `L1.2` | 三入口结果一致：`CALL vector_search` / `vector_index_search` TVF / 改写规则（普通 SQL 被改写） | 同一 query 的 `(data_file, pos, score, row)` 逐行相同 | #2023/#2028 |
-| `L1.3` | 结果正确性：recall@10 对精确扫描；`row` JSON 与 `SELECT` 逐行一致（null/嵌套/decimal/timestamp/binary） | recall ≥ 天花板（10M 0.9833，100M 1.0000）；JSON 逐行相等 | #2028 那类静默错误 |
-| `L1.4` | 删除语义：position delete 与 equality delete 两类表 | 索引结果 == 精确扫描结果（不多不少） | #2021/#2065 |
-| `L1.5` | 边界：NULL 向量行、空表、单文件表、payload 版本不兼容时报错 | 不抛 NPE；不兼容时应显式拒绝而非静默降级 | #2728/#2022 |
-| `L1.6` | 缓存脏读：同一 query 在 offload 前后结果一致 | 逐行相同 | #2411 场景表 |
-
-### L2 曲线与格式（10M 每版；100M 与全量按需）
-
-| id | 内容 | 断言 | 来源 | 节奏 |
+| profile | executors | heap / overhead | cache.bytes | 插件 |
 |---|---|---|---|---|
-| `L2.1` | 10M 骨架：Parquet/Lance × {IVF 1/2/3/4bit、IVF-NONE、HNSW、FLAT} × over(1/10/100) × 2 查询 × 2 轮 | 每格产出 recall/中位延迟/体积；满 recall 的最小 over 自动选出 | #1632/#1924 | 每版 |
-| `L2.2` | 100M 推荐臂：每格式 2 臂（Lance 1bit@100、Parquet 3bit@10）× 3 查询 × 2 轮 | 推荐臂 recall 达天花板；相对扫描/暴力/HNSW 的倍数入档 | #1924 | 每版（若 100M 排队失败则 `blocked`） |
-| `L2.3` | 报告生成与双份存档：详细报告 + 摘要页，`docs/` 与 umem 副本逐字节相同 | sha256 一致；摘要含推荐配置与"仍没答的问题" | #2684 的规范 | 每版 |
-| `L2.4` | nprobe 曲线：固定 bits=1/3，扫 nprobe(8/16/32/64/128)×over=10，10M 优先 | 给出 recall–延迟曲线的拐点，写入报告 | #1948 的"下一个旋钮" | 按需 |
-| `L2.5` | over 3/30 补齐（100M 两格式推荐臂） | 五点网格与 10M 对齐 | #1924 打回项 | 按需 |
-| `L2.6` | 100M 稳态延迟：`P100-CURVE`，缓存覆盖 7.49 GB | 冷/热分别记录；不再出现"每查询读 7 GB"的冷启动数字被当稳态 | #1632 待补项 | 按需 |
-| `L2.7` | 100M HNSW 两格（Parquet/Lance） | 只在做取舍结论时跑；报告已证其在 100M 等于全表扫描，默认不做 | #1963 | 按需（默认否） |
+| `P10` | 6 | 7g / 2g | 省略，自动推导 | L3启用IndexCachePlugin；L1/L2显式记录启停 |
+| `P100-CURVE` | 4 | 16g / 4g | 显式8g/节点 | 记录启停，稳态先实测驻留覆盖与准入 |
+| `P100-AUTO` | 4 | 16g / 4g | 省略，自动推导 | 驻留case启用IndexCachePlugin |
 
-### L3 驻留与容量
+`P100-AUTO` 替代旧名 P100-NOCACHE：省略预算不等于禁用缓存。显式8g也不证明HNSW或某位宽全驻留，需按实际解压结构与各节点预算验证。异预算case在子规格中列出每节点预算，不能默认齐次 profile 就覆盖。
 
-| id | 内容 | 断言 | 来源 | 节奏 |
-|---|---|---|---|---|
-| `L3.1` | 10M 自动预算覆盖率（`P10`，不设 `cache.bytes`）：`load_index` 后读 `index_cache_status` | coverage ≥ 0.95，且逐 executor 的 entries/bytes/workingSet 入档 | #2760（10M 已过） | 每版 |
-| `L3.2` | 驻留生命周期：offload 后 coverage→0；重复 load 幂等；旧命令兼容；未装插件时退化 | 状态收敛、无残留 holders | #2411 场景表 | 每版 |
-| `L3.3` | 故障注入：kill 一个 executor 后 stale 复查、holders 收敛、查询结果不缺不重 | 结果逐行与 kill 前一致；stale 窗口后状态自洽 | #2411 | 每版 |
-| `L3.4` | 双索引 + 异预算 + 永久保护；含两条当前 RED 回归（复用同一文件 70 次后 COMPLETE 误降 PENDING；双索引共享 key 未经新 owner ACK 即 COMPLETE） | 两条回归必须先修绿，否则本 case 保持红 | #2411 未过项 | 每版（前置修复） |
-| `L3.5` | 100M 大索引放置（`P100-NOCACHE`，100M HNSW + IVF·3bit）：每文件至少一个已确认副本；PARTIAL 逐文件写明 `FILE_TOO_LARGE` 或容量不足；每节点占用/预算 ≤ 均值×1.25 且无 >90%/<50%；两轮查询后 `bytesIn/bytesOut` 稳定；冷/驻留结果逐行一致 | 以上全部成立 | #2296 | 大版本 |
-| `L3.6` | 100M 自动预算覆盖率（不设 `cache.bytes`） | coverage ≥ 0.95；达不到时记录 budget/workingSet 比值并说明是容量问题而非估算缺陷 | #2760 的 100M 口径 | 大版本 |
+### 4.2 资源占用、超时与清理
 
-### 基线门禁
+首版复用平台已有预留队列/排队窗口；工具仓不引入自己的分布式锁服务。若没有排他资源保障，manifest记录 `isolation=observed_quiet` 而非 `exclusive`；性能仅作为带此标记的观测数据。
 
-| id | 内容 |
+占用判断使用应用身份/资源队列/运行标签，不能只凭 `sparkann-*` 名称；区分本套件与其他应用、Pending/Running与终态。保留Completed历史pod不阻塞开跑。提交前、executor就绪后及运行中持续采样；后来出现竞争、监控断线或资源不可确认时标记证据受影响，性能比较无效，不自动进入性能基线。环境不足导致未完成必跑case则 blocked。
+
+manifest声明排队、应用启动、case执行、状态收敛、kill后等待的超时；不无限sleep，不能超时后“继续反正测一下”。全部错误有case/run-id和原因，失败后可收集日志，但停止有依赖的case，不把没运行标成pass。
+
+只有 `isolation=reserved` 且全程无观察到竞争/监控空洞的运行才可更新性能基线；`observed_quiet`/受竞争影响但功能用例完整通过的运行，允许人工批准发布功能结果并更新功能基线，性能字段标 `comparison_valid=false`，保留历史性能基线来源，不用本轮数字替换它。若本版变更有已批准的性能/容量收益要求，相关测量是必跑assert：资源隔离不足时该项blocked，不能以功能通过替代。以上资格分别写入机器结果，禁止用全局pass隐藏性能未验证。
+
+并发套件使用独立输出目录、application label、表/索引名；cleanup只删本run拥有的资产，finally执行并记清单；共享大表和非本run的pod永不删除。租约/队列预留不覆盖所有工作负载时如实记录限制。
+
+## 5. 输入与输出结构
+
+### 5.1 当前发布清单与上一版基线职责不同
+
+`release-manifest.json` 描述本次待发布产物和验收要求：schema_version、release_id、产品/tool SHA、expected image digest与jar哈希、平台版本、spec hash、档位、profiles、冻结资产、expected case-instance与每实例query/repeat集合、质量目标、可用性超时、输出生成时间。
+
+L0核验的是**实际运行产物与本次manifest**。上一版image digest/build SHA不同是升级的正常现象，不能判blocked。metadata/payload读写兼容必须有实际往返fixture，不可用jar字符串搜索代替。
+
+`results.json` 保存每个case-instance的 `pass/fail/blocked/not_requested`，证据链接/hash、原因、断言明细和metrics。`not_requested`仅允许用于manifest未要求的case；只要必跑case缺失就不能pass。
+
+case-instance键采用规范化结构而非一个 `case_id`：至少包含case_id、dataset_id/format、logical index arm、definition hash、metric、result contract、topK、over、nprobe、profile_id、scenario。新增run的物理UUID仅作provenance；不能因每次重建UUID不同而找不到可比较键。数组/数值/省略参数统一规范化，参数缺省后的实际值也入档。
+
+以下都是无效证据：缺少必填字段、非法数值或NaN/Infinity、重复键/重复(query,repeat)、缺query/轮次、日志截断、expected臂缺失、没有实际执行计划证明走目标路径。拒绝而非取交集凑出比较结果。适用指标按case schema声明，未定义的recall/coverage用null，不把缺值当0或1。
+
+### 5.2 基线晋升
+
+1. 执行前解析manifest，生成expected-case清单和各case样本集合；baseline仅包含上一版已认可的数据。
+2. 验证输入和完整性，再运行各assert；功能错误fail，环境/证据不完备blocked，未请求case not_requested。
+3. 每个必跑case必须pass；质量目标和逐查询比较满足；所有需人工处置的性能告警有签名/说明；cleanup与证据归档完成。否则发布判定非通过。
+4. 独立保存不可变 `results.json`，只有上述条件满足且有显式promotion批准，才能原子更新该档位/比较序列的基线指针。临时文件→rename，并保留历史baseline及原始日志hash；并发更新有锁或expected-prev-hash检查，不允许最后写覆盖另一发布。
+5. `--only` 子集永远不晋升完整发布基线；extended完整通过可为standard建立其完整子集基线，standard不能覆盖extended历史结果或令100M数据看似本版跑过。
+6. 首版/metric变更/数据变更/spec门槛变更建立新比较序列，人工确认并说明不能跨序列计算加速/不退化；不从失真的旧0.9833日志直接初始化基线。普通版本只比较相同输入/合同/profile实例。
+
+质量spec在本设计认可后作为L0卡的固定输入实现，初始推荐如下：精确小fixture要求全部结果正确；数值同score参考容差为 `abs(actual-expected) <= 1e-6 * max(1,abs(expected))`，非有限值按明确fixture合同检查，不进入指标JSON；topK边界tie距离使用同一固定容差。SIFT推荐配置的每个固定查询目标为recall=1.0，达不到即fail而非现场调低目标；这是发布质量要求，不是对所有数据的算法保证。曲线逐查询相对同序列基线允许损失命中数为0；已有认可基线可用于比较，没有基线时只能记录首次观测。若这些推荐门槛需放宽，必须设计/spec审批并建立新比较序列，工具实现者无权自行调整。
+
+首版SIFT质量实例映射固定如下（topK=10、query ID为1–6，每查询2轮，EUCLIDEAN，普通SQL `TABLE_LIVE_TOPK`）：
+
+| 数据/格式 | logical臂 | nprobe / over | 绝对质量门 |
+|---|---|---|---|
+| 10M Parquet与Lance | IVF1bit（推荐） | 150 / 100 | 每查询recall=1.0 |
+| 10M Parquet与Lance | IVF3bit（对照） | 150 / 10 | 每查询recall=1.0 |
+| 100M Parquet与Lance | IVF1bit（推荐对照） | 32 / 100 | 每查询recall=1.0 |
+| 100M Parquet与Lance | IVF3bit（推荐对照） | 32 / 10 | 每查询recall=1.0 |
+
+其余L2.1/L2.4/L2.5位宽和over实例仅受完整证据及同键逐查询零退化基线门约束，不额外套上满recall门；同一实例若命中上表，质量门和基线门都要通过。10M默认150沿用当前大表冻结定义，不据独立nprobe实验把32静默当已测推荐；定义改变建立新实例/新序列。L1精确FLAT、小表穷尽所有list的IVF-NONE及独立数值参考仍要求精确正确；不把非穷尽IVF-NONE声明为任意数据的精确搜索。
+
+首版只有在全部绝对功能/质量要求通过、曲线证据完整且人工认可首次观测后才能建立基线；报告必须写“首次建立，未验证跨版不退化”。已知缺陷必须列在known-issues清单并有阻断与修复去向。不能把“不报错”当“值正确”。例如#2784点号字段真实值丢失，L1.3需保留值断言和明确fail；若平台批准限制支持范围，manifest列出限制并加边界拒绝测试，不能悄悄弱化一个case后称全支持通过。
+
+### 5.3 返回码与可复现报告
+
+拟定退出码：0=本次请求的全部case通过；1=功能/质量断言fail；2=环境/证据blocked；3=manifest/schema/用法错误。多个问题优先报输入错误，其次fail，其次blocked；机器结果保留全部原因。诊断子集即使返回0，也必须显示 `release_eligible=false`、`promotable=false`。
+
+生成报告固定manifest生成时间、稳定排序、稳定摘要与抖动hash，禁止datetime.now()/进程随机hash影响重生；相同results/manifest/tool版本生成逐字节相同报告。另将同一原文通过umem upsert-doc存档并sha256核对；这是副本一致性，不代替重生确定性测试。报告显示每条数据的来源run、样本、metric、合同、档位、fresh/stale，不混历史与本版数字。
+
+## 6. 用例清单
+
+### L0：产物与输入（每版）
+
+| id | 内容与断言 |
 |---|---|
-| `G.1` | `baseline.json` 结构：`{version, image_digest, build_sha, generated_at, spec_profile, cases: {case_id: {...}}}`；每 case 字段：`status`(pass/fail/blocked)、`recall`、`p50_ms`、`p95_ms`、`coverage`、`bytes_in`/`bytes_out`、`build_seconds`、`index_bytes`、`notes` |
-| `G.2` | 判定规则：`recall` 不低于上版 −0.005（且不低于该规模天花板 −0.005）；`coverage` ≥ 0.95 且不低于上版；逐行一致性必须 100%；`p50/p95/build_seconds` 只记录并在超上版 1.5× 时告警 |
-| `G.3` | 回填：全绿后把本版结果写成下一版的 `baseline.json`，历史目录保留；`p50` 波动 >30% 时在报告里标注负载原因，不静默覆盖 |
-| `G.4` | 输出：`vector-index-gate.py --baseline <prev>/baseline.json --current <this>/baseline.json` 的退出码即发布门；同时扩展它读取 `SMOKE {...}` 行的 coverage/均衡字段（现在只吃 `BENCHRESULT`） |
+| L0.1 | 实际digest/SHA/JVM/Spark/Scala/jar哈希对当前manifest；reader可读版本及writer能力由fixture验证；工具资产为cluster/image-jars.txt与list-image-jars.sh，未知provenance blocked |
+| L0.2 | 队列预留/观测空闲、运行标签、持续采样、启动就绪、超时与竞争标记；terminated旧pod不阻塞；监控不可用不假定空闲 |
+| L0.3 | 冻结四张大表的实际snapshot/文件清单/index definition及check_indexes；不自动改共享索引。standard只要求所用10M资产，extended才要求100M |
+| L0.4 | 规范查询向量hash/ID、metric/topK/真值算法及源snapshot；变更建立新比较序列，不静默复用旧gt |
 
-## 6. 五张旧卡的去向（逐条，不丢项）
+### L1：小数据功能与兼容（每版）
 
-| 旧卡 | 状态 | 吸收到 | 未完成项去向 |
-|---|---|---|---|
-| #1632（10M 曲线，报告已定稿） | 人工从 done 移回 review | `L1.*`、`L2.1` | "bits×over 网格"由 `L2.1` 每版覆盖；"100M 稳态延迟"→ `L2.6` |
-| #1924（100M 格式对照） | review，打回四条未改 | `L2.2`、`L2.5` | ①正文口径过时 → 套件自动生成的表取代卡片正文 ②缺 over 3/30 → `L2.5` ③日志未提交 → 已在 `iceberg-tools` 提交，作为 `L2.3` 的产物要求 ④1bit@100 recall 只在图上 → `L2.2` 生成表格必含数值 |
-| #2760（100M 覆盖率） | todo | `L3.6`（10M 对照为 `L3.1`） | 100M 自动预算从未跑 → `L3.6`；"不得为达标改默认值/加参数"约束继承 |
-| #2411（驻留故障与并发） | doing，独立审查判 No | `L3.2`、`L3.3`、`L3.4` | 两条 RED 回归 + 双索引/异预算场景 → `L3.4` 的前置修复；历史 smoke 只比 pos 不比完整行 → `L3.3` 要求逐行 |
-| #2296（100M 放置与均衡） | todo，blocked-by #2411 | `L3.5` | 全部验收条件原样搬入 `L3.5`，含 `P100-NOCACHE` 与 1.25 倍均衡判据 |
+| id | 内容与断言 |
+|---|---|
+| L1.1 | 独立小表每支持kernel新建：IVF-NONE、RaBitQ1/2/3/4bit、HNSW、FLAT，Parquet/Lance适用路径；包含BM25写读。记录built_by_SHA；各自writer与reader往返；旧payload/manifest fixture兼容不要求重建 |
+| L1.2 | CALL↔对应TVF单/批查询INDEX_HITS严格一致，含raw score、顺序、null行；普通SQL TABLE_LIVE_TOPK对同metric真值独立验，精确fixture才比较跨合同共同字段 |
+| L1.3 | 真实行值/JSON正确（null/嵌套/decimal/timestamp/binary、辅助列同名及特殊列名），对照原始独立fixture与正常SELECT，不用同样丢值的旧rowsAt作唯一真值；#2028 regression、#2784值断言保留 |
+| L1.4 | position/equality delete与未覆盖新文件：SQL不含删除行且补残差，CALL/TVF保留missing hit为row=null；快照冻结与并发append/refresh不混读 |
+| L1.5 | 空表、NULL向量、零向量、维度不符、k=0/大于有效行数、同距边界、无索引/多索引歧义、损坏/不兼容payload、失败构建注册清理；检查规定错误或合法回退，不以“不NPE”作为唯一正确性 |
+| L1.6 | offload/重新load与禁用缓存前后，合同各自结果一致；无插件普通查询可用，load/offload按接口明确拒绝 |
+| L1.7 | BM25：null/空文档仍计语料统计、词频/分数/单批结果与参考一致、更新/删除契约；不强行套向量的距离/驻留机制 |
 
-## 7. 风险与取舍
+L1.7的具体参考：每个文本case无外部并发写，记录建索引的source snapshot及metadata统计。null/空文本均计入文档总数，其token数为0；词频、文档频率与平均长度按该索引snapshot的语料从独立fixture算得，不以被测实现的输出反向当oracle。CALL/对应TVF返回该索引统计下的原始分数/命中顺序，删除后未refresh时统计仍为旧索引语料，最新表已删除命中回表为null（不存在文件同理），不能要求此时分数等于当前存活表重算。refresh后统计和命中按新索引snapshot重验，包含新文档及删除。普通SQL文本改写的存活行/残差与统计绑定按现有批准合同单独测试，不与CALL强制相等；若接口无法固定所需快照，则以独立静态阶段串行运行并记录限制，不凭此声称并发文本快照隔离已通过。
 
-### 7.1 延迟门禁没有客观阈值（最重要的取舍）
+普通SQL文本 `text_score/text_match` 的独立合同：`RewriteTextSearch` 必须绑定**与读取表snapshot相同**的index snapshot及CorpusStatistics，并要求该snapshot数据文件完整覆盖；它不同于向量残差路径，不能把旧统计用于补扫未覆盖新文件。oracle用当前绑定snapshot全部存活文档计算N/df/avgdl以及固定tokenizer/BM25参数，核对排名/分数；null文本的text_score为null，text_match的对应null/filter行为单列断言。append/delete后未refresh或覆盖缺失时检查规则不使用旧索引；未绑定统计的非null text_score须按当前接口明确拒绝，不能声称普通SQL自动全扫成功。refresh到当前snapshot且覆盖完整后再核对SQL排名。CALL/TVF仍按旧索引snapshot原始命中合同独立测试，不与SQL强制等价。文本并发规划冻结超出当前接口已保证范围时显式不覆盖，不凭静态fixture声称通过。
 
-集群负载能让同一臂差 1.4–1.8×（`grid2` 现场）；按 ±10% 设阈会天天红，按 ±50% 设阈挡不住真回归。因此 `G.2` 只对 recall、覆盖率、一致性设硬门，延迟只告警。**代价**：纯性能退化（recall 不变、延迟缓慢上涨 30%）不会被门禁挡住，只能靠人看报告的趋势。缓解：报告里每版保留同轮相对倍数（推荐臂 vs 扫描/暴力/HNSW），这个比值对负载不敏感，人眼容易发现漂移。
+数值与JSON比较在schema中声明规范：精确数值或固定容差、timestamp时区、null策略、binary/decimal编码。CALL和TVF必须使用相同session参数，已删除行null不等于其JSON字段为null。
 
-### 7.2 每版必跑的价格与集群现实冲突
+### L2：参数与格式
 
-L0+L1+L2 骨架+L3 精简约 2–3 h 独占，而集群常态有几十个 Pending（历史上 43–49 个）。缓解：`L0.2` 允许在指定排队窗口内重试（如最多等 2 h），超时即 `blocked`。**代价**：发版节奏会被集群可用性绑定；不接受"跳过 L3 标绿"，因为那正是 `#2411` 现在这种状态（代码合了、验收没跑、卡不能关）。
+| id | 内容 | 节奏与判定 |
+|---|---|---|
+| L2.1 | 10M Parquet/Lance × IVF1/2/3/4bit/NONE、HNSW、FLAT；近似over1/10/100，6查询×2轮 | standard；每个实例明确metric/真值，按逐查询基线而非全格满recall；FLAT为直接调用单点，并另验完整表exact基线 |
+| L2.2 | 100M两格式各比较1bit@100与3bit@10，6查询×2轮，同run完整表exact scan参照 | extended；两臂都入表，质量目标/配对时间；不锁定Parquet赢家，未在本轮跑FLAT/HNSW就不报本轮相对倍数 |
+| L2.3 | 全部raw evidence/results/hash、详细+摘要两报告、docs/umem同版 | 各发布档必跑；缺required证据不能晋升 |
+| L2.4 | nprobe8/16/32/64/128 × bits1/3，over10/100，10M | 探索；曲线不把每点都设满recall门，配置改变要重建/绑定相应索引定义 |
+| L2.5 | 100M over3/30补点与位宽扩展 | 探索；明确其expected集合与已测/未测范围 |
+| L2.6 | P100-CURVE的冷load、确认驻留后的暖态、prepare、kernel与SQL分开量 | 内存/加载重大改动extended必跑；准入不足不得冒充完全稳态 |
+| L2.7 | 100M FLAT/HNSW精确对照与性能取舍 | 探索；HNSW改动则extended加入实际HNSW查询回归，不用“曾经很慢”豁免正确性 |
 
-### 7.3 索引复用会造成"测的不是这版代码"
+L2.1与L2.2的近似臂使用普通SQL改写路径 `TABLE_LIVE_TOPK`；表是冻结静态fixture，无并发删除/追加。FLAT分成两个实例：`INDEX_HITS`直接调用（用于kernel读写/精确原始命中对照），以及不走索引的同metric完整表exact scan（用于完整表基线）。每个实例写明入口/合同，不能混合耗时或以CALL近似命中对完整表强制满召回。L2.2只报告本轮确实测过的参照。
 
-每版只重建每格式一个臂、其余复用旧索引；若 payload 格式变更而 `check_indexes` 漏检，曲线测的是旧格式。缓解：`L0.3` 把 `check_indexes` 作为硬门，`L1.1` 强制每版真建一次索引。**代价**：每版多花 10–15 min 构建。
+性能无统一硬阈值：记录p50/p95/p99、query/sample、冷/热状态、分配与峰值；相对上版超1.5×或不满足性能变更卡已批准目标时，需要独立复核/处置，报告不可自动晋升覆盖。功能fail不能用性能改善抵消；同轮比值不是负载免疫证据。
 
-### 7.4 100M HNSW 在每版里太贵，且已被证明没有存在理由
+### L3：驻留、故障与容量
 
-100M HNSW 构建约 295 min、索引 23.67 GB，而报告已证其延迟 ≈ 全表扫描（139 s vs 133.6 s）。所以它只作为 `L3.5` 的一次性/大版本放置对象，`L2.7` 默认不做。**代价**：若将来 HNSW 的放置/加载有改动，需要人主动打开 `L2.7`。
+| id | 内容与断言 | 档位 |
+|---|---|---|
+| L3.1 | P10自动预算：load确认副本、实际bytes/预算、coverage并集与重复副本；在预先证明能装下的fixture要求coverage≥0.95，不改变默认值凑达标 | standard |
+| L3.2 | 重复load幂等及参数语义：首次省略0/显式值，重复省略保留截止/显式重计；固定保护期不因query续期；到期仅可淘汰，压力时索引级LRU；永久保护与offload解除 | standard |
+| L3.3 | kill、executor ID复用、迟到ACK/旧epoch、使用中offload与安全释放：有界等待状态收敛，按合同完整行/身份/score与故障前一致；不要求完成后的load自动修复副本 | standard |
+| L3.4 | 双索引共享key与异预算；重复load新snapshot复用共有、旧独有待引用释放；部分load失败保留成功；两条现RED（70次复用误降PENDING、未经新owner ACK即COMPLETE）保持断言，修前fail而非skip | standard |
+| L3.5 | P100-AUTO HNSW+IVF3bit：按实际文件驻留大小/节点预算规划、合法COMPLETE或PARTIAL、缺口FILE_TOO_LARGE/容量/任务失败分清，已ACK副本才算持有；显式load规划的均衡与冷/驻留查询一致 | extended |
+| L3.6 | P100-AUTO预算估计与真实准入：实测C/U/结构及workingSet、逐节点预算、coverage并集；有容量且可放置时要求≥0.95，装不下时验证PARTIAL与精确缺口，不以低coverage直接定为产品缺陷 | extended |
 
-### 7.5 套件自身会腐化
+均衡判定先固定可放置任务集合、保护占用和文件粒度约束。可均匀分配且容量充足的fixture要求占用/预算比例不超过均值1.25倍；文件巨大、保护固定或偏斜预算不能满足时输出约束与规划对照，不用绝对<50%或>90%本身判失败。容量准入永不超预算；合法PARTIAL不能同时要求每文件有副本。coverage按目标文件的**集群确认副本并集**/目标文件总数，offload完成后归属holders为0；有query引用的pending释放与已释放区分，不能提前当空闲。
 
-脚本、阈值、表结构都会漂移，而套件如果没人跑就等于不存在。约束：`G.3` 的基线回填与 `L2.3` 的双份报告存档是硬要求；每次跑完必须在伞卡留 note（含 `blocked`），否则视为没跑。
+每case状态等待必须绑定目标index snapshot/epoch，释放ACK后才验byte回收。查询只观察既有驻留、不主动追加规划；二轮查询bytesIn/out稳定仅在声明无miss/无驱逐、全驻留的fixture要求，不把后台再平衡当已存在功能。
 
-## 8. 套件自身的验收
+## 7. 门禁实现与反例测试
 
-1. 一条命令 `release-e2e.sh --version <v> [--only L0,L1]` 能从空目录产出完整结果目录、`baseline.json`、两份报告，并在任一 case 红时以非零退出。
-2. 人为制造三种失败各一次并被正确归类：集群被占（`blocked`）、recall 掉到天花板以下（`fail`）、镜像 digest 与基线不一致（`blocked`）。
-3. 用上一版基线跑本版：全绿时 `G.2` 通过；把某个臂的 recall 人为压低 0.02 时 `G.2` 失败并指出具体 case 与臂。
-4. 结果目录可在另一台机器上仅凭 `baseline.json` + 报告复现结论（不需要重跑）。
+L0卡先固定manifest/results schema与expected-case，并用离线fixture验证字段和身份；G卡随后按该协议实现断言与整合。两者不得各定义一套字段。门禁位于工具仓，不以当前脚本无修改直接作发布门。
 
-## 9. 未决问题
+现有 `vector-index-gate.py` 解析 `arm`，harness写 `index`，多臂会折叠成同一key且median掩盖单臂下降。G必须接受规范case身份并严格校验迁移旧log字段，不能既忽略index又声称按臂比较。旧脚本“只比较交集”只适合探索，发布模式必须expected全集。
 
-- 阈值 −0.005 是先用"天花板 −0.005"顶着的经验值，需要 ≥2 版真实数据后再定稿。
-- `L2.2` 的 100M 推荐臂是否每版都跑，取决于排队窗口能否保证；若长期排不上，需要单独申请夜间窗口，否则会持续 `blocked`。
-- `L3.4` 的两条 RED 回归修复归到哪张实现卡：建议直接并入新伞卡下的实现卡，不另开（避免又一次"代码合了、验收没跑"）。
-- 是否需要第二个集群做并行验证（一个跑曲线、一个跑驻留）：目前判断不需要，串行即可，代价是发版窗口被拉长到 3 h 级。
+| id | 验收 |
+|---|---|
+| G.1 | schema版本/复合键/metric与合同/样本数/缺值规则验证；缺case、缺query、重复sample、NaN、未知schema拒绝 |
+| G.2 | 逐查询质量、exact/tie与适用coverage、状态/缺口/ACK断言；不同contract不比较；单臂recall下降0.02能命名case/臂/query并失败；低over正常不被错判 |
+| G.3 | promotion审批、首版/新序列建立、原子指针与并发expected-prev检查；fail/blocked/子集不能晋升；警告需处置，原始证据不可覆盖 |
+| G.4 | BENCHRESULT/SMOKE适配与退出码；精确render确定性、双份sha256；临时fixture证明旧多臂漏报修复（1bit0.8→0.4、其余不变不能pass） |
+
+还必须覆盖：新镜像digest不同于旧版但匹配当前manifest正常通过；错装镜像与当前manifest不符blocked；无baseline不假装比较；完全不共享key不是成功；故意缺必跑100M不能被standard结果覆盖；Completed历史pod不阻塞、监控失败不假定空闲；删除命中与SQL合法差异不误fail；artifact不支持文件明确报告；special-column null丢值不能被“不异常”标pass。
+
+## 8. 旧要求承接与依赖
+
+| 来源 | 新落点 |
+|---|---|
+| #1632 | L1正确metric、L2.1骨架、L2.4 nprobe、L2.6稳态；未完成点有独立结果，不沿用旧天花板 |
+| #1924 | L2.2两格式两臂明细、L2.5补点、L2.3证据与报告；不混本版/历史倍数 |
+| #2760 | L3.1/L3.6自动预算，省略cache.bytes的实际行为，无新增默认值 |
+| #2411 | L3.2–3.4固定保护/LRU、新snapshot、partial、并发offload、kill/迟到ACK、双owner两RED与完整行比较；不能仅移卡便视为修绿 |
+| #2296 | L3.5可放置与预算约束下均衡、COMPLETE/PARTIAL、逐文件ACK、实际查询；不承诺自动重平衡 |
+| #2028/#2784 | L1.3 JSON/辅助字段和special-name真实值；已知读取丢值保留fail或批准的支持范围限制 |
+| #2756 | L0.1真实镜像读写同版/旧版兼容；不能绕过list_indexes失败继续标整个套件通过 |
+
+实施前完成本设计复审；开发依赖沿用L0协议/环境→L1、L2、L3→G完整断言/整合，各层先验证自己的schema和原始证据。执行时序为L0→各必跑case→G校验/门禁→归档/晋升，二者不混淆、不形成环。工具构建/测试在工具仓独立worktree，产品修复由明确修复卡负责，不混入验收套件实现。
+
+## 9. 收口条件与限制
+
+- 指定档位从空输出目录完整执行→证据校验→门禁→报告归档→批准晋升，至少一次闭环；只生成文件不等于发布套件可用。
+- 每个必跑case可单跑复现，失败有明确原因；清理仅本run资产。
+- 文档仓库与umem原文逐字节同版；原始结果留工具/证据仓，文档不代替原始日志。
+- 部署基线移植到厂内1.9.1、metric/布局/模型改变，分别建立相应新比较序列并重验；未实现能力不得在报告里宣称已上线。
+- standard/extended分工及性能告警审批是本次推荐，待整体确认后才实施。若没有排他队列，性能数据只可作带竞争标记的观察，不承诺测出绝对排名。
