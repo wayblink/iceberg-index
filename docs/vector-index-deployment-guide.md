@@ -119,8 +119,10 @@ SET spark.iceberg.index.vector.over-sample = 100;
 
 ### 3.1 版本与产物命名
 
-- 仓库版本号沿用 Iceberg 的（当前 `1.12.0-SNAPSHOT` 系列），**不要自造版本号**，否则依赖解析与 revapi 都会乱。
-- 发布产物只有一个：`iceberg-spark-runtime-3.5_2.13-<version>.jar`（shadow jar，已包含 `iceberg-index-vector`、`iceberg-index-text`、`iceberg-index-spark`）。
+- 仓库版本号沿用 Iceberg 的（回溯到 1.9.1 基线后是 `1.9.1` 一线），**不要另起版本号体系**，否则依赖解析与 revapi 都会乱；对外用带来源的后缀区分（见下一条）。
+- Scala 版本必须与厂内 Spark 发行版一致：`_2.12`（仓库默认 `defaultScalaVersion=2.12`，厂内 Spark 也是 2.12）。
+- 发布产物只有一个：`iceberg-spark-runtime-3.5_2.12-<version>.jar`（shadow jar，已包含 `iceberg-index-vector`、`iceberg-index-text`、`iceberg-index-spark`）。
+- **版本号不得伪装成上游版本**：它是「上游 1.9.1 + 索引能力」，公开发布时用带来源的后缀（如 `1.9.1-shb.1`），并在发布说明里写明基线是 1.9.1、不支持 variant 类型（见 §7.1）。
 - 镜像 tag 建议 `<日期><序号>`（如 `20261027a`），并在镜像 LABEL 里写入 jar 的 git commit，便于回答"这个镜像到底是哪版"。
 
 ---
@@ -131,10 +133,10 @@ SET spark.iceberg.index.vector.over-sample = 100;
 
 ```
 export JAVA_HOME=/opt/homebrew/opt/openjdk@17
-./gradlew :iceberg-spark:iceberg-spark-runtime-3.5_2.13:shadowJar -DsparkVersions=3.5
+./gradlew :iceberg-spark:iceberg-spark-runtime-3.5_2.12:shadowJar -DsparkVersions=3.5
 ./gradlew spotlessCheck revApiCheck            # 格式与 API 兼容门禁
 ./gradlew :iceberg-core:test :iceberg-index-vector:test \
-          :iceberg-spark:iceberg-spark-3.5_2.13:test --tests "*Vector*" --tests "*Index*"
+          :iceberg-spark:iceberg-spark-3.5_2.12:test --tests "*Vector*" --tests "*Index*"
 ```
 
 集群侧另有需要单独构建的两个测试工具（不进发布产物）：`cluster-build.jar`（建索引的 driver）与 `bench/vector-benchmark.jar`（测量）。**它们必须与镜像里的 jar 来自同一个 commit**——#2756 的直接原因就是这两者不同步。
@@ -143,7 +145,8 @@ export JAVA_HOME=/opt/homebrew/opt/openjdk@17
 
 ```
 cd /data/workspace/sparkann
-# Dockerfile 做两件事：删掉被替换的 vendor jar、拷贝我们的 jar
+# Dockerfile 只做两件事：删掉 vendor 的 iceberg-spark-runtime、拷入我们的 jar
+# parquet / avro 跟随 Spark 自带版本，不再替换（见 §7.1）
 docker build -t hub.i.basemind.com/spark/sparkann-e2e:<tag> .
 docker push hub.i.basemind.com/spark/sparkann-e2e:<tag>
 ```
@@ -219,7 +222,77 @@ docker push hub.i.basemind.com/spark/sparkann-e2e:<tag>
 
 ---
 
-## 7. 已知缺口（上线前必须知道）
+## 7. 版本基线与升级路径
+
+这一节是部署前必须拍板的部分，结论已经确定，依据和代价写在这里以便复核。
+
+### 7.1 版本基线（已决定）
+
+厂内 Spark 主版本是钉死的（3.5.7，随带 Iceberg 1.9.1），因此**不跟随上游 Iceberg 升级**：把索引能力回溯到厂内 1.9.1 基线，而不是把集群的 Iceberg 运行时从 1.9.1 跳到 1.12。
+
+**为什么不是"直接发一个 1.12 的 jar 换进去"。** 换 jar 换的是**整个集群的 Iceberg 运行时**，不只是带索引的表：写侧会获得 1.10–1.12 的新能力（本 fork 的 `SUPPORTED_TABLE_FORMAT_VERSION = 4`、`MIN_FORMAT_VERSION_ROW_LINEAGE = 3`），一旦某张表被写成 format-version 3，跑 1.9.1 的其它读方会直接读不了。这个风险与索引功能无关，不该被"装索引"顺带引入。
+
+**厂内 1.9.1 的实测核对**（从基础镜像 `spark:3.5.7-STEP-rc2-tpcds-dsdgen-lance-20260416a` 取出 jar 比对）：
+
+| 项 | 结果 |
+|---|---|
+| jar 名 | `iceberg-spark-runtime-3.5_2.12-1.9.1-STEP-rc1.jar`（44 MB，厂内自建） |
+| 是否带索引能力 | **否**：`org/apache/iceberg/index/` 包计数 0 |
+| 类集合 vs 上游 tag `apache-iceberg-1.9.1` | **完全一致**：22997 个 class 中，排除 shaded guava（`relocated`）、`shaded`、Immutables 生成的 `Immutable*` 与 `package-info` 后，厂内独有类为 **0** |
+| `META-INF/MANIFEST.MF` | 只有 `Manifest-Version: 1.0`，无版本/commit 信息 |
+
+结论：厂内 1.9.1 是**同名重建**，没有新增功能或 API。但类名一致**不能排除方法体被改**；要排除这一点需要本地构建上游 1.9.1 再逐类 diff 字节码，目前未做——因此验收以"厂内 jar 的实际行为"为准，源码基线用 tag。
+
+**parquet / avro 基线：用 Spark 自带版本（1.13.1 / 1.11.4）。** 依据不是偏好，而是厂内现状：
+
+| | 上游 1.9.1 编译基线 | 厂内镜像实际 | 我们采用 |
+|---|---|---|---|
+| parquet | 1.15.2 | **1.13.1** | 1.13.1 |
+| avro | 1.12.0 | **1.11.4** | 1.11.4 |
+
+也就是说厂内的 1.9.1 runtime jar 本来就是"编译于 1.15.2、跑在 1.13.1 上"。选这个基线不是引入新风险，而是与厂内既有组合保持一致，镜像里不再需要替换 parquet/avro。
+
+顺带一个原先以为必须处理的问题自动消失：**1.9.1 不使用 Parquet 的 VARIANT 逻辑类型**。`git grep variantType(` 在 tag `apache-iceberg-1.9.1` 的整个 `src/main` 里为 0 处；1.9.1 的 `TypeToMessageType.variant()` 只建普通 group（`metadata`/`value`/可选 `typed_value`）。我们用到的 `.as(LogicalTypeAnnotation.variantType(...))` 是后来才引入的，只存在于当前 1.12 基线的 fork 里。所以回溯之后**不需要为 variant 打任何补丁**。
+
+待验：`iceberg-core` 把 avro 当 `api` 级依赖，1.9.1 原基线是 1.12.0；用 1.11.4 编译能否通过、manifest 读写是否正常，是回溯后第一个必须跑通的关口。
+
+### 7.2 回溯计划与工作量
+
+索引功能在 fork 里的落点（实测清点）：
+
+| 部分 | 规模 |
+|---|---|
+| `core/src/main/java/org/apache/iceberg/index/` | 28 个文件、约 4956 行 |
+| `index-spark` / `index-vector` / `index-text` 三个模块 | 新增模块 |
+| `spark/v3.5` 的索引与过程（`spark/index`、`procedures/*Vector*`、`*Index*`） | 41 个文件 |
+| 被改动的**既有**上游文件 | **3 个**：`api/.../FileFormat.java`（+2/−1）、`core/.../formats/FormatModelRegistry.java`（+26/−11）、`core/.../formats/ReadBuilder.java`（+20） |
+
+那 3 个既有文件的改动都是 **format-model / Lance 相关**（`FileFormat.LANCE`、`LanceFormatModels` 注册、按格式的读取构建），不是索引逻辑；最小回溯可以先把 Lance 那条线留在后面。
+
+顺序建议：①在 1.9.1 基线上把 parquet 1.13.1 / avro 1.11.4 的编译跑通（不含索引）→ ②移植 `core` 的 index 包 → ③加三个模块 → ④移植 `spark/v3.5` 集成（函数、改写规则、物理策略、16 个过程）→ ⑤补测试。
+
+主要风险：索引代码可能用到 1.9.1 之后才有的上游 API。目前看常用工具都在（`Tasks`、`CloseableIterable`、`Preconditions`），但 `MetadataUpdate`、`TableMetadata`、`TableOperations` 的新增能力需要逐个确认——这是移植阶段最容易卡住的地方。
+
+### 7.3 升级矩阵
+
+| 组件 | 跟随谁升级 | 升级时要做什么 | 验证 |
+|---|---|---|---|
+| `core` 索引层、`index-vector`、`index-text`、`iceberg-lance` | Iceberg | 换基线、重放索引改动（3 个既有文件 + 新目录） | 单测 + revapi（`api/`） |
+| `spark/v3.5` 集成、`index-spark` | Spark 3.5.x **和** Iceberg | Spark 补丁版升级：重建镜像即可；Spark 主版本升级：**移植项目**（我们站在 Catalyst 内部 API 上：`injectFunction`/`injectOptimizerRule`/`injectPlannerStrategy`、`CodegenFallback` 表达式、物理算子） | 六条集群验收 |
+| parquet / avro | **Spark 自带版本**（不独立升级） | 无需动作 | 编译 + 写读 smoke |
+| 镜像基础层 | 厂内 Spark 镜像 | 重建镜像、重跑验收 | 六条集群验收 |
+| `IndexManifest` 二进制格式 | **我们自己**（与 upstream 无关） | 改格式必须保证读兼容旧版本 | 版本化注册表测试 |
+
+### 7.4 基线变更后的重新验证范围
+
+基线一换，之前所有集群结论（召回、延迟、索引体积）都失效，必须重跑。最小集合：
+
+1. 编译与单测：`core`（索引）、`index-vector`、`index-text`、`spark/v3.5`（`*Index*`、`*Vector*`）。
+2. 集群六条验收：`list_indexes` 返回全部行 → `build_vector_index` 成功且 `index_build_status` 终态正确 → `ORDER BY vec_distance` 走索引且与 L2 全扫逐行一致 → `check_indexes` 无 needs_rebuild → 杀掉一个 executor 后结果逐行一致 → `index_cache_status` 可读且不 OOM。
+3. 基准回归：用 `iceberg-tools` 仓库的 `vector-benchmark` 跑 10M 网格（Parquet + Lance，量化 1/2/3/4bit），确认延迟与召回相对本手册引用的数字没有退化；100M 待 10M 通过后再决定。
+4. 镜像：重建（此时 `Dockerfile` **不再需要**删除 parquet/avro，只需删除 vendor `iceberg-spark-runtime` 并放入我们的 jar），并按工具仓 `iceberg-tools` 的 `cluster/README.md` 里的版本一致性检查复核。
+
+## 8. 已知缺口（上线前必须知道）
 
 这些不是"以后再说"，而是会影响运维决策的现状：
 
@@ -233,7 +306,7 @@ docker push hub.i.basemind.com/spark/sparkann-e2e:<tag>
 
 ---
 
-## 8. 上线检查清单（一页版）
+## 9. 上线检查清单（一页版）
 
 - [ ] 镜像 tag 记录了 git commit，且与 `cluster-build.jar` 同一 commit
 - [ ] §4.3 六条验收全绿，特别是 `list_indexes` 返回全部行
@@ -242,6 +315,8 @@ docker push hub.i.basemind.com/spark/sparkann-e2e:<tag>
 - [ ] `over-sample` 默认值写进集群配置（建议 100），并在用户文档里说明它是什么
 - [ ] 建索引用的 principal 有表元数据写权限
 - [ ] 回滚方案演练过：旧镜像 + 新索引的唯一问题是读不了 v2，确认窗口内不建索引
+- [ ] 基线符合 §7.1：Iceberg 取厂内 1.9.1、parquet/avro 取 Spark 自带版本；镜像不再替换 parquet/avro
+- [ ] §7.4 的四类验证都重跑过（基线变更会让旧的召回/延迟数字失效）
 - [ ] 监控采集 `index_cache_status` 与查询 P99
 - [ ] 用户文档按 `CALL` 过程写，附"参数怎么选"表（§2.1）
 
