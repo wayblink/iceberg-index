@@ -299,9 +299,9 @@ public final class IndexEntries {
     }
 
     // the row travels as one value of its own type rather than as one column per name: its JSON
-    // then comes from the schema the read was given, so a column called `pos` or `data_file`, or
-    // one whose name contains a dot, serialises like any other and never goes through the query
-    // parser. The position travels with the row, so nothing depends on the order of the answers.
+    // then comes from the schema the read was given, so no column name of the row is resolved by
+    // the query parser and none of them collides with the file or the position. The position
+    // travels with the row, so nothing depends on the order of the answers.
     int readTasks = readTaskCount(tasks.size());
     Dataset<Row> json =
         spark
@@ -786,10 +786,9 @@ public final class IndexEntries {
     return values;
   }
 
-  /** The schema of the given columns, taken from the schema they are read with. */
   /**
-   * The schema a fetch-back hands to Spark: the data file and the position a row answers, then the
-   * requested columns.
+   * The schema a fetch-back hands to Spark: the data file and the position a row answers, then one
+   * value of the row's own type carrying the requested columns.
    */
   private static StructType schemaOf(List<String> columns, StructType readSchema) {
     // the requested columns are nested under one field: a top-level field per column would have to
@@ -804,6 +803,7 @@ public final class IndexEntries {
     return new StructType(fields.toArray(new StructField[0]));
   }
 
+  /** The schema of the given columns, taken from the schema they are read with. */
   private static StructType schemaFor(List<String> columns, StructType readSchema) {
     StructField[] fields = new StructField[columns.size()];
     for (int i = 0; i < fields.length; i++) {
