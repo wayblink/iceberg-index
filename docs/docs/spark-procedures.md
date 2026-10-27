@@ -1552,8 +1552,11 @@ The optimizer rewrites this into an index lookup, so only the matched rows are r
 whole table. It does so when the index has something to say about the query:
 
 - the column has a vector index,
-- the index is in exact mode, not HNSW,
-- at least one of the snapshot's data files is covered by the index.
+- the index covers data files of the snapshot being read.
+
+An exact (`FLAT`) index is used too: whether an index answers is a question of correctness, not of
+cost. It saves less than an approximate one, because its candidates are every entry, but the plan is
+the same.
 
 An index that is behind the snapshot being read is still used, together with a scan of the data
 files it does not cover, so a query does not have to wait for a refresh. Rows removed after the
@@ -1565,11 +1568,18 @@ those do not put the column value itself in the path, and a row read back would 
 place.
 
 If none of these holds, the plan is left exactly as it was, and the query still returns correct
-results, just by scanning. A warning is logged when the matched rows cannot be read back, and when
-the type of an index is not registered in the session.
+results, just by scanning. Shape matters as well: a join, an aggregate, a window, an `OFFSET`, more
+than one sort key, or a filter other than `IS NOT NULL` on the vector column keeps the plan as it is.
+A warning is logged when the matched rows cannot be read back, and when the type of an index is not
+registered in the session.
 
-An approximate (HNSW) index is left alone for now: its candidates have to be re-scored first, which
-is planned work. `EXPLAIN` shows whether the rewrite happened, by the absence of the table scan:
+Every structure (`FLAT`, `HNSW`, `IVF`) is used with its candidates widened and then re-scored
+exactly, so the query still returns its true nearest neighbours: how many more candidates to ask for
+is `spark.iceberg.index.vector.over-sample` (default 1, which is only right for a kernel that scores
+exactly; a value that is not a positive integer is an error rather than a silent 1). This paragraph
+describes the `ORDER BY` rewrite: `CALL system.vector_search` and the vector table functions keep the
+index's own score and order and do not re-score or scan uncovered files. `EXPLAIN` shows whether the
+rewrite happened, by the absence of the table scan:
 
 ```sql
 EXPLAIN SELECT id FROM local.db.docs
