@@ -204,7 +204,7 @@ docker push hub.i.basemind.com/spark/sparkann-e2e:<tag>
 
 | 症状 | 最可能原因 | 处置 |
 |---|---|---|
-| `list_indexes` 抛 `Unsupported index manifest format version: 2` | 镜像里的 `IndexManifest` 旧于构建器（#2756） | 重建镜像；**不要手改清单文件** |
+| `list_indexes` 抛 `Unsupported index manifest format version: 2` | 该索引的清单是旧构建器写的 v2（每文件内嵌 memory），镜像里的 `IndexManifest` 只认 v1（#2756） | 重建镜像；**不要手改清单文件、也不要靠重建索引**——重建只会再写一次 v2。当前构建器已回到 v1 + 尾部附加段，新写的清单旧读者也能读 |
 | 查询没走索引、计划里是扫描 | 列上无索引 / 索引快照对读快照没有覆盖 / 一列多索引但没设 `spark.iceberg.index.vector.name` / 形状不命中白名单（Join、聚合、窗口、OFFSET、多排序键、非纯属性投影） | 先看 `EXPLAIN EXTENDED` 里有没有 `VectorSearchSource`，再按 §2.2 的命中条件逐条查 |
 | 结果比全表扫描少几行 | 用了 `vec_distance` 的默认余弦做对照，而索引是 EUCLIDEAN | 用 L2 表达式做对照（§2.2 末尾） |
 | 构建中断后索引"存在但查不到" | 早期版本会留下空注册 | 已修（失败构建会 `dropIndex(..., true)`），仍建议跑 `cleanup_index_files` |
