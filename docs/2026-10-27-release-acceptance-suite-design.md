@@ -38,6 +38,10 @@ under the License.
 
 **禁止**把三入口的 `(data_file,pos,score,row)` 一概断言相等。普通 SQL 默认输出也不是 CALL 的四列 schema。量化近似 score、删除命中和残差文件都能导致合法差异。
 
+绑定时点必须按入口核对：普通SQL在优化器改写为绑定的VectorSearchSource后已冻结；CALL在其实际plan/bind时冻结；TVF的VectorSearchHitsRequest逻辑计划只是请求，直到执行开始才绑定。因此“取TVF optimizedPlan后append，执行应该还看旧快照”是错误断言。TVF执行前的数据变化可被看到；绑定后的冻结需要先取得真实绑定context再验证，不能拿纯逻辑计划代替。
+
+当前文本API以实际注册为准：build_text_index无name参数，提供text_index_search单查询TVF和text_search_batch过程，不提供text_index_search_batch TVF；SQL匹配函数名为`match`，不是text_match。这些缺少的可选接口记capability=false，不制造回归fail；已有分数/删除/JSON合同仍严格验。
+
 跨合同比较只在专门的精确 fixture 上进行：完整覆盖、无删除、精确 kernel，并投影共同的行身份/值，重新计算同 metric 的距离；不把原始近似 score 当精确 score。不兼容 payload 的明确拒绝与缺少索引时的合法扫描回退也要分别断言。
 
 ## 3. 输入冻结与真值
@@ -160,7 +164,7 @@ case-instance键采用规范化结构而非一个 `case_id`：至少包含case_i
 
 L1.7的具体参考：每个文本case无外部并发写，记录建索引的source snapshot及metadata统计。null/空文本均计入文档总数，其token数为0；词频、文档频率与平均长度按该索引snapshot的语料从独立fixture算得，不以被测实现的输出反向当oracle。CALL/对应TVF返回该索引统计下的原始分数/命中顺序，删除后未refresh时统计仍为旧索引语料，最新表已删除命中回表为null（不存在文件同理），不能要求此时分数等于当前存活表重算。refresh后统计和命中按新索引snapshot重验，包含新文档及删除。普通SQL文本改写的存活行/残差与统计绑定按现有批准合同单独测试，不与CALL强制相等；若接口无法固定所需快照，则以独立静态阶段串行运行并记录限制，不凭此声称并发文本快照隔离已通过。
 
-普通SQL文本 `text_score/text_match` 的独立合同：`RewriteTextSearch` 必须绑定**与读取表snapshot相同**的index snapshot及CorpusStatistics，并要求该snapshot数据文件完整覆盖；它不同于向量残差路径，不能把旧统计用于补扫未覆盖新文件。oracle用当前绑定snapshot全部存活文档计算N/df/avgdl以及固定tokenizer/BM25参数，核对排名/分数；null文本的text_score为null，text_match的对应null/filter行为单列断言。append/delete后未refresh或覆盖缺失时检查规则不使用旧索引；未绑定统计的非null text_score须按当前接口明确拒绝，不能声称普通SQL自动全扫成功。refresh到当前snapshot且覆盖完整后再核对SQL排名。CALL/TVF仍按旧索引snapshot原始命中合同独立测试，不与SQL强制等价。文本并发规划冻结超出当前接口已保证范围时显式不覆盖，不凭静态fixture声称通过。
+普通SQL文本 `text_score/match` 的独立合同：`RewriteTextSearch` 必须绑定**与读取表snapshot相同**的index snapshot及CorpusStatistics，并要求该snapshot数据文件完整覆盖；它不同于向量残差路径，不能把旧统计用于补扫未覆盖新文件。oracle用当前绑定snapshot全部存活文档计算N/df/avgdl以及固定tokenizer/BM25参数，核对排名/分数；null文本的text_score为null，text_match的对应null/filter行为单列断言。append/delete后未refresh或覆盖缺失时检查规则不使用旧索引；未绑定统计的非null text_score须按当前接口明确拒绝，不能声称普通SQL自动全扫成功。refresh到当前snapshot且覆盖完整后再核对SQL排名。CALL/TVF仍按旧索引snapshot原始命中合同独立测试，不与SQL强制等价。文本并发规划冻结超出当前接口已保证范围时显式不覆盖，不凭静态fixture声称通过。
 
 数值与JSON比较在schema中声明规范：精确数值或固定容差、timestamp时区、null策略、binary/decimal编码。CALL和TVF必须使用相同session参数，已删除行null不等于其JSON字段为null。
 
