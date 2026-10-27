@@ -71,15 +71,23 @@ private[spark] object VectorSearchExec {
     val residual = residualRows(spark, context, names, readSchema)
     val residualNanos = System.nanoTime() - residualStart
     val residualFiles = if (residual == null) 0 else context.inputs.uncoveredDataFiles.size
+    // the parameters are decided before a source is ever built, but the candidate loop treats them
+    // as possibly absent, so the log reads them the same way instead of failing where that guard
+    // would have returned an empty request
+    val overSample =
+      if (context.parameters == null) {
+        "unset[unset]"
+      } else {
+        s"${context.parameters.overSample}[${context.parameters.overSampleOrigin}]"
+      }
     logger.info(
-      "vector search contract={} k={} overSample={}[{}] candidates={} lastRequest={} live={} "
+      "vector search contract={} k={} overSample={} candidates={} lastRequest={} live={} "
         + "unresolved={} outsideSnapshot={} rounds={} rowsAtFiles={} residualFiles={} reason={} "
         + "driverMaterialization=true candidatesMs={} residualMs={}",
       Array[Object](
         context.request.input.contract.name,
         Integer.valueOf(context.request.input.topK),
-        JLong.valueOf(context.parameters.overSample),
-        context.parameters.overSampleOrigin,
+        overSample,
         JLong.valueOf(found.initial),
         JLong.valueOf(found.requested),
         Integer.valueOf(found.rows.size),

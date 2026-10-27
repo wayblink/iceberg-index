@@ -114,7 +114,7 @@ private[spark] case class VectorSearchSourceExec(spark: SparkSession, source: Ve
         "distinct data files read to resolve candidates"),
       "numResidualFiles" -> SQLMetrics.createMetric(
         spark.sparkContext,
-        "scanned files the index does not cover"),
+        "uncovered files the residual branch was planned over"),
       "numIndexUnderfilled" -> SQLMetrics.createMetric(
         spark.sparkContext,
         "index branches that ended with fewer than k live candidates"),
