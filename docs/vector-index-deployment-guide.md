@@ -159,7 +159,7 @@ docker push hub.i.basemind.com/spark/sparkann-e2e:<tag>
 5. 删掉一个 executor 再查询，结果逐行一致（缓存丢失不应改变答案）；
 6. `CALL system.index_cache_status()` 能报出占用；未设预算时不 OOM。
 
-验收脚本建议直接复用 `tools/vector-benchmark/`（`run-benchmark.sh` + `collect-results.sh`）：它能同时给出"走索引/不走索引"的召回与延迟，比手工 SQL 更不易漏。
+验收脚本建议直接复用工具仓 `iceberg-tools`（与本仓并列）里的 `vector-benchmark/`（`run-benchmark.sh` + `collect-results.sh`）：它能同时给出"走索引/不走索引"的召回与延迟，比手工 SQL 更不易漏。工具仓不在本仓内，也不参与本仓的构建与 CI。
 
 ### 4.4 灰度与回滚
 
@@ -247,4 +247,4 @@ docker push hub.i.basemind.com/spark/sparkann-e2e:<tag>
 
 ---
 
-**参考**：基准报告 `docs/sift-vector-index-benchmark.html`（10M/100M × Parquet/Lance × HNSW/IVF/暴力 × 1/2/3/4bit × over-sample）；用户过程手册 `docs/docs/spark-procedures.md`；改写规则 `spark/v3.5/spark/src/main/scala/org/apache/iceberg/spark/index/RewriteVectorSearch.scala`；索引格式 `core/src/main/java/org/apache/iceberg/index/IndexManifest.java`。
+**参考**：基准报告 `docs/sift-vector-index-benchmark.html`（10M/100M × Parquet/Lance × HNSW/IVF/暴力 × 1/2/3/4bit × over-sample）；用户过程手册 `docs/docs/spark-procedures.md`；改写规则 `spark/v3.5/spark/src/main/scala/org/apache/iceberg/spark/index/RewriteVectorSearch.scala`；索引格式 `core/src/main/java/org/apache/iceberg/index/IndexManifest.java`；集群侧工具（建索引入口、镜像、测量）在并列的工具仓 `iceberg-tools`。

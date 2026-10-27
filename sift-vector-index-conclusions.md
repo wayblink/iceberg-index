@@ -1,7 +1,7 @@
 # SIFT 向量索引：端到端结论与遗留清单
 
 > 收口卡：#400（E2E-6）。数据来源：集群 A（K8s）、`hms.sparkann` 下的 1M/10M/100M 表、
-> benchmark `tools/vector-benchmark` + `reports/vector-index-benchmark.html`。
+> benchmark 在工具仓 `iceberg-tools` 的 `vector-benchmark/`；报告 `reports/vector-index-benchmark.html`（该报告已随工具仓外迁，留在本仓副本仅作历史参考）。
 > 所有数字都标了**测量口径**（单查询 / 批量摊销 / 索引腿），混用口径是这类对比最常见的错误来源。
 
 ---
@@ -103,7 +103,7 @@
 
 ```bash
 # 一条命令重跑（任一套表）
-tools/vector-benchmark/run-benchmark.sh sift10m-over \
+iceberg-tools/vector-benchmark/run-benchmark.sh sift10m-over \
     hms.sparkann.sift10m_base hms.sparkann.sift10m_query 10 15 3 2 1,3,10,30,100
 # 报告（自包含，无外网依赖）
 reports/vector-index-benchmark.html
