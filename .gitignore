@@ -85,3 +85,6 @@ derby.log
 
 # tooling lives in its own repository (../iceberg-tools); this is a convenience symlink
 tools
+
+# agent bookkeeping (SDD ledgers, gate logs, XML archives), not product
+.superpowers/
