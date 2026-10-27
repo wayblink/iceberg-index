@@ -20,6 +20,7 @@ package org.apache.iceberg.spark.extensions;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.assertj.core.api.Assertions.within;
 
 import java.nio.file.Path;
 import java.util.Comparator;
@@ -372,6 +373,75 @@ class TestRewriteVectorSearch {
                 "SELECT id FROM local.%s "
                     + "ORDER BY vec_distance(embedding, array(1.0d, 0.0d)) LIMIT 1"))
         .contains("vec_distance(EUCLIDEAN");
+  }
+
+  @Test
+  public void rewritesAQueryThatOrdersByAProjectedDistance() {
+    // selecting the distance under a name and ordering by that name is the natural way to show it:
+    // Spark then leaves an attribute in the sort, with the distance in the projection below it
+    String table = tableWithIndex("docs_aliased", "hnsw");
+    String query =
+        String.format(
+            "SELECT id, vec_distance(embedding, array(0.9d, 0.1d)) AS d FROM local.%s "
+                + "ORDER BY d LIMIT 2",
+            table);
+
+    assertThat(planOf(table, query)).contains("VectorSearchSource");
+
+    List<Row> hits = spark.sql(query).collectAsList();
+    assertThat(hits).hasSize(2);
+    assertThat(hits).extracting(row -> row.getLong(0)).containsExactly(1L, 3L);
+    // the distance is still the one the caller asked for, so it is reported with the row
+    assertThat(hits.get(0).getDouble(1)).isCloseTo(0.0053, within(0.001));
+  }
+
+  @Test
+  public void aProjectedDistanceFollowsTheMetricOfTheIndexThatAnswersIt() {
+    // the metric is bound where the distance is computed, which for a projected distance is the
+    // projection: ordering by the alias must not answer with the metric the function starts with
+    String table = "db.docs_metric_aliased";
+    spark.sql(String.format("CREATE TABLE local.%s %s", table, COLUMNS));
+    spark.sql(
+        String.format(
+            "INSERT INTO local.%s VALUES "
+                + "(1, 'far-on-the-ray', array(10.0d, 0.0d)), "
+                + "(2, 'near-off-the-ray', array(1.0d, 0.1d))",
+            table));
+    spark.sql(
+        String.format(
+            "CALL local.system.build_vector_index("
+                + "table => '%s', column => 'embedding', dimension => 2, metric => 'euclidean', "
+                + "structure => 'flat')",
+            table));
+
+    String query =
+        String.format(
+            "SELECT id, vec_distance(embedding, array(1.0d, 0.0d)) AS d FROM local.%s "
+                + "ORDER BY d LIMIT 1",
+            table);
+
+    List<Row> hits = spark.sql(query).collectAsList();
+    assertThat(hits).hasSize(1);
+    assertThat(hits.get(0).getLong(0)).isEqualTo(2L);
+    assertThat(planOf(table, query)).contains("vec_distance(EUCLIDEAN");
+  }
+
+  @Test
+  public void aProjectedDistanceOfAnotherColumnIsLeftAlone() {
+    // the alias names a distance over a column without an index, so there is nothing to answer with
+    String table = "db.docs_aliased_other";
+    spark.sql(String.format("CREATE TABLE local.%s %s", table, COLUMNS));
+    spark.sql(String.format("INSERT INTO local.%s VALUES %s", table, VECTORS));
+    spark.sql(
+        String.format(
+            "CALL local.system.build_vector_index("
+                + "table => '%s', column => 'embedding', dimension => 2, mode => 'hnsw')",
+            table));
+
+    String query =
+        String.format("SELECT id FROM local.%s ORDER BY vec_distance(body, 'zz') LIMIT 2", table);
+
+    assertThat(planOf(table, query)).doesNotContain("VectorSearchSource");
   }
 
   @Test

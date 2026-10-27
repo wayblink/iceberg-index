@@ -25,7 +25,6 @@ import org.apache.iceberg.index.spark.IndexEntries
 import org.apache.iceberg.spark.SparkSchemaUtil
 import org.apache.iceberg.spark.source.SparkTable
 import org.apache.spark.sql.catalyst.InternalRow
-import org.apache.spark.sql.catalyst.expressions.AttributeReference
 import org.apache.spark.sql.catalyst.expressions.Expression
 import org.apache.spark.sql.catalyst.expressions.GenericInternalRow
 import org.apache.spark.sql.execution.datasources.v2.DataSourceV2Relation
@@ -33,8 +32,6 @@ import org.apache.spark.sql.catalyst.plans.logical.LogicalPlan
 import org.apache.spark.sql.catalyst.util.ArrayData
 import org.apache.spark.sql.Row
 import org.apache.spark.sql.SparkSession
-import org.apache.spark.sql.types.DataType
-import org.apache.spark.sql.types.Decimal
 import org.apache.spark.sql.types.DataType
 import org.apache.spark.sql.types.Decimal
 import org.apache.spark.sql.types.StructType
@@ -231,16 +228,6 @@ object IndexRewriteSupport {
         .map(row => row.copy())
         .collect()
         .toSeq
-    }
-  }
-
-  /** The vector or text value of a row, at the position of its column in the read. */
-  def arrayValue(row: Row, columnIndex: Int): Option[Array[Float]] = {
-    row.get(columnIndex) match {
-      case values: Seq[Any] =>
-        Some(values.map(value => value.asInstanceOf[Number].floatValue()).toArray)
-      case _ =>
-        None
     }
   }
 

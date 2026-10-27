@@ -22,16 +22,16 @@ import java.lang.{Long => JLong}
 
 import scala.collection.mutable
 
-import org.apache.iceberg.spark.source.SparkTable
+import org.apache.iceberg.index.vector.VectorIndexDefinition.Metric
 import org.apache.spark.sql.SparkSession
 import org.apache.spark.sql.catalyst.InternalRow
-import org.apache.spark.sql.catalyst.expressions.Attribute
+import org.apache.spark.sql.catalyst.expressions.Alias
 import org.apache.spark.sql.catalyst.expressions.AttributeReference
 import org.apache.spark.sql.catalyst.expressions.Ascending
+import org.apache.spark.sql.catalyst.expressions.ExprId
 import org.apache.spark.sql.catalyst.expressions.Expression
 import org.apache.spark.sql.catalyst.expressions.GenericInternalRow
 import org.apache.spark.sql.catalyst.expressions.IsNotNull
-import org.apache.spark.sql.catalyst.expressions.SortOrder
 import org.apache.spark.sql.catalyst.plans.logical.{Filter, GlobalLimit, LocalLimit, LogicalPlan, Project, Sort, SubqueryAlias}
 import org.apache.spark.sql.catalyst.rules.Rule
 import org.apache.spark.sql.execution.datasources.v2.DataSourceV2Relation
@@ -52,6 +52,11 @@ import org.slf4j.LoggerFactory
  * and an optional {@code IsNotNull} guard on the vector column in between. A join, an aggregate, a
  * window, an offset or any other filter leaves the query alone, because a candidate set is not the
  * same as the input those operators expect.
+ *
+ * <p>The distance the sort orders by is either computed in the sort or named by a projection below
+ * it, so {@code ORDER BY vec_distance(...)} and {@code ORDER BY d} over {@code ... AS d} are the same
+ * query. Where it is computed is also where its metric is bound, because the vector column is not
+ * an output of the projection that hides it.
  */
 case class RewriteVectorSearch(spark: SparkSession) extends Rule[LogicalPlan] {
 
@@ -76,20 +81,28 @@ case class RewriteVectorSearch(spark: SparkSession) extends Rule[LogicalPlan] {
   private def extract(limit: GlobalLimit, rows: Expression): Option[LogicalPlan] = {
     val sort = globalSort(limit).getOrElse(return None)
     val order = sort.order.head
-    if (order.direction != Ascending || !order.child.isInstanceOf[VectorDistanceExpression]) {
+    if (order.direction != Ascending) {
       return None
     }
-    val distance = order.child.asInstanceOf[VectorDistanceExpression]
+
+    val chain = eligibleChain(limit).getOrElse(return None)
+    // the distance the sort orders by, whether the sort computes it or names a projection that does
+    val distance = chain.distanceOf(order.child).getOrElse(return None)
     val column = distance.vector match {
       case attribute: AttributeReference => attribute.name
       case _ => return None
+    }
+    // the filters are judged once the column is known: a guard is one on the vector column, and a
+    // filter on anything else is a reason to leave the query to Spark
+    if (!chain.guards(column)) {
+      return None
     }
     val k = IndexRewriteSupport.foldableInt(rows).getOrElse(return None)
     if (k <= 0) {
       return None
     }
 
-    val scan = eligibleChain(limit, column).getOrElse(return None)
+    val scan = chain.scan
     val sparkTable = IndexRewriteSupport.icebergTable(scan).getOrElse(return None)
     if (sparkTable.table().schema().findField(column) == null) {
       return None
@@ -128,12 +141,12 @@ case class RewriteVectorSearch(spark: SparkSession) extends Rule[LogicalPlan] {
             if (resolved == null) {
               None
             } else {
-              val source = VectorSearchSource(resolved, scan.output)
+              val source = VectorSearchSource(resolved)(scan.output)
               // the distance in the sort is bound to the metric of the index that answers it: the
               // re-scoring has to measure what the query asked for, and the function alone only
               // knows the default metric
               val metric = resolved.inputs.definition.metric()
-              val lowered = limit.transformDown {
+              val lowered = bindNamedDistance(limit, order.child, distance, metric).transformDown {
                 case relation: DataSourceV2Relation if relation eq scan => source
                 case node: Sort if node.order.exists(_.child eq distance) =>
                   node.copy(order =
@@ -168,6 +181,84 @@ case class RewriteVectorSearch(spark: SparkSession) extends Rule[LogicalPlan] {
   }
 
   /**
+   * Binds the metric on the projection that computes a distance the sort only names.
+   *
+   * <p>The distance cannot move into the sort: the projection below it outputs the name and not the
+   * vector column, so the sort would be left referring to a column nothing above it has. Binding it
+   * where it is computed keeps the attribute the sort already refers to pointing at the metric the
+   * index answers with.
+   */
+  private def bindNamedDistance(
+      plan: LogicalPlan,
+      key: Expression,
+      distance: VectorDistanceExpression,
+      metric: Metric): LogicalPlan = {
+    val named = key match {
+      case attribute: AttributeReference => Some(attribute.exprId)
+      case _ => None
+    }
+
+    if (named.isEmpty) {
+      return plan
+    }
+
+    plan.transformDown {
+      case project: Project =>
+        val rewritten = project.projectList.map {
+          case alias: Alias if alias.exprId == named.get && (alias.child eq distance) =>
+            // the projection keeps its name and its expression id, so the attribute the sort orders
+            // by still refers to the distance, now measured the way the index measures it
+            Alias(distance.copy(metric = metric), alias.name)(
+              exprId = alias.exprId,
+              qualifier = alias.qualifier,
+              explicitMetadata = alias.explicitMetadata,
+              nonInheritableMetadataKeys = alias.nonInheritableMetadataKeys)
+          case other => other
+        }
+        if (rewritten == project.projectList) {
+          project
+        } else {
+          project.copy(projectList = rewritten)
+        }
+      case other => other
+    }
+  }
+
+  /**
+   * The scan of an eligible plan, with the distances its projections named and the filters it kept.
+   *
+   * <p>The distances are collected while the chain is walked because the column the query is about
+   * is only known once one of them is found: a filter is a guard on the vector column, and the
+   * vector column is what the distance names.
+   */
+  private case class EligibleChain(
+      scan: DataSourceV2Relation,
+      computed: Map[ExprId, VectorDistanceExpression],
+      named: Map[String, VectorDistanceExpression],
+      filters: Seq[Filter]) {
+
+    /** The distance an ordering key stands for, whether the key computes it or names it. */
+    def distanceOf(key: Expression): Option[VectorDistanceExpression] = {
+      key match {
+        case expression: VectorDistanceExpression => Some(expression)
+        case attribute: AttributeReference =>
+          computed.get(attribute.exprId).orElse {
+            // a projection the optimizer added between the sort and the one that names the distance
+            // gives the name a new expression id, so the name is what is left to match on
+            val byName = named.filter { case (name, _) => name == attribute.name }.values.toSeq
+            if (byName.size == 1) Some(byName.head) else None
+          }
+        case _ => None
+      }
+    }
+
+    /** Whether every filter between the limit and the scan is a non-null guard on the column. */
+    def guards(column: String): Boolean = {
+      filters.forall(filter => isVectorGuard(filter.condition, column))
+    }
+  }
+
+  /**
    * The scan of an eligible plan, if everything between the limit and it keeps rows as they are.
    *
    * <p>A {@code IsNotNull} guard on the vector column is one of them: it stays above the source and
@@ -176,19 +267,33 @@ case class RewriteVectorSearch(spark: SparkSession) extends Rule[LogicalPlan] {
    * a null), so a covered file holds no null, and a null appended later sits in an uncovered file
    * and reaches the answer through the scan branch, which Spark orders as it always does.
    */
-  private def eligibleChain(limit: GlobalLimit, column: String): Option[DataSourceV2Relation] = {
+  private def eligibleChain(limit: GlobalLimit): Option[EligibleChain] = {
     val allowed = mutable.ListBuffer.empty[LogicalPlan]
+    val computed = mutable.Map.empty[ExprId, VectorDistanceExpression]
+    val named = mutable.Map.empty[String, VectorDistanceExpression]
+    val filters = mutable.ListBuffer.empty[Filter]
     var node: LogicalPlan = limit.child
     var scans: Option[DataSourceV2Relation] = None
     while (scans.isEmpty) {
       node match {
         case relation: DataSourceV2Relation =>
           scans = Some(relation)
-        case filter @ Filter(condition, child) if isVectorGuard(condition, column) =>
+        case filter @ Filter(condition, child) =>
           allowed += filter
+          filters += filter
           node = child
-        case project @ Project(_, child) =>
+        case project @ Project(projectList, child) =>
           allowed += project
+          projectList.foreach {
+            case alias: Alias =>
+              alias.child match {
+                case expression: VectorDistanceExpression =>
+                  computed.put(alias.exprId, expression)
+                  named.put(alias.name, expression)
+                case _ =>
+              }
+            case _ =>
+          }
           node = child
         case sort @ Sort(_, _, child) =>
           allowed += sort
@@ -208,7 +313,7 @@ case class RewriteVectorSearch(spark: SparkSession) extends Rule[LogicalPlan] {
     if (sortCount != 1) {
       return None
     }
-    scans
+    Some(EligibleChain(scans.get, computed.toMap, named.toMap, filters.toList))
   }
 
   /** Whether a filter is a non-null guard on the vector column, which both branches can apply. */

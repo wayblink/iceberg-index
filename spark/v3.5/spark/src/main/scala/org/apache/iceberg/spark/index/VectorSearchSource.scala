@@ -18,7 +18,6 @@
  */
 package org.apache.iceberg.spark.index
 
-import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.expressions.Attribute
 import org.apache.spark.sql.catalyst.plans.logical.LeafNode
 
@@ -31,7 +30,7 @@ import org.apache.spark.sql.catalyst.plans.logical.LeafNode
  * frozen table and index snapshots, the parameters with their origins, the candidate budget, and
  * the output attributes of the scan it replaces. Planning it reads no data file and starts no job.
  */
-private[spark] case class VectorSearchSource(context: VectorSearchContext, key: Long = 0L)(
+private[spark] case class VectorSearchSource(context: VectorSearchContext)(
     override val output: Seq[Attribute])
     extends LeafNode {
 
@@ -78,14 +77,4 @@ private[spark] case class VectorSearchSource(context: VectorSearchContext, key: 
 
   override def simpleString(maxFields: Int): String =
     s"VectorSearchSource[${stringArgs.mkString(", ")}]"
-
-  def withContext(newContext: VectorSearchContext): VectorSearchSource =
-    VectorSearchSource(newContext, key)(output)
-}
-
-private[spark] object VectorSearchSource {
-  def apply(context: VectorSearchContext, output: Seq[Attribute]): VectorSearchSource =
-    new VectorSearchSource(context)(output)
-
-  def internalRow(value: Any): InternalRow = value.asInstanceOf[InternalRow]
 }

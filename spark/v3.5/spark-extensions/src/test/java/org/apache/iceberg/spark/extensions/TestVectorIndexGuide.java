@@ -216,6 +216,32 @@ class TestVectorIndexGuide {
         .contains("VectorSearchSource");
   }
 
+  /**
+   * §4.1 · a distance the caller projected under a name is ordered by that name, and that is the
+   * same query.
+   */
+  @Test
+  void aDistanceOrderedByTheNameItWasProjectedUnderIsRewritten() {
+    createTable("aliased", 8);
+    spark.sql(
+        "CALL local.system.build_vector_index("
+            + "table => 'db.aliased', column => 'embedding', dimension => 2)");
+
+    String query =
+        "SELECT id, vec_distance(embedding, array(0.95d, 0.05d)) AS d FROM local.db.aliased "
+            + "ORDER BY d LIMIT 3";
+
+    assertThat(spark.sql(query).queryExecution().optimizedPlan().toString())
+        .as("ordering by the projected name reaches the index too")
+        .contains("VectorSearchSource");
+    // the same query with a shape the rewrite does not recognise is answered from a full scan, and
+    // the index has to answer what that scan answers
+    String scanned = query.replace("ORDER BY d LIMIT 3", "ORDER BY d + 0.0d LIMIT 3");
+    assertThat(spark.sql(query).collectAsList())
+        .as("the index answers what a scan answers")
+        .isEqualTo(spark.sql(scanned).collectAsList());
+  }
+
   /** §2 · only identity partitioning is rewritten. */
   @Test
   void aTransformedPartitionIsNotRewritten() {

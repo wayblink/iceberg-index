@@ -118,7 +118,16 @@ ORDER BY vec_distance(embedding, array(0.95d, 0.05d))
 LIMIT 10;
 ```
 
-`vec_distance(vector, query)` 恒定"越小越近"（`cosine` 是 `1-cos`，`dot_product` 是 `-dot`，`euclidean` 是 L2），所以写法永远是升序。改写发生的条件：列上有向量索引、索引类型已在会话注册、结构不是 `FLAT`、表只有 identity 分区、索引至少覆盖一个数据文件。用 `EXPLAIN` 验证是否改写：没有 `TableScan` 就说明命中了。
+`vec_distance(vector, query)` 恒定"越小越近"（`cosine` 是 `1-cos`，`dot_product` 是 `-dot`，`euclidean` 是 L2），所以写法永远是升序。改写发生的条件：
+
+1. 列上有向量索引（多个索引时用 `spark.iceberg.index.vector.name` 指定，否则规则不动手）；
+2. 索引类型已在会话注册；
+3. 表只有 identity 分区（bucket/truncate/时间 transform 不行，它们的列值不在数据文件路径里）；
+4. 形状是"单表 + 单一升序距离 + 可折叠的正数 `LIMIT`"，从 `LIMIT` 到扫描之间只有投影、子查询别名、以及向量列上的 `IS NOT NULL`。
+
+距离写在 `ORDER BY` 里，或者先 `SELECT ... AS d` 再 `ORDER BY d`，两种都改写。反过来，`Join`、`Aggregate`、`Window`、`OFFSET`、多排序列（`ORDER BY dist, id`）、以及任何其它过滤条件都会让规则退让——带普通 `WHERE` 谓词的查询会退回全表扫描，这是已知取舍（谓词下推常把 `isnotnull` 并进同一个 `Filter`，所以 `WHERE embedding IS NOT NULL AND id < 50` 也不命中）。索引覆盖率为 0 时仍然改写：候选分支空转，未覆盖部分由残差扫描答全表。用 `EXPLAIN` 验证是否改写：没有 `TableScan` 就说明命中了。
+
+`FLAT`（精确索引）也参与改写。早先的规则因为"`FLAT` 每个条目都要打分、代价等同扫描"把它排除在外，现在这条成本判断已移除——能不能用索引只看正确性，不看代价。所以 `FLAT` 也会走到索引路径，只是省不了多少开销：候选就是全部条目，重排后仍然是全量打分。做"不走索引"的对照时，用改写认不出来的写法（如距离后加 `+ 0.0d`）。
 
 近似结构（`HNSW`/`IVF`）需要放宽候选再精确重排，候选倍数靠会话配置：
 
