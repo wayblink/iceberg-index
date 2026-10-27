@@ -29,7 +29,7 @@
 
 没有 `CREATE INDEX` 这样的 DDL——**全部通过 `CALL` 过程**。这是有意的：索引参数多、且需要回显构建结果，过程比语法更好演进。
 
-```sql
+```
 CALL prod.system.build_vector_index(
   table                    => 'db.docs',
   column                   => 'embedding',
@@ -59,7 +59,7 @@ CALL prod.system.build_vector_index(
 
 ### 2.2 查询
 
-```sql
+```
 SELECT id, title
 FROM db.docs
 ORDER BY vec_distance(embedding, array(0.12d, 0.98d, ...))
@@ -75,7 +75,7 @@ LIMIT 10;
 
 一个列上有多个索引时，`ORDER BY` 里没地方写索引名字，必须用配置指定，否则规则不动手（避免猜）：
 
-```sql
+```
 SET spark.iceberg.index.vector.name = docs_ivf_1bit;
 SET spark.iceberg.index.vector.over-sample = 100;
 ```
@@ -127,7 +127,7 @@ SET spark.iceberg.index.vector.over-sample = 100;
 
 ### 4.1 构建
 
-```bash
+```
 export JAVA_HOME=/opt/homebrew/opt/openjdk@17
 ./gradlew :iceberg-spark:iceberg-spark-runtime-3.5_2.13:shadowJar -DsparkVersions=3.5
 ./gradlew spotlessCheck revApiCheck            # 格式与 API 兼容门禁
@@ -139,7 +139,7 @@ export JAVA_HOME=/opt/homebrew/opt/openjdk@17
 
 ### 4.2 镜像
 
-```bash
+```
 cd /data/workspace/sparkann
 # Dockerfile 做两件事：删掉被替换的 vendor jar、拷贝我们的 jar
 docker build -t hub.i.basemind.com/spark/sparkann-e2e:<tag> .
