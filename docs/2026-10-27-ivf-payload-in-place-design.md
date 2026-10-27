@@ -17,204 +17,171 @@ specific language governing permissions and limitations
 under the License.
 -->
 
-# IVF 索引常驻结构改造设计（#2773）
+# 索引通用内存与加载优化：IVF 原地布局、向量公共 Top-K
 
-状态：设计待评审。对应卡片 #2773（原属 #2020 伞卡，2026-10-27 移出为独立卡）。相关：#2024（缓存按真实占用记账）、#2772（list 级 Range 读）。
+状态：**修订稿，已完成独立只读技术复审（无阻断），待人工确认；不是实现完成或性能验证报告。** 本稿替代已打回的初稿，对应独立伞卡 #2773、设计卡 #2779，处置评审备注 #2952、#3006。源码核对基线为 `002552ffe`。本轮只修改设计和卡片，不修改产品代码，不运行 Java 或集群性能测试。
 
-## 1. 一句话
+## 1. 目标、分工与范围
 
-让 IVF 的「prepared 结构」不再是逐条解码出来的对象图，而是**同一份 payload 字节 + 一张 list 目录**；查询时按偏移算术定位打分，只给幸存者建结果对象。目标不是让单条向量算得更快，而是让同一台 executor 能常驻的索引文件数变成约 2.7 倍。
+保留一份具有明确所有权的解压 payload，IVF 用 list 目录定位记录，不再为每条记录建立对象；查询边打分边维护有界 Top-K，最终才创建结果对象。目标是降低常驻内存、加载/prepare 分配和排序成本，**收益须分别实测，不能称为仅容量优化或保证固定倍数**。
 
-## 2. 现状与账
+| 层次 | 负责内容与位置 | 实际调用方及边界 |
+|---|---|---|
+| 通用索引基础设施 | `core`/`index-spark` 的加载所有权、真实记账、估算模型与 placement | 按 adapter 实际依赖处理，不硬编码 IVF；公共 Puffin 读取覆盖适用索引 |
+| 向量公共工具 | `index-vector` 包内字节读取、完整结果比较、有界 Top-K | IVF 首先接入；FLAT 由 #2782 接入，分别验收，不扩大公开 API |
+| IVF 专属表示 | `IvfKernel` 的目录、量化 code/factors 和未量化记录原地读取 | 不复制到 HNSW 图或文本倒排结构 |
 
-### 2.1 一次查询现在付什么
+不改已有 payload 编码版本，不要求重建旧索引，不新增配置、不改变默认值。保留 `IndexBlob`/`IndexEntry` 的公开防御性复制语义。文本 BM25 当前跨文件合并语料统计，不宣称它自动进入向量 executor 缓存/工作集估算路径。HNSW 先由图选择有限候选，其查询收益不能套用 IVF 全扫描候选的数字。
 
-读一份 IVF payload 的链路（坐标已核对）：
+## 2. 现状与收益口径
 
-| 位置 | 做什么 |
+读取链路为 `DistributedIndexSearch.readPayload` → `InMemoryInputFile` → `PuffinReader.readAll`/解压 → `PuffinIndexFileContainer.read`/`IndexBlob` → `prepareFile` → kernel。整容器、内存输入、blob 包装和 kernel 边界存在多处复制；`InMemoryInputFile` 构造也会 clone。默认 ZSTD 的压缩输入与解压输出是独立数组，不能把压缩容器当成可打分的原地字节。
+
+IVF 当前 `readList` 为记录分配 `IvfEntry`、code/vector/factors 数组，查询为所有探测候选创建结果后全部排序。FLAT 当前逐条取得 payload、解码向量、创建结果并排序。因此减少对象和有界选择既可能节省内存，也可能降低查询耗时；不能用假设的单次分配时间替代测量全量排序。
+
+定义 C 为保留的压缩容器，U 为解压 payload，S 为旧对象图，M 为新目录、字典、中心、量化器等元数据。下式均按实际对象图、数组头、对齐和共享引用去重，字节数不是磁盘文件长度：
+
+| 状态 | 常驻组成 |
 |---|---|
-| `index-spark/.../DistributedIndexSearch.java:657` `readPayload` | 整个 Puffin 容器 → `byte[]` |
-| `core/.../PuffinIndexFileContainer.java:96-98` `read` | 解压后的 blob → `new byte[remaining]` → `IndexBlob.of(...)` |
-| `core/.../IndexBlob.java:41,54` | 构造函数 `payload.clone()`、`payload()` 再 `clone()` |
-| `index-spark/.../DistributedIndexSearch.java:694` `prepareFile` | `blob.payload()` 的那份 clone → `ByteBuffer.wrap` → `adapter.prepare` |
-| `index-vector/.../VectorPayloads.java:159` `toBytes` | 再复制一份，喂给 `DataInputStream` |
-| `index-vector/.../IvfKernel.java:270` `prepare` | `load()` 逐条解码 |
-| `index-vector/.../IvfKernel.java:469` `readList` | 每条记录 `code.clone()` + `new float[3]` + 一个 `IvfEntry` |
-| `index-vector/.../IvfKernel.java:374-392` `ListSearcher.search` | 被探测到的 list 里**每一条**都 `IndexSearchResult.of(...)`，最后对全部结果 `sort` 再截断 |
+| 当前典型缓存 | C + S |
+| 新结构但仍保留无用容器 | C + U + M |
+| 核心目标 | U + M |
 
-三个 kernel（IVF / HNSW / 暴力）都在 `toBytes` 处各复制一次；HNSW 还会把 graph 再拷进自己的一块 `byte[]`（`HnswlibKernel.java:206-214`）。所以“拷贝链”是共用基础设施层面的问题，不只是 IVF 的问题。
+节省比例按 `(旧常驻 - 新常驻) / 旧常驻` 实测；既有“2.7 倍容量”“固定每条目降幅”“500 万次分配只花 50ms”“一份 payload 峰值”的承诺全部撤回。目录以外还有 O(listCount × dimension/padded) 元数据，稀疏索引不能把它当零。加载时压缩输入、解压输出、边界复制和准备结构可能同时存在；峰值另测，不能由常驻公式推导。
 
-同一时刻最多有 4 份 payload 存活：容器 `content`、`IndexBlob` 里那份、`payload()` 返回的那份、`toBytes` 返回的那份。一个 752MB 的文件 prepare 期间峰值约 3GB——这解释了为什么单文件上限只能挂在 2GB 附近（`IndexPayloadLimits.java:32` `MAX_PAYLOAD_BYTES = Integer.MAX_VALUE`）。
+候选数为探测 list 的真实 count 之和。均衡等长文件下 `nprobe × sqrt(总条目数 × 文件数)` 仅是粗略估计，list 偏斜、显式 nlist 或 nprobe 截断时不适用。coverage 按集群至少一台 executor 持有的文件并集计算，不能用单机文件槽位比例代替；已 coverage=1 的表仍可观察预算余量、多索引容量和尾延迟。
 
-### 2.2 常驻字节：每条目的账
+## 3. 所有权、接口与真实记账（#2780）
 
-按 `PreparedStructureSize` 的模型（压缩引用、8 字节对齐、compact string）复算，128 维、单条目：
+### 3.1 核心实现先采用可证明的独占路径
 
-| 配置 | payload/条目 | 结构/条目（现在） | 结构/条目（改后） | 常驻/条目 现在 → 改后 | 降幅 |
-|---|---|---|---|---|---|
-| 4 bit（码 64B） | 88 B | 152 B | ≈0（目录按 list 摊） | **240 → ~90** | 62% |
-| 1 bit（码 16B，现场推荐） | 40 B | 104 B | ≈0 | **144 → ~42** | 71% |
-| 未量化（码 512B） | 524 B | 568 B | ≈0 | **1092 → ~524** | 52% |
+保持公开 `prepare(ByteBuffer)` 签名。IVF prepare 对调用方的 `[position, limit)` 做防御性快照，内部保存独占 U；快照不修改输入 position/limit，不受调用方后来写入原数组影响。只读 ByteBuffer 不能证明 backing array 不被其他引用修改，不能凭 `isReadOnly()` 借用。read-only、direct、非零 arrayOffset 和 slice 均有回归样本。
 
-其中 `preparedBytes()` 现在报的是 payload 的 1.78 倍（4bit）／2.6 倍（1bit）／1.09 倍（未量化）；缓存记账是 `payload.length + preparedBytes`（`IndexCacheMemory.java:36-39`），所以预算看到的是 payload 的 2.78／3.6／2.09 倍。
+初始实现允许 `blob.payload()` 与 prepare 间仍有暂态复制，不以公共“零复制”改造为前置。prepared 不保留整个 Puffin 文件或外部 InputFile。加载完成后无用 C 不进入缓存根对象；其他 adapter 若保留解压输入，须按其真实引用计费，不一刀切释放。缓存释放/eviction 不破坏仍被 lease 使用的 searcher。
 
-**位数越低收益越大**，而现场推荐配置恰恰是 1bit + over=100——这是这条改造最划算的地方。
+公共拷贝链后置到 #2774。若要转移独占解压数组，必须有受控所有权证据；不能修改公开 `IndexBlob.payload()` 的复制合同，也不把现有 `toBytes` 偷换成返回任意完整 backing array 的方法。
 
-### 2.3 换算成真实机器
+### 3.2 新内存模型与旧记录迁移
 
-以报告里那套环境（6 executor × 12GB 堆，缓存预算假设每台 6GB）为例：
+采用新的内存 **modelVersion=2**，不改变 payload 的 v1/v2、reader 编码版本或 manifest 存储格式。`payloadBytes` 仍为 **blob 压缩前的编码 payload 长度 U**，`fileBytes` 仍为物理容器 C，二者保留诊断用途，不能自动相加作为常驻。
 
-- **100M × 4bit**：索引合计 7.49GB、256 个文件、每文件约 390k 条。现在每文件常驻约 94MB，一台机器只装得下 64/256 个 → coverage 0.25；改后每文件约 35MB，装 171 个 → coverage 0.67。
-- **10M × 4bit**：索引合计 752MB（磁盘，压缩后），十几个文件，一台机器早就全装下 → coverage 1.0。**这种场景下这条改造几乎换不来延迟**，只有 prepare 首查和 p99 抖动的收益。
+新模型的 `preparedBytes`/运行时 `estimatedBytes()` 描述 searcher 实际可达的独占状态 P：IVF 为 U+M，HNSW 为实际图/映射，FLAT 为实际保留的 entries/字节。排除已经释放的调用方输入和 query scratch；内部持有的快照 U 必须计入。澄清相关 javadoc：排除外部输入缓冲，不是排除 searcher 自己拥有的数组。
 
-所以要认清卡的定位：它是**容量/规模卡**。单表 10M、单索引、已经全常驻的场景不是它的价值场景；价值场景是 100M、多表多索引并存、以及“堆不变的前提下留出安全边际”。
+新缓存 resident 以 P 为主，再加确实被缓存额外保留且不属于 P 的状态 E。共享数组按身份只计一次；slice 若保留大 backing array，计完整数组。核心独占路径 E 中没有 C。`IndexCacheMemory` 的新模型转换不再无条件加 `fileBytes`；build、runtime、manifest→placement 使用同一估算函数，不能一边报 U+M、一边仍加 C。
 
-### 2.4 每查询的候选数（卡里那个数字要改）
+model=1、未知模型、缺失 memory、reader/runtimeProfile 不匹配的旧估算不能直接用于精确容量决策：由统一 resolver 加载并按当前模型重估，或返回显式 unknown，不能返回0、不能继续声称严格预算已获保证。保留既有 legacy fallback 的明确“不准确估算”标识；managed 规划不得把 unknown 当已知可容纳。新估算可按不可变文件身份、reader、model、runtime 缓存；升级使旧缓存失效。无需重建或重写旧 payload，也不强制更新旧 manifest。跨 kernel 的 model 标记与公式一起升级，不能统一换版本号却保留不一致语义。
 
-被打分并建结果的条数是每个文件 `nprobe × (entries_file / nlist_file)`，而 `nlistFor` 默认取 `sqrt(entries_file)`（`IvfOptions.java:119-126`，按文件算），于是总数 ≈ `nprobe × sqrt(entries × files)`：
+验收同时核对可达数组与收费模型；仅 build 数字等于 prepare 数字不足以证明没有双方共同漏账。
 
-- 100M × 256 文件 × nprobe=32 → 32 × 625 × 256 ≈ **5.1M**
-- 10M × 16 文件 × nprobe=150 → 150 × 790 × 16 ≈ **1.9M**
-- 10M × 单文件 × nprobe=150 → **47 万**
+## 4. IVF 编码与目录（#2776）
 
-原卡写的“80 万”对应“100M 只装 6 个文件”的形态，与现场 256 文件不符。这个数字只影响对“分配”这条收益的打分，不影响方案本身：500 万次分配约 50ms，相对 9.6s／13.5s 是零头，所以**分配是过程指标，不是主收益**。
+### 4.1 格式不变：大端、modified UTF-8、padded 步长
 
-## 3. 目标与非目标
+继续复用 `VectorPayloads.readHeader` 的 legacy header 和当前 kernel 版本检查。数值字段由 `DataOutputStream` 写出，读取固定 **BIG_ENDIAN**；Puffin 外层部分小端字段不影响 IVF。字符串字典使用 `DataInputStream.readUTF`，匹配 `writeUTF` 的 unsigned-short 字节长度和 **modified UTF-8**，不是普通 UTF-8。
 
-目标：
+设 d 为逻辑维度，p 为 RaBitQ 使用的下一个2次幂 padded 维度，b 为 bits；计算中间值均使用 long 并检查 representability：
 
-1. prepared 结构不再按条目物化：payload 字节 + 每 list 的偏移目录 + dataFile 字典。
-2. 打分循环零分配；只有最终 topK 的幸存者解码成 `IndexSearchResult`。
-3. `preparedBytes()` 按新布局重写，记账口径与实际保留一致。
-4. **payload 格式不变**（`FORMAT_VERSION`／`QUANTIZED_FORMAT_VERSION` 都不动）——不需要重建任何索引，这是本设计的硬约束。
+```text
+codeBytes       = ceil((long)p * b / 8)
+quantizedStride = 4 + 8 + codeBytes + 3 * 4
+plainStride     = 4 + 8 + (long)d * 4
+quantizedListHeader = (long)d * 4 + 4
+plainListHeader     = 4
+```
 
-非目标：不改召回与打分口径；不引入 direct memory／mmap；不改 HNSW 的图外置方式；不做 list 级 Range 读（#2772 会复用本设计的目录，但不在本卡做）。
+例如 d=129、b=2，p=256，codeBytes=64，量化记录步长=88，不能按逻辑维度得到33字节 code。padded 求值、乘法、加法和 long→int 转换均校验，不能复用可能溢出的 int 公式。
 
-## 4. 方案
+目录保存每个 list 的记录起点、count，以及量化中心位置；保留用于选择 list 的 trained centroids，不能用 listQuantizer 的中心替代它。中心与量化器初期允许解码为小数组，均计入 M；共享 signs、优化 centroid 选择不是核心前置，也不能改变 seed/算术。
 
-### 4.1 P0：拷贝链收敛到一份（前置条件）
+### 4.2 prepare 验证所有记录，选择正确性而不是虚假的 O(header)
 
-必须先做，否则后面的收益兑现不了一半（见 5.1）。
+公开输入先快照；在快照内解析头、字典、centroids 和 list header，记录字节边界。每个 list 用 checked long 计算 `recordStart + count * stride`，先验证不超过有效 payload 区间，再访问/跳转。分配任何按文件计数的数组前，用剩余字节及最小编码长度约束计数，防止畸形 nlist/字典数量直接触发巨大分配。
 
-1. `PuffinIndexFileContainer.read` 不再 `new byte[]` + `IndexBlob.of` 的两次复制；读出的 blob 以「源数组 + 偏移 + 长度」的只读视图表示。
-2. `IndexBlob` 现在的 `clone()` 是为“调用方不能改”服务的契约（`IndexBlob.java:41,54`）。改成共享视图需要换一个契约（只读视图 + 长度限定），这属于 core 公开类的语义变更，要过 revapi 讨论；备选是不动 `IndexBlob`，只在索引读路径新增一个包内可见的“零拷贝 blob”类型。
-3. `VectorPayloads.toBytes` 改成“能共享就共享”（`ByteBuffer.hasArray()` 时直接取数组 + `arrayOffset`），三个 kernel 一起受益；`prepareFile` 直接把 `(byte[], offset, length)` 交给 adapter，避免 `toBytes` 那一份。
-4. 决定 `ExecutorIndexCache.CachedFile.payload`（`ExecutorIndexCache.java:364,385`）的去留：它在生产代码里没有读方（只有测试读），却全额进 `residentBytes`。要么删掉并改记账，要么让 prepared 直接持有它（4.2 的选择）。
+**初期 prepare 保留全记录校验**：扫描每条记录的 dataFileIndex，含查询不会探测的 list，验证 `0 <= index < dictionary.length`；验证 list count 非负、累计 count 与 entryCount 相等、中心和记录不截断。按新格式规范加强计数一致性只拒绝畸形文件，不改变合法旧文件的可读性；不借本次改动添加新的向量数值规范。已有 reader 对记录后的尾字节不强制EOF，本实现也不无故改变该行为。
 
-P0 自身收益：prepare 峰值 ≈ 4 份 → 1 份（752MB 文件从 ~3GB 到 ~0.76GB），少一份常驻；行为零变化，三个 kernel 都受益。
+验证扫描不 clone code/factors、不创建逐条对象，但仍是 O(N+L) 次记录索引访问；快照本身也是 O(U)。因此撤回“只读 header 就完成 prepare”“微秒/50ms”等承诺。失败发生在 prepare 返回之前，以具体字段/list/record 的可定位异常报告，不能等碰巧探测该 list 才发现错误。
 
-### 4.2 P1：payload 原地 + 目录 + 有界堆
+### 4.3 code 定位不对绝对地址做位乘法
 
-**内存表示。** `PreparedSearch` 持有：payload `byte[]`（共享自容器，见 P0）+ `int[] listOffsets`（长度 `nlist + 1`）+ `int[] listCounts`（或由偏移差推导，读时校验 header 里的 count）+ dataFile 字典 `String[]` + 每 list 一个 `RaBitQQuantizer` 的**轻量**形式。
+```text
+localBit = (long)coordinate * bits + bit
+byteAddress = (long)codeBase + (localBit >>> 3)
+bitInByte = localBit & 7
+```
 
-payload ≤ 2GB（`IndexPayloadLimits`），所以偏移用 `int` 就够，目录本身 `nlist × 4~8 B`：nlist=2915 时约 12–23KB，相对 752MB 可忽略。
+byteAddress 通过合法 code 区间和 U 边界检查后才转换成 int；不能用 `int bitOffset = absoluteOffset * 8`。因素读取从 `codeBase + codeBytes` 读取3个大端 float。初期可以用单次 search 私有的 `float[3]` scratch 适配现有量化器方法，也可增加读取标量的包内重载；不得使用 per-prepared 可变 scratch。无论选哪条，都有逐分数参考测试，保持现有计算顺序。
 
-**定长记录按算术定位。** 每个 list 的 header 与条目布局都不变：
+## 5. 向量公共 Top-K 与数值合同
 
-- 量化：list header = `dim × float`（list 中心）+ `int count`；条目 = `int dataFileIndex` + `long rowPosition` + `code(codeBytes)` + `3 × float factors`
-- 未量化：list header = `int count`；条目 = `int dataFileIndex` + `long rowPosition` + `dim × float`
+公共工具留在 `index-vector` 包内，接收显式记录定位/字段读取方式，不依赖 IVF list 布局。比较依次是 metric 的分数方向、文件路径的 Java `String.compareTo`、`Long.compare(rowPosition)`。若建立字典排序 rank，必须按路径值排序、重复路径得到相同 rank，不能用字典首次出现编号。只有以上都相同的完全等价记录，才用遍历序作为稳定性末级规则，不能用 visitRank 替代文件/位置排序。
 
-条目在 list 内定长，所以第 i 条地址 = `listStart + headerBytes + i × entryBytes`。`rowPosition` 落在 4 mod 8 的偏移上：`byte[]` 视图的 `VarHandle` 普通 `get/set` 允许非对齐（原子操作不允许，本设计不用原子操作），用 `MethodHandles.byteArrayViewVarHandle(long[].class, ByteOrder.LITTLE_ENDIAN)`。
+分数使用现有 `VectorScoring.compareScores` 的 `Double.compare` 语义：欧氏升序，dot/cosine降序；保留 NaN、±0、±Infinity 的顺序，不用减法或普通大小比较代替。保持旧 float/double 运算次序、类型和累加顺序。例如量化查询的 `double difference = query[d] - center[d]` 先执行 float 减法，而未量化欧氏已有显式 double 转换；不能为了原地读取顺手统一精度。不能把 Math.sqrt、省略校正或FMA当作本次优化。
 
-**打分循环不建对象。** `RaBitQQuantizer` 的打分签名已经是 `(byte[] code, int offset, float[] factors, …)`，`offset` 是 code 的相对字节偏移（内部按 `offset * 8` 算位），所以传 payload 绝对偏移即可直接复用。`factors` 是数组，两个选项：
+search 在选择 list 后由已验证目录计算候选总数 V，long累计且不超过 entryCount。目标槽位 T=`min((long)topK,V)`；topK<0报错，topK=0或V=0返回空。不能按外部 topK 直接 `new array[topK]`。堆从小的内部容量开始，按实际收到的候选增长，checked 算术保证不超过 T；这是内部实现常量，不增加用户开关。
 
-- **推荐**：给 `estimatedDistanceSquared`／`estimatedInnerProduct` 增加 `(byte[] payload, int factorsOffset, …)` 重载，用 `Float.intBitsToFloat` 读 3 个数。理由：不引入可变状态，`PreparedSearch` 保持“无隐藏状态、可并发调用”的性质。
-- 否掉：per-prepared 的 `scratch float[3]`。它只有在“同一 prepared 不被并发搜索”时才正确，今天靠 `CachedFile.searchLock`（`ExecutorIndexCache.java:388-398`）兜住，将来谁放开并发就静默算错分。
+堆根为最差候选；保存 primitive score、记录 offset 和必要的稳定性序号，不给每个候选创建结果对象。路径rank/位置仅在比较需要时读取；幸存者按同一总序输出并创建 `IndexSearchResult`。大topK且V很小不应有大额预分配；大topK且V确实巨大时返回那么多行本来需要O(T)内存，不能承诺无限输出不OOM，也不能静默减小用户topK。可表示性/长度问题明确报错，内存峰值随T报告。
 
-`rotateQuery` 每探测一个 list 会分配一个 `float[padded]`；可以顺手改成复用一个 per-search 的 scratch（生命周期在单次 `search` 内，没有并发问题）。
+FLAT 的 #2782 复用字节读取与堆，但仍保持精确打分、entry-bearing encode/decode 和 legacy 可读性；处理 `IndexEntry.payload()` 的复制边界时不得削弱不可变合同。准备期是否保存紧凑字节或已解码向量，须计入该卡的prepare成本与常驻，不能把分配搬到prepare后称为消失。
 
-**有界堆 + 总序。** 维护大小为 `topK` 的堆，键是 `(score, visitRank)`，`visitRank` = 候选被访问的全局自增序号（list 访问序 → list 内条目序）。这**必须**与今天的“按访问顺序 add + 稳定排序”等价：今天同分候选的顺序由访问顺序决定，`nearestCentroids` 还专门为可复现写了固定 tie-break 的注释（`IvfKernel.java:592-598`），所以同分必须在堆里也用同一总序，否则同分候选的**集合**和顺序都会变。实现用 `double[]` 分数 + `int[]` 序号，避免为候选建对象；出堆后按同一总序升序输出。内存上只有 `2 × topK × 8 B`。
+## 6. 后续公共优化，不阻塞核心
 
-**顺手一起改的两处（同一个文件，同一轮测试）**：
+#2774 逐点量容器、`InMemoryInputFile`、Puffin解压、blob边界及kernel复制，优先消除有所有权证明的冗余复制。共享的只能是合适的解压数组，完整ZSTD解压不等于单数组峰值；各kernel分别回归，文本仅覆盖实际公共读取，不重写BM25统计。
 
-- `nearestCentroids`（`IvfKernel.java:581-603`）每查询为每个 list 装箱一个 `Integer` 再排序（10M 单文件 nlist=2915）。改成 `double[]` + `int[]`（或用大小 `nprobe` 的选择堆），零风险。
-- 每个 list 的 `RaBitQQuantizer` 都重算一份 `signs(seed, padded)`（`RaBitQQuantizer.java:90`），nlist=2915 时是 1.5MB 的重复数组；`center` 也已经存在 payload 里（`center.clone()` 又是一份）。改成 signs 共享一份、centre 直接读 payload 偏移。
+#2777 优先利用与当前model/reader/runtime匹配的可信 memory/structure。旧估算统一重估或unknown。当前压缩blob不能按物理offset直接Range出逻辑header；仅读前缀需要实际codec支持。字典、中心及逐list count分布在正文中，目录与验证也未必只靠前缀足够。若现有codec不能做到小量读取，就保留明确的全量加载回退并报告读字节，不能声称已实现“免全量”。无新依赖或公开API扩大未经讨论加入。G的读取优化不跳过第4节首次加载校验。
 
-### 4.3 P2：用 header 估大小，省掉 driver 的全量 prepare
+## 7. 基线、TDD与验收
 
-`workingSetBytes`（`DistributedIndexSearch.java:573`）为了算预算，把每个索引文件完整读一遍并 prepare（串行、每 JVM 一次，结果只进 `KNOWN_PREPARED_BYTES`）。100M × 4bit 那是 7.5GB 的纯浪费读数（1bit 是 3.2GB）。
+### 7.1 正确性与模型测试先定义
 
-P1 之后 `estimatedBytes` 完全由 header 决定（list 数、条目数、每条目字节、字典长度），所以这一步可以退化成“尾部读 footer + 头部读 payload header”，不需要读 blob 正文。这条可延后，但它正好与 #2024 的“按真实占用记账”是同一件事。
-
-## 5. 风险与反例
-
-### 5.1 拷贝链决定成败（最重要）
-
-只有当 prepared **共享**容器里的那段字节时，常驻才会从 `payload + 1.78×payload` 变成 `payload + 目录`。如果实现时“从 payload 拷一份出来自己持有”，常驻变成 `容器 + 拷贝 = 2×`，只降 28%——**低于本卡 30% 的验收线**。所以 P0 不是可选项，而是 P1 收益的前提；评审时要按这个顺序卡。
-
-### 5.2 记账口径必须跟着改
-
-`PreparedSearch.estimatedBytes()` 的语义是“除了调用方已经记账的 payload 之外，prepared 还额外 retains 多少”。这条不变式要写进 javadoc 并用测试卡住：
-
-- 共享：`estimatedBytes ≈ 目录`（KB 级），`resident = payload.length + 目录`。
-- 拷贝：`estimatedBytes` 必须包含那份拷贝，否则缓存会低估、把预算撑爆。
-
-`TestVectorBuildMemory.java:239` 断言“build 时的 preparedBytes 估算 == prepare 时 `estimatedBytes()`”，两种路径都要按同一模型算。
-
-### 5.3 别把热循环搬到 ByteBuffer／direct memory
-
-热循环用 `byte[]` + `int` 偏移 + `VarHandle`：JIT 的边界检查消除和向量化都在 `byte[]` 上最好。`ByteBuffer` 会引入额外类型检查与调用，direct memory 还逃出堆预算（`IndexPayloadLimits` 的存在正说明“堆内 ≤2GB 就够”）。
-
-### 5.4 非量化分支也要做，但别用 4bit 的数字验收
-
-未量化每条目 payload 524B、结构 568B，改后降到 524B（降 52%）——收益仍然显著，但绝对字节大、结构占比小，看起来“变化不大”。验收要写绝对阈值（B/条目），不要只写比例。
-
-### 5.5 磁盘字节 ≠ 内存字节
-
-Puffin 容器默认压缩（`PuffinIndexFileContainer.java:62-66`），磁盘上 752MB 的文件，解压后的 payload 更大。核算“降了百分之多少”时只能用内存里的 payload 字节，拿磁盘大小会算出错误的百分比。
-
-### 5.6 反例（什么情况下这张卡不值得）
-
-- 单表、单索引、预算已经全装下（10M 现状 coverage=1.0）：只剩 prepare 首查与 p99 抖动的小钱。
-- 若将来把 payload 搬到 mmap/direct memory 并改按页记账，本设计的“字节账”要重做。
-- 若把 IVF 换成“索引文件更大、文件数更少”的布局，`sqrt(entries × files)` 变小，分配收益进一步缩小（但常驻收益不变，因为它是逐条目线性的）。
-
-## 6. 分步落地与工作量
-
-| 步骤 | 内容 | 估计 | 可独立合并 |
-|---|---|---|---|
-| P0 | blob 共享视图、`toBytes` 不再复制、`prepareFile` 传切片、`CachedFile.payload` 去留 | 1–2 天 | 是（行为零变化） |
-| P1 | `IvfKernel` 原地布局 + 无分配打分 + 有界堆 + `preparedBytes` 重写 + 口径同步 | 3–5 天 | 是 |
-| P2 | header 估大小，去掉 driver 侧全量 prepare | 1–2 天 | 是 |
-
-P1 只动 `index-vector`（`IvfKernel` 814 行、`RaBitQQuantizer` 加两个重载、`PreparedStructureSize` 口径），不碰 Spark 调度；P0 会碰 core 的 `IndexBlob`／`PuffinIndexFileContainer`，是唯一需要 API 讨论的地方。
-
-## 7. 测试与验收
-
-正确性：
-
-- `TestIvfKernel` 现有 recall／`searchBatch`／determinism 测试全部通过（召回不许变）。
-- 新增 tie-break 测试：构造同分候选（重复向量），断言“堆实现的输出顺序 == 全量排序实现的输出顺序”，含 topK 边界上的同分。
-- `TestVectorBuildMemory:239` 的 build 估算 == prepare 估算仍成立。
-- `TestPreparedStructureSize` 增加 B/条目的绝对断言与模型注释（4bit ≤ 100B、1bit ≤ 60B、未量化 ≤ 560B）。
-
-资源：
-
-- **峰值**：给 750MB 级 payload 的 prepare 单测加 `-Xmx` 约束（如 1.2 × payload）；现状会 OOM，改后通过——这是“拷贝链真的只剩一份”的硬证据。
-- **prepare 时间**：890 万条 payload 从“逐条解析”降到“读 header + 目录”，断言 ≤ 50ms 量级。
-- **分配**：`ThreadMXBean.getThreadAllocatedBytes`，单次 search ≤ 100KB（现状是每条目一个对象）。
-
-延迟（**这条要按配对测量写**）：
-
-- 同一轮里 A/B 交替跑，报告 10M×4bit 与 100M×4bit／1bit 的中位与 p99；判据是“中位比 ≤ 1.05 且两轮符号一致”，不接受“12 次测量差 5% 以内”。理由：benchmark 报告里同一格在不同时段出现过 13.5s vs 51.7s、首查 356s 的差异，用噪声阈值判回归没有分辨力。
-
-容量（真正的主指标）：
-
-- 同一 100M×4bit 表、同 6×12GB 环境，`coverage` 前后对照（#2024 的探针）。**这条也是本卡的优先级关口**：如果实测 100M 已经 coverage ≥ 0.95，本卡降级为“顺手做”，先落 P0+P2。
-
-## 8. 被否掉的备选
-
-| 备选 | 否掉的理由 |
+| 测试组 | 必须覆盖 |
 |---|---|
-| 把 list 目录写进 payload（升 `FORMAT_VERSION`） | 目录能从 header 在 prepare 时用 `nlist` 次读算出来，代价可忽略；升版意味着所有索引重建（100M 约 40 分钟/轮），得不偿失 |
-| payload 走 direct／mmap | 热循环 JIT 更差、逃出堆预算、`Integer.MAX_VALUE` 的堆内上限本来就够 |
-| 只做有界堆，不动布局 | 常驻一点没降（仍是 152B/条目），只拿到 ~50ms 的延迟与 p99 抖动，不值一次改动 |
-| 保留对象图但丢掉 `CachedFile.payload`（240 → 152，降 37%） | 便宜但没有终点：结构仍是每条目 152B；只在 P0 受阻时作为退路 |
-| per-prepared `scratch float[3]` 复用 factors | 引入可变状态，正确性依赖“同一 prepared 不并发搜索”，将来会被静默破坏 |
+| 旧格式 | 旧写者生成legacy/v1/v2 payload；大端编号/long/float；writeUTF/readUTF路径含NUL、中文、重音、补充字符 |
+| 步长/定位 | d=129、2bit及各1–8bit；非2次幂维度；256MiB与512MiB上下偏移；checked乘加和code边界 |
+| 完整验证 | 未探测list非法文件编号、负count、总数不符、截断中心/code/factors、过大头部计数、允许的尾字节 |
+| 输入与并发 | 非零position/limit、slice、read-only/direct、外部修改；并发search的私有scratch；lease释放 |
+| Top-K与数值 | 同分边界/乱序及重复路径字典、各metric；NaN/±0/±Infinity比较器；大topK小V、空索引；逐score原始double位值/逐结果与旧参考一致 |
+| 内存与迁移 | 可达数组身份去重、U完整计入、C释放、build/runtime/placement相等且下界正确；旧model、未知/profile不匹配；IVF/HNSW/FLAT不同状态 |
+| 集成 | 全部索引回归、recall、实际拥有searchBatch的模块、FLAT精确排序；文本读取和统计合同不变 |
 
-## 9. 待定问题
+大型offset的算法测试先用不需要巨堆的地址计算样本，独立资源探针再实测跨256/512MiB的真实payload。极端比较器输入不代表放宽已有写入端finite约束。新目录/评分参考不得与待测代码复用错误的解析算法；使用旧写者fixture和旧全量排序作为独立参照。
 
-1. **100M 的 coverage 实测**（决定 P1 优先级；用现成探针半天可测）。
-2. `IndexBlob` 共享视图的 API 形态：改现有类的契约，还是在索引读路径新增内部类型（影响 revapi 与 core 的公开 API 稳定性）。
-3. `PreparedSearch` 是否需要显式区分“我持有 payload”与“我不持有”，让 `IndexCacheMemory` 不必猜（当前靠 `preparedBytes <= 0` 的兜底，`ExecutorIndexCache.java:1311-1321`）。
-4. 目录要不要顺手为 #2772 的 list 级 Range 读留出“每 list 的字节区间”语义（本设计的偏移差已经够，但要在命名上体现）。
+### 7.2 测量边界与通过标准
+
+B在改产品前固定commit、镜像、JVM/GC/堆、压缩codec、真实文件数与条目数、d/padded/bits/nlist/nprobe/topK和查询集合。分开量：容器load含读取/解压/边界复制，kernel prepare含快照/完整验证/目录，driver估算，kernel search及端到端SQL。记录各阶段峰值、分配字节、prepare时间、常驻对象图；search给暖态p50/p99与冷态数据，原始证据可复跑。工具进并列 `iceberg-tools` 仓，产品测试进拥有实现的模块。
+
+初期IVF门槛保留：同口径常驻下降≥30%、query分配降低至少一个数量级、暖态p50不劣于改前（5%容忍度），回归/recall/searchBatch通过。5%是验收门槛不是测量精度；A/B配对交替、反转先后、充分暖机并多轮重复，样本不足或波动跨门槛时标不确定，不用“两轮符号一致”替代统计证据。p99、峰值及prepare成本如实报告，不能把明显劣化藏在内存收益后；失败先定位/回退，不能迁就设计。
+
+至少覆盖128维1bit/4bit/未量化及129维2bit正确性，按小/大topK、nprobe和文件布局报告。10M单文件是独立实验形态，不能把现有10M多文件索引总磁盘字节写成某单文件大小。100M按真实文件并集coverage、副本和每executor预算报告；baseline coverage=1仍测试余量，不强制要求提高coverage。
+
+FLAT独立测分配、排序和精确结果，不套用IVF内存门槛。所有性能数字在B/E/H实际测量前均为未验证。资源测试用受控子进程、预制fixture和明确堆/GC记录，不在普通单测写固定750MB或固定50ms断言；`getThreadAllocatedBytes`若不支持须报告，不能把缺测当0。测试部署用明确新jar/镜像重启测试服务后真实SQL smoke，清理junk数据/索引并保留正式证据。
+
+## 8. 子卡、交付与复审门
+
+| 子卡 | 交付 |
+|---|---|
+| A #2779 | 本修订稿、四项确定错误和新增边界逐条处置，双份逐字节保存并独立复审 |
+| B #2775 | 固定改前基线与独立探针，不确认尚未测量的收益 |
+| C #2780 | 独占状态、model=2真实记账与旧估算resolver，公共adapter合同 |
+| D #2776 | 包内向量工具+IVF目录/完整校验/原地打分/有界堆 |
+| E #2778 | IVF核心回归、配对测量、集群smoke及容量证据 |
+| F #2774 | 后续公共拷贝链减少，逐kernel验证 |
+| G #2777 | 后续driver估算读取优化，真实codec路径和回退 |
+| H #2782 | FLAT第二真实调用方及独立验收 |
+
+依赖保持 A→B→C→D→E，E→F/G/H；F/G/H可分别推进，不是D/E前置。不使用初稿P0/P1/P2顺序，不预设工期和未验证的收益。首次落地保持中心/量化器算术和公开复制合同，centroid选择、signs共享等可另行测量，不强制捎带。
+
+本稿独立只读技术复审未发现阻断项，人工确认仍待完成。A移入review不意味着整个#2773完成，B及实现仍受A完成状态阻塞。仓库`docs/`为权威版本，umem保存同格式同字节副本并校验sha256；模型、布局或验收发生变化，两份一起更新。
+
+## 9. 评审处置索引
+
+| 意见 | 落实位置 |
+|---|---|
+| 小端错误、modified UTF-8、padded维度 | §4.1与旧格式/步长测试 |
+| visitRank错误、NaN/±0/Infinity、浮点精度 | §5完整比较和逐score参考 |
+| 256MiB绝对位地址溢出 | §4.3及大offset测试 |
+| C/U共享、只读不等于不可变、漏记U | §2、§3.1、§3.2所有权/计费 |
+| 未探测list校验、总数、截断和prepare复杂度 | §4.2明确全记录验证，撤回header-only承诺 |
+| 超大topK预分配 | §5 T=min(topK,V)，按真实候选增长 |
+| 旧model迁移及driver压缩header | §3.2、§6统一重估/unknown与实际读路径 |
+| 固定收益、单机比例冒充coverage、阶段峰值 | §2、§7.2基线及独立测量 |
+| 分层、FLAT调用方、公共优化后置 | §1、§5、§6、§8 |
