@@ -248,6 +248,7 @@ private[spark] object VectorSearchExec {
       return null
     }
 
+    val vectorIndex = names.indexOf(context.request.input.column)
     IndexEntries
       .liveRows(
         spark,
@@ -258,6 +259,10 @@ private[spark] object VectorSearchExec {
         context.inputs.scanTasks)
       .queryExecution
       .toRdd
+      // a row without a vector is not a candidate, and the index branch never returns one: the two
+      // branches have to answer the same question, or the same row would appear or not depending on
+      // whether its file happens to be covered
+      .filter(row => vectorIndex < 0 || !row.isNullAt(vectorIndex))
       .map(row => row.copy())
   }
 

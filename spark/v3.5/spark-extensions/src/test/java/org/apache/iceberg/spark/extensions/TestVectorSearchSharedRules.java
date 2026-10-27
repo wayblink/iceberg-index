@@ -232,10 +232,12 @@ class TestVectorSearchSharedRules {
   }
 
   @Test
-  void aNullVectorAppendedAfterTheIndexIsStillAnswered() throws Exception {
-    // an index is only ever built over rows that have a vector, so a covered file holds no null.
-    // A null appended later is in an uncovered file, reaches the answer through the scan branch,
-    // and keeps the ordering Spark gives it: first, for an ascending distance
+  void aRowWithoutAVectorIsNotAQueryResult() throws Exception {
+    // a vector query asks which row is nearest, and a row with no vector has no distance: it is not
+    // a candidate. That holds whether its file is covered or not, so the row appended after the
+    // build is left out by the scan branch just as the index leaves out the one it was built over.
+    // A scan of the same rows without the index does return it, first, because a null distance
+    // sorts first -- the difference is the point of the rule, not a side effect.
     spark.sql(
         "CREATE TABLE local.db.shared_nullable (id bigint, embedding array<double>) USING iceberg");
     spark.sql(
@@ -251,25 +253,33 @@ class TestVectorSearchSharedRules {
             + "ORDER BY vec_distance(embedding, array(1.0d, 0.0d)) LIMIT 3";
     assertThat(spark.sql(query).queryExecution().optimizedPlan().toString())
         .contains("VectorSearchSource");
+    List<Row> answered = spark.sql(query).collectAsList();
+    assertThat(answered.stream().map(row -> row.getLong(0)))
+        .as("only the rows that have a vector")
+        .containsExactly(1L, 2L);
 
-    // the same query without the index, which is the answer the rewrite has to reproduce
+    // the same rows without an index, which is what a plain scan answers: three of them, the row
+    // with no vector first
     spark.sql(
-        "CREATE TABLE local.db.shared_nullable_plain (id bigint, embedding array<double>) USING iceberg");
+        "CREATE TABLE local.db.shared_nullable_plain (id bigint, embedding array<double>) "
+            + "USING iceberg");
     spark.sql(
         "INSERT INTO local.db.shared_nullable_plain VALUES (1, array(1.0d, 0.0d)), "
             + "(2, array(0.0d, 1.0d)), (3, null)");
     String plain =
         "SELECT id FROM local.db.shared_nullable_plain "
             + "ORDER BY vec_distance(embedding, array(1.0d, 0.0d)) LIMIT 3";
-    assertThat(spark.sql(query).collectAsList())
-        .containsExactlyElementsOf(spark.sql(plain).collectAsList());
+    assertThat(spark.sql(plain).collectAsList()).hasSize(3);
 
-    // a guard on the vector column removes that row from both branches alike
+    // once the query rules the null row out itself, the two agree exactly
     String guarded =
         "SELECT id FROM local.db.shared_nullable WHERE embedding IS NOT NULL "
             + "ORDER BY vec_distance(embedding, array(1.0d, 0.0d)) LIMIT 3";
-    assertThat(spark.sql(guarded).queryExecution().optimizedPlan().toString())
-        .contains("VectorSearchSource");
+    assertThat(
+            spark.sql(guarded).collectAsList().stream()
+                .map(row -> row.getLong(0))
+                .collect(java.util.stream.Collectors.toList()))
+        .containsExactly(1L, 2L);
     assertThat(spark.sql(guarded).collectAsList()).hasSize(2);
   }
 

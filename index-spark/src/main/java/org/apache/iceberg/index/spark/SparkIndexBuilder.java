@@ -365,7 +365,8 @@ public final class SparkIndexBuilder {
     JavaRDD<Row> allRows = null;
     List<JavaRDD<Row>> groups = Lists.newArrayList();
     for (List<FileScanTask> groupTasks : tasksByIndexFile.values()) {
-      JavaRDD<Row> rows = IndexEntries.entryRows(spark, table, groupTasks, vectorColumn, adapter);
+      JavaRDD<Row> rows =
+          IndexEntries.entryRows(spark, table, groupTasks, vectorColumn, adapter, progress.skipped);
       if (rows != null) {
         // a group is one index file, so its rows have to reach one task; merging the partitions of
         // its data files is a narrow transformation, which is the point of reading this way
@@ -509,11 +510,13 @@ public final class SparkIndexBuilder {
     }
 
     LOG.info(
-        "Built {} of {} index files for {}, {} rows, {} failed, in {} ms",
+        "Built {} of {} index files for {}, {} rows, {} skipped for having no vector, {} failed, "
+            + "in {} ms",
         filesBuilt.value(),
         totalGroups,
         indexLocation,
         rowsWritten.value(),
+        progress.skipped(),
         filesFailed.value(),
         System.currentTimeMillis() - buildStartedMillis);
 
@@ -556,6 +559,7 @@ public final class SparkIndexBuilder {
     private final LongAccumulator built;
     private final LongAccumulator failed;
     private final LongAccumulator rows;
+    private final LongAccumulator skipped;
     private final java.util.concurrent.atomic.AtomicLong total =
         new java.util.concurrent.atomic.AtomicLong(0L);
 
@@ -564,6 +568,7 @@ public final class SparkIndexBuilder {
       this.built = context.longAccumulator(BUILT_ACCUMULATOR);
       this.failed = context.longAccumulator(FAILED_ACCUMULATOR);
       this.rows = context.longAccumulator(ENTRIES_ACCUMULATOR);
+      this.skipped = context.longAccumulator(SKIPPED_ACCUMULATOR);
     }
 
     private long filesTotal() {
@@ -581,11 +586,16 @@ public final class SparkIndexBuilder {
     private long rows() {
       return rows.value();
     }
+
+    private long skipped() {
+      return skipped.value();
+    }
   }
 
   private static final String BUILT_ACCUMULATOR = "iceberg.index.build.files-built";
   private static final String FAILED_ACCUMULATOR = "iceberg.index.build.files-failed";
   private static final String ENTRIES_ACCUMULATOR = "iceberg.index.build.rows";
+  private static final String SKIPPED_ACCUMULATOR = "iceberg.index.build.skipped-null-vectors";
 
   /** How many data files the group at this partition index was assigned. */
   private static int dataFileCount(Map<Integer, List<FileScanTask>> tasksByIndexFile, int index) {

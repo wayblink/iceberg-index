@@ -68,6 +68,7 @@ import org.apache.spark.sql.types.DataType;
 import org.apache.spark.sql.types.DataTypes;
 import org.apache.spark.sql.types.StructField;
 import org.apache.spark.sql.types.StructType;
+import org.apache.spark.util.LongAccumulator;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import scala.Tuple2;
@@ -137,6 +138,26 @@ public final class IndexEntries {
       java.util.Collection<FileScanTask> tasks,
       String column,
       IndexAdapter adapter) {
+    return entryRows(spark, table, tasks, column, adapter, null);
+  }
+
+  /**
+   * The same, reporting the rows it left out.
+   *
+   * <p>A row whose vector is null has nothing to put in an index, and a nearest-neighbour query is
+   * about the rows that have a vector: such a row is skipped rather than failing the build, and
+   * counted so the caller can say how many it was. A vector that is present but cannot be indexed,
+   * a wrong dimension for instance, is still an error about the data.
+   *
+   * @param skipped counts the rows left out because they have no vector, which may be null
+   */
+  public static JavaRDD<Row> entryRows(
+      SparkSession spark,
+      Table table,
+      java.util.Collection<FileScanTask> tasks,
+      String column,
+      IndexAdapter adapter,
+      LongAccumulator skipped) {
     Schema tableSchema = table.schema();
     List<FileScanTask> taskList = Lists.newArrayList(tasks);
     if (taskList.isEmpty()) {
@@ -159,8 +180,12 @@ public final class IndexEntries {
     for (FileScanTask task : taskList) {
       String dataFile = task.file().location().toString();
 
+      int columnIndex = readColumns.indexOf(column);
       JavaRDD<Row> fileRows =
           liveRowsOf(spark, tableSchema, task, readColumns, null, null, deletes, conf)
+              .filter(
+                  (Function<Tuple2<Long, Row>, Boolean>)
+                      entry -> hasVector(entry._2(), columnIndex, skipped))
               .mapToPair(
                   (PairFunction<Tuple2<Long, Row>, Long, Row>)
                       entry ->
@@ -169,8 +194,7 @@ public final class IndexEntries {
                               RowFactory.create(
                                   dataFile,
                                   entry._1(),
-                                  adapter.encodeEntryValue(
-                                      columnValue(entry._2(), readColumns.indexOf(column))))))
+                                  adapter.encodeEntryValue(columnValue(entry._2(), columnIndex)))))
               .values();
 
       rows = rows == null ? fileRows : rows.union(fileRows);
@@ -1122,6 +1146,17 @@ public final class IndexEntries {
    * Spark rows as Scala sequences, which are converted to Java lists here so adapters do not need
    * Scala.
    */
+  /** Whether a row has a vector to index, counting the row when it does not. */
+  private static boolean hasVector(Row row, int columnIndex, LongAccumulator skipped) {
+    if (columnValue(row, columnIndex) == null) {
+      if (skipped != null) {
+        skipped.add(1L);
+      }
+      return false;
+    }
+    return true;
+  }
+
   private static Object columnValue(Row row, int columnIndex) {
     Object value = row.get(columnIndex);
     if (value instanceof scala.collection.Seq) {
