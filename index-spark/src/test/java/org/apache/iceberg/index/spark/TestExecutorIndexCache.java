@@ -47,7 +47,7 @@ class TestExecutorIndexCache {
   @Test
   void loadsEachFileOnce() {
     AtomicInteger loads = new AtomicInteger();
-    ExecutorIndexCache.Config enabled = config(1024 * 1024, 1024 * 1024);
+    ExecutorIndexCache.Config enabled = config(1024 * 1024);
 
     for (int i = 0; i < 3; i++) {
       ExecutorIndexCache.CachedFile file =
@@ -63,7 +63,7 @@ class TestExecutorIndexCache {
   @Test
   void keepsFilesApartByLocationAndAdapter() {
     AtomicInteger loads = new AtomicInteger();
-    ExecutorIndexCache.Config enabled = config(1024 * 1024, 1024 * 1024);
+    ExecutorIndexCache.Config enabled = config(1024 * 1024);
 
     cache.file("s3://bucket/a.puffin", enabled, "adapter", () -> load(loads, 10));
     cache.file("s3://bucket/b.puffin", enabled, "adapter", () -> load(loads, 20));
@@ -77,7 +77,7 @@ class TestExecutorIndexCache {
   @Test
   void evictsLeastRecentlyUsedWhenOverBudget() {
     AtomicInteger loads = new AtomicInteger();
-    ExecutorIndexCache.Config enabled = mode(ExecutorIndexCache.Mode.PIN_HOT, 250, 250);
+    ExecutorIndexCache.Config enabled = mode(ExecutorIndexCache.Mode.PIN_HOT, 250);
 
     cache.file("s3://bucket/a.puffin", enabled, "adapter", () -> load(loads, 100));
     cache.file("s3://bucket/b.puffin", enabled, "adapter", () -> load(loads, 100));
@@ -93,22 +93,24 @@ class TestExecutorIndexCache {
   }
 
   @Test
-  void doesNotCacheAFileOverTheEntryLimit() {
+  void cachesAFileWithoutASizeLimitOfItsOwn() {
+    // one entry is one prepared index file, and a file bigger than the others is still a file the
+    // query reads every time: refusing it only makes the cache read it again. What bounds the cache
+    // is the budget, not a second, smaller ceiling per file.
     AtomicInteger loads = new AtomicInteger();
-    ExecutorIndexCache.Config enabled = config(1024 * 1024, 50);
+    ExecutorIndexCache.Config enabled = config(1024 * 1024);
 
     cache.file("s3://bucket/big.puffin", enabled, "adapter", () -> load(loads, 100));
     cache.file("s3://bucket/big.puffin", enabled, "adapter", () -> load(loads, 100));
 
-    assertThat(loads).hasValue(2);
-    assertThat(cache.stats().skippedTooLarge()).isEqualTo(2);
-    assertThat(cache.stats().entries()).isZero();
+    assertThat(loads).as("the second read is served from the cache").hasValue(1);
+    assertThat(cache.stats().entries()).isEqualTo(1);
   }
 
   @Test
   void pinHotAdmitsAFileOnlyOnceItIsAskedForTwice() {
     AtomicInteger loads = new AtomicInteger();
-    ExecutorIndexCache.Config pinHot = mode(ExecutorIndexCache.Mode.PIN_HOT, 1 << 20, 1 << 20);
+    ExecutorIndexCache.Config pinHot = mode(ExecutorIndexCache.Mode.PIN_HOT, 1 << 20);
 
     cache.file("s3://bucket/a.puffin", pinHot, "adapter", () -> load(loads, 10));
     assertThat(cache.stats().entries()).isZero();
@@ -123,7 +125,7 @@ class TestExecutorIndexCache {
   @Test
   void streamModeKeepsNothing() {
     AtomicInteger loads = new AtomicInteger();
-    ExecutorIndexCache.Config stream = mode(ExecutorIndexCache.Mode.STREAM, 1 << 20, 1 << 20);
+    ExecutorIndexCache.Config stream = mode(ExecutorIndexCache.Mode.STREAM, 1 << 20);
 
     for (int i = 0; i < 3; i++) {
       cache.file("s3://bucket/a.puffin", stream, "adapter", () -> load(loads, 10));
@@ -136,7 +138,7 @@ class TestExecutorIndexCache {
   @Test
   void aFileAskedForTwiceOutranksOneSeenOnce() {
     AtomicInteger loads = new AtomicInteger();
-    ExecutorIndexCache.Config pinHot = mode(ExecutorIndexCache.Mode.PIN_HOT, 250, 250);
+    ExecutorIndexCache.Config pinHot = mode(ExecutorIndexCache.Mode.PIN_HOT, 250);
 
     // a is admitted after its second ask and promoted on its third, so when c needs room the entry
     // seen once is the one that goes
@@ -155,7 +157,7 @@ class TestExecutorIndexCache {
   @Test
   void pinAllDoesNotEvictToMakeRoom() {
     AtomicInteger loads = new AtomicInteger();
-    ExecutorIndexCache.Config pinAll = mode(ExecutorIndexCache.Mode.PIN_ALL, 250, 250);
+    ExecutorIndexCache.Config pinAll = mode(ExecutorIndexCache.Mode.PIN_ALL, 250);
 
     cache.file("s3://bucket/a.puffin", pinAll, "adapter", () -> load(loads, 100));
     cache.file("s3://bucket/b.puffin", pinAll, "adapter", () -> load(loads, 100));
@@ -169,7 +171,7 @@ class TestExecutorIndexCache {
   void unloadsEntriesThatNoQueryAskedFor() throws Exception {
     AtomicInteger loads = new AtomicInteger();
     ExecutorIndexCache.Config ttl =
-        ExecutorIndexCache.Config.of(true, 1 << 20, 1 << 20, ExecutorIndexCache.Mode.PIN_ALL, 1);
+        ExecutorIndexCache.Config.of(true, 1 << 20, ExecutorIndexCache.Mode.PIN_ALL, 1);
     ExecutorIndexCache.sweepIntervalForTests(0);
 
     cache.file("s3://bucket/a.puffin", ttl, "adapter", () -> load(loads, 10));
@@ -184,7 +186,9 @@ class TestExecutorIndexCache {
   @Test
   void twoLoadsInFlightReserveTheirRoomInsteadOfBothSeeingItFree() throws Exception {
     // Two 100-byte loads can hold room at once; the third must wait for a reservation to finish.
-    ExecutorIndexCache.Config enabled = config(250, 100);
+    // Each load says how large its file is before reading it, which is what a caller that reads a
+    // file can do and what keeps the reservation proportional to the file without a ceiling.
+    ExecutorIndexCache.Config enabled = config(250);
     CountDownLatch allStarted = new CountDownLatch(2);
     CountDownLatch mayFinish = new CountDownLatch(1);
     ExecutorService pool = Executors.newFixedThreadPool(3);
@@ -198,6 +202,7 @@ class TestExecutorIndexCache {
                       "s3://bucket/" + name + ".puffin",
                       enabled,
                       "adapter",
+                      100L,
                       () -> {
                         allStarted.countDown();
                         try {
@@ -229,8 +234,8 @@ class TestExecutorIndexCache {
   @Test
   void aTableBeyondItsShareIsTheOneThatLosesRoom() {
     AtomicInteger loads = new AtomicInteger();
-    ExecutorIndexCache.Config small = ownerConfig("small", 400, 400);
-    ExecutorIndexCache.Config large = ownerConfig("large", 400, 400);
+    ExecutorIndexCache.Config small = ownerConfig("small", 400);
+    ExecutorIndexCache.Config large = ownerConfig("large", 400);
 
     // small keeps one entry of 100; large fills the rest and then needs more
     ask("s3://bucket/small-a.puffin", small, loads);
@@ -250,8 +255,8 @@ class TestExecutorIndexCache {
   @Test
   void aTableBorrowsRoomAnotherIsNotUsing() {
     AtomicInteger loads = new AtomicInteger();
-    ExecutorIndexCache.Config small = ownerConfig("small", 300, 300);
-    ExecutorIndexCache.Config large = ownerConfig("large", 300, 300);
+    ExecutorIndexCache.Config small = ownerConfig("small", 300);
+    ExecutorIndexCache.Config large = ownerConfig("large", 300);
 
     // with only one table holding anything, it may use the whole budget
     ask("s3://bucket/large-a.puffin", large, loads);
@@ -288,7 +293,7 @@ class TestExecutorIndexCache {
   @Test
   void preparesOneFileOnceWhenTwoThreadsAskAtTheSameTime() throws Exception {
     AtomicInteger loads = new AtomicInteger();
-    ExecutorIndexCache.Config enabled = config(1024 * 1024, 1024 * 1024);
+    ExecutorIndexCache.Config enabled = config(1024 * 1024);
     CountDownLatch start = new CountDownLatch(1);
     ExecutorService threads = Executors.newFixedThreadPool(4);
     try {
@@ -332,7 +337,7 @@ class TestExecutorIndexCache {
 
   @Test
   void searchesOneFileFromOneThreadAtATime() throws Exception {
-    ExecutorIndexCache.Config enabled = config(1024 * 1024, 1024 * 1024);
+    ExecutorIndexCache.Config enabled = config(1024 * 1024);
     ExecutorIndexCache.CachedFile file =
         cache.file("s3://bucket/a.puffin", enabled, "adapter", () -> load(new AtomicInteger(), 10));
 
@@ -379,8 +384,8 @@ class TestExecutorIndexCache {
     assertThat(overlapped).hasValue(0);
   }
 
-  private static ExecutorIndexCache.Config config(long maxBytes, long maxEntryBytes) {
-    return ExecutorIndexCache.Config.of(true, maxBytes, maxEntryBytes);
+  private static ExecutorIndexCache.Config config(long maxBytes) {
+    return ExecutorIndexCache.Config.of(true, maxBytes);
   }
 
   /** A PIN_HOT cache admits a file on its second ask, so asking twice is what plants an entry. */
@@ -389,21 +394,18 @@ class TestExecutorIndexCache {
     cache.file(location, config, "adapter", () -> load(loads, 100));
   }
 
-  private static ExecutorIndexCache.Config ownerConfig(
-      String owner, long maxBytes, long maxEntryBytes) {
-    return ExecutorIndexCache.Config.of(
-            true, maxBytes, maxEntryBytes, ExecutorIndexCache.Mode.PIN_HOT, 0)
+  private static ExecutorIndexCache.Config ownerConfig(String owner, long maxBytes) {
+    return ExecutorIndexCache.Config.of(true, maxBytes, ExecutorIndexCache.Mode.PIN_HOT, 0)
         .withOwner(owner);
   }
 
-  private static ExecutorIndexCache.Config owned(String owner, long maxBytes, long maxEntryBytes) {
+  private static ExecutorIndexCache.Config owned(String owner, long maxBytes) {
     return ExecutorIndexCache.Config.from(
         org.apache.spark.sql.SparkSession.builder().getOrCreate(), 0, owner);
   }
 
-  private static ExecutorIndexCache.Config mode(
-      ExecutorIndexCache.Mode mode, long maxBytes, long maxEntryBytes) {
-    return ExecutorIndexCache.Config.of(true, maxBytes, maxEntryBytes, mode, 0);
+  private static ExecutorIndexCache.Config mode(ExecutorIndexCache.Mode mode, long maxBytes) {
+    return ExecutorIndexCache.Config.of(true, maxBytes, mode, 0);
   }
 
   private static ExecutorIndexCache.CachedFile load(AtomicInteger loads, int bytes) {

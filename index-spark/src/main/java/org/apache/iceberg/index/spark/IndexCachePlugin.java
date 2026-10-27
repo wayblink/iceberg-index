@@ -129,7 +129,7 @@ public class IndexCachePlugin implements SparkPlugin {
               pluginContext.executorID(),
               incarnation(pluginContext),
               ExecutorIndexCache.get(),
-              ExecutorIndexCache.Config.of(true, Math.max(1L, budget), Math.max(1L, budget / 2)),
+              ExecutorIndexCache.Config.of(true, Math.max(1L, budget)),
               new IndexCacheReadContext(),
               config);
       loop = new IndexCacheExecutorLoop(channel, worker, config, budget);

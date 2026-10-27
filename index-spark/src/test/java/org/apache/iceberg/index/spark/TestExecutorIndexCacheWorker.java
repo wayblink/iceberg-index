@@ -432,7 +432,7 @@ class TestExecutorIndexCacheWorker {
             INCARNATION,
             cache,
             // Only 100 bytes of budget: the 120-byte file cannot be admitted right now.
-            ExecutorIndexCache.Config.of(true, 100L, 1_000L),
+            ExecutorIndexCache.Config.of(true, 100L),
             countingLoader(),
             IndexCacheWorkerConfig.parse(Map.of()));
 
@@ -440,25 +440,6 @@ class TestExecutorIndexCacheWorker {
 
     assertThat(ack.status()).isEqualTo(IndexCacheProtocol.AckStatus.REJECTED);
     assertThat(ack.reason()).isEqualTo("BUSY");
-  }
-
-  @Test
-  void anEntryLargerThanTheCacheLimitIsPermanent() {
-    worker.close();
-    worker =
-        new ExecutorIndexCacheWorker(
-            SESSION,
-            EXECUTOR,
-            INCARNATION,
-            cache,
-            ExecutorIndexCache.Config.of(true, 1_000_000L, 100L),
-            countingLoader(),
-            IndexCacheWorkerConfig.parse(Map.of()));
-
-    IndexCacheProtocol.Ack ack = worker.execute(load("A", "f1", 1));
-
-    assertThat(ack.status()).isEqualTo(IndexCacheProtocol.AckStatus.REJECTED);
-    assertThat(ack.reason()).isEqualTo("ENTRY_TOO_LARGE");
   }
 
   @Test
@@ -471,7 +452,7 @@ class TestExecutorIndexCacheWorker {
             EXECUTOR,
             INCARNATION,
             cache,
-            ExecutorIndexCache.Config.of(true, 130L, 1_000L),
+            ExecutorIndexCache.Config.of(true, 130L),
             countingLoader(),
             IndexCacheWorkerConfig.parse(Map.of()));
 
@@ -582,7 +563,7 @@ class TestExecutorIndexCacheWorker {
         EXECUTOR,
         INCARNATION,
         cache,
-        ExecutorIndexCache.Config.of(true, 1_000_000L, 1_000_000L),
+        ExecutorIndexCache.Config.of(true, 1_000_000L),
         loader,
         config);
   }

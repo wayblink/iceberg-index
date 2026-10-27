@@ -177,7 +177,7 @@ prepared.search(query, topK);   // ← 内部串行化，见 §5
 **已实现**
 - `ExecutorIndexCache`（`index-spark`，JVM 单例）：`LinkedHashMap(accessOrder)` 做 LRU、按字节记账、per-location 单飞（`ConcurrentHashMap<String, Object>` 作 monitor）、`skippedTooLarge`、`hits/misses/loads/evictions/bytes` 统计。
 - 接入两处调用点：`DistributedIndexSearch.search`（单查询）与 `searchBatch`（批）。原来"读 payload + Puffin 解析 + prepare"整体移进 `Loader`，只在 miss 时执行。
-- 配置（driver 读、随 job 广播）：`spark.iceberg.index.cache.enabled`（默认 false）、`.bytes`（默认 512m）、`.max-entry-bytes`（默认 256m），支持 k/m/g 后缀。
+- 配置（driver 读、随 job 广播）：`spark.iceberg.index.cache.enabled`（默认 false）、`.bytes`（默认 512m），支持 k/m/g 后缀。单条的大小不再设有独立上限：一个是文件就要能被缓存，另一个是上限与预算各说一套时只会静默退化。
 - 缓存键 = `adapter 类名 | blob 类型` + 文件 location（索引文件不可变，不主动失效）。
 - 并发：`CachedFile.searching(...)` 持 per-file 锁，满足 kernel"单线程使用 PreparedSearch"的契约。
 - 计数：`PreparedSearch.estimatedBytes()` 默认 0，缓存回退到"payload 长度的两倍"。

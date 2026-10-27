@@ -87,31 +87,22 @@ final class ExecutorIndexCache {
   static final class Config implements Serializable {
     static final String ENABLED = "spark.iceberg.index.cache.enabled";
     static final String BYTES = "spark.iceberg.index.cache.bytes";
-    static final String MAX_ENTRY_BYTES = "spark.iceberg.index.cache.max-entry-bytes";
     static final String HEAP_FRACTION = "spark.iceberg.index.cache.heap-fraction";
     static final String MODE = "spark.iceberg.index.cache.mode";
     static final String IDLE_TTL = "spark.iceberg.index.cache.idle-ttl";
     static final long MIN_BUDGET_BYTES = 512L * 1024L * 1024L;
 
-    private static final Config DISABLED = new Config(false, 0, 0, Mode.STREAM, 0, "");
+    private static final Config DISABLED = new Config(false, 0, Mode.STREAM, 0, "");
 
     private final boolean enabled;
     private final long maxBytes;
-    private final long maxEntryBytes;
     private final Mode mode;
     private final long idleTtlMillis;
     private final String owner;
 
-    private Config(
-        boolean enabled,
-        long maxBytes,
-        long maxEntryBytes,
-        Mode mode,
-        long idleTtlMillis,
-        String owner) {
+    private Config(boolean enabled, long maxBytes, Mode mode, long idleTtlMillis, String owner) {
       this.enabled = enabled;
       this.maxBytes = maxBytes;
-      this.maxEntryBytes = maxEntryBytes;
       this.mode = mode;
       this.idleTtlMillis = idleTtlMillis;
       this.owner = owner;
@@ -141,19 +132,14 @@ final class ExecutorIndexCache {
       return DISABLED;
     }
 
-    static Config of(boolean enabled, long maxBytes, long maxEntryBytes) {
+    static Config of(boolean enabled, long maxBytes) {
       Preconditions.checkArgument(maxBytes > 0, "The cache budget must be positive: %s", maxBytes);
-      Preconditions.checkArgument(
-          maxEntryBytes > 0, "The per-entry limit must be positive: %s", maxEntryBytes);
-      return new Config(enabled, maxBytes, maxEntryBytes, Mode.PIN_ALL, 0, "");
+      return new Config(enabled, maxBytes, Mode.PIN_ALL, 0, "");
     }
 
-    static Config of(
-        boolean enabled, long maxBytes, long maxEntryBytes, Mode mode, long idleTtlMillis) {
+    static Config of(boolean enabled, long maxBytes, Mode mode, long idleTtlMillis) {
       Preconditions.checkArgument(maxBytes > 0, "The cache budget must be positive: %s", maxBytes);
-      Preconditions.checkArgument(
-          maxEntryBytes > 0, "The per-entry limit must be positive: %s", maxEntryBytes);
-      return new Config(enabled, maxBytes, maxEntryBytes, mode, idleTtlMillis, "");
+      return new Config(enabled, maxBytes, mode, idleTtlMillis, "");
     }
 
     /**
@@ -181,7 +167,6 @@ final class ExecutorIndexCache {
 
       String configured = setting(spark, BYTES, null);
       long configuredBytes = configured != null ? parseBytes(configured, BYTES) : 0L;
-      long maxEntryBytes = parseBytes(setting(spark, MAX_ENTRY_BYTES, "256m"), MAX_ENTRY_BYTES);
       int executors = executors(spark);
       long budget =
           derive(
@@ -193,9 +178,7 @@ final class ExecutorIndexCache {
               heapFraction(spark));
       Mode mode = mode(setting(spark, MODE, "auto"), workingSetBytes, budget, executors);
       long idleTtlMillis = durationMillis(setting(spark, IDLE_TTL, "30m"), IDLE_TTL);
-      long effectiveEntryLimit = Math.min(maxEntryBytes, budget);
-      return new Config(
-          true, budget, effectiveEntryLimit, mode, idleTtlMillis, owner == null ? "" : owner);
+      return new Config(true, budget, mode, idleTtlMillis, owner == null ? "" : owner);
     }
 
     /**
@@ -352,10 +335,6 @@ final class ExecutorIndexCache {
       return maxBytes;
     }
 
-    long maxEntryBytes() {
-      return maxEntryBytes;
-    }
-
     Mode mode() {
       return mode;
     }
@@ -370,7 +349,7 @@ final class ExecutorIndexCache {
     }
 
     Config withOwner(String newOwner) {
-      return new Config(enabled, maxBytes, maxEntryBytes, mode, idleTtlMillis, newOwner);
+      return new Config(enabled, maxBytes, mode, idleTtlMillis, newOwner);
     }
 
     /** Only a mode that keeps files is worth the bookkeeping. */
@@ -455,23 +434,14 @@ final class ExecutorIndexCache {
     private final long misses;
     private final long loads;
     private final long evictions;
-    private final long skippedTooLarge;
     private final long bytes;
     private final long entries;
 
-    private Stats(
-        long hits,
-        long misses,
-        long loads,
-        long evictions,
-        long skippedTooLarge,
-        long bytes,
-        long entries) {
+    private Stats(long hits, long misses, long loads, long evictions, long bytes, long entries) {
       this.hits = hits;
       this.misses = misses;
       this.loads = loads;
       this.evictions = evictions;
-      this.skippedTooLarge = skippedTooLarge;
       this.bytes = bytes;
       this.entries = entries;
     }
@@ -490,10 +460,6 @@ final class ExecutorIndexCache {
 
     public long evictions() {
       return evictions;
-    }
-
-    public long skippedTooLarge() {
-      return skippedTooLarge;
     }
 
     public long bytes() {
@@ -515,7 +481,6 @@ final class ExecutorIndexCache {
           + " evictions="
           + evictions
           + " tooLarge="
-          + skippedTooLarge
           + " entries="
           + entries
           + " bytes="
@@ -566,7 +531,6 @@ final class ExecutorIndexCache {
   private final AtomicLong misses = new AtomicLong();
   private final AtomicLong loads = new AtomicLong();
   private final AtomicLong evictions = new AtomicLong();
-  private final AtomicLong skippedTooLarge = new AtomicLong();
   private long bytes = 0;
 
   // room promised to loads in flight, and the budget those promises are against
@@ -608,6 +572,18 @@ final class ExecutorIndexCache {
    * @param loader reads the payload and prepares it, only called on a miss
    */
   CachedFile file(String location, Config config, String key, Loader loader) {
+    return file(location, config, key, 0L, loader);
+  }
+
+  /**
+   * The same, for a caller that knows how large the file is before reading it.
+   *
+   * <p>What one entry costs cannot be known from a configured ceiling any more, and reserving the
+   * whole budget for every load would let one load hold the cache while it prepares, serialising a
+   * query's loads. The length of the file is a cheap lower bound and keeps the reservations in
+   * proportion to the files, without a setting to keep in step with the data.
+   */
+  CachedFile file(String location, Config config, String key, long sizeHint, Loader loader) {
     if (!config.caching()) {
       return loader.load();
     }
@@ -649,20 +625,10 @@ final class ExecutorIndexCache {
           return loader.load();
         }
 
-        Reservation reservation = reserve(config);
+        Reservation reservation = reserve(config, null, sizeHint);
         try {
           CachedFile loaded = loader.load();
           loads.incrementAndGet();
-          if (loaded.bytes() > config.maxEntryBytes()) {
-            skippedTooLarge.incrementAndGet();
-            LOG.debug(
-                "Not caching {}: {} bytes is over the {} byte entry limit",
-                location,
-                loaded.bytes(),
-                config.maxEntryBytes());
-            return loaded;
-          }
-
           return put(cacheKey, loaded, config, reservation);
         } finally {
           releaseReservation(reservation);
@@ -711,6 +677,11 @@ final class ExecutorIndexCache {
   /** Returns only a retained current-epoch entry; rejection never constitutes a load ACK. */
   CachedFile installManaged(
       String indexUuid, long epoch, String cacheKey, Config config, Loader loader) {
+    return installManaged(indexUuid, epoch, cacheKey, config, 0L, loader);
+  }
+
+  CachedFile installManaged(
+      String indexUuid, long epoch, String cacheKey, Config config, long sizeHint, Loader loader) {
     if (!config.enabled()) {
       return null;
     }
@@ -739,17 +710,13 @@ final class ExecutorIndexCache {
             return existing;
           }
         }
-        Reservation reservation = reserve(config, load);
+        Reservation reservation = reserve(config, load, sizeHint);
         if (reservation == null) {
           return null;
         }
         try {
           CachedFile loaded = loader.load();
           loads.incrementAndGet();
-          if (loaded.bytes() > config.maxEntryBytes()) {
-            skippedTooLarge.incrementAndGet();
-            return null;
-          }
           CachedFile retained = put(cacheKey, loaded, config, reservation, load);
           synchronized (mapLock) {
             return current(load) && find(cacheKey) == retained ? retained : null;
@@ -912,8 +879,7 @@ final class ExecutorIndexCache {
 
   private boolean canReuse(CachedFile file, Config config, Reservation reservation) {
     long otherReservations = reservedBytes - (reservation == null ? 0 : reservation.bytes);
-    return file.bytes() <= config.maxEntryBytes()
-        && bytes <= budget(config.maxBytes()) - otherReservations;
+    return bytes <= budget(config.maxBytes()) - otherReservations;
   }
 
   private CachedFile find(String cacheKey) {
@@ -1131,12 +1097,12 @@ final class ExecutorIndexCache {
    * loaders or uncached searches.
    */
   private Reservation reserve(Config config) {
-    return reserve(config, null);
+    return reserve(config, null, 0L);
   }
 
-  private Reservation reserve(Config config, ManagedLoad load) {
+  private Reservation reserve(Config config, ManagedLoad load, long sizeHint) {
     synchronized (mapLock) {
-      long requested = Math.min(config.maxEntryBytes(), config.maxBytes());
+      long requested = expectedEntryBytes(config, sizeHint);
       while (true) {
         if (load != null && !current(load)) {
           return null;
@@ -1161,6 +1127,28 @@ final class ExecutorIndexCache {
         }
       }
     }
+  }
+
+  /**
+   * What one entry is expected to cost, so a load can reserve its room without a configured
+   * ceiling.
+   *
+   * <p>The cache has no size to go by before a file is read, and reserving the whole budget would
+   * let one load hold the cache while it runs, serialising the loads of a query. What it does know
+   * is what the entries it already holds cost, which is the same structure for the same index: the
+   * largest of them is the estimate, and until one is resident the whole budget is reserved, which
+   * is safe and only costs parallelism on the first load of an executor.
+   */
+  private long expectedEntryBytes(Config config, long sizeHint) {
+    long largest = Math.max(0L, sizeHint);
+    for (CachedFile file : protectedFiles.values()) {
+      largest = Math.max(largest, file.bytes());
+    }
+    for (CachedFile file : probation.values()) {
+      largest = Math.max(largest, file.bytes());
+    }
+
+    return largest > 0L ? largest : config.maxBytes();
   }
 
   private long budget(long configured) {
@@ -1257,7 +1245,6 @@ final class ExecutorIndexCache {
           misses.get(),
           loads.get(),
           evictions.get(),
-          skippedTooLarge.get(),
           bytes,
           probation.size() + protectedFiles.size());
     }
@@ -1306,7 +1293,6 @@ final class ExecutorIndexCache {
       misses.set(0);
       loads.set(0);
       evictions.set(0);
-      skippedTooLarge.set(0);
       lastSweepNanos = System.nanoTime();
       mapLock.notifyAll();
     }

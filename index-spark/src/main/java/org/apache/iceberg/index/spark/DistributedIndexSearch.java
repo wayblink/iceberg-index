@@ -200,6 +200,7 @@ public final class DistributedIndexSearch {
                                     location,
                                     cacheConfig,
                                     cacheKey,
+                                    sizeHint(fileIO, location),
                                     () -> loadFile(fileIO, location, fileAdapter));
                         long readNanos = System.nanoTime() - readStart;
                         long searchStart = System.nanoTime();
@@ -339,6 +340,7 @@ public final class DistributedIndexSearch {
                                     location,
                                     cacheConfig,
                                     cacheKey,
+                                    sizeHint(fileIO, location),
                                     () -> loadFile(fileIO, location, fileAdapter));
                         long readNanos = System.nanoTime() - readStart;
 
@@ -583,6 +585,22 @@ public final class DistributedIndexSearch {
   static ExecutorIndexCache.CachedFile loadFile(FileIO io, String location, IndexAdapter adapter) {
     byte[] content = readPayload(io, location);
     return ExecutorIndexCache.loaded(content, prepareFile(content, adapter));
+  }
+
+  /**
+   * The length of a file, which a load reserves room against before it reads anything.
+   *
+   * <p>It is a lower bound of what the prepared structure costs, and it is free to ask for. Without
+   * it a load would have to reserve the whole budget, which would let one load hold the cache while
+   * it prepares and serialise the loads of a single query.
+   */
+  private static long sizeHint(FileIO io, String location) {
+    try {
+      return io.newInputFile(location).getLength();
+    } catch (RuntimeException e) {
+      // a length is a hint for sizing, never a reason to fail a read that will report the error
+      return 0L;
+    }
   }
 
   private static long preparedBytesOf(FileIO io, String location, IndexAdapter adapter) {

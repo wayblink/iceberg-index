@@ -194,11 +194,6 @@ final class ExecutorIndexCacheWorker implements AutoCloseable {
       return reject(command, WAIT_REFERENCES);
     }
 
-    if (estimate > cacheConfig.maxEntryBytes()) {
-      // A size that can never fit is permanent, so it must not be retried as transient pressure.
-      return reject(command, "ENTRY_TOO_LARGE");
-    }
-
     // Free space is checked before this command promises its own estimate: a first load must not
     // see its own reservation as if it were already used.
     long free = cacheConfig.maxBytes() - cache.stats().bytes() - reservedBytes();
@@ -232,8 +227,7 @@ final class ExecutorIndexCacheWorker implements AutoCloseable {
             promised.remove(command.commandId());
           }
 
-          return reject(
-              command, estimate > cacheConfig.maxEntryBytes() ? "ENTRY_TOO_LARGE" : "BUSY");
+          return reject(command, "BUSY");
         }
 
         synchronized (stateLock) {

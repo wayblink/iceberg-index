@@ -138,7 +138,6 @@ miss 分五类，处理方式不同：
 1. session conf：`spark.iceberg.index.cache.bytes`
 2. 表属性：`index.cache.bytes`（按表隔离时用）
 3. 自动：`min(25% × executor 堆, 本次查询索引总大小 × 1.2)`
-4. 硬上限：`maxEntryBytes`（单文件超过则流式）
 
 ### 5.2 准入控制（避免"装不下还硬装"）
 
@@ -325,7 +324,6 @@ final class IndexFileRDD extends RDD<String> {
 |---|---|---|
 | `spark.iceberg.index.cache.enabled` | false | 总开关 |
 | `spark.iceberg.index.cache.bytes` | 自动：`min(25% heap, workingSet×1.2)` | 预算（**不再写死 512m**） |
-| `spark.iceberg.index.cache.max-entry-bytes` | 256m | 单文件上限，超过则流式 |
 | `...mode` | `auto` | `auto` / `pin-all` / `pin-hot` / `stream` |
 | `...idle-ttl` | 30m | 空闲卸载 |
 | `...hot-threshold` | 3 次/衰减窗口 | PIN_HOT 的热度阈值 |
@@ -395,7 +393,6 @@ final class IndexFileRDD extends RDD<String> {
    auto        = min(⌊executor 堆 × heapFraction⌋, max(512MB, perExecutor × 1.2))
    ```
    - 显式配置了 `spark.iceberg.index.cache.bytes` 就照用，但若低于 `perExecutor × 0.9` → **打警告**（说明必然抖动）；
-   - `maxEntryBytes` 超过预算时自动跟预算一起下调（否则单文件限额比总预算还大会自相矛盾）。
 2. **工作集大小**由 driver 在 plan 阶段算出：对每个 `IndexFile` 取 `InputFile.getLength()`，按 location 记忆（索引文件不可变），失败时退回 0（预算用默认，不影响查询）。
 3. **抖动告警**：executor 侧在"第一次淘汰发生时 hits 仍为 0"打印警告，明确指出预算/条目数/字节数，以及该调 `bytes` 还是关掉缓存。
 4. 单测 `TestIndexCacheBudget`（5 个）：覆盖"按 per-executor 分额推导""堆比例上限""显式配置优先""工作集未知时用下限""永远不超过堆比例"。

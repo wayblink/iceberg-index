@@ -163,10 +163,7 @@ class TestIndexCacheMemory {
             .isNotEqualTo(planned);
         ExecutorIndexCache cache = ExecutorIndexCache.get();
         cache.file(
-            file.location(),
-            ExecutorIndexCache.Config.of(true, expected, expected),
-            "adapter",
-            () -> loaded);
+            file.location(), ExecutorIndexCache.Config.of(true, expected), "adapter", () -> loaded);
         assertThat(cache.stats().bytes()).isEqualTo(planned);
         assertThat(DistributedIndexSearch.workingSetBytes(fileIO, published, adapter))
             .isEqualTo(planned);

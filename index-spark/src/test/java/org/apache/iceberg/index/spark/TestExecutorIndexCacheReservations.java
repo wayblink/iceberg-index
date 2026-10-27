@@ -70,7 +70,7 @@ class TestExecutorIndexCacheReservations {
         };
     // Check the returned entry and actual resident accounting.
     ExecutorIndexCache.CachedFile loaded = ExecutorIndexCache.loaded(new byte[10], prepared);
-    cache.file("a", ExecutorIndexCache.Config.of(true, 1000, 1000), "adapter", () -> loaded);
+    cache.file("a", ExecutorIndexCache.Config.of(true, 1000), "adapter", () -> loaded);
     assertThat(loaded.bytes()).isEqualTo(80);
     assertThat(cache.stats().bytes()).isEqualTo(80);
   }
@@ -81,7 +81,7 @@ class TestExecutorIndexCacheReservations {
     CountDownLatch firstStarted = new CountDownLatch(1);
     CountDownLatch secondStarted = new CountDownLatch(1);
     CountDownLatch finishFirst = new CountDownLatch(1);
-    ExecutorIndexCache.Config config = ExecutorIndexCache.Config.of(true, 250, 250);
+    ExecutorIndexCache.Config config = ExecutorIndexCache.Config.of(true, 250);
     try {
       Future<?> first =
           pool.submit(
@@ -127,7 +127,7 @@ class TestExecutorIndexCacheReservations {
     CountDownLatch allStarted = new CountDownLatch(3);
     CountDownLatch finish = new CountDownLatch(1);
     AtomicLong allocated = new AtomicLong();
-    ExecutorIndexCache.Config config = ExecutorIndexCache.Config.of(true, 250, 100);
+    ExecutorIndexCache.Config config = ExecutorIndexCache.Config.of(true, 250);
     List<Future<?>> futures = new ArrayList<>();
     try {
       for (int i = 0; i < 3; i++) {
@@ -166,7 +166,7 @@ class TestExecutorIndexCacheReservations {
 
   @Test
   void partialReservationIsReleasedAfterLoaderFailure() throws Exception {
-    ExecutorIndexCache.Config config = ExecutorIndexCache.Config.of(true, 250, 250);
+    ExecutorIndexCache.Config config = ExecutorIndexCache.Config.of(true, 250);
     cache.file(
         "resident",
         config.withOwner("A"),
@@ -180,7 +180,8 @@ class TestExecutorIndexCacheReservations {
                     "adapter",
                     () -> {
                       try {
-                        assertThat(reserved()).isEqualTo(150);
+                        // one entry is estimated by the entry already resident, not by a ceiling
+                        assertThat(reserved()).isEqualTo(100);
                       } catch (Exception e) {
                         throw new IllegalStateException(e);
                       }
@@ -200,12 +201,12 @@ class TestExecutorIndexCacheReservations {
   }
 
   @Test
-  void oversizedEntryCannotSpendAnotherLoadsReservation() throws Exception {
+  void aLoadCannotSpendAnotherLoadsReservation() throws Exception {
     ExecutorService pool = Executors.newFixedThreadPool(2);
     CountDownLatch bothStarted = new CountDownLatch(2);
     CountDownLatch finishLarge = new CountDownLatch(1);
     CountDownLatch finishOther = new CountDownLatch(1);
-    ExecutorIndexCache.Config config = ExecutorIndexCache.Config.of(true, 250, 100);
+    ExecutorIndexCache.Config config = ExecutorIndexCache.Config.of(true, 250);
     try {
       Future<?> large =
           pool.submit(
@@ -214,6 +215,7 @@ class TestExecutorIndexCacheReservations {
                       "large",
                       config.withOwner("A"),
                       "adapter",
+                      150L,
                       () -> {
                         bothStarted.countDown();
                         await(finishLarge);
@@ -226,6 +228,7 @@ class TestExecutorIndexCacheReservations {
                       "other",
                       config.withOwner("B"),
                       "adapter",
+                      100L,
                       () -> {
                         bothStarted.countDown();
                         await(finishOther);
@@ -234,13 +237,11 @@ class TestExecutorIndexCacheReservations {
       assertThat(bothStarted.await(10, TimeUnit.SECONDS)).isTrue();
       finishLarge.countDown();
       large.get(10, TimeUnit.SECONDS);
-      assertThat(reserved()).isEqualTo(100);
-      assertThat(cache.stats().entries()).isZero();
-      assertThat(cache.stats().skippedTooLarge()).isEqualTo(1);
+      assertThat(reserved()).as("the second load's promise is untouched").isEqualTo(100);
       finishOther.countDown();
       other.get(10, TimeUnit.SECONDS);
       assertThat(reserved()).isZero();
-      assertThat(cache.stats().bytes()).isEqualTo(100);
+      assertThat(cache.stats().bytes()).isEqualTo(250);
     } finally {
       finishLarge.countDown();
       finishOther.countDown();
@@ -255,7 +256,7 @@ class TestExecutorIndexCacheReservations {
     CountDownLatch bothStarted = new CountDownLatch(2);
     CountDownLatch finishFirst = new CountDownLatch(1);
     CountDownLatch finishSecond = new CountDownLatch(1);
-    ExecutorIndexCache.Config config = ExecutorIndexCache.Config.of(true, 250, 100);
+    ExecutorIndexCache.Config config = ExecutorIndexCache.Config.of(true, 250);
     try {
       Future<?> first =
           pool.submit(
@@ -264,6 +265,7 @@ class TestExecutorIndexCacheReservations {
                       "first",
                       config.withOwner("A"),
                       "adapter",
+                      80L,
                       () -> {
                         bothStarted.countDown();
                         await(finishFirst);
@@ -276,6 +278,7 @@ class TestExecutorIndexCacheReservations {
                       "second",
                       config.withOwner("B"),
                       "adapter",
+                      100L,
                       () -> {
                         bothStarted.countDown();
                         await(finishSecond);
@@ -302,8 +305,7 @@ class TestExecutorIndexCacheReservations {
   @Test
   void admissionCountsMeasuredIncomingBytesForFairEviction() {
     ExecutorIndexCache.Config a =
-        ExecutorIndexCache.Config.of(true, 100, 100, ExecutorIndexCache.Mode.PIN_HOT, 0)
-            .withOwner("A");
+        ExecutorIndexCache.Config.of(true, 100, ExecutorIndexCache.Mode.PIN_HOT, 0).withOwner("A");
     ExecutorIndexCache.Config b = a.withOwner("B");
     askTwice("a-old", a, 40);
     askTwice("b", b, 60);
@@ -318,7 +320,7 @@ class TestExecutorIndexCacheReservations {
   void clearRemovesResidentOwnerAccounting() throws Exception {
     cache.file(
         "old",
-        ExecutorIndexCache.Config.of(true, 1000, 1000).withOwner("old-table"),
+        ExecutorIndexCache.Config.of(true, 1000).withOwner("old-table"),
         "adapter",
         () -> ExecutorIndexCache.loaded(new byte[1000], EMPTY, 1000));
     cache.clear();
@@ -333,7 +335,7 @@ class TestExecutorIndexCacheReservations {
   @ParameterizedTest
   @ValueSource(booleans = {false, true})
   void releasedResidentRoomWakesReservationWaiter(boolean clear) throws Exception {
-    ExecutorIndexCache.Config config = ExecutorIndexCache.Config.of(true, 140, 40);
+    ExecutorIndexCache.Config config = ExecutorIndexCache.Config.of(true, 140);
     ExecutorIndexCache.CachedFile resident =
         cache.file(
             "resident",
@@ -424,7 +426,7 @@ class TestExecutorIndexCacheReservations {
 
   @Test
   void interruptedWaitKeepsOtherToken() throws Exception {
-    ExecutorIndexCache.Config config = ExecutorIndexCache.Config.of(true, 100, 100);
+    ExecutorIndexCache.Config config = ExecutorIndexCache.Config.of(true, 100);
     ExecutorService pool = Executors.newFixedThreadPool(2);
     CountDownLatch firstStarted = new CountDownLatch(1);
     CountDownLatch finishFirst = new CountDownLatch(1);
@@ -490,8 +492,7 @@ class TestExecutorIndexCacheReservations {
   @Test
   void oldLoadCannotPublishAfterOffload() throws Exception {
     String key = "table|adapter|managed";
-    ExecutorIndexCache.Config config =
-        ExecutorIndexCache.Config.of(true, 100, 100).withOwner("table");
+    ExecutorIndexCache.Config config = ExecutorIndexCache.Config.of(true, 100).withOwner("table");
     cache.applyTarget("A", 1, Set.of(key));
     ExecutorService pool = Executors.newSingleThreadExecutor();
     CountDownLatch started = new CountDownLatch(1);
@@ -526,8 +527,7 @@ class TestExecutorIndexCacheReservations {
   @Test
   void sharedFileKeepsOtherIndexOwner() {
     String key = "table|adapter|managed";
-    ExecutorIndexCache.Config config =
-        ExecutorIndexCache.Config.of(true, 100, 100).withOwner("table");
+    ExecutorIndexCache.Config config = ExecutorIndexCache.Config.of(true, 100).withOwner("table");
     ExecutorIndexCache.CachedFile file = install("A", 1, key, config);
     cache.applyTarget("B", 1, Set.of(key));
     assertThat(
@@ -553,8 +553,7 @@ class TestExecutorIndexCacheReservations {
   @Test
   void releaseWaitsForSearch() throws Exception {
     String key = "table|adapter|managed";
-    ExecutorIndexCache.Config config =
-        ExecutorIndexCache.Config.of(true, 100, 100).withOwner("table");
+    ExecutorIndexCache.Config config = ExecutorIndexCache.Config.of(true, 100).withOwner("table");
     ExecutorIndexCache.CachedFile file = install("A", 1, key, config);
     ExecutorService pool = Executors.newSingleThreadExecutor();
     CountDownLatch started = new CountDownLatch(1);
@@ -591,8 +590,7 @@ class TestExecutorIndexCacheReservations {
   @Test
   void leaseBeforeSearchingBlocksRelease() {
     String key = "table|adapter|managed";
-    ExecutorIndexCache.Config config =
-        ExecutorIndexCache.Config.of(true, 100, 100).withOwner("table");
+    ExecutorIndexCache.Config config = ExecutorIndexCache.Config.of(true, 100).withOwner("table");
     ExecutorIndexCache.CachedFile file = install("A", 1, key, config);
     try (ExecutorIndexCache.Lease lease = cache.acquireManaged("A", 1, key)) {
       assertThat(lease).isNotNull();
@@ -609,8 +607,7 @@ class TestExecutorIndexCacheReservations {
   @Test
   void oldLeaseCloseCannotReleaseNewOwnerAndCloseIsIdempotent() {
     String key = "table|adapter|managed";
-    ExecutorIndexCache.Config config =
-        ExecutorIndexCache.Config.of(true, 100, 100).withOwner("table");
+    ExecutorIndexCache.Config config = ExecutorIndexCache.Config.of(true, 100).withOwner("table");
     ExecutorIndexCache.CachedFile file = install("A", 1, key, config);
     ExecutorIndexCache.Lease lease = cache.acquireManaged("A", 1, key);
     try {
@@ -644,8 +641,7 @@ class TestExecutorIndexCacheReservations {
     String old = "table|adapter|old";
     String common = "table|adapter|common";
     String next = "table|adapter|next";
-    ExecutorIndexCache.Config config =
-        ExecutorIndexCache.Config.of(true, 100, 100).withOwner("table");
+    ExecutorIndexCache.Config config = ExecutorIndexCache.Config.of(true, 100).withOwner("table");
     cache.applyTarget("A", 1, Set.of(old, common));
     ExecutorIndexCache.CachedFile oldFile =
         cache.installManaged(
@@ -666,8 +662,7 @@ class TestExecutorIndexCacheReservations {
   @Test
   void managedKeyCannotBeFilledByLegacyLazyQuery() {
     String key = "table|adapter|managed";
-    ExecutorIndexCache.Config config =
-        ExecutorIndexCache.Config.of(true, 100, 100).withOwner("table");
+    ExecutorIndexCache.Config config = ExecutorIndexCache.Config.of(true, 100).withOwner("table");
     cache.applyTarget("A", 1, Set.of(key));
     assertThat(
             cache.file(
@@ -683,8 +678,7 @@ class TestExecutorIndexCacheReservations {
   void managedEntryIsNotAnIdleOrFairShareVictim() throws Exception {
     String key = "A|adapter|managed";
     ExecutorIndexCache.Config config =
-        ExecutorIndexCache.Config.of(true, 40, 20, ExecutorIndexCache.Mode.PIN_HOT, 1)
-            .withOwner("A");
+        ExecutorIndexCache.Config.of(true, 40, ExecutorIndexCache.Mode.PIN_HOT, 1).withOwner("A");
     ExecutorIndexCache.CachedFile file = install("A", 1, key, config);
     Field lastAccess = file.getClass().getDeclaredField("lastAccessNanos");
     lastAccess.setAccessible(true);
@@ -701,10 +695,9 @@ class TestExecutorIndexCacheReservations {
   }
 
   @Test
-  void failedOrOversizedManagedLoadReleasesItsReservation() throws Exception {
+  void failedManagedLoadReleasesItsReservation() throws Exception {
     String key = "table|adapter|managed";
-    ExecutorIndexCache.Config config =
-        ExecutorIndexCache.Config.of(true, 100, 10).withOwner("table");
+    ExecutorIndexCache.Config config = ExecutorIndexCache.Config.of(true, 100).withOwner("table");
     cache.applyTarget("A", 1, Set.of(key));
     assertThatThrownBy(
             () ->
@@ -718,12 +711,12 @@ class TestExecutorIndexCacheReservations {
                     }))
         .hasMessage("Cannot prepare index");
     assertThat(reserved()).isZero();
-    assertThat(
-            cache.installManaged(
-                "A", 1, key, config, () -> ExecutorIndexCache.loaded(new byte[10], EMPTY)))
-        .isNull();
+    ExecutorIndexCache.CachedFile installed =
+        cache.installManaged(
+            "A", 1, key, config, () -> ExecutorIndexCache.loaded(new byte[10], EMPTY));
+    assertThat(installed).isNotNull();
     assertThat(reserved()).isZero();
-    assertThat(cache.stats().bytes()).isZero();
+    assertThat(cache.stats().bytes()).isEqualTo(installed.bytes());
   }
 
   @Test
@@ -747,14 +740,14 @@ class TestExecutorIndexCacheReservations {
   void explicitInstallationDoesNotInheritLazyAdmissionMode(ExecutorIndexCache.Mode mode) {
     String key = "table|adapter|managed";
     ExecutorIndexCache.Config config =
-        ExecutorIndexCache.Config.of(true, 100, 100, mode, 0).withOwner("table");
+        ExecutorIndexCache.Config.of(true, 100, mode, 0).withOwner("table");
     assertThat(install("A", 1, key, config).bytes()).isEqualTo(cache.stats().bytes());
   }
 
   @Test
   void closedLeaseDoesNotRetainFile() throws Exception {
     String key = "table|adapter|managed";
-    install("A", 1, key, ExecutorIndexCache.Config.of(true, 100, 100).withOwner("table"));
+    install("A", 1, key, ExecutorIndexCache.Config.of(true, 100).withOwner("table"));
     ExecutorIndexCache.Lease lease = cache.acquireManaged("A", 1, key);
     assertThat(lease).isNotNull();
     lease.close();
@@ -768,7 +761,7 @@ class TestExecutorIndexCacheReservations {
   void clearKeepsLeasedBytesUntilClose() {
     String key = "table|adapter|managed";
     ExecutorIndexCache.CachedFile file =
-        install("A", 1, key, ExecutorIndexCache.Config.of(true, 100, 100).withOwner("table"));
+        install("A", 1, key, ExecutorIndexCache.Config.of(true, 100).withOwner("table"));
     try (ExecutorIndexCache.Lease lease = cache.acquireManaged("A", 1, key)) {
       assertThat(lease).isNotNull();
       cache.clear();
@@ -781,8 +774,7 @@ class TestExecutorIndexCacheReservations {
   void reservationWaiterIsCancelledByOffload() throws Exception {
     String a = "table|adapter|a";
     String b = "table|adapter|b";
-    ExecutorIndexCache.Config config =
-        ExecutorIndexCache.Config.of(true, 20, 20).withOwner("table");
+    ExecutorIndexCache.Config config = ExecutorIndexCache.Config.of(true, 20).withOwner("table");
     cache.applyTarget("A", 1, Set.of(a));
     cache.applyTarget("B", 1, Set.of(b));
     ExecutorService pool = Executors.newFixedThreadPool(2);
@@ -834,8 +826,7 @@ class TestExecutorIndexCacheReservations {
   @Test
   void legacyLoadStartedBeforeManagementCannotPublish() throws Exception {
     String key = "table|adapter|managed";
-    ExecutorIndexCache.Config config =
-        ExecutorIndexCache.Config.of(true, 100, 100).withOwner("table");
+    ExecutorIndexCache.Config config = ExecutorIndexCache.Config.of(true, 100).withOwner("table");
     ExecutorService pool = Executors.newSingleThreadExecutor();
     CountDownLatch started = new CountDownLatch(1);
     CountDownLatch finish = new CountDownLatch(1);
@@ -868,8 +859,7 @@ class TestExecutorIndexCacheReservations {
   @Test
   void sameFileWaitersKeepOneMonitorAfterFailure() throws Exception {
     String key = "table|adapter|managed";
-    ExecutorIndexCache.Config config =
-        ExecutorIndexCache.Config.of(true, 100, 20).withOwner("table");
+    ExecutorIndexCache.Config config = ExecutorIndexCache.Config.of(true, 100).withOwner("table");
     for (String index : List.of("A", "B", "C")) {
       cache.applyTarget(index, 1, Set.of(key));
     }
@@ -945,8 +935,7 @@ class TestExecutorIndexCacheReservations {
   @Test
   void legacyHitAfterControlCannotReturnManagedObject() throws Exception {
     String key = "table|adapter|managed";
-    ExecutorIndexCache.Config config =
-        ExecutorIndexCache.Config.of(true, 100, 100).withOwner("table");
+    ExecutorIndexCache.Config config = ExecutorIndexCache.Config.of(true, 100).withOwner("table");
     ExecutorIndexCache.CachedFile ephemeral = ExecutorIndexCache.loaded(new byte[10], EMPTY);
     Method acquireMonitor =
         ExecutorIndexCache.class.getDeclaredMethod("loadingMonitor", String.class);
@@ -984,29 +973,30 @@ class TestExecutorIndexCacheReservations {
   }
 
   @ParameterizedTest
-  @CsvSource({"100,10", "10,100", "10,10"})
-  void reuseRespectsNewLimitsWithoutReleasingSharedLease(long budget, long entryLimit)
+  @CsvSource({"100,true", "10,false"})
+  void reuseRespectsTheNewBudgetWithoutReleasingSharedLease(long budget, boolean reusable)
       throws Exception {
     String key = "table|adapter|managed";
-    ExecutorIndexCache.Config original =
-        ExecutorIndexCache.Config.of(true, 100, 100).withOwner("table");
+    ExecutorIndexCache.Config original = ExecutorIndexCache.Config.of(true, 100).withOwner("table");
     install("A", 1, key, original);
     cache.applyTarget("B", 1, Set.of(key));
     try (ExecutorIndexCache.Lease lease = cache.acquireManaged("B", 1, key)) {
       assertThat(lease).isNotNull();
       cache.applyTarget("A", 2, Set.of(key));
       ExecutorIndexCache.Config limited =
-          ExecutorIndexCache.Config.of(true, budget, entryLimit).withOwner("table");
-      assertThat(
-              cache.installManaged(
-                  "A",
-                  2,
-                  key,
-                  limited,
-                  () -> {
-                    throw new AssertionError("Rejected reuse must not reload");
-                  }))
-          .isNull();
+          ExecutorIndexCache.Config.of(true, budget).withOwner("table");
+      ExecutorIndexCache.CachedFile reused =
+          cache.installManaged(
+              "A",
+              2,
+              key,
+              limited,
+              () -> {
+                throw new AssertionError("Reuse must not reload");
+              });
+      // a file of 20 bytes fits a budget of 100 but not one of 10, and the budget is now the only
+      // thing that decides that
+      assertThat(reused != null).isEqualTo(reusable);
       cache.releaseIndex("A", 3);
       assertThat(cache.stats().bytes()).isEqualTo(20);
       assertThat(lease.file().bytes()).isEqualTo(20);
@@ -1020,8 +1010,7 @@ class TestExecutorIndexCacheReservations {
   void reuseCannotAcknowledgeWhenOccupancyExceedsNewBudget() {
     String a = "table|adapter|a";
     String b = "table|adapter|b";
-    ExecutorIndexCache.Config original =
-        ExecutorIndexCache.Config.of(true, 100, 100).withOwner("table");
+    ExecutorIndexCache.Config original = ExecutorIndexCache.Config.of(true, 100).withOwner("table");
     install("A", 1, a, original);
     install("B", 1, b, original);
     cache.applyTarget("A", 2, Set.of(a));
@@ -1030,7 +1019,7 @@ class TestExecutorIndexCacheReservations {
                 "A",
                 2,
                 a,
-                ExecutorIndexCache.Config.of(true, 30, 100).withOwner("table"),
+                ExecutorIndexCache.Config.of(true, 30).withOwner("table"),
                 () -> {
                   throw new AssertionError("Rejected reuse must not reload");
                 }))
@@ -1042,8 +1031,7 @@ class TestExecutorIndexCacheReservations {
   @Test
   void optionalAttributionPreservesLazySharedFileBehavior() {
     String key = "table|adapter|unmanaged";
-    ExecutorIndexCache.Config config =
-        ExecutorIndexCache.Config.of(true, 100, 100).withOwner("table");
+    ExecutorIndexCache.Config config = ExecutorIndexCache.Config.of(true, 100).withOwner("table");
     ExecutorIndexCache.CachedFile file =
         cache.file(
             "unmanaged", config, "adapter", () -> ExecutorIndexCache.loaded(new byte[10], EMPTY));
@@ -1073,7 +1061,7 @@ class TestExecutorIndexCacheReservations {
     String key = "table|adapter|unmanaged";
     ExecutorIndexCache.Config config =
         ExecutorIndexCache.Config.of(
-                true, 100, 100, ExecutorIndexCache.Mode.PIN_ALL, TimeUnit.MINUTES.toMillis(30))
+                true, 100, ExecutorIndexCache.Mode.PIN_ALL, TimeUnit.MINUTES.toMillis(30))
             .withOwner("table");
     ExecutorIndexCache.CachedFile file =
         cache.file(
@@ -1101,8 +1089,7 @@ class TestExecutorIndexCacheReservations {
   @Test
   void attributionDoesNotChangeFairShareEviction() {
     ExecutorIndexCache.Config a =
-        ExecutorIndexCache.Config.of(true, 100, 100, ExecutorIndexCache.Mode.PIN_HOT, 0)
-            .withOwner("A");
+        ExecutorIndexCache.Config.of(true, 100, ExecutorIndexCache.Mode.PIN_HOT, 0).withOwner("A");
     ExecutorIndexCache.Config b = a.withOwner("B");
     askTwice("a-old", a, 40);
     askTwice("b", b, 60);

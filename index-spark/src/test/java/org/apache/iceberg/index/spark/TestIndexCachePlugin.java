@@ -339,7 +339,7 @@ class TestIndexCachePlugin {
             EXECUTOR,
             INCARNATION,
             cache,
-            ExecutorIndexCache.Config.of(true, 1_000_000L, 1_000_000L),
+            ExecutorIndexCache.Config.of(true, 1_000_000L),
             command -> {
               loaderCalls.incrementAndGet();
               return loaded();
