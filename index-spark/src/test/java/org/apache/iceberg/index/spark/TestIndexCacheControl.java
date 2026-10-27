@@ -404,7 +404,7 @@ class TestIndexCacheControl {
 
   @Test
   void missingControlChannelNamesThePlugin() {
-    assertThatThrownBy(() -> IndexCacheDriverRegistry.require("no-such-application"))
+    assertThatThrownBy(() -> IndexCacheDriverRegistry.require(null))
         .isInstanceOf(IllegalArgumentException.class)
         .hasMessageContaining("spark.plugins");
   }

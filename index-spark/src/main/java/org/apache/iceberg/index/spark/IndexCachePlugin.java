@@ -50,19 +50,21 @@ public class IndexCachePlugin implements SparkPlugin {
   static final class IndexCacheDriverPlugin implements DriverPlugin {
     private static final Logger LOG = LoggerFactory.getLogger(IndexCacheDriverPlugin.class);
     private IndexCacheDriverControl control;
-    private String applicationId;
+    private SparkContext context;
 
     @Override
     public Map<String, String> init(SparkContext sc, PluginContext pluginContext) {
+      IndexCacheTypeRegistration.registerAll();
       IndexCacheWorkerConfig config =
           IndexCacheWorkerConfig.parse(pluginSettings(pluginContext.conf()));
       control =
           new IndexCacheDriverControl(
               new IndexResidencyCoordinator(
                   System::nanoTime, config.maxCommands(), config.maxAttempts()));
-      // The facade and the procedures reach this application's channel through the registry.
-      applicationId = sc.applicationId();
-      IndexCacheDriverRegistry.register(applicationId, control);
+      // The facade and the procedures reach this application's channel through the registry, keyed
+      // by the context: Spark has not assigned the application id when a driver plugin starts.
+      context = sc;
+      IndexCacheDriverRegistry.register(sc, control);
       return Map.of();
     }
 
@@ -103,7 +105,8 @@ public class IndexCachePlugin implements SparkPlugin {
 
     @Override
     public void shutdown() {
-      IndexCacheDriverRegistry.unregister(applicationId);
+      IndexCacheDriverRegistry.unregister(context);
+      context = null;
       control = null;
     }
   }
@@ -120,6 +123,7 @@ public class IndexCachePlugin implements SparkPlugin {
      */
     @Override
     public void init(PluginContext pluginContext, Map<String, String> extraConf) {
+      IndexCacheTypeRegistration.registerAll();
       IndexCacheWorkerConfig config = IndexCacheWorkerConfig.parse(extraConf);
       long budget = budgetBytes(pluginContext.conf());
       IndexCacheControlChannel channel = pluginContext::ask;
@@ -129,6 +133,7 @@ public class IndexCachePlugin implements SparkPlugin {
               pluginContext.executorID(),
               incarnation(pluginContext),
               ExecutorIndexCache.get(),
+              // the per-file ceiling is gone: the budget decides whether a file fits
               ExecutorIndexCache.Config.of(true, Math.max(1L, budget)),
               new IndexCacheReadContext(),
               config);

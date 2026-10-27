@@ -18,40 +18,45 @@
  */
 package org.apache.iceberg.index.spark;
 
+import java.util.Collections;
+import java.util.IdentityHashMap;
 import java.util.Map;
-import java.util.concurrent.ConcurrentHashMap;
 import org.apache.iceberg.relocated.com.google.common.base.Preconditions;
+import org.apache.spark.SparkContext;
 
 /**
  * The control channel of each running application, as registered by the driver side of {@link
- * IndexCachePlugin}. A control command belongs to one application, so the registry is keyed by the
- * application identity rather than by a table.
+ * IndexCachePlugin}.
+ *
+ * <p>It is keyed by the {@link SparkContext} itself, not by the application id: Spark creates the
+ * driver plugin before it assigns that id, so a registry keyed by the id cannot be filled in at
+ * init. A driver JVM runs one context, and the procedures reach it through the same session.
  */
 final class IndexCacheDriverRegistry {
-  private static final Map<String, IndexCacheDriverControl> CONTROLS = new ConcurrentHashMap<>();
+  private static final Map<SparkContext, IndexCacheDriverControl> CONTROLS =
+      Collections.synchronizedMap(new IdentityHashMap<>());
 
   private IndexCacheDriverRegistry() {}
 
-  static void register(String applicationId, IndexCacheDriverControl control) {
-    Preconditions.checkArgument(
-        applicationId != null && !applicationId.isEmpty(), "Application identity is missing");
-    CONTROLS.put(applicationId, Preconditions.checkNotNull(control, "Control is null"));
+  static void register(SparkContext context, IndexCacheDriverControl control) {
+    Preconditions.checkNotNull(context, "Spark context is null");
+    CONTROLS.put(context, Preconditions.checkNotNull(control, "Control is null"));
   }
 
-  static void unregister(String applicationId) {
-    if (applicationId != null) {
-      CONTROLS.remove(applicationId);
+  static void unregister(SparkContext context) {
+    if (context != null) {
+      CONTROLS.remove(context);
     }
   }
 
   /** The channel of this application, or null when the plugin is not enabled. */
-  static IndexCacheDriverControl find(String applicationId) {
-    return applicationId == null ? null : CONTROLS.get(applicationId);
+  static IndexCacheDriverControl find(SparkContext context) {
+    return context == null ? null : CONTROLS.get(context);
   }
 
   /** The control channel of this application, or a message that says the plugin is not enabled. */
-  static IndexCacheDriverControl require(String applicationId) {
-    IndexCacheDriverControl control = applicationId == null ? null : CONTROLS.get(applicationId);
+  static IndexCacheDriverControl require(SparkContext context) {
+    IndexCacheDriverControl control = find(context);
     Preconditions.checkArgument(
         control != null,
         "The index cache control channel is not available: start the application with "

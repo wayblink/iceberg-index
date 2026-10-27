@@ -56,8 +56,7 @@ public final class IndexCacheControl {
    * plugin is not enabled, so a query never fails because of residency bookkeeping.
    */
   public static void recordAccess(SparkSession spark, String indexUuid) {
-    IndexCacheDriverControl control =
-        IndexCacheDriverRegistry.find(spark.sparkContext().applicationId());
+    IndexCacheDriverControl control = IndexCacheDriverRegistry.find(spark.sparkContext());
     if (control != null) {
       control.recordAccess(indexUuid, System.nanoTime());
     }
@@ -115,7 +114,7 @@ public final class IndexCacheControl {
   }
 
   private static IndexCacheDriverControl controlOf(SparkSession spark) {
-    return IndexCacheDriverRegistry.require(spark.sparkContext().applicationId());
+    return IndexCacheDriverRegistry.require(spark.sparkContext());
   }
 
   /** One managed index: its protection and how long ago a query last used it. */
