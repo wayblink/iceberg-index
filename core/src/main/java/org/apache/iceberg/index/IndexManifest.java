@@ -51,10 +51,21 @@ import org.apache.iceberg.relocated.com.google.common.collect.Sets;
  */
 public final class IndexManifest {
 
-  /** Format version of this encoding. */
-  public static final int FORMAT_VERSION = 2;
+  /**
+   * Format version of this encoding, which is the version every reader has always accepted.
+   *
+   * <p>Anything added to the encoding later is written after the file list rather than inside a
+   * file record, so a reader that only knows this version reads the files and stops. That is what
+   * keeps a newer writer readable by an older reader: bumping the version int alone would make
+   * every older reader refuse the file, which is a worse outcome than it missing an optional field.
+   */
+  public static final int FORMAT_VERSION = 1;
 
-  private static final int LEGACY_FORMAT_VERSION = 1;
+  /**
+   * A version this reader still accepts although it is no longer written: manifests written before
+   * memory estimates moved to the end of the file carry them inside each file record.
+   */
+  private static final int INLINE_MEMORY_FORMAT_VERSION = 2;
 
   private static final byte[] MAGIC = new byte[] {'I', 'C', 'E', 'I', 'M', 'N', '1', 0};
 
@@ -89,7 +100,12 @@ public final class IndexManifest {
         for (String dataFile : coveredDataFiles) {
           out.writeUTF(dataFile);
         }
+      }
 
+      // the optional part of the encoding goes after the files it describes, so a reader that does
+      // not know it has already finished by the time it reaches these bytes
+      out.writeInt(indexFiles.size());
+      for (IndexFile indexFile : indexFiles) {
         writeMemory(out, indexFile.memory());
       }
     }
@@ -104,7 +120,7 @@ public final class IndexManifest {
       Preconditions.checkArgument(Arrays.equals(MAGIC, magic), "Invalid index manifest magic");
       int version = in.readInt();
       Preconditions.checkArgument(
-          version == LEGACY_FORMAT_VERSION || version == FORMAT_VERSION,
+          version == FORMAT_VERSION || version == INLINE_MEMORY_FORMAT_VERSION,
           "Unsupported index manifest format version: %s",
           version);
       int indexFileCount = in.readInt();
@@ -130,13 +146,53 @@ public final class IndexManifest {
                 .blobType(blobType)
                 .entryCount(entryCount)
                 .coveredDataFiles(coveredDataFiles)
-                .memory(version == LEGACY_FORMAT_VERSION ? null : readMemory(in))
+                .memory(version == INLINE_MEMORY_FORMAT_VERSION ? readMemory(in) : null)
                 .build());
       }
+
+      if (version == FORMAT_VERSION && raw.getPos() < inputFile.getLength()) {
+        readTrailingMemory(in, indexFiles);
+      }
+
       return new IndexManifest(indexFiles);
     } catch (IOException e) {
       throw new UncheckedIOException("Failed to read index manifest", e);
     }
+  }
+
+  /**
+   * Reads the optional section that follows the file list, attaching what it holds to the files.
+   *
+   * <p>A manifest written without it ends after the file list, which is why its absence is decided
+   * by how many bytes are left rather than by a flag: a reader that never wrote the section cannot
+   * have left a hint that it did.
+   */
+  private static void readTrailingMemory(DataInputStream in, List<IndexFile> indexFiles)
+      throws IOException {
+    int memoryCount = in.readInt();
+    Preconditions.checkArgument(
+        memoryCount == indexFiles.size(),
+        "Index memory count %s does not match the %s index files",
+        memoryCount,
+        indexFiles.size());
+    for (int i = 0; i < memoryCount; i++) {
+      IndexFile indexFile = indexFiles.get(i);
+      IndexFileMemory memory = readMemory(in);
+      if (memory != null) {
+        indexFiles.set(i, withMemory(indexFile, memory));
+      }
+    }
+  }
+
+  private static IndexFile withMemory(IndexFile indexFile, IndexFileMemory memory) {
+    return IndexFile.builder()
+        .location(indexFile.location())
+        .kind(indexFile.kind())
+        .blobType(indexFile.blobType())
+        .entryCount(indexFile.entryCount())
+        .coveredDataFiles(indexFile.coveredDataFiles())
+        .memory(memory)
+        .build();
   }
 
   private static void writeMemory(DataOutputStream out, IndexFileMemory memory) throws IOException {

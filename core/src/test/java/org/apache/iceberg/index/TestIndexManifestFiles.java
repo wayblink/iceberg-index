@@ -41,14 +41,72 @@ import org.junit.jupiter.api.io.TempDir;
 class TestIndexManifestFiles {
 
   @Test
-  void writesVersionTwo(@TempDir Path tempDir) throws IOException {
+  void writesTheVersionEveryReaderAccepts(@TempDir Path tempDir) throws IOException {
     Path path = tempDir.resolve("current.imn");
     IndexManifest.write(localOutput(path.toFile()), List.of());
     try (DataInputStream in = new DataInputStream(Files.newInputStream(path))) {
       assertThat(in.readNBytes(8))
           .containsExactly(new byte[] {'I', 'C', 'E', 'I', 'M', 'N', '1', 0});
-      assertThat(in.readInt()).isEqualTo(2);
+      // bumping this int is what makes an older reader refuse the file outright, so an optional
+      // field is written after the file list instead of behind a new version
+      assertThat(in.readInt()).isEqualTo(1);
     }
+  }
+
+  @Test
+  void aManifestWithMemoryIsReadableByAReaderThatOnlyKnowsTheFileList(@TempDir Path tempDir)
+      throws IOException {
+    Path path = tempDir.resolve("compatible.imn");
+    IndexManifest.write(
+        localOutput(path.toFile()), List.of(fileWithMemory(memory().build()), fixtureFile()));
+
+    // what a reader that predates the memory section does: read the files, stop, never look at what
+    // follows. It has to see exactly the files, and it must not be asked to understand the tail.
+    try (DataInputStream in = new DataInputStream(Files.newInputStream(path))) {
+      in.readNBytes(8);
+      assertThat(in.readInt()).isEqualTo(1);
+      int count = in.readInt();
+      assertThat(count).isEqualTo(2);
+      assertThat(readFileRecord(in)).isEqualTo(fixtureFile());
+      assertThat(readFileRecord(in)).isEqualTo(fixtureFile());
+      assertThat(in.available()).as("the tail is left unread").isPositive();
+    }
+  }
+
+  @Test
+  void aManifestWrittenWithoutMemoryStillCarriesAnEmptyTail(@TempDir Path tempDir)
+      throws IOException {
+    Path path = tempDir.resolve("no-memory.imn");
+    IndexManifest.write(localOutput(path.toFile()), List.of(fixtureFile()));
+    List<IndexFile> files = IndexManifest.read(localInput(path.toFile())).indexFiles();
+    assertThat(files).containsExactly(fixtureFile());
+    assertThat(files.get(0).memory()).isNull();
+  }
+
+  @Test
+  void rejectsATailThatDoesNotMatchTheFileList(@TempDir Path tempDir) throws IOException {
+    Path path = tempDir.resolve("wrong-tail-count.imn");
+    try (DataOutputStream out = new DataOutputStream(Files.newOutputStream(path))) {
+      writeHeader(out, 1, 1);
+      writeFile(out);
+      out.writeInt(2);
+      writeMemory(out, 1, List.of("nodes"));
+      writeMemory(out, 1, List.of("nodes"));
+    }
+    assertThatThrownBy(() -> IndexManifest.read(localInput(path.toFile())))
+        .isInstanceOf(IllegalArgumentException.class)
+        .hasMessageContaining("does not match");
+  }
+
+  @Test
+  void rejectsATruncatedTail(@TempDir Path tempDir) throws IOException {
+    Path path = tempDir.resolve("truncated-tail.imn");
+    IndexManifest.write(localOutput(path.toFile()), List.of(fileWithMemory(memory().build())));
+    byte[] bytes = Files.readAllBytes(path);
+    Files.write(path, Arrays.copyOf(bytes, bytes.length - 1));
+    assertThatThrownBy(() -> IndexManifest.read(localInput(path.toFile())))
+        .isInstanceOf(UncheckedIOException.class)
+        .hasCauseInstanceOf(EOFException.class);
   }
 
   @Test
@@ -209,6 +267,26 @@ class TestIndexManifestFiles {
     assertThatThrownBy(() -> IndexManifest.read(localInput(path.toFile())))
         .isInstanceOf(IllegalArgumentException.class)
         .hasMessageContaining("payload bytes");
+  }
+
+  /** One file record, read the way the oldest reader reads it: no memory, no look-ahead. */
+  private static IndexFile readFileRecord(DataInputStream in) throws IOException {
+    String location = in.readUTF();
+    Kind kind = Kind.valueOf(in.readUTF());
+    String blobType = in.readUTF();
+    long entryCount = in.readLong();
+    int coveredCount = in.readInt();
+    List<String> covered = new java.util.ArrayList<>();
+    for (int i = 0; i < coveredCount; i++) {
+      covered.add(in.readUTF());
+    }
+    return IndexFile.builder()
+        .location(location)
+        .kind(kind)
+        .blobType(blobType)
+        .entryCount(entryCount)
+        .coveredDataFiles(covered)
+        .build();
   }
 
   private static void writeMemory(DataOutputStream out, int model, List<String> keys)
