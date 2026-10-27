@@ -19,6 +19,7 @@
 package org.apache.iceberg.spark.extensions;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.within;
 
 import java.nio.file.Path;
 import java.util.List;
@@ -89,7 +90,11 @@ class TestIndexBuildNullValues {
                 "CALL local.system.text_search(table => 'db.null_text', column => 'body', "
                     + "query => 'snow', k => 2)")
             .collectAsList();
-    assertThat(hits).as("the documents that hold the term").isNotEmpty();
+    assertThat(hits).as("the documents that hold the term").hasSize(2);
+    // N=3, df(snow)=2, totalLength=4, avgdl=4/3, each hit has length=2 and tf=1.
+    double expected = Math.log(1.0 + 1.5 / 2.5) * 2.2 / 2.65;
+    assertThat(hits)
+        .allSatisfy(hit -> assertThat(hit.getDouble(2)).isCloseTo(expected, within(1e-9)));
   }
 
   @Test
@@ -116,6 +121,9 @@ class TestIndexBuildNullValues {
                     + "column => 'embedding', query => array(1.0d, 0.0d), k => 3)")
             .collectAsList();
     assertThat(hits).hasSize(2);
+    assertThat(hits).allSatisfy(hit -> assertThat(hit.getString(0)).endsWith(".lance"));
+    assertThat(hits.get(0).getString(3)).contains("\"id\":1");
+    assertThat(hits.get(1).getString(3)).contains("\"id\":2");
   }
 
   private static long entries(String table) {

@@ -156,15 +156,6 @@ public interface IndexAdapter {
   }
 
   /**
-   * Encodes one column value into the payload of an index entry.
-   *
-   * <p>The value is the indexed column's value in the engine's representation: a {@code List<?
-   * extends Number>} for numeric array columns, a {@code String} for text columns. Engines use this
-   * to build entries without knowing the index type, so a new adapter needs no engine change.
-   *
-   * @throws UnsupportedOperationException when this index type does not encode raw column values
-   */
-  /**
    * Statistics this adapter needs in order to score rows itself, merged from the payloads of one
    * index snapshot. An engine that computes scores outside the index, a query expression for
    * instance, asks the reader for these so that its scores are the ones the index would give.
@@ -193,6 +184,15 @@ public interface IndexAdapter {
     return false;
   }
 
+  /**
+   * Encodes one column value into the payload of an index entry.
+   *
+   * <p>The value is the indexed column's value in the engine's representation: a {@code List<?
+   * extends Number>} for numeric array columns, a {@code String} for text columns. Engines use this
+   * to build entries without knowing the index type, so a new adapter needs no engine change.
+   *
+   * @throws UnsupportedOperationException when this index type does not encode raw column values
+   */
   default byte[] encodeEntryValue(Object columnValue) {
     throw new UnsupportedOperationException(
         "This index type does not encode raw column values: " + definition().type());
