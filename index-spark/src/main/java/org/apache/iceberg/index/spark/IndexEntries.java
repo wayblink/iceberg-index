@@ -59,13 +59,16 @@ import org.apache.spark.api.java.function.Function;
 import org.apache.spark.api.java.function.PairFlatMapFunction;
 import org.apache.spark.api.java.function.PairFunction;
 import org.apache.spark.broadcast.Broadcast;
+import org.apache.spark.sql.Column;
 import org.apache.spark.sql.Dataset;
 import org.apache.spark.sql.Row;
 import org.apache.spark.sql.RowFactory;
 import org.apache.spark.sql.SparkSession;
 import org.apache.spark.sql.catalyst.expressions.GenericRowWithSchema;
+import org.apache.spark.sql.functions;
 import org.apache.spark.sql.types.DataType;
 import org.apache.spark.sql.types.DataTypes;
+import org.apache.spark.sql.types.Metadata;
 import org.apache.spark.sql.types.StructField;
 import org.apache.spark.sql.types.StructType;
 import org.apache.spark.util.LongAccumulator;
@@ -93,6 +96,8 @@ public final class IndexEntries {
   public static final String DATA_FILE_COLUMN = "data_file";
   public static final String POSITION_COLUMN = "pos";
   public static final String VECTOR_COLUMN = "vector";
+
+  private static final String JSON_COLUMN = "row_json";
 
   public static final StructType SCHEMA =
       new StructType()
@@ -243,6 +248,98 @@ public final class IndexEntries {
       List<String> columns,
       StructType readSchema,
       List<FileScanTask> scanTasks) {
+    List<FileScanTask> tasks = tasksAt(positionsByFile, scanTasks);
+    Map<String, Map<Long, Row>> rowsByFile = Maps.newLinkedHashMap();
+    JavaPairRDD<String, Tuple2<Long, Row>> rows =
+        liveRowsRdd(spark, table, positionsByFile, columns, readSchema, tasks);
+    if (rows == null) {
+      return rowsByFile;
+    }
+
+    // a lookup reads a few rows from each hit file, so what the fetch-back pays is opening the
+    // files and starting the tasks rather than moving bytes. Packing the files into fewer tasks
+    // keeps that fixed cost paid a handful of times instead of once per file; the number is a
+    // property so the trade-off against per-file parallelism can be measured.
+    int readTasks = readTaskCount(tasks.size());
+    for (Tuple2<String, Tuple2<Long, Row>> entry : rows.coalesce(readTasks).collect()) {
+      rowsByFile
+          .computeIfAbsent(entry._1(), key -> Maps.newLinkedHashMap())
+          .put(entry._2()._1(), entry._2()._2());
+    }
+
+    return rowsByFile;
+  }
+
+  /**
+   * Reads the live rows of a snapshot at the given positions as JSON, keyed by data file and then
+   * by row position.
+   *
+   * <p>This is the same fetch-back as {@link #rowsAt}, with the JSON of a row produced on the
+   * executor that read it. A lookup resolves a whole record per hit, so collecting the records and
+   * then parallelising them again to serialise them moves the same records across the driver
+   * barrier twice; serialising them where they are read moves them once.
+   */
+  public static Map<String, Map<Long, String>> rowsAtJson(
+      SparkSession spark,
+      Table table,
+      Map<String, ? extends Collection<Long>> positionsByFile,
+      List<String> columns,
+      StructType readSchema,
+      List<FileScanTask> scanTasks) {
+    List<FileScanTask> tasks = tasksAt(positionsByFile, scanTasks);
+    Map<String, Map<Long, String>> jsonByFile = Maps.newLinkedHashMap();
+    JavaPairRDD<String, Tuple2<Long, Row>> rows =
+        liveRowsRdd(spark, table, positionsByFile, columns, readSchema, tasks);
+    if (rows == null) {
+      return jsonByFile;
+    }
+
+    List<Column> requested = Lists.newArrayListWithCapacity(columns.size());
+    for (String column : columns) {
+      requested.add(functions.col(column));
+    }
+
+    // the positions travel with the rows instead of being recovered from an order: a row's JSON is
+    // keyed by the position it answers, so nothing here depends on how the rows are partitioned
+    int readTasks = readTaskCount(tasks.size());
+    int width = columns.size();
+    Dataset<Row> json =
+        spark
+            .createDataFrame(
+                rows.coalesce(readTasks)
+                    .map(
+                        (Function<Tuple2<String, Tuple2<Long, Row>>, Row>)
+                            entry -> {
+                              Object[] values = new Object[width + 2];
+                              values[0] = entry._1();
+                              values[1] = entry._2()._1();
+                              Row row = entry._2()._2();
+                              for (int i = 0; i < width; i++) {
+                                values[i + 2] = row.get(i);
+                              }
+
+                              return RowFactory.create(values);
+                            }),
+                schemaOf(columns, readSchema))
+            .select(
+                functions.col(DATA_FILE_COLUMN),
+                functions.col(POSITION_COLUMN),
+                functions
+                    .to_json(functions.struct(requested.toArray(new Column[0])))
+                    .as(JSON_COLUMN));
+
+    for (Row row : json.collectAsList()) {
+      jsonByFile
+          .computeIfAbsent(row.getString(0), key -> Maps.newLinkedHashMap())
+          .put(row.getLong(1), row.getString(2));
+    }
+
+    return jsonByFile;
+  }
+
+  /** The scan tasks a fetch-back reads: the ones whose file is asked for a row of. */
+  private static List<FileScanTask> tasksAt(
+      Map<String, ? extends Collection<Long>> positionsByFile, List<FileScanTask> scanTasks) {
     List<FileScanTask> tasks = Lists.newArrayList();
     for (FileScanTask task : scanTasks) {
       if (positionsByFile.containsKey(task.file().location().toString())) {
@@ -250,8 +347,24 @@ public final class IndexEntries {
       }
     }
 
-    // the rows of every file are unioned and read by one job, which only holds because the
-    // positions are counted as the rows stream past rather than asked of Spark per file
+    return tasks;
+  }
+
+  /**
+   * The live rows of the given files, paired with their data file and position, as one RDD. Null
+   * when there is nothing to read.
+   */
+  private static JavaPairRDD<String, Tuple2<Long, Row>> liveRowsRdd(
+      SparkSession spark,
+      Table table,
+      Map<String, ? extends Collection<Long>> positionsByFile,
+      List<String> columns,
+      StructType readSchema,
+      List<FileScanTask> tasks) {
+    if (tasks.isEmpty()) {
+      return null;
+    }
+
     // one serializable configuration for the whole fetch-back: building it copies the session's
     // Hadoop configuration, which is not something to do once per data file
     SerializableConfiguration conf =
@@ -273,23 +386,7 @@ public final class IndexEntries {
       rows = rows == null ? fileRows : rows.union(fileRows);
     }
 
-    Map<String, Map<Long, Row>> rowsByFile = Maps.newLinkedHashMap();
-    if (rows == null) {
-      return rowsByFile;
-    }
-
-    // a lookup reads a few rows from each hit file, so what the fetch-back pays is opening the
-    // files and starting the tasks rather than moving bytes. Packing the files into fewer tasks
-    // keeps that fixed cost paid a handful of times instead of once per file; the number is a
-    // property so the trade-off against per-file parallelism can be measured.
-    int readTasks = readTaskCount(tasks.size());
-    for (Tuple2<String, Tuple2<Long, Row>> entry : rows.coalesce(readTasks).collect()) {
-      rowsByFile
-          .computeIfAbsent(entry._1(), key -> Maps.newLinkedHashMap())
-          .put(entry._2()._1(), entry._2()._2());
-    }
-
-    return rowsByFile;
+    return rows;
   }
 
   /**
@@ -701,6 +798,22 @@ public final class IndexEntries {
   }
 
   /** The schema of the given columns, taken from the schema they are read with. */
+  /**
+   * The schema a fetch-back hands to Spark: the data file and the position a row answers, then the
+   * requested columns.
+   */
+  private static StructType schemaOf(List<String> columns, StructType readSchema) {
+    StructType requested = schemaFor(columns, readSchema);
+    List<StructField> fields = Lists.newArrayListWithCapacity(columns.size() + 2);
+    fields.add(new StructField(DATA_FILE_COLUMN, DataTypes.StringType, false, Metadata.empty()));
+    fields.add(new StructField(POSITION_COLUMN, DataTypes.LongType, false, Metadata.empty()));
+    for (StructField field : requested.fields()) {
+      fields.add(field);
+    }
+
+    return new StructType(fields.toArray(new StructField[0]));
+  }
+
   private static StructType schemaFor(List<String> columns, StructType readSchema) {
     StructField[] fields = new StructField[columns.size()];
     for (int i = 0; i < fields.length; i++) {

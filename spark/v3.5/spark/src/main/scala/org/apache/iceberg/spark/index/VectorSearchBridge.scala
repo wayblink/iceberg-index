@@ -180,7 +180,13 @@ private[spark] object VectorSearchBridge {
     hits.values.take(k).toSeq
   }
 
-  /** The JSON of each hit's live row, keyed by data file and then by position. */
+  /**
+   * The JSON of each hit's live row, keyed by data file and then by position.
+   *
+   * <p>The JSON is serialised where the row is read: a lookup resolves a whole record per hit, and
+   * collecting the records only to parallelise them again to serialise them would move them across
+   * the driver barrier twice.
+   */
   private def resolveRows(
       spark: SparkSession,
       context: VectorSearchContext,
@@ -197,31 +203,14 @@ private[spark] object VectorSearchBridge {
         dataFile -> fileHits.map(hit => JLong.valueOf(hit.rowPosition())).toSet.asJava
       }
       .asJava
-    val rowsByFile = IndexEntries.rowsAt(
+
+    IndexEntries.rowsAtJson(
       spark,
       inputs.table,
       positions,
       names.toList.asJava,
       inputs.readSchema,
       inputs.scanTasks)
-
-    val result = mutable.Map.empty[String, mutable.Map[JLong, String]]
-    rowsByFile.asScala.foreach { case (dataFile, byPosition) =>
-      if (!byPosition.isEmpty) {
-        // the row JSON is built from the same rows the caller would see, in one pass, so a row's
-        // text does not depend on how many other hits were resolved with it
-        val ordered = byPosition.asScala.toSeq.sortBy { case (position, _) => position.longValue() }
-        val json = spark
-          .createDataFrame(ordered.map { case (_, row) => row }.asJava, inputs.readSchema)
-          .toJSON
-          .collect()
-        val byFile = result.getOrElseUpdate(dataFile, mutable.Map.empty[JLong, String])
-        ordered.zipWithIndex.foreach { case ((position, _), index) =>
-          byFile.put(position, json(index))
-        }
-      }
-    }
-    result.map { case (dataFile, byPosition) => dataFile -> byPosition.asJava }.asJava
   }
 }
 
