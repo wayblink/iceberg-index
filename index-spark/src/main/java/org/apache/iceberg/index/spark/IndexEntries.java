@@ -257,20 +257,16 @@ public final class IndexEntries {
     SerializableConfiguration conf =
         new SerializableConfiguration(spark.sessionState().newHadoopConf());
 
+    // the deletes belong to the fetch-back, not to the file being read: the same set applies to
+    // every file, so reading them inside the loop would read and broadcast them once per hit file
+    SnapshotDeletes deletes = deletesFor(spark, tasks, table);
+
     JavaPairRDD<String, Tuple2<Long, Row>> rows = null;
     for (FileScanTask task : tasks) {
       String dataFile = task.file().location().toString();
       Collection<Long> positions = positionsByFile.get(dataFile);
       JavaPairRDD<String, Tuple2<Long, Row>> fileRows =
-          liveRowsOf(
-                  spark,
-                  table.schema(),
-                  task,
-                  columns,
-                  positions,
-                  readSchema,
-                  deletesFor(spark, tasks, table),
-                  conf)
+          liveRowsOf(spark, table.schema(), task, columns, positions, readSchema, deletes, conf)
               .mapToPair(
                   (PairFunction<Tuple2<Long, Row>, String, Tuple2<Long, Row>>)
                       entry -> new Tuple2<>(dataFile, entry));
