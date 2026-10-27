@@ -657,15 +657,8 @@ public final class DistributedIndexSearch {
   private static byte[] readPayload(FileIO io, String location) {
     InputFile file = io.newInputFile(location);
     long length = file.getLength();
-    if (length > Integer.MAX_VALUE) {
-      throw new IllegalArgumentException(
-          "Index file "
-              + location
-              + " is "
-              + length
-              + " bytes, more than the "
-              + Integer.MAX_VALUE
-              + " bytes a payload can be read into; build it with a smaller grouping budget");
+    if (length > IndexPayloadLimits.MAX_PAYLOAD_BYTES) {
+      throw new IllegalArgumentException(IndexPayloadLimits.tooLargeToRead(length, location));
     }
 
     byte[] content = new byte[(int) length];

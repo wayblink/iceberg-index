@@ -185,6 +185,8 @@ docker push hub.i.basemind.com/spark/sparkann-e2e:<tag>
 
 规划时按 `1bit ≈ 30 字节/行`、`3bit ≈ 60 字节/行` 估算（含索引文件头与量化参数）。索引文件数由 `max_entries_per_index_file` 决定（benchmark 用 262144，10M 表 38 个文件、100M 表 256 个）。
 
+**单个索引文件的上限是 2 GB（2147483647 字节）。** 查询时一个执行器要把整个 payload 读进一个数组，超过这个长度就永远读不了，所以构建会在写盘前就失败，并在错误里给出"按当前每文件条目数推算、能保证不超限的 `max_entries_per_index_file` 建议值"。按上面的体积表，100M × 4bit 分成 256 个文件是 29 MB/文件、留了约 70 倍余量；真正会撞上的是"少文件布局"（把 `max_entries_per_index_file` 调得很大，让多个数据文件合成一个索引文件）或本身含几千万行的超大单个数据文件。撞上时唯一的解法是**把分组预算调小**（得到更多、更小的文件），而不是切分索引文件——索引文件是一个整体，图或倒排表被切开就不再是一个索引。
+
 ### 5.2 缓存预算
 
 `spark.iceberg.index.cache.enabled`（默认 true）、`spark.iceberg.index.cache.bytes`（每个执行器的预算，默认按工作集与堆推导）、`spark.iceberg.index.cache.mode`。经验：**索引装不进缓存时会退化成"每次查询读自己的索引文件"**，100M 的 HNSW（23.7 GB / 6 执行器）就是这样废掉的——它的延迟等于全表扫描。所以缓存预算要按"最大索引 ÷ 执行器数"给，宁多勿少。

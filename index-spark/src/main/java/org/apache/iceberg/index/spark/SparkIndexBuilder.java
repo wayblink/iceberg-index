@@ -449,6 +449,10 @@ public final class SparkIndexBuilder {
                     kind = IndexFile.Kind.ENTRY_BEARING;
                   }
                   IndexFileMemory memory = built.memory();
+                  // Checked before the payload becomes one array: a file past the limit could be
+                  // written, published, and then rejected by every query that reads it.
+                  IndexPayloadLimits.checkFits(
+                      built.payload().remaining(), groupEntries.size(), location);
                   try {
                     fileContainer.write(
                         fileIO.newOutputFile(location),
