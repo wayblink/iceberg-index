@@ -186,21 +186,22 @@ class TestIndexTableFunctions {
   }
 
   /**
-   * A table with columns named like the ones a search returns is searched like any other: a
-   * resolved row is serialised from the schema it was read with, so no column name of the row is
-   * parsed as a SQL reference and none of them collides with the columns of the answer.
+   * A table with columns named like the ones a search returns, or with a name a parquet writer
+   * stores escaped, is searched like any other: a resolved row is serialised from the schema the
+   * read was given, and the read finds each column by field id, so no column name is parsed as a
+   * SQL reference, none collides with the columns of the answer, and none reads back as a null.
    */
   @Test
   public void searchResolvesColumnsNamedLikeTheOutputColumns() {
     spark.sql("DROP TABLE IF EXISTS local.db.clashing");
     spark.sql(
-        "CREATE TABLE local.db.clashing (id bigint, pos bigint, data_file string,"
+        "CREATE TABLE local.db.clashing (id bigint, pos bigint, data_file string, `a.b` string,"
             + " embedding array<double>) USING iceberg");
     spark.sql(
         "INSERT INTO local.db.clashing VALUES"
-            + " (1, 10, 'mine-a', array(1.0d, 0.0d)),"
-            + " (2, 20, 'mine-b', array(0.0d, 1.0d)),"
-            + " (3, 30, 'mine-c', array(0.7d, 0.7d))");
+            + " (1, 10, 'mine-a', 'dot-a', array(1.0d, 0.0d)),"
+            + " (2, 20, 'mine-b', 'dot-b', array(0.0d, 1.0d)),"
+            + " (3, 30, 'mine-c', 'dot-c', array(0.7d, 0.7d))");
     spark.sql(
         "CALL local.system.build_vector_index(table => 'db.clashing', column => 'embedding',"
             + " dimension => 2)");
@@ -223,7 +224,8 @@ class TestIndexTableFunctions {
                 assertThat(json)
                     .contains("\"id\":1")
                     .contains("\"pos\":10")
-                    .contains("\"data_file\":\"mine-a\""));
+                    .contains("\"data_file\":\"mine-a\"")
+                    .contains("\"a.b\":\"dot-a\""));
   }
 
   @Test

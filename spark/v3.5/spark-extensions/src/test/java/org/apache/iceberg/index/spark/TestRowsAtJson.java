@@ -208,6 +208,11 @@ class TestRowsAtJson {
    * A column whose name contains a dot is a legal column. Serialising a resolved row reads the
    * schema, so the name is a JSON key rather than a path through nested values, and it is not
    * resolved by the query parser.
+   *
+   * <p>The value has to survive the read as well: a parquet writer stores such a name escaped
+   * (`a.b` as `a_x2Eb`), so a read that asks for the column by its table name finds nothing and
+   * answers a null. The fetch-back therefore has to find the column the way Iceberg does, by
+   * field id.
    */
   @Test
   void aColumnWhoseNameContainsADotStillSerialises() throws Exception {
@@ -217,11 +222,30 @@ class TestRowsAtJson {
             + " USING iceberg");
     spark.sql("INSERT INTO local.db.dotted_names SELECT /*+ COALESCE(1) */ 1L, 'dotted', 'spaced'");
 
-    // the value of such a column is not what this test is about: a parquet writer escapes a dot in
-    // a column name to `a_x2Eb`, so the fetch-back cannot match the escaped name in the file and
-    // reads a null there. What the test pins is that serialising the row no longer goes through the
-    // query parser, which is what used to reject the name outright.
-    assertSameJsonAsTheRowToJsonConversion("local.db.dotted_names");
+    Map<String, Map<Long, String>> json =
+        assertSameJsonAsTheRowToJsonConversion("local.db.dotted_names");
+    assertThat(json.values().stream().flatMap(byPosition -> byPosition.values().stream()))
+        .as("the values of the columns whose names a writer escapes")
+        .allSatisfy(
+            value ->
+                assertThat(value).contains("\"a.b\":\"dotted\"").contains("\"c d\":\"spaced\""));
+
+    // a caller that asks for one of them alone gets that one, which is the shape a query that
+    // projects the column has
+    Table table = Spark3Util.loadIcebergTable(spark, "local.db.dotted_names");
+    StructType fullSchema = SparkSchemaUtil.convert(table.schema());
+    List<FileScanTask> tasks = IndexEntries.scanTasks(table, table.currentSnapshot().snapshotId());
+    Map<String, Map<Long, String>> onlyDotted =
+        IndexEntries.rowsAtJson(
+            spark,
+            table,
+            positionsOfDeleted(tasks),
+            Lists.newArrayList("a.b"),
+            fullSchema,
+            tasks);
+    assertThat(onlyDotted.values().stream().flatMap(byPosition -> byPosition.values().stream()))
+        .as("a fetch-back that asks for the column alone")
+        .allSatisfy(value -> assertThat(value).isEqualTo("{\"a.b\":\"dotted\"}"));
   }
 
   @Test
@@ -260,7 +284,8 @@ class TestRowsAtJson {
   }
 
   /** Both conversions of every row of a table, checked to agree. */
-  private void assertSameJsonAsTheRowToJsonConversion(String tableName) throws Exception {
+  private Map<String, Map<Long, String>> assertSameJsonAsTheRowToJsonConversion(String tableName)
+      throws Exception {
     Table table = Spark3Util.loadIcebergTable(spark, tableName);
     List<String> columns = Lists.newArrayList();
     for (Types.NestedField field : table.schema().columns()) {
@@ -281,6 +306,8 @@ class TestRowsAtJson {
     assertThat(json.values().stream().flatMap(byPosition -> byPosition.values().stream()))
         .as("the rows %s answered", tableName)
         .isNotEmpty();
+
+    return json;
   }
 
   private static List<String> allColumns() {

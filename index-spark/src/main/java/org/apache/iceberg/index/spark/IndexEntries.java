@@ -529,16 +529,13 @@ public final class IndexEntries {
     FileFormat format = task.file().format();
 
     if (format == FileFormat.PARQUET) {
-      Dataset<Row> data =
-          readSchema == null
-              ? spark.read().parquet(dataFile)
-              : spark.read().schema(readSchema).parquet(dataFile);
       // The position of a row is its ordinal in the file, so it has to be counted as the rows
       // stream past. zipWithIndex would give the same answer, but it runs a job of its own to size
       // the partitions first, so a lookup that touches ten data files pays for ten jobs and reads
       // each file twice. Merging to one partition first costs nothing when the file was going to
       // be read by a single task anyway, and it is how every other format is read below.
-      return data.toJavaRDD()
+      return readParquet(spark, dataFile, columns, tableSchema, readSchema, conf)
+          .toJavaRDD()
           .coalesce(1)
           .mapPartitionsToPair(
               (PairFlatMapFunction<Iterator<Row>, Row, Long>) rows -> new NumberedRows(rows), true);
@@ -555,6 +552,106 @@ public final class IndexEntries {
             (PairFlatMapFunction<String, Row, Long>)
                 file ->
                     readFileWithFormat(file, format, projection, sparkSchema, positions, readConf));
+  }
+
+  /**
+   * Reads a parquet data file into the given columns, in that order.
+   *
+   * <p>A parquet writer escapes a column name it cannot store verbatim: `a.b` is written as
+   * `a_x2Eb` and `c d` as `c_x20d`. Asking for such a column by its table name finds nothing in the
+   * file, and the read answers a null rather than failing. The file still carries the field ids, so
+   * the name each column is stored under is read from the footer and the read asks for that, then
+   * renames the columns back to the table's names. Only a table that has such a name pays for the
+   * footer read; every other table matches every column by name, which is how the file stores it.
+   */
+  private static Dataset<Row> readParquet(
+      SparkSession spark,
+      String dataFile,
+      List<String> columns,
+      Schema tableSchema,
+      StructType readSchema,
+      SerializableConfiguration conf) {
+    if (readSchema == null) {
+      return spark.read().parquet(dataFile);
+    }
+
+    if (!hasEscapableName(columns)) {
+      return spark.read().schema(readSchema).parquet(dataFile);
+    }
+
+    Map<Integer, String> stored = storedNames(dataFile, conf);
+    StructField[] storedFields = new StructField[columns.size()];
+    boolean renamed = false;
+    for (int i = 0; i < columns.size(); i++) {
+      StructField field = readSchema.apply(columns.get(i));
+      Types.NestedField column = columnOf(tableSchema, columns.get(i));
+      String storedName = column == null ? null : stored.get(column.fieldId());
+      boolean differs = storedName != null && !storedName.equals(field.name());
+      renamed |= differs;
+      storedFields[i] =
+          differs
+              ? new StructField(storedName, field.dataType(), field.nullable(), field.metadata())
+              : field;
+    }
+
+    Dataset<Row> data = spark.read().schema(new StructType(storedFields)).parquet(dataFile);
+    return renamed ? data.toDF(columns.toArray(new String[0])) : data;
+  }
+
+  /**
+   * The name each column of a parquet file is stored under, keyed by field id, empty when the file
+   * carries no ids.
+   */
+  private static Map<Integer, String> storedNames(String dataFile, SerializableConfiguration conf) {
+    Map<Integer, String> names = Maps.newHashMap();
+    try (org.apache.parquet.hadoop.ParquetFileReader reader =
+        org.apache.parquet.hadoop.ParquetFileReader.open(
+            org.apache.parquet.hadoop.util.HadoopInputFile.fromPath(
+                new org.apache.hadoop.fs.Path(dataFile), taskConf(conf)))) {
+      org.apache.parquet.schema.MessageType schema =
+          reader.getFooter().getFileMetaData().getSchema();
+      for (int i = 0; i < schema.getFieldCount(); i++) {
+        org.apache.parquet.schema.Type field = schema.getType(i);
+        if (field.getId() != null) {
+          names.put(field.getId().intValue(), schema.getFieldName(i));
+        }
+      }
+    } catch (IOException e) {
+      throw new UncheckedIOException(String.format("Failed to read the footer of %s", dataFile), e);
+    }
+
+    return names;
+  }
+
+  /**
+   * Whether a parquet writer would store one of the column names escaped, which it does for a name
+   * with a character outside the plain identifier set. Such a table is the only one whose columns
+   * cannot be found in the file by name.
+   */
+  private static boolean hasEscapableName(List<String> columns) {
+    for (String column : columns) {
+      for (int i = 0; i < column.length(); i++) {
+        char c = column.charAt(i);
+        boolean plain =
+            (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_';
+        if (!plain) {
+          return true;
+        }
+      }
+    }
+
+    return false;
+  }
+
+  /** The table column of a given name, or null when the table does not have it. */
+  private static Types.NestedField columnOf(Schema tableSchema, String name) {
+    for (Types.NestedField column : tableSchema.columns()) {
+      if (column.name().equals(name)) {
+        return column;
+      }
+    }
+
+    return null;
   }
 
   /**
