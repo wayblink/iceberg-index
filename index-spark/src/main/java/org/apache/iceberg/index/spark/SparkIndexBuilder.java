@@ -128,7 +128,7 @@ public final class SparkIndexBuilder {
               currentMetadata.maxEntriesPerIndexFile(),
               writer);
       manifestList = writer.writeManifestList(indexLocation, snapshotId, indexFiles);
-    } catch (RuntimeException e) {
+    } catch (Exception | Error e) {
       writer.abortAttempt(indexLocation);
       throw e;
     }
@@ -238,7 +238,7 @@ public final class SparkIndexBuilder {
       indexFiles = Lists.newArrayList(carried);
       indexFiles.addAll(newIndexFiles);
       manifestList = writer.writeManifestList(indexLocation, snapshotId, indexFiles);
-    } catch (RuntimeException e) {
+    } catch (Exception | Error e) {
       // carried-over files belong to the parent snapshot and must survive a failed refresh
       writer.abortAttempt(indexLocation);
       throw e;
@@ -308,7 +308,8 @@ public final class SparkIndexBuilder {
               reporter);
       reporter.succeeded();
       return indexFiles;
-    } catch (RuntimeException | Error e) {
+    } catch (Exception | Error e) {
+      // Spark's Java APIs can throw checked exceptions without declaring them.
       reporter.failed(e);
       throw e;
     } finally {
