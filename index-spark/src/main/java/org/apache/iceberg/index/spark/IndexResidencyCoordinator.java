@@ -510,16 +510,42 @@ final class IndexResidencyCoordinator {
   }
 
   /** The executor each planned file was sent to, for the driver's own reporting. */
+  /**
+   * Which executor holds each of a plan's files, as far as the driver knows.
+   *
+   * <p>A plan only commands the copies it still has to place, so a file that was already resident
+   * and got reused has no command of its own; reporting nothing for it would leave a COMPLETE plan
+   * with files whose holder is unknown. Any executor that currently holds the key answers that.
+   */
   Map<String, String> placements(String planId) {
     PlanState plan = plans.get(planId);
     if (plan == null) {
       return Map.of();
     }
 
-    Map<String, String> placements = new LinkedHashMap<>();
+    Map<String, String> byKey = new LinkedHashMap<>();
     for (PlanFile command : plan.commands.values()) {
       if (command.type == IndexCacheProtocol.CommandType.LOAD) {
-        placements.putIfAbsent(command.location, command.executorId);
+        byKey.putIfAbsent(command.cacheKey, command.executorId);
+      }
+    }
+
+    for (Map.Entry<String, IndexState> entry : indexes.entrySet()) {
+      IndexState index = entry.getValue();
+      if (!entry.getKey().equals(plan.indexUuid)) {
+        continue;
+      }
+
+      for (Holder holder : holders(index.indexUuid)) {
+        byKey.putIfAbsent(holder.cacheKey(), holder.executorId());
+      }
+    }
+
+    Map<String, String> placements = new LinkedHashMap<>();
+    for (IndexCacheProtocol.File file : plan.files) {
+      String executorId = byKey.get(file.cacheKey());
+      if (executorId != null) {
+        placements.putIfAbsent(file.location(), executorId);
       }
     }
 

@@ -619,6 +619,25 @@ class TestIndexResidencyCoordinator {
   }
 
   @Test
+  void aReusedFileStillNamesTheExecutorThatHoldsIt() {
+    coordinator.report(node("a", "a-1", 1, 1_000, 0));
+    String first =
+        coordinator.acceptLoad(
+            target("A", "f", 40), IndexResidencyPolicy.parse("forever"), clock.now());
+    ackFile(first, "f", IndexCacheProtocol.AckStatus.LOADED);
+    coordinator.report(holding("a", "a-1", 2, 1_000, 40, "adapter|A|f", 40));
+
+    String second =
+        coordinator.acceptLoad(
+            target("A", "f", 40), IndexResidencyPolicy.parse("forever"), clock.now());
+
+    // The copy is already there, so this plan commands nothing; the holder still has to be named or
+    // a COMPLETE plan reports files whose executor is unknown.
+    assertThat(coordinator.result(second).reusedFiles()).isNotEmpty();
+    assertThat(coordinator.placements(second)).containsEntry("f", "a");
+  }
+
+  @Test
   void finishedPlansAreKeptInABoundedWindow() {
     coordinator.report(node("a", "a-1", 1, 1_000_000, 0));
     for (int i = 0; i < 70; i++) {
