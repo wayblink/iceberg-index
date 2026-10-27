@@ -26,12 +26,10 @@ import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicInteger;
-import org.apache.iceberg.DeleteFile;
 import org.apache.iceberg.FileScanTask;
 import org.apache.iceberg.Table;
 import org.apache.iceberg.hadoop.HadoopFileIO;
 import org.apache.iceberg.io.InputFile;
-import org.apache.iceberg.relocated.com.google.common.collect.Iterables;
 import org.apache.iceberg.spark.Spark3Util;
 import org.apache.spark.sql.Row;
 import org.apache.spark.sql.SparkSession;
@@ -89,22 +87,37 @@ class TestRowsAtReadsDeletesOnce {
   void aFetchBackOverThreeFilesReadsTheDeleteFileOnce() throws Exception {
     Table table = tableWithOnePositionDelete();
 
-    // three data files are asked for, so a per-file read of the deletes opens the same file three
-    // times
-    List<FileScanTask> hits = new ArrayList<>();
-    List<DeleteFile> deletes = new ArrayList<>();
+    // the file that carries the delete has to be one of the three asked for: three files that
+    // carry no delete read no delete file at all, and then the count below is zero whether the
+    // deletes are read once or once per hit file. Which file the delete landed on is not something
+    // a scan promises, so it is picked by looking for it rather than by taking the first tasks.
+    List<FileScanTask> withDeletes = new ArrayList<>();
+    List<FileScanTask> withoutDeletes = new ArrayList<>();
     for (FileScanTask task : IndexEntries.scanTasks(table, table.currentSnapshot().snapshotId())) {
-      if (hits.size() < 3) {
-        hits.add(task);
+      if (task.deletes().isEmpty()) {
+        withoutDeletes.add(task);
+      } else {
+        withDeletes.add(task);
       }
-      deletes.addAll(task.deletes());
     }
-    assertThat(hits).as("the fixture needs three data files with a hit each").hasSize(3);
-    assertThat(deletes).as("the fixture needs one position delete file").hasSize(1);
+    assertThat(withDeletes).as("the fixture needs one data file carrying a delete").hasSize(1);
+    assertThat(withoutDeletes)
+        .as("the fixture needs two more data files that carry none")
+        .hasSizeGreaterThanOrEqualTo(2);
 
+    List<FileScanTask> hits = new ArrayList<>();
+    hits.add(withDeletes.get(0));
+    hits.addAll(withoutDeletes.subList(0, 2));
+
+    // every position of every hit file is asked for, so the answer shows both that the deleted row
+    // is gone and that its file still answers the row next to it
     Map<String, java.util.Collection<Long>> positions = new java.util.HashMap<>();
     for (FileScanTask task : hits) {
-      positions.put(task.file().location().toString(), List.of(0L));
+      List<Long> filePositions = new ArrayList<>();
+      for (long position = 0; position < task.file().recordCount(); position++) {
+        filePositions.add(position);
+      }
+      positions.put(task.file().location().toString(), filePositions);
     }
 
     Map<String, Map<Long, Row>> rows =
@@ -117,14 +130,27 @@ class TestRowsAtReadsDeletesOnce {
                 table.schema().select("id", "embedding")),
             IndexEntries.scanTasks(table, table.currentSnapshot().snapshotId()));
 
-    String deleteLocation = Iterables.getOnlyElement(deletes).location().toString();
-    assertThat(CountingFileIO.opens(deleteLocation))
+    String deleteFileLocation = withDeletes.get(0).deletes().get(0).location();
+    String deletedDataFile = withDeletes.get(0).file().location().toString();
+    assertThat(CountingFileIO.opens(deleteFileLocation))
         .as("the delete file is read once for the whole fetch-back")
         .isEqualTo(1);
 
-    // and the row it removes is still absent from the answer
-    long absent = positions.keySet().stream().filter(file -> !rows.containsKey(file)).count();
-    assertThat(absent).as("the deleted row's file still answered its other rows").isZero();
+    // three files were asked for and three answered: the fetch-back did not drop one because it
+    // carries a delete
+    assertThat(rows.keySet()).as("the files that answered").isEqualTo(positions.keySet());
+    // the file that carries the delete held two rows and answers one, which is the row the delete
+    // did not remove
+    assertThat(rows.get(deletedDataFile)).as("the rows the deleted file answered").hasSize(1);
+    assertThat(rows.get(deletedDataFile).values())
+        .as("the row the delete left")
+        .allSatisfy(row -> assertThat(row.getLong(0)).isNotEqualTo(2L));
+    // and the files without deletes answer both of their rows
+    for (FileScanTask task : withoutDeletes.subList(0, 2)) {
+      assertThat(rows.get(task.file().location().toString()))
+          .as("the rows of a file without deletes")
+          .hasSize(2);
+    }
   }
 
   /**
