@@ -149,12 +149,12 @@ public final class IndexEntries {
   /**
    * The same, reporting the rows it left out.
    *
-   * <p>A row whose vector is null has nothing to put in an index, and a nearest-neighbour query is
-   * about the rows that have a vector: such a row is skipped rather than failing the build, and
-   * counted so the caller can say how many it was. A vector that is present but cannot be indexed,
-   * a wrong dimension for instance, is still an error about the data.
+   * <p>A row the adapter cannot hold is left out rather than failing the build: a vector index has
+   * nothing to store for a null vector, so such a row is skipped and counted, while an index type
+   * that records an absence still gets the row. A value that is present but cannot be indexed, a
+   * wrong dimension for instance, is still an error about the data.
    *
-   * @param skipped counts the rows left out because they have no vector, which may be null
+   * @param skipped counts the rows left out because their value is null, which may be null
    */
   public static JavaRDD<Row> entryRows(
       SparkSession spark,
@@ -186,11 +186,15 @@ public final class IndexEntries {
       String dataFile = task.file().location().toString();
 
       int columnIndex = readColumns.indexOf(column);
+      // only an index type that cannot represent a null asks for the row to be left out: a text
+      // index records a null document as a document with no tokens, and dropping it would change
+      // the corpus statistics its scores are computed from
+      boolean skipNulls = adapter.skipsNullValues();
       JavaRDD<Row> fileRows =
           liveRowsOf(spark, tableSchema, task, readColumns, null, null, deletes, conf)
               .filter(
                   (Function<Tuple2<Long, Row>, Boolean>)
-                      entry -> hasVector(entry._2(), columnIndex, skipped))
+                      entry -> !skipNulls || hasValue(entry._2(), columnIndex, skipped))
               .mapToPair(
                   (PairFunction<Tuple2<Long, Row>, Long, Row>)
                       entry ->
@@ -1241,8 +1245,8 @@ public final class IndexEntries {
    * Spark rows as Scala sequences, which are converted to Java lists here so adapters do not need
    * Scala.
    */
-  /** Whether a row has a vector to index, counting the row when it does not. */
-  private static boolean hasVector(Row row, int columnIndex, LongAccumulator skipped) {
+  /** Whether a row has a value the index can hold, counting it when the row is left out. */
+  private static boolean hasValue(Row row, int columnIndex, LongAccumulator skipped) {
     if (columnValue(row, columnIndex) == null) {
       if (skipped != null) {
         skipped.add(1L);

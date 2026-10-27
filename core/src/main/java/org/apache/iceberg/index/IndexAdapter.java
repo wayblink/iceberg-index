@@ -179,6 +179,20 @@ public interface IndexAdapter {
     return null;
   }
 
+  /**
+   * Whether a row whose indexed column is null has nothing to put in this index.
+   *
+   * <p>A vector index stores a vector per entry, so a row without one cannot be an entry, and a
+   * nearest-neighbour query is about the rows that have a vector. An index whose entries describe
+   * an absence instead — a text index, where a null document is a document with no tokens — still
+   * has something to record, and dropping the row would silently change what its statistics count.
+   * The default keeps every row: skipping is the exception, and it belongs to the index type that
+   * needs it.
+   */
+  default boolean skipsNullValues() {
+    return false;
+  }
+
   default byte[] encodeEntryValue(Object columnValue) {
     throw new UnsupportedOperationException(
         "This index type does not encode raw column values: " + definition().type());

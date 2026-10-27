@@ -104,6 +104,11 @@ public final class VectorIndexAdapter implements IndexAdapter, java.io.Serializa
   }
 
   @Override
+  public boolean skipsNullValues() {
+    return true;
+  }
+
+  @Override
   public byte[] encodeEntryValue(Object columnValue) {
     List<Float> values =
         org.apache.iceberg.relocated.com.google.common.collect.Lists.newArrayList();

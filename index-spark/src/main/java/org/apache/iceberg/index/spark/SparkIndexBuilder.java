@@ -513,8 +513,17 @@ public final class SparkIndexBuilder {
               .build());
     }
 
+    if (progress.skipped() > 0) {
+      // a build that leaves rows out is a fact about the table, not a detail of the run: whoever
+      // reads the log should see it without turning on debug logging
+      LOG.warn(
+          "Skipped {} rows of {} whose indexable value is null; they are not entries of this index",
+          progress.skipped(),
+          table.name());
+    }
+
     LOG.info(
-        "Built {} of {} index files for {}, {} rows, {} skipped for having no vector, {} failed, "
+        "Built {} of {} index files for {}, {} rows, {} skipped for having no value, {} failed, "
             + "in {} ms",
         filesBuilt.value(),
         totalGroups,
