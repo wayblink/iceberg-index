@@ -530,15 +530,8 @@ final class IndexResidencyCoordinator {
       }
     }
 
-    for (Map.Entry<String, IndexState> entry : indexes.entrySet()) {
-      IndexState index = entry.getValue();
-      if (!entry.getKey().equals(plan.indexUuid)) {
-        continue;
-      }
-
-      for (Holder holder : holders(index.indexUuid)) {
-        byKey.putIfAbsent(holder.cacheKey(), holder.executorId());
-      }
+    for (Holder holder : holders(plan.indexUuid)) {
+      byKey.putIfAbsent(holder.cacheKey(), holder.executorId());
     }
 
     Map<String, String> placements = new LinkedHashMap<>();
@@ -1606,15 +1599,39 @@ final class IndexResidencyCoordinator {
     return states;
   }
 
+  /**
+   * Every copy of an index, looked up through the keys that index owns.
+   *
+   * <p>A cache key is the table location, the adapter and the file: the index identity is not in
+   * it, so matching keys by the identity finds nothing on a real key. What belongs to the index is
+   * its current target plus the files its plans named.
+   */
   private List<Holder> holders(String indexUuid) {
     List<Holder> holders = new ArrayList<>();
-    for (Map.Entry<String, List<Holder>> entry : holdersByCacheKey().entrySet()) {
-      if (entry.getKey().contains("|" + indexUuid + "|")) {
-        holders.addAll(entry.getValue());
-      }
+    Map<String, List<Holder>> byKey = holdersByCacheKey();
+    for (String cacheKey : keysOf(indexUuid)) {
+      holders.addAll(byKey.getOrDefault(cacheKey, List.of()));
     }
 
     return holders;
+  }
+
+  private Set<String> keysOf(String indexUuid) {
+    Set<String> keys = new LinkedHashSet<>();
+    IndexState index = indexes.get(indexUuid);
+    if (index != null) {
+      keys.addAll(index.targetCacheKeys);
+    }
+
+    for (PlanState plan : plans.values()) {
+      if (plan.indexUuid.equals(indexUuid)) {
+        for (IndexCacheProtocol.File file : plan.files) {
+          keys.add(file.cacheKey());
+        }
+      }
+    }
+
+    return keys;
   }
 
   /**

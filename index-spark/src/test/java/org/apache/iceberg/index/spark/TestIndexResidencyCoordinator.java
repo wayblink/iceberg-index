@@ -257,7 +257,7 @@ class TestIndexResidencyCoordinator {
     coordinator.ack(ack);
     coordinator.ack(ack);
     assertThat(coordinator.result(plan).residentBytes()).isEqualTo(10);
-    assertThat(coordinator.state("a", "a-1").holders()).containsOnlyKeys("adapter|A|f1");
+    assertThat(coordinator.state("a", "a-1").holders()).containsOnlyKeys(cacheKey("A", "f1"));
     assertThat(coordinator.state("a", "a-1").usedBytes()).isEqualTo(10);
   }
 
@@ -272,7 +272,7 @@ class TestIndexResidencyCoordinator {
     // The executor answers the fenced file after the pause was published.
     ackFile(load, "f2", IndexCacheProtocol.AckStatus.LOADED);
     assertThat(coordinator.result(offload).status()).isEqualTo(IndexCacheProtocol.Status.RELEASING);
-    assertThat(coordinator.state("a", "a-1").holders()).doesNotContainKey("adapter|A|f2");
+    assertThat(coordinator.state("a", "a-1").holders()).doesNotContainKey(cacheKey("A", "f2"));
     assertThat(coordinator.commands("a", "a-1"))
         .filteredOn(c -> c.type() == IndexCacheProtocol.CommandType.RELEASE)
         .extracting(c -> c.file().location())
@@ -302,7 +302,7 @@ class TestIndexResidencyCoordinator {
         coordinator.acceptLoad(
             target("A", "f", 40), IndexResidencyPolicy.parse("forever"), clock.now());
     ackFile(first, "f", IndexCacheProtocol.AckStatus.LOADED);
-    coordinator.report(holding("a", "a-1", 2, 100, 40, "adapter|A|f", 40));
+    coordinator.report(holding("a", "a-1", 2, 100, 40, cacheKey("A", "f"), 40));
     coordinator.report(node("b", "b-1", 1, 100, 0));
 
     String plan =
@@ -313,7 +313,7 @@ class TestIndexResidencyCoordinator {
     assertThat(coordinator.commands("a", "a-1"))
         .filteredOn(c -> c.type() == IndexCacheProtocol.CommandType.RELEASE)
         .isEmpty();
-    assertThat(coordinator.state("a", "a-1").holders()).containsKey("adapter|A|f");
+    assertThat(coordinator.state("a", "a-1").holders()).containsKey(cacheKey("A", "f"));
 
     coordinator.ack(ack(plan, "b", "b-1", load, IndexCacheProtocol.AckStatus.LOADED));
     assertThat(coordinator.commands("a", "a-1"))
@@ -321,7 +321,7 @@ class TestIndexResidencyCoordinator {
         .extracting(c -> c.executorId())
         .containsExactly("a");
     // The new copy is confirmed before the old one is released.
-    assertThat(coordinator.state("b", "b-1").holders()).containsKey("adapter|A|f");
+    assertThat(coordinator.state("b", "b-1").holders()).containsKey(cacheKey("A", "f"));
   }
 
   @Test
@@ -331,7 +331,7 @@ class TestIndexResidencyCoordinator {
         coordinator.acceptLoad(
             target("A", "f", 40), IndexResidencyPolicy.parse("forever"), clock.now());
     ackFile(first, "f", IndexCacheProtocol.AckStatus.LOADED);
-    coordinator.report(holding("a", "a-1", 2, 100, 40, "adapter|A|f", 40));
+    coordinator.report(holding("a", "a-1", 2, 100, 40, cacheKey("A", "f"), 40));
     // b is proportionally colder (15/50) but only 35 bytes are free, less than a second copy.
     coordinator.report(node("b", "b-1", 1, 50, 15));
 
@@ -344,7 +344,7 @@ class TestIndexResidencyCoordinator {
     assertThat(coordinator.commands("a", "a-1"))
         .filteredOn(c -> c.type() == IndexCacheProtocol.CommandType.RELEASE)
         .isEmpty();
-    assertThat(coordinator.state("a", "a-1").holders()).containsKey("adapter|A|f");
+    assertThat(coordinator.state("a", "a-1").holders()).containsKey(cacheKey("A", "f"));
   }
 
   @Test
@@ -392,11 +392,11 @@ class TestIndexResidencyCoordinator {
     coordinator.report(node("a", "a-1", 1, 100, 0));
     String old = coordinator.acceptLoad(target("old", "o1", 40), null, clock.now());
     ackFile(old, "o1", IndexCacheProtocol.AckStatus.LOADED);
-    coordinator.report(holding("a", "a-1", 2, 100, 40, "adapter|old|o1", 40));
+    coordinator.report(holding("a", "a-1", 2, 100, 40, cacheKey("old", "o1"), 40));
     clock.advance(5 * SECOND);
     String hot = coordinator.acceptLoad(target("hot", "h1", 40), null, clock.now());
     ackFile(hot, "h1", IndexCacheProtocol.AckStatus.LOADED);
-    coordinator.report(holding("a", "a-1", 3, 100, 80, "adapter|hot|h1", 40));
+    coordinator.report(holding("a", "a-1", 3, 100, 80, cacheKey("hot", "h1"), 40));
 
     String plan = coordinator.acceptLoad(target("new", "n1", 30), null, clock.now());
 
@@ -412,7 +412,7 @@ class TestIndexResidencyCoordinator {
         coordinator.acceptLoad(
             target("old", "o1", 40), IndexResidencyPolicy.parse("0"), clock.now());
     ackFile(old, "o1", IndexCacheProtocol.AckStatus.LOADED);
-    coordinator.report(holding("a", "a-1", 2, 100, 40, "adapter|old|o1", 40));
+    coordinator.report(holding("a", "a-1", 2, 100, 40, cacheKey("old", "o1"), 40));
     String hot =
         coordinator.acceptLoad(
             target("hot", "h1", 40), IndexResidencyPolicy.parse("0"), clock.now());
@@ -425,7 +425,7 @@ class TestIndexResidencyCoordinator {
     coordinator.report(
         node("a", "a-1", 3, 100, 80)
             .copy()
-            .holders(Map.of("adapter|old|o1", 40L, "adapter|hot|h1", 40L))
+            .holders(Map.of(cacheKey("old", "o1"), 40L, cacheKey("hot", "h1"), 40L))
             .accessAgeNanos(ages)
             .build());
 
@@ -441,7 +441,7 @@ class TestIndexResidencyCoordinator {
     String victim =
         coordinator.acceptLoad(target("V", "v1", 40), IndexResidencyPolicy.parse("0"), clock.now());
     ackFile(victim, "v1", IndexCacheProtocol.AckStatus.LOADED);
-    coordinator.report(holding("a", "a-1", 2, 100, 40, "adapter|V|v1", 40));
+    coordinator.report(holding("a", "a-1", 2, 100, 40, cacheKey("V", "v1"), 40));
     coordinator.report(node("b", "b-1", 1, 100, 100));
 
     // No node can hold a 200-byte file, so evicting anything cannot help.
@@ -451,7 +451,7 @@ class TestIndexResidencyCoordinator {
 
     assertThat(coordinator.result(plan).uncovered()).containsEntry("big", "FILE_TOO_LARGE");
     assertThat(coordinator.result(plan).evictedIndexes()).isEmpty();
-    assertThat(coordinator.state("a", "a-1").holders()).containsKey("adapter|V|v1");
+    assertThat(coordinator.state("a", "a-1").holders()).containsKey(cacheKey("V", "v1"));
   }
 
   @Test
@@ -460,7 +460,7 @@ class TestIndexResidencyCoordinator {
     String victim =
         coordinator.acceptLoad(target("V", "v1", 40), IndexResidencyPolicy.parse("0"), clock.now());
     ackFile(victim, "v1", IndexCacheProtocol.AckStatus.LOADED);
-    coordinator.report(holding("a", "a-1", 2, 100, 40, "adapter|V|v1", 40));
+    coordinator.report(holding("a", "a-1", 2, 100, 40, cacheKey("V", "v1"), 40));
 
     String plan =
         coordinator.acceptLoad(
@@ -488,7 +488,7 @@ class TestIndexResidencyCoordinator {
         .filteredOn(c -> c.type() == IndexCacheProtocol.CommandType.RELEASE)
         .extracting(c -> c.file().location())
         .contains("f2");
-    assertThat(coordinator.state("a", "a-1").holders()).doesNotContainKey("adapter|A|f2");
+    assertThat(coordinator.state("a", "a-1").holders()).doesNotContainKey(cacheKey("A", "f2"));
   }
 
   @Test
@@ -541,7 +541,7 @@ class TestIndexResidencyCoordinator {
         coordinator.acceptLoad(
             target("A", "old", 40), IndexResidencyPolicy.parse("forever"), clock.now());
     ackFile(first, "old", IndexCacheProtocol.AckStatus.LOADED);
-    coordinator.report(holding("a", "a-1", 2, 100, 40, "adapter|A|old", 40));
+    coordinator.report(holding("a", "a-1", 2, 100, 40, cacheKey("A", "old"), 40));
 
     // Replacing the target both loads a new file and releases the old one.
     String replace =
@@ -625,7 +625,7 @@ class TestIndexResidencyCoordinator {
         coordinator.acceptLoad(
             target("A", "f", 40), IndexResidencyPolicy.parse("forever"), clock.now());
     ackFile(first, "f", IndexCacheProtocol.AckStatus.LOADED);
-    coordinator.report(holding("a", "a-1", 2, 1_000, 40, "adapter|A|f", 40));
+    coordinator.report(holding("a", "a-1", 2, 1_000, 40, cacheKey("A", "f"), 40));
 
     String second =
         coordinator.acceptLoad(
@@ -659,7 +659,7 @@ class TestIndexResidencyCoordinator {
         coordinator.acceptLoad(
             target("A", "f", 40), IndexResidencyPolicy.parse("forever"), clock.now());
     ackFile(first, "f", IndexCacheProtocol.AckStatus.LOADED);
-    coordinator.report(holding("a", "a-1", 2, 100, 40, "adapter|A|f", 40));
+    coordinator.report(holding("a", "a-1", 2, 100, 40, cacheKey("A", "f"), 40));
     coordinator.report(node("b", "b-1", 1, 100, 0));
 
     String plan =
@@ -698,7 +698,7 @@ class TestIndexResidencyCoordinator {
         coordinator.acceptLoad(
             target("A", "f", 40), IndexResidencyPolicy.parse("forever"), clock.now());
     ackFile(first, "f", IndexCacheProtocol.AckStatus.LOADED);
-    coordinator.report(holding("a", "a-1", 2, 100, 40, "adapter|A|f", 40));
+    coordinator.report(holding("a", "a-1", 2, 100, 40, cacheKey("A", "f"), 40));
     coordinator.report(node("b", "b-1", 1, 100, 0));
 
     String plan =
@@ -725,7 +725,7 @@ class TestIndexResidencyCoordinator {
     assertThat(coordinator.pendingCommands("b", "b-1"))
         .flatExtracting(IndexCacheProtocol.Plan::files)
         .extracting(IndexCacheProtocol.File::cacheKey)
-        .contains("adapter|A|f");
+        .contains(cacheKey("A", "f"));
     assertThat(coordinator.pendingCommands("a", "a-1")).isEmpty();
   }
 
@@ -761,10 +761,10 @@ class TestIndexResidencyCoordinator {
         coordinator.acceptLoad(
             target("old", "o1", 40), IndexResidencyPolicy.parse("0"), clock.now());
     ackFile(old, "o1", IndexCacheProtocol.AckStatus.LOADED);
-    coordinator.report(holding("a", "a-1", 2, 100, 40, "adapter|old|o1", 40));
+    coordinator.report(holding("a", "a-1", 2, 100, 40, cacheKey("old", "o1"), 40));
     // 30 seconds old when reported.
     coordinator.report(
-        holding("a", "a-1", 3, 100, 40, "adapter|old|o1", 40)
+        holding("a", "a-1", 3, 100, 40, cacheKey("old", "o1"), 40)
             .copy()
             .accessAgeNanos(Map.of("old", 30 * SECOND))
             .build());
@@ -774,7 +774,7 @@ class TestIndexResidencyCoordinator {
         coordinator.acceptLoad(
             target("hot", "h1", 40), IndexResidencyPolicy.parse("0"), clock.now());
     ackFile(hot, "h1", IndexCacheProtocol.AckStatus.LOADED);
-    coordinator.report(holding("a", "a-1", 4, 100, 80, "adapter|hot|h1", 40));
+    coordinator.report(holding("a", "a-1", 4, 100, 80, cacheKey("hot", "h1"), 40));
 
     String plan =
         coordinator.acceptLoad(
@@ -789,7 +789,7 @@ class TestIndexResidencyCoordinator {
         coordinator.acceptLoad(
             target("A", "f", 40), IndexResidencyPolicy.parse("forever"), clock.now());
     ackFile(first, "f", IndexCacheProtocol.AckStatus.LOADED);
-    coordinator.report(holding("a", "a-1", 2, 100, 40, "adapter|A|f", 40));
+    coordinator.report(holding("a", "a-1", 2, 100, 40, cacheKey("A", "f"), 40));
 
     // Offload issues a release that the executor has not answered yet.
     String offload = coordinator.acceptOffload("A", clock.now());
@@ -835,7 +835,7 @@ class TestIndexResidencyCoordinator {
     String victim =
         coordinator.acceptLoad(target("V", "v1", 40), IndexResidencyPolicy.parse("0"), clock.now());
     ackFile(victim, "v1", IndexCacheProtocol.AckStatus.LOADED);
-    coordinator.report(holding("a", "a-1", 2, 100, 40, "adapter|V|v1", 40));
+    coordinator.report(holding("a", "a-1", 2, 100, 40, cacheKey("V", "v1"), 40));
     // The requesting index itself advances to epoch 3 before it needs to evict.
     for (int i = 0; i < 2; i++) {
       clock.advance(SECOND);
@@ -945,13 +945,13 @@ class TestIndexResidencyCoordinator {
         coordinator.acceptLoad(
             target("old", "o1", 40), IndexResidencyPolicy.parse("0"), clock.now());
     ackFile(old, "o1", IndexCacheProtocol.AckStatus.LOADED);
-    coordinator.report(holding("a", "a-1", 2, 100, 40, "adapter|old|o1", 40));
+    coordinator.report(holding("a", "a-1", 2, 100, 40, cacheKey("old", "o1"), 40));
     clock.advance(SECOND);
     String hot =
         coordinator.acceptLoad(
             target("hot", "h1", 40), IndexResidencyPolicy.parse("0"), clock.now());
     ackFile(hot, "h1", IndexCacheProtocol.AckStatus.LOADED);
-    coordinator.report(holding("a", "a-1", 3, 100, 80, "adapter|hot|h1", 40));
+    coordinator.report(holding("a", "a-1", 3, 100, 80, cacheKey("hot", "h1"), 40));
 
     // The old index is used again after the hot one was loaded.
     clock.advance(SECOND);
@@ -1072,8 +1072,15 @@ class TestIndexResidencyCoordinator {
   }
 
   // Cache keys start with the adapter namespace, the middle segment is the index identity.
+  /**
+   * The key the search path builds: owner, adapter class, blob type, then the file. The index
+   * identity is not part of it, and a test key that carried it would hide any lookup that fails on
+   * a real key -- which is exactly how a placement lookup that never matched reached review.
+   */
   private static String cacheKey(String indexUuid, String location) {
-    return "adapter|" + indexUuid + "|" + location;
+    return "file:/warehouse|org.apache.iceberg.index.vector.VectorIndexAdapter"
+        + "|iceberg-vector-entries-v1|"
+        + location;
   }
 
   private static IndexCacheProtocol.NodeReport withAccess(
@@ -1150,7 +1157,7 @@ class TestIndexResidencyCoordinator {
             target("old", "o1", 40), IndexResidencyPolicy.parse("0"), clock.now());
     ackFile(old, "o1", IndexCacheProtocol.AckStatus.LOADED);
     coordinator.report(
-        holding("a", "a-1", 2, 100, 40, "adapter|old|o1", 40)
+        holding("a", "a-1", 2, 100, 40, cacheKey("old", "o1"), 40)
             .copy()
             .accessAgeNanos(Map.of("old", 5 * SECOND))
             .build());
@@ -1163,7 +1170,7 @@ class TestIndexResidencyCoordinator {
         coordinator.acceptLoad(
             target("hot", "h1", 40), IndexResidencyPolicy.parse("0"), clock.now());
     ackFile(hot, "h1", IndexCacheProtocol.AckStatus.LOADED);
-    coordinator.report(holding("a", "a-1", 3, 100, 80, "adapter|hot|h1", 40));
+    coordinator.report(holding("a", "a-1", 3, 100, 80, cacheKey("hot", "h1"), 40));
 
     String plan =
         coordinator.acceptLoad(
@@ -1185,7 +1192,7 @@ class TestIndexResidencyCoordinator {
     coordinator.report(
         node("a", "a-1", 2, 100, 60)
             .copy()
-            .holders(Map.of("adapter|stale|s1", 40L, "adapter|fresh|f1", 20L))
+            .holders(Map.of(cacheKey("stale", "s1"), 40L, cacheKey("fresh", "f1"), 20L))
             .accessAgeNanos(Map.of("stale", Long.MAX_VALUE - 1, "fresh", SECOND))
             .build());
     // Time must pass after the report, otherwise an overflowing addition never happens. One second
