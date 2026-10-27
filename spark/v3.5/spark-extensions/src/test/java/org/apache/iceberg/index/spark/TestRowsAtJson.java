@@ -30,8 +30,8 @@ import org.apache.iceberg.FileScanTask;
 import org.apache.iceberg.Table;
 import org.apache.iceberg.relocated.com.google.common.collect.Lists;
 import org.apache.iceberg.spark.Spark3Util;
-import org.apache.iceberg.types.Types;
 import org.apache.iceberg.spark.SparkSchemaUtil;
+import org.apache.iceberg.types.Types;
 import org.apache.spark.scheduler.SparkListener;
 import org.apache.spark.scheduler.SparkListenerJobStart;
 import org.apache.spark.sql.Row;
@@ -190,8 +190,8 @@ class TestRowsAtJson {
   }
 
   /**
-   * A table may have a column of its own named like the two the fetch-back carries next to the
-   * row. Those travel outside the row, so the caller's column keeps its name and its value.
+   * A table may have a column of its own named like the two the fetch-back carries next to the row.
+   * Those travel outside the row, so the caller's column keeps its name and its value.
    */
   @Test
   void aColumnNamedLikeAnAuxiliaryColumnStillSerialises() throws Exception {
@@ -199,8 +199,7 @@ class TestRowsAtJson {
     spark.sql(
         "CREATE TABLE local.db.auxiliary_names (id bigint, pos bigint, data_file string)"
             + " USING iceberg");
-    spark.sql(
-        "INSERT INTO local.db.auxiliary_names SELECT /*+ COALESCE(1) */ 1L, 42L, 'mine'");
+    spark.sql("INSERT INTO local.db.auxiliary_names SELECT /*+ COALESCE(1) */ 1L, 42L, 'mine'");
 
     assertSameJsonAsTheRowToJsonConversion("local.db.auxiliary_names");
   }
