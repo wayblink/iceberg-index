@@ -22,6 +22,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 import java.io.IOException;
+import java.lang.reflect.Array;
 import java.lang.reflect.Field;
 import java.lang.reflect.Modifier;
 import java.nio.ByteBuffer;
@@ -30,6 +31,7 @@ import java.util.ArrayList;
 import java.util.IdentityHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import org.apache.iceberg.TestTables.LocalFileIO;
 import org.apache.iceberg.index.IndexAdapter;
 import org.apache.iceberg.index.IndexEntry;
@@ -51,6 +53,7 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.CsvSource;
+import org.junit.jupiter.params.provider.ValueSource;
 
 class TestIndexCacheMemory {
   @BeforeAll
@@ -98,12 +101,159 @@ class TestIndexCacheMemory {
           }
         }
       }
-      assertThat(cache.stats().bytes())
+      assertThat(cache.chargeSnapshot().residentBytes())
           .as("Charge must cover the independently counted cache-root lower bound")
           .isGreaterThanOrEqualTo(lower);
     } finally {
       cache.clear();
     }
+  }
+
+  @Test
+  void sharedOwnerUsesOneOwnedTextAndClearReleasesTables() throws ReflectiveOperationException {
+    ExecutorIndexCache cache = ExecutorIndexCache.get();
+    cache.clear();
+    String owner = "共享表".repeat(2_000);
+    IndexAdapter.PreparedSearch prepared = (query, topK) -> List.of();
+    try {
+      for (int i = 0; i < 100; i++) {
+        cache.file(
+            "路径" + i,
+            ExecutorIndexCache.Config.of(true, 1_000_000)
+                .withOwner(new String(owner.toCharArray())),
+            "reader",
+            () -> ExecutorIndexCache.loaded(new byte[0], prepared, 128));
+      }
+      Field field = ExecutorIndexCache.class.getDeclaredField("protectedFiles");
+      field.setAccessible(true);
+      Map<?, ?> roots = (Map<?, ?>) field.get(cache);
+      assertThat(roots).hasSize(100);
+      Object owned = null;
+      for (Object value : roots.values()) {
+        String current = ((ExecutorIndexCache.CachedFile) value).owner();
+        assertThat(current).isEqualTo(owner).isNotSameAs(owner);
+        if (owned != null) {
+          assertThat(current).isSameAs(owned);
+        }
+        owned = current;
+      }
+      assertThat(cache.chargeSnapshot().residentBytes()).isGreaterThan(40_000);
+      cache.clear();
+      assertThat(cache.chargeSnapshot().residentBytes()).isZero();
+      assertThat(cache.chargeSnapshot().controlBytes()).isZero();
+      Field table = roots.getClass().getDeclaredField("table");
+      table.setAccessible(true);
+      assertThat((Object[]) table.get(roots)).isEmpty();
+    } finally {
+      cache.clear();
+    }
+  }
+
+  @ParameterizedTest
+  @ValueSource(strings = {"latin", "中文"})
+  void metadataSnapshotCoversIndependentRoots(String alphabet) throws ReflectiveOperationException {
+    ExecutorIndexCache cache = ExecutorIndexCache.get();
+    cache.clear();
+    String owner = alphabet.repeat(1_000);
+    String key = owner + "|reader|" + alphabet.repeat(2_000);
+    try {
+      cache.applyTarget(alphabet + "#index", 1, Set.of(key));
+      cache.installManaged(
+          alphabet + "#index",
+          1,
+          key,
+          ExecutorIndexCache.Config.of(true, 1_000_000).withOwner(owner),
+          () -> ExecutorIndexCache.loaded(new byte[0], (query, topK) -> List.of(), 128));
+      cache.recordIndexAttribution(alphabet + "#association", Set.of(key));
+      IdentityHashMap<Object, Boolean> seen = new IdentityHashMap<>();
+      long lower = 0;
+      for (String name :
+          List.of(
+              "probation",
+              "protectedFiles",
+              "pendingReleases",
+              "attribution",
+              "bytesByOwner",
+              "entriesByOwner",
+              "ownership",
+              "asked",
+              "loading",
+              "reservations",
+              "reservedByOwner",
+              "texts")) {
+        Field field = ExecutorIndexCache.class.getDeclaredField(name);
+        field.setAccessible(true);
+        lower += metadataRootLowerBound(field.get(cache), seen);
+      }
+      assertThat(cache.chargeSnapshot().usedBytes()).isGreaterThanOrEqualTo(lower);
+    } finally {
+      cache.clear();
+    }
+  }
+
+  // Independent cache-root oracle: explicit owned roots, actual fields and array lengths. JDK
+  // internals and unproved prepared representations are omitted, never opened reflectively.
+  private static long metadataRootLowerBound(Object value, IdentityHashMap<Object, Boolean> seen)
+      throws ReflectiveOperationException {
+    if (value == null || seen.put(value, Boolean.TRUE) != null) {
+      return 0;
+    }
+    if (value instanceof String text) {
+      long width = text.chars().anyMatch(character -> character > 255) ? 2 : 1;
+      return 24 + ((16 + width * text.length() + 7) / 8) * 8;
+    }
+    Class<?> type = value.getClass();
+    if (type.isArray()) {
+      int length = Array.getLength(value);
+      if (length == 0) {
+        return 0; // The shared empty array is part of the explicit empty-manager baseline.
+      }
+      Class<?> component = type.getComponentType();
+      long width =
+          component == byte.class || component == boolean.class
+              ? 1
+              : component == char.class || component == short.class
+                  ? 2
+                  : component == long.class || component == double.class ? 8 : 4;
+      long bytes = ((16 + width * length + 7) / 8) * 8;
+      if (!component.isPrimitive()) {
+        for (int i = 0; i < length; i++) {
+          bytes += metadataRootLowerBound(Array.get(value, i), seen);
+        }
+      }
+      return bytes;
+    }
+    if (!type.getName().startsWith("org.apache.iceberg.index.spark.IndexCacheMetadata$")
+        && type != IndexCacheOwnership.class
+        && !type.getName().startsWith("org.apache.iceberg.index.spark.IndexCacheOwnership$")
+        && type != ExecutorIndexCache.CachedFile.class) {
+      return 0;
+    }
+    if (value instanceof Map<?, ?> map && map.isEmpty()
+        || value instanceof Set<?> set && set.isEmpty()) {
+      return 0;
+    }
+    long fields = 12;
+    long children = 0;
+    for (Class<?> current = type; current != Object.class; current = current.getSuperclass()) {
+      for (Field field : current.getDeclaredFields()) {
+        if (Modifier.isStatic(field.getModifiers())) {
+          continue;
+        }
+        Class<?> fieldType = field.getType();
+        fields +=
+            fieldType == byte.class || fieldType == boolean.class
+                ? 1
+                : fieldType == char.class || fieldType == short.class
+                    ? 2
+                    : fieldType == long.class || fieldType == double.class ? 8 : 4;
+        if (!fieldType.isPrimitive() && current.getName().startsWith("org.apache.iceberg.")) {
+          field.setAccessible(true);
+          children += metadataRootLowerBound(field.get(value), seen);
+        }
+      }
+    }
+    return ((fields + 7) / 8) * 8 + children;
   }
 
   @Test

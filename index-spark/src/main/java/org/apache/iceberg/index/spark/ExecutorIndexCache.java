@@ -27,10 +27,14 @@ import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
-import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.locks.ReentrantLock;
 import org.apache.iceberg.index.IndexAdapter;
+import org.apache.iceberg.index.spark.IndexCacheMetadata.Component;
+import org.apache.iceberg.index.spark.IndexCacheMetadata.Components;
+import org.apache.iceberg.index.spark.IndexCacheMetadata.OwnedMap;
+import org.apache.iceberg.index.spark.IndexCacheMetadata.OwnedSet;
+import org.apache.iceberg.index.spark.IndexCacheMetadata.Texts;
 import org.apache.iceberg.relocated.com.google.common.base.Preconditions;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -369,7 +373,7 @@ final class ExecutorIndexCache {
   }
 
   /** One index file as an executor remembers it. */
-  static final class CachedFile {
+  static final class CachedFile implements Component {
     private final String owner;
     private final IndexAdapter.PreparedSearch prepared;
     private final long bytes;
@@ -394,6 +398,19 @@ final class ExecutorIndexCache {
       this.prepared = prepared;
       this.bytes = bytes;
       this.context = context;
+    }
+
+    @Override
+    public void charge(Components components) {
+      if (components.object(this, 64)) {
+        components.object(searchLock, 24 + 32);
+        if (context != null) {
+          components.object(context, IndexCacheMetadata.align(16L + context.length));
+        }
+        long preparedBytes = prepared.estimatedBytes();
+        components.object(prepared, preparedBytes > 0 ? preparedBytes : bytes);
+        components.add(owner);
+      }
     }
 
     boolean hasKnownContext() {
@@ -529,27 +546,28 @@ final class ExecutorIndexCache {
   }
 
   // access order, so the first entry of the iteration is the least recently used
-  private final Map<String, CachedFile> probation = new LinkedHashMap<>(16, 0.75f, true);
-  private final Map<String, CachedFile> protectedFiles = new LinkedHashMap<>(16, 0.75f, true);
+  private final Texts texts = new Texts();
+  private final Map<String, CachedFile> probation = new OwnedMap<>(true);
+  private final Map<String, CachedFile> protectedFiles = new OwnedMap<>(true);
   // how often a file has been asked for without being kept, for the PIN_HOT admission
-  private final Map<String, Integer> asked =
-      new LinkedHashMap<>(16, 0.75f, true) {
-        @Override
-        protected boolean removeEldestEntry(Map.Entry<String, Integer> eldest) {
-          return size() > 100_000;
-        }
-      };
+  private final Map<String, Integer> asked = new OwnedMap<>(true);
   private final Object mapLock = new Object();
-  private final IndexCacheOwnership ownership = new IndexCacheOwnership();
-  private final Set<String> pendingReleases = new LinkedHashSet<>();
+  private final IndexCacheOwnership ownership = new IndexCacheOwnership(texts);
+  private final Set<String> pendingReleases = new OwnedSet<>();
   // Observational associations do not confer residency ownership or protection.
-  private final Map<String, Set<String>> attribution = new LinkedHashMap<>();
+  private final Map<String, Set<String>> attribution = new OwnedMap<>();
   private long generation;
+  private long chargeSequence;
   // Registered waiters keep the same monitor alive until every caller has left.
-  private final ConcurrentHashMap<String, LoadMonitor> loading = new ConcurrentHashMap<>();
+  private final Map<String, LoadMonitor> loading = new OwnedMap<>();
 
-  private static final class LoadMonitor {
+  private static final class LoadMonitor implements Component {
     private int callers;
+
+    @Override
+    public void charge(Components components) {
+      components.object(this, 16);
+    }
   }
 
   private record ManagedLoad(String indexUuid, long epoch, String cacheKey, long generation) {}
@@ -562,13 +580,20 @@ final class ExecutorIndexCache {
 
   // room promised to loads in flight, and the budget those promises are against
   private long reservedBytes = 0;
-  private final Set<Reservation> reservations = new LinkedHashSet<>();
-  private final Map<String, Long> reservedByOwner = new LinkedHashMap<>();
+  private final Set<Reservation> reservations = new OwnedSet<>();
+  private final Map<String, Long> reservedByOwner = new OwnedMap<>();
 
-  private static final class Reservation {
+  private static final class Reservation implements Component {
     private final String owner;
     private final long bytes;
     private final long budget;
+
+    @Override
+    public void charge(Components components) {
+      if (components.object(this, 32)) {
+        components.add(owner);
+      }
+    }
 
     private Reservation(String owner, long bytes, long budget) {
       this.owner = owner;
@@ -578,8 +603,8 @@ final class ExecutorIndexCache {
   }
 
   // what each table holds, so a share of the budget can be reserved per table
-  private final Map<String, Long> bytesByOwner = new LinkedHashMap<>();
-  private final Map<String, Integer> entriesByOwner = new LinkedHashMap<>();
+  private final Map<String, Long> bytesByOwner = new OwnedMap<>();
+  private final Map<String, Integer> entriesByOwner = new OwnedMap<>();
   private long lastSweepNanos = System.nanoTime();
   private static long sweepIntervalNanos = java.util.concurrent.TimeUnit.SECONDS.toNanos(30);
 
@@ -674,7 +699,9 @@ final class ExecutorIndexCache {
     synchronized (mapLock) {
       for (String key : cacheKeys) {
         if (probation.containsKey(key) || protectedFiles.containsKey(key)) {
-          attribution.computeIfAbsent(key, ignored -> new LinkedHashSet<>()).add(indexUuid);
+          attribution
+              .computeIfAbsent(texts.own(key), ignored -> new OwnedSet<>())
+              .add(texts.own(indexUuid));
         }
       }
     }
@@ -882,24 +909,27 @@ final class ExecutorIndexCache {
   }
 
   private LoadMonitor loadingMonitor(String cacheKey) {
-    return loading.compute(
-        cacheKey,
-        (ignored, existing) -> {
-          LoadMonitor monitor = existing == null ? new LoadMonitor() : existing;
-          monitor.callers = Math.incrementExact(monitor.callers);
-          return monitor;
-        });
+    synchronized (mapLock) {
+      String key = texts.own(cacheKey);
+      LoadMonitor monitor = loading.get(key);
+      if (monitor == null) {
+        monitor = new LoadMonitor();
+        loading.put(key, monitor);
+      }
+      monitor.callers = Math.incrementExact(monitor.callers);
+      return monitor;
+    }
   }
 
   private void releaseLoadingMonitor(String cacheKey, LoadMonitor monitor) {
-    loading.computeIfPresent(
-        cacheKey,
-        (ignored, existing) -> {
-          Preconditions.checkState(
-              existing == monitor, "Index loading monitor changed: %s", cacheKey);
-          existing.callers -= 1;
-          return existing.callers == 0 ? null : existing;
-        });
+    synchronized (mapLock) {
+      LoadMonitor existing = loading.get(cacheKey);
+      Preconditions.checkState(existing == monitor, "Index loading monitor changed: %s", cacheKey);
+      existing.callers -= 1;
+      if (existing.callers == 0) {
+        loading.remove(cacheKey);
+      }
+    }
   }
 
   private boolean current(ManagedLoad load) {
@@ -926,7 +956,7 @@ final class ExecutorIndexCache {
     if (file == null) {
       pendingReleases.remove(cacheKey);
     } else if (file.inUse()) {
-      pendingReleases.add(cacheKey);
+      pendingReleases.add(texts.own(cacheKey));
     } else {
       protectedFiles.remove(cacheKey);
       probation.remove(cacheKey);
@@ -946,7 +976,12 @@ final class ExecutorIndexCache {
 
   private boolean askedBefore(String cacheKey) {
     synchronized (mapLock) {
-      int times = asked.merge(cacheKey, 1, Integer::sum);
+      int times = asked.merge(texts.own(cacheKey), 1, Integer::sum);
+      if (asked.size() > 100_000) {
+        Iterator<String> oldest = asked.keySet().iterator();
+        oldest.next();
+        oldest.remove();
+      }
       return times > 1;
     }
   }
@@ -1004,7 +1039,8 @@ final class ExecutorIndexCache {
       releaseReservation(reservation);
 
       // the loader does not know which table it is loading for, so the entry is stamped here
-      file = file.withOwner(config.owner());
+      cacheKey = texts.own(cacheKey);
+      file = file.withOwner(texts.own(config.owner()));
       file.pinned = config.mode() == Mode.PIN_ALL;
       // an admitted PIN_HOT entry starts on probation: being asked twice earns it a place, being
       // asked again is what earns it protection
@@ -1142,10 +1178,11 @@ final class ExecutorIndexCache {
         long spare = Math.max(0L, capacity - bytes - reservedBytes);
         if (spare >= requested || reservations.isEmpty()) {
           long held = Math.min(requested, spare);
-          Reservation reservation = new Reservation(config.owner(), held, config.maxBytes());
+          String owner = texts.own(config.owner());
+          Reservation reservation = new Reservation(owner, held, config.maxBytes());
           reservations.add(reservation);
           reservedBytes += held;
-          reservedByOwner.merge(config.owner(), held, Long::sum);
+          reservedByOwner.merge(owner, held, Long::sum);
           return reservation;
         }
 
@@ -1267,6 +1304,65 @@ final class ExecutorIndexCache {
     return unloaded;
   }
 
+  record ChargeSnapshot(
+      long version,
+      boolean known,
+      long usedBytes,
+      long residentBytes,
+      long controlBytes,
+      long reservedBytes,
+      long releasingBytes,
+      int holders,
+      int groupRefs) {}
+
+  ChargeSnapshot chargeSnapshot() {
+    synchronized (mapLock) {
+      drainPendingReleases();
+      Components components = new Components();
+      components.root(probation);
+      components.root(protectedFiles);
+      components.root(pendingReleases);
+      components.root(attribution);
+      components.root(bytesByOwner);
+      components.root(entriesByOwner);
+      components.root(loading);
+      components.root(reservations);
+      components.root(reservedByOwner);
+      long resident = components.bytes();
+      components.add(ownership);
+      components.root(asked);
+      texts.retain(components);
+      texts.charge(components);
+      Components releasing = new Components();
+      for (String key : pendingReleases) {
+        releasing.add(key);
+        releasing.add(find(key));
+      }
+      int holders = 0;
+      boolean known = IndexCacheMemory.supportedLayout();
+      for (CachedFile file : probation.values()) {
+        known &= file.hasKnownContext();
+        holders = Math.addExact(holders, file.leases);
+      }
+      for (CachedFile file : protectedFiles.values()) {
+        known &= file.hasKnownContext();
+        holders = Math.addExact(holders, file.leases);
+      }
+      // Snapshot sequence is monotonic even across clear; it is not the controller policy epoch.
+      chargeSequence = Math.incrementExact(chargeSequence);
+      return new ChargeSnapshot(
+          chargeSequence,
+          known,
+          components.bytes(),
+          resident,
+          components.bytes() - resident,
+          reservedBytes,
+          releasing.bytes(),
+          holders,
+          ownership.groupRefs());
+    }
+  }
+
   Stats stats() {
     synchronized (mapLock) {
       drainPendingReleases();
@@ -1319,6 +1415,7 @@ final class ExecutorIndexCache {
         releaseIfUnowned(key);
       }
       asked.clear();
+      chargeSnapshot();
       hits.set(0);
       misses.set(0);
       loads.set(0);
