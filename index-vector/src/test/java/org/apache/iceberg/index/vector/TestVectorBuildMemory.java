@@ -24,6 +24,7 @@ import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.spy;
 
 import java.nio.ByteBuffer;
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
@@ -119,6 +120,34 @@ class TestVectorBuildMemory {
 
   @ParameterizedTest
   @EnumSource(VectorStructure.class)
+  void callerPayloadMutationCannotChangePreparedSearch(VectorStructure structure) {
+    VectorIndexAdapter adapter = adapter(structure, VectorQuantizer.NONE, options(structure));
+    ByteBuffer payload = adapter.kernel().build(entries(adapter, 33, i -> "data"), 1);
+    PreparedSearch prepared = adapter.kernel().prepare(payload);
+    ByteBuffer query = ByteBuffer.wrap(adapter.encodeVector(new float[DIMENSION]));
+    List<?> expected = prepared.search(query, 3);
+    for (int i = 0; i < payload.limit(); i++) {
+      payload.put(i, (byte) 0);
+    }
+    payload.clear();
+    assertThat(prepared.search(query, 3)).usingRecursiveComparison().isEqualTo(expected);
+  }
+
+  @ParameterizedTest
+  @ValueSource(ints = {0, 1, 33})
+  void nonPowerOfTwoQuantizedBuildMatchesPreparedRepresentation(int count) {
+    VectorIndexAdapter adapter =
+        adapter(
+            VectorStructure.IVF,
+            VectorQuantizer.RABITQ,
+            Map.of("nlist", "8", "nprobe", "1", "rabitq-bits", "2"),
+            129);
+    assertEstimate(
+        adapter, buildWithPreparationForbidden(adapter, entries(adapter, count, i -> "中文", 129)));
+  }
+
+  @ParameterizedTest
+  @EnumSource(VectorStructure.class)
   void estimatesEmptyPayloads(VectorStructure structure) {
     VectorIndexAdapter adapter = adapter(structure, VectorQuantizer.NONE, options(structure));
     assertEstimate(adapter, adapter.kernel().buildWithMemory(List.of(), 1));
@@ -165,20 +194,57 @@ class TestVectorBuildMemory {
   }
 
   @Test
-  void hnswModelChargesAllocatedCapacity() {
-    long small = HnswlibKernel.preparedBytes(100, 48, 100, DIMENSION, 8, 100, 1);
-    long large = HnswlibKernel.preparedBytes(100, 48, 100, DIMENSION, 8, 200, 1);
-    // 100 additional four-byte node slots and 16 extra bytes in each of two visited bitsets.
-    assertThat(large - small).isEqualTo(100L * Integer.BYTES + 2L * 16);
+  void processorProfileDistinguishesVisitedPoolLayout() {
+    assertThat(VectorMemoryEstimates.profile(1)).isNotEqualTo(VectorMemoryEstimates.profile(2));
   }
 
-  @Test
-  void hnswModelAndProfileChargeProcessorSizedVisitedPool() {
-    long one = HnswlibKernel.preparedBytes(100, 48, 100, DIMENSION, 8, 100, 1);
-    long two = HnswlibKernel.preparedBytes(100, 48, 100, DIMENSION, 8, 100, 2);
-    // The extra bitset retains a 24-byte object and a 32-byte four-int array.
-    assertThat(two - one).isEqualTo(24L + 32);
-    assertThat(VectorMemoryEstimates.profile(1)).isNotEqualTo(VectorMemoryEstimates.profile(2));
+  @ParameterizedTest
+  @ValueSource(
+      strings = {
+        "-XX:-UseCompressedOops",
+        "-XX:-UseCompressedClassPointers",
+        "-XX:-CompactStrings",
+        "-XX:ObjectAlignmentInBytes=16"
+      })
+  void unsupportedJvmLayoutReturnsUnknownWithoutBreakingSearch(String flag) throws Exception {
+    Process process =
+        new ProcessBuilder(
+                System.getProperty("java.home") + "/bin/java",
+                flag,
+                "-cp",
+                System.getProperty("java.class.path"),
+                UnsupportedLayoutProbe.class.getName())
+            .redirectErrorStream(true)
+            .start();
+    String output = new String(process.getInputStream().readAllBytes(), StandardCharsets.UTF_8);
+    assertThat(process.waitFor()).as(output).isZero();
+    assertThat(output).contains("unknown=3;searches=3");
+  }
+
+  public static class UnsupportedLayoutProbe {
+    public static void main(String[] args) {
+      VectorIndexTypes.register();
+      int unknown = 0;
+      int searches = 0;
+      for (VectorStructure structure : VectorStructure.values()) {
+        VectorIndexAdapter adapter = adapter(structure, VectorQuantizer.NONE, options(structure));
+        IndexBuildResult built =
+            adapter.kernel().buildWithMemory(entries(adapter, 1, i -> "data"), 1);
+        PreparedSearch prepared = adapter.kernel().prepare(built.payload());
+        IndexBuildResult empty = adapter.kernel().buildWithMemory(List.of(), 1);
+        if (built.memory() == null
+            && prepared.estimatedBytes() == 0
+            && empty.memory() == null
+            && adapter.kernel().prepare(empty.payload()).estimatedBytes() == 0) {
+          unknown++;
+        }
+        if (prepared.search(ByteBuffer.wrap(adapter.encodeVector(new float[DIMENSION])), 1).size()
+            == 1) {
+          searches++;
+        }
+      }
+      System.out.println("unknown=" + unknown + ";searches=" + searches);
+    }
   }
 
   @Test
@@ -235,6 +301,8 @@ class TestVectorBuildMemory {
 
   private static void assertEstimate(VectorIndexAdapter adapter, IndexBuildResult built) {
     assertThat(built.memory()).isNotNull();
+    assertThat(built.memory().modelVersion()).isEqualTo(2);
+    assertThat(built.memory().runtimeProfile()).contains("representation=decoded-v2");
     assertThat(built.memory().payloadBytes()).isEqualTo(built.payload().remaining());
     assertThat(built.memory().preparedBytes())
         .isEqualTo(adapter.kernel().prepare(built.payload()).estimatedBytes());
