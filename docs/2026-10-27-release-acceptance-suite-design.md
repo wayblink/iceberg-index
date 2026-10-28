@@ -19,7 +19,7 @@ under the License.
 
 # 索引发布验收套件：用例、结果合同、基线与门禁
 
-状态：**用户已于2026-10-27批准实施；套件尚未完成。** 今天先编译冻结最新代码的新镜像、重建10M测试输入，开发并迭代standard；100M工具入口可开发，真实执行留到后续窗口，不自动启动。对应 #2787，子卡 #2788–#2792；本次修订落实评审 #3095。设计核对基线为产品 `a682bc368`，首轮运行冻结产品 `f33843cd3`，工具来源为独立仓库 `iceberg-tools`。本文中的执行规则是实施合同；资源、时间和性能均不得冒充实测。固定厂内 Spark 3.5 / Scala 2.12，不讨论其他 Spark 主版本。
+状态：**用户已于2026-10-27批准实施；套件尚未完成。** 今天先编译冻结最新代码的新镜像、重建10M测试输入，开发并迭代standard；100M工具入口可开发，真实执行留到后续窗口，不自动启动。对应 #2787，子卡 #2788–#2792；本次修订落实评审 #3095，并补齐正式复审 #3245 的加载终态、硬目标与边界同距规则（修订卡 #2808）。设计核对基线为产品 `a682bc368`，首轮运行冻结产品 `f33843cd3`，工具来源为独立仓库 `iceberg-tools`。本文中的执行规则是实施合同；资源、时间和性能均不得冒充实测。固定厂内 Spark 3.5 / Scala 2.12，不讨论其他 Spark 主版本。
 
 ## 1. 意图与范围
 
@@ -61,6 +61,21 @@ under the License.
 - 推荐配置质量门：每个固定查询达到配置目标；初始目标采用同度量修正后的认可数据，不硬编码历史错误数字。近似算法不因“默认推荐”就对任意数据保证满召回。
 - 曲线格子：低 over 本来用于展示量化损失，**不要求所有格子满召回**；与同键认可基线比较逐查询命中及质量指标。允许下降的命中数/容差按配置写入 spec，精确 fixture 容差为0。首版没有可比较数据时标明首次观测，由人工认可后建立基线，不假装完成跨版不退化验证。
 
+### 3.2 边界同距的命中公式（精确与近似共用）
+
+此公式用于 `TABLE_LIVE_TOPK` 对完整表精确真值的质量比较，不改变产品排序或 CALL/TVF 的 `INDEX_HITS` 原始命中合同；CALL↔TVF仍严格比较原始身份、顺序与score，不能借同距规则豁免差异。
+
+对每个冻结查询，令有效行集合为 `E`、`m=min(k,|E|)`；行身份使用稳定主键或 `(data_file,position)`。独立oracle将各metric统一为越小越近的精确距离 `d`，取第m名距离为 `tau`。容差 `eps=1e-6*max(1,abs(tau))` 使用§5.2固定spec；对有限距离定义：
+
+- `S={x∈E: d(x)<tau-eps}`：严格优于边界、必须命中的集合。
+- `B={x∈E: abs(d(x)-tau)<=eps}`：边界同距集合，包含**完整有效数据集**的边界行，不能只包含某次topK选出的ID。
+- `R` 为返回的有效且身份唯一的行集合。重复身份、非有效行、错误行值单独判fail，不以去重后的recall掩盖；`returned_count` 与质量命中数分开记录。
+- `found=|R∩S|+min(|R∩B|,m-|S|)`，`recall=found/m`。精确结果还要求 `|R|=m`、`S⊆R`、`R⊆S∪B`；近似结果按该公式与每实例质量门/同序列逐查询基线比较。
+
+例如k=2，A距离0，B/C距离1，D距离2：返回A+B与A+C均found=2；返回B+C只有found=1（遗漏严格更近的A不能靠两个边界行补分）；返回A+D也只有found=1。k=1且A/B同距时，返回任一行均recall=1。m=0时recall为null，单独要求零返回；不建立tau或伪造满召回。
+
+非有限距离、零向量的有效性/排序按独立fixture合同断言，不用有限距离公式默默排除；未声明此合同的case证据不完备。保存oracle版本、tie规则版本、eps、严格/边界集合的身份或可核证集合hash/原始证据，并进入spec/oracle hash。`truth_ids`的确定性展示顺序不作为唯一ID交集oracle；基线比较使用相同规则的found，边界等距替换不算退化，严格更近行丢失会减分。旧ID交集基线不得无审批直接改成此口径，应建立新比较序列。
+
 ## 4. 执行与资源
 
 ### 4.1 明确的两档节奏（本修订的推荐）
@@ -91,7 +106,7 @@ under the License.
 
 manifest声明排队、应用启动、case执行、状态收敛、kill后等待的超时；不无限sleep，不能超时后“继续反正测一下”。全部错误有case/run-id和原因，失败后可收集日志，但停止有依赖的case，不把没运行标成pass。
 
-只有 `isolation=reserved` 且全程无观察到竞争/监控空洞的运行才可更新性能基线；`observed_quiet`/受竞争影响但功能用例完整通过的运行，允许人工批准发布功能结果并更新功能基线，性能字段标 `comparison_valid=false`，保留历史性能基线来源，不用本轮数字替换它。若本版变更有已批准的性能/容量收益要求，相关测量是必跑assert：资源隔离不足时该项blocked，不能以功能通过替代。以上资格分别写入机器结果，禁止用全局pass隐藏性能未验证。
+只有 `isolation=reserved` 且全程无观察到竞争/监控空洞的运行才可更新性能基线；`observed_quiet`/受竞争影响但功能用例完整通过的运行，允许人工批准发布功能结果并更新功能基线，性能字段标 `comparison_valid=false`，保留历史性能基线来源，不用本轮数字替换它。若本版变更有已批准的性能/容量收益要求，相关测量是必跑硬assert：资源隔离不足或证据缺失时该项blocked；合格测量不满足目标时该项fail。二者均不能以功能通过、普通告警签字或promotion批准替代。若要修改目标，必须先另行批准spec并建立新比较序列，保留原运行的fail/blocked证据。以上资格分别写入机器结果，禁止用全局pass隐藏性能未验证。
 
 并发套件使用独立输出目录、application label、表/索引名；cleanup只删本run拥有的资产，finally执行并记清单；共享大表和非本run的pod永不删除。租约/队列预留不覆盖所有工作负载时如实记录限制。
 
@@ -112,8 +127,8 @@ case-instance键采用规范化结构而非一个 `case_id`：至少包含case_i
 ### 5.2 基线晋升
 
 1. 执行前解析manifest，生成expected-case清单和各case样本集合；baseline仅包含上一版已认可的数据。
-2. 验证输入和完整性，再运行各assert；功能错误fail，环境/证据不完备blocked，未请求case not_requested。
-3. 每个必跑case必须pass；质量目标和逐查询比较满足；所有需人工处置的性能告警有签名/说明；cleanup与证据归档完成。否则发布判定非通过。
+2. 验证输入和完整性，再运行各assert；功能/质量/已批准硬性能或容量目标违反为fail，环境/证据不完备blocked，未请求case not_requested。
+3. 每个必跑case必须pass；质量目标、逐查询比较及所有已批准硬目标满足；普通性能趋势告警有签名/说明；cleanup与证据归档完成。告警处置与promotion批准不能覆盖failed assertion或blocked measurement，否则发布判定非通过。
 4. 独立保存不可变 `results.json`，只有上述条件满足且有显式promotion批准，才能原子更新该档位/比较序列的基线指针。临时文件→rename，并保留历史baseline及原始日志hash；并发更新有锁或expected-prev-hash检查，不允许最后写覆盖另一发布。
 5. `--only` 子集永远不晋升完整发布基线；extended完整通过可为standard建立其完整子集基线，standard不能覆盖extended历史结果或令100M数据看似本版跑过。
 6. 首版/metric变更/数据变更/spec门槛变更建立新比较序列，人工确认并说明不能跨序列计算加速/不退化；不从失真的旧0.9833日志直接初始化基线。普通版本只比较相同输入/合同/profile实例。
@@ -135,7 +150,7 @@ case-instance键采用规范化结构而非一个 `case_id`：至少包含case_i
 
 ### 5.3 返回码与可复现报告
 
-拟定退出码：0=本次请求的全部case通过；1=功能/质量断言fail；2=环境/证据blocked；3=manifest/schema/用法错误。多个问题优先报输入错误，其次fail，其次blocked；机器结果保留全部原因。诊断子集即使返回0，也必须显示 `release_eligible=false`、`promotable=false`。
+拟定退出码：0=本次请求的全部case通过；1=功能/质量/硬性能或容量目标断言fail；2=环境/证据blocked；3=manifest/schema/用法错误。多个问题优先报输入错误，其次fail，其次blocked；机器结果保留全部原因。诊断子集即使返回0，也必须显示 `release_eligible=false`、`promotable=false`。
 
 生成报告固定manifest生成时间、稳定排序、稳定摘要与抖动hash，禁止datetime.now()/进程随机hash影响重生；相同results/manifest/tool版本生成逐字节相同报告。另将同一原文通过umem upsert-doc存档并sha256核对；这是副本一致性，不代替重生确定性测试。报告显示每条数据的来源run、样本、metric、合同、档位、fresh/stale，不混历史与本版数字。
 
@@ -182,7 +197,7 @@ L1.7的具体参考：每个文本case无外部并发写，记录建索引的sou
 
 L2.1与L2.2的近似臂使用普通SQL改写路径 `TABLE_LIVE_TOPK`；表是冻结静态fixture，无并发删除/追加。FLAT分成两个实例：`INDEX_HITS`直接调用（用于kernel读写/精确原始命中对照），以及不走索引的同metric完整表exact scan（用于完整表基线）。每个实例写明入口/合同，不能混合耗时或以CALL近似命中对完整表强制满召回。L2.2只报告本轮确实测过的参照。
 
-性能无统一硬阈值：记录p50/p95/p99、query/sample、冷/热状态、分配与峰值；相对上版超1.5×或不满足性能变更卡已批准目标时，需要独立复核/处置，报告不可自动晋升覆盖。功能fail不能用性能改善抵消；同轮比值不是负载免疫证据。
+性能无统一硬阈值：记录p50/p95/p99、query/sample、冷/热状态、分配与峰值。相对上版超1.5×属于普通趋势告警，需独立复核/处置后才可申请晋升；这不替代变更卡已批准的硬目标。合格测量违反硬目标必须fail，缺测或隔离不合格必须blocked；普通告警签字不改变这两类判定。功能fail不能用性能改善抵消；同轮比值不是负载免疫证据。机器证据分别保存 `operation_status`、各assert的expected/actual与pass/fail/blocked、普通warning及处置，不把操作终态或warning混成case结论。
 
 ### L3：驻留、故障与容量
 
@@ -192,12 +207,27 @@ L2.1与L2.2的近似臂使用普通SQL改写路径 `TABLE_LIVE_TOPK`；表是冻
 | L3.2 | 重复load幂等及参数语义：首次省略0/显式值，重复省略保留截止/显式重计；固定保护期不因query续期；到期仅可淘汰，压力时索引级LRU；永久保护与offload解除 | standard |
 | L3.3 | kill、executor ID复用、迟到ACK/旧epoch、使用中offload与安全释放：有界等待状态收敛，按合同完整行/身份/score与故障前一致；不要求完成后的load自动修复副本 | standard |
 | L3.4 | 双索引共享key与异预算；重复load新snapshot复用共有、旧独有待引用释放；部分load失败保留成功；两条现RED（70次复用误降PENDING、未经新owner ACK即COMPLETE）保持断言，修前fail而非skip | standard |
-| L3.5 | P100-AUTO HNSW+IVF3bit：按实际文件驻留大小/节点预算规划、合法COMPLETE或PARTIAL、缺口FILE_TOO_LARGE/容量/任务失败分清，已ACK副本才算持有；显式load规划的均衡与冷/驻留查询一致 | extended |
-| L3.6 | P100-AUTO预算估计与真实准入：实测C/U/结构及workingSet、逐节点预算、coverage并集；有容量且可放置时要求≥0.95，装不下时验证PARTIAL与精确缺口，不以低coverage直接定为产品缺陷 | extended |
+| L3.5 | P100-AUTO HNSW+IVF3bit：按实际文件驻留大小/节点预算规划、合法COMPLETE、PARTIAL或零成功FAILED、缺口FILE_TOO_LARGE/容量/任务失败分清，已ACK副本才算持有；显式load规划的均衡与冷/驻留查询一致 | extended |
+| L3.6 | P100-AUTO预算估计与真实准入：实测C/U/结构及workingSet、逐节点预算、coverage并集；有容量且可放置时要求≥0.95，装不下时验证部分成功PARTIAL或零成功FAILED及精确缺口，不以低coverage直接定为产品缺陷 | extended |
 
 均衡判定先固定可放置任务集合、保护占用和文件粒度约束。可均匀分配且容量充足的fixture要求占用/预算比例不超过均值1.25倍；文件巨大、保护固定或偏斜预算不能满足时输出约束与规划对照，不用绝对<50%或>90%本身判失败。容量准入永不超预算；合法PARTIAL不能同时要求每文件有副本。coverage按目标文件的**集群确认副本并集**/目标文件总数，offload完成后归属holders为0；有query引用的pending释放与已释放区分，不能提前当空闲。
 
 每case状态等待必须绑定目标index snapshot/epoch，释放ACK后才验byte回收。查询只观察既有驻留、不主动追加规划；二轮查询bytesIn/out稳定仅在声明无miss/无驱逐、全驻留的fixture要求，不把后台再平衡当已存在功能。
+
+### 6.1 加载操作终态与用例判定分离
+
+`operation_status`记录真实load计划终态，case的 `status` 由预先声明的场景assert确定。不能把所有操作FAILED直接判case fail，也不能因出现FAILED就普遍放行：
+
+| 预先声明的场景 | 合法操作终态与证据 | 用例判定 |
+|---|---|---|
+| 容量充分且目标全部可放置 | COMPLETE，全部目标有真实ACK副本，预算不超发 | 满足全部assert才pass；意外PARTIAL/FAILED为fail，有环境/证据缺口则blocked |
+| 容量不足，仍有部分成功副本 | PARTIAL，成功副本与逐文件容量缺口精确对账 | 拒绝原因、ACK、预算与独立规划参考一致才pass |
+| 所有目标文件均大于任一节点预算，零成功 | FAILED，每个文件FILE_TOO_LARGE、零副本及预留释放可核证 | 预期拒绝正确且查询合同不变才pass，不能强求PARTIAL |
+| 所有可容纳目标都因保护占用/可用容量不足而零成功 | FAILED，每个文件INSUFFICIENT_CAPACITY，预算与保护占用可解释 | 只在预先声明的容量拒绝fixture且参考验证成立时pass |
+| 预先声明的加载任务失败注入 | 部分成功PARTIAL或零成功FAILED，原因匹配注入，成功保留/失败释放正确 | 注入场景assert全部满足才pass；普通运行中的未知任务失败不可当容量拒绝放行 |
+| 无executor、节点失联、未收敛或执行超时 | 保留实际FAILED/PENDING/QUEUED及NO_EXECUTORS等原因 | 正常容量用例blocked；故障注入用例另按已批准场景、有界恢复与结果合同验，不借缺环境标pass |
+
+expected终态/原因/已确认副本数及每文件缺口在执行前固定；结果必须绑定目标snapshot/epoch，并验证已发命令终结、失败预留回收。不允许因为实跑失败再把本case改成“预期拒绝”。空目标集合COMPLETE与非空目标零成功FAILED分开，不用 `resident_bytes==0` 单独推断失败。
 
 ## 7. 门禁实现与反例测试
 
@@ -208,9 +238,11 @@ L0卡先固定manifest/results schema与expected-case，并用离线fixture验�
 | id | 验收 |
 |---|---|
 | G.1 | schema版本/复合键/metric与合同/样本数/缺值规则验证；缺case、缺query、重复sample、NaN、未知schema拒绝 |
-| G.2 | 逐查询质量、exact/tie与适用coverage、状态/缺口/ACK断言；不同contract不比较；单臂recall下降0.02能命名case/臂/query并失败；低over正常不被错判 |
-| G.3 | promotion审批、首版/新序列建立、原子指针与并发expected-prev检查；fail/blocked/子集不能晋升；警告需处置，原始证据不可覆盖 |
+| G.2 | 逐查询质量（§3.2固定tie公式）、exact与适用coverage、操作终态/场景判定/缺口/ACK断言；不同contract不比较；单臂recall下降0.02能命名case/臂/query并失败；低over正常不被错判 |
+| G.3 | promotion审批、首版/新序列建立、原子指针与并发expected-prev检查；fail/blocked/子集不能晋升；仅普通warning可经处置申请晋升，硬目标失败不可签字豁免，原始证据不可覆盖 |
 | G.4 | BENCHRESULT/SMOKE适配与退出码；精确render确定性、双份sha256；临时fixture证明旧多臂漏报修复（1bit0.8→0.4、其余不变不能pass） |
+
+新增必测反例：§6.1全文件过大/零成功FAILED正确拒绝可通过，而有容量的意外FAILED不得通过；无executor正常用例blocked。硬目标违约即使附warning处置和promotion批准也必须fail且不可晋升，测量缺失blocked；普通趋势warning有处置且全部assert通过才可申请晋升。§3.2边界同距替换不降found、缺严格更近行降低found、重复/无效行判fail、空真值null单独验。L0固定spec/oracle规则与hash，L1构造fixture、L2输出独立距离/集合证据，G复算而非盲信harness自报recall。
 
 还必须覆盖：新镜像digest不同于旧版但匹配当前manifest正常通过；错装镜像与当前manifest不符blocked；无baseline不假装比较；完全不共享key不是成功；故意缺必跑100M不能被standard结果覆盖；Completed历史pod不阻塞、监控失败不假定空闲；删除命中与SQL合法差异不误fail；artifact不支持文件明确报告；special-column null丢值不能被“不异常”标pass。
 
@@ -222,7 +254,7 @@ L0卡先固定manifest/results schema与expected-case，并用离线fixture验�
 | #1924 | L2.2两格式两臂明细、L2.5补点、L2.3证据与报告；不混本版/历史倍数 |
 | #2760 | L3.1/L3.6自动预算，省略cache.bytes的实际行为，无新增默认值 |
 | #2411 | L3.2–3.4固定保护/LRU、新snapshot、partial、并发offload、kill/迟到ACK、双owner两RED与完整行比较；不能仅移卡便视为修绿 |
-| #2296 | L3.5可放置与预算约束下均衡、COMPLETE/PARTIAL、逐文件ACK、实际查询；不承诺自动重平衡 |
+| #2296 | L3.5可放置与预算约束下均衡、COMPLETE/PARTIAL/预期零成功FAILED、逐文件ACK、实际查询；不承诺自动重平衡 |
 | #2028/#2784 | L1.3 JSON/辅助字段和special-name真实值；已知读取丢值保留fail或批准的支持范围限制 |
 | #2756 | L0.1真实镜像读写同版/旧版兼容；不能绕过list_indexes失败继续标整个套件通过 |
 
