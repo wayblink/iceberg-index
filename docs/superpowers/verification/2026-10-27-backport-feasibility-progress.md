@@ -153,3 +153,21 @@ export JAVA_HOME=/opt/homebrew/Cellar/openjdk@17/17.0.20.1/libexec/openjdk.jdk/C
 **spark-extensions 全量的两类残留。** 一次 486 项的全量跑有 49 项失败，逐条看过：45 项是 `TestVectorIndexProcedures` 的 `HiveException ... TTransportException: SocketException: Broken pipe`，发生在建 SparkSession 阶段，连 testhadoop 参数化也挂；隔离单跑该类是 44 项 0 失败，属测试环境（嵌入 Hive metastore）问题。另 4 项是 Lance 写路径 `BaseFileWriterFactory.newDataWriter` 没有 `LANCE` 分支——按决定不支持，不是缺陷。日志里 `format-model` / `FormatModelRegistry` 命中 0 次，原先那 27 项确实消失。
 
 **辅助审计（独立 agent）结论。** 清单只覆盖"被索引提交改动过的文件"，不覆盖"被索引代码依赖但没被改过的文件"。扫描 242 个源文件 + 13 个改造文件的新增行后，找到的漏项就是 `DummyMetricsServlet`（字符串类名引用）与两个缺成员（`PositionDelete.deleteClass()`、`BaseProcedure` 的两个参数助手）；测试继承基类这一类查下来是空的。`FormatModelRegistry` 里硬编码的四个 `*FormatModels` 注册类在 1.9.1 里全部不存在，会被 `DynMethods` 静默吞掉——这正是"27 项运行时才炸"的机制，也是不做 format-model 移植后必须删掉它的原因。
+
+## 第四阶段：分支形状与开发卡落地（2026-10-28）
+
+实验种子 `exp/2763-closure` = `19e463c6a` 是"一个 250 文件的大提交"，能跑但不能审。开发阶段把它拆成按卡可审的提交，落在长期分支上：
+
+- 分支：`step-1.9-index`，基底厂内 `step-1.9` 的 `d2e4ba7e4`；主仓 `main` 是 1.12 基线，**不合并过去**（部署手册 §7.8 决定 B）。
+- 三个开发卡与提交的对应（内容与种子完全一致，`git diff 19e463c6a <branch>` 为空）：
+  | 卡 | 提交 | 规模 | 内容 |
+  |---|---|---|---|
+  | #2765 core 索引层 | `19d00660c` | 46 文件 +8431 | `core/.../index/` 28 个实现 + 17 个测试、`FileFormat.LANCE` 枚举 |
+  | #2766 三模块 | `0c62b0796` | 92 文件 +26744 | `index-vector`/`index-text`/`index-spark` + build/settings/版本目录 |
+  | #2767 Spark 3.5 集成 | `b3fd0bd0d` | 82 文件 +17132 | 函数、改写规则、物理策略、16 个过程 |
+  | 基线适配 | `21d087240` | 3 文件 +30/−1 | `Files` 的 `file:` 前缀、`BaseProcedure` 两个参数助手、`.gitignore` 去掉 `gradle/` |
+  | 文档与报告 | `5055cfd25` | 30 文件 +10960 | 设计笔记、计划、基准报告 |
+
+**干净树验证（不是复用旧 build 产物）**：新 worktree `iceberg-wt/2765`，`--no-build-cache`，结果取自 test-results XML。core 索引 86 项、index-vector 89 项、index-text 6 项、index-spark 271 项，全部 0 失败；`core/.../index/` 下 grep `spark` 命中 0，核心层不依赖 Spark。`index-spark` 的 `runtimeClasspath` 里 parquet 全为 1.15.2、avro 1.12.0（符合 §7.1，不是卡面原先写的 1.13.1——那条来自已作废的降级计划）。
+
+**卡面口径修订**：#2766 的"必须 parquet 1.13.1"与"审查通过后 `--ff-only` 合入"两条已改：前者改为 1.15.2（内部 shaded 版本），后者改为落在 `step-1.9-index` 而不合 main。
