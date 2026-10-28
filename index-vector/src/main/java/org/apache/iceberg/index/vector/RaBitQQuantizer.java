@@ -168,7 +168,13 @@ public final class RaBitQQuantizer implements java.io.Serializable {
 
   /** How many bytes a code takes. */
   int codeBytes() {
-    return (padded * bits + 7) / 8;
+    try {
+      return Math.toIntExact(IvfLayout.codeBytes(padded, bits));
+    } catch (ArithmeticException e) {
+      throw new IllegalArgumentException(
+          "Code size of " + padded + " padded coordinates at " + bits + " bits is not addressable",
+          e);
+    }
   }
 
   /** The centre of the vectors, for a caller that has to report it. */
@@ -236,6 +242,22 @@ public final class RaBitQQuantizer implements java.io.Serializable {
    */
   double estimatedDistanceSquared(
       byte[] code, int offset, float[] factors, float[] rotatedQuery, double queryLengthSquared) {
+    return estimatedDistanceSquared(code, (long) offset, factors, rotatedQuery, queryLengthSquared);
+  }
+
+  /**
+   * Estimates the square of the distance from a code stored at {@code codeBase} in {@code payload}.
+   *
+   * <p>The code is read where it lies rather than copied into an array of its own; the address of
+   * each level's bits is computed with {@code long} arithmetic and checked against the code and the
+   * payload, so a payload over 256 MiB does not overflow an {@code int} midway.
+   */
+  double estimatedDistanceSquared(
+      byte[] payload,
+      long codeBase,
+      float[] factors,
+      float[] rotatedQuery,
+      double queryLengthSquared) {
     double norm = factors[0];
     double correction = factors[1];
     // <x, P q'>, over the coordinates the code covers; a zero padded coordinate contributes
@@ -243,7 +265,7 @@ public final class RaBitQQuantizer implements java.io.Serializable {
     int levels = levels();
     double projection = 0.0;
     for (int i = 0; i < padded; i++) {
-      projection += decodeLevel(getLevel(code, offset, i), levels) * rotatedQuery[i];
+      projection += decodeLevel(levelAt(payload, codeBase, i), levels) * rotatedQuery[i];
     }
 
     double estimatedInner = norm == 0.0 || correction == 0.0 ? 0.0 : norm * projection / correction;
@@ -256,12 +278,18 @@ public final class RaBitQQuantizer implements java.io.Serializable {
   /** Estimates the inner product between a vector and a query, for a metric that needs it. */
   double estimatedInnerProduct(
       byte[] code, int offset, float[] factors, float[] rotatedQuery, float[] query) {
+    return estimatedInnerProduct(code, (long) offset, factors, rotatedQuery, query);
+  }
+
+  /** Estimates the inner product from a code stored at {@code codeBase} in {@code payload}. */
+  double estimatedInnerProduct(
+      byte[] payload, long codeBase, float[] factors, float[] rotatedQuery, float[] query) {
     double norm = factors[0];
     double correction = factors[1];
     int levels = levels();
     double projection = 0.0;
     for (int i = 0; i < padded; i++) {
-      projection += decodeLevel(getLevel(code, offset, i), levels) * rotatedQuery[i];
+      projection += decodeLevel(levelAt(payload, codeBase, i), levels) * rotatedQuery[i];
     }
 
     double centeredInner = norm == 0.0 || correction == 0.0 ? 0.0 : norm * projection / correction;
@@ -349,25 +377,46 @@ public final class RaBitQQuantizer implements java.io.Serializable {
   }
 
   private void setLevel(byte[] code, int offset, int index, int level) {
-    int bitOffset = offset * 8 + index * bits;
-    for (int bit = 0; bit < bits; bit++) {
-      if ((level & (1 << bit)) != 0) {
-        int position = bitOffset + bit;
-        code[position >> 3] |= (byte) (1 << (position & 7));
-      }
+    long codeBytes = codeBytes();
+    int mask = levels() - 1;
+    long localBit = (long) index * bits;
+    int shift = (int) (localBit & 7);
+    int first = IvfLayout.codeByteAddress(offset, index, bits, 0, codeBytes, code.length);
+    int word = code[first] & 0xFF;
+    int second = -1;
+    if (shift + bits > Byte.SIZE) {
+      second = IvfLayout.codeByteAddress(offset, index, bits, bits - 1, codeBytes, code.length);
+      word |= (code[second] & 0xFF) << 8;
+    }
+
+    word &= ~(mask << shift);
+    word |= (level & mask) << shift;
+    code[first] = (byte) word;
+    if (second >= 0) {
+      code[second] = (byte) (word >>> 8);
     }
   }
 
-  private int getLevel(byte[] code, int offset, int index) {
-    int bitOffset = offset * 8 + index * bits;
-    int level = 0;
-    for (int bit = 0; bit < bits; bit++) {
-      int position = bitOffset + bit;
-      if ((code[position >> 3] & (1 << (position & 7))) != 0) {
-        level |= 1 << bit;
-      }
+  /**
+   * One quantization level, read from the code where it lies.
+   *
+   * <p>The first bit's address is checked against the code and the payload; a level that crosses a
+   * byte boundary reads one more, whose address is checked the same way. Bits within a byte are
+   * least-significant first, which is also the order {@link #setLevel} writes them in.
+   */
+  private int levelAt(byte[] payload, long codeBase, int index) {
+    long codeBytes = codeBytes();
+    long localBit = (long) index * bits;
+    int shift = (int) (localBit & 7);
+    int first = IvfLayout.codeByteAddress(codeBase, index, bits, 0, codeBytes, payload.length);
+    int word = payload[first] & 0xFF;
+    if (shift + bits > Byte.SIZE) {
+      int second =
+          IvfLayout.codeByteAddress(codeBase, index, bits, bits - 1, codeBytes, payload.length);
+      word |= (payload[second] & 0xFF) << 8;
     }
-    return level;
+
+    return (word >>> shift) & (levels() - 1);
   }
 
   /** Estimates the retained center, padded signs and quantizer fields without copying arrays. */
@@ -383,8 +432,11 @@ public final class RaBitQQuantizer implements java.io.Serializable {
   }
 
   private static int nextPowerOfTwo(int value) {
+    Preconditions.checkArgument(value > 0, "Dimension must be positive: %s", value);
     int padded = 1;
     while (padded < value) {
+      Preconditions.checkArgument(
+          padded <= (Integer.MAX_VALUE >>> 1), "Padded dimension overflows for %s", value);
       padded <<= 1;
     }
     return padded;

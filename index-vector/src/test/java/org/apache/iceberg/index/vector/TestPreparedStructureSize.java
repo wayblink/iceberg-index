@@ -464,7 +464,7 @@ class TestPreparedStructureSize {
   }
 
   @Test
-  void quantizedEstimateCoversRetainedArraysAndEntryObjects() throws Exception {
+  void quantizedEstimateCoversTheSnapshotDirectoryAndQuantizers() throws Exception {
     VectorIndexAdapter quantized =
         sizedAdapter(
             VectorStructure.IVF,
@@ -474,8 +474,14 @@ class TestPreparedStructureSize {
     IndexAdapter.PreparedSearch prepared = prepare(quantized, 64, 1024, i -> "a");
     Object loaded = field(prepared, "loaded");
     Map<Object, Boolean> seen = new IdentityHashMap<>();
+    byte[] payload = (byte[]) field(loaded, "payload");
+    int[] starts = (int[]) field(loaded, "listStarts");
+    int[] counts = (int[]) field(loaded, "listCounts");
     long lowerBound =
-        retainedArrays(field(loaded, "centroids"), seen)
+        retainedArrayBytes(payload.length)
+            + retainedArrayBytes(starts.length * 4L)
+            + retainedArrayBytes(counts.length * 4L)
+            + retainedArrays(field(loaded, "centroids"), seen)
             + retainedArrays(field(loaded, "listCenters"), seen);
     Object[] quantizers = (Object[]) field(loaded, "listQuantizers");
     lowerBound += retainedArrayBytes(quantizers.length * 4L);
@@ -484,20 +490,40 @@ class TestPreparedStructureSize {
       lowerBound += retainedArrays(field(q, "center"), seen);
       lowerBound += retainedArrays(field(q, "signs"), seen);
     }
-    List<?> lists = (List<?>) field(loaded, "lists");
-    lowerBound += 32 + retainedArrayBytes(lists.size() * 4L);
-    for (Object list : lists) {
-      List<?> members = (List<?>) list;
-      lowerBound += 32 + retainedArrayBytes(members.size() * 4L);
-      for (Object entry : members) {
-        lowerBound += 40; // row position and four references, including null fields
-        lowerBound += retainedArrays(field(entry, "code"), seen);
-        lowerBound += retainedArrays(field(entry, "factors"), seen);
-      }
+    for (Object dataFile : (Object[]) field(loaded, "dataFiles")) {
+      lowerBound += 24 + retainedArrayBytes(((String) dataFile).length());
     }
+    // the loaded structure, its searcher and the scoring object
+    lowerBound += 48 + 56 + 24;
     assertThat(prepared.estimatedBytes())
-        .as("retained arrays and objects, excluding paths and searcher")
+        .as("the snapshot and everything the searcher can reach")
         .isGreaterThanOrEqualTo(lowerBound);
+  }
+
+  @Test
+  void ivfEntryCountDoesNotAddPerRecordObjects() {
+    VectorIndexAdapter quantized =
+        sizedAdapter(
+            VectorStructure.IVF,
+            VectorQuantizer.RABITQ,
+            16,
+            Map.of("nlist", "1", "nprobe", "1", "rabitq-bits", "1"));
+    VectorIndexAdapter exact =
+        sizedAdapter(
+            VectorStructure.IVF, VectorQuantizer.NONE, 16, Map.of("nlist", "1", "nprobe", "1"));
+    long fewQuantized = preparedBytes(quantized, payload(quantized, 64, false));
+    long manyQuantized = preparedBytes(quantized, payload(quantized, 4096, false));
+    long quantizedGrowth = manyQuantized - fewQuantized;
+
+    long fewExact = preparedBytes(exact, payload(exact, 64, false));
+    long manyExact = preparedBytes(exact, payload(exact, 4096, false));
+    long exactGrowth = manyExact - fewExact;
+
+    // A one-bit code of dimension 16 is two bytes, and a record is 26 bytes; growth is the codes
+    // in the snapshot, not an object per record on top of them (the old representation added about
+    // a hundred bytes per record). An unquantized record is 76 bytes.
+    assertThat(quantizedGrowth).isEqualTo(4032L * 26L);
+    assertThat(exactGrowth).isEqualTo(4032L * 76L);
   }
 
   @Test
