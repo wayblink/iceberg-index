@@ -37,7 +37,6 @@ import org.apache.iceberg.index.IndexReader;
 import org.apache.iceberg.index.IndexSearchResult;
 import org.apache.iceberg.index.IndexTypes;
 import org.apache.iceberg.index.PuffinIndexFileContainer;
-import org.apache.iceberg.inmemory.InMemoryInputFile;
 import org.apache.iceberg.io.FileIO;
 import org.apache.iceberg.io.IOUtil;
 import org.apache.iceberg.io.InputFile;
@@ -650,12 +649,16 @@ public final class DistributedIndexSearch {
   }
 
   static LoadedFile loadFileState(FileIO io, String location, IndexAdapter adapter) {
-    byte[] content = readPayload(io, location);
-    PreparedFile prepared = prepareFile(content, adapter);
+    InputFile input = io.newInputFile(location);
+    long length = input.getLength();
+    if (length > IndexPayloadLimits.MAX_PAYLOAD_BYTES) {
+      throw new IllegalArgumentException(IndexPayloadLimits.tooLargeToRead(length, location));
+    }
+    PreparedFile prepared = prepareFile(input, adapter);
     ExecutorIndexCache.CachedFile file =
         ExecutorIndexCache.loaded(prepared.payloadBytes(), prepared.searcher())
             .withContext(adapter);
-    return new LoadedFile(file, content.length, prepared.payloadBytes(), file.preparedBytes());
+    return new LoadedFile(file, length, prepared.payloadBytes(), file.preparedBytes());
   }
 
   /**
@@ -692,7 +695,7 @@ public final class DistributedIndexSearch {
   }
 
   /** Prepares one index file, which an executor has read whole, for any number of searches. */
-  private static PreparedFile prepareFile(byte[] content, IndexAdapter adapter) {
+  private static PreparedFile prepareFile(InputFile input, IndexAdapter adapter) {
     // every type the adapter can still read, not just the one it writes: an index built before a
     // rename is still on tables, and a reader that only knew the current name would skip it
     java.util.Set<String> blobTypes =
@@ -702,7 +705,7 @@ public final class DistributedIndexSearch {
 
     List<IndexBlob> blobs;
     try {
-      blobs = new PuffinIndexFileContainer().read(new InMemoryInputFile(content));
+      blobs = new PuffinIndexFileContainer().read(input);
     } catch (java.io.IOException e) {
       throw new java.io.UncheckedIOException("Failed to read an index file", e);
     }
