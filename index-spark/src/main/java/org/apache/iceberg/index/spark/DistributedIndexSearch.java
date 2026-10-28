@@ -558,14 +558,24 @@ public final class DistributedIndexSearch {
   }
 
   /**
-   * The current retained-state estimate for the query's files, or -1 when any size is unknown.
-   *
-   * <p>Initial resolution reads and prepares complete payloads. Successful estimates are bound to
-   * the immutable file, reader definition, memory model and runtime; they are structural estimates,
-   * not heap measurements. A failed or unsupported estimate never becomes free capacity.
+   * The retained-state estimate is only known under the table that owns the cache keys, so the
+   * owner-less form is always unknown (-1). Use {@link #workingSetBytes(FileIO, List, IndexAdapter,
+   * String)} with the table location.
    */
   static long workingSetBytes(FileIO io, List<IndexFile> files, IndexAdapter adapter) {
     return -1;
+  }
+
+  /**
+   * The prepared-state bytes of one index file under this reader and runtime, or -1 when unknown.
+   *
+   * <p>A manifest record matching the current model, reader and runtime is trusted without a read;
+   * otherwise the file is read and prepared once to re-estimate it. The value is the retained
+   * prepared state P, not the container or encoded payload lengths, which are diagnostic only.
+   */
+  static long preparedBytesOf(FileIO io, IndexFile file, IndexAdapter adapter) {
+    IndexFileMemory memory = IndexCacheMemory.resolveMemory(io, file, adapter);
+    return memory == null ? -1 : memory.preparedBytes();
   }
 
   static long workingSetBytes(

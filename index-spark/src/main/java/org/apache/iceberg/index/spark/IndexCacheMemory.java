@@ -320,7 +320,14 @@ final class IndexCacheMemory {
     return memory == null ? null : residentBytes(memory);
   }
 
-  /** Re-estimation never pairs a current charge with the old manifest's model or profile. */
+  /**
+   * Resolves the retained-memory estimate of one file under this reader and runtime.
+   *
+   * <p>A manifest record whose model, reader and runtime already match this runtime is trusted
+   * without reading the file. An old, missing or mismatched record is re-estimated by reading and
+   * preparing the complete file, and a failure leaves the estimate explicitly unknown rather than
+   * silently free.
+   */
   static IndexFileMemory resolveMemory(FileIO io, IndexFile file, IndexAdapter adapter) {
     if (!supportedLayout()) {
       return null;
@@ -330,6 +337,13 @@ final class IndexCacheMemory {
       IndexFileMemory descriptor = descriptor(adapter, context);
       if (descriptor == null || descriptor.modelVersion() != 2 || descriptor.preparedBytes() <= 0) {
         return null;
+      }
+
+      // A matching manifest record already describes this exact representation, so it is trusted
+      // without a read. Old, missing or mismatched records fall through to the re-estimate below.
+      IndexFileMemory declared = file.memory();
+      if (declared != null && declared.preparedBytes() > 0 && compatible(declared, descriptor)) {
+        return declared;
       }
 
       EstimateKey key =
@@ -348,8 +362,8 @@ final class IndexCacheMemory {
         return known;
       }
 
-      // Initial migration deliberately reads and prepares the complete file. Matching metadata
-      // is not yet a substitute for validating the representation this runtime actually holds.
+      // A record that does not match this reader or runtime is re-estimated by reading and
+      // preparing the complete file; the full validation stays intact here and on the executor.
       DistributedIndexSearch.LoadedFile loaded =
           DistributedIndexSearch.loadFileState(io, file.location(), adapter);
       if (loaded.preparedBytes() <= 0) {
@@ -440,14 +454,19 @@ final class IndexCacheMemory {
       return false;
     }
     try {
-      IndexFileMemory descriptor = descriptor(adapter, contextKey(adapter));
-      return descriptor != null
-          && memory.modelVersion() == descriptor.modelVersion()
-          && memory.readerId().equals(descriptor.readerId())
-          && memory.runtimeProfile().equals(descriptor.runtimeProfile());
+      return compatible(memory, descriptor(adapter, contextKey(adapter)));
     } catch (RuntimeException e) {
       return false;
     }
+  }
+
+  /** Whether one memory record describes the same model, reader and runtime as another. */
+  private static boolean compatible(IndexFileMemory memory, IndexFileMemory descriptor) {
+    return memory != null
+        && descriptor != null
+        && memory.modelVersion() == descriptor.modelVersion()
+        && memory.readerId().equals(descriptor.readerId())
+        && memory.runtimeProfile().equals(descriptor.runtimeProfile());
   }
 
   static String runtimeIdentity() {
