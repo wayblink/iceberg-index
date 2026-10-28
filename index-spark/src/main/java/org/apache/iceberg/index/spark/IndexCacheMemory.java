@@ -89,15 +89,23 @@ final class IndexCacheMemory {
     MetadataState mutated = mutation.apply(before);
     Texts ownedTexts = mutated.texts().copy();
     MetadataState after = mutated.withTexts(ownedTexts);
+    Components live = new Components();
+    for (Component root : after.residentRoots()) {
+      live.root(root);
+    }
+    for (Component root : after.controlRoots()) {
+      live.root(root);
+    }
+    ownedTexts.retain(live);
     Components components = new Components();
     for (Component root : after.residentRoots()) {
       components.root(root);
     }
+    ownedTexts.chargeResident(components);
     long resident = components.bytes();
     for (Component root : after.controlRoots()) {
       components.root(root);
     }
-    ownedTexts.retain(components);
     ownedTexts.charge(components);
     long used = components.bytes();
     return new ChargeProjection(

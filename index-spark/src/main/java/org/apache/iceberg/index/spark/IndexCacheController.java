@@ -150,6 +150,7 @@ final class IndexCacheController {
           IndexCacheProtocol.File.builder()
               .location(file.location())
               .cacheKey(cacheKey(table, metadata, file.location()))
+              .owner(table.location())
               .kind(file.kind().name())
               .blobType(file.blobType())
               .estimatedBytes(memory == null ? null : IndexCacheMemory.residentBytes(memory))
@@ -159,6 +160,7 @@ final class IndexCacheController {
 
     return IndexCacheProtocol.Target.builder()
         .indexUuid(metadata.indexUuid())
+        .owner(table.location())
         .snapshotId(snapshotId)
         .files(planned)
         .definition(metadata.definition())

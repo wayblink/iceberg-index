@@ -18,10 +18,12 @@
  */
 package org.apache.iceberg.index.spark;
 
+import java.io.Serializable;
 import java.util.AbstractCollection;
 import java.util.AbstractMap;
 import java.util.AbstractSet;
 import java.util.Collection;
+import java.util.HashSet;
 import java.util.IdentityHashMap;
 import java.util.Iterator;
 import java.util.List;
@@ -54,7 +56,7 @@ final class IndexCacheMetadata {
   }
 
   /** A value canonicalizer. Its keys and values refer to the same owned string and backing. */
-  static final class Texts {
+  static final class Texts implements Serializable {
     private OwnedMap<String, String> values = new OwnedMap<>();
 
     Texts copy() {
@@ -87,8 +89,20 @@ final class IndexCacheMetadata {
       }
     }
 
+    void chargeResident(Components components) {
+      Set<String> resident = new HashSet<>();
+      for (String key : values.keySet()) {
+        if (components.contains(key)) {
+          resident.add(key);
+        }
+      }
+      values.chargeEntries(components, resident);
+    }
+
     void charge(Components components) {
-      components.root(values);
+      if (!values.isEmpty()) {
+        values.chargeAll(components);
+      }
     }
   }
 
@@ -154,7 +168,7 @@ final class IndexCacheMetadata {
   }
 
   /** Hash buckets plus a linked access-order chain, with actual table capacity available. */
-  static final class OwnedMap<K, V> extends AbstractMap<K, V> implements Component {
+  static final class OwnedMap<K, V> extends AbstractMap<K, V> implements Component, Serializable {
     private static final Node<?, ?>[] EMPTY = new Node<?, ?>[0];
     private Node<?, ?>[] table = EMPTY;
     private Node<K, V> first;
@@ -183,7 +197,7 @@ final class IndexCacheMetadata {
       putAll(source);
     }
 
-    private static final class Node<K, V> implements Map.Entry<K, V> {
+    private static final class Node<K, V> implements Map.Entry<K, V>, Serializable {
       private final K key;
       private V value;
       private final int hash;
@@ -254,6 +268,11 @@ final class IndexCacheMetadata {
         append(node);
       }
       return node.value;
+    }
+
+    V peek(Object key) {
+      Node<K, V> node = node(key);
+      return node == null ? null : node.value;
     }
 
     @Override
@@ -466,12 +485,40 @@ final class IndexCacheMetadata {
       };
     }
 
+    void chargeEntries(Components components, Set<K> keys) {
+      boolean nonempty = false;
+      for (K key : keys) {
+        if (containsKey(key)) {
+          nonempty = true;
+          break;
+        }
+      }
+      if (!nonempty) {
+        return;
+      }
+      components.object(this, 40);
+      components.object(table, align(16L + 4L * table.length));
+      for (K key : keys) {
+        Node<K, V> node = node(key);
+        if (node != null) {
+          components.object(node, 40);
+          components.add(node.key);
+          components.add(node.value);
+        }
+      }
+    }
+
     @Override
     public void charge(Components components) {
       // Empty root containers are the fixed baseline. clear actually releases their buckets.
       if (!components.object(this, 40)) {
         return;
       }
+      chargeAll(components);
+    }
+
+    private void chargeAll(Components components) {
+      components.object(this, 40);
       if (table.length > 0) {
         components.object(table, align(16L + 4L * table.length));
       }
@@ -483,7 +530,7 @@ final class IndexCacheMetadata {
     }
   }
 
-  static final class OwnedSet<E> extends AbstractSet<E> implements Component {
+  static final class OwnedSet<E> extends AbstractSet<E> implements Component, Serializable {
     private final OwnedMap<E, Boolean> values = new OwnedMap<>();
 
     OwnedSet() {}
@@ -520,6 +567,13 @@ final class IndexCacheMetadata {
     @Override
     public Iterator<E> iterator() {
       return values.keySet().iterator();
+    }
+
+    void chargeEntries(Components components, Set<E> entries) {
+      if (!entries.isEmpty()) {
+        components.object(this, 16);
+        values.chargeEntries(components, entries);
+      }
     }
 
     @Override

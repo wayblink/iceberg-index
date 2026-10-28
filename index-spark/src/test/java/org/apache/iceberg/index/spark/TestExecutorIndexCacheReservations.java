@@ -936,12 +936,13 @@ class TestExecutorIndexCacheReservations {
   @Test
   void legacyHitAfterControlCannotReturnManagedObject() throws Exception {
     String key = "table|adapter|managed";
-    ExecutorIndexCache.Config config = ExecutorIndexCache.Config.of(true, 100).withOwner("table");
+    ExecutorIndexCache.Config config =
+        ExecutorIndexCache.Config.of(true, Long.MAX_VALUE).withOwner("table");
     ExecutorIndexCache.CachedFile ephemeral = ExecutorIndexCache.loaded(new byte[10], EMPTY);
     Method acquireMonitor =
-        ExecutorIndexCache.class.getDeclaredMethod("loadingMonitor", String.class);
+        ExecutorIndexCache.class.getDeclaredMethod("loadingMonitor", String.class, String.class);
     acquireMonitor.setAccessible(true);
-    Object monitor = acquireMonitor.invoke(cache, key);
+    Object monitor = acquireMonitor.invoke(cache, key, "table");
     Method releaseMonitor =
         ExecutorIndexCache.class.getDeclaredMethod(
             "releaseLoadingMonitor", String.class, monitor.getClass());
@@ -962,30 +963,34 @@ class TestExecutorIndexCacheReservations {
       }
       assertThat(legacy.get(10, TimeUnit.SECONDS)).isSameAs(ephemeral);
       cache.releaseIndex("A", 2);
-      assertThat(cache.stats().bytes()).isZero();
+      assertThat(cache.residentKeys()).isEmpty();
     } finally {
       pool.shutdownNow();
       try {
         assertThat(pool.awaitTermination(10, TimeUnit.SECONDS)).isTrue();
       } finally {
         releaseMonitor.invoke(cache, key, monitor);
+        assertThat(cache.stats().bytes()).isZero();
       }
     }
   }
 
   @ParameterizedTest
-  @CsvSource({"100,true", "10,false"})
-  void reuseRespectsTheNewBudgetWithoutReleasingSharedLease(long budget, boolean reusable)
+  @CsvSource({"0,true", "-1,false"})
+  void reuseRespectsTheNewBudgetWithoutReleasingSharedLease(long budgetDelta, boolean reusable)
       throws Exception {
     String key = "table|adapter|managed";
-    ExecutorIndexCache.Config original = ExecutorIndexCache.Config.of(true, 100).withOwner("table");
+    ExecutorIndexCache.Config original =
+        ExecutorIndexCache.Config.of(true, Long.MAX_VALUE).withOwner("table");
     install("A", 1, key, original);
     cache.applyTarget("B", 1, Set.of(key));
     try (ExecutorIndexCache.Lease lease = cache.acquireManaged("B", 1, key)) {
       assertThat(lease).isNotNull();
       cache.applyTarget("A", 2, Set.of(key));
+      long resident = cache.chargeSnapshot().residentBytes();
+      long full = cache.chargeSnapshot().usedBytes();
       ExecutorIndexCache.Config limited =
-          ExecutorIndexCache.Config.of(true, budget).withOwner("table");
+          ExecutorIndexCache.Config.of(true, full + budgetDelta).withOwner("table");
       ExecutorIndexCache.CachedFile reused =
           cache.installManaged(
               "A",
@@ -995,11 +1000,10 @@ class TestExecutorIndexCacheReservations {
               () -> {
                 throw new AssertionError("Reuse must not reload");
               });
-      // a file of 20 bytes fits a budget of 100 but not one of 10, and the budget is now the only
-      // thing that decides that
+      // Reuse requires the complete R+Q charge; lowering that capacity by one byte must reject it.
       assertThat(reused != null).isEqualTo(reusable);
       cache.releaseIndex("A", 3);
-      assertThat(cache.stats().bytes()).isEqualTo(20);
+      assertThat(cache.stats().bytes()).isEqualTo(resident);
       assertThat(lease.file().bytes()).isEqualTo(20);
       assertThat(reserved()).isZero();
     }
@@ -1011,21 +1015,24 @@ class TestExecutorIndexCacheReservations {
   void reuseCannotAcknowledgeWhenOccupancyExceedsNewBudget() {
     String a = "table|adapter|a";
     String b = "table|adapter|b";
-    ExecutorIndexCache.Config original = ExecutorIndexCache.Config.of(true, 100).withOwner("table");
+    ExecutorIndexCache.Config original =
+        ExecutorIndexCache.Config.of(true, Long.MAX_VALUE).withOwner("table");
     install("A", 1, a, original);
     install("B", 1, b, original);
     cache.applyTarget("A", 2, Set.of(a));
+    long resident = cache.chargeSnapshot().residentBytes();
+    long limited = cache.chargeSnapshot().usedBytes() - 1;
     assertThat(
             cache.installManaged(
                 "A",
                 2,
                 a,
-                ExecutorIndexCache.Config.of(true, 30).withOwner("table"),
+                ExecutorIndexCache.Config.of(true, limited).withOwner("table"),
                 () -> {
                   throw new AssertionError("Rejected reuse must not reload");
                 }))
         .isNull();
-    assertThat(cache.stats().bytes()).isEqualTo(40);
+    assertThat(cache.stats().bytes()).isEqualTo(resident);
     assertThat(cache.residentKeys()).containsExactlyInAnyOrder(a, b);
   }
 
@@ -1056,7 +1063,7 @@ class TestExecutorIndexCacheReservations {
                 }))
         .isSameAs(file);
     assertThat(cache.acquireManaged("table#A", 1, key)).isNull();
-    assertThat(cache.stats().bytes()).isEqualTo(20);
+    assertThat(cache.stats().bytes()).isEqualTo(budget);
   }
 
   @Test
@@ -1070,6 +1077,7 @@ class TestExecutorIndexCacheReservations {
     ExecutorIndexCache.CachedFile file =
         cache.file(
             "unmanaged", config, "adapter", () -> ExecutorIndexCache.loaded(new byte[10], EMPTY));
+    long residentBeforeAssociation = cache.stats().bytes();
     Field lastAccess = file.getClass().getDeclaredField("lastAccessNanos");
     lastAccess.setAccessible(true);
     long expired = System.nanoTime() - TimeUnit.MINUTES.toNanos(31);
@@ -1084,7 +1092,7 @@ class TestExecutorIndexCacheReservations {
       cache.file("fresh", config, "adapter", () -> ExecutorIndexCache.loaded(new byte[10], EMPTY));
       assertThat(cache.residentKeys()).doesNotContain(key);
       assertThat(cache.indexAttribution()).doesNotContainKey(key);
-      assertThat(cache.stats().bytes()).isEqualTo(20);
+      assertThat(cache.stats().bytes()).isEqualTo(residentBeforeAssociation);
     } finally {
       ExecutorIndexCache.sweepIntervalForTests(TimeUnit.SECONDS.toNanos(30));
     }
@@ -1098,7 +1106,21 @@ class TestExecutorIndexCacheReservations {
     askTwiceWithOwnedPrepared("b", measuring.withOwner("B"), 60_000);
     cache.recordIndexAttribution("table#A", Set.of("A|adapter|a-old"));
     cache.recordIndexAttribution("table#B", Set.of("A|adapter|a-old", "B|adapter|b"));
-    long budget = cache.chargeSnapshot().usedBytes();
+    long[] metadataPeak = {cache.chargeSnapshot().usedBytes()};
+    for (int i = 0; i < 2; i++) {
+      cache.file(
+          "a-new",
+          measuring.withOwner("A"),
+          "adapter",
+          () -> {
+            metadataPeak[0] = Math.max(metadataPeak[0], cache.chargeSnapshot().usedBytes());
+            return ExecutorIndexCache.loaded(new byte[0], ownedPrepared(40_000), 40_000);
+          });
+    }
+    // The fixture includes the new asked/loading/reservation roots, not another prepared copy.
+    long budget = metadataPeak[0];
+    cache.releaseCopy("fixture", "A|adapter|a-old");
+    long expectedResident = cache.chargeSnapshot().residentBytes();
     cache.clear();
     ExecutorIndexCache.Config a =
         ExecutorIndexCache.Config.of(true, budget, ExecutorIndexCache.Mode.PIN_HOT, 0)
@@ -1113,7 +1135,9 @@ class TestExecutorIndexCacheReservations {
     askTwiceWithOwnedPrepared("a-new", a, 40_000);
     assertThat(cache.residentKeys()).containsExactlyInAnyOrder("B|adapter|b", "A|adapter|a-new");
     assertThat(cache.indexAttribution()).doesNotContainKey("A|adapter|a-old");
-    assertThat(cache.stats().bytes()).isEqualTo(100_000);
+    assertThat(cache.stats().bytes()).isEqualTo(expectedResident);
+    assertThat(cache.chargeSnapshot().usedBytes() + cache.chargeSnapshot().reservedBytes())
+        .isLessThanOrEqualTo(budget);
   }
 
   @Test

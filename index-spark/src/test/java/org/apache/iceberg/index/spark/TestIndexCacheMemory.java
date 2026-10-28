@@ -119,12 +119,27 @@ class TestIndexCacheMemory {
     cache.clear();
     String owner = "共享表".repeat(2_000);
     IndexAdapter.PreparedSearch prepared = (query, topK) -> List.of();
+    Constructor<ExecutorIndexCache> constructor = ExecutorIndexCache.class.getDeclaredConstructor();
+    constructor.setAccessible(true);
+    ExecutorIndexCache measuring = constructor.newInstance();
+    long budget;
+    try {
+      for (int i = 0; i < 100; i++) {
+        measuring.file(
+            "路径" + i,
+            ExecutorIndexCache.Config.of(true, Long.MAX_VALUE).withOwner(owner),
+            "reader",
+            () -> ExecutorIndexCache.loaded(new byte[0], prepared, 128));
+      }
+      budget = measuring.shape().effectiveAdmissionBytes(Set.of(owner + "|reader|路径99"));
+    } finally {
+      measuring.clear();
+    }
     try {
       for (int i = 0; i < 100; i++) {
         cache.file(
             "路径" + i,
-            ExecutorIndexCache.Config.of(true, 1_000_000)
-                .withOwner(new String(owner.toCharArray())),
+            ExecutorIndexCache.Config.of(true, budget).withOwner(new String(owner.toCharArray())),
             "reader",
             () -> ExecutorIndexCache.loaded(new byte[0], prepared, 128));
       }
@@ -175,7 +190,6 @@ class TestIndexCacheMemory {
           List.of(
               "probation",
               "protectedFiles",
-              "pendingReleases",
               "attribution",
               "bytesByOwner",
               "entriesByOwner",
@@ -416,6 +430,123 @@ class TestIndexCacheMemory {
   }
 
   @Test
+  void longMetadataCannotBeAdmittedUsingOnlyThePreparedQuote() {
+    VectorIndexAdapter adapter =
+        new VectorIndexAdapter(
+            VectorIndexDefinition.builder()
+                .fieldId(1)
+                .dimension(2)
+                .metric(Metric.EUCLIDEAN)
+                .structure(VectorStructure.FLAT)
+                .build());
+    IndexAdapter.PreparedSearch prepared = adapter.prepare(adapter.encodeEntries(List.of()));
+    ExecutorIndexCache cache = ExecutorIndexCache.get();
+    String owner = new String("owner".repeat(2_000).toCharArray());
+    String location = "file".repeat(2_000);
+    cache.clear();
+    try {
+      ExecutorIndexCache.CachedFile result =
+          cache.file(
+              location,
+              ExecutorIndexCache.Config.of(true, 1_024).withOwner(owner),
+              DistributedIndexSearch.adapterKey(adapter),
+              () -> ExecutorIndexCache.loaded(0, prepared).withContext(adapter));
+      assertThat(cache.stats().entries())
+          .as("A prepared quote below budget cannot admit metadata above budget")
+          .isZero();
+      List<IndexSearchResult> hits =
+          result.searching(
+              searcher ->
+                  searcher.search(ByteBuffer.wrap(adapter.encodeVector(new float[] {1, 0})), 1));
+      assertThat(hits).isEmpty();
+    } finally {
+      cache.clear();
+    }
+  }
+
+  @Test
+  void ownerlessWorkingSetIsUnknownEvenWithoutPayloadResolution() {
+    assertThat(DistributedIndexSearch.workingSetBytes(null, List.of(), null)).isEqualTo(-1);
+  }
+
+  @Test
+  void nodeProjectionSharesOwnerButChargesAnotherOwnership() {
+    String owner = "table-owner".repeat(200);
+    IndexFileMemory descriptor = memory(null, 7, 128).toBuilder().modelVersion(2).build();
+    IndexCacheProtocol.File first =
+        IndexCacheProtocol.File.builder()
+            .location("file1")
+            .cacheKey("key1")
+            .owner(owner)
+            .memory(descriptor)
+            .estimatedBytes(IndexCacheMemory.residentBytes(descriptor))
+            .build();
+    IndexCacheProtocol.File second =
+        IndexCacheProtocol.File.builder()
+            .location("file2")
+            .cacheKey("key2")
+            .owner(owner)
+            .memory(descriptor)
+            .estimatedBytes(IndexCacheMemory.residentBytes(descriptor))
+            .build();
+    ExecutorIndexCache.Shape empty = ExecutorIndexCache.Shape.empty();
+    ExecutorIndexCache.Shape one = empty.project("index", 1, List.of(first));
+    ExecutorIndexCache.Shape shared = one.project("index", 1, List.of(second));
+    ExecutorIndexCache.Shape together = empty.project("index", 1, List.of(first, second));
+    assertThat(shared.charge().usedBytes()).isEqualTo(together.charge().usedBytes());
+    assertThat(shared.charge().usedBytes())
+        .isLessThan(
+            one.charge().usedBytes()
+                + empty.project("index", 1, List.of(second)).charge().usedBytes());
+    ExecutorIndexCache.Shape newOwnership = one.project("another-index", 1, List.of(first));
+    assertThat(newOwnership.charge().usedBytes()).isGreaterThan(one.charge().usedBytes());
+    assertThat(newOwnership.charge().residentBytes())
+        .isGreaterThanOrEqualTo(one.charge().residentBytes())
+        .isLessThan(one.charge().residentBytes() + descriptor.preparedBytes());
+    assertThat(newOwnership.holders()).hasSize(1);
+    assertThat(newOwnership.charge().groupRefs()).isEqualTo(2);
+    assertThat(one.charge().groupRefs()).isEqualTo(1);
+  }
+
+  @Test
+  void necessaryMetadataFailurePreservesTargetAndLease() {
+    ExecutorIndexCache cache = ExecutorIndexCache.get();
+    cache.clear();
+    String key = "owner|reader|file";
+    long budget = 4_096;
+    try {
+      cache.applyTarget("index", 1, Set.of(key));
+      cache.installManaged(
+          "index",
+          1,
+          key,
+          ExecutorIndexCache.Config.of(true, budget).withOwner("owner"),
+          () -> ExecutorIndexCache.loaded(new byte[0], (query, topK) -> List.of(), 128));
+      try (ExecutorIndexCache.Lease lease = cache.acquireManaged("index", 1, key)) {
+        assertThat(lease).isNotNull();
+        ExecutorIndexCache.ChargeSnapshot before = cache.chargeSnapshot();
+        cache.applyTarget("index", 2, Set.of("large".repeat(4_000)));
+        cache.addManagedKeys("index", 1, Set.of("large".repeat(4_000)));
+        cache.applyTarget("新owner".repeat(4_000), 1, Set.of(key));
+        ExecutorIndexCache.ChargeSnapshot after = cache.chargeSnapshot();
+        assertThat(after.usedBytes()).isEqualTo(before.usedBytes());
+        assertThat(after.groupRefs()).isEqualTo(before.groupRefs());
+        assertThat(after.holders()).isEqualTo(1);
+        assertThat(after.usedBytes() + after.reservedBytes()).isLessThanOrEqualTo(budget);
+        try (ExecutorIndexCache.Lease current = cache.acquireManaged("index", 1, key)) {
+          assertThat(current).isNotNull();
+        }
+        cache.releaseIndex("index", 2);
+        assertThat(cache.stats().bytes()).isPositive();
+      }
+      assertThat(cache.stats().bytes()).isZero();
+      assertThat(cache.chargeSnapshot().usedBytes()).isLessThanOrEqualTo(budget);
+    } finally {
+      cache.clear();
+    }
+  }
+
+  @Test
   void independentPreparedStateDoesNotRetainContainer() throws ReflectiveOperationException {
     byte[] container = new byte[20_000];
     byte[] state = new byte[] {10};
@@ -608,12 +739,32 @@ class TestIndexCacheMemory {
         assertThat(Math.addExact(file.memory().payloadBytes(), file.memory().preparedBytes()))
             .as("Blob-buffer charge is not the whole-container cache charge")
             .isNotEqualTo(planned);
+        String owner = "table";
+        String key = DistributedIndexSearch.adapterKey(adapter);
+        long plannedSet = DistributedIndexSearch.workingSetBytes(fileIO, published, adapter, owner);
+        IndexCacheProtocol.File prospect =
+            IndexCacheProtocol.File.builder()
+                .location(file.location())
+                .owner(owner)
+                .cacheKey(DistributedIndexSearch.cacheKey(owner, key, file.location()))
+                .memory(file.memory())
+                .estimatedBytes(planned)
+                .build();
+        ExecutorIndexCache.ChargeSnapshot admission =
+            ExecutorIndexCache.Shape.empty().projectAdmission(null, 0, List.of(prospect)).charge();
+        long capacity = Math.addExact(admission.usedBytes(), admission.reservedBytes());
+        assertThat(plannedSet).isEqualTo(admission.residentBytes()).isGreaterThan(planned);
         ExecutorIndexCache cache = ExecutorIndexCache.get();
         cache.file(
-            file.location(), ExecutorIndexCache.Config.of(true, expected), "adapter", () -> loaded);
-        assertThat(cache.stats().bytes()).isEqualTo(planned);
+            file.location(),
+            ExecutorIndexCache.Config.of(true, capacity).withOwner(owner),
+            key,
+            () -> loaded);
+        assertThat(cache.stats().entries()).isEqualTo(1);
+        assertThat(cache.stats().bytes()).isEqualTo(plannedSet);
+        assertThat(cache.chargeSnapshot().usedBytes()).isLessThanOrEqualTo(capacity);
         assertThat(DistributedIndexSearch.workingSetBytes(fileIO, published, adapter))
-            .isEqualTo(planned);
+            .isEqualTo(-1);
       } finally {
         try {
           writer.abortAttempt(indexLocation);

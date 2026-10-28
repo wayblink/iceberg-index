@@ -20,6 +20,7 @@ package org.apache.iceberg.index.spark;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
+import java.nio.ByteBuffer;
 import java.util.List;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
@@ -28,12 +29,14 @@ import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import org.apache.iceberg.index.IndexAdapter;
+import org.apache.iceberg.index.IndexSearchResult;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableList;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 
 class TestExecutorIndexCache {
 
+  private static final int OPAQUE_SEARCHER_BYTES = 32;
   private static final IndexAdapter.PreparedSearch EMPTY = (query, topK) -> ImmutableList.of();
 
   private final ExecutorIndexCache cache = ExecutorIndexCache.get();
@@ -77,18 +80,19 @@ class TestExecutorIndexCache {
   @Test
   void evictsLeastRecentlyUsedWhenOverBudget() {
     AtomicInteger loads = new AtomicInteger();
-    ExecutorIndexCache.Config enabled = mode(ExecutorIndexCache.Mode.PIN_HOT, 250);
+    ExecutorIndexCache.Config enabled = mode(ExecutorIndexCache.Mode.PIN_HOT, 25_000);
 
-    cache.file("s3://bucket/a.puffin", enabled, "adapter", () -> load(loads, 100));
-    cache.file("s3://bucket/b.puffin", enabled, "adapter", () -> load(loads, 100));
-    // each is asked twice, so both are admitted; c then needs room
-    cache.file("s3://bucket/a.puffin", enabled, "adapter", () -> load(loads, 100));
-    cache.file("s3://bucket/b.puffin", enabled, "adapter", () -> load(loads, 100));
-    cache.file("s3://bucket/c.puffin", enabled, "adapter", () -> load(loads, 100));
-    cache.file("s3://bucket/c.puffin", enabled, "adapter", () -> load(loads, 100));
+    cache.file("s3://bucket/a.puffin", enabled, "adapter", () -> load(loads, 10_000));
+    cache.file("s3://bucket/b.puffin", enabled, "adapter", () -> load(loads, 10_000));
+    // Two independent prepared states fit with metadata; the third requires eviction.
+    cache.file("s3://bucket/a.puffin", enabled, "adapter", () -> load(loads, 10_000));
+    cache.file("s3://bucket/b.puffin", enabled, "adapter", () -> load(loads, 10_000));
+    assertThat(cache.stats().entries()).isEqualTo(2);
+    cache.file("s3://bucket/c.puffin", enabled, "adapter", () -> load(loads, 10_000));
+    cache.file("s3://bucket/c.puffin", enabled, "adapter", () -> load(loads, 10_000));
 
     assertThat(cache.stats().evictions()).isEqualTo(1);
-    assertThat(cache.stats().bytes()).isLessThanOrEqualTo(250);
+    assertThat(cache.chargeSnapshot().usedBytes()).isLessThanOrEqualTo(25_000);
     assertThat(cache.stats().entries()).isEqualTo(2);
   }
 
@@ -138,18 +142,18 @@ class TestExecutorIndexCache {
   @Test
   void aFileAskedForTwiceOutranksOneSeenOnce() {
     AtomicInteger loads = new AtomicInteger();
-    ExecutorIndexCache.Config pinHot = mode(ExecutorIndexCache.Mode.PIN_HOT, 250);
+    ExecutorIndexCache.Config pinHot = mode(ExecutorIndexCache.Mode.PIN_HOT, 25_000);
 
-    // a is admitted after its second ask and promoted on its third, so when c needs room the entry
-    // seen once is the one that goes
-    cache.file("s3://bucket/a.puffin", pinHot, "adapter", () -> load(loads, 100));
-    cache.file("s3://bucket/a.puffin", pinHot, "adapter", () -> load(loads, 100));
-    cache.file("s3://bucket/a.puffin", pinHot, "adapter", () -> load(loads, 100));
-    cache.file("s3://bucket/b.puffin", pinHot, "adapter", () -> load(loads, 100));
-    cache.file("s3://bucket/b.puffin", pinHot, "adapter", () -> load(loads, 100));
-    cache.file("s3://bucket/c.puffin", pinHot, "adapter", () -> load(loads, 100));
-    cache.file("s3://bucket/c.puffin", pinHot, "adapter", () -> load(loads, 100));
-    cache.file("s3://bucket/c.puffin", pinHot, "adapter", () -> load(loads, 100));
+    // A is admitted after its second ask and promoted on its third; B is still probationary.
+    cache.file("s3://bucket/a.puffin", pinHot, "adapter", () -> load(loads, 10_000));
+    cache.file("s3://bucket/a.puffin", pinHot, "adapter", () -> load(loads, 10_000));
+    cache.file("s3://bucket/a.puffin", pinHot, "adapter", () -> load(loads, 10_000));
+    cache.file("s3://bucket/b.puffin", pinHot, "adapter", () -> load(loads, 10_000));
+    cache.file("s3://bucket/b.puffin", pinHot, "adapter", () -> load(loads, 10_000));
+    assertThat(cache.stats().entries()).isEqualTo(2);
+    cache.file("s3://bucket/c.puffin", pinHot, "adapter", () -> load(loads, 10_000));
+    cache.file("s3://bucket/c.puffin", pinHot, "adapter", () -> load(loads, 10_000));
+    cache.file("s3://bucket/c.puffin", pinHot, "adapter", () -> load(loads, 10_000));
 
     assertThat(ExecutorIndexCache.get().residentKeys()).anyMatch(key -> key.endsWith("a.puffin"));
   }
@@ -157,12 +161,13 @@ class TestExecutorIndexCache {
   @Test
   void pinAllDoesNotEvictToMakeRoom() {
     AtomicInteger loads = new AtomicInteger();
-    ExecutorIndexCache.Config pinAll = mode(ExecutorIndexCache.Mode.PIN_ALL, 250);
+    ExecutorIndexCache.Config pinAll = mode(ExecutorIndexCache.Mode.PIN_ALL, 25_000);
 
-    cache.file("s3://bucket/a.puffin", pinAll, "adapter", () -> load(loads, 100));
-    cache.file("s3://bucket/b.puffin", pinAll, "adapter", () -> load(loads, 100));
-    // the budget cannot hold a third file, and a pin-all entry is not evicted for one
-    cache.file("s3://bucket/c.puffin", pinAll, "adapter", () -> load(loads, 100));
+    cache.file("s3://bucket/a.puffin", pinAll, "adapter", () -> load(loads, 10_000));
+    cache.file("s3://bucket/b.puffin", pinAll, "adapter", () -> load(loads, 10_000));
+    assertThat(cache.stats().entries()).isEqualTo(2);
+    // Pinned entries are not evicted to make room for a third independent state.
+    cache.file("s3://bucket/c.puffin", pinAll, "adapter", () -> load(loads, 10_000));
 
     assertThat(ExecutorIndexCache.get().residentKeys()).noneMatch(key -> key.endsWith("c.puffin"));
   }
@@ -234,18 +239,26 @@ class TestExecutorIndexCache {
   @Test
   void aTableBeyondItsShareIsTheOneThatLosesRoom() {
     AtomicInteger loads = new AtomicInteger();
-    ExecutorIndexCache.Config small = ownerConfig("small", 400);
-    ExecutorIndexCache.Config large = ownerConfig("large", 400);
+    ExecutorIndexCache.Config measuring = ownerConfig("small", Long.MAX_VALUE);
+    fairAsk("s3://bucket/small-a.puffin", measuring, loads, null);
+    for (String suffix : List.of("a", "b", "c")) {
+      fairAsk("s3://bucket/large-" + suffix + ".puffin", measuring.withOwner("large"), loads, null);
+    }
+    long[] peak = {0};
+    fairAsk("s3://bucket/large-d.puffin", measuring.withOwner("large"), loads, peak);
+    long budget = peak[0];
+    cache.clear();
+    ExecutorIndexCache.Config small = ownerConfig("small", budget);
+    ExecutorIndexCache.Config large = ownerConfig("large", budget);
 
-    // small keeps one entry of 100; large fills the rest and then needs more
-    ask("s3://bucket/small-a.puffin", small, loads);
-    ask("s3://bucket/large-a.puffin", large, loads);
-    ask("s3://bucket/large-b.puffin", large, loads);
-    ask("s3://bucket/large-c.puffin", large, loads);
-    ask("s3://bucket/large-d.puffin", large, loads);
+    fairAsk("s3://bucket/small-a.puffin", small, loads, null);
+    fairAsk("s3://bucket/large-a.puffin", large, loads, null);
+    fairAsk("s3://bucket/large-b.puffin", large, loads, null);
+    fairAsk("s3://bucket/large-c.puffin", large, loads, null);
+    fairAsk("s3://bucket/large-d.puffin", large, loads, null);
 
-    // 400 bytes over two tables is 200 each, so large has to give up its own oldest entry rather
-    // than push small out
+    // The fixture covers four residents and the fifth load's necessary metadata. Large borrows
+    // most of that collection and must give back its own oldest file, not the small table's file.
     assertThat(ExecutorIndexCache.get().residentKeys())
         .anyMatch(key -> key.endsWith("small-a.puffin"));
     assertThat(ExecutorIndexCache.get().residentKeys())
@@ -255,18 +268,26 @@ class TestExecutorIndexCache {
   @Test
   void aTableBorrowsRoomAnotherIsNotUsing() {
     AtomicInteger loads = new AtomicInteger();
-    ExecutorIndexCache.Config small = ownerConfig("small", 300);
-    ExecutorIndexCache.Config large = ownerConfig("large", 300);
+    ExecutorIndexCache.Config measuring = ownerConfig("large", Long.MAX_VALUE);
+    fairAsk("s3://bucket/large-a.puffin", measuring, loads, null);
+    fairAsk("s3://bucket/large-b.puffin", measuring, loads, null);
+    fairAsk("s3://bucket/small-a.puffin", measuring.withOwner("small"), loads, null);
+    long[] peak = {0};
+    fairAsk("s3://bucket/small-b.puffin", measuring.withOwner("small"), loads, peak);
+    long budget = peak[0];
+    cache.clear();
+    ExecutorIndexCache.Config small = ownerConfig("small", budget);
+    ExecutorIndexCache.Config large = ownerConfig("large", budget);
 
-    // with only one table holding anything, it may use the whole budget
-    ask("s3://bucket/large-a.puffin", large, loads);
-    ask("s3://bucket/large-b.puffin", large, loads);
+    // With only one table holding anything, it may borrow the available component budget.
+    fairAsk("s3://bucket/large-a.puffin", large, loads, null);
+    fairAsk("s3://bucket/large-b.puffin", large, loads, null);
 
     assertThat(ExecutorIndexCache.get().residentKeys()).hasSize(2);
 
     // when the other table arrives it takes its share back from the borrower
-    ask("s3://bucket/small-a.puffin", small, loads);
-    ask("s3://bucket/small-b.puffin", small, loads);
+    fairAsk("s3://bucket/small-a.puffin", small, loads, null);
+    fairAsk("s3://bucket/small-b.puffin", small, loads, null);
 
     assertThat(ExecutorIndexCache.get().residentKeys())
         .anyMatch(key -> key.endsWith("small-a.puffin"));
@@ -394,6 +415,36 @@ class TestExecutorIndexCache {
     cache.file(location, config, "adapter", () -> load(loads, 100));
   }
 
+  private void fairAsk(
+      String location, ExecutorIndexCache.Config config, AtomicInteger loads, long[] metadataPeak) {
+    for (int i = 0; i < 2; i++) {
+      cache.file(
+          location,
+          config,
+          "adapter",
+          () -> {
+            loads.incrementAndGet();
+            if (metadataPeak != null) {
+              metadataPeak[0] = Math.max(metadataPeak[0], cache.chargeSnapshot().usedBytes());
+            }
+            byte[] state = new byte[10_000 - 32];
+            IndexAdapter.PreparedSearch prepared =
+                new IndexAdapter.PreparedSearch() {
+                  @Override
+                  public List<IndexSearchResult> search(ByteBuffer query, int topK) {
+                    return List.of();
+                  }
+
+                  @Override
+                  public long estimatedBytes() {
+                    return state.length + 32L;
+                  }
+                };
+            return ExecutorIndexCache.loaded(0, prepared);
+          });
+    }
+  }
+
   private static ExecutorIndexCache.Config ownerConfig(String owner, long maxBytes) {
     return ExecutorIndexCache.Config.of(true, maxBytes, ExecutorIndexCache.Mode.PIN_HOT, 0)
         .withOwner(owner);
@@ -410,6 +461,18 @@ class TestExecutorIndexCache {
 
   private static ExecutorIndexCache.CachedFile load(AtomicInteger loads, int bytes) {
     loads.incrementAndGet();
-    return ExecutorIndexCache.loaded(new byte[bytes], EMPTY, bytes);
+    IndexAdapter.PreparedSearch prepared =
+        new IndexAdapter.PreparedSearch() {
+          @Override
+          public List<IndexSearchResult> search(ByteBuffer query, int topK) {
+            return List.of();
+          }
+
+          @Override
+          public long estimatedBytes() {
+            return Math.max(OPAQUE_SEARCHER_BYTES, bytes);
+          }
+        };
+    return ExecutorIndexCache.loaded(new byte[bytes], prepared, bytes);
   }
 }

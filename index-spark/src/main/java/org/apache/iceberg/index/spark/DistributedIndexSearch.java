@@ -20,6 +20,7 @@ package org.apache.iceberg.index.spark;
 
 import java.io.Serializable;
 import java.nio.ByteBuffer;
+import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.Iterator;
 import java.util.List;
@@ -29,6 +30,7 @@ import org.apache.iceberg.Table;
 import org.apache.iceberg.index.IndexAdapter;
 import org.apache.iceberg.index.IndexBlob;
 import org.apache.iceberg.index.IndexFile;
+import org.apache.iceberg.index.IndexFileMemory;
 import org.apache.iceberg.index.IndexMetadata;
 import org.apache.iceberg.index.IndexQuery;
 import org.apache.iceberg.index.IndexReader;
@@ -153,7 +155,7 @@ public final class DistributedIndexSearch {
     // properties of its catalog rather than with whatever the session happens to be configured with
     Broadcast<FileIO> ioRef = context.broadcast(table.io());
     // whether an executor remembers index files between queries, and how much it may keep
-    long workingSet = workingSetBytes(table.io(), files, adapter);
+    long workingSet = workingSetBytes(table.io(), files, adapter, table.location());
     Broadcast<ExecutorIndexCache.Config> cacheRef =
         context.broadcast(ExecutorIndexCache.Config.from(spark, workingSet, table.location()));
     String cacheKey = adapterKey(adapter);
@@ -300,7 +302,7 @@ public final class DistributedIndexSearch {
     }
     Broadcast<List<byte[]>> queriesRef = context.broadcast(queryPayloads);
     Broadcast<FileIO> ioRef = context.broadcast(table.io());
-    long workingSet = workingSetBytes(table.io(), files, adapter);
+    long workingSet = workingSetBytes(table.io(), files, adapter, table.location());
     Broadcast<ExecutorIndexCache.Config> cacheRef =
         context.broadcast(ExecutorIndexCache.Config.from(spark, workingSet, table.location()));
     String cacheKey = adapterKey(adapter);
@@ -564,19 +566,34 @@ public final class DistributedIndexSearch {
    * not heap measurements. A failed or unsupported estimate never becomes free capacity.
    */
   static long workingSetBytes(FileIO io, List<IndexFile> files, IndexAdapter adapter) {
-    long total = 0;
-    for (IndexFile file : files) {
-      Long bytes = IndexCacheMemory.resolve(io, file, adapter);
-      if (bytes == null) {
-        return -1;
-      }
-      try {
-        total = Math.addExact(total, bytes);
-      } catch (ArithmeticException e) {
-        return -1;
-      }
+    return -1;
+  }
+
+  static long workingSetBytes(
+      FileIO io, List<IndexFile> files, IndexAdapter adapter, String owner) {
+    if (owner == null || owner.isBlank() || IndexCacheMemory.currentDescriptor(adapter) == null) {
+      return -1;
     }
-    return total;
+    List<IndexCacheProtocol.File> planned = new ArrayList<>();
+    for (IndexFile file : files) {
+      IndexFileMemory memory = IndexCacheMemory.resolveMemory(io, file, adapter);
+      if (memory == null) {
+        return -1;
+      }
+      planned.add(
+          IndexCacheProtocol.File.builder()
+              .location(file.location())
+              .cacheKey(cacheKey(owner, adapterKey(adapter), file.location()))
+              .owner(owner)
+              .memory(memory)
+              .estimatedBytes(IndexCacheMemory.residentBytes(memory))
+              .build());
+    }
+    try {
+      return ExecutorIndexCache.Shape.empty().project(null, 0, planned).charge().usedBytes();
+    } catch (RuntimeException e) {
+      return -1;
+    }
   }
 
   record LoadedFile(
@@ -591,12 +608,10 @@ public final class DistributedIndexSearch {
   static LoadedFile loadFileState(FileIO io, String location, IndexAdapter adapter) {
     byte[] content = readPayload(io, location);
     PreparedFile prepared = prepareFile(content, adapter);
-    return new LoadedFile(
+    ExecutorIndexCache.CachedFile file =
         ExecutorIndexCache.loaded(prepared.payloadBytes(), prepared.searcher())
-            .withContext(adapter),
-        content.length,
-        prepared.payloadBytes(),
-        prepared.searcher().estimatedBytes());
+            .withContext(adapter);
+    return new LoadedFile(file, content.length, prepared.payloadBytes(), file.preparedBytes());
   }
 
   /**

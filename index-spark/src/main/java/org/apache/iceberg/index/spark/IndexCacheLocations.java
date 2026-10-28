@@ -25,8 +25,10 @@ import java.util.Collection;
 import java.util.Comparator;
 import java.util.Iterator;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import org.apache.spark.SparkContext;
 import org.apache.spark.scheduler.SparkListener;
@@ -59,6 +61,7 @@ final class IndexCacheLocations {
     private final long bytes;
     private final long entries;
     private final long reportedAtMillis;
+    private ExecutorIndexCache.Shape metadataShape;
 
     Report(
         String executorId,
@@ -85,6 +88,15 @@ final class IndexCacheLocations {
       this.bytes = bytes;
       this.entries = entries;
       this.reportedAtMillis = reportedAtMillis;
+    }
+
+    Report withMetadata(ExecutorIndexCache.Shape shape) {
+      this.metadataShape = shape;
+      return this;
+    }
+
+    ExecutorIndexCache.Shape metadataShape() {
+      return metadataShape;
     }
 
     String executorId() {
@@ -252,6 +264,7 @@ final class IndexCacheLocations {
     private final long hits;
     private final long misses;
     private final long evictions;
+    private final ExecutorIndexCache.Shape metadataShape;
     private long bytes;
     private long lastSeenMillis;
 
@@ -265,6 +278,7 @@ final class IndexCacheLocations {
       this.misses = report.misses();
       this.evictions = report.evictions();
       this.bytes = report.bytes();
+      this.metadataShape = report.metadataShape();
       // the executor's own clock, not the moment the driver happened to merge it: a report that
       // arrives late is old news, and stamping it on arrival would make it look fresh
       this.lastSeenMillis =
@@ -318,7 +332,17 @@ final class IndexCacheLocations {
 
     synchronized (lock) {
       View current = views.get(report.executorId());
-      if (current == null || report.epoch() != current.epoch || report.seq() > current.seq) {
+      boolean newerCharge =
+          report.metadataShape() != null
+              && (current == null
+                  || current.metadataShape == null
+                  || report.metadataShape().charge().version()
+                      > current.metadataShape.charge().version());
+      if (current == null
+          || report.epoch() != current.epoch
+          || (report.metadataShape() != null
+              ? newerCharge
+              : report.seq() > current.seq && current.metadataShape == null)) {
         views.put(report.executorId(), new View(report));
       }
     }
@@ -431,7 +455,15 @@ final class IndexCacheLocations {
       executors = views.size();
       for (View view : views.values()) {
         files += view.keys.length;
-        bytes += view.bytes;
+        if (cacheKeys == null || cacheKeys.isEmpty()) {
+          bytes = bytes < 0 ? -1 : Math.addExact(bytes, view.bytes);
+        } else if (view.metadataShape == null || !view.metadataShape.charge().known()) {
+          bytes = -1;
+        } else if (bytes >= 0) {
+          Set<String> selected = new LinkedHashSet<>(cacheKeys);
+          selected.retainAll(view.metadataShape.holders().keySet());
+          bytes = Math.addExact(bytes, view.metadataShape.residentBytes(selected));
+        }
         hits += view.hits;
         misses += view.misses;
         evictions += view.evictions;
@@ -452,18 +484,19 @@ final class IndexCacheLocations {
       for (View view : views.values()) {
         reports.add(
             new Report(
-                view.executorId,
-                view.host,
-                view.epoch,
-                view.seq,
-                view.keys,
-                view.hits,
-                view.misses,
-                0,
-                view.evictions,
-                view.bytes,
-                view.keys.length,
-                view.lastSeenMillis));
+                    view.executorId,
+                    view.host,
+                    view.epoch,
+                    view.seq,
+                    view.keys,
+                    view.hits,
+                    view.misses,
+                    0,
+                    view.evictions,
+                    view.bytes,
+                    view.keys.length,
+                    view.lastSeenMillis)
+                .withMetadata(view.metadataShape));
       }
     }
 

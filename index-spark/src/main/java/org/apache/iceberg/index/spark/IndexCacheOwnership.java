@@ -18,6 +18,7 @@
  */
 package org.apache.iceberg.index.spark;
 
+import java.io.Serializable;
 import java.util.Map;
 import java.util.Set;
 import org.apache.iceberg.index.spark.IndexCacheMetadata.Component;
@@ -28,8 +29,9 @@ import org.apache.iceberg.index.spark.IndexCacheMetadata.Texts;
 import org.apache.iceberg.relocated.com.google.common.base.Preconditions;
 
 /** Index target ownership, guarded by the executor cache's map lock. */
-final class IndexCacheOwnership implements Component {
-  private record Target(long epoch, boolean paused, Set<String> keys) implements Component {
+final class IndexCacheOwnership implements Component, Serializable {
+  private record Target(long epoch, boolean paused, Set<String> keys)
+      implements Component, Serializable {
     @Override
     public void charge(Components components) {
       if (components.object(this, 32)) {
@@ -49,6 +51,17 @@ final class IndexCacheOwnership implements Component {
 
   IndexCacheOwnership(Texts texts) {
     this.texts = texts;
+  }
+
+  IndexCacheOwnership copy(Texts ownedTexts) {
+    IndexCacheOwnership copy = new IndexCacheOwnership(ownedTexts);
+    targets.forEach(
+        (owner, target) ->
+            copy.targets.put(
+                owner, new Target(target.epoch(), target.paused(), new OwnedSet<>(target.keys()))));
+    ownersByKey.forEach((key, owners) -> copy.ownersByKey.put(key, new OwnedSet<>(owners)));
+    copy.managedKeys.addAll(managedKeys);
+    return copy;
   }
 
   private Set<String> own(Set<String> source) {
@@ -110,7 +123,8 @@ final class IndexCacheOwnership implements Component {
     return target != null
         && !target.paused()
         && target.epoch() == epoch
-        && target.keys().contains(cacheKey);
+        && target.keys().contains(cacheKey)
+        && ownersByKey.getOrDefault(cacheKey, Set.of()).contains(indexUuid);
   }
 
   void release(String indexUuid, long epoch) {
@@ -126,11 +140,13 @@ final class IndexCacheOwnership implements Component {
     validate(indexUuid, epoch);
     Preconditions.checkArgument(cacheKeys != null, "Index target keys are null");
     Target target = targets.get(indexUuid);
-    if (target == null || target.epoch() != epoch) {
+    if (target == null || target.paused() || target.epoch() != epoch) {
       return;
     }
     Set<String> keys = own(target.keys());
     Set<String> added = own(cacheKeys);
+    // A withdrawn key stays known at this epoch; only a newer target can admit it again.
+    added.removeAll(target.keys());
     keys.addAll(added);
     String owner = texts.own(indexUuid);
     targets.put(owner, new Target(epoch, target.paused(), keys));
@@ -144,12 +160,10 @@ final class IndexCacheOwnership implements Component {
   boolean releaseKey(String indexUuid, String cacheKey) {
     validate(indexUuid, 0L);
     Target target = targets.get(indexUuid);
-    if (target == null || !target.keys().contains(cacheKey)) {
+    if (target == null || !ownersByKey.getOrDefault(cacheKey, Set.of()).contains(indexUuid)) {
       return false;
     }
-    Set<String> keys = own(target.keys());
-    keys.remove(cacheKey);
-    targets.put(texts.own(indexUuid), new Target(target.epoch(), target.paused(), keys));
+    // Reuse the charged known-key node as the tombstone instead of allocating on release.
     ownersByKey.computeIfPresent(
         cacheKey,
         (ignored, owners) -> {
@@ -182,9 +196,27 @@ final class IndexCacheOwnership implements Component {
     return managedKeys.contains(cacheKey);
   }
 
+  long epoch(String indexUuid) {
+    Target target = targets.get(indexUuid);
+    return target == null ? -1 : target.epoch();
+  }
+
+  boolean hasTarget(String indexUuid) {
+    return targets.containsKey(indexUuid);
+  }
+
   Set<String> keys(String indexUuid) {
     Target target = targets.get(indexUuid);
-    return target == null ? Set.of() : Set.copyOf(target.keys());
+    if (target == null || target.paused()) {
+      return Set.of();
+    }
+    Set<String> keys = new OwnedSet<>();
+    for (String key : target.keys()) {
+      if (ownersByKey.getOrDefault(key, Set.of()).contains(indexUuid)) {
+        keys.add(key);
+      }
+    }
+    return Set.copyOf(keys);
   }
 
   void clear() {

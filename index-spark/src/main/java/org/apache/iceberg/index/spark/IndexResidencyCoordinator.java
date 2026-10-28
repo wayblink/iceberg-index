@@ -218,38 +218,69 @@ final class IndexResidencyCoordinator {
     }
 
     private void observe(IndexCacheProtocol.NodeReport next, long nowNanos) {
+      ExecutorIndexCache.Shape current = report.metadataShape();
+      ExecutorIndexCache.Shape incoming = next.metadataShape();
+      if (current != null
+          && (incoming == null || incoming.charge().version() <= current.charge().version())) {
+        next = next.copy().metadataShape(current).build();
+      }
       this.report = next;
       this.reportTimeNanos = nowNanos;
+    }
+
+    private void observeShape(ExecutorIndexCache.Shape incoming) {
+      ExecutorIndexCache.Shape current = report.metadataShape();
+      if (incoming != null
+          && (current == null || incoming.charge().version() > current.charge().version())) {
+        report = report.copy().metadataShape(incoming).build();
+      }
     }
 
     private boolean holds(String cacheKey) {
       return report.holders().containsKey(cacheKey);
     }
 
+    private ExecutorIndexCache.Shape projected(String excludedPlan) {
+      ExecutorIndexCache.Shape shape = report.metadataShape();
+      if (shape == null || !shape.charge().known()) {
+        return null;
+      }
+      for (IndexCacheProtocol.Command command : issued) {
+        if (reservedByCommand.containsKey(command.commandId())
+            && !command.planId().equals(excludedPlan)) {
+          try {
+            shape =
+                shape.projectAdmission(
+                    command.indexUuid(), command.epoch(), List.of(command.file()));
+          } catch (RuntimeException e) {
+            return null;
+          }
+        }
+      }
+      return shape;
+    }
+
+    private long effective(String excludedPlan) {
+      ExecutorIndexCache.Shape shape = projected(excludedPlan);
+      return shape == null
+          ? Long.MAX_VALUE
+          : Math.addExact(shape.charge().usedBytes(), shape.charge().reservedBytes());
+    }
+
     private long reservedBytes() {
-      return reservedByCommand.values().stream().mapToLong(Long::longValue).sum();
+      long baseline = Math.addExact(report.usedBytes(), report.reservedBytes());
+      return Math.max(0, effective(null) - baseline);
     }
 
     private long reservedBytesFor(String planId) {
-      long total = 0;
-      for (Map.Entry<String, Long> reservation : reservedByCommand.entrySet()) {
-        if (planId.equals(planOfCommand.get(reservation.getKey()))) {
-          total = Math.addExact(total, reservation.getValue());
-        }
-      }
-
-      return total;
+      return Math.max(0, effective(null) - effective(planId));
     }
 
     private Map<String, Long> reservedByPlan() {
       Map<String, Long> byPlan = new LinkedHashMap<>();
-      for (Map.Entry<String, Long> reservation : reservedByCommand.entrySet()) {
-        String planId = planOfCommand.get(reservation.getKey());
-        if (planId != null) {
-          byPlan.merge(planId, reservation.getValue(), Long::sum);
-        }
+      for (String planId : planOfCommand.values()) {
+        byPlan.put(planId, reservedBytesFor(planId));
       }
-
       return byPlan;
     }
 
@@ -614,6 +645,27 @@ final class IndexResidencyCoordinator {
       return;
     }
 
+    IndexCacheProtocol.Command issued =
+        node.issued.stream()
+            .filter(command -> command.commandId().equals(ack.commandId()))
+            .findFirst()
+            .orElse(null);
+    if (issued == null
+        || !issued.planId().equals(ack.planId())
+        || issued.epoch() != ack.epoch()
+        || issued.sequence() != ack.sequence()) {
+      return;
+    }
+    if (ack.metadataShape() == null
+        && node.reservedByCommand.containsKey(ack.commandId())
+        && (ack.status() == IndexCacheProtocol.AckStatus.LOADED
+            || ack.status() == IndexCacheProtocol.AckStatus.RELEASED)
+        && node.report.metadataShape() != null) {
+      node.report =
+          node.report.copy().metadataShape(node.report.metadataShape().unknownCharge()).build();
+    }
+    node.observeShape(ack.metadataShape());
+
     PlanState plan = plans.get(ack.planId());
     if (plan == null) {
       return;
@@ -670,7 +722,12 @@ final class IndexResidencyCoordinator {
         plan.released.add(replicaKey(command.cacheKey, command.executorId));
         // Only the copy on that node stops counting; a migrated copy of the same key survives.
         forgetCopy(
-            command.cacheKey, command.executorId, command.incarnation, command.releasesCommandId);
+            command.cacheKey,
+            command.executorId,
+            command.incarnation,
+            command.releasesCommandId,
+            issued.indexUuid(),
+            issued.epoch());
       }
 
       node.settle(ack.commandId());
@@ -693,16 +750,7 @@ final class IndexResidencyCoordinator {
         return;
       }
 
-      // A report may already list the copy; only the part the report is missing gets charged here.
-      long delta = node.report.holders().containsKey(command.cacheKey) ? 0 : command.bytes;
-      Map<String, Long> holders = new LinkedHashMap<>(node.report.holders());
-      holders.put(command.cacheKey, command.bytes);
-      node.report =
-          node.report
-              .copy()
-              .holders(holders)
-              .usedBytes(Math.addExact(node.report.usedBytes(), delta))
-              .build();
+      // Coverage follows command identity; capacity follows only a newer committed shape.
       plan.loaded.put(command.cacheKey, command);
       plan.failed.remove(command.location);
       // The reservation becomes retained bytes; keeping it would charge the copy twice.
@@ -811,26 +859,16 @@ final class IndexResidencyCoordinator {
 
     Set<String> lost = lostIncarnations();
     Map<String, String> uncovered = new LinkedHashMap<>(plan.rejected);
-    Map<String, Long> counted = new LinkedHashMap<>();
+    Set<String> counted = new LinkedHashSet<>();
     for (IndexCacheProtocol.File file : plan.files) {
-      if (plan.reused.contains(file.cacheKey()) && confirmedAnywhere(file.cacheKey())) {
-        counted.putIfAbsent(file.cacheKey(), bytesOf(file.cacheKey()));
-        continue;
-      }
-
       // Confirmed copies live in plan.loaded; a release removes exactly the copy it acknowledged,
       // so a migrated copy of the same key stays counted here.
       PlanFile loaded = plan.loaded.get(file.cacheKey());
       if (loaded != null && !lost.contains(loaded.incarnation)) {
-        counted.putIfAbsent(file.cacheKey(), loaded.bytes);
+        counted.add(file.cacheKey());
       } else {
         uncovered.putIfAbsent(file.location(), reason(plan, file, lost));
       }
-    }
-
-    long resident = 0;
-    for (long bytes : counted.values()) {
-      resident = Math.addExact(resident, bytes);
     }
 
     IndexCacheProtocol.Status status;
@@ -839,7 +877,8 @@ final class IndexResidencyCoordinator {
     } else if (uncovered.isEmpty()) {
       status = IndexCacheProtocol.Status.COMPLETE;
     } else if (plan.expired) {
-      status = resident == 0 ? IndexCacheProtocol.Status.FAILED : IndexCacheProtocol.Status.PARTIAL;
+      status =
+          counted.isEmpty() ? IndexCacheProtocol.Status.FAILED : IndexCacheProtocol.Status.PARTIAL;
     } else if (queued(plan.planId)) {
       status = IndexCacheProtocol.Status.QUEUED;
     } else if (plan.loaded.isEmpty() && allIssuedLoadsAnswered(plan, lost)) {
@@ -1002,15 +1041,14 @@ final class IndexResidencyCoordinator {
       if (target.indexUuid() == null || !cacheKeyBelongsTo(file)) {
         plan.rejected.put(file.location(), "CACHE_KEY_NOT_OWNED");
       } else if (confirmedAnywhere(file.cacheKey())) {
-        // A shared file already has one confirmed copy in this target; no second load is needed.
         plan.reused.add(file.cacheKey());
-        reusable.add(file.location());
       }
     }
 
     IndexCacheProtocol.Target routable =
         IndexCacheProtocol.Target.builder()
             .indexUuid(target.indexUuid())
+            .owner(target.owner())
             .snapshotId(target.snapshotId())
             .files(
                 target.files().stream()
@@ -1019,11 +1057,11 @@ final class IndexResidencyCoordinator {
             .definition(target.definition())
             .io(target.io())
             .build();
-    List<IndexCacheProtocol.File> pendingFiles =
-        routable.files().stream().filter(file -> !reusable.contains(file.location())).toList();
+    List<IndexCacheProtocol.File> pendingFiles = routable.files();
     IndexCacheProtocol.Target pending =
         IndexCacheProtocol.Target.builder()
             .indexUuid(target.indexUuid())
+            .owner(target.owner())
             .snapshotId(target.snapshotId())
             .files(pendingFiles)
             .definition(target.definition())
@@ -1044,14 +1082,17 @@ final class IndexResidencyCoordinator {
       // Only an acknowledged copy counts; a report on its own grants nothing.
       if (node == null) {
         plan.rejected.put(file.location(), "NODE_LOST");
-      } else if (confirmedOn(node.report.executorId(), file.cacheKey())) {
-        // A confirmed copy on this node already covers the file; no second load is planned.
-        continue;
       } else if (file.estimatedBytes() == null) {
         plan.rejected.put(file.location(), "SIZE_UNKNOWN");
       } else if (node.report.budgetBytes() <= 0) {
         plan.rejected.put(file.location(), "CACHE_DISABLED");
       } else {
+        List<Holder> holders = holdersOfKey(file.cacheKey());
+        if (!holders.isEmpty()
+            && holders.stream().noneMatch(holder -> holder.executorId().equals(executorId))) {
+          plan.migrationTargets.put(file.location(), executorId);
+          plan.migrationSources.put(file.cacheKey(), holders.get(0));
+        }
         enqueue(
             plan,
             node,
@@ -1138,7 +1179,7 @@ final class IndexResidencyCoordinator {
         }
 
         if (lessOccupied(node, holderNode)) {
-          if (hasRoomForSecondCopy(node, file)) {
+          if (hasRoomForSecondCopy(node, file, index.indexUuid)) {
             if (destination == null || lessOccupied(node, destination)) {
               destination = node;
             }
@@ -1184,12 +1225,22 @@ final class IndexResidencyCoordinator {
 
   /** Occupancy used for comparisons; the planner charges the same two fields. */
   private long occupied(NodeState node) {
-    return Math.addExact(node.report.usedBytes(), node.reservedBytes());
+    return node.effective(null);
   }
 
-  private boolean hasRoomForSecondCopy(NodeState node, IndexCacheProtocol.File file) {
-    long free = node.report.budgetBytes() - occupied(node);
-    return free >= file.estimatedBytes();
+  private boolean hasRoomForSecondCopy(
+      NodeState node, IndexCacheProtocol.File file, String indexUuid) {
+    ExecutorIndexCache.Shape before = node.projected(null);
+    if (before == null) {
+      return false;
+    }
+    try {
+      ExecutorIndexCache.ChargeSnapshot after =
+          before.projectAdmission(indexUuid, Long.MAX_VALUE, List.of(file)).charge();
+      return Math.addExact(after.usedBytes(), after.reservedBytes()) <= node.report.budgetBytes();
+    } catch (RuntimeException e) {
+      return false;
+    }
   }
 
   /** Releases the previous node's copy of a migrated file once the replacement is confirmed. */
@@ -1307,20 +1358,32 @@ final class IndexResidencyCoordinator {
         continue;
       }
 
-      Long bytes = bytesOfPending(pending, rejection.getKey());
-      if (bytes == null) {
+      IndexCacheProtocol.File file =
+          pending.stream()
+              .filter(candidate -> candidate.location().equals(rejection.getKey()))
+              .findFirst()
+              .orElse(null);
+      if (file == null) {
         continue;
       }
-
       for (NodeState node : nodes.values()) {
-        long budget = node.report.budgetBytes();
-        if (budget <= 0 || bytes > budget) {
+        ExecutorIndexCache.Shape before = node.projected(null);
+        if (before == null || node.report.budgetBytes() <= 0) {
           continue;
         }
-
-        long free = budget - node.report.usedBytes() - node.report.reservedBytes();
-        if (free < bytes) {
-          deficits.merge(node.report.executorId(), bytes - free, Math::max);
+        try {
+          ExecutorIndexCache.ChargeSnapshot after =
+              before
+                  .projectAdmission(placement.indexUuid(), Long.MAX_VALUE, List.of(file))
+                  .charge();
+          long excess =
+              Math.addExact(after.usedBytes(), after.reservedBytes()) - node.report.budgetBytes();
+          if (excess > 0) {
+            deficits.merge(node.report.executorId(), excess, Math::max);
+          }
+        } catch (RuntimeException e) {
+          // An unknown shape cannot establish a reclaimable capacity gap.
+          continue;
         }
       }
     }
@@ -1339,13 +1402,21 @@ final class IndexResidencyCoordinator {
   }
 
   private boolean canFree(IndexState victim, Map<String, Long> deficits) {
-    Map<String, Long> reclaimable = new LinkedHashMap<>();
+    Map<String, Set<String>> keysByNode = new LinkedHashMap<>();
     for (Holder holder : holders(victim.indexUuid)) {
-      reclaimable.merge(holder.executorId(), holder.bytes(), Long::sum);
+      keysByNode
+          .computeIfAbsent(holder.executorId(), ignored -> new LinkedHashSet<>())
+          .add(holder.cacheKey());
     }
-
     for (Map.Entry<String, Long> deficit : deficits.entrySet()) {
-      if (reclaimable.getOrDefault(deficit.getKey(), 0L) >= deficit.getValue()) {
+      NodeState node = nodes.get(deficit.getKey());
+      ExecutorIndexCache.Shape before = node == null ? null : node.report.metadataShape();
+      Set<String> keys = keysByNode.getOrDefault(deficit.getKey(), Set.of());
+      if (before != null
+          && before.charge().known()
+          && before.charge().usedBytes()
+                  - before.releaseKeys(victim.indexUuid, keys).charge().usedBytes()
+              >= deficit.getValue()) {
         return true;
       }
     }
@@ -1549,7 +1620,8 @@ final class IndexResidencyCoordinator {
   private List<IndexCacheProtocol.NodeReport> reports() {
     List<IndexCacheProtocol.NodeReport> reports = new ArrayList<>();
     for (NodeState node : nodes.values()) {
-      reports.add(node.report.copy().reservedBytes(node.reservedBytes()).build());
+      ExecutorIndexCache.Shape projected = node.projected(null);
+      reports.add(node.report.copy().metadataShape(projected).build());
     }
 
     return reports;
@@ -1562,18 +1634,7 @@ final class IndexResidencyCoordinator {
   private List<IndexCacheProtocol.NodeReport> reportsFor(String planId) {
     List<IndexCacheProtocol.NodeReport> reports = new ArrayList<>();
     for (NodeState node : nodes.values()) {
-      // reservedBytesFor is a subset of reservedBytes, so this is non-negative; clamp anyway so a
-      // silent overflow cannot turn into a negative occupancy that hides a capacity problem.
-      long others = Math.max(0, node.reservedBytes() - node.reservedBytesFor(planId));
-
-      // Occupancy includes retained copies plus every other plan's unresolved promise; the
-      // planner adds this plan's own placements to that baseline.
-      reports.add(
-          node.report
-              .copy()
-              .usedBytes(Math.addExact(node.report.usedBytes(), others))
-              .reservedBytes(0)
-              .build());
+      reports.add(node.report.copy().metadataShape(node.projected(planId)).build());
     }
 
     return reports;
@@ -1705,13 +1766,21 @@ final class IndexResidencyCoordinator {
    * migration releases the same key elsewhere, so matching by key alone would hide a live copy.
    */
   private void forgetCopy(
-      String cacheKey, String executorId, String incarnation, String releasesCommandId) {
+      String cacheKey,
+      String executorId,
+      String incarnation,
+      String releasesCommandId,
+      String indexUuid,
+      long epoch) {
     for (PlanState plan : plans.values()) {
+      if (!plan.indexUuid.equals(indexUuid)) {
+        continue;
+      }
       PlanFile copy = plan.loaded.get(cacheKey);
       if (copy != null
           && copy.executorId.equals(executorId)
           && copy.incarnation.equals(incarnation)
-          && (releasesCommandId == null || releasesCommandId.equals(copy.commandId))) {
+          && copy.epoch <= epoch) {
         plan.loaded.remove(cacheKey);
       }
     }
@@ -1878,9 +1947,35 @@ final class IndexResidencyCoordinator {
       Map<String, String> uncovered,
       List<String> evicted,
       Map<String, String> releasePending) {
-    long resident = 0;
+    Map<String, Set<String>> keysByNode = new LinkedHashMap<>();
     for (PlanFile loaded : plan.loaded.values()) {
-      resident = Math.addExact(resident, loaded.bytes);
+      NodeState node = nodes.get(loaded.executorId);
+      if (node != null && node.report.incarnation().equals(loaded.incarnation)) {
+        keysByNode
+            .computeIfAbsent(loaded.executorId, ignored -> new LinkedHashSet<>())
+            .add(loaded.cacheKey);
+      }
+    }
+    if (plan.offload) {
+      for (PlanFile command : plan.commands.values()) {
+        NodeState node = nodes.get(command.executorId);
+        if (command.type == IndexCacheProtocol.CommandType.RELEASE
+            && node != null
+            && node.report.incarnation().equals(command.incarnation)) {
+          keysByNode
+              .computeIfAbsent(command.executorId, ignored -> new LinkedHashSet<>())
+              .add(command.cacheKey);
+        }
+      }
+    }
+    long resident = 0;
+    for (Map.Entry<String, Set<String>> entry : keysByNode.entrySet()) {
+      ExecutorIndexCache.Shape shape = nodes.get(entry.getKey()).report.metadataShape();
+      if (shape == null || !shape.charge().known()) {
+        resident = -1;
+        break;
+      }
+      resident = Math.addExact(resident, shape.residentBytes(entry.getValue()));
     }
 
     return IndexCacheProtocol.Result.builder()

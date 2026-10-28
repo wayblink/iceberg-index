@@ -153,9 +153,11 @@ class TestIndexCacheReadContext {
           .write(io.newOutputFile(location), List.of(IndexBlob.of(adapter.entryBlobType(), bytes)));
       ExecutorIndexCache cache = ExecutorIndexCache.get();
       cache.clear();
-      ExecutorIndexCache.Config config = ExecutorIndexCache.Config.of(true, 10_000);
+      ExecutorIndexCache.Config config =
+          ExecutorIndexCache.Config.of(true, 10_000).withOwner("table");
       String key =
-          DistributedIndexSearch.cacheKey("", DistributedIndexSearch.adapterKey(adapter), location);
+          DistributedIndexSearch.cacheKey(
+              "table", DistributedIndexSearch.adapterKey(adapter), location);
       try {
         ExecutorIndexCache.CachedFile warm =
             cache.file(
@@ -163,6 +165,7 @@ class TestIndexCacheReadContext {
                 config,
                 DistributedIndexSearch.adapterKey(adapter),
                 () -> DistributedIndexSearch.loadFile(io, location, adapter));
+        cache.applyTarget("index", 1, Set.of(key));
         long charged = cache.stats().bytes();
         reads.set(0);
         IndexFileMemory memory = adapter.encodeEntriesWithMemory(List.of()).memory();
@@ -183,6 +186,7 @@ class TestIndexCacheReadContext {
                     IndexCacheProtocol.File.builder()
                         .location(location)
                         .cacheKey(key)
+                        .owner("table")
                         .estimatedBytes(IndexCacheMemory.residentBytes(memory))
                         .memory(memory)
                         .build())
@@ -282,9 +286,10 @@ class TestIndexCacheReadContext {
           .write(io.newOutputFile(location), List.of(IndexBlob.of(adapter.entryBlobType(), bytes)));
       ExecutorIndexCache cache = ExecutorIndexCache.get();
       cache.clear();
-      ExecutorIndexCache.Config config = ExecutorIndexCache.Config.of(true, 10_000);
+      ExecutorIndexCache.Config config =
+          ExecutorIndexCache.Config.of(true, 10_000).withOwner("table");
       String adapterKey = DistributedIndexSearch.adapterKey(adapter);
-      String key = DistributedIndexSearch.cacheKey("", adapterKey, location);
+      String key = DistributedIndexSearch.cacheKey("table", adapterKey, location);
       try {
         ExecutorIndexCache.CachedFile warm =
             cache.file(
@@ -324,6 +329,7 @@ class TestIndexCacheReadContext {
                       IndexCacheProtocol.File.builder()
                           .location(location)
                           .cacheKey(key)
+                          .owner("table")
                           .estimatedBytes(IndexCacheMemory.residentBytes(memory))
                           .memory(memory)
                           .build())
