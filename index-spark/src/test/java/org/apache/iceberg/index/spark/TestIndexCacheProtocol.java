@@ -43,8 +43,8 @@ class TestIndexCacheProtocol {
       IndexFileMemory.builder()
           .fileBytes(2_048L)
           .payloadBytes(1_024L)
-          .preparedBytes(512L)
-          .modelVersion(1)
+          .preparedBytes(2_448L)
+          .modelVersion(2)
           .readerId("vector/hnswlib/1")
           .runtimeProfile("reference-bytes=4;alignment=8")
           .structure(Map.of("entries", 100L))
@@ -63,8 +63,8 @@ class TestIndexCacheProtocol {
     assertThat(copy.estimatedBytes()).isEqualTo(2_560L);
     assertThat(copy.memory()).isNotNull();
     assertThat(copy.memory().fileBytes()).isEqualTo(2_048L);
-    assertThat(copy.memory().preparedBytes()).isEqualTo(512L);
-    assertThat(copy.memory().modelVersion()).isEqualTo(1);
+    assertThat(copy.memory().preparedBytes()).isEqualTo(2_448L);
+    assertThat(copy.memory().modelVersion()).isEqualTo(2);
     assertThat(copy.memory().readerId()).isEqualTo("vector/hnswlib/1");
     assertThat(copy.memory().structure()).containsEntry("entries", 100L);
     assertThat(readPayload(copy.payload())).isEqualTo("payload");

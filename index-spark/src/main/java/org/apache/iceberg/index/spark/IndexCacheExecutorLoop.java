@@ -105,7 +105,13 @@ final class IndexCacheExecutorLoop implements AutoCloseable {
       }
 
       IndexCacheProtocol.NodeReport report =
-          worker.report("", ++sequence, budgetBytes, worker.reservedBytes(), 0L, Map.of());
+          worker.report(
+              IndexCacheMemory.runtimeIdentity(),
+              ++sequence,
+              budgetBytes,
+              worker.reservedBytes(),
+              0L,
+              Map.of());
       Object response = channel.ask(report);
       if (!(response instanceof IndexCacheProtocol.Reply reply)) {
         return;

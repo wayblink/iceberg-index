@@ -41,12 +41,13 @@ class TestExecutorIndexCacheWorker {
   private static final String EXECUTOR = "executor-1";
   private static final String INCARNATION = "executor-1#1";
   private static final IndexDefinition DEFINITION = new VectorDefinition(3);
+  private static final long FILE_BYTES = 152L;
   private static final IndexFileMemory MEMORY =
       IndexFileMemory.builder()
           .fileBytes(80L)
           .payloadBytes(80L)
           .preparedBytes(40L)
-          .modelVersion(1)
+          .modelVersion(2)
           .readerId("vector/hnswlib/1")
           .runtimeProfile("reference-bytes=4")
           .structure(Map.of("entries", 10L))
@@ -255,7 +256,7 @@ class TestExecutorIndexCacheWorker {
     assertThat(report.session()).isEqualTo(SESSION);
     assertThat(report.executorId()).isEqualTo(EXECUTOR);
     assertThat(report.incarnation()).isEqualTo(INCARNATION);
-    assertThat(report.holders()).containsEntry("adapter|A|f1", 120L);
+    assertThat(report.holders()).containsEntry("adapter|A|f1", FILE_BYTES);
     assertThat(report.accessAgeNanos()).containsEntry("A", 5_000L);
   }
 
@@ -431,7 +432,7 @@ class TestExecutorIndexCacheWorker {
             EXECUTOR,
             INCARNATION,
             cache,
-            // Only 100 bytes of budget: the 120-byte file cannot be admitted right now.
+            // Only 100 bytes of budget: this prepared-state charge cannot be admitted now.
             ExecutorIndexCache.Config.of(true, 100L),
             countingLoader(),
             IndexCacheWorkerConfig.parse(Map.of()));
@@ -452,7 +453,7 @@ class TestExecutorIndexCacheWorker {
             EXECUTOR,
             INCARNATION,
             cache,
-            ExecutorIndexCache.Config.of(true, 130L),
+            ExecutorIndexCache.Config.of(true, FILE_BYTES + 10),
             countingLoader(),
             IndexCacheWorkerConfig.parse(Map.of()));
 
@@ -608,7 +609,7 @@ class TestExecutorIndexCacheWorker {
     return IndexCacheProtocol.File.builder()
         .location(location)
         .cacheKey("adapter|" + indexUuid + "|" + location)
-        .estimatedBytes(120L)
+        .estimatedBytes(FILE_BYTES)
         .memory(MEMORY)
         .build();
   }
@@ -628,7 +629,7 @@ class TestExecutorIndexCacheWorker {
             return 40L;
           }
         },
-        120L);
+        FILE_BYTES);
   }
 
   private ExecutorIndexCacheWorker.Loader countingLoader() {

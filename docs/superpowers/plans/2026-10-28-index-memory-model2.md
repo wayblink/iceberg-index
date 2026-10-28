@@ -35,7 +35,7 @@ under the License.
 - C当前IVF的P为独立对象图S，不人为长期保留已解码的U；D才持U+M，届时必须完整记U及数组头。HNSW图/映射、FLAT entries/字节分别按实际引用计算。
 - 保持payload编码/manifest格式，不重建旧索引、不强制重写旧manifest。保留IndexBlob/IndexEntry公开复制合同。
 - 不新增public接口、配置或依赖，不改默认值，不重写BM25统计、图算法或调度策略。现有默认prepare方法内部实现可修改，签名不变。
-- model=2的P包含自有数组，不含已释放外部输入/query scratch。C/U长度仅诊断；固定JVM布局的结构估计不是精确retained heap实测。
+- model=2的P包含自有数组，不含已释放外部输入/query scratch。C/U长度仅诊断；固定JVM布局的结构估计不是精确retained heap实测。当前vector实现只对检测通过的HotSpot17/64bit/压缩引用及class pointers/8字节对齐/compact strings给known估计；HNSW还限定已确认的hnswlib1.1.0与Eclipse容器表示，不支持时null/0表示unknown。
 - 数组按身份去重，slice保留完整backing必须完整计费；未知不能填0，managed不得把未知当可装下。
 - plain的≥30%适用范围尚未调整，本计划不改收益门槛；E使用同基底配对，不把B14f7到当前main的无关差异归因C。
 
@@ -113,7 +113,7 @@ under the License.
 ./gradlew -DsparkVersions=3.5 -DscalaVersion=2.12 :iceberg-core:test --tests org.apache.iceberg.index.TestIndexBuildResult
 ./gradlew -DsparkVersions=3.5 -DscalaVersion=2.12 :iceberg-core:test --tests 'org.apache.iceberg.index.*'
 ./gradlew -DsparkVersions=3.5 -DscalaVersion=2.12 :iceberg-index-vector:test :iceberg-index-spark:test :iceberg-index-text:test
-./gradlew -DsparkVersions=3.5 -DscalaVersion=2.12 spotlessCheck revApiCheck
+./gradlew -DsparkVersions=3.5 -DscalaVersion=2.12 spotlessCheck :iceberg-core:revapi :iceberg-api:revapi
 ```
 
 Expected：测试实际执行且XML 0 failures/errors；编译失败不算行为RED，缺测/跳过明确记录。初始新树89+271+6=366测试通过仅作前置基线，不代表本计划完成。

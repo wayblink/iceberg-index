@@ -22,9 +22,12 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 import java.io.IOException;
+import java.lang.reflect.Field;
+import java.lang.reflect.Modifier;
 import java.nio.ByteBuffer;
 import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.IdentityHashMap;
 import java.util.List;
 import java.util.Map;
 import org.apache.iceberg.TestTables.LocalFileIO;
@@ -56,18 +59,106 @@ class TestIndexCacheMemory {
   }
 
   @Test
-  void unknownContainerLengthCannotBecomeFreeCapacity() {
-    IndexFileMemory memory = memory(null, 7, 11);
-    assertThatThrownBy(() -> IndexCacheMemory.residentBytes(memory))
-        .isInstanceOf(IllegalArgumentException.class)
-        .hasMessageContaining("container length");
+  void independentPreparedStateDoesNotRetainContainer() throws ReflectiveOperationException {
+    byte[] container = new byte[20_000];
+    byte[] state = new byte[] {10};
+    IndexAdapter.PreparedSearch prepared =
+        new IndexAdapter.PreparedSearch() {
+          @Override
+          public List<IndexSearchResult> search(ByteBuffer query, int topK) {
+            return List.of(IndexSearchResult.of("data", 7, state[0]));
+          }
+
+          @Override
+          public long estimatedBytes() {
+            return 80;
+          }
+        };
+    ExecutorIndexCache.CachedFile loaded = ExecutorIndexCache.loaded(container, prepared);
+    assertThat(reachable(loaded, container, new IdentityHashMap<>())).isFalse();
+    assertThat(reachable(loaded, state, new IdentityHashMap<>())).isTrue();
+    List<IndexSearchResult> results =
+        loaded.searching(searcher -> searcher.search(ByteBuffer.allocate(0), 1));
+    assertThat(results).extracting(IndexSearchResult::score).containsExactly(10.0);
+    assertThat(loaded.bytes()).isGreaterThanOrEqualTo(80).isLessThan(1_024);
   }
 
   @Test
-  void containerConversionChecksOverflow() {
-    IndexFileMemory memory = memory(Long.MAX_VALUE, 7, 11);
-    assertThatThrownBy(() -> IndexCacheMemory.residentBytes(memory))
-        .isInstanceOf(ArithmeticException.class);
+  void releasedInputSizeDoesNotChangePreparedCharge() {
+    IndexAdapter.PreparedSearch prepared =
+        new IndexAdapter.PreparedSearch() {
+          @Override
+          public List<IndexSearchResult> search(ByteBuffer query, int topK) {
+            return List.of();
+          }
+
+          @Override
+          public long estimatedBytes() {
+            return 80;
+          }
+        };
+    assertThat(ExecutorIndexCache.loaded(new byte[20_000], prepared).bytes())
+        .isEqualTo(ExecutorIndexCache.loaded(new byte[100], prepared).bytes());
+  }
+
+  private static boolean reachable(
+      Object root, Object target, IdentityHashMap<Object, Boolean> seen)
+      throws ReflectiveOperationException {
+    if (root == target) {
+      return true;
+    }
+    if (root == null || seen.put(root, true) != null) {
+      return false;
+    }
+    if (root instanceof Object[] values) {
+      for (Object value : values) {
+        if (reachable(value, target, seen)) {
+          return true;
+        }
+      }
+      return false;
+    }
+    // Inspect only Iceberg-owned objects; no JDK module opening or GC-dependent assertions.
+    if (!root.getClass().getName().startsWith("org.apache.iceberg.")) {
+      return false;
+    }
+    for (Class<?> type = root.getClass(); type != Object.class; type = type.getSuperclass()) {
+      for (Field field : type.getDeclaredFields()) {
+        if (!Modifier.isStatic(field.getModifiers()) && !field.getType().isPrimitive()) {
+          field.setAccessible(true);
+          if (reachable(field.get(root), target, seen)) {
+            return true;
+          }
+        }
+      }
+    }
+    return false;
+  }
+
+  @Test
+  void unknownMemoryCannotBecomeFreeCapacity() {
+    assertThatThrownBy(() -> IndexCacheMemory.residentBytes(null))
+        .isInstanceOf(IllegalArgumentException.class)
+        .hasMessageContaining("memory is unknown");
+  }
+
+  @Test
+  void diagnosticContainerLengthDoesNotOverflowResident() {
+    IndexFileMemory memory = memory(Long.MAX_VALUE, 7, 80).toBuilder().modelVersion(2).build();
+    assertThat(IndexCacheMemory.residentBytes(memory)).isGreaterThanOrEqualTo(80).isLessThan(1_024);
+  }
+
+  @Test
+  void knownPreparedChargeDoesNotRequireContainerLength() {
+    IndexFileMemory memory = memory(null, 7, 80).toBuilder().modelVersion(2).build();
+    assertThat(IndexCacheMemory.residentBytes(memory)).isGreaterThanOrEqualTo(80).isLessThan(1_024);
+  }
+
+  @Test
+  void legacyMemoryIsNotUsedAsCurrentCapacity() {
+    assertThatThrownBy(() -> IndexCacheMemory.residentBytes(memory(7L, 7, 80)))
+        .isInstanceOf(IllegalArgumentException.class)
+        .hasMessageContaining("memory model");
   }
 
   @Test
@@ -108,7 +199,7 @@ class TestIndexCacheMemory {
     "IVF,NONE,none", "IVF,NONE,zstd",
     "IVF,RABITQ,none", "IVF,RABITQ,zstd"
   })
-  void manifestEstimateMatchesRetainedContainerCharge(
+  void manifestEstimateMatchesIndependentPreparedCharge(
       VectorStructure structure, VectorQuantizer quantizer, String codec, @TempDir Path tempDir)
       throws IOException {
     VectorIndexAdapter adapter =
@@ -152,9 +243,8 @@ class TestIndexCacheMemory {
         IndexFile file = published.get(0);
         ExecutorIndexCache.CachedFile loaded =
             DistributedIndexSearch.loadFile(fileIO, file.location(), adapter);
-        long containerBytes = fileIO.newInputFile(file.location()).getLength();
-        long expected = containerBytes + file.memory().preparedBytes();
-        assertThat(loaded.payload()).hasSize(Math.toIntExact(containerBytes));
+        long expected = file.memory().preparedBytes() + 112;
+        assertThat(file.memory().modelVersion()).isEqualTo(2);
         assertThat(loaded.bytes()).isEqualTo(expected);
         long planned = IndexCacheMemory.residentBytes(file.memory());
         assertThat(planned).isEqualTo(expected);

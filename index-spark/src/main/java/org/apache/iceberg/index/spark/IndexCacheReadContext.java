@@ -20,6 +20,7 @@ package org.apache.iceberg.index.spark;
 
 import org.apache.iceberg.index.IndexAdapter;
 import org.apache.iceberg.index.IndexTypes;
+import org.apache.iceberg.relocated.com.google.common.base.Preconditions;
 
 /**
  * Reads and prepares one index file on the executor, using the read context the command carries.
@@ -30,6 +31,16 @@ final class IndexCacheReadContext implements ExecutorIndexCacheWorker.Loader {
   public ExecutorIndexCache.CachedFile load(IndexCacheProtocol.Command command) {
     IndexAdapter adapter =
         IndexTypes.fromType(command.definition().type()).createAdapter(command.definition());
-    return DistributedIndexSearch.loadFile(command.io(), command.file().location(), adapter);
+    Preconditions.checkArgument(
+        IndexCacheMemory.compatible(command.file().memory(), adapter),
+        "Index memory model, reader or runtime profile is incompatible: %s",
+        command.file().location());
+    DistributedIndexSearch.LoadedFile loaded =
+        DistributedIndexSearch.loadFileState(command.io(), command.file().location(), adapter);
+    Preconditions.checkArgument(
+        loaded.preparedBytes() > 0,
+        "Index prepared memory is unknown: %s",
+        command.file().location());
+    return loaded.file();
   }
 }

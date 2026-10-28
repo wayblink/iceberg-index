@@ -52,7 +52,7 @@ class TestExecutorIndexCache {
     for (int i = 0; i < 3; i++) {
       ExecutorIndexCache.CachedFile file =
           cache.file("s3://bucket/index-a.puffin", enabled, "adapter", () -> load(loads, 100));
-      assertThat(file.payload()).hasSize(100);
+      assertThat(file.bytes()).isEqualTo(100);
     }
 
     assertThat(loads).hasValue(1);

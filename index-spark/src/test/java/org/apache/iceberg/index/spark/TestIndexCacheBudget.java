@@ -28,6 +28,24 @@ class TestIndexCacheBudget {
   private static final long GB = 1024L * MB;
 
   @Test
+  void unknownWorkingSetUsesOpportunisticAdmission() {
+    assertThat(ExecutorIndexCache.Config.mode("auto", -1, 100, 1))
+        .isEqualTo(ExecutorIndexCache.Mode.PIN_HOT);
+  }
+
+  @Test
+  void totalCapacityOverflowDoesNotDisableCaching() {
+    assertThat(ExecutorIndexCache.Config.mode("auto", Long.MAX_VALUE, Long.MAX_VALUE / 2, 3))
+        .isEqualTo(ExecutorIndexCache.Mode.PIN_ALL);
+  }
+
+  @Test
+  void doubledCapacityOverflowDoesNotDisableCaching() {
+    assertThat(ExecutorIndexCache.Config.mode("auto", Long.MAX_VALUE, Long.MAX_VALUE / 2 + 1, 1))
+        .isEqualTo(ExecutorIndexCache.Mode.PIN_HOT);
+  }
+
+  @Test
   void derivesABudgetThatHoldsTheWholeWorkingSetOnEveryExecutor() {
     // a search can be sent to any executor, so the budget has to hold every file rather than an
     // even slice of them: a budget of one executor's share read 33 of 39 files, because the files

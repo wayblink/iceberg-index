@@ -18,23 +18,211 @@
  */
 package org.apache.iceberg.index.spark;
 
+import java.io.ByteArrayOutputStream;
+import java.io.IOException;
+import java.io.ObjectOutputStream;
+import java.io.UncheckedIOException;
+import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
+import java.util.HexFormat;
+import java.util.List;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
+import org.apache.iceberg.index.IndexAdapter;
+import org.apache.iceberg.index.IndexBuildResult;
+import org.apache.iceberg.index.IndexFile;
 import org.apache.iceberg.index.IndexFileMemory;
+import org.apache.iceberg.io.FileIO;
 import org.apache.iceberg.relocated.com.google.common.base.Preconditions;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
-/** Converts compatible blob-build estimates to the executor's retained-container cache charge. */
+/** Converts prepared-state estimates to a cache-entry charge under the current memory model. */
 final class IndexCacheMemory {
+  // Model 2 uses 16-byte object headers, 4-byte references and 8-byte alignment. The entry
+  // retains its own object (56 bytes), a ReentrantLock (24) and its empty synchronizer (32).
+  // Lock waiters exist only while queries are active and are not resident index state.
+  private static final long ENTRY_BYTES = 112;
+  private static final int MAX_ESTIMATES = 100_000;
+  private static final Logger LOG = LoggerFactory.getLogger(IndexCacheMemory.class);
+  private static final Map<ContextKey, IndexFileMemory> DESCRIPTORS = new ConcurrentHashMap<>();
+  private static final Map<EstimateKey, IndexFileMemory> ESTIMATES = new ConcurrentHashMap<>();
+
+  private record ContextKey(Class<?> adapterType, String definition, String vm, int processors) {}
+
+  private record EstimateKey(
+      ContextKey context,
+      String location,
+      IndexFile.Kind kind,
+      String blobType,
+      long entries,
+      IndexFileMemory declared,
+      int model,
+      String reader,
+      String profile) {}
+
   private IndexCacheMemory() {}
 
-  /** Requires a matching reader model/runtime profile and a known container length. */
+  /** Container and encoded payload lengths are diagnostic, not additional retained buffers. */
   static long residentBytes(IndexFileMemory memory) {
     Preconditions.checkArgument(memory != null, "Index file memory is unknown");
-    Preconditions.checkArgument(memory.fileBytes() != null, "Index container length is unknown");
-    // The whole Puffin file replaces the blob buffer; both buffers are not charged together.
-    return residentBytes(memory.fileBytes(), memory.preparedBytes());
+    Preconditions.checkArgument(
+        memory.modelVersion() == 2, "Unsupported index memory model: %s", memory.modelVersion());
+    Preconditions.checkArgument(memory.preparedBytes() > 0, "Index prepared memory is unknown");
+    return Math.addExact(memory.preparedBytes(), ENTRY_BYTES);
   }
 
-  static long residentBytes(long retainedBufferBytes, long preparedBytes) {
-    return Math.addExact(
-        retainedBufferBytes, preparedBytes > 0 ? preparedBytes : retainedBufferBytes);
+  /** Resolves a file under this reader and runtime, or leaves its capacity explicitly unknown. */
+  static Long resolve(FileIO io, IndexFile file, IndexAdapter adapter) {
+    IndexFileMemory memory = resolveMemory(io, file, adapter);
+    return memory == null ? null : residentBytes(memory);
+  }
+
+  /** Re-estimation never pairs a current charge with the old manifest's model or profile. */
+  static IndexFileMemory resolveMemory(FileIO io, IndexFile file, IndexAdapter adapter) {
+    try {
+      ContextKey context = contextKey(adapter);
+      IndexFileMemory descriptor = descriptor(adapter, context);
+      if (descriptor == null || descriptor.modelVersion() != 2) {
+        return null;
+      }
+
+      EstimateKey key =
+          new EstimateKey(
+              context,
+              file.location(),
+              file.kind(),
+              file.blobType(),
+              file.entryCount(),
+              file.memory(),
+              descriptor.modelVersion(),
+              descriptor.readerId(),
+              descriptor.runtimeProfile());
+      IndexFileMemory known = ESTIMATES.get(key);
+      if (known != null) {
+        return known;
+      }
+
+      // Initial migration deliberately reads and prepares the complete file. Matching metadata
+      // is not yet a substitute for validating the representation this runtime actually holds.
+      DistributedIndexSearch.LoadedFile loaded =
+          DistributedIndexSearch.loadFileState(io, file.location(), adapter);
+      if (loaded.preparedBytes() <= 0) {
+        return null;
+      }
+
+      IndexFileMemory memory =
+          IndexFileMemory.builder()
+              .fileBytes(loaded.fileBytes())
+              .payloadBytes(loaded.payloadBytes())
+              .preparedBytes(loaded.preparedBytes())
+              .modelVersion(descriptor.modelVersion())
+              .readerId(descriptor.readerId())
+              .runtimeProfile(descriptor.runtimeProfile())
+              .build();
+      residentBytes(memory);
+      if (ESTIMATES.size() < MAX_ESTIMATES) {
+        ESTIMATES.putIfAbsent(key, memory);
+      }
+      return memory;
+    } catch (RuntimeException e) {
+      LOG.debug("Index capacity is unknown for {} under the current reader", file.location(), e);
+      return null;
+    }
+  }
+
+  /** Uses the existing codec SPI rather than adding a public memory-model descriptor interface. */
+  private static IndexFileMemory descriptor(IndexAdapter adapter, ContextKey context) {
+    IndexFileMemory known = DESCRIPTORS.get(context);
+    if (known != null) {
+      return known;
+    }
+
+    IndexBuildResult built =
+        adapter.writesAuxiliaryFiles()
+            ? adapter.encodeAuxiliaryPayloadWithMemory(List.of(), 1)
+            : adapter.encodeEntriesWithMemory(List.of());
+    IndexFileMemory memory = built.memory();
+    if (memory != null && memory.modelVersion() == 2 && DESCRIPTORS.size() < MAX_ESTIMATES) {
+      DESCRIPTORS.putIfAbsent(context, memory);
+    }
+    return memory;
+  }
+
+  static boolean compatible(IndexFileMemory memory, IndexAdapter adapter) {
+    if (memory == null || memory.modelVersion() != 2) {
+      return false;
+    }
+    try {
+      IndexFileMemory descriptor = descriptor(adapter, contextKey(adapter));
+      return descriptor != null
+          && memory.modelVersion() == descriptor.modelVersion()
+          && memory.readerId().equals(descriptor.readerId())
+          && memory.runtimeProfile().equals(descriptor.runtimeProfile());
+    } catch (RuntimeException e) {
+      return false;
+    }
+  }
+
+  static String runtimeIdentity() {
+    return "vm="
+        + System.getProperty("java.vm.name")
+        + ";version="
+        + System.getProperty("java.vm.version")
+        + ";processors="
+        + Runtime.getRuntime().availableProcessors();
+  }
+
+  static String readerKey(IndexAdapter adapter) {
+    try {
+      ContextKey context = contextKey(adapter);
+      IndexFileMemory descriptor = descriptor(adapter, context);
+      String identity = context.definition() + "/" + context.vm() + "/" + context.processors();
+      if (descriptor != null) {
+        identity +=
+            "/"
+                + descriptor.modelVersion()
+                + "/"
+                + descriptor.readerId()
+                + "/"
+                + descriptor.runtimeProfile();
+      }
+      return HexFormat.of()
+          .formatHex(
+              MessageDigest.getInstance("SHA-256")
+                  .digest(identity.getBytes(StandardCharsets.UTF_8)));
+    } catch (RuntimeException | NoSuchAlgorithmException e) {
+      // Unidentifiable legacy readers cannot share a prepared state across adapter instances.
+      return "unknown-" + Integer.toHexString(System.identityHashCode(adapter));
+    }
+  }
+
+  private static ContextKey contextKey(IndexAdapter adapter) {
+    try {
+      ByteArrayOutputStream bytes = new ByteArrayOutputStream();
+      try (ObjectOutputStream out = new ObjectOutputStream(bytes)) {
+        out.writeObject(adapter.definition());
+      }
+      String definition =
+          HexFormat.of()
+              .formatHex(MessageDigest.getInstance("SHA-256").digest(bytes.toByteArray()));
+      return new ContextKey(
+          adapter.getClass(),
+          definition,
+          System.getProperty("java.vm.name") + "/" + System.getProperty("java.vm.version"),
+          Runtime.getRuntime().availableProcessors());
+    } catch (IOException e) {
+      throw new UncheckedIOException("Cannot identify the index definition for capacity", e);
+    } catch (NoSuchAlgorithmException e) {
+      throw new IllegalStateException("SHA-256 is unavailable", e);
+    }
+  }
+
+  /** A missing prepared estimate retains the explicitly inexact legacy sizing fallback. */
+  static long residentBytes(long inputBytes, long preparedBytes) {
+    return preparedBytes > 0
+        ? Math.addExact(preparedBytes, ENTRY_BYTES)
+        : Math.multiplyExact(inputBytes, 2);
   }
 }

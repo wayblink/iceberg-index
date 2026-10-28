@@ -46,12 +46,13 @@ class TestIndexCachePlugin {
   private static final String EXECUTOR = "executor-1";
   private static final String INCARNATION = "executor-1#1";
   private static final IndexDefinition DEFINITION = new VectorDefinition(2);
+  private static final long FILE_BYTES = 152L;
   private static final IndexFileMemory MEMORY =
       IndexFileMemory.builder()
           .fileBytes(80L)
           .payloadBytes(60L)
           .preparedBytes(40L)
-          .modelVersion(1)
+          .modelVersion(2)
           .readerId("vector/hnswlib/1")
           .runtimeProfile("reference-bytes=4")
           .structure(Map.of())
@@ -106,7 +107,7 @@ class TestIndexCachePlugin {
             .epoch(command.epoch())
             .sequence(command.sequence())
             .status(IndexCacheProtocol.AckStatus.LOADED)
-            .bytes(120)
+            .bytes(FILE_BYTES)
             .build());
 
     assertThat(coordinator.result(plan).status()).isEqualTo(IndexCacheProtocol.Status.COMPLETE);
@@ -291,7 +292,7 @@ class TestIndexCachePlugin {
             .epoch(command.epoch())
             .sequence(command.sequence())
             .status(IndexCacheProtocol.AckStatus.LOADED)
-            .bytes(120)
+            .bytes(FILE_BYTES)
             .build());
     assertThat(runner.worker.holders()).containsKey("adapter|A|f1");
 
@@ -361,6 +362,23 @@ class TestIndexCachePlugin {
 
   private record IndexCacheRunner(ExecutorIndexCacheWorker worker, IndexCacheExecutorLoop loop) {}
 
+  @Test
+  void controlReportIncludesActualRuntimeIdentity() {
+    List<Object> sent = new ArrayList<>();
+    IndexCacheRunner runner =
+        runner(message -> IndexCacheProtocol.Reply.builder().commands(List.of()).build(), sent);
+    try {
+      runner.loop.pollOnce();
+      assertThat(sent).hasSize(1);
+      IndexCacheProtocol.NodeReport report = (IndexCacheProtocol.NodeReport) sent.get(0);
+      assertThat(report.profile())
+          .contains(System.getProperty("java.vm.name"))
+          .contains("processors=" + Runtime.getRuntime().availableProcessors());
+    } finally {
+      runner.loop.close();
+    }
+  }
+
   private IndexCacheProtocol.NodeReport report(long sequence, long budget, long used) {
     return IndexCacheProtocol.NodeReport.builder()
         .session(SESSION)
@@ -383,7 +401,7 @@ class TestIndexCachePlugin {
                         IndexCacheProtocol.File.builder()
                             .location(location)
                             .cacheKey("adapter|" + indexUuid + "|" + location)
-                            .estimatedBytes(120L)
+                            .estimatedBytes(FILE_BYTES)
                             .memory(MEMORY)
                             .build())
                 .toList())
@@ -406,7 +424,7 @@ class TestIndexCachePlugin {
             return 40L;
           }
         },
-        120L);
+        FILE_BYTES);
   }
 
   private static final class VectorDefinition implements IndexDefinition {

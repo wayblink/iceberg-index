@@ -194,15 +194,24 @@ final class ExecutorIndexCache {
         return Mode.valueOf(configured.trim().toUpperCase(java.util.Locale.ROOT).replace('-', '_'));
       }
 
-      if (workingSetBytes <= 0) {
+      if (workingSetBytes < 0) {
+        // Unknown capacity cannot promise full residency. Legacy queries may still admit a hot
+        // entry using the explicitly inexact per-file fallback; managed loads require a bound.
+        return Mode.PIN_HOT;
+      }
+      if (workingSetBytes == 0) {
         return Mode.PIN_ALL;
       }
 
-      // compared in the same unit as the budget: what the payloads become, not what they weigh
-      long capacity = budgetPerExecutor * Math.max(1, executors);
+      long capacity;
+      try {
+        capacity = Math.multiplyExact(budgetPerExecutor, Math.max(1, executors));
+      } catch (ArithmeticException e) {
+        capacity = Long.MAX_VALUE;
+      }
       if (workingSetBytes <= capacity) {
         return Mode.PIN_ALL;
-      } else if (workingSetBytes <= 2 * capacity) {
+      } else if (workingSetBytes - capacity <= capacity) {
         return Mode.PIN_HOT;
       } else {
         return Mode.STREAM;
@@ -361,7 +370,6 @@ final class ExecutorIndexCache {
   /** One index file as an executor remembers it. */
   static final class CachedFile {
     private final String owner;
-    private final byte[] payload;
     private final IndexAdapter.PreparedSearch prepared;
     private final long bytes;
     private final ReentrantLock searchLock = new ReentrantLock();
@@ -374,16 +382,10 @@ final class ExecutorIndexCache {
     private boolean protectedRank;
     private long lastAccessNanos = System.nanoTime();
 
-    private CachedFile(
-        String owner, byte[] payload, IndexAdapter.PreparedSearch prepared, long bytes) {
+    private CachedFile(String owner, IndexAdapter.PreparedSearch prepared, long bytes) {
       this.owner = owner;
-      this.payload = payload;
       this.prepared = prepared;
       this.bytes = bytes;
-    }
-
-    byte[] payload() {
-      return payload;
     }
 
     /** Runs the body against the prepared structure, with this file's search held exclusively. */
@@ -419,7 +421,7 @@ final class ExecutorIndexCache {
     }
 
     CachedFile withOwner(String newOwner) {
-      return new CachedFile(newOwner, payload, prepared, bytes);
+      return new CachedFile(newOwner, prepared, bytes);
     }
 
     private void touch() {
@@ -1298,30 +1300,33 @@ final class ExecutorIndexCache {
     }
   }
 
-  /** Produces an index file's payload and the structure prepared from it. */
+  /** Produces the independent state prepared from an index file. */
   interface Loader {
     CachedFile load();
   }
 
   /**
-   * An entry whose cost is the payload plus whatever the prepared structure adds to it. A searcher
-   * that expands the payload says so; one that does not is charged the payload twice, once for its
-   * bytes and once for reading them.
+   * Keeps only prepared state. Input bytes contribute to the explicitly inexact legacy fallback
+   * when the searcher cannot report its retained memory, but the cache does not retain that input.
    */
   static CachedFile loaded(byte[] payload, IndexAdapter.PreparedSearch prepared) {
+    return loaded(payload.length, prepared);
+  }
+
+  static CachedFile loaded(long inputBytes, IndexAdapter.PreparedSearch prepared) {
     long preparedBytes = prepared.estimatedBytes();
     if (preparedBytes <= 0) {
       LOG.debug(
           "Index cache size is estimated: prepared structure did not report its size; "
-              + "using {} payload bytes as the fallback",
-          payload.length);
+              + "using {} input bytes as the inexact fallback",
+          inputBytes);
     }
-    long bytes = IndexCacheMemory.residentBytes(payload.length, preparedBytes);
-    return new CachedFile("", payload, prepared, bytes);
+    long bytes = IndexCacheMemory.residentBytes(inputBytes, preparedBytes);
+    return new CachedFile("", prepared, bytes);
   }
 
   static CachedFile loaded(byte[] payload, IndexAdapter.PreparedSearch prepared, long bytes) {
-    return new CachedFile("", payload, prepared, bytes);
+    return new CachedFile("", prepared, bytes);
   }
 
   Set<String> residentKeys() {

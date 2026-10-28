@@ -134,12 +134,7 @@ final class TestIndexFixtures {
   static String cacheKeyFor(IndexMetadata metadata, String fileLocation) {
     VectorIndexAdapter adapter =
         new VectorIndexAdapter((VectorIndexDefinition) metadata.definition());
-    String adapterKey =
-        adapter.getClass().getName()
-            + "|"
-            + (adapter.writesAuxiliaryFiles()
-                ? adapter.auxiliaryBlobType()
-                : adapter.entryBlobType());
+    String adapterKey = DistributedIndexSearch.adapterKey(adapter);
     return metadata.tableLocation() + "|" + adapterKey + "|" + fileLocation;
   }
 }

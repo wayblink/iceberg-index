@@ -71,8 +71,8 @@ class TestExecutorIndexCacheReservations {
     // Check the returned entry and actual resident accounting.
     ExecutorIndexCache.CachedFile loaded = ExecutorIndexCache.loaded(new byte[10], prepared);
     cache.file("a", ExecutorIndexCache.Config.of(true, 1000), "adapter", () -> loaded);
-    assertThat(loaded.bytes()).isEqualTo(80);
-    assertThat(cache.stats().bytes()).isEqualTo(80);
+    assertThat(loaded.bytes()).isEqualTo(182);
+    assertThat(cache.stats().bytes()).isEqualTo(182);
   }
 
   @Test

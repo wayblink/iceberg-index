@@ -22,10 +22,24 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 import java.io.File;
+import java.io.IOException;
 import java.time.Duration;
+import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.atomic.AtomicInteger;
+import org.apache.iceberg.index.IndexFile;
+import org.apache.iceberg.index.IndexFileMemory;
+import org.apache.iceberg.index.IndexManifest;
+import org.apache.iceberg.index.IndexManifestList;
+import org.apache.iceberg.index.vector.VectorIndexAdapter;
+import org.apache.iceberg.index.vector.VectorIndexDefinition;
+import org.apache.iceberg.io.FileIO;
+import org.apache.iceberg.io.InputFile;
+import org.apache.iceberg.io.OutputFile;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 
 class TestIndexCacheControl {
   private static final long BASE = Duration.ofMinutes(10).toNanos();
@@ -429,6 +443,111 @@ class TestIndexCacheControl {
                     control, table, TestIndexFixtures.metadataFor(table, "idx-empty"), "0", BASE))
         .isInstanceOf(IllegalArgumentException.class)
         .hasMessageContaining("snapshot");
+  }
+
+  @Test
+  void readContextRefusesIncompatibleMemoryBeforePayload() {
+    TestIndexFixtures.BuiltIndex built =
+        TestIndexFixtures.build(tempDir, "profile-check", "data.parquet");
+    AtomicInteger reads = new AtomicInteger();
+    FileIO guarded =
+        new FileIO() {
+          @Override
+          public InputFile newInputFile(String path) {
+            reads.incrementAndGet();
+            throw new AssertionError("Incompatible memory must be refused before file IO");
+          }
+
+          @Override
+          public OutputFile newOutputFile(String path) {
+            throw new UnsupportedOperationException();
+          }
+
+          @Override
+          public void deleteFile(String path) {
+            throw new UnsupportedOperationException();
+          }
+        };
+    IndexFileMemory memory =
+        IndexFileMemory.builder()
+            .payloadBytes(1)
+            .preparedBytes(80)
+            .modelVersion(2)
+            .readerId("old-reader")
+            .runtimeProfile("old-runtime")
+            .build();
+    IndexCacheProtocol.Command command =
+        IndexCacheProtocol.Command.builder()
+            .session("session")
+            .executorId("executor")
+            .incarnation("incarnation")
+            .indexUuid("profile-check")
+            .epoch(1)
+            .planId("plan")
+            .commandId("command")
+            .type(IndexCacheProtocol.CommandType.LOAD)
+            .file(
+                IndexCacheProtocol.File.builder()
+                    .location(indexFiles(built).get(0))
+                    .cacheKey("key")
+                    .estimatedBytes(192L)
+                    .memory(memory)
+                    .build())
+            .definition(built.metadata().definition())
+            .io(guarded)
+            .build();
+    assertThatThrownBy(() -> new IndexCacheReadContext().load(command))
+        .isInstanceOf(IllegalArgumentException.class)
+        .hasMessageContaining("memory");
+    assertThat(reads).hasValue(0);
+  }
+
+  @ParameterizedTest
+  @ValueSource(ints = {1, 2, 99})
+  void targetReestimatesIncompatibleManifestMemory(int model) throws IOException {
+    TestIndexFixtures.BuiltIndex built =
+        TestIndexFixtures.build(tempDir, "stale-memory", "data.parquet");
+    String listLocation = built.metadata().snapshots().get(0).indexManifestList();
+    String manifestLocation =
+        IndexManifestList.read(built.table().io().newInputFile(listLocation))
+            .manifests()
+            .get(0)
+            .location();
+    List<IndexFile> rewritten = new ArrayList<>();
+    for (IndexFile file :
+        IndexManifest.read(built.table().io().newInputFile(manifestLocation)).indexFiles()) {
+      rewritten.add(
+          IndexFile.builder()
+              .location(file.location())
+              .kind(file.kind())
+              .blobType(file.blobType())
+              .entryCount(file.entryCount())
+              .coveredDataFiles(file.coveredDataFiles())
+              .memory(
+                  file.memory().toBuilder()
+                      .preparedBytes(1)
+                      .modelVersion(model)
+                      .readerId("old-reader")
+                      .runtimeProfile("old-runtime")
+                      .build())
+              .build());
+    }
+    built.table().io().deleteFile(manifestLocation);
+    IndexManifest.write(built.table().io().newOutputFile(manifestLocation), rewritten);
+
+    VectorIndexAdapter adapter =
+        new VectorIndexAdapter((VectorIndexDefinition) built.metadata().definition());
+    DistributedIndexSearch.LoadedFile loaded =
+        DistributedIndexSearch.loadFileState(
+            built.table().io(), rewritten.get(0).location(), adapter);
+    IndexCacheProtocol.File planned =
+        IndexCacheController.target(built.table(), built.metadata()).files().get(0);
+    assertThat(planned.estimatedBytes()).isEqualTo(loaded.file().bytes());
+    assertThat(planned.memory()).isNotNull();
+    assertThat(planned.memory().modelVersion()).isEqualTo(2);
+    assertThat(planned.memory().preparedBytes()).isEqualTo(loaded.preparedBytes());
+    assertThat(planned.memory().readerId()).isNotEqualTo("old-reader");
+    assertThat(planned.memory().runtimeProfile()).isNotEqualTo("old-runtime");
   }
 
   private static List<String> indexFiles(TestIndexFixtures.BuiltIndex built) {
