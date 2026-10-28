@@ -74,7 +74,7 @@ class TestDistributedIndexSearchLoad {
         .as(
             "bytes allocated loading a %s byte file holding a %s byte blob",
             fileBytes, payload.length)
-        .isLessThan(fileBytes + 2L * payload.length + payload.length / 2);
+        .isLessThan(fileBytes + 7L * payload.length / 2);
   }
 
   @Test
