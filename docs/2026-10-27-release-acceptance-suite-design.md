@@ -171,7 +171,7 @@ case-instance键采用规范化结构而非一个 `case_id`：至少包含case_i
 |---|---|
 | L1.1 | 独立小表每支持kernel新建：IVF-NONE、RaBitQ1/2/3/4bit、HNSW、FLAT，Parquet/Lance适用路径；包含BM25写读。记录built_by_SHA；各自writer与reader往返；旧payload/manifest fixture兼容不要求重建 |
 | L1.2 | CALL↔对应TVF单/批查询INDEX_HITS严格一致，含raw score、顺序、null行；普通SQL TABLE_LIVE_TOPK对同metric真值独立验，精确fixture才比较跨合同共同字段 |
-| L1.3 | 真实行值/JSON正确（null/嵌套/decimal/timestamp/binary、辅助列同名及特殊列名），对照原始独立fixture与正常SELECT，不用同样丢值的旧rowsAt作唯一真值；#2028 regression、#2784值断言保留。嵌套（struct/map/list<struct>）只在 Parquet 上验：Lance 数据文件首版只承载扁平列及其列表，Lance 侧改为断言“建 reader/writer 即清晰拒绝并点名列”（`LanceRowTypes`），不得把拒绝当通过，也不得为凑绿把 case 降级成无嵌套 |
+| L1.3 | 真实行值/JSON正确（null/嵌套/decimal/timestamp/binary、辅助列同名及特殊列名），对照原始独立fixture与正常SELECT，不用同样丢值的旧rowsAt作唯一真值；#2028 regression、#2784值断言保留。嵌套（struct/map/list<struct>）与含点号的字段名只在 Parquet 上验：Lance 数据文件首版只承载扁平列及其列表，且顶层字段名不能含点号（格式按路径解析），Lance 侧改为断言“建 reader/writer 即清晰拒绝并点名列、失败写入不提交任何文件”（`LanceRowTypes`），不得把拒绝当通过，也不得为凑绿把 case 降级成无嵌套或无特殊列名；Lance 仍须用独立 fixture 验它确实承载的扁平值（含空值、decimal、timestamp、binary、带空格列名） |
 | L1.4 | position/equality delete与未覆盖新文件：SQL不含删除行且补残差，CALL/TVF保留missing hit为row=null；快照冻结与并发append/refresh不混读 |
 | L1.5 | 空表、NULL向量、零向量、维度不符、k=0/大于有效行数、同距边界、无索引/多索引歧义、损坏/不兼容payload、失败构建注册清理；检查规定错误或合法回退，不以“不NPE”作为唯一正确性 |
 | L1.6 | offload/重新load与禁用缓存前后，合同各自结果一致；无插件普通查询可用，load/offload按接口明确拒绝 |
