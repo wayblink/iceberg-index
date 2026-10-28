@@ -26,6 +26,7 @@ import java.io.IOException;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Set;
 import java.util.concurrent.atomic.AtomicInteger;
 import org.apache.iceberg.index.IndexFile;
 import org.apache.iceberg.index.IndexFileMemory;
@@ -212,6 +213,10 @@ class TestIndexCacheControl {
                             command.file().estimatedBytes() == null
                                 ? 0
                                 : command.file().estimatedBytes())
+                        .metadataShape(
+                            ExecutorIndexCache.Shape.empty()
+                                .project(
+                                    command.indexUuid(), command.epoch(), List.of(command.file())))
                         .build());
               }
             });
@@ -350,6 +355,9 @@ class TestIndexCacheControl {
             .sequence(command.sequence())
             .status(IndexCacheProtocol.AckStatus.LOADED)
             .bytes(command.file().estimatedBytes())
+            .metadataShape(
+                ExecutorIndexCache.Shape.empty()
+                    .project(command.indexUuid(), command.epoch(), List.of(command.file())))
             .build());
 
     IndexCacheProtocol.Result offload =
@@ -586,17 +594,29 @@ class TestIndexCacheControl {
       IndexCacheProtocol.Command command,
       IndexCacheProtocol.AckStatus status,
       long bytes) {
-    return IndexCacheProtocol.Ack.builder()
-        .session("application-1")
-        .planId(planId)
-        .commandId(command.commandId())
-        .executorId(executorId)
-        .incarnation(incarnation)
-        .epoch(command.epoch())
-        .sequence(command.sequence())
-        .status(status)
-        .bytes(bytes)
-        .build();
+    IndexCacheProtocol.Ack.Builder ack =
+        IndexCacheProtocol.Ack.builder()
+            .session("application-1")
+            .planId(planId)
+            .commandId(command.commandId())
+            .executorId(executorId)
+            .incarnation(incarnation)
+            .epoch(command.epoch())
+            .sequence(command.sequence())
+            .status(status)
+            .bytes(bytes);
+    if (status == IndexCacheProtocol.AckStatus.LOADED) {
+      // A loaded copy reports the executor's capacity state, not only the command's estimate.
+      ack.metadataShape(
+          ExecutorIndexCache.Shape.empty()
+              .project(command.indexUuid(), command.epoch(), List.of(command.file())));
+    } else if (status == IndexCacheProtocol.AckStatus.RELEASED) {
+      ack.metadataShape(
+          ExecutorIndexCache.Shape.empty()
+              .project(command.indexUuid(), command.epoch(), List.of(command.file()))
+              .releaseKeys(command.indexUuid(), Set.of(command.file().cacheKey())));
+    }
+    return ack.build();
   }
 
   private static IndexCacheProtocol.NodeReport nodeFor(String executorId, long sequence) {
@@ -607,6 +627,7 @@ class TestIndexCacheControl {
         .sequence(sequence)
         .budgetBytes(1_000_000L)
         .usedBytes(0L)
+        .metadataShape(ExecutorIndexCache.Shape.empty())
         .build();
   }
 
@@ -622,6 +643,7 @@ class TestIndexCacheControl {
         .sequence(sequence)
         .budgetBytes(1_000_000L)
         .usedBytes(0L)
+        .metadataShape(ExecutorIndexCache.Shape.empty())
         .build();
   }
 }
