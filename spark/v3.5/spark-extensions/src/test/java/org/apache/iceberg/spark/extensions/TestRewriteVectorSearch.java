@@ -376,6 +376,45 @@ class TestRewriteVectorSearch {
   }
 
   @Test
+  public void ordersByTheColumnItNamesRatherThanADistanceOfTheSameName() {
+    // a distance aliased to a column's own name is not the column: ordering by the qualified column
+    // asks for that column's order, and answering it with the distance would be a different query
+    String table = "db.docs_shadow";
+    spark.sql(
+        String.format(
+            "CREATE TABLE local.%s (id bigint, rank double, embedding array<double>) USING iceberg",
+            table));
+    // ordering by rank puts 3 first, ordering by the distance puts 2 first
+    spark.sql(
+        String.format(
+            "INSERT INTO local.%s VALUES "
+                + "(1, 2.0d, array(10.0d, 0.0d)), "
+                + "(2, 3.0d, array(1.0d, 0.1d)), "
+                + "(3, 1.0d, array(2.0d, 1.0d))",
+            table));
+    spark.sql(
+        String.format(
+            "CALL local.system.build_vector_index("
+                + "table => '%s', column => 'embedding', dimension => 2, metric => 'euclidean', "
+                + "structure => 'flat')",
+            table));
+
+    String query =
+        String.format(
+            "SELECT id, vec_distance(embedding, array(1.0d, 0.0d)) AS rank FROM local.%s "
+                + "ORDER BY local.%s.rank LIMIT 1",
+            table, table);
+
+    assertThat(planOf(table, query))
+        .as("the ordering names a column, so there is nothing to answer from an index")
+        .doesNotContain("VectorSearchSource");
+    assertThat(spark.sql(query).collectAsList())
+        .as("the smallest rank, which is not the nearest row")
+        .extracting(row -> row.getLong(0))
+        .containsExactly(3L);
+  }
+
+  @Test
   public void rewritesAQueryThatOrdersByAProjectedDistance() {
     // selecting the distance under a name and ordering by that name is the natural way to show it:
     // Spark then leaves an attribute in the sort, with the distance in the projection below it

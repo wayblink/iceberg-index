@@ -146,7 +146,7 @@ case class RewriteVectorSearch(spark: SparkSession) extends Rule[LogicalPlan] {
               // re-scoring has to measure what the query asked for, and the function alone only
               // knows the default metric
               val metric = resolved.inputs.definition.metric()
-              val lowered = bindNamedDistance(limit, order.child, distance, metric).transformDown {
+              val lowered = bindMetric(limit, distance, metric).transformDown {
                 case relation: DataSourceV2Relation if relation eq scan => source
                 case node: Sort if node.order.exists(_.child eq distance) =>
                   node.copy(order =
@@ -181,31 +181,24 @@ case class RewriteVectorSearch(spark: SparkSession) extends Rule[LogicalPlan] {
   }
 
   /**
-   * Binds the metric on the projection that computes a distance the sort only names.
+   * Binds the metric where the distance is computed, instead of moving it into the sort.
    *
-   * <p>The distance cannot move into the sort: the projection below it outputs the name and not the
-   * vector column, so the sort would be left referring to a column nothing above it has. Binding it
-   * where it is computed keeps the attribute the sort already refers to pointing at the metric the
-   * index answers with.
+   * <p>A distance the sort computes can carry the metric itself. One the sort only names cannot: the
+   * projection below outputs the name and not the vector column, so a sort above it would refer to a
+   * column nothing above it has. Binding every projection that computes this distance keeps the
+   * attribute the sort orders by pointing at the metric the index answers with. It goes through the
+   * distance rather than the ordering key on purpose: the distance it binds is the very expression
+   * the resolution returned, so a query can never be rewritten with a distance whose metric is not
+   * then bound.
    */
-  private def bindNamedDistance(
+  private def bindMetric(
       plan: LogicalPlan,
-      key: Expression,
       distance: VectorDistanceExpression,
       metric: Metric): LogicalPlan = {
-    val named = key match {
-      case attribute: AttributeReference => Some(attribute.exprId)
-      case _ => None
-    }
-
-    if (named.isEmpty) {
-      return plan
-    }
-
     plan.transformDown {
       case project: Project =>
         val rewritten = project.projectList.map {
-          case alias: Alias if alias.exprId == named.get && (alias.child eq distance) =>
+          case alias: Alias if alias.child eq distance =>
             // the projection keeps its name and its expression id, so the attribute the sort orders
             // by still refers to the distance, now measured the way the index measures it
             Alias(distance.copy(metric = metric), alias.name)(
@@ -234,20 +227,21 @@ case class RewriteVectorSearch(spark: SparkSession) extends Rule[LogicalPlan] {
   private case class EligibleChain(
       scan: DataSourceV2Relation,
       computed: Map[ExprId, VectorDistanceExpression],
-      named: Map[String, VectorDistanceExpression],
       filters: Seq[Filter]) {
 
-    /** The distance an ordering key stands for, whether the key computes it or names it. */
+    /**
+     * The distance an ordering key stands for, when the key names a projection that computes one.
+     *
+     * <p>The key is matched by expression id and not by name. A name is not what an attribute refers
+     * to: {@code ORDER BY t.rank} names a column of the table, and a projection above it may alias a
+     * distance to the same name, so resolving on the name would answer a query for that column with
+     * a distance — a different query, and one whose metric is then not the one the index answers with.
+     * An attribute can only be the distance when it *is* that projection's output.
+     */
     def distanceOf(key: Expression): Option[VectorDistanceExpression] = {
       key match {
         case expression: VectorDistanceExpression => Some(expression)
-        case attribute: AttributeReference =>
-          computed.get(attribute.exprId).orElse {
-            // a projection the optimizer added between the sort and the one that names the distance
-            // gives the name a new expression id, so the name is what is left to match on
-            val byName = named.filter { case (name, _) => name == attribute.name }.values.toSeq
-            if (byName.size == 1) Some(byName.head) else None
-          }
+        case attribute: AttributeReference => computed.get(attribute.exprId)
         case _ => None
       }
     }
@@ -270,7 +264,6 @@ case class RewriteVectorSearch(spark: SparkSession) extends Rule[LogicalPlan] {
   private def eligibleChain(limit: GlobalLimit): Option[EligibleChain] = {
     val allowed = mutable.ListBuffer.empty[LogicalPlan]
     val computed = mutable.Map.empty[ExprId, VectorDistanceExpression]
-    val named = mutable.Map.empty[String, VectorDistanceExpression]
     val filters = mutable.ListBuffer.empty[Filter]
     var node: LogicalPlan = limit.child
     var scans: Option[DataSourceV2Relation] = None
@@ -289,7 +282,6 @@ case class RewriteVectorSearch(spark: SparkSession) extends Rule[LogicalPlan] {
               alias.child match {
                 case expression: VectorDistanceExpression =>
                   computed.put(alias.exprId, expression)
-                  named.put(alias.name, expression)
                 case _ =>
               }
             case _ =>
@@ -313,7 +305,7 @@ case class RewriteVectorSearch(spark: SparkSession) extends Rule[LogicalPlan] {
     if (sortCount != 1) {
       return None
     }
-    Some(EligibleChain(scans.get, computed.toMap, named.toMap, filters.toList))
+    Some(EligibleChain(scans.get, computed.toMap, filters.toList))
   }
 
   /** Whether a filter is a non-null guard on the vector column, which both branches can apply. */
