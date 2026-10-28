@@ -69,7 +69,8 @@ LIMIT 10;
 改写规则命中后，这次查询变成"索引检索候选 → 回表取行 → 精确重排 → 取前 k"。命中条件（`RewriteVectorSearch`）：
 
 1. 该列上存在向量索引；
-2. 至少有一个数据文件被索引覆盖（未覆盖的部分仍会残余扫描，所以索引落后于快照也能用）。
+2. 至少有一个数据文件被索引覆盖（未覆盖的部分仍会残余扫描，所以索引落后于快照也能用）；
+3. **表的非恒等分区不能存在**：数据文件里不含分区列的值，只有恒等分区能从路径里还原，所以 `bucket(...)`、`days(...)` 之类的表上规则会让路、查询退回扫描。恒等分区（`PARTITIONED BY (dt)`）可以。这条是集群验收时实测到的（`RewriteVectorSearch` 里的 `hasOnlyIdentityPartitions`），不是猜测——用 `bucket(4, id)` 建表时 `EXPLAIN` 里没有 `VectorSearchSource`，去掉分区后立刻出现。
 
 **FLAT 也参与改写。** 早先的规则因为"FLAT 每个条目都要打分、代价等同扫描"把精确索引排除在改写之外；现在这条成本判断已被移除——能不能用索引只看正确性，不看代价（`TestVectorIndexGuide.theRewriteUsesWhateverStructureTheIndexHas` 断言了 `EXPLAIN` 里出现 `VectorSearchSource`）。所以 `ORDER BY` 自动改写对 FLAT 也生效，只是它省不了多少开销：候选就是全部条目，重排后仍然是全量打分。用户手册里"索引不能是 FLAT"的说法属于旧行为，以本条为准。
 
@@ -85,6 +86,8 @@ SET spark.iceberg.index.vector.over-sample = 100;
 `over-sample` 的含义是"向索引要 k×over 个候选，再取前 k"。对 `ORDER BY` 的自动改写，取前 k 之前会**精确重排**，所以放大倍数提高的是**召回**；对 `CALL vector_search` / 两个向量 TVF，结果合同是"索引自己的原始分数、按索引顺序取前 k、删掉的行以 `row = null` 保留"，**不精确重排、不扫未覆盖文件**，因此放大倍数只扩大候选范围、不会让结果变成"精确 Top-K"（近似 kernel 扩大范围后候选集本身可能变，但不保证与旧 `C=k` 逐条一致）。
 
 它是唯一在查询时能调的召回/延迟旋钮：一次设成 100 是安全的默认（实测 10M/100M 的 1bit 都要 100 倍候选才追平精确召回）。未设置时用兼容基线 1，并在计划里标成 `COMPAT_DEFAULT(no-calibrated-policy)`——那不是"已-calibrated 的最优值"。显式设置（包括显式写 1）一律保留；空串、非整数、0、负数会报错而不是被静默改成 1。
+
+**近似 kernel 要拿到与精确扫描一致的结果，必须放大 over-sample。** 集群验收实测：200k 行、16 维、IVF+RaBitQ 4bit、`nprobe=1024`、`nlist=256` 时，`over-sample` 为默认值 1 的 Top-10 与 L2 真值**不同**（召回不满）；把 `spark.iceberg.index.vector.over-sample` 设成 4000 后，Top-10 与 L2 真值逐行一致。也就是说"索引结果 = 精确结果"不是默认行为，而是候选预算足够的产物。
 
 **注意度量**：`vec_distance` 默认算余弦，只有在被改写命中时才特化成索引的 metric。所以"手写一个不走索引的对照查询"时，`vec_distance(...) + 0.0d` 这种写法其实是余弦排序——若索引是 EUCLIDEAN，两者排序不同，会出现"精确索引也差一行"的假象。做对照必须自己写 L2 表达式。
 
@@ -325,6 +328,23 @@ docker push hub.i.basemind.com/spark/sparkann-e2e:<tag>
 **仍未做的**：集群六条验收（k8s + 生产 catalog）与 10M 基准回归 —— 上面是单机 `local[2]` 的制品验收，不能替代 #2769。
 
 **这些通过只证明"代码在 1.9.1 上活着"，不证明生产可用。** 还没做、且必须做的：集群六条验收（`list_indexes`、建索引、SQL 查询走索引且与 L2 全扫逐行一致、`check_indexes`、杀 executor 后一致、缓存状态可读）、10M 基准回归（Parquet × 量化 1/2/3/4bit，并量出 7.3 里取回退化的实际代价）、镜像重建（此时不再需要替换 parquet/avro，只需删 vendor 的 `iceberg-spark-runtime` 并放入我们的 jar）。基线一换，之前所有集群召回/延迟数字全部失效。
+
+### 7.5.2 集群六条验收（2026-10-28，`sh-a-spark` / ns `spark`）
+
+镜像 `hub.i.basemind.com/spark/sparkann-e2e:2769-5f646565`（digest `sha256:09f0d367…`），8 executor × (8g+2g)/2core、driver 6g，表 200k 行 × 16 维，`IVF × RaBitQ 4bit`、`nlist=256`、`nprobe=1024`、`over-sample=4000`。驱动 `cluster/ClusterIndexAcceptance`（工具仓），每项打印一行 `CHECK n PASS/FAIL`。
+
+| 卡上的验收项 | 结果 | 证据 |
+|---|---|---|
+| 1 `list_indexes` 返回全部行 | PASS | 1 行，含 `PUBLISHED`、`200000` 条、定义 JSON |
+| 2 建索引成功 + `index_build_status` 终态 | PASS | `SUCCEEDED`，起止时间与 200000 行 |
+| 3 计划里有索引算子 | PASS | `EXPLAIN` 出现 `VectorSearchSource[... metric=EUCLIDEAN, uncoveredFiles=0 ...]`，日志 `RewriteVectorSearch: rewrote a vector query into VectorSearchSource` |
+| 4 与 **L2 全扫**逐行一致 | PASS | 索引 Top-10 与 L2 表达式 Top-10 完全相同 `[129507, 18804, 57749, 90562, 162320, 168452, 96694, 51617, 24936, 123375]` |
+| 5 杀掉 executor 后仍一致 | PASS | 第 1 次迭代后 `Lost executor 2 ... deleted by a user`，其后 5 次迭代 Top-10 与 L2 真值逐行相同 |
+| 6 `index_cache_status` 可读、不 OOM | PASS（附带说明） | 可读、无 OOM；返回 **0 行**，因为该路径 `driverMaterialization=true`，索引检索在 driver 侧完成，执行器没有缓存条目可报。这不是缺陷，但意味着"缓存状态"目前不能用来判断这个计划下的缓存占用 |
+
+**验收过程中学到的两条（已写回 §2.2）**：非恒等分区（`bucket(...)`）会让改写规则让路；近似 kernel 要拿到与精确扫描一致的结果，必须把 `over-sample` 放大（默认 1 时 Top-10 与真值不同，4000 时一致）。
+
+**本节不做的事**：没有测 100M、没有测多索引并存、没有更新集群默认配置。验收用的表与索引留在 HDFS `/user/wanganyang/iceberg-acc/warehouse` 作为证据。
 
 ### 7.6 升级矩阵
 
