@@ -289,4 +289,42 @@ class TestLanceFormatTable {
     List<Row> files = spark.sql("SELECT file_path FROM " + table + ".files").collectAsList();
     assertThat(files).allSatisfy(row -> assertThat(row.getString(0)).endsWith(".lance"));
   }
+
+  @Test
+  public void vectorSearchReturnsTheSameTypedRowsAsANormalRead() {
+    // a Lance data file is not read by a parquet reader: the fetch-back behind an index hit goes
+    // through the format model, which has to hand Spark the same typed values a normal read does
+    String table = "local.db.lance_fetchback_types";
+    spark.sql("CREATE NAMESPACE IF NOT EXISTS local.db");
+    spark.sql("DROP TABLE IF EXISTS " + table);
+    spark.sql(
+        "CREATE TABLE "
+            + table
+            + " (id bigint, d date, ts timestamp, ts_ntz timestamp_ntz, dec decimal(9,2), "
+            + "bin binary, embedding array<double>) USING iceberg "
+            + "TBLPROPERTIES ('write.format.default' = 'lance')");
+    spark.sql(
+        "INSERT INTO "
+            + table
+            + " SELECT id, DATE '2026-01-02', TIMESTAMP '2026-01-02 03:04:05',"
+            + " TIMESTAMP_NTZ '2026-01-02 03:04:05', CAST(1.25 AS DECIMAL(9,2)), unhex('00ff'),"
+            + " array(1d, 0d) FROM range(1, 4)");
+    spark.sql(
+        "CALL local.system.build_vector_index(table=>'"
+            + table
+            + "',column=>'embedding',dimension=>2,structure=>'FLAT',name=>'lance_flat')");
+
+    List<Row> hits =
+        spark
+            .sql(
+                "CALL local.system.vector_search(table=>'"
+                    + table
+                    + "',column=>'embedding',query=>array(0.95d,0.05d),k=>3,index=>'lance_flat')")
+            .collectAsList();
+    assertThat(hits).hasSize(3);
+    assertThat(hits)
+        .extracting(row -> row.isNullAt(3) ? null : row.getString(3))
+        .containsExactlyInAnyOrderElementsOf(
+            spark.sql("SELECT * FROM " + table + " ORDER BY id").toJSON().collectAsList());
+  }
 }

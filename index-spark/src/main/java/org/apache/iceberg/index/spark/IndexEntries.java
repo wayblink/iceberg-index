@@ -811,13 +811,20 @@ public final class IndexEntries {
       case BOOLEAN:
         return DataTypes.BooleanType;
       case INTEGER:
-      case DATE:
         return DataTypes.IntegerType;
+      case DATE:
+        return DataTypes.DateType;
       case LONG:
       case TIME:
-      case TIMESTAMP:
-      case TIMESTAMP_NANO:
         return DataTypes.LongType;
+      case TIMESTAMP:
+        return ((Types.TimestampType) type).shouldAdjustToUTC()
+            ? DataTypes.TimestampType
+            : DataTypes.TimestampNTZType;
+      case TIMESTAMP_NANO:
+        return ((Types.TimestampNanoType) type).shouldAdjustToUTC()
+            ? DataTypes.TimestampType
+            : DataTypes.TimestampNTZType;
       case FLOAT:
         return DataTypes.FloatType;
       case DOUBLE:
@@ -839,7 +846,37 @@ public final class IndexEntries {
     }
   }
 
-  /** Converts an Iceberg value into the value a Spark row holds for it. */
+  private static boolean adjustsToUtc(org.apache.iceberg.types.Type type) {
+    return type.typeId() == org.apache.iceberg.types.Type.TypeID.TIMESTAMP_NANO
+        ? ((Types.TimestampNanoType) type).shouldAdjustToUTC()
+        : ((Types.TimestampType) type).shouldAdjustToUTC();
+  }
+
+  private static java.time.Instant instantOf(Object value) {
+    if (value instanceof java.time.Instant) {
+      return (java.time.Instant) value;
+    } else if (value instanceof java.time.OffsetDateTime) {
+      return ((java.time.OffsetDateTime) value).toInstant();
+    } else if (value instanceof java.time.LocalDateTime) {
+      return ((java.time.LocalDateTime) value).toInstant(java.time.ZoneOffset.UTC);
+    }
+
+    return ((java.sql.Timestamp) value).toInstant();
+  }
+
+  /** The wall clock a zone-less timestamp holds, whichever way the format handed it back. */
+  private static java.time.LocalDateTime localDateTimeOf(Object value) {
+    if (value instanceof java.time.LocalDateTime) {
+      return (java.time.LocalDateTime) value;
+    } else if (value instanceof java.time.OffsetDateTime) {
+      return ((java.time.OffsetDateTime) value)
+          .withOffsetSameInstant(java.time.ZoneOffset.UTC)
+          .toLocalDateTime();
+    }
+
+    return java.time.LocalDateTime.ofInstant(instantOf(value), java.time.ZoneOffset.UTC);
+  }
+
   private static Object toSparkValue(org.apache.iceberg.types.Type type, Object value) {
     if (value == null) {
       return null;
@@ -858,21 +895,33 @@ public final class IndexEntries {
           return scala.collection.JavaConverters.asScalaBuffer(elements);
         }
       case DATE:
-        return (int) ((java.time.LocalDate) value).toEpochDay();
+        return java.sql.Date.valueOf((java.time.LocalDate) value);
       case TIME:
         return ((java.time.LocalTime) value).toNanoOfDay() / 1000L;
       case TIMESTAMP:
-        return microsToSpark(((java.time.OffsetDateTime) value).toInstant());
       case TIMESTAMP_NANO:
-        return ((java.time.Instant) value).getEpochSecond() * 1_000_000L
-            + ((java.time.Instant) value).getNano() / 1000L;
+        // Spark's external type for a zone-aware timestamp is java.sql.Timestamp and for a
+        // zone-less one a LocalDateTime: the value has to arrive as that type, not as the count of
+        // micros the row holds internally, or every later encode of the row fails on the column.
+        // A format may hand back either an instant or a wall clock for the zone-less case, so the
+        // declared type decides and not the Java class the value happens to have.
+        return adjustsToUtc(type)
+            ? java.sql.Timestamp.from(instantOf(value))
+            : localDateTimeOf(value);
+      case BINARY:
+      case FIXED:
+        // Spark hands a binary column to an external row as a byte array, while the format model
+        // reads the bytes into a buffer
+        return value instanceof java.nio.ByteBuffer ? bytesOf((java.nio.ByteBuffer) value) : value;
       default:
         return value;
     }
   }
 
-  private static long microsToSpark(java.time.Instant instant) {
-    return instant.getEpochSecond() * 1_000_000L + instant.getNano() / 1000L;
+  private static byte[] bytesOf(java.nio.ByteBuffer buffer) {
+    byte[] bytes = new byte[buffer.remaining()];
+    buffer.duplicate().get(bytes);
+    return bytes;
   }
 
   private static Object[] asValues(Row row, List<String> readColumns, List<String> columns) {
