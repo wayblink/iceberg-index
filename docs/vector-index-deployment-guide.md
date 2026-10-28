@@ -228,73 +228,99 @@ docker push hub.i.basemind.com/spark/sparkann-e2e:<tag>
 
 ## 7. 版本基线与升级路径
 
-这一节是部署前必须拍板的部分，结论已经确定，依据和代价写在这里以便复核。
+这一节是部署前必须拍板的部分。下面每个数字都来自 2026-10-28 在**真实厂内基线上跑出来的实测**（源码 `gitlab.basemind.com/storage/iceberg` 的 `step-1.9`，实验树独立 worktree），不是估算；还没做的是集群验收，范围见 7.5。
 
-### 7.1 版本基线（已决定）
+### 7.1 源码基线：厂内 `step-1.9`，不是上游 tag
 
-厂内 Spark 主版本是钉死的（3.5.7，随带 Iceberg 1.9.1），因此**不跟随上游 Iceberg 升级**：把索引能力回溯到厂内 1.9.1 基线，而不是把集群的 Iceberg 运行时从 1.9.1 跳到 1.12。
+厂内 Spark 钉死在 3.5.7，随带的 Iceberg 是厂内自建的 1.9.1。回溯目标因此是**厂内那份 1.9.1**，而不是"换成 1.12/1.11 的 runtime"——换 jar 换的是整个集群的 Iceberg 运行时，写侧会获得更高 format-version 的能力，一旦某张表被写成新版本，跑旧 runtime 的其它读方直接读不了。这个风险与索引功能无关，不该被"装索引"顺带引入。
 
-**为什么不是"直接发一个 1.12 的 jar 换进去"。** 换 jar 换的是**整个集群的 Iceberg 运行时**，不只是带索引的表：写侧会获得 1.10–1.12 的新能力（本 fork 的 `SUPPORTED_TABLE_FORMAT_VERSION = 4`、`MIN_FORMAT_VERSION_ROW_LINEAGE = 3`），一旦某张表被写成 format-version 3，跑 1.9.1 的其它读方会直接读不了。这个风险与索引功能无关，不该被"装索引"顺带引入。
+实测出的厂内基线与上游 tag 的关系：
 
-**厂内 1.9.1 的实测核对**（从基础镜像 `spark:3.5.7-STEP-rc2-tpcds-dsdgen-lance-20260416a` 取出 jar 比对）：
-
-| 项 | 结果 |
+| 项 | 值 |
 |---|---|
-| jar 名 | `iceberg-spark-runtime-3.5_2.12-1.9.1-STEP-rc1.jar`（44 MB，厂内自建） |
-| 是否带索引能力 | **否**：`org/apache/iceberg/index/` 包计数 0 |
-| 类集合 vs 上游 tag `apache-iceberg-1.9.1` | **完全一致**：22997 个 class 中，排除 shaded guava（`relocated`）、`shaded`、Immutables 生成的 `Immutable*` 与 `package-info` 后，厂内独有类为 **0** |
-| `META-INF/MANIFEST.MF` | 只有 `Manifest-Version: 1.0`，无版本/commit 信息 |
+| 厂内仓库 / 分支 | `gitlab.basemind.com/storage/iceberg`，`step-1.9`，tip `d2e4ba7e4` |
+| 与上游 `apache-iceberg-1.9.1`（`f40208ae6`）的关系 | **0 behind / 7 ahead**（merge-base 就是 tag 本身） |
+| 差异规模 | 23 个文件，+1290 / −70 |
+| 7 个提交 | executor cache 独立线程池、Parquet 小文件修复、split-size session conf、duplicate DV 回填（2 个提交 + 2 个 merge）、amoro 默认值与版本号 |
 
-结论：厂内 1.9.1 是**同名重建**，没有新增功能或 API。但类名一致**不能排除方法体被改**；要排除这一点需要本地构建上游 1.9.1 再逐类 diff 字节码，目前未做——因此验收以"厂内 jar 的实际行为"为准，源码基线用 tag。
+结论有两条。**第一，移植基线取 `step-1.9` 的 tip，不取 tag**：这 7 个补丁就是厂内生产在跑的行为，站在 tag 上回溯等于把生产已经修掉的问题重新引入一份。**第二，"厂内有没有偷偷改方法体"这个悬而未决的风险消失了**：不需要再逐类 diff 字节码，源码就是答案。
 
-**parquet / avro 基线：用 Spark 自带版本（1.13.1 / 1.11.4）。** 依据不是偏好，而是厂内现状：
+**内部 shaded 依赖不跟着外部 Spark 走。** 之前"把 parquet 降到 1.13.1、avro 降到 1.11.4"的结论作废，原因是搞混了两层命名空间：Iceberg runtime jar 内部打包的是 shaded 的 Avro **1.12.0** 与 Parquet **1.15.2**（jar 内 `pom.properties` 实读），而 Spark 侧 `pom.xml` 声明的 Avro 1.11.4 / Parquet 1.13.1 只影响 Spark 自己的类加载，改不了已经编译进 fat jar 的字节码。所以回溯版保留内部 1.12.0 / 1.15.2，同时**不替换** Spark 的 `avro` / `parquet` jar——这也正好是厂内现状。
 
-| | 上游 1.9.1 编译基线 | 厂内镜像实际 | 我们采用 |
-|---|---|---|---|
-| parquet | 1.15.2 | **1.13.1** | 1.13.1 |
-| avro | 1.12.0 | **1.11.4** | 1.11.4 |
+**JDK 目标是 17。** 上游 1.9.1 的 `build.gradle` 里是 `options.release = 11`，而索引代码用了 1.11 时代的语言特性（`record`、`instanceof` 模式、switch 箭头）。集群运行时用 JDK 17，因此回溯分支把编译目标改成 17，不做 Java 11 降级改写。
 
-也就是说厂内的 1.9.1 runtime jar 本来就是"编译于 1.15.2、跑在 1.13.1 上"。选这个基线不是引入新风险，而是与厂内既有组合保持一致，镜像里不再需要替换 parquet/avro。
+顺带确认一个原先以为必须打补丁的问题并不存在：1.9.1 全仓 0 处 `variantType(`，它建 variant 列时只建普通 group，所以回溯版**不需要**任何 variant 补丁。
 
-顺带一个原先以为必须处理的问题自动消失：**1.9.1 不使用 Parquet 的 VARIANT 逻辑类型**。`git grep variantType(` 在 tag `apache-iceberg-1.9.1` 的整个 `src/main` 里为 0 处；1.9.1 的 `TypeToMessageType.variant()` 只建普通 group（`metadata`/`value`/可选 `typed_value`）。我们用到的 `.as(LogicalTypeAnnotation.variantType(...))` 是后来才引入的，只存在于当前 1.12 基线的 fork 里。所以回溯之后**不需要为 variant 打任何补丁**。
+### 7.2 迁移闭包与实测冲突面
 
-待验：`iceberg-core` 把 avro 当 `api` 级依赖，1.9.1 原基线是 1.12.0；用 1.11.4 编译能否通过、manifest 读写是否正常，是回溯后第一个必须跑通的关口。
+索引能力在 fork 里的真实边界是**一段提交区间**，不是"几个文件"：`7447be7cd..main`，277 个提交，全部作者 `wayblink`。落到文件级是 **278 个（265 新增 + 13 修改）**，其中在 1.9.1 里已经存在的**只有 11 个**。这 278 个里有一部分是 Lance 文件格式与文档，按 §7.3 的决定不进回溯版：**实际要搬的是 250 个**（219 个产品/测试代码 + 29 个文档与报告），构成是去掉 `lance/` 22 个、`core/.../formats/` 2 个、4 个 `TestLance*` 测试。
 
-### 7.2 回溯计划与工作量
+两个必须先记住的教训。**其一，闭包必须钉在具体 commit 上**：我开工时 main 是 `c8dcf1a83`，做完实验它已经前进到 `12f4a04f9`（#2796/#2797 的修复），清单会漂；移植卡必须写固定快照，不能写 `main`。**其二，之前"只改了 3 个既有上游文件"的结论不成立**：那是按提交信息过滤出来的，真正的文件级差异是 13 个；按 §7.3 去掉 Lance 与 format-model 之后实际要搬 250 个文件，另外还差一个测试支撑类（见 7.4）。
 
-索引功能在 fork 里的落点（实测清点）：
+移植方式：不做 277 次 cherry-pick，改为**按固定快照做文件级搬运**（265 个新文件整文件放入，13 个改造文件对 1.9.1 版做三路合并）。实测代价：
 
-| 部分 | 规模 |
+| 13 个改造文件 | 结果 |
 |---|---|
-| `core/src/main/java/org/apache/iceberg/index/` | 28 个文件、约 4956 行 |
-| `index-spark` / `index-vector` / `index-text` 三个模块 | 新增模块 |
-| `spark/v3.5` 的索引与过程（`spark/index`、`procedures/*Vector*`、`*Index*`） | 41 个文件 |
-| 被改动的**既有**上游文件 | **3 个**：`api/.../FileFormat.java`（+2/−1）、`core/.../formats/FormatModelRegistry.java`（+26/−11）、`core/.../formats/ReadBuilder.java`（+20） |
+| 干净应用 7 个 | `FileFormat`、`build.gradle`、`settings.gradle`、`spark/v3.5/build.gradle`、`IcebergSparkSessionExtensions.scala`、`TestRemoveOrphanFilesProcedure`、`SparkProcedures` |
+| 冲突 4 个，都是小冲突 | `.gitignore`、`docs/docs/spark-procedures.md`、`gradle/libs.versions.toml`、`DeleteOrphanFilesSparkAction`（只差两行 import） |
+| 1.9.1 里不存在、按新增处理 2 个 | `core/.../formats/FormatModelRegistry.java`、`ReadBuilder.java` |
 
-那 3 个既有文件的改动都是 **format-model / Lance 相关**（`FileFormat.LANCE`、`LanceFormatModels` 注册、按格式的读取构建），不是索引逻辑；最小回溯可以先把 Lance 那条线留在后面。
+也就是说"277 个提交重放"的工作量被压成"250 个文件 + 4 个小冲突"，冲突面比 cherry-pick 路线低一个量级。这是本方案的实质结论之一。
 
-顺序建议：①在 1.9.1 基线上把 parquet 1.13.1 / avro 1.11.4 的编译跑通（不含索引）→ ②移植 `core` 的 index 包 → ③加三个模块 → ④移植 `spark/v3.5` 集成（函数、改写规则、物理策略、16 个过程）→ ⑤补测试。
+### 7.3 两个已定的取舍：不移植 format-model，不支持 Lance
 
-主要风险：索引代码可能用到 1.9.1 之后才有的上游 API。目前看常用工具都在（`Tasks`、`CloseableIterable`、`Preconditions`），但 `MetadataUpdate`、`TableMetadata`、`TableOperations` 的新增能力需要逐个确认——这是移植阶段最容易卡住的地方。
+**决定一：回溯版不移植 1.11 的 format-model 子系统，索引侧改成 Parquet 直读。** 索引代码原本通过 `FormatModelRegistry.readBuilder(...)` 读数据文件与 delete 文件，这是一个 1.11 才有的子系统（`formats/` 7 个文件 + 各格式的模型实现：Parquet 430 行、ORC 316 行、Avro 277 行 + Generic/Spark 注册类）。实测把它整体搬过来会遇到两层问题：Parquet 模型直接引用 variant 时代的 API（`PARQUET_SHRED_VARIANTS`、`VariantShreddingAnalyzer`、`BufferedFileAppender`），这些在 1.9.1 里不存在，等于要边搬边删代码；而 Avro/ORC 模型还要求把若干 `private` 内部类提权。代价明显高于收益，因为**我们的生产表都是 Parquet**，索引读文件只需要 Parquet 一条路径。
 
-### 7.3 升级矩阵
+替代实现只有一处改动：`IndexEntries` 里两个调用点改成 `Parquet.read(input).project(projection).createReaderFunc(GenericParquetReaders.buildReader(...))`，并在模块依赖里加 `iceberg-parquet`。**代价必须写清**：1.9.1 没有"只读指定 row 位置"的能力，取回（fetch-back）会退化为整文件读，命中行由调用方按位置过滤——结果正确（代码里本来就有"格式忽略位置则按顺序重新编号"的兜底），慢多少要在 10M 基准回归里量（第 8 章已知缺口）。如果后续必须做位置裁剪，再评估把 1.11 的 Parquet 位置读单独摘出来。**这条改动是实测出来的，不是设想**：改造前 `spark-extensions` 有 27 项因 `Format model is not registered for format PARQUET and type interface org.apache.iceberg.data.Record` 失败，改造后这些用例全部通过（另一次 62 项的抽查 0 失败），日志里 `FormatModelRegistry` 命中 0 次。
+
+**决定二：回溯版不支持 Lance 文件格式。** Lance 模型依赖 1.11 的 format-model 子系统、Arrow 18（本 fork 其余部分在 Arrow 15）和一个本地打过补丁的 `lance-core`。实验里 4 个 Lance 测试的失败是 `UnsupportedOperationException: Unsupported data file format: LANCE`，属于"没搬这条线"的预期结果。Lance 目前只用于基准对比，不在生产路径上，因此回溯版明确不支持，`FileFormat.LANCE` 枚举保留（写侧不会产出），Lance 相关模块不进 1.9.1 分支。
+
+### 7.4 清单外的必需补入与小改
+
+照 7.2 的清单搬运**还不够**。实测踩出下面这些，移植卡必须照做；反过来，"不移植 format-model"这个决定也消掉了一批原本要补的东西，两条一起看。
+
+| 类别 | 项 | 为什么必须 |
+|---|---|---|
+| 清单外文件（1） | `spark/.../DummyMetricsServlet`（测试支撑） | 被移植测试以**字符串**类名引用（`spark.metrics.conf.*.sink.servlet.class`），编译期发现不了，运行时 `ClassNotFoundException` |
+| 仓库内小改 | `api/Files.java`：`localInput` / `localOutput` 支持 `file:` 前缀 | 1.9.1 不剥 `file:` 会把路径当相对路径写到当前目录，索引状态文件因此"写了但读不到"（`TestIndexBuildStatus` 6 项失败，修完归零） |
+| 仓库内小改 | `spark/.../procedures/BaseProcedure.java`：补 `requiredInParameter` / `optionalInParameter` 两个助手 + `ProcedureParameter` import | 移植过来的 20 余个过程全靠这两个助手声明参数，1.9.1 没有 |
+| 仓库内小改 | `gradle/libs.versions.toml`：加 `junit-pioneer 2.3.0` | 移植的测试用它；属 1.11 的测试基建 |
+| 仓库内小改 | `build.gradle`：`options.release` 与 scalac `-release` 改 17；`index-spark` 增 `iceberg-parquet` 依赖；删掉 `iceberg-lance` 模块与 `spark/v3.5` 对它的 `testImplementation` | 见 §7.1（JDK 17）与 §7.3（Parquet 直读、不支持 Lance） |
+| **陷阱** | `.gitignore`：删掉 1.9.1 的 `gradle/` 忽略行 | 1.9.1 整目录忽略 `gradle/`，保留它会让 `gradle/libs.versions.toml` 的改动静默不被提交——版本目录改了等于没改 |
+| 不需要了（因 §7.3 决定） | `core/.../formats/` 7 个文件、`PositionDelete.deleteClass()`、`FileWriterBuilderImpl` 的 `FileAppender` import 与泛型强转、Avro 内部类可见性放宽、Parquet/ORC/Avro 三个格式模型（430/316/277 行） | 这些都是 format-model 子系统的接口；索引侧改 Parquet 直读后整条链不再需要 |
+
+**一个通用教训写在这里**：那 13 个"改造文件"绝对不能整文件复制主仓版本，必须和 1.9.1 版做三路合并。例如主仓的 `PositionDelete` 在 1.11 里已被上游改过，整文件覆盖会丢掉 1.9.1 里还在用的 `set()` / `row()`。同理 `DeleteOrphanFilesSparkAction` 要保留 1.9.1 的 `FileURI` / `FileSystemWalker`，只并入索引相关的两行 import。
+
+### 7.5 已完成的验证与还没做的验证
+
+已完成（实验树 `exp/2763-closure`，基线 `d2e4ba7e4`，JDK 17，`-DsparkVersions=3.5 -DscalaVersion=2.12`，全部 `--no-build-cache` + `cleanTest`，数字取自 test-results XML）：
+
+| 范围 | 结果 |
+|---|---|
+| 编译（含测试代码） | `core`、`index-vector`、`index-text`、`index-spark`、`spark-3.5`、`spark-extensions` 全部通过 |
+| `core` 索引单测 | 86 项，0 失败 |
+| `index-vector` | 89 项，0 失败 |
+| `index-text` | 6 项，0 失败 |
+| `index-spark` | 271 项，0 失败 |
+| `spark-3.5`（`*Vector*` / `*Index*`） | 197 项，0 失败，39 跳过（跳过的都是 Parquet 向量化读的参数化用例，与索引无关） |
+| `spark-extensions` 抽查（等值删除 / 检索执行 / 带删除的检索） | 62 项，0 失败 |
+| `spark-extensions` 全量（`*Vector*` / `*Index*`，含 16 个 `CALL` 过程） | 486 项里 49 失败：**45 项是嵌入 Hive metastore 的 `Broken pipe`**（隔离单跑该类 44 项 0 失败，属测试环境问题，不是移植代码）；**4 项是 Lance 写路径**（`BaseFileWriterFactory.newDataWriter` 没有 LANCE 分支，按 §7.3 决定不支持） |
+
+**这些通过只证明"代码在 1.9.1 上活着"，不证明生产可用。** 还没做、且必须做的：集群六条验收（`list_indexes`、建索引、SQL 查询走索引且与 L2 全扫逐行一致、`check_indexes`、杀 executor 后一致、缓存状态可读）、10M 基准回归（Parquet × 量化 1/2/3/4bit，并量出 7.3 里取回退化的实际代价）、镜像重建（此时不再需要替换 parquet/avro，只需删 vendor 的 `iceberg-spark-runtime` 并放入我们的 jar）。基线一换，之前所有集群召回/延迟数字全部失效。
+
+### 7.6 升级矩阵
 
 | 组件 | 跟随谁升级 | 升级时要做什么 | 验证 |
 |---|---|---|---|
-| `core` 索引层、`index-vector`、`index-text`、`iceberg-lance` | Iceberg | 换基线、重放索引改动（3 个既有文件 + 新目录） | 单测 + revapi（`api/`） |
-| `spark/v3.5` 集成、`index-spark` | Spark 3.5.x **和** Iceberg | Spark 补丁版升级：重建镜像即可；Spark 主版本升级：**移植项目**（我们站在 Catalyst 内部 API 上：`injectFunction`/`injectOptimizerRule`/`injectPlannerStrategy`、`CodegenFallback` 表达式、物理算子） | 六条集群验收 |
-| parquet / avro | **Spark 自带版本**（不独立升级） | 无需动作 | 编译 + 写读 smoke |
+| `core` 索引层、`index-vector`、`index-text` | 厂内 `step-1.9` 分支 | 厂内补丁更新时 rebase 到新 tip，重放 250 文件快照 | 单测 + revapi（`api/`） |
+| `spark/v3.5` 集成、`index-spark` | Spark 3.5.x **和** 厂内 Iceberg | Spark 补丁版升级：重建镜像即可；Spark 主版本升级：**移植项目**（我们站在 Catalyst 内部 API 上：`injectFunction`/`injectOptimizerRule`/`injectPlannerStrategy`、`CodegenFallback` 表达式、物理算子） | 六条集群验收 |
+| parquet / avro | **跟随 Iceberg runtime 内部版本**（1.15.2 / 1.12.0），不动 Spark 外部 jar | 无需动作 | 编译 + 写读 smoke |
 | 镜像基础层 | 厂内 Spark 镜像 | 重建镜像、重跑验收 | 六条集群验收 |
 | `IndexManifest` 二进制格式 | **我们自己**（与 upstream 无关） | 改格式必须保证读兼容旧版本 | 版本化注册表测试 |
 
-### 7.4 基线变更后的重新验证范围
+### 7.7 基线变更后的重新验证范围
 
-基线一换，之前所有集群结论（召回、延迟、索引体积）都失效，必须重跑。最小集合：
-
-1. 编译与单测：`core`（索引）、`index-vector`、`index-text`、`spark/v3.5`（`*Index*`、`*Vector*`）。
-2. 集群六条验收：`list_indexes` 返回全部行 → `build_vector_index` 成功且 `index_build_status` 终态正确 → `ORDER BY vec_distance` 走索引且与 L2 全扫逐行一致 → `check_indexes` 无 needs_rebuild → 杀掉一个 executor 后结果逐行一致 → `index_cache_status` 可读且不 OOM。
-3. 基准回归：用 `iceberg-tools` 仓库的 `vector-benchmark` 跑 10M 网格（Parquet + Lance，量化 1/2/3/4bit），确认延迟与召回相对本手册引用的数字没有退化；100M 待 10M 通过后再决定。
-4. 镜像：重建（此时 `Dockerfile` **不再需要**删除 parquet/avro，只需删除 vendor `iceberg-spark-runtime` 并放入我们的 jar），并按工具仓 `iceberg-tools` 的 `cluster/README.md` 里的版本一致性检查复核。
+最小集合是四项：编译与单测（`core` 索引、`index-vector`、`index-text`、`spark/v3.5` 的 `*Index*`/`*Vector*`）；集群六条验收（`list_indexes` 返回全部行 → `build_vector_index` 成功且 `index_build_status` 终态正确 → `ORDER BY vec_distance` 走索引且与 L2 全扫逐行一致 → `check_indexes` 无 needs_rebuild → 杀掉一个 executor 后结果逐行一致 → `index_cache_status` 可读且不 OOM）；10M 基准回归（`iceberg-tools` 的 `vector-benchmark`，Parquet，量化 1/2/3/4bit，与本章引用的数字对比，退化必须定位到改动）；镜像重建与版本一致性检查。100M 待 10M 通过后再决定。
 
 ## 8. 已知缺口（上线前必须知道）
 
@@ -307,6 +333,7 @@ docker push hub.i.basemind.com/spark/sparkann-e2e:<tag>
 5. **无 DDL**。所有索引操作是 `CALL` 过程，用户文档要按过程写，不要承诺 `CREATE INDEX`。
 6. **`FLAT` 不作为生产查询手段**（它在规模上省不了开销），但它**不再被改写规则拒绝**：旧规则里"FLAT 代价等同扫描所以跳过"的判断已删除，`TestVectorIndexGuide.theRewriteUsesWhateverStructureTheIndexHas` 断言 FLAT 也会生成 `VectorSearchSource`。早先"FLAT 走 `ORDER BY` 拿不到结果"的观察对应旧行为；用户手册里"索引不能是 `FLAT`"一句已过期，改文档时以本条为准。
 7. **删除表/删除行的边界**：equality delete 的多键集已支持，`timestamp_nano` 键被明确拒绝（避免同微秒多行误删）；带删除的表上建索引前请确认删除文件格式（跟随数据格式，Lance 表是 `.lance`）。
+8. **回溯版的两项能力缺失（受 1.9.1 基线限制，见 §7.3）**：其一，取回（fetch-back）没有"只读指定 row 位置"的能力，命中后会把整文件读出来再按位置过滤，结果正确但比 1.10+ 慢，差值待 10M 基准量；其二，**不支持 Lance 文件格式**，索引只读 Parquet，基准对比里的 Lance 列不适用于回溯版。
 
 ---
 

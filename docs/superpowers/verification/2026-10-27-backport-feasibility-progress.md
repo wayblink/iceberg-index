@@ -104,3 +104,52 @@
 - baseline516项通过不等于新增索引模块或shaded runtime的运行验收通过。真正的集群与10M回归仍在后续验证卡。
 
 证据：`/Users/jyxc-dz-0101035/workspace/iceberg-reviews/2762-start/`中的vendor-runtime.log、两个编译日志、Parquet测试日志与两份cherry-pick JSON记录。
+
+## 第二阶段：真实厂内基线（2026-10-28）
+
+上一阶段的两个前提被推翻，换成了实测。
+
+**源码基线不再是"待索取"。** 厂内 Iceberg 源码在 shai 的 `/home/wanganyang/workspace/iceberg`，remote 是 `gitlab.basemind.com/storage/iceberg`，`step-1.9` 分支 tip 为 `d2e4ba7e4`。它与上游 `apache-iceberg-1.9.1`（`f40208ae6`）的 merge-base 就是 tag 本身，`0 behind / 7 ahead`，差异 23 个文件 +1290/−70。因此源码基线 = 厂内 `step-1.9`；"厂内是否改过方法体"不再是未知项。
+
+**parquet/avro 不降级。** 厂内 runtime jar 内部是 shaded Avro 1.12.0 / Parquet 1.15.2（jar 内 `pom.properties` 实读）；外部 Spark jar 的 1.11.4 / 1.13.1 属于另一层命名空间，改不动已编译进 fat jar 的字节码。此前"厂内编译 1.15.2、实际跑 1.13.1"的推断作废。
+
+**实验树与命令。** 实验树 `/Users/jyxc-dz-0101035/workspace/iceberg-wt/2763`，分支 `exp/2763-closure`，起点 `d2e4ba7e4`（通过 `git fetch shai:/home/wanganyang/workspace/iceberg refs/remotes/origin/step-1.9:refs/remotes/shai/step19-origin` 取得）。所有构建命令都带：
+
+```
+export JAVA_HOME=/opt/homebrew/Cellar/openjdk@17/17.0.20.1/libexec/openjdk.jdk/Contents/Home
+./gradlew --no-build-cache -DsparkVersions=3.5 -DscalaVersion=2.12 -I /tmp/2763-gitmeta.init.gradle <task>
+```
+
+`/tmp/2763-gitmeta.init.gradle` 把 Git-properties 插件的 `dotGitDirectory` 指向一个共享对象库的 bare 元数据镜像（`/tmp/2763-gitmeta.git`，HEAD 固定为实验基线），避免 linked worktree 的 `.git` 文件不被识别、也避免误标主树 SHA。
+
+**闭包。** `7447be7cd..c8dcf1a83` 共 277 个提交（全部作者 `wayblink`），文件级 278 个（265 新增 / 13 修改），其中 1.9.1 里已存在的 11 个。**必须钉 commit**：实验期间 main 从 `c8dcf1a83` 前进到 `12f4a04f9`（#2796/#2797 修复），按 `main` 取清单会漂。
+
+**搬运结果。** 13 个改造文件：7 个干净应用，4 个冲突（`.gitignore`、`docs/docs/spark-procedures.md`、`gradle/libs.versions.toml`、`DeleteOrphanFilesSparkAction` 两行 import），2 个按新增处理。清单外补入 6 个文件（`formats/` 5 个基建 + `DummyMetricsServlet`），另有 8 处小改（见部署手册 §7.4）。其中两个是踩出来的：1.9.1 的 `Files.localInput/localOutput` 不剥 `file:` 前缀，导致索引状态文件"写了读不到"（`TestIndexBuildStatus` 6 项失败），修好后归零；`DummyMetricsServlet` 只以字符串类名被引用，编译期发现不了。
+
+**.gitignore 陷阱（必须记住）。** 1.9.1 的 `.gitignore` 忽略整个 `gradle/`，保留它会让 `gradle/libs.versions.toml` 的改动静默不被提交。
+
+**测试结果（`--no-build-cache`，`cleanTest`，逐个 XML 汇总）。** core 索引 86、index-vector 89、index-text 6、index-spark 271，全部 0 失败；spark 3.5 的 `*Vector*`/`*Index*` 197 项 0 失败（39 跳过是 Parquet 向量化读的参数化用例，与索引无关）。spark-extensions 的 485 项起初 31 失败，全部定位为两类根因：27 项"format model 未注册"（1.11 的 format-model 子系统 1.9.1 没有）、4 项 Lance 数据文件不支持。据此决定不移植 format-model，索引侧改 Parquet 直读（部署手册 §7.3），改完后的结果见 7.5。
+
+**尚未做。** 集群六条验收、10M 基准回归、镜像重建——三者都在后续卡里，且基线一换旧数字全部失效。
+
+## 第三阶段：收敛后的闭包（2026-10-28）
+
+按"不移植 format-model、不支持 Lance"的决定把实验树收敛，并重新验证，目的是让搬运面变成可执行的最小集合，而不是把 1.11 的子系统一起拖过来。
+
+**收敛动作。** 删除 `core/src/main/java/org/apache/iceberg/formats/` 整个包（7 个文件）；删除 `lance/` 模块（含 `settings.gradle` 的 `include 'lance'`、`build.gradle` 的 `project(':iceberg-lance')` 块、`spark/v3.5/build.gradle` 的 `testImplementation project(':iceberg-lance')`）；删除 4 个 `TestLance*` 测试。随之不再需要 `PositionDelete.deleteClass()`、`FileWriterBuilderImpl` 的 `FileAppender` import 与泛型强转、Avro 内部类可见性放宽——这些原本都是 format-model 子系统的接口。
+
+**验证（全部 `--no-build-cache` + `cleanTest`，数字取自 test-results XML）。**
+
+| 范围 | 结果 |
+|---|---|
+| 编译（含测试代码） | core、index-vector、index-text、index-spark、spark-3.5、spark-extensions 全通 |
+| core 索引 | 86 项 0 失败 |
+| index-vector | 89 项 0 失败 |
+| index-text | 6 项 0 失败 |
+| index-spark | 271 项 0 失败 |
+| spark-3.5 `*Vector*`/`*Index*` | 197 项 0 失败，39 跳过（Parquet 向量化读参数化用例） |
+| spark-extensions 抽查（EqualityDeletes / VectorSearchExecution / VectorIndexDeletes） | 62 项 0 失败 |
+
+**spark-extensions 全量的两类残留。** 一次 486 项的全量跑有 49 项失败，逐条看过：45 项是 `TestVectorIndexProcedures` 的 `HiveException ... TTransportException: SocketException: Broken pipe`，发生在建 SparkSession 阶段，连 testhadoop 参数化也挂；隔离单跑该类是 44 项 0 失败，属测试环境（嵌入 Hive metastore）问题。另 4 项是 Lance 写路径 `BaseFileWriterFactory.newDataWriter` 没有 `LANCE` 分支——按决定不支持，不是缺陷。日志里 `format-model` / `FormatModelRegistry` 命中 0 次，原先那 27 项确实消失。
+
+**辅助审计（独立 agent）结论。** 清单只覆盖"被索引提交改动过的文件"，不覆盖"被索引代码依赖但没被改过的文件"。扫描 242 个源文件 + 13 个改造文件的新增行后，找到的漏项就是 `DummyMetricsServlet`（字符串类名引用）与两个缺成员（`PositionDelete.deleteClass()`、`BaseProcedure` 的两个参数助手）；测试继承基类这一类查下来是空的。`FormatModelRegistry` 里硬编码的四个 `*FormatModels` 注册类在 1.9.1 里全部不存在，会被 `DynMethods` 静默吞掉——这正是"27 项运行时才炸"的机制，也是不做 format-model 移植后必须删掉它的原因。

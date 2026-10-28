@@ -23,16 +23,17 @@
 
 **Goal:** 让厂内 Spark 3.5.7 集群在**不改变 Iceberg 版本（1.9.1）**的前提下获得向量/文本索引能力，并且镜像里不再替换 parquet/avro。
 
-**Architecture:** 以 `apache-iceberg-1.9.1` 为源码基线，把索引能力（`core` 的 index 包、`index-spark`/`index-vector`/`index-text` 三模块、`spark/v3.5` 的函数/改写规则/物理策略/16 个过程）移植过来；parquet/avro 采用 Spark 自带版本（1.13.1 / 1.11.4）。发布物是一个 shaded runtime jar，镜像只替换 vendor 的 `iceberg-spark-runtime`。
+**Architecture:** 以厂内 `gitlab.basemind.com/storage/iceberg` 的 `step-1.9`（tip `d2e4ba7e4` = 上游 `apache-iceberg-1.9.1` + 7 个厂内补丁）为源码基线，把索引能力（`core` 的 index 包、`index-spark`/`index-vector`/`index-text` 三模块、`spark/v3.5` 的函数/改写规则/物理策略/16 个过程）移植过来；parquet/avro 保留 runtime 内部 shading 版本（1.15.2 / 1.12.0），不动 Spark 外部 jar；编译目标 JDK 17；Lance 文件格式不在回溯范围。发布物是一个 shaded runtime jar，镜像只替换 vendor 的 `iceberg-spark-runtime`。
 
 **Tech Stack:** Java 17、Scala 2.12、Spark 3.5、JUnit 5 + AssertJ、现有 Iceberg FileIO/Puffin，不新增第三方依赖。
 
-**Design:** `docs/vector-index-deployment-guide.md` 第 7 章（版本基线与升级路径，2026-10-27 用户已拍板：Iceberg 回溯 1.9.1、parquet/avro 走 Spark 自带版本）。
+**Design:** `docs/vector-index-deployment-guide.md` 第 7 章（版本基线与升级路径）。2026-10-28 的实测修订了其中两条：基线取厂内 `step-1.9` 而非上游 tag；parquet/avro 不降级（那是把两层命名空间搞混了）。
 
 ## Global Constraints
 
-- **不改 Iceberg 版本**：基线是厂内 1.9.1，验收以厂内 jar 的实际行为为准（厂内 jar 类集合与上游 tag 一致，但无法排除方法体补丁）。
-- **parquet / avro 跟 Spark 走**：1.13.1 / 1.11.4，镜像不再替换它们；`iceberg-core` 的 avro 是 `api` 级依赖，先用 1.11.4 编译验证。
+- **不改 Iceberg 版本**：基线是厂内 `step-1.9` 的 tip；源码即厂内补丁，不需要再逐类 diff 字节码。
+- **parquet / avro 不降级**：runtime 内部是 shaded 的 1.15.2 / 1.12.0，外部 Spark jar 的 1.13.1 / 1.11.4 是另一层命名空间，改不了已编译进 fat jar 的字节码；镜像里同样不替换 Spark 的 parquet/avro。
+- **闭包钉在具体 commit 上**：索引能力 = `7447be7cd..<快照 commit>`（当前快照 `c8dcf1a83`），278 个文件。不要写 `main`——做完实验时 main 已前进 2 个提交。
 - **不需要 variant 补丁**：1.9.1 的 `src/main` 里 `variantType(` 出现 0 次，`.as(LogicalTypeAnnotation.variantType(...))` 只存在于 1.12 基线的 fork 中。
 - Spark / Scala 固定 3.5 / 2.12，所有 gradle 命令显式 `-DsparkVersions=3.5 -DscalaVersion=2.12`。
 - 每卡独立 worktree；只 `git add` 具体路径；审查后 rebase main、主树 `git merge --ff-only`、清理 worktree；不碰其他 Agent 的改动。
@@ -44,38 +45,32 @@
 1. 移植过程中是否**悄悄带上了 1.9.1 之后的上游能力**（`MetadataUpdate`/`TableMetadata`/`TableOperations` 的新增方法）：带上了就会让写侧产出 1.9.1 读方读不了的元数据。
 2. `IndexManifest` 读兼容：v1/v2 都必须能读，且旧镜像读不了 v2 这件事要在文档里写清。
 3. 索引查询与全表扫描结果**逐行一致**（metric 必须对齐：EUCLIDEAN 用 L2 表达式做真值）。
-4. parquet/avro 降级后写入路径是否仍能建表/写 parquet（1.9.1 编译基线是 1.15.2 / 1.12.0）。
+4. 写入路径在 1.9.1 + 内部 1.15.2/1.12.0 下是否仍能建表/写 parquet（不再有降级动作，但要防顺手换版本）。
 5. 缓存与执行器故障下结果不变（丢缓存只影响速度）。
 
 ---
 
-## Task 0：可行性实验（不产出产品代码）
+## Task 0：可行性实验（已完成，2026-10-28）
 
-**Files:** 临时 worktree，只改 `gradle/libs.versions.toml`。
+**Files:** 临时 worktree（`iceberg-wt/191-base`、`iceberg-wt/2763`），不产出产品代码。
 
-**做法**：`git worktree add -b exp/191-base ../iceberg-wt/191-base apache-iceberg-1.9.1`，在 worktree 里把 `parquet = "1.13.1"`、`avro = "1.11.4"`，然后：
+**做法与结果**：
 
-```bash
-./gradlew :iceberg-core:compileJava :iceberg-parquet:compileJava -DsparkVersions=3.5 -DscalaVersion=2.12
-./gradlew :iceberg-parquet:test --tests "*Parquet*" -DsparkVersions=3.5 -DscalaVersion=2.12
-```
+1. 在 `apache-iceberg-1.9.1` 上把 `parquet = "1.13.1"`、`avro = "1.11.4"`：core 编译 exit 1，4 个 `TimestampNanos` / `timestampNanos` 缺失（`AvroSchemaUtil`、`TypeToSchema`、`SchemaToType`）。恢复原始依赖后编译 exit 0，`:iceberg-parquet:test` 516 项通过。
+2. 读厂内 runtime jar 的 `pom.properties`：内部 shaded 依赖是 Avro **1.12.0** / Parquet **1.15.2**。所以"降到 Spark 自带版本"这个前提本身是错的——外部 jar 版本不改变 fat jar 内部字节码。
+3. 结论：**不降级**，保留内部 1.12.0 / 1.15.2，镜像不替换 Spark 的 parquet/avro。Task 0 到此收口，不再做 avro 1.11.4 的组合验证。
 
-- [ ] **记录结论**：编译是否通过；若失败，列出每个缺失符号（预期最可能来自 avro 1.11 与 1.12 的差异）。
-- [ ] **判定**：通过 → 进 Task 1；只在少数几处失败 → 评估补丁量，写清楚偏离上游的点；大面积失败 → 回到设计（可能必须保留 avro 1.12，只对齐 parquet）。
+## Task 1：确定移植方式（已完成，2026-10-28）
 
-## Task 1：确定移植方式（cherry-pick 试运行）
+**Files:** 实验树 `iceberg-wt/2763`（分支 `exp/2763-closure`，基线 `d2e4ba7e4`），不提交。
 
-**Files:** 临时 worktree（同上），不提交。
+**做法与结果**：不做 277 次 cherry-pick，改按固定快照做**文件级搬运**（`7447be7cd..c8dcf1a83` 的 278 个文件：265 新增整文件放入，13 个改造文件对 1.9.1 版三路合并）：
 
-**做法**：把索引工作的提交（作者 `wayblink`，243 个）按时间顺序 `cherry-pick --no-commit` 到 1.9.1 基线上，只看冲突面：
-
-```bash
-git log --reverse --format=%H --author=wayblink > /tmp/index-commits.txt
-# 逐个 cherry-pick --no-commit，记录冲突文件与冲突数
-```
-
-- [ ] **记录**：冲突集中在哪些文件、冲突总数、哪些是新增文件（预期 0 冲突）、哪些是那 3 个既有文件（`FileFormat.java`、`FormatModelRegistry.java`、`ReadBuilder.java`）。
-- [ ] **判定**：冲突可接受 → 采用 cherry-pick；冲突漫延到索引无关文件 → 改为"在 1.9.1 上重建 index 包"（Task 2 的两种实现路径二选一）。
+- 干净应用 7 个；冲突 4 个（`.gitignore`、`docs/docs/spark-procedures.md`、`gradle/libs.versions.toml`、`DeleteOrphanFilesSparkAction` 的两行 import）。
+- 1.9.1 里不存在的 2 个格式文件（`FormatModelRegistry`、`ReadBuilder`）按新增处理。
+- 按 §7.3 的决定（不移植 format-model、不支持 Lance），实际搬运面收敛到 **250 个文件**（278 减 `lance/` 22、`core/.../formats/` 2、`TestLance*` 4），另需补 1 个清单外文件（`DummyMetricsServlet`）与 5 处小改，逐条见 `docs/vector-index-deployment-guide.md` §7.4。
+- 编译：core、三个索引模块、spark 3.5、spark-extensions 全通（JDK 17，含测试代码）；测试 452 项模块级 + 197 项 spark 3.5 全绿，Lance 相关按决定排除。
+- 判定：**采用在 1.9.1 上按快照重建**，不做提交重放。Task 2–4 因此都变成"放入快照 + 按 §7.4 适配 + 跑测试"，而不是逐个解冲突。
 
 ## Task 2：`core` 索引层移植
 
@@ -92,7 +87,7 @@ git log --reverse --format=%H --author=wayblink > /tmp/index-commits.txt
 **Files:** `index-vector/`、`index-text/`、`index-spark/`（含 `settings.gradle`、`build.gradle` 的模块声明）。
 
 - [ ] **GREEN:** `./gradlew :iceberg-index-vector:test :iceberg-index-text:test -DsparkVersions=3.5 -DscalaVersion=2.12` 通过。
-- [ ] `index-spark` 依赖 `spark-hive_2.12` 与 parquet-column/hadoop；确认版本与镜像一致（parquet 1.13.1）。
+- [ ] `index-spark` 依赖 `spark-hive_2.12` 与 parquet-column/hadoop；parquet 跟随 runtime 内部 1.15.2（不降级），另需新增 `implementation project(':iceberg-parquet')`（§7.3 的 Parquet 直读）。
 - [ ] **注意**：`index-spark` 用到 `Tasks.foreach`、`CloseableIterable`；若 1.9.1 签名不同，在此处适配。
 
 ## Task 4：Spark 3.5 集成
@@ -130,7 +125,7 @@ git log --reverse --format=%H --author=wayblink > /tmp/index-commits.txt
 
 ## Task 8：文档收口
 
-- [ ] `docs/vector-index-deployment-guide.md` 第 7 章补上 Task 0/1 的实测结论（avro 1.11.4 是否可用、cherry-pick 冲突面）。
+- [x] `docs/vector-index-deployment-guide.md` 第 7 章已按 Task 0/1 实测重写（基线取厂内 `step-1.9`、278→250 文件闭包、4 个冲突、Parquet 直读取舍、Lance 不支持）。
 - [ ] 更新 `docs/sift-vector-index-benchmark.html` 的数据来源说明（基线变了）。
 - [ ] 按 SPEC 双份存档到 umem。
 
