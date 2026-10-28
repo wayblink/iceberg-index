@@ -31,6 +31,8 @@ under the License.
 
 ## Global Constraints
 
+- 用户最新顺序优先：先完成#2773全部开发，只跑必要小TDD/编译/格式/轻量代码复核；全core、跨模块完整回归、资源及10M100M性能、新镜像集群SQL验收全部移交后置#2778。开发就绪不等于最终验收，不因耗时大测试推迟下一开发卡。
+
 - 独立`card/2780`，工作树`/Users/jyxc-dz-0101035/workspace/iceberg-wt/2780`，基底`ede87bcd8ff2bfc8f1d3d67d20ac97038104865d`。只add具体文件，不自动merge/push main。
 - C当前IVF的P为独立对象图S，不人为长期保留已解码的U；D才持U+M，届时必须完整记U及数组头。HNSW图/映射、FLAT entries/字节分别按实际引用计算。
 - 保持payload编码/manifest格式，不重建旧索引、不强制重写旧manifest。保留IndexBlob/IndexEntry公开复制合同。

@@ -100,6 +100,8 @@ workingSetBytes(FileIO io, List<IndexFile> files, IndexAdapter adapter, String o
 
 ## 5. TDD实施顺序
 
+**用户最新执行节奏：先完成#2773全部开发，耗时大测试统一后置。** 以下开发步骤仅跑必要的目标单测、编译/格式及轻量代码复核；E4全suite、完整Spark/集群/资源与性能测量移交统一后置的#2778，不在E1–E3间反复启动。不得将后置项记为pass，也不等这些耗时作业完成才开始D/F/G/H开发。发布/部署/最终关卡仍需真实验收，未经授权不合main。
+
 ### E1: owned元数据与缓存根下界
 
 - [ ] 保留现有正式`TestIndexCacheMemory.cacheRootChargeIncludesLongKeyAndOwnerStorage`，先将其接到真实R及Cache-root oracle，禁止跳过。
