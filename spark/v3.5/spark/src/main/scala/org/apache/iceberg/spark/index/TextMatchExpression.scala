@@ -46,8 +46,11 @@ case class TextMatchExpression(
 
   override def eval(input: InternalRow): Any = {
     score.eval(input) match {
+      // a null document or query scores nothing, and SQL does not answer a comparison against an
+      // unknown with false: the row is filtered out either way, but the value it projects is unknown
+      case null => null
       case value: Double => value > 0.0
-      case _ => false
+      case _ => null
     }
   }
 

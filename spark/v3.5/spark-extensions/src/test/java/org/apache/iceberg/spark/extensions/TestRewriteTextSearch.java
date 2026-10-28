@@ -99,6 +99,38 @@ class TestRewriteTextSearch {
   }
 
   @Test
+  public void matchOfANullDocumentIsUnknownNotFalse() {
+    String table = "db.docs_null_body";
+    spark.sql("CREATE NAMESPACE IF NOT EXISTS local.db");
+    spark.sql(String.format("CREATE TABLE local.%s %s", table, COLUMNS));
+    spark.sql(
+        String.format(
+            "INSERT INTO local.%s VALUES (1, 'the fox runs'), (2, NULL), (3, 'a quiet sun')",
+            table));
+    spark.sql(
+        String.format(
+            "CALL local.system.build_text_index(table => '%s', column => 'body')", table));
+
+    // the null row is the only row this reads, so the expression is only asked about a null
+    // document
+    List<Row> nulls =
+        spark
+            .sql(String.format("SELECT match(body, 'fox') FROM local.%s WHERE body IS NULL", table))
+            .collectAsList();
+    assertThat(nulls).hasSize(1);
+    // a null document holds no term, and SQL does not answer a comparison against it with false
+    assertThat(nulls.get(0).isNullAt(0)).isTrue();
+
+    // a filter still keeps only the row that holds the term
+    assertThat(
+            idsOf(
+                spark
+                    .sql(String.format("SELECT id FROM local.%s WHERE match(body, 'fox')", table))
+                    .collectAsList()))
+        .containsExactly(1L);
+  }
+
+  @Test
   public void saysSoWhenThereIsNoIndex() {
     String table = table("docs_no_text_index");
     assertThat(planOf(table, ranking(table))).doesNotContain("LocalRelation");
