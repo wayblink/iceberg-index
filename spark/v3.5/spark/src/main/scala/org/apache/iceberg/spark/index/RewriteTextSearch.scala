@@ -65,19 +65,37 @@ case class RewriteTextSearch(spark: SparkSession) extends Rule[LogicalPlan] {
   private val MaxMatchRows = 100000
 
   override def apply(plan: LogicalPlan): LogicalPlan = {
-    plan.transformDown {
+    // each rewritten search, with the node that now stands in its place: binding its score
+    // expressions needs the plan around that node, which the pass below cannot see from inside
+    val rewrittenSearches = collection.mutable.ListBuffer.empty[(LogicalPlan, BoundIndex)]
+
+    val rewritten = plan.transformDown {
       // the ranking form: a limit over a global sort, with the projection in between
       case node @ GlobalLimit(k, _) =>
         globalSort(node) match {
           case Some(sort) =>
-            rewrite(node, k, sort.order.head.child.asInstanceOf[TextScoreExpression])
-              .getOrElse(node)
+            val score = sort.order.head.child.asInstanceOf[TextScoreExpression]
+            rewrite(node, k, score) match {
+              case Some((replacement, bound)) =>
+                rewrittenSearches.append((replacement, bound))
+                replacement
+              case None => node
+            }
           case None => node
         }
 
       // the filter form: a predicate over the scan
       case filter @ Filter(matchExpression: TextMatchExpression, _) =>
-        rewriteFilter(filter, matchExpression).getOrElse(filter)
+        rewriteFilter(filter, matchExpression) match {
+          case Some((replacement, bound)) =>
+            rewrittenSearches.append((replacement, bound))
+            replacement
+          case None => filter
+        }
+    }
+
+    rewrittenSearches.foldLeft(rewritten) { case (current, (target, bound)) =>
+      bindPath(current, target, bound)._1
     }
   }
 
@@ -92,11 +110,11 @@ case class RewriteTextSearch(spark: SparkSession) extends Rule[LogicalPlan] {
     order.direction == Descending && order.child.isInstanceOf[TextScoreExpression]
   }
 
-  /** Rewrites a limit-over-sort node, or says it cannot. */
+  /** Rewrites a limit-over-sort node, or says it cannot, with the index it was bound to. */
   private def rewrite(
       node: LogicalPlan,
       k: Expression,
-      score: TextScoreExpression): Option[LogicalPlan] = {
+      score: TextScoreExpression): Option[(LogicalPlan, BoundIndex)] = {
     val limit = IndexRewriteSupport.foldableInt(k).getOrElse(return None)
     if (limit <= 0) {
       return None
@@ -119,7 +137,10 @@ case class RewriteTextSearch(spark: SparkSession) extends Rule[LogicalPlan] {
       return None
     }
 
-    val bound = bind(table, sparkTable, scan, score, column).getOrElse(return None)
+    val query = queryText(score).getOrElse(return None)
+
+    val bound =
+      bind(table, sparkTable, scan, score, column, query).getOrElse(return None)
     val snapshotId = bound.snapshotId
 
     // a text search is only answered from the snapshot it is bound to, so anything the index does
@@ -138,7 +159,6 @@ case class RewriteTextSearch(spark: SparkSession) extends Rule[LogicalPlan] {
       return None
     }
 
-    val query = queryText(score).getOrElse(return None)
     val hits = search(bound, snapshotId, query, limit)
     if (hits.isEmpty) {
       return None
@@ -150,19 +170,13 @@ case class RewriteTextSearch(spark: SparkSession) extends Rule[LogicalPlan] {
       return None
     }
 
-    val specialized = score.copy(definition = bound.definition, statistics = bound.statistics)
-    val newSort =
-      Sort(
-        Seq(SortOrder(specialized, Descending)),
-        true,
-        LocalRelation(scan.output, IndexRewriteSupport.internalRows(spark, rows)))
-    Some(node.withNewChildren(Seq(newSort)))
+    Some((rowsInPlaceOfScan(node, scan, rows), bound))
   }
 
-  /** Rewrites a filter node, or says it cannot. */
+  /** Rewrites a filter node, or says it cannot, with the index it was bound to. */
   private def rewriteFilter(
       filter: Filter,
-      matchExpression: TextMatchExpression): Option[LogicalPlan] = {
+      matchExpression: TextMatchExpression): Option[(LogicalPlan, BoundIndex)] = {
     val scan = IndexRewriteSupport.findIcebergScan(filter).getOrElse(return None)
     val sparkTable = IndexRewriteSupport.icebergTable(scan).getOrElse(return None)
     val table = sparkTable.table()
@@ -177,7 +191,11 @@ case class RewriteTextSearch(spark: SparkSession) extends Rule[LogicalPlan] {
       return None
     }
 
-    val bound = bind(table, sparkTable, scan, matchExpression.score, column).getOrElse(return None)
+    val query = queryText(matchExpression.score).getOrElse(return None)
+
+    val bound =
+      bind(table, sparkTable, scan, matchExpression.score, column, query)
+        .getOrElse(return None)
     val snapshotId = bound.snapshotId
 
     val dataFiles = IndexEntries.dataFiles(table, snapshotId).asScala.toSet
@@ -195,7 +213,6 @@ case class RewriteTextSearch(spark: SparkSession) extends Rule[LogicalPlan] {
     }
 
     // a filter asks for every matching row, and a score of zero is not a match
-    val query = queryText(matchExpression.score).getOrElse(return None)
     val hits =
       search(bound, snapshotId, query, Int.MaxValue).filter(hit => hit.score() > 0.0)
     if (hits.isEmpty) {
@@ -219,12 +236,78 @@ case class RewriteTextSearch(spark: SparkSession) extends Rule[LogicalPlan] {
       return None
     }
 
-    val specialized =
-      matchExpression.score.copy(definition = bound.definition, statistics = bound.statistics)
-    Some(
-      Filter(
-        matchExpression.copy(score = specialized),
-        LocalRelation(scan.output, IndexRewriteSupport.internalRows(spark, rows))))
+    Some((rowsInPlaceOfScan(filter, scan, rows), bound))
+  }
+
+  /** Replaces the scan with the rows the index returned, keeping what the plan put above it. */
+  private def rowsInPlaceOfScan(
+      node: LogicalPlan,
+      scan: org.apache.spark.sql.execution.datasources.v2.DataSourceV2Relation,
+      rows: Seq[Row]): LogicalPlan = {
+    val relation = LocalRelation(scan.output, IndexRewriteSupport.internalRows(spark, rows))
+    // the scan goes by identity, so the node replaced is the one this search read and no other
+    node.transformDown { case current if current eq scan => relation }
+  }
+
+  /**
+   * Binds the score expressions of one rewritten search to the statistics of its index.
+   *
+   * <p>A score is bound only where it names the column and the query of that index, so a plan that
+   * holds more than one search binds each to its own.
+   *
+   * <p>The binding reaches the nodes on the way down to the rewritten search as well as the ones
+   * inside it: a projection that asks for the score of a matched row sits above the filter that
+   * names the search, and an unbound score expression refuses to score at all rather than returning
+   * a wrong number.
+   *
+   * @return the rebuilt plan, and whether the rewritten search was in it
+   */
+  private def bindPath(
+      plan: LogicalPlan,
+      target: LogicalPlan,
+      bound: BoundIndex): (LogicalPlan, Boolean) = {
+    if (plan eq target) {
+      (bindScores(plan, bound), true)
+    } else {
+      var found = false
+      val children = plan.children.map { child =>
+        val (rewritten, inChild) = bindPath(child, target, bound)
+        found = found || inChild
+        rewritten
+      }
+
+      if (found) {
+        (bindNode(plan.withNewChildren(children), bound), true)
+      } else {
+        (plan, false)
+      }
+    }
+  }
+
+  /** Binds the score expressions of a subtree and of every node in it. */
+  private def bindScores(node: LogicalPlan, bound: BoundIndex): LogicalPlan = {
+    node.transformUp { case plan => bindNode(plan, bound) }
+  }
+
+  /**
+   * Binds the score expressions of one node.
+   *
+   * <p>The plan's own expression traversal reaches the expressions a node holds, not the ones inside
+   * them, and a score usually sits inside an alias of a projection. Descending through each
+   * expression is what reaches it.
+   */
+  private def bindNode(node: LogicalPlan, bound: BoundIndex): LogicalPlan = {
+    node.mapExpressions { expression =>
+      expression.transformDown {
+        case score: TextScoreExpression if answers(score, bound) =>
+          score.copy(definition = bound.definition, statistics = bound.statistics)
+      }
+    }
+  }
+
+  /** Whether a score expression is the one this index answers. */
+  private def answers(score: TextScoreExpression, bound: BoundIndex): Boolean = {
+    textColumn(score).contains(bound.column) && queryText(score).contains(bound.query)
   }
 
   /** The index of the column a text expression reads, bound to the snapshot being read. */
@@ -233,7 +316,8 @@ case class RewriteTextSearch(spark: SparkSession) extends Rule[LogicalPlan] {
       sparkTable: org.apache.iceberg.spark.source.SparkTable,
       scan: org.apache.spark.sql.execution.datasources.v2.DataSourceV2Relation,
       score: TextScoreExpression,
-      column: String): Option[BoundIndex] = {
+      column: String,
+      query: String): Option[BoundIndex] = {
     val index = VectorIndexes.findIndexOrNull(table, column, "text")
     if (index == null) {
       return None
@@ -270,7 +354,7 @@ case class RewriteTextSearch(spark: SparkSession) extends Rule[LogicalPlan] {
           return None
       }
 
-    Some(BoundIndex(snapshotId, definition, statistics, reader))
+    Some(BoundIndex(snapshotId, definition, statistics, reader, column, query))
   }
 
   /** Searches the index for the query of a score expression, which has to be a constant. */
@@ -327,11 +411,14 @@ case class RewriteTextSearch(spark: SparkSession) extends Rule[LogicalPlan] {
     }
   }
 
+  /** The index a search is answered from, and what its score expressions are matched by. */
   private case class BoundIndex(
       snapshotId: Long,
       definition: TextIndexDefinition,
       statistics: CorpusStatistics,
-      reader: IndexReader)
+      reader: IndexReader,
+      column: String,
+      query: String)
 
   private val EmptyRow: InternalRow = new GenericInternalRow(new Array[Any](0))
 }

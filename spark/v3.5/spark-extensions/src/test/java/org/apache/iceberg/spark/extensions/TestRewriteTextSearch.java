@@ -20,6 +20,7 @@ package org.apache.iceberg.spark.extensions;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.assertj.core.api.Assertions.within;
 
 import java.nio.file.Path;
 import java.util.List;
@@ -124,6 +125,93 @@ class TestRewriteTextSearch {
         .doesNotContain("LocalRelation");
   }
 
+  @Test
+  public void projectsTheScoreTheOrderingUsed() {
+    String table = tableWithIndex("docs_score_projected");
+
+    List<Row> rows =
+        spark
+            .sql(
+                String.format(
+                    "SELECT id, text_score(body, 'the fox') AS score FROM local.%s "
+                        + "ORDER BY text_score(body, 'the fox') DESC LIMIT 2",
+                    table))
+            .collectAsList();
+    assertThat(planOf(table, scoredRanking(table))).contains("LocalRelation");
+    assertThat(rows).hasSize(2);
+
+    // the function searches the same index, so it answers with the same documents and the same
+    // scores: a projection that lands in the wrong column answers with something else entirely
+    assertThat(idsOf(rows)).isEqualTo(idsOf(functionHits(table, 2)));
+    assertThat(rows.get(0).getDouble(1))
+        .as("the score of the best document")
+        .isCloseTo(functionHits(table, 2).get(0).getDouble(1), within(1e-9));
+  }
+
+  @Test
+  public void keepsTheColumnsOfTheProjectionInOrder() {
+    String table = tableWithIndex("docs_score_reordered");
+
+    // the score is asked for first and the document last, so a plan that answers with the scan's
+    // columns in their own order puts the document where the score should be
+    List<Row> rows =
+        spark
+            .sql(
+                String.format(
+                    "SELECT text_score(body, 'the fox') AS score, id, body FROM local.%s "
+                        + "ORDER BY text_score(body, 'the fox') DESC LIMIT 1",
+                    table))
+            .collectAsList();
+    assertThat(rows).hasSize(1);
+    Row best = rows.get(0);
+    List<Row> hits = functionHits(table, 1);
+    assertThat(best.getDouble(0))
+        .as("the score is a score")
+        .isCloseTo(hits.get(0).getDouble(1), within(1e-9));
+    assertThat(best.getLong(1))
+        .as("the id is the id of that document")
+        .isEqualTo(hits.get(0).getLong(0));
+    assertThat(best.getString(2)).as("the document is the document").contains("fox");
+  }
+
+  @Test
+  public void projectsTheScoreOfAMatchedRow() {
+    String table = tableWithIndex("docs_score_matched");
+
+    List<Row> rows =
+        spark
+            .sql(
+                String.format(
+                    "SELECT id, text_score(body, 'the fox') AS score FROM local.%s "
+                        + "WHERE match(body, 'the fox')",
+                    table))
+            .collectAsList();
+    assertThat(rows).isNotEmpty();
+    assertThat(idsOf(rows)).containsExactlyInAnyOrderElementsOf(idsOf(functionHits(table, 100)));
+    assertThat(rows).allSatisfy(row -> assertThat(row.getDouble(1)).isPositive());
+  }
+
+  @Test
+  public void bindsEachSearchOfAPlanToItsOwnIndex() {
+    String first = tableWithIndex("docs_two_searches_a");
+    String second = tableWithIndex("docs_two_searches_b");
+
+    // two searches in one plan, each over its own index: binding both to one index would answer
+    // one of them with the other's corpus statistics
+    List<Row> rows =
+        spark
+            .sql(
+                String.format(
+                    "(SELECT id, text_score(body, 'the fox') AS score FROM local.%s "
+                        + "ORDER BY text_score(body, 'the fox') DESC LIMIT 2) UNION ALL "
+                        + "(SELECT id, text_score(body, 'dog') AS score FROM local.%s "
+                        + "ORDER BY text_score(body, 'dog') DESC LIMIT 2)",
+                    first, second))
+            .collectAsList();
+    assertThat(rows).hasSize(4);
+    assertThat(rows).allSatisfy(row -> assertThat(row.getDouble(1)).isPositive());
+  }
+
   /** Creates the table without an index. */
   private static String table(String name) {
     String table = "db." + name;
@@ -144,6 +232,28 @@ class TestRewriteTextSearch {
   private static String ranking(String table) {
     return String.format(
         "SELECT id FROM local.%s ORDER BY text_score(body, 'the fox') DESC LIMIT 2", table);
+  }
+
+  private static String scoredRanking(String table) {
+    return String.format(
+        "SELECT id, text_score(body, 'the fox') AS score FROM local.%s "
+            + "ORDER BY text_score(body, 'the fox') DESC LIMIT 2",
+        table);
+  }
+
+  private static List<Long> idsOf(List<Row> rows) {
+    return rows.stream().map(row -> row.getLong(0)).collect(java.util.stream.Collectors.toList());
+  }
+
+  /** The hits of the table-valued function for the same query, with their scores. */
+  private static List<Row> functionHits(String table, int limit) {
+    return spark
+        .sql(
+            String.format(
+                "SELECT CAST(get_json_object(row, '$.id') AS bigint) AS id, score FROM "
+                    + "text_index_search('local.%s', 'body', 'the fox', %d) ORDER BY score DESC",
+                table, limit))
+        .collectAsList();
   }
 
   private static String filtering(String table) {
