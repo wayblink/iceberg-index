@@ -127,7 +127,7 @@ public final class BruteforceKernel implements VectorKernel {
 
   @Override
   public List<IndexEntry> entries(ByteBuffer payload) {
-    return decodeEntries(payload).entries;
+    return ImmutableList.copyOf(decodeEntries(payload).entries);
   }
 
   private DecodedEntries decodeEntries(ByteBuffer payload) {
@@ -164,7 +164,7 @@ public final class BruteforceKernel implements VectorKernel {
         retainedPayloadBytes += PreparedStructureSize.bytes(payloadLength);
       }
 
-      return new DecodedEntries(ImmutableList.copyOf(entries), retainedPayloadBytes);
+      return new DecodedEntries(entries, retainedPayloadBytes);
     } catch (IOException e) {
       throw new UncheckedIOException("Failed to decode vector index entries", e);
     }
@@ -191,10 +191,13 @@ public final class BruteforceKernel implements VectorKernel {
   }
 
   private static long preparedBytes(int count, long payloadBytes, long dictionaryBytes) {
-    // Both dataFile and payload references are fields, even though the path is shared.
+    // The private ArrayList was allocated with exactly count slots. The non-static searcher also
+    // retains its kernel and scoring object; the metric enum is shared static state.
     return PreparedStructureSize.references(count)
-        + PreparedStructureSize.object(2L * PreparedStructureSize.REFERENCE_BYTES)
+        + PreparedStructureSize.object(2L * Integer.BYTES + PreparedStructureSize.REFERENCE_BYTES)
         + PreparedStructureSize.object(2L * PreparedStructureSize.REFERENCE_BYTES + Long.BYTES)
+        + PreparedStructureSize.object(Integer.BYTES + PreparedStructureSize.REFERENCE_BYTES)
+        + PreparedStructureSize.object(PreparedStructureSize.REFERENCE_BYTES)
         + (long) count
             * PreparedStructureSize.object(Long.BYTES + 2L * PreparedStructureSize.REFERENCE_BYTES)
         + payloadBytes
@@ -247,7 +250,7 @@ public final class BruteforceKernel implements VectorKernel {
 
     @Override
     public long estimatedBytes() {
-      return bytes;
+      return VectorMemoryEstimates.knownBytes(bytes);
     }
   }
 

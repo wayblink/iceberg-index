@@ -20,17 +20,24 @@ package org.apache.iceberg.index.vector;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
+import com.github.jelmerk.knn.DistanceFunction;
 import com.github.jelmerk.knn.hnsw.HnswIndex;
 import java.io.ByteArrayOutputStream;
 import java.io.DataOutputStream;
+import java.lang.reflect.Array;
 import java.lang.reflect.Field;
 import java.lang.reflect.Modifier;
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.IdentityHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.ArrayBlockingQueue;
+import java.util.concurrent.atomic.AtomicReferenceArray;
+import java.util.concurrent.locks.ReentrantLock;
 import java.util.function.IntFunction;
+import java.util.stream.Stream;
 import org.apache.iceberg.index.IndexAdapter;
 import org.apache.iceberg.index.IndexEntry;
 import org.apache.iceberg.index.vector.VectorIndexDefinition.Metric;
@@ -41,6 +48,8 @@ import org.apache.iceberg.relocated.com.google.common.collect.Lists;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.Arguments;
+import org.junit.jupiter.params.provider.MethodSource;
 import org.junit.jupiter.params.provider.ValueSource;
 
 /**
@@ -58,6 +67,228 @@ class TestPreparedStructureSize {
   @BeforeAll
   static void registerVectorIndexType() {
     VectorIndexTypes.register();
+  }
+
+  @ParameterizedTest
+  @MethodSource("reachableFixtures")
+  void estimatesCoverIndependentReachableRootAndArrayReceipt(
+      VectorStructure structure, VectorQuantizer quantizer, int count) throws Exception {
+    VectorIndexAdapter adapter =
+        sizedAdapter(
+            structure,
+            quantizer,
+            129,
+            structure == VectorStructure.FLAT
+                ? Map.of()
+                : structure == VectorStructure.HNSW
+                    ? Map.of("max-m", "8")
+                    : quantizer == VectorQuantizer.RABITQ
+                        ? Map.of("nlist", "8", "nprobe", "1", "rabitq-bits", "2")
+                        : Map.of("nlist", "8", "nprobe", "1"));
+    IndexAdapter.PreparedSearch prepared = prepare(adapter, count, 129, i -> "中文");
+    assertThat(prepared.estimatedBytes())
+        .as("independent lower receipt for %s/%s/%s", structure, quantizer, count)
+        .isGreaterThanOrEqualTo(reachableLowerBound(prepared, new IdentityHashMap<>()));
+  }
+
+  static Stream<Arguments> reachableFixtures() {
+    return Stream.of(0, 1, 33)
+        .flatMap(
+            count ->
+                Stream.of(
+                    Arguments.of(VectorStructure.FLAT, VectorQuantizer.NONE, count),
+                    Arguments.of(VectorStructure.HNSW, VectorQuantizer.NONE, count),
+                    Arguments.of(VectorStructure.IVF, VectorQuantizer.NONE, count),
+                    Arguments.of(VectorStructure.IVF, VectorQuantizer.RABITQ, count)));
+  }
+
+  private static long reachableLowerBound(Object instance, Map<Object, Boolean> seen)
+      throws Exception {
+    if (instance == null || instance instanceof Enum<?> || seen.put(instance, true) != null) {
+      return 0;
+    }
+    Class<?> type = instance.getClass();
+    if (type.isArray()) {
+      int width =
+          type.getComponentType() == long.class ? 8 : type.getComponentType() == byte.class ? 1 : 4;
+      long bytes = retainedArrayBytes((long) Array.getLength(instance) * width);
+      if (instance instanceof Object[]) {
+        for (Object child : (Object[]) instance) {
+          bytes += reachableLowerBound(child, seen);
+        }
+      }
+      return bytes;
+    }
+    if (instance instanceof String) {
+      String value = (String) instance;
+      return 24
+          + retainedArrayBytes(value.length() * (value.chars().anyMatch(c -> c > 255) ? 2L : 1L));
+    }
+    if (instance instanceof Long) {
+      return 24;
+    }
+    if (instance instanceof AtomicReferenceArray<?>) {
+      AtomicReferenceArray<?> nodes = (AtomicReferenceArray<?>) instance;
+      long bytes = 16 + retainedArrayBytes(nodes.length() * 4L);
+      for (int i = 0; i < nodes.length(); i++) {
+        bytes += reachableLowerBound(nodes.get(i), seen);
+      }
+      return bytes;
+    }
+    if (instance instanceof ArrayBlockingQueue<?>) {
+      ArrayBlockingQueue<?> queue = (ArrayBlockingQueue<?>) instance;
+      long bytes =
+          48 + retainedArrayBytes((queue.size() + queue.remainingCapacity()) * 4L) + 48 + 48;
+      for (Object item : queue.toArray()) {
+        bytes += reachableLowerBound(item, seen);
+      }
+      return bytes;
+    }
+    if (instance instanceof List<?>) {
+      List<?> list = (List<?>) instance;
+      // All private decoded lists use the exact serialized count as ArrayList capacity.
+      long bytes = 24 + retainedArrayBytes(list.size() * 4L);
+      for (Object item : list) {
+        bytes += reachableLowerBound(item, seen);
+      }
+      return bytes;
+    }
+    if (instance instanceof ReentrantLock) {
+      return 48;
+    }
+    if (instance instanceof HashMap<?, ?>) {
+      assertThat((Map<?, ?>) instance).isEmpty();
+      return 48;
+    }
+    if (!type.getName().startsWith("org.apache.iceberg.index.")
+        && !type.getName().startsWith("com.github.jelmerk.knn.")
+        && !type.getName().startsWith("org.eclipse.collections.impl.")) {
+      return 0;
+    }
+    long fields = 0;
+    long children = 0;
+    for (Class<?> current = type; current != Object.class; current = current.getSuperclass()) {
+      for (Field field : current.getDeclaredFields()) {
+        if (!Modifier.isStatic(field.getModifiers())) {
+          Class<?> fieldType = field.getType();
+          if (!fieldType.isPrimitive()) {
+            field.setAccessible(true);
+            fields += 4;
+            children += reachableLowerBound(field.get(instance), seen);
+          } else {
+            fields +=
+                fieldType == long.class || fieldType == double.class
+                    ? 8
+                    : fieldType == boolean.class || fieldType == byte.class ? 1 : 4;
+          }
+        }
+      }
+    }
+    return ((12 + fields + 7) / 8 * 8) + children;
+  }
+
+  @Test
+  void unsupportedLibraryStateIsUnknownRatherThanPartiallyCharged() throws Exception {
+    VectorIndexAdapter graph =
+        sizedAdapter(VectorStructure.HNSW, VectorQuantizer.NONE, 16, Map.of("max-m", "8"));
+    IndexAdapter.PreparedSearch prepared = prepare(graph, 1, 16, i -> "a");
+    HnswIndex<?, ?, ?, ?> index = (HnswIndex<?, ?, ?, ?>) field(prepared, "index");
+    Field distance = index.getClass().getDeclaredField("distanceFunction");
+    distance.setAccessible(true);
+    distance.set(index, new CapturingDistance());
+    ByteArrayOutputStream graphBytes = new ByteArrayOutputStream();
+    index.save(graphBytes);
+    ByteArrayOutputStream payload = new ByteArrayOutputStream();
+    try (DataOutputStream out = new DataOutputStream(payload)) {
+      VectorPayloads.writeHeader(out, HnswlibKernel.NAME, 1);
+      out.writeInt(graphBytes.size());
+      out.write(graphBytes.toByteArray());
+      out.writeInt(1);
+      out.writeUTF("a");
+      out.writeInt(1);
+      out.writeInt(0);
+      out.writeLong(0);
+    }
+    IndexAdapter.PreparedSearch loaded =
+        graph.prepareAuxiliary(ByteBuffer.wrap(payload.toByteArray()));
+    assertThat(loaded.estimatedBytes()).isZero();
+    assertThat(loaded.search(ByteBuffer.wrap(graph.encodeVector(new float[16])), 1)).hasSize(1);
+  }
+
+  private static class CapturingDistance implements DistanceFunction<float[], Float> {
+    private final byte[] retained = new byte[4096];
+
+    @Override
+    public Float distance(float[] first, float[] second) {
+      return (float) new VectorScoring(Metric.EUCLIDEAN).score(first, second) + retained[0];
+    }
+  }
+
+  @Test
+  void sharedQuantizerArraysAreChargedByIdentity() throws Exception {
+    RaBitQQuantizer first = RaBitQQuantizer.blank(129, 2);
+    RaBitQQuantizer second = RaBitQQuantizer.blank(129, 2);
+    for (String name : List.of("center", "signs")) {
+      Field field = RaBitQQuantizer.class.getDeclaredField(name);
+      field.setAccessible(true);
+      field.set(second, field.get(first));
+    }
+    PreparedStructureSize.Receipt receipt = new PreparedStructureSize.Receipt();
+    // Two 48-byte quantizers, one 536-byte center and one 1040-byte padded signs array.
+    assertThat(first.estimatedBytes(receipt) + second.estimatedBytes(receipt)).isEqualTo(1672);
+  }
+
+  @Test
+  void emptyFlatChargesSearcherKernelScoringAndListRoots() {
+    VectorIndexAdapter flat =
+        sizedAdapter(VectorStructure.FLAT, VectorQuantizer.NONE, 16, Map.of());
+    IndexAdapter.PreparedSearch prepared = prepare(flat, 0, 16, i -> "a");
+    // Independent compressed-reference lower bound: searcher 32, kernel 24, scoring 16,
+    // ArrayList root 24 and zero-length backing array 16. Static enum state is shared.
+    assertThat(prepared.estimatedBytes()).isGreaterThanOrEqualTo(112);
+  }
+
+  @Test
+  void graphChargesEveryActualConnectionLayer() throws Exception {
+    VectorIndexAdapter graph =
+        sizedAdapter(VectorStructure.HNSW, VectorQuantizer.NONE, 129, Map.of("max-m", "2"));
+    IndexAdapter.PreparedSearch prepared = prepare(graph, 1, 129, i -> "a");
+    Object index = field(prepared, "index");
+    AtomicReferenceArray<?> nodes = (AtomicReferenceArray<?>) field(index, "nodes");
+    Object[] connections = (Object[]) field(nodes.get(0), "connections");
+    Object[] expanded = (Object[]) Array.newInstance(connections.getClass().getComponentType(), 80);
+    for (int layer = 0; layer < expanded.length; layer++) {
+      expanded[layer] = connections[0].getClass().getConstructor(int.class).newInstance(32);
+    }
+    Field connectionField = nodes.get(0).getClass().getDeclaredField("connections");
+    connectionField.setAccessible(true);
+    connectionField.set(nodes.get(0), expanded);
+    ByteArrayOutputStream serialized = new ByteArrayOutputStream();
+    ((HnswIndex<?, ?, ?, ?>) index).save(serialized);
+    ByteArrayOutputStream encoded = new ByteArrayOutputStream();
+    try (DataOutputStream out = new DataOutputStream(encoded)) {
+      VectorPayloads.writeHeader(out, HnswlibKernel.NAME, 1);
+      out.writeInt(serialized.size());
+      out.write(serialized.toByteArray());
+      out.writeInt(1);
+      out.writeUTF("a");
+      out.writeInt(1);
+      out.writeInt(0);
+      out.writeLong(0);
+    }
+    prepared = graph.prepareAuxiliary(ByteBuffer.wrap(encoded.toByteArray()));
+    index = field(prepared, "index");
+    nodes = (AtomicReferenceArray<?>) field(index, "nodes");
+    connections = (Object[]) field(nodes.get(0), "connections");
+    // Count each real list and allocated int backing independently; no average upper level.
+    long lowerBound = 32 + 24 + 24 + 16 + 32 + retainedArrayBytes(129L * 4);
+    lowerBound += retainedArrayBytes(nodes.length() * 4L);
+    lowerBound += retainedArrayBytes(connections.length * 4L);
+    for (Object connection : connections) {
+      int[] items = (int[]) field(connection, "items");
+      lowerBound += 24 + retainedArrayBytes(items.length * 4L);
+    }
+    assertThat(prepared.estimatedBytes()).isGreaterThanOrEqualTo(lowerBound);
   }
 
   @Test

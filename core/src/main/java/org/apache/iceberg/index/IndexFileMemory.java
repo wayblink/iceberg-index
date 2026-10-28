@@ -51,7 +51,8 @@ public final class IndexFileMemory {
     Preconditions.checkArgument(
         builder.preparedBytes >= 0, "Invalid index prepared bytes: %s", builder.preparedBytes);
     Preconditions.checkArgument(
-        builder.payloadBytes <= Long.MAX_VALUE - builder.preparedBytes,
+        (builder.modelVersion != null && builder.modelVersion == 2)
+            || builder.payloadBytes <= Long.MAX_VALUE - builder.preparedBytes,
         "Index retained bytes overflow: payload=%s, prepared=%s",
         builder.payloadBytes,
         builder.preparedBytes);
@@ -99,7 +100,10 @@ public final class IndexFileMemory {
     return payloadBytes;
   }
 
-  /** Returns the prepared search structure estimate in bytes, excluding the payload buffer. */
+  /**
+   * Returns the prepared-state estimate. Model 2 includes all owned arrays reachable from the
+   * searcher; the encoded payload length is diagnostic, not an additional resident charge.
+   */
   public long preparedBytes() {
     return preparedBytes;
   }

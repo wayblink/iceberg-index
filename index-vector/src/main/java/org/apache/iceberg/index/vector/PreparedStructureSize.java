@@ -18,6 +18,7 @@
  */
 package org.apache.iceberg.index.vector;
 
+import java.lang.reflect.Array;
 import java.util.Collections;
 import java.util.IdentityHashMap;
 import java.util.Set;
@@ -27,9 +28,10 @@ import org.apache.iceberg.relocated.com.google.common.base.Preconditions;
  * Structural estimates of retained heap on a 64-bit JVM with compressed references, 8-byte
  * alignment and compact strings. These are not heap measurements or allocation-peak limits.
  *
- * <p>Payload buffers and query scratch space are excluded. Object headers and collection slack are
- * conservative approximations; different JVM layouts and disabled compact strings can change the
- * result. References belong to their containing objects or arrays, not to their targets.
+ * <p>External input buffers and query scratch are excluded, but owned arrays are included. The
+ * 16-byte object-header allowance rounds up the supported HotSpot 17 header; collection backing
+ * capacities must be taken from the actual representation. References belong to their containing
+ * objects or arrays, not to their targets. Callers must gate estimates on the runtime profile.
  */
 final class PreparedStructureSize {
 
@@ -37,7 +39,6 @@ final class PreparedStructureSize {
   static final int REFERENCE_BYTES = 4;
   static final int ALIGNMENT = 8;
   private static final int STRING_OBJECT_BYTES = 24;
-  private static final int MAP_ENTRY_BYTES = 40;
 
   private PreparedStructureSize() {}
 
@@ -94,13 +95,6 @@ final class PreparedStructureSize {
     return total;
   }
 
-  /** Conservative hash-map allowance including table slack and separately retained keys/values. */
-  static long map(long entries, long keyBytes, long valueBytes) {
-    return object(4L * REFERENCE_BYTES + 2L * Integer.BYTES)
-        + array(2L * entries * REFERENCE_BYTES)
-        + entries * (MAP_ENTRY_BYTES + keyBytes + valueBytes);
-  }
-
   /** Object fields and retained arrays; incoming references are counted by the caller. */
   static long entry(long ownFields, long... arrays) {
     long total = object(ownFields);
@@ -115,6 +109,35 @@ final class PreparedStructureSize {
     return object(2L * REFERENCE_BYTES + 2L * Integer.BYTES)
         + array(elements * REFERENCE_BYTES)
         + elements * elementBytes;
+  }
+
+  /** Identity receipt for owned state; it does not traverse arbitrary objects. */
+  static final class Receipt {
+    private final Set<Object> seen = Collections.newSetFromMap(new IdentityHashMap<>());
+
+    long object(Object value, long fields) {
+      return value != null && seen.add(value) ? PreparedStructureSize.object(fields) : 0;
+    }
+
+    long array(Object value) {
+      if (value == null || !seen.add(value)) {
+        return 0;
+      }
+      Class<?> component = value.getClass().getComponentType();
+      int width =
+          !component.isPrimitive()
+              ? REFERENCE_BYTES
+              : component == byte.class || component == boolean.class
+                  ? 1
+                  : component == short.class || component == char.class
+                      ? 2
+                      : component == long.class || component == double.class ? 8 : 4;
+      return PreparedStructureSize.array((long) Array.getLength(value) * width);
+    }
+
+    long string(String value) {
+      return value != null && seen.add(value) ? PreparedStructureSize.string(value) : 0;
+    }
   }
 
   private static long align(long bytes) {

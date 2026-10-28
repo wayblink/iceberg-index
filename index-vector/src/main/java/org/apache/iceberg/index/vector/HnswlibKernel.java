@@ -61,9 +61,6 @@ public final class HnswlibKernel implements VectorKernel {
 
   private static final int FORMAT_VERSION = 1;
 
-  // Index, searcher, serializers, comparators, locks and empty map/queue objects.
-  private static final int INDEX_OVERHEAD_BYTES = 1024;
-
   private static final ProgressListener NO_PROGRESS = (workDone, max) -> {};
 
   /**
@@ -174,14 +171,7 @@ public final class HnswlibKernel implements VectorKernel {
     return VectorMemoryEstimates.result(
         this,
         ByteBuffer.wrap(payload.toByteArray()),
-        preparedBytes(
-            materialized.size(),
-            dictionaryBytes,
-            index.size(),
-            dimension,
-            index.getM(),
-            index.getMaxItemCount(),
-            processors),
+        preparedBytes(index, materialized.size(), dictionaryBytes, true),
         processors,
         Map.of(
             "mapping-count", (long) materialized.size(),
@@ -239,72 +229,32 @@ public final class HnswlibKernel implements VectorKernel {
       index.setEf(options.efSearch());
       long preparedBytes =
           preparedBytes(
+              index,
               mappingCount,
               PreparedStructureSize.distinctStrings(Arrays.asList(dataFiles)),
-              index.size(),
-              dimension,
-              index.getM(),
-              index.getMaxItemCount(),
-              Runtime.getRuntime().availableProcessors());
+              false);
       return new GraphSearcher(index, dataFiles, positions, mappingCount, preparedBytes);
     } catch (IOException e) {
       throw new UncheckedIOException("Failed to load the HNSW index payload", e);
     }
   }
 
-  /**
-   * Estimates a loaded hnswlib-core 1.1.0 graph without walking its private node graph.
-   *
-   * <p>Level zero allocates 2M ints per node. One additional M-sized layer is budgeted per node,
-   * including list objects and the connections reference array. The geometric level distribution
-   * has only 1/(M-1) upper layers per node on average, so this is deliberately conservative, not a
-   * measurement or a strict upper bound for unusual level distributions. JVM layout and primitive
-   * map capacity also introduce error; there is no guaranteed percentage error bound.
-   *
-   * <p>Node slots and the CPU-sized visited pool use allocated maxItemCount, not mapping length.
-   * Mapping arrays and distinct retained paths are charged separately and only once. Query scratch
-   * allocations and serialized payload buffers are excluded.
-   */
-  static long preparedBytes(
-      int mappingCount,
-      long dictionaryBytes,
-      int nodes,
-      int dimension,
-      int m,
-      int maxCount,
-      int processors) {
-    long listFields = Integer.BYTES + PreparedStructureSize.REFERENCE_BYTES;
-    long connections =
-        PreparedStructureSize.references(2)
-            + PreparedStructureSize.entry(
-                listFields, PreparedStructureSize.array(2L * m * Integer.BYTES))
-            + PreparedStructureSize.entry(
-                listFields, PreparedStructureSize.array((long) m * Integer.BYTES));
-    long item =
-        PreparedStructureSize.entry(
-            Long.BYTES + PreparedStructureSize.REFERENCE_BYTES,
-            PreparedStructureSize.floats(dimension));
-    long node =
-        PreparedStructureSize.object(
-                Integer.BYTES + Byte.BYTES + 2L * PreparedStructureSize.REFERENCE_BYTES)
-            + item
-            + connections;
-    long total = INDEX_OVERHEAD_BYTES + (long) nodes * node;
-    total += PreparedStructureSize.references(maxCount);
-    // ObjectIntHashMap stores boxed Long keys and primitive int values. A general hash-map
-    // allowance covers its open-addressing slack without inspecting the library's private tables.
-    total +=
-        PreparedStructureSize.map(nodes, PreparedStructureSize.object(Long.BYTES), Integer.BYTES);
-    total += PreparedStructureSize.references(mappingCount);
-    total += PreparedStructureSize.longs(mappingCount);
-    total += dictionaryBytes;
-
-    long bitset =
-        PreparedStructureSize.entry(
-            PreparedStructureSize.REFERENCE_BYTES, PreparedStructureSize.ints((maxCount >> 5) + 1));
-    total += (processors + 1L) * bitset;
-    total += PreparedStructureSize.references(processors);
-    return total;
+  /** Counts the allocated graph, mapping and non-static searcher's kernel state. */
+  private static long preparedBytes(
+      HnswIndex<?, ?, ?, ?> index, int mappingCount, long dictionaryBytes, boolean building) {
+    long graphBytes = HnswStructureSize.bytes(index, building);
+    if (graphBytes == 0) {
+      return 0;
+    }
+    return graphBytes
+        + PreparedStructureSize.object(
+            4L * PreparedStructureSize.REFERENCE_BYTES + Integer.BYTES + Long.BYTES)
+        + PreparedStructureSize.object(Integer.BYTES + 2L * PreparedStructureSize.REFERENCE_BYTES)
+        + PreparedStructureSize.object(3L * Integer.BYTES)
+        + PreparedStructureSize.object(PreparedStructureSize.REFERENCE_BYTES)
+        + PreparedStructureSize.references(mappingCount)
+        + PreparedStructureSize.longs(mappingCount)
+        + dictionaryBytes;
   }
 
   /** A loaded graph, which reports what it holds. */
@@ -330,7 +280,7 @@ public final class HnswlibKernel implements VectorKernel {
 
     @Override
     public long estimatedBytes() {
-      return bytes;
+      return VectorMemoryEstimates.knownBytes(bytes);
     }
 
     @Override

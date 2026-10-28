@@ -25,7 +25,6 @@ import java.io.DataOutputStream;
 import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.nio.ByteBuffer;
-import java.util.IdentityHashMap;
 import java.util.List;
 import java.util.Map;
 import org.apache.iceberg.index.IndexAdapter.PreparedSearch;
@@ -282,29 +281,39 @@ public final class IvfKernel implements VectorKernel {
    * bytes each where an unquantized entry holds a whole vector.
    */
   private long preparedBytes(Loaded loaded) {
-    long dictionaryBytes = 0;
-    long memberListsBytes = 0;
-    long entryBytes = entryBytes();
-    // Decoded entries share dictionary strings, regardless of the identity of the build inputs.
-    IdentityHashMap<String, Boolean> dataFiles = new IdentityHashMap<>();
+    PreparedStructureSize.Receipt receipt = new PreparedStructureSize.Receipt();
+    long bytes =
+        receipt.object(loaded, 4L * PreparedStructureSize.REFERENCE_BYTES)
+            + PreparedStructureSize.object(
+                2L * PreparedStructureSize.REFERENCE_BYTES + 2L * Integer.BYTES + Long.BYTES)
+            + PreparedStructureSize.object(PreparedStructureSize.REFERENCE_BYTES)
+            + receipt.array(loaded.centroids)
+            + receipt.array(loaded.listCenters)
+            + receipt.array(loaded.listQuantizers);
+    for (float[] centroid : loaded.centroids) {
+      bytes += receipt.array(centroid);
+    }
+    for (float[] center : loaded.listCenters) {
+      bytes += receipt.array(center);
+    }
+    // Each private ArrayList is constructed with exactly its serialized count as capacity.
+    bytes += PreparedStructureSize.nestedList(loaded.lists.size(), 0);
     for (List<IvfEntry> members : loaded.lists) {
-      memberListsBytes += PreparedStructureSize.nestedList(members.size(), entryBytes);
+      bytes += PreparedStructureSize.nestedList(members.size(), 0);
       for (IvfEntry entry : members) {
-        if (dataFiles.put(entry.dataFile, Boolean.TRUE) == null) {
-          dictionaryBytes += PreparedStructureSize.string(entry.dataFile);
-        }
+        bytes += receipt.object(entry, Long.BYTES + 4L * PreparedStructureSize.REFERENCE_BYTES);
+        bytes += receipt.string(entry.dataFile);
+        bytes += receipt.array(entry.vector);
+        bytes += receipt.array(entry.code);
+        bytes += receipt.array(entry.factors);
       }
     }
-
-    long quantizerBytes = 0;
     if (loaded.listQuantizers != null) {
       for (RaBitQQuantizer listQuantizer : loaded.listQuantizers) {
-        quantizerBytes += listQuantizer.estimatedBytes();
+        bytes += listQuantizer.estimatedBytes(receipt);
       }
     }
-
-    return preparedBytes(
-        loaded.centroids.length, memberListsBytes, dictionaryBytes, quantizerBytes);
+    return bytes;
   }
 
   private long preparedBytes(
@@ -358,7 +367,7 @@ public final class IvfKernel implements VectorKernel {
 
     @Override
     public long estimatedBytes() {
-      return bytes;
+      return VectorMemoryEstimates.knownBytes(bytes);
     }
 
     @Override
