@@ -42,6 +42,25 @@
 
 **需要校正的前提**：外部Spark Avro1.11.4/Parquet1.13.1与runtime内部shaded依赖是两层。保持Spark外部jar不替换，不要求把Iceberg内部依赖也强制降到那些版本。此前“厂内编译1.15.2、实际运行1.13.1”的推断不能仅凭容器外部jar目录成立。
 
+## 依赖设置的源码追踪（shai）
+
+本次只读检出：Spark `/data/workspace/spark`，commit `606d742b85bc34717ff36cc5d97cb57342f903bc`；Iceberg `/home/wanganyang/workspace/iceberg`，commit `d2e4ba7e483cc0996188a6a9e8548c1f39d8bf83`。没有修改它们的工作文件。
+
+| 层次 | 设置位置 | 实际值/作用 |
+| --- | --- | --- |
+| Spark外部依赖 | `pom.xml:143/161` | Parquet1.13.1、Avro1.11.4；dependencyManagement管理SQL模块的普通org.apache.*依赖 |
+| Spark引入Iceberg | `pom.xml:3906–3915`，profile `ndp-repo` | 当前代码引用`iceberg-spark-runtime-3.5_2.12:1.9.1-STEP-rc3`，排除所有传递依赖；不影响jar内部已经打包的类 |
+| Iceberg自己的版本目录 | `gradle/libs.versions.toml:30/77` | Avro1.12.0、Parquet1.15.2，与上游1.9.1的默认构建依赖一致 |
+| Iceberg模块使用依赖 | 根`build.gradle:347/397` | core以api使用Avro，data使用parquet-avro；版本来自上面的目录 |
+| 收集runtime依赖 | `spark/v3.5/build.gradle:237–249/285–286` | 引入Spark集成模块及其core/parquet等传递依赖，按runtimeClasspath生成shadow jar |
+| 私有包重定位 | 同文件`:302–306` | Avro→`org.apache.iceberg.shaded.org.apache.avro`，Parquet→`org.apache.iceberg.shaded.org.apache.parquet` |
+
+实际vendor rc1字节码也确认这一点：`TypeToSchema`调用shaded Avro的`timestampNanos()`；`Parquet$ReadBuilder`构造shaded `PlainParquetConfiguration`。因此不是只有pom属性而类调用仍指向外部旧包。
+
+注意当前Spark源码声明的是rc3，而此前基础镜像取出的是rc1。它们来自不同时期，不能声称rc1就是由上述当前检出构建的；但实际rc1内置版本与Iceberg版本目录匹配。
+
+结论：两个Java包命名空间并存，Spark的Maven版本选择不会改写已构建的Iceberg fat jar内部字节码。不能把这一组合说成“同一个Parquet编译1.15.2、运行却是1.13.1”。后续应维护厂内内部shading边界并保留Spark外部jar不变；这不保证所有新模块（例如Lance/JNI跨包接口）自动兼容，发布与运行验收仍必须做。
+
 ## 实测二：新实验树的编译与测试
 
 | 组合 | 操作 | 结果 |
