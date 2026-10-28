@@ -124,8 +124,8 @@ SET spark.iceberg.index.vector.over-sample = 100;
 - 仓库版本号沿用 Iceberg 的（回溯到 1.9.1 基线后是 `1.9.1` 一线），**不要另起版本号体系**，否则依赖解析与 revapi 都会乱；对外用带来源的后缀区分（见下一条）。
 - Scala 版本必须与厂内 Spark 发行版一致：`_2.12`（仓库默认 `defaultScalaVersion=2.12`，厂内 Spark 也是 2.12）。
 - 发布产物只有一个：`iceberg-spark-runtime-3.5_2.12-<version>.jar`（shadow jar，已包含 `iceberg-index-vector`、`iceberg-index-text`、`iceberg-index-spark`）。
-- **版本号不得伪装成上游版本**：它是「上游 1.9.1 + 索引能力」，公开发布时用带来源的后缀（如 `1.9.1-shb.1`），并在发布说明里写明基线是 1.9.1、不支持 variant 类型（见 §7.1）。
-- 镜像 tag 建议 `<日期><序号>`（如 `20261027a`），并在镜像 LABEL 里写入 jar 的 git commit，便于回答"这个镜像到底是哪版"。
+- **版本号不得伪装成上游版本**：它是「厂内 1.9.1 + 索引能力」，由分支上的 `version.txt` 决定，取 `1.9.1-shb.N`（递增与发布说明的要求见 §7.8 决定 C），并在发布说明里写明基线是厂内 `step-1.9` 的哪个 commit、不支持 variant 类型。
+- 镜像 tag 建议 `<日期><序号>`（如 `20261027a`），并在镜像 LABEL 里写入源码 commit、jar 的 sha256 与内部 shaded 的 Avro/Parquet 版本（§7.8 决定 D），便于回答"这个镜像到底是哪版"。
 
 ---
 
@@ -321,6 +321,20 @@ docker push hub.i.basemind.com/spark/sparkann-e2e:<tag>
 ### 7.7 基线变更后的重新验证范围
 
 最小集合是四项：编译与单测（`core` 索引、`index-vector`、`index-text`、`spark/v3.5` 的 `*Index*`/`*Vector*`）；集群六条验收（`list_indexes` 返回全部行 → `build_vector_index` 成功且 `index_build_status` 终态正确 → `ORDER BY vec_distance` 走索引且与 L2 全扫逐行一致 → `check_indexes` 无 needs_rebuild → 杀掉一个 executor 后结果逐行一致 → `index_cache_status` 可读且不 OOM）；10M 基准回归（`iceberg-tools` 的 `vector-benchmark`，Parquet，量化 1/2/3/4bit，与本章引用的数字对比，退化必须定位到改动）；镜像重建与版本一致性检查。100M 待 10M 通过后再决定。
+
+### 7.8 收口决定（分支、发布命名、补丁风险）
+
+§7.1–7.5 是实测，这一节由实测推出四个决定，每个都写清"不这么做会怎样"。
+
+**决定 A：移植方式 = 按固定快照做文件级搬运，不重放提交。** 依据是 §7.2 的冲突数据（13 个改造文件里 4 个小冲突、7 个干净）。反例有两头：重放 277 个提交，每个提交都要在 1.9.1 的上下文里解一次冲突，而同样这几个文件会被反复碰到（`build.gradle`、`settings.gradle`、`spark/v3.5/build.gradle`），冲突不是解一次就完；反过来"纯手写重建 index 包"要重写约 5000 行实现加全部测试，既无法与 fork 对账（以后 fork 前进就再也合不回来），也丢掉已经通过的 452 项测试。
+
+**决定 B：长期维护一条 `step-1.9-index` 分支，基线跟厂内 `step-1.9`，不跟上游。** 厂内 `step-1.9` 每次前进时在该分支上 `git rebase step-1.9`，冲突面按 §7.2 预期仍集中在那 13 个改造文件；rebase 后必须重跑 §7.5 的单测矩阵。不这么做的反例是"把索引改动做成一个 250 文件的 patch 序列发给厂内"：厂内一旦改了 `step-1.9`，patch 会静默不再 apply，而没有一个分支去承接 rebase，问题要等到下次发版才暴露。**明确不做的事**：不把这条分支 rebase 到我们主仓的 `main`（1.12 基线），那等于把新基线带回 1.9.1。
+
+**决定 C：发布物命名由 `version.txt` 决定，取 `1.9.1-shb.N`。** 厂内 `step-1.9` 自己就是用 `version.txt` 定版本的（当前是 `1.9.1-STEP-rc3`），`build.gradle` 的 `getProjectVersion()` 先读 `version.txt`、读不到才从 git tag 推 MAJOR.MINOR+1-SNAPSHOT。所以回溯分支只需把 `version.txt` 改成 `1.9.1-shb.N`，产物自然是 `iceberg-spark-runtime-3.5_2.12-1.9.1-shb.N`，Scala 固定 `_2.12`。N 的规则：每个对外发布（镜像或仓库制品）递增 1，同一 N 不得重复发布；发布说明必须写三件事——基线 `1.9.1`（厂内 `step-1.9` 哪个 commit）、**不支持 variant**、**仅 Spark 3.5 / Scala 2.12**。不这么做的反例：靠 git tag 推版本会得到 `1.10.0-SNAPSHOT` 这种"看起来比厂内还新"的号，运维在集群里看到两个 Iceberg 版本时无法判断谁是我们的构建。
+
+**决定 D：厂内补丁风险从"未知"降级为"有源码"，但仍要记录制品与源码的对应关系。** 源码已在 `gitlab.basemind.com/storage/iceberg` 的 `step-1.9`，不再需要"向厂内索取补丁清单"。剩下的风险是**制品与源码的对应关系没有记录**：基础镜像里那个 `1.9.1-STEP-rc1` jar 的 manifest 没有 commit 信息，而当前源码声明的版本号是 `1.9.1-STEP-rc3`，两者不是同一个构建。所以每份发布记录必须写：源码 commit、jar 的 sha256、jar 内 `pom.properties` 里的 shaded Avro/Parquet 版本。验收以厂内 jar 的实际行为为准，不以"类集合一致"为由跳过集群验收。
+
+**附带决定：Spark 编译基线先用 catalog 里的 3.5.5，不用厂内 `3.5.7-STEP` 私有构建。** 理由：`libs.versions.toml` 里的 `spark35 = "3.5.5"` 能直接解析，厂内 3.5.7-STEP 只在厂内仓库；编译期 API 差异由集群验收兜住（若出现编译期缺符号，再把厂内 jar 装进本地 maven 并改用）。不这么做的反例是把私有构建塞进公共依赖解析，任何外部协作者（包括 CI）都无法构建。
 
 ## 8. 已知缺口（上线前必须知道）
 
