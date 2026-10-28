@@ -25,7 +25,7 @@ import java.io.DataOutputStream;
 import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.nio.ByteBuffer;
-import java.util.IdentityHashMap;
+import java.util.Arrays;
 import java.util.List;
 import java.util.Map;
 import org.apache.iceberg.index.IndexAdapter.PreparedSearch;
@@ -42,6 +42,11 @@ import org.apache.iceberg.relocated.com.google.common.collect.Lists;
  * <p>This is the reference the other structures are measured against: it answers exactly, so a
  * recall figure for an approximate kernel is only meaningful next to it. It is also the simplest
  * kernel, which is what makes it the one to read first when adding another.
+ *
+ * <p>A search reads each entry where it lies in the payload it was prepared from and keeps a
+ * bounded top-k of the scores, so it allocates for the results it was asked for rather than for a
+ * result object per entry and a sort over all of them. The payload keeps its entry-bearing form and
+ * stays readable by the version that wrote it.
  */
 public final class BruteforceKernel implements VectorKernel {
 
@@ -50,6 +55,25 @@ public final class BruteforceKernel implements VectorKernel {
   public static final String NAME = "bruteforce";
 
   private static final int FORMAT_VERSION = 1;
+
+  /** The fixed part of an entry: the data file index, the row position and the payload length. */
+  private static final int RECORD_PREFIX = 2 * Integer.BYTES + Long.BYTES;
+
+  /** The fixed part of a value: the format version and the dimension. */
+  private static final int VALUE_PREFIX = 2 * Integer.BYTES;
+
+  /** The retained fields of the loaded payload, in the layout the estimate describes. */
+  private static final long LOADED_FIELDS =
+      2L * PreparedStructureSize.REFERENCE_BYTES + 2L * Integer.BYTES;
+
+  /** The retained fields of the searcher: the payload it reads, the dimension and the scoring. */
+  private static final long SEARCHER_FIELDS =
+      PreparedStructureSize.REFERENCE_BYTES
+          + 2L * Integer.BYTES
+          + PreparedStructureSize.REFERENCE_BYTES
+          + Long.BYTES;
+
+  private static final long SCORING_FIELDS = PreparedStructureSize.REFERENCE_BYTES;
 
   private final int dimension;
   private final VectorScoring scoring;
@@ -85,7 +109,6 @@ public final class BruteforceKernel implements VectorKernel {
     // says so rather than letting the hint disappear silently
     Preconditions.checkNotNull(entries, "Index entries are null");
     List<String> dataFiles = VectorPayloads.dataFilesOf(entries);
-    long retainedPayloadBytes = 0;
     ByteArrayOutputStream bytes = new ByteArrayOutputStream();
     try (DataOutputStream out = new DataOutputStream(bytes)) {
       VectorPayloads.writeHeader(out, NAME, FORMAT_VERSION);
@@ -105,24 +128,22 @@ public final class BruteforceKernel implements VectorKernel {
         byte[] payload = entry.payload();
         out.writeInt(payload.length);
         out.write(payload);
-        retainedPayloadBytes =
-            Math.addExact(retainedPayloadBytes, PreparedStructureSize.bytes(payload.length));
       }
     } catch (IOException e) {
       throw new UncheckedIOException("Failed to encode vector index entries", e);
     }
-    long dictionaryBytes = VectorMemoryEstimates.dictionaryBytes(dataFiles);
+
+    byte[] encoded = bytes.toByteArray();
     return VectorMemoryEstimates.result(
         this,
-        ByteBuffer.wrap(bytes.toByteArray()),
-        preparedBytes(entries.size(), retainedPayloadBytes, dictionaryBytes),
+        ByteBuffer.wrap(encoded),
+        preparedBytes(encoded.length, dataFiles),
         Runtime.getRuntime().availableProcessors(),
         Map.of(
             "entry-count", (long) entries.size(),
             "dimension", (long) dimension,
             "data-file-count", (long) dataFiles.size(),
-            "data-file-string-bytes", dictionaryBytes,
-            "entry-payload-array-bytes", retainedPayloadBytes));
+            "data-file-string-bytes", VectorMemoryEstimates.dictionaryBytes(dataFiles)));
   }
 
   @Override
@@ -146,7 +167,6 @@ public final class BruteforceKernel implements VectorKernel {
       int entryCount = in.readInt();
       Preconditions.checkArgument(entryCount >= 0, "Invalid vector entry count: %s", entryCount);
       List<IndexEntry> entries = Lists.newArrayListWithCapacity(entryCount);
-      long retainedPayloadBytes = 0;
       for (int i = 0; i < entryCount; i++) {
         int dataFileIndex = in.readInt();
         Preconditions.checkArgument(
@@ -161,10 +181,9 @@ public final class BruteforceKernel implements VectorKernel {
         byte[] entryPayload = new byte[payloadLength];
         in.readFully(entryPayload);
         entries.add(IndexEntry.of(dataFiles[dataFileIndex], rowPosition, entryPayload));
-        retainedPayloadBytes += PreparedStructureSize.bytes(payloadLength);
       }
 
-      return new DecodedEntries(entries, retainedPayloadBytes);
+      return new DecodedEntries(entries);
     } catch (IOException e) {
       throw new UncheckedIOException("Failed to decode vector index entries", e);
     }
@@ -172,85 +191,231 @@ public final class BruteforceKernel implements VectorKernel {
 
   @Override
   public PreparedSearch prepare(ByteBuffer payload) {
-    // the entries are decoded once, so a batch pays the decode per index file instead of per query
-    DecodedEntries decoded = decodeEntries(payload);
-    return new EntrySearcher(decoded.entries, preparedBytes(decoded));
+    // the snapshot is this searcher's own array: the caller may reuse or mutate what it passed
+    byte[] snapshot = VectorPayloads.toBytes(payload);
+    Loaded loaded = load(snapshot);
+    return new EntrySearcher(loaded, dimension, scoring, preparedBytes(loaded));
   }
 
-  /** Estimates retained entries without cloning their immutable payloads to obtain lengths. */
-  private static long preparedBytes(DecodedEntries decoded) {
-    long dictionaryBytes = 0;
-    IdentityHashMap<String, Boolean> seen = new IdentityHashMap<>();
-    for (IndexEntry entry : decoded.entries) {
-      if (seen.put(entry.dataFile(), Boolean.TRUE) == null) {
-        dictionaryBytes += PreparedStructureSize.string(entry.dataFile());
+  /**
+   * What a prepared search holds: the snapshot its entries are read from, the dictionary of data
+   * files they point at, and the small objects that read them. An entry is read where it lies, so
+   * it costs the bytes the payload already holds rather than an object of its own.
+   */
+  private static long preparedBytes(int payloadLength, List<String> dataFiles) {
+    return PreparedStructureSize.bytes(payloadLength)
+        + PreparedStructureSize.references(dataFiles.size())
+        + VectorMemoryEstimates.dictionaryBytes(dataFiles)
+        + PreparedStructureSize.object(LOADED_FIELDS)
+        + PreparedStructureSize.object(SEARCHER_FIELDS)
+        + PreparedStructureSize.object(SCORING_FIELDS);
+  }
+
+  private static long preparedBytes(Loaded loaded) {
+    return preparedBytes(loaded.snapshot.length, Arrays.asList(loaded.dataFiles));
+  }
+
+  /** Validates the payload header and leaves the reader at the first kernel field. */
+  private void readHeader(VectorPayloadReader in) {
+    VectorPayloadHeader header = VectorPayloadHeader.of(in.payload());
+    Preconditions.checkArgument(
+        header.readableBy(this),
+        "Vector payload was written by %s; this build reads kernel %s version %s",
+        header,
+        NAME,
+        FORMAT_VERSION);
+    in.position(Integer.BYTES);
+    if (!header.legacy()) {
+      int nameLength = in.readUnsignedShort();
+      in.skip(nameLength + (long) Integer.BYTES, "the payload header");
+    }
+  }
+
+  /**
+   * Reads the snapshot into the dictionary and verifies every entry it holds.
+   *
+   * <p>Every entry is checked, so a corrupt payload fails when the searcher is built rather than
+   * when a query happens to reach the entry. The counts are bounded by the bytes that are actually
+   * present before anything is read from them.
+   */
+  private Loaded load(byte[] bytes) {
+    VectorPayloadReader in = new VectorPayloadReader(bytes);
+    readHeader(in);
+    String[] dataFiles = readDataFiles(in);
+    int entryCount = in.readInt();
+    Preconditions.checkArgument(entryCount >= 0, "Invalid vector entry count: %s", entryCount);
+
+    long minimumPerEntry = RECORD_PREFIX + VALUE_PREFIX + (long) Float.BYTES * dimension;
+    Preconditions.checkArgument(
+        (long) entryCount * minimumPerEntry <= in.remaining(),
+        "Invalid vector entry count %s: the %s-byte payload ends before those entries (each entry"
+            + " needs %s bytes, at most %s fit)",
+        entryCount,
+        in.remaining(),
+        minimumPerEntry,
+        in.remaining() / minimumPerEntry);
+
+    int firstEntry = in.position();
+    long at = firstEntry;
+    for (int entry = 0; entry < entryCount; entry++) {
+      Preconditions.checkArgument(
+          at + RECORD_PREFIX <= in.limit(),
+          "Vector entry %s starts at byte %s, past the %s-byte payload",
+          entry,
+          at,
+          in.limit());
+      int dataFileIndex = in.intAt(at);
+      Preconditions.checkArgument(
+          dataFileIndex >= 0 && dataFileIndex < dataFiles.length,
+          "Invalid vector data file index %s at entry %s: the dictionary holds %s data files",
+          dataFileIndex,
+          entry,
+          dataFiles.length);
+      int payloadLength = in.intAt(at + RECORD_PREFIX - Integer.BYTES);
+      Preconditions.checkArgument(
+          payloadLength >= 0, "Invalid vector entry length: %s", payloadLength);
+      long entryEnd = at + RECORD_PREFIX + payloadLength;
+      Preconditions.checkArgument(
+          entryEnd <= in.limit(),
+          "Vector entry %s holds %s payload bytes from byte %s, ending at %s after the %s-byte"
+              + " payload",
+          entry,
+          payloadLength,
+          at,
+          entryEnd,
+          in.limit());
+      Preconditions.checkArgument(
+          payloadLength >= VALUE_PREFIX + (long) Float.BYTES * dimension,
+          "Vector entry %s holds %s payload bytes, too few for a %s-dimensional value",
+          entry,
+          payloadLength,
+          dimension);
+
+      long valueAt = at + RECORD_PREFIX;
+      int valueVersion = in.intAt(valueAt);
+      Preconditions.checkArgument(
+          valueVersion == VectorPayloads.VALUE_FORMAT_VERSION,
+          "Unsupported vector entry %s value format version: %s",
+          entry,
+          valueVersion);
+      int valueLength = in.intAt(valueAt + Integer.BYTES);
+      Preconditions.checkArgument(
+          valueLength == dimension,
+          "Vector entry %s dimension %s does not match index dimension %s",
+          entry,
+          valueLength,
+          dimension);
+      for (int d = 0; d < dimension; d++) {
+        float value = in.floatAt(valueAt + VALUE_PREFIX + (long) Float.BYTES * d);
+        Preconditions.checkArgument(
+            Float.isFinite(value),
+            "Vector entry %s dimension %s is not finite: %s",
+            (long) entry,
+            d,
+            value);
+      }
+
+      at = entryEnd;
+    }
+
+    return new Loaded(bytes, dataFiles, entryCount, firstEntry);
+  }
+
+  private static String[] readDataFiles(VectorPayloadReader in) {
+    int dataFileCount = in.readInt();
+    Preconditions.checkArgument(
+        dataFileCount >= 0, "Invalid vector data file count: %s", dataFileCount);
+    Preconditions.checkArgument(
+        (long) dataFileCount * Short.BYTES <= in.remaining(),
+        "Invalid vector data file count %s: the payload holds %s bytes, enough for at most %s",
+        dataFileCount,
+        in.remaining(),
+        in.remaining() / Short.BYTES);
+    String[] dataFiles = new String[dataFileCount];
+    for (int i = 0; i < dataFileCount; i++) {
+      try {
+        dataFiles[i] = in.readUTF();
+      } catch (IllegalArgumentException e) {
+        throw new IllegalArgumentException(
+            "Vector data file dictionary entry " + i + " is truncated: " + e.getMessage(), e);
       }
     }
 
-    return preparedBytes(decoded.entries.size(), decoded.payloadBytes, dictionaryBytes);
+    return dataFiles;
   }
 
-  private static long preparedBytes(int count, long payloadBytes, long dictionaryBytes) {
-    // The private ArrayList was allocated with exactly count slots. The non-static searcher also
-    // retains its kernel and scoring object; the metric enum is shared static state.
-    return PreparedStructureSize.references(count)
-        + PreparedStructureSize.object(2L * Integer.BYTES + PreparedStructureSize.REFERENCE_BYTES)
-        + PreparedStructureSize.object(2L * PreparedStructureSize.REFERENCE_BYTES + Long.BYTES)
-        + PreparedStructureSize.object(Integer.BYTES + PreparedStructureSize.REFERENCE_BYTES)
-        + PreparedStructureSize.object(PreparedStructureSize.REFERENCE_BYTES)
-        + (long) count
-            * PreparedStructureSize.object(Long.BYTES + 2L * PreparedStructureSize.REFERENCE_BYTES)
-        + payloadBytes
-        + dictionaryBytes;
+  /** The loaded payload: its snapshot, the dictionary, and where the entries begin. */
+  private static final class Loaded {
+    private final byte[] snapshot;
+    private final String[] dataFiles;
+    private final int entryCount;
+    private final int firstEntry;
+
+    private Loaded(byte[] snapshot, String[] dataFiles, int entryCount, int firstEntry) {
+      this.snapshot = snapshot;
+      this.dataFiles = dataFiles;
+      this.entryCount = entryCount;
+      this.firstEntry = firstEntry;
+    }
   }
 
   private static final class DecodedEntries {
     private final List<IndexEntry> entries;
-    private final long payloadBytes;
 
-    private DecodedEntries(List<IndexEntry> entries, long payloadBytes) {
+    private DecodedEntries(List<IndexEntry> entries) {
       this.entries = entries;
-      this.payloadBytes = payloadBytes;
     }
   }
 
-  /** A prepared search that reports what it holds. */
-  private final class EntrySearcher implements PreparedSearch {
-    private final List<IndexEntry> entries;
+  /** A prepared search that reads entries where they lie and keeps a bounded top-k. */
+  private static final class EntrySearcher implements PreparedSearch {
+    private final Loaded loaded;
+    private final int dimension;
+    private final VectorScoring scoring;
     private final long bytes;
 
-    private EntrySearcher(List<IndexEntry> entries, long bytes) {
-      this.entries = entries;
+    private EntrySearcher(Loaded loaded, int dimension, VectorScoring scoring, long bytes) {
+      this.loaded = loaded;
+      this.dimension = dimension;
+      this.scoring = scoring;
       this.bytes = bytes;
-    }
-
-    @Override
-    public List<IndexSearchResult> search(ByteBuffer query, int topK) {
-      Preconditions.checkArgument(topK >= 0, "Top-k must be non-negative: %s", topK);
-      if (topK == 0) {
-        return ImmutableList.of();
-      }
-
-      float[] queryVector =
-          VectorPayloads.decodeVector(VectorPayloads.toBytes(query), dimension, "Query");
-      List<IndexSearchResult> results = Lists.newArrayList();
-      for (IndexEntry entry : entries) {
-        float[] vector = VectorPayloads.decodeVector(entry.payload(), dimension, "Entry");
-        results.add(
-            IndexSearchResult.of(
-                entry.dataFile(), entry.rowPosition(), scoring.score(queryVector, vector)));
-      }
-
-      results.sort(scoring.comparator());
-      if (results.size() > topK) {
-        results = Lists.newArrayList(results.subList(0, topK));
-      }
-      return ImmutableList.copyOf(results);
     }
 
     @Override
     public long estimatedBytes() {
       return VectorMemoryEstimates.knownBytes(bytes);
+    }
+
+    @Override
+    public List<IndexSearchResult> search(ByteBuffer query, int topK) {
+      Preconditions.checkArgument(topK >= 0, "Top-k must be non-negative: %s", topK);
+      if (topK == 0 || loaded.entryCount == 0) {
+        return ImmutableList.of();
+      }
+
+      float[] queryVector =
+          VectorPayloads.decodeVector(VectorPayloads.toBytes(query), dimension, "Query");
+      VectorTopK top =
+          new VectorTopK(topK, loaded.entryCount, scoring, index -> loaded.dataFiles[index]);
+      VectorPayloadReader reader = new VectorPayloadReader(loaded.snapshot);
+      // one array per search, reused for every entry: the vector is scored where it lies, so the
+      // arithmetic and the bits are the ones a decoded array would have given
+      float[] vector = new float[dimension];
+      long at = loaded.firstEntry;
+      for (int entry = 0; entry < loaded.entryCount; entry++) {
+        int dataFileIndex = reader.intAt(at);
+        long rowPosition = reader.longAt(at + Integer.BYTES);
+        int payloadLength = reader.intAt(at + RECORD_PREFIX - Integer.BYTES);
+        long valueAt = at + RECORD_PREFIX + VALUE_PREFIX;
+        for (int d = 0; d < dimension; d++) {
+          vector[d] = reader.floatAt(valueAt + (long) Float.BYTES * d);
+        }
+
+        top.offer(dataFileIndex, rowPosition, scoring.score(queryVector, vector));
+        at += RECORD_PREFIX + (long) payloadLength;
+      }
+
+      return top.results();
     }
   }
 

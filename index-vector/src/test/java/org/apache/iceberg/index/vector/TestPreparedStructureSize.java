@@ -239,12 +239,13 @@ class TestPreparedStructureSize {
   }
 
   @Test
-  void emptyFlatChargesSearcherKernelScoringAndListRoots() {
+  void emptyFlatChargesSnapshotDictionarySearcherAndScoring() {
     VectorIndexAdapter flat =
         sizedAdapter(VectorStructure.FLAT, VectorQuantizer.NONE, 16, Map.of());
     IndexAdapter.PreparedSearch prepared = prepare(flat, 0, 16, i -> "a");
-    // Independent compressed-reference lower bound: searcher 32, kernel 24, scoring 16,
-    // ArrayList root 24 and zero-length backing array 16. Static enum state is shared.
+    // Independent compressed-reference lower bound: the snapshot the entries are read from, the
+    // dictionary array, the loaded payload, the searcher and the scoring object. Static enum state
+    // is shared.
     assertThat(prepared.estimatedBytes()).isGreaterThanOrEqualTo(112);
   }
 
@@ -541,9 +542,10 @@ class TestPreparedStructureSize {
         sizedAdapter(VectorStructure.FLAT, VectorQuantizer.NONE, 16, Map.of());
     long shortPath = prepare(flat, 1000, 16, i -> "a").estimatedBytes();
     long longPath = prepare(flat, 1000, 16, i -> "a".repeat(1024)).estimatedBytes();
-    assertThat(longPath - shortPath)
-        .as("one dictionary String, not 1000 copies")
-        .isBetween(1000L, 1040L);
+    // The path is held twice, once as the dictionary String and once inside the snapshot the
+    // entries are read from, and never once per entry: about 1016 bytes for the String and about
+    // 1023 for the bytes the payload gained, not a thousand copies.
+    assertThat(longPath - shortPath).isBetween(2000L, 2080L);
   }
 
   @ParameterizedTest
