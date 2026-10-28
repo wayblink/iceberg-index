@@ -1883,6 +1883,7 @@ final class ExecutorIndexCache {
         long spare = Math.max(0L, capacity - usedBytes() - reservedBytes);
         if (spare >= requested || reservations.isEmpty()) {
           Reservation reservation = new Reservation(config.owner(), 0, config.maxBytes());
+          AdmissionDelta[] projected = new AdmissionDelta[1];
           boolean accepted =
               admit(
                   capacity,
@@ -1896,8 +1897,31 @@ final class ExecutorIndexCache {
                     reservation.bytes = Math.min(requested, available);
                     reservedBytes += reservation.bytes;
                     reservedByOwner.merge(owner, reservation.bytes, Long::sum);
-                  });
-          return accepted ? reservation : null;
+                  },
+                  false,
+                  delta -> projected[0] = delta);
+          if (accepted) {
+            return reservation;
+          }
+
+          // The reservation itself costs control bytes. When resident entries can make room for
+          // it, reclaim them here so the caller can load and then be admitted normally.
+          Map.Entry<String, CachedFile> victim = mostOverQuota(capacity, projected[0]);
+          if (victim == null) {
+            victim = oldestEvictable(probation, false);
+          }
+          if (victim == null) {
+            victim = oldestEvictable(protectedFiles, true);
+          }
+          if (victim == null) {
+            return null;
+          }
+          release(victim.getValue());
+          attribution.remove(victim.getKey());
+          protectedFiles.remove(victim.getKey());
+          probation.remove(victim.getKey());
+          evictions.incrementAndGet();
+          continue;
         }
 
         try {
