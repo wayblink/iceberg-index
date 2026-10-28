@@ -26,6 +26,11 @@ import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.iceberg.hadoop.HadoopFileIO;
@@ -114,6 +119,92 @@ class TestIndexCachePlugin {
     IndexCacheProtocol.Reply reply = control.receive(report(2, 0, 0));
 
     assertThat(reply.commands()).isEmpty();
+  }
+
+  @Test
+  void acknowledgingAReusedLazyCopyDoesNotChargeItAgain() {
+    ExecutorIndexCache.Config lazy = ExecutorIndexCache.Config.of(true, 1000).withOwner("adapter");
+    cache.file("f1", lazy, "A", TestIndexCachePlugin::loaded);
+    ExecutorIndexCacheWorker worker =
+        new ExecutorIndexCacheWorker(
+            SESSION,
+            EXECUTOR,
+            INCARNATION,
+            cache,
+            ExecutorIndexCache.Config.of(true, 1000),
+            command -> {
+              loaderCalls.incrementAndGet();
+              return loaded();
+            },
+            IndexCacheWorkerConfig.parse(Map.of()));
+    control.receive(worker.report("test", 1, 1000, 0, Map.of()));
+    String plan =
+        coordinator.acceptLoad(target("A", "f1"), IndexResidencyPolicy.parse("forever"), now);
+    IndexCacheProtocol.Command command =
+        control.receive(worker.report("test", 2, 1000, 0, Map.of())).commands().get(0);
+    assertThat(coordinator.result(plan).status()).isEqualTo(IndexCacheProtocol.Status.PENDING);
+    assertThat(coordinator.state(EXECUTOR, INCARNATION).reservedBytes()).isZero();
+    control.receive(worker.execute(command));
+    assertThat(coordinator.result(plan).status()).isEqualTo(IndexCacheProtocol.Status.COMPLETE);
+    assertThat(coordinator.state(EXECUTOR, INCARNATION).usedBytes())
+        .isEqualTo(cache.stats().bytes());
+    assertThat(loaderCalls).hasValue(0);
+  }
+
+  @Test
+  void aLoadedAckConvertsOnlyItsReportedReservationToUsedBytes() throws Exception {
+    ExecutorService executor = Executors.newSingleThreadExecutor();
+    CountDownLatch loading = new CountDownLatch(1);
+    CountDownLatch finish = new CountDownLatch(1);
+    try (ExecutorIndexCache.ExecutorBudget ignored = cache.bindExecutorBudget(1000)) {
+      cache.file(
+          "warm",
+          ExecutorIndexCache.Config.of(true, 1000),
+          "test",
+          () -> ExecutorIndexCache.loaded(new byte[] {1}, null, 300));
+      ExecutorIndexCacheWorker worker =
+          new ExecutorIndexCacheWorker(
+              SESSION,
+              EXECUTOR,
+              INCARNATION,
+              cache,
+              ExecutorIndexCache.Config.of(true, 1000),
+              command -> {
+                loading.countDown();
+                try {
+                  if (!finish.await(5, TimeUnit.SECONDS)) {
+                    throw new IllegalStateException("Loader timed out");
+                  }
+                } catch (InterruptedException e) {
+                  Thread.currentThread().interrupt();
+                  throw new IllegalStateException(e);
+                }
+                return loaded();
+              },
+              IndexCacheWorkerConfig.parse(Map.of()));
+      control.receive(worker.report("test", 1, 1000, 0, Map.of()));
+      String plan =
+          coordinator.acceptLoad(target("A", "f1"), IndexResidencyPolicy.parse("forever"), now);
+      IndexCacheProtocol.Command command =
+          control.receive(worker.report("test", 2, 1000, 0, Map.of())).commands().get(0);
+      Future<IndexCacheProtocol.Ack> load = executor.submit(() -> worker.execute(command));
+      assertThat(loading.await(5, TimeUnit.SECONDS)).isTrue();
+      IndexCacheProtocol.NodeReport during = worker.report("test", 3, 1000, 0, Map.of());
+      assertThat(during.reservedByCommand()).containsEntry(command.commandId(), 300L);
+      assertThat(during.reservedBytesFor(plan)).isEqualTo(300);
+      control.receive(during);
+      assertThat(coordinator.state(EXECUTOR, INCARNATION).reservedBytes()).isEqualTo(300);
+      finish.countDown();
+      control.receive(load.get(5, TimeUnit.SECONDS));
+      IndexCacheProtocol.NodeReport after = coordinator.state(EXECUTOR, INCARNATION);
+      assertThat(after.usedBytes()).isEqualTo(420);
+      assertThat(after.reservedBytes()).isZero();
+      assertThat(after.reservedByCommand()).isEmpty();
+    } finally {
+      finish.countDown();
+      executor.shutdownNow();
+      assertThat(executor.awaitTermination(5, TimeUnit.SECONDS)).isTrue();
+    }
   }
 
   @Test

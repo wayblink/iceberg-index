@@ -33,6 +33,62 @@ class TestIndexResidencyCoordinator {
   private final IndexResidencyCoordinator coordinator = new IndexResidencyCoordinator(clock);
 
   @Test
+  void reportedLazyReservationsRemainUnavailableToPlacement() {
+    coordinator.report(node("a", "a-1", 1, 512, 0).copy().reservedBytes(400).build());
+    coordinator.acceptLoad(
+        target("A", "f1", 300), IndexResidencyPolicy.parse("forever"), clock.now());
+    assertThat(coordinator.commands("a", "a-1")).isEmpty();
+    assertThat(coordinator.state("a", "a-1").reservedBytes()).isGreaterThanOrEqualTo(400);
+    coordinator.report(node("a", "a-1", 2, 512, 0));
+    coordinator.acceptLoad(target("A", "f1", 300), null, clock.now());
+    assertThat(coordinator.commands("a", "a-1"))
+        .extracting(IndexCacheProtocol.Command::type)
+        .contains(IndexCacheProtocol.CommandType.LOAD);
+  }
+
+  @Test
+  void aReportedPlanReservationIsNotAddedToItsDriverPromiseAgain() {
+    coordinator.report(node("a", "a-1", 1, 1000, 0));
+    String first =
+        coordinator.acceptLoad(
+            target("A", "f1", 300), IndexResidencyPolicy.parse("forever"), clock.now());
+    String commandId = coordinator.commands("a", "a-1").get(0).commandId();
+    coordinator.report(
+        node("a", "a-1", 2, 1000, 0)
+            .copy()
+            .reservedBytes(300)
+            .reservedByPlan(Map.of(first, 300L))
+            .reservedByCommand(Map.of(commandId, 300L))
+            .build());
+    assertThat(coordinator.state("a", "a-1").reservedBytes()).isEqualTo(300);
+    coordinator.acceptLoad(
+        target("B", "f2", 600), IndexResidencyPolicy.parse("forever"), clock.now());
+    assertThat(coordinator.commands("a", "a-1"))
+        .extracting(command -> command.file().location())
+        .contains("f2");
+  }
+
+  @Test
+  void ackChargesTheActualRetainedBytesInsteadOfTheEstimate() {
+    coordinator.report(node("a", "a-1", 1, 1000, 0));
+    String plan =
+        coordinator.acceptLoad(
+            target("A", "f1", 100), IndexResidencyPolicy.parse("forever"), clock.now());
+    IndexCacheProtocol.Command command = loadCommand(plan);
+    coordinator.ack(
+        ack(
+            plan,
+            "a",
+            "a-1",
+            command.sequence(),
+            command.commandId(),
+            IndexCacheProtocol.AckStatus.LOADED,
+            200));
+    assertThat(coordinator.state("a", "a-1").usedBytes()).isEqualTo(200);
+    assertThat(coordinator.result(plan).residentBytes()).isEqualTo(200);
+  }
+
+  @Test
   void firstLoadStartsProtectionAndRepeatKeepsTheDeadline() {
     coordinator.report(node("a", "a-1", 1, 100, 0));
     coordinator.acceptLoad(target("A", "f1", 10), IndexResidencyPolicy.parse("30m"), clock.now());

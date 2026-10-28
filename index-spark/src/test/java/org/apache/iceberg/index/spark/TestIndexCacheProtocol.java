@@ -153,6 +153,7 @@ class TestIndexCacheProtocol {
             .releasingBytes(10)
             .holders(Map.of("adapter|table#A|f1", 40L))
             .reservedByPlan(Map.of("plan-9", 20L))
+            .reservedByCommand(Map.of("command-9", 20L))
             .profile("reference-bytes=4")
             .accessAgeNanos(Map.of("table#A", 3_000L))
             .build();
@@ -160,6 +161,7 @@ class TestIndexCacheProtocol {
     IndexCacheProtocol.NodeReport reportCopy = roundTrip(report);
     assertThat(reportCopy.holders()).containsEntry("adapter|table#A|f1", 40L);
     assertThat(reportCopy.reservedBytesFor("plan-9")).isEqualTo(20L);
+    assertThat(reportCopy.reservedByCommand()).containsEntry("command-9", 20L);
     assertThat(reportCopy.accessAgeNanos()).containsEntry("table#A", 3_000L);
     assertThat(reportCopy.profile()).isEqualTo("reference-bytes=4");
 

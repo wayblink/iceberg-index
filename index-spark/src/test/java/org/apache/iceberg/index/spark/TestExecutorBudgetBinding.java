@@ -90,7 +90,7 @@ class TestExecutorBudgetBinding {
       IndexCacheProtocol.NodeReport report = observer.report("test", 1, 512 * MB, 0, Map.of());
       assertThat(report.usedBytes()).isEqualTo(100 * MB);
       assertThat(report.reservedBytes()).isEqualTo(400 * MB);
-      assertThat(report.holders()).isEmpty();
+      assertThat(report.holders()).containsEntry("|test|resident", 100 * MB);
       assertThat(report.usedBytes() + report.reservedBytes())
           .isLessThanOrEqualTo(report.budgetBytes());
       finish.countDown();
@@ -172,6 +172,43 @@ class TestExecutorBudgetBinding {
           "test",
           () -> charged(600 * MB));
       assertThat(cache.residentKeys()).isEmpty();
+    }
+  }
+
+  @Test
+  void closingThePluginBudgetFencesLoadsAlreadyInFlight() throws Exception {
+    ExecutorService executor = Executors.newSingleThreadExecutor();
+    CountDownLatch loading = new CountDownLatch(1);
+    CountDownLatch finish = new CountDownLatch(1);
+    ExecutorIndexCache.ExecutorBudget binding = cache.bindExecutorBudget(512 * MB);
+    try {
+      Future<?> load =
+          executor.submit(
+              () ->
+                  cache.file(
+                      "old-app",
+                      ExecutorIndexCache.Config.of(true, 1024 * MB),
+                      "test",
+                      300 * MB,
+                      () -> {
+                        loading.countDown();
+                        await(finish);
+                        return charged(300 * MB);
+                      }));
+      assertThat(loading.await(5, TimeUnit.SECONDS)).isTrue();
+      binding.close();
+      finish.countDown();
+      load.get(5, TimeUnit.SECONDS);
+      assertThat(cache.residentKeys()).isEmpty();
+      assertThat(cache.memoryUsage().reservedBytes()).isZero();
+      try (ExecutorIndexCache.ExecutorBudget next = cache.bindExecutorBudget(512 * MB)) {
+        assertThat(cache.memoryUsage().usedBytes()).isZero();
+      }
+    } finally {
+      finish.countDown();
+      binding.close();
+      executor.shutdownNow();
+      assertThat(executor.awaitTermination(5, TimeUnit.SECONDS)).isTrue();
     }
   }
 

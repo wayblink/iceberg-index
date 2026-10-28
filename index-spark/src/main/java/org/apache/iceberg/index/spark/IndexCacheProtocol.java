@@ -333,6 +333,7 @@ final class IndexCacheProtocol {
     private final long releasingBytes;
     private final Map<String, Long> holders;
     private final Map<String, Long> reservedByPlan;
+    private final Map<String, Long> reservedByCommand;
     private final String profile;
     private final Map<String, Long> accessAgeNanos;
 
@@ -373,6 +374,7 @@ final class IndexCacheProtocol {
       this.releasingBytes = builder.releasingBytes;
       this.holders = immutableMap(builder.holders);
       this.reservedByPlan = immutableMap(builder.reservedByPlan);
+      this.reservedByCommand = immutableMap(builder.reservedByCommand);
       this.profile = builder.profile;
       this.accessAgeNanos = immutableMap(builder.accessAgeNanos);
     }
@@ -422,6 +424,10 @@ final class IndexCacheProtocol {
       return reservedByPlan;
     }
 
+    Map<String, Long> reservedByCommand() {
+      return reservedByCommand == null ? Map.of() : reservedByCommand;
+    }
+
     String profile() {
       return profile;
     }
@@ -452,6 +458,7 @@ final class IndexCacheProtocol {
           .releasingBytes(releasingBytes)
           .holders(holders)
           .reservedByPlan(reservedByPlan)
+          .reservedByCommand(reservedByCommand())
           .profile(profile)
           .accessAgeNanos(accessAgeNanos);
     }
@@ -467,6 +474,7 @@ final class IndexCacheProtocol {
       private long releasingBytes;
       private Map<String, Long> holders = Map.of();
       private Map<String, Long> reservedByPlan = Map.of();
+      private Map<String, Long> reservedByCommand = Map.of();
       private String profile;
       private Map<String, Long> accessAgeNanos = Map.of();
 
@@ -517,6 +525,11 @@ final class IndexCacheProtocol {
 
       Builder reservedByPlan(Map<String, Long> value) {
         this.reservedByPlan = value;
+        return this;
+      }
+
+      Builder reservedByCommand(Map<String, Long> value) {
+        this.reservedByCommand = value;
         return this;
       }
 

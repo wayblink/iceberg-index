@@ -20,12 +20,72 @@ package org.apache.iceberg.index.spark;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
+import java.nio.file.Path;
+import java.util.List;
 import java.util.Map;
+import org.apache.spark.sql.Row;
 import org.apache.spark.sql.SparkSession;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
 
 class TestPluginExecutorBudget {
   private static final long MB = 1024L * 1024L;
+  @TempDir Path warehouse;
+
+  @Test
+  void realPluginLoadOffloadAndReloadKeepQueryResults() {
+    SparkSession spark = start(null);
+    String table = "local.db.plugin_budget_vectors";
+    ExecutorIndexCache cache = ExecutorIndexCache.get();
+    try {
+      spark.sql("CREATE NAMESPACE IF NOT EXISTS local.db");
+      spark.sql("CREATE TABLE " + table + " (id bigint, embedding array<double>) USING iceberg");
+      spark.sql("INSERT INTO " + table + " VALUES (1, array(1.0d, 0.0d)), (2, array(0.0d, 1.0d))");
+      String index =
+          spark
+              .sql(
+                  "CALL local.system.build_vector_index(table=>'db.plugin_budget_vectors', column=>'embedding', dimension=>2, structure=>'FLAT', metric=>'EUCLIDEAN')")
+              .head()
+              .getString(0);
+      String query =
+          "CALL local.system.vector_search(table=>'db.plugin_budget_vectors', column=>'embedding', query=>array(1.0d,0.0d), k=>2)";
+      List<Row> expected = spark.sql(query).collectAsList();
+      assertThat(cache.stats().bytes()).isPositive();
+      String load =
+          "CALL local.system.load_index(table=>'local.db.plugin_budget_vectors', index=>'"
+              + index
+              + "')";
+      assertThat(spark.sql(load).head().getString(0)).isEqualTo("COMPLETE");
+      assertThat(spark.sql(query).collectAsList()).containsExactlyElementsOf(expected);
+      assertThat(IndexCacheControl.status(spark, false))
+          .isNotEmpty()
+          .allSatisfy(
+              status -> {
+                assertThat(status.budgetBytes()).isEqualTo(512 * MB);
+                assertThat(status.usedBytes() + status.reservedBytes())
+                    .isLessThanOrEqualTo(status.budgetBytes());
+              });
+      assertThat(
+              spark
+                  .sql(
+                      "CALL local.system.offload_index(table=>'local.db.plugin_budget_vectors', index=>'"
+                          + index
+                          + "')")
+                  .head()
+                  .getString(0))
+          .isEqualTo("OFFLOADED");
+      assertThat(spark.sql(query).collectAsList()).containsExactlyElementsOf(expected);
+      assertThat(spark.sql(load).head().getString(0)).isEqualTo("COMPLETE");
+      assertThat(spark.sql(query).collectAsList()).containsExactlyElementsOf(expected);
+    } finally {
+      try {
+        spark.sql("DROP TABLE IF EXISTS " + table + " PURGE");
+      } finally {
+        cache.clear();
+        spark.stop();
+      }
+    }
+  }
 
   @Test
   void lazyQueryCannotExceedTheAdvertisedAutomaticBudget() {
@@ -133,7 +193,7 @@ class TestPluginExecutorBudget {
     }
   }
 
-  private static SparkSession start(String configured) {
+  private SparkSession start(String configured) {
     ExecutorIndexCache.get().clear();
     SparkSession.Builder builder =
         SparkSession.builder()
@@ -144,6 +204,12 @@ class TestPluginExecutorBudget {
             .config("spark.ui.enabled", "false")
             .config("spark.executor.memory", "7g")
             .config("spark.plugins", IndexCachePlugin.class.getName())
+            .config(
+                "spark.sql.extensions",
+                "org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions")
+            .config("spark.sql.catalog.local", "org.apache.iceberg.spark.SparkCatalog")
+            .config("spark.sql.catalog.local.type", "hadoop")
+            .config("spark.sql.catalog.local.warehouse", warehouse.toUri().toString())
             .config(ExecutorIndexCache.Config.ENABLED, "true");
     if (configured != null) {
       builder.config(ExecutorIndexCache.Config.BYTES, configured);

@@ -197,6 +197,19 @@ final class IndexResidencyCoordinator {
       this.commandId = commandId;
       this.releasesCommandId = releasesCommandId;
     }
+
+    private PlanFile withBytes(long retainedBytes) {
+      return new PlanFile(
+          location,
+          cacheKey,
+          executorId,
+          incarnation,
+          retainedBytes,
+          type,
+          epoch,
+          commandId,
+          releasesCommandId);
+    }
   }
 
   private static final class NodeState {
@@ -226,31 +239,93 @@ final class IndexResidencyCoordinator {
       return report.holders().containsKey(cacheKey);
     }
 
-    private long reservedBytes() {
-      return reservedByCommand.values().stream().mapToLong(Long::longValue).sum();
+    private Map<String, Long> effectiveReservedByCommand() {
+      Map<String, Long> combined = new LinkedHashMap<>(reservedByCommand);
+      report
+          .reservedByCommand()
+          .forEach((command, bytes) -> combined.merge(command, bytes, Math::max));
+      return combined;
     }
 
-    private long reservedBytesFor(String planId) {
-      long total = 0;
-      for (Map.Entry<String, Long> reservation : reservedByCommand.entrySet()) {
-        if (planId.equals(planOfCommand.get(reservation.getKey()))) {
+    private String planOf(String commandId) {
+      String plan = planOfCommand.get(commandId);
+      if (plan != null) {
+        return plan;
+      }
+      for (IndexCacheProtocol.Command command : issued) {
+        if (command.commandId().equals(commandId)) {
+          return command.planId();
+        }
+      }
+      return null;
+    }
+
+    private Map<String, Long> effectiveReservedByPlan() {
+      Map<String, Long> byPlan = new LinkedHashMap<>();
+      effectiveReservedByCommand()
+          .forEach(
+              (command, bytes) -> {
+                String plan = planOf(command);
+                if (plan != null) {
+                  byPlan.merge(plan, bytes, Math::addExact);
+                }
+              });
+      return byPlan;
+    }
+
+    private long effectiveReservedBytes() {
+      return effectiveReservedBytesExcept(null);
+    }
+
+    private long effectiveReservedBytesExcept(String excludedPlan) {
+      long attributed = 0;
+      for (long bytes : report.reservedByCommand().values()) {
+        attributed = Math.addExact(attributed, bytes);
+      }
+      // Reservations without a control command belong to ordinary queries and stay unavailable.
+      long total = Math.max(0, report.reservedBytes() - attributed);
+      for (Map.Entry<String, Long> reservation : effectiveReservedByCommand().entrySet()) {
+        if (excludedPlan == null || !excludedPlan.equals(planOf(reservation.getKey()))) {
           total = Math.addExact(total, reservation.getValue());
         }
       }
-
       return total;
     }
 
-    private Map<String, Long> reservedByPlan() {
-      Map<String, Long> byPlan = new LinkedHashMap<>();
-      for (Map.Entry<String, Long> reservation : reservedByCommand.entrySet()) {
-        String planId = planOfCommand.get(reservation.getKey());
-        if (planId != null) {
-          byPlan.merge(planId, reservation.getValue(), Long::sum);
+    private long excessReservationsFor(String planId) {
+      long excess = 0;
+      for (Map.Entry<String, Long> actual : report.reservedByCommand().entrySet()) {
+        if (planId.equals(planOf(actual.getKey()))) {
+          excess =
+              Math.addExact(
+                  excess,
+                  Math.max(
+                      0, actual.getValue() - reservedByCommand.getOrDefault(actual.getKey(), 0L)));
         }
       }
+      return excess;
+    }
 
-      return byPlan;
+    private void acknowledgeReservation(String commandId) {
+      Long held = report.reservedByCommand().get(commandId);
+      if (held == null) {
+        return;
+      }
+      Map<String, Long> byCommand = new LinkedHashMap<>(report.reservedByCommand());
+      byCommand.remove(commandId);
+      Map<String, Long> byPlan = new LinkedHashMap<>(report.reservedByPlan());
+      String plan = planOf(commandId);
+      if (plan != null) {
+        byPlan.computeIfPresent(plan, (key, bytes) -> Math.max(0, bytes - held));
+        byPlan.values().removeIf(bytes -> bytes == 0);
+      }
+      report =
+          report
+              .copy()
+              .reservedBytes(Math.max(0, report.reservedBytes() - held))
+              .reservedByCommand(byCommand)
+              .reservedByPlan(byPlan)
+              .build();
     }
 
     private void reserve(String planId, String commandId, long bytes) {
@@ -693,17 +768,23 @@ final class IndexResidencyCoordinator {
         return;
       }
 
-      // A report may already list the copy; only the part the report is missing gets charged here.
-      long delta = node.report.holders().containsKey(command.cacheKey) ? 0 : command.bytes;
+      if (ack.bytes() <= 0) {
+        plan.failed.put(command.location, "INVALID_RETAINED_BYTES");
+        node.settle(ack.commandId());
+        return;
+      }
+      node.acknowledgeReservation(ack.commandId());
+      long previous = node.report.holders().getOrDefault(command.cacheKey, 0L);
+      long delta = ack.bytes() - previous;
       Map<String, Long> holders = new LinkedHashMap<>(node.report.holders());
-      holders.put(command.cacheKey, command.bytes);
+      holders.put(command.cacheKey, ack.bytes());
       node.report =
           node.report
               .copy()
               .holders(holders)
               .usedBytes(Math.addExact(node.report.usedBytes(), delta))
               .build();
-      plan.loaded.put(command.cacheKey, command);
+      plan.loaded.put(command.cacheKey, command.withBytes(ack.bytes()));
       plan.failed.remove(command.location);
       // The reservation becomes retained bytes; keeping it would charge the copy twice.
       node.settle(ack.commandId());
@@ -865,8 +946,9 @@ final class IndexResidencyCoordinator {
         ? null
         : node.report
             .copy()
-            .reservedBytes(node.reservedBytes())
-            .reservedByPlan(node.reservedByPlan())
+            .reservedBytes(node.effectiveReservedBytes())
+            .reservedByPlan(node.effectiveReservedByPlan())
+            .reservedByCommand(node.effectiveReservedByCommand())
             .build();
   }
 
@@ -1184,7 +1266,7 @@ final class IndexResidencyCoordinator {
 
   /** Occupancy used for comparisons; the planner charges the same two fields. */
   private long occupied(NodeState node) {
-    return Math.addExact(node.report.usedBytes(), node.reservedBytes());
+    return Math.addExact(node.report.usedBytes(), node.effectiveReservedBytes());
   }
 
   private boolean hasRoomForSecondCopy(NodeState node, IndexCacheProtocol.File file) {
@@ -1539,7 +1621,7 @@ final class IndexResidencyCoordinator {
             commandId,
             releasesCommandId));
     if (type == IndexCacheProtocol.CommandType.LOAD) {
-      node.reserve(plan.planId, commandId, bytes);
+      node.reserve(plan.planId, commandId, node.holds(file.cacheKey()) ? 0 : bytes);
     }
 
     // Registration is by the queue itself, so a command cannot be marked issued before it exists.
@@ -1549,7 +1631,13 @@ final class IndexResidencyCoordinator {
   private List<IndexCacheProtocol.NodeReport> reports() {
     List<IndexCacheProtocol.NodeReport> reports = new ArrayList<>();
     for (NodeState node : nodes.values()) {
-      reports.add(node.report.copy().reservedBytes(node.reservedBytes()).build());
+      reports.add(
+          node.report
+              .copy()
+              .reservedBytes(node.effectiveReservedBytes())
+              .reservedByPlan(node.effectiveReservedByPlan())
+              .reservedByCommand(node.effectiveReservedByCommand())
+              .build());
     }
 
     return reports;
@@ -1562,9 +1650,11 @@ final class IndexResidencyCoordinator {
   private List<IndexCacheProtocol.NodeReport> reportsFor(String planId) {
     List<IndexCacheProtocol.NodeReport> reports = new ArrayList<>();
     for (NodeState node : nodes.values()) {
-      // reservedBytesFor is a subset of reservedBytes, so this is non-negative; clamp anyway so a
-      // silent overflow cannot turn into a negative occupancy that hides a capacity problem.
-      long others = Math.max(0, node.reservedBytes() - node.reservedBytesFor(planId));
+      // This plan is accounted for by the placements being planned. Other commands and every
+      // ordinary-query reservation must remain unavailable.
+      long others =
+          Math.addExact(
+              node.effectiveReservedBytesExcept(planId), node.excessReservationsFor(planId));
 
       // Occupancy includes retained copies plus every other plan's unresolved promise; the
       // planner adds this plan's own placements to that baseline.
@@ -1573,6 +1663,8 @@ final class IndexResidencyCoordinator {
               .copy()
               .usedBytes(Math.addExact(node.report.usedBytes(), others))
               .reservedBytes(0)
+              .reservedByPlan(Map.of())
+              .reservedByCommand(Map.of())
               .build());
     }
 

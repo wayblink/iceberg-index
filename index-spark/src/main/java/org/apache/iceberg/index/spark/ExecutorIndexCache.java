@@ -586,7 +586,13 @@ final class ExecutorIndexCache {
     private int callers;
   }
 
-  private record ManagedLoad(String indexUuid, long epoch, String cacheKey, long generation) {}
+  private record ManagedLoad(
+      String indexUuid,
+      long epoch,
+      String cacheKey,
+      long generation,
+      String planId,
+      String commandId) {}
 
   private final AtomicLong hits = new AtomicLong();
   private final AtomicLong misses = new AtomicLong();
@@ -603,11 +609,15 @@ final class ExecutorIndexCache {
     private final String owner;
     private final long bytes;
     private final long budget;
+    private final String planId;
+    private final String commandId;
 
-    private Reservation(String owner, long bytes, long budget) {
+    private Reservation(String owner, long bytes, long budget, String planId, String commandId) {
       this.owner = owner;
       this.bytes = bytes;
       this.budget = budget;
+      this.planId = planId;
+      this.commandId = commandId;
     }
   }
 
@@ -642,6 +652,7 @@ final class ExecutorIndexCache {
 
   final class ExecutorBudget implements AutoCloseable {
     private final long maxBytes;
+    private boolean closed;
 
     private ExecutorBudget(long maxBytes) {
       this.maxBytes = maxBytes;
@@ -651,14 +662,25 @@ final class ExecutorIndexCache {
     public void close() {
       synchronized (mapLock) {
         if (executorBudget == this) {
-          executorBudget = null;
+          if (!closed) {
+            closed = true;
+            generation = Math.incrementExact(generation);
+          }
+          if (reservations.isEmpty()) {
+            executorBudget = null;
+          }
           mapLock.notifyAll();
         }
       }
     }
   }
 
-  record MemoryUsage(long usedBytes, long reservedBytes, Map<String, Long> residentFiles) {}
+  record MemoryUsage(
+      long usedBytes,
+      long reservedBytes,
+      Map<String, Long> residentFiles,
+      Map<String, Long> reservedByPlan,
+      Map<String, Long> reservedByCommand) {}
 
   /** One coherent snapshot of all retained files and reservations, including lazy queries. */
   MemoryUsage memoryUsage() {
@@ -667,7 +689,18 @@ final class ExecutorIndexCache {
       Map<String, Long> resident = new LinkedHashMap<>();
       probation.forEach((key, file) -> resident.put(key, file.bytes()));
       protectedFiles.forEach((key, file) -> resident.put(key, file.bytes()));
-      return new MemoryUsage(bytes, reservedBytes, Map.copyOf(resident));
+      Map<String, Long> byPlan = new LinkedHashMap<>();
+      Map<String, Long> byCommand = new LinkedHashMap<>();
+      for (Reservation reservation : reservations) {
+        if (reservation.planId != null) {
+          byPlan.merge(reservation.planId, reservation.bytes, Math::addExact);
+        }
+        if (reservation.commandId != null) {
+          byCommand.merge(reservation.commandId, reservation.bytes, Math::addExact);
+        }
+      }
+      return new MemoryUsage(
+          bytes, reservedBytes, Map.copyOf(resident), Map.copyOf(byPlan), Map.copyOf(byCommand));
     }
   }
 
@@ -700,7 +733,9 @@ final class ExecutorIndexCache {
     sweepIfDue(config);
     boolean managed;
     CachedFile hit;
+    long loadGeneration;
     synchronized (mapLock) {
+      loadGeneration = generation;
       managed = ownership.isManagedKey(cacheKey);
       hit = managed ? null : lookup(cacheKey);
     }
@@ -737,7 +772,7 @@ final class ExecutorIndexCache {
         try {
           CachedFile loaded = loader.load();
           loads.incrementAndGet();
-          return put(cacheKey, loaded, config, reservation);
+          return put(cacheKey, loaded, config, reservation, null, loadGeneration);
         } finally {
           releaseReservation(reservation);
         }
@@ -790,13 +825,25 @@ final class ExecutorIndexCache {
 
   CachedFile installManaged(
       String indexUuid, long epoch, String cacheKey, Config config, long sizeHint, Loader loader) {
+    return installManaged(indexUuid, epoch, cacheKey, config, sizeHint, null, null, loader);
+  }
+
+  CachedFile installManaged(
+      String indexUuid,
+      long epoch,
+      String cacheKey,
+      Config config,
+      long sizeHint,
+      String planId,
+      String commandId,
+      Loader loader) {
     if (!config.enabled()) {
       return null;
     }
 
     ManagedLoad load;
     synchronized (mapLock) {
-      load = new ManagedLoad(indexUuid, epoch, cacheKey, generation);
+      load = new ManagedLoad(indexUuid, epoch, cacheKey, generation, planId, commandId);
       if (!current(load)) {
         return null;
       }
@@ -825,7 +872,7 @@ final class ExecutorIndexCache {
         try {
           CachedFile loaded = loader.load();
           loads.incrementAndGet();
-          CachedFile retained = put(cacheKey, loaded, config, reservation, load);
+          CachedFile retained = put(cacheKey, loaded, config, reservation, load, load.generation());
           synchronized (mapLock) {
             return current(load) && find(cacheKey) == retained ? retained : null;
           }
@@ -1054,14 +1101,17 @@ final class ExecutorIndexCache {
     }
   }
 
-  private CachedFile put(String cacheKey, CachedFile file, Config config, Reservation reservation) {
-    return put(cacheKey, file, config, reservation, null);
-  }
-
   private CachedFile put(
-      String cacheKey, CachedFile file, Config config, Reservation reservation, ManagedLoad load) {
+      String cacheKey,
+      CachedFile file,
+      Config config,
+      Reservation reservation,
+      ManagedLoad load,
+      long loadGeneration) {
     synchronized (mapLock) {
-      if (load == null ? ownership.isManagedKey(cacheKey) : !current(load)) {
+      if (load == null
+          ? generation != loadGeneration || ownership.isManagedKey(cacheKey)
+          : !current(load)) {
         return file;
       }
       CachedFile existing = find(cacheKey);
@@ -1220,7 +1270,13 @@ final class ExecutorIndexCache {
         long spare = Math.max(0L, capacity - bytes - reservedBytes);
         if (spare >= requested || reservations.isEmpty()) {
           long held = Math.min(requested, spare);
-          Reservation reservation = new Reservation(config.owner(), held, config.maxBytes());
+          Reservation reservation =
+              new Reservation(
+                  config.owner(),
+                  held,
+                  config.maxBytes(),
+                  load == null ? null : load.planId(),
+                  load == null ? null : load.commandId());
           reservations.add(reservation);
           reservedBytes += held;
           reservedByOwner.merge(config.owner(), held, Long::sum);
@@ -1275,6 +1331,9 @@ final class ExecutorIndexCache {
         reservedByOwner.computeIfPresent(
             reservation.owner,
             (owner, held) -> held - reservation.bytes == 0 ? null : held - reservation.bytes);
+        if (executorBudget != null && executorBudget.closed && reservations.isEmpty()) {
+          executorBudget = null;
+        }
         mapLock.notifyAll();
       }
     }

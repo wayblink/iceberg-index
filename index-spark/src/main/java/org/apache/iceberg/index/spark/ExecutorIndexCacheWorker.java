@@ -220,6 +220,9 @@ final class ExecutorIndexCacheWorker implements AutoCloseable {
                 command.epoch(),
                 cacheKey,
                 cacheConfig,
+                estimate,
+                command.planId(),
+                command.commandId(),
                 () -> loader.load(command));
         if (file == null) {
           // Admission refused: either this entry can never fit, or the space is momentarily taken.
@@ -301,7 +304,6 @@ final class ExecutorIndexCacheWorker implements AutoCloseable {
       long releasingBytes,
       Map<String, Long> accessAgeNanos) {
     ExecutorIndexCache.MemoryUsage memory = cache.memoryUsage();
-    Map<String, Long> holders = holders(memory.residentFiles());
 
     return IndexCacheProtocol.NodeReport.builder()
         .session(session)
@@ -312,7 +314,11 @@ final class ExecutorIndexCacheWorker implements AutoCloseable {
         .usedBytes(memory.usedBytes())
         .reservedBytes(memory.reservedBytes())
         .releasingBytes(releasingBytes)
-        .holders(holders)
+        // Physical residency is not a managed ownership ACK. Including lazy keys prevents a
+        // later managed reuse from charging the same retained file a second time.
+        .holders(memory.residentFiles())
+        .reservedByPlan(memory.reservedByPlan())
+        .reservedByCommand(memory.reservedByCommand())
         .profile(profile)
         .accessAgeNanos(accessAgeNanos == null ? Map.of() : accessAgeNanos)
         .build();
