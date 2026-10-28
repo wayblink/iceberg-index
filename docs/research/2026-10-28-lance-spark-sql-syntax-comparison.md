@@ -19,6 +19,8 @@
 
 # Lance-Spark SQL 用法与 Iceberg 索引语法对比
 
+继续阅读：[向 Lance-Spark 对齐 SQL 的可行性、工作量与收益](2026-10-28-lance-spark-sql-alignment-feasibility.md)。这是研究建议，尚未批准实施或新增接口参数。
+
 ## 1. 总览：先找任务，再比较写法
 
 Lance-Spark 最值得学习的不是函数更短，而是命名索引的动作统一、检索返回有类型的业务关系、文本条件放在 WHERE、分数作为 metadata 读取。我方 CALL 沿用 Iceberg procedures，并非错误设计；已有普通距离 SQL 的有限改写和 batch 入口，也不应被比较表抹掉。真正的短板是入口与结果合同分裂、JSON 回表、conf 与 metric 隐式、错误校验和组合边界较弱。对方也要付 namespace 接入、aliases 优先级、options 字符串及部分未知键静默忽略的代价，不能说所有语法都更好。
