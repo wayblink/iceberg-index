@@ -501,7 +501,11 @@ final class IndexResidencyCoordinator {
           IndexCacheProtocol.CommandType.RELEASE,
           indexUuid,
           modeFor(cacheKey),
-          IndexCacheProtocol.File.builder().location(location).cacheKey(cacheKey).build(),
+          IndexCacheProtocol.File.builder()
+              .location(location)
+              .cacheKey(cacheKey)
+              .owner(modeFor(cacheKey))
+              .build(),
           holder.bytes(),
           holder.epoch(),
           holder.installedBy());
@@ -710,8 +714,6 @@ final class IndexResidencyCoordinator {
       node.report =
           node.report.copy().metadataShape(node.report.metadataShape().unknownCharge()).build();
     }
-    node.observeShape(ack.metadataShape());
-
     PlanState plan = plans.get(ack.planId());
     if (plan == null) {
       return;
@@ -720,6 +722,10 @@ final class IndexResidencyCoordinator {
     PlanFile command = plan.command(ack.commandId());
     if (command == null || command.bytes < 0) {
       return;
+    }
+    if (ack.status() != IndexCacheProtocol.AckStatus.LOADED
+        || !plan.fenced.contains(command.cacheKey)) {
+      node.observeShape(ack.metadataShape());
     }
 
     IndexState index = indexes.get(plan.indexUuid);
@@ -1088,6 +1094,7 @@ final class IndexResidencyCoordinator {
         plan.rejected.put(file.location(), "CACHE_KEY_NOT_OWNED");
       } else if (confirmedAnywhere(file.cacheKey())) {
         plan.reused.add(file.cacheKey());
+        reusable.add(file.location());
       }
     }
 
@@ -1174,6 +1181,7 @@ final class IndexResidencyCoordinator {
               IndexCacheProtocol.File.builder()
                   .location(holder.location())
                   .cacheKey(holder.cacheKey())
+                  .owner(modeFor(holder.cacheKey()))
                   .build(),
               holder.bytes(),
               holder.epoch(),
@@ -1315,6 +1323,7 @@ final class IndexResidencyCoordinator {
         IndexCacheProtocol.File.builder()
             .location(migrated.location)
             .cacheKey(migrated.cacheKey)
+            .owner(modeFor(migrated.cacheKey))
             .build(),
         migrated.bytes,
         source.epoch(),
@@ -1379,6 +1388,7 @@ final class IndexResidencyCoordinator {
             IndexCacheProtocol.File.builder()
                 .location(holder.location())
                 .cacheKey(holder.cacheKey())
+                .owner(modeFor(holder.cacheKey()))
                 .build(),
             holder.bytes(),
             holder.epoch(),
@@ -1891,6 +1901,7 @@ final class IndexResidencyCoordinator {
         IndexCacheProtocol.File.builder()
             .location(orphan.location)
             .cacheKey(orphan.cacheKey)
+            .owner(modeFor(orphan.cacheKey))
             .build(),
         orphan.bytes,
         orphan.epoch,
