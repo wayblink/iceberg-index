@@ -1049,6 +1049,9 @@ final class ExecutorIndexCache {
       Preconditions.checkArgument(compatibleRuntime(), "Index cache runtime profile is unknown");
       ExecutorIndexCache model = new ExecutorIndexCache();
       model.restore(state);
+      // A projection is newer than the snapshot it came from. A fresh model starts at zero, so
+      // without this the projected shape would be rejected as an older report by the driver.
+      model.chargeSequence = charge.version();
       model.detachModel();
       Set<String> keys = new LinkedHashSet<>();
       for (IndexCacheProtocol.File file : files) {
@@ -1177,6 +1180,7 @@ final class ExecutorIndexCache {
     Shape releaseKeys(String indexUuid, Set<String> keys) {
       ExecutorIndexCache model = new ExecutorIndexCache();
       model.restore(state);
+      model.chargeSequence = charge.version();
       model.detachModel();
       for (String key : keys) {
         model.releaseCopy(indexUuid, key);
