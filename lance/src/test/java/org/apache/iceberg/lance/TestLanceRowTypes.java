@@ -110,6 +110,25 @@ class TestLanceRowTypes {
   }
 
   @Test
+  void aColumnNameWithADotIsRefusedByName() {
+    // a Lance field name cannot contain a dot: the file format reads it as a nested path. Writing
+    // one fails inside the native writer as a close error, so the boundary says so up front.
+    Schema schema =
+        new Schema(
+            Types.NestedField.required(1, "id", Types.LongType.get()),
+            Types.NestedField.optional(2, "a.b", Types.StringType.get()));
+
+    assertThatThrownBy(() -> LanceRowTypes.checkWritable(schema))
+        .isInstanceOf(UnsupportedOperationException.class)
+        .hasMessageContaining("a.b")
+        .hasMessageContaining("dot")
+        .hasMessageContaining("write.format.default");
+    assertThatThrownBy(() -> LanceRowTypes.checkReadable(schema))
+        .isInstanceOf(UnsupportedOperationException.class)
+        .hasMessageContaining("a.b");
+  }
+
+  @Test
   void everyColumnThatCannotPassIsNamedAtOnce() {
     // one build fails with the whole answer, rather than one column per attempt
     Schema schema =

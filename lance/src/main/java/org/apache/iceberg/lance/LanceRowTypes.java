@@ -62,8 +62,16 @@ public final class LanceRowTypes {
     for (Types.NestedField field : schema.columns()) {
       // a metadata column is not carried by the file: its value comes from the reader's constants,
       // and the partition column for one is a struct that holds nothing a file would store
-      if (!MetadataColumns.isMetadataColumn(field.fieldId()) && !carries(field.type())) {
+      if (MetadataColumns.isMetadataColumn(field.fieldId())) {
+        continue;
+      }
+
+      if (!carries(field.type())) {
         unsupported.add(field.name() + " (" + field.type() + ")");
+      } else if (field.name().contains(".")) {
+        // a file field name cannot contain a dot: the format reads it as a path, and the native
+        // writer rejects the file only after the rows are buffered
+        unsupported.add(field.name() + " (a field name cannot contain a dot)");
       }
     }
 
@@ -72,13 +80,13 @@ public final class LanceRowTypes {
     }
 
     throw new UnsupportedOperationException(
-        "Lance data files carry only flat columns and lists of them in this release, so these columns"
-            + " cannot be "
+        "Lance data files carry only flat columns and lists of them in this release, and a field name"
+            + " cannot contain a dot, so these columns cannot be "
             + what
             + ": "
             + String.join(", ", unsupported)
             + ". Write the table in another format, for example with 'write.format.default' = "
-            + "'parquet', or flatten the column");
+            + "'parquet', rename the column, or flatten it");
   }
 
   /** Whether one column can pass through the row path, which a list can only if its element can. */

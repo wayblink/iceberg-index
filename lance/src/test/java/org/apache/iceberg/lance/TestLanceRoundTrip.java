@@ -299,6 +299,42 @@ class TestLanceRoundTrip {
   }
 
   @Test
+  void carriesFlatValuesThroughTheRowPath() throws IOException {
+    LanceFormatModel<Record, Void> model = createModel();
+    Schema schema =
+        new Schema(
+            Types.NestedField.required(1, "id", Types.LongType.get()),
+            Types.NestedField.optional(3, "c d", Types.StringType.get()),
+            Types.NestedField.optional(4, "dec", Types.DecimalType.of(9, 2)),
+            Types.NestedField.optional(5, "ts", Types.TimestampType.withZone()),
+            Types.NestedField.optional(6, "bin", Types.BinaryType.get()));
+    File file = lanceFile("flat-values");
+
+    List<Record> written = Lists.newArrayList();
+    for (long i = 1; i <= 3; i++) {
+      GenericRecord record = GenericRecord.create(schema);
+      record.setField("id", i);
+      record.setField("c d", "space-" + i);
+      record.setField("dec", new java.math.BigDecimal("1.25"));
+      record.setField("ts", java.time.OffsetDateTime.parse("2026-01-01T00:00:00Z"));
+      record.setField("bin", java.nio.ByteBuffer.wrap(new byte[] {0, (byte) 0xff}));
+      written.add(record);
+    }
+
+    writeRecords(model, file, schema, written);
+    List<Record> read = readRecords(model, file, schema);
+
+    assertThat(read).hasSize(3);
+    for (int i = 0; i < 3; i++) {
+      assertThat(read.get(i).getField("id")).isEqualTo(written.get(i).getField("id"));
+      assertThat(read.get(i).getField("c d")).isEqualTo(written.get(i).getField("c d"));
+      assertThat(read.get(i).getField("dec")).isEqualTo(written.get(i).getField("dec"));
+      assertThat(read.get(i).getField("ts")).isEqualTo(written.get(i).getField("ts"));
+      assertThat(read.get(i).getField("bin")).isEqualTo(written.get(i).getField("bin"));
+    }
+  }
+
+  @Test
   void testFileLength() throws IOException {
     LanceFormatModel<Record, Void> model = createModel();
     File file = lanceFile("file-length");
