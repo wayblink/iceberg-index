@@ -44,6 +44,9 @@ import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
 
 class TestDistributedIndexSearchSizing {
+  // The owner a query plans with is the table location; a working set is only known under one.
+  private static final String OWNER = "file:/warehouse";
+
   @TempDir private Path temp;
 
   @ParameterizedTest
@@ -60,11 +63,8 @@ class TestDistributedIndexSearchSizing {
             .entryCount(0)
             .build();
     IndexAdapter adapter = new SizedAdapter(preparedBytes);
-    byte[] payload = java.nio.file.Files.readAllBytes(temp.resolve("index.puffin"));
-    long residentBytes =
-        ExecutorIndexCache.loaded(payload, adapter.prepare(ByteBuffer.wrap(payload))).bytes();
-    long expected = preparedBytes == 0 ? -1 : residentBytes;
-    assertThat(DistributedIndexSearch.workingSetBytes(new LocalIO(), List.of(file), adapter))
+    long expected = admittedBytes(file, adapter);
+    assertThat(DistributedIndexSearch.workingSetBytes(new LocalIO(), List.of(file), adapter, OWNER))
         .isEqualTo(expected);
   }
 
@@ -131,12 +131,15 @@ class TestDistributedIndexSearchSizing {
   @Test
   void changingDefinitionAtTheSameLocationInvalidatesEstimate() throws IOException {
     IndexFile file = writeFile("definition.puffin");
+    SizedAdapter smaller = new SizedAdapter(70);
+    SizedAdapter larger = new SizedAdapter(170);
     long first =
-        DistributedIndexSearch.workingSetBytes(new LocalIO(), List.of(file), new SizedAdapter(70));
+        DistributedIndexSearch.workingSetBytes(new LocalIO(), List.of(file), smaller, OWNER);
     long second =
-        DistributedIndexSearch.workingSetBytes(new LocalIO(), List.of(file), new SizedAdapter(170));
-    assertThat(first).isEqualTo(IndexCacheMemory.residentBytes(10, 70));
-    assertThat(second).isEqualTo(IndexCacheMemory.residentBytes(10, 170));
+        DistributedIndexSearch.workingSetBytes(new LocalIO(), List.of(file), larger, OWNER);
+    // Each reader is priced by the estimate it publishes, not by the file's blob length.
+    assertThat(first).isEqualTo(admittedBytes(file, smaller)).isPositive();
+    assertThat(second).isEqualTo(admittedBytes(file, larger)).isGreaterThan(first);
   }
 
   @Test
@@ -145,14 +148,15 @@ class TestDistributedIndexSearchSizing {
     java.nio.file.Files.write(path, new byte[10]);
     IndexFile file = file(path.toString());
     SizedAdapter adapter = new SizedAdapter(70);
-    assertThat(DistributedIndexSearch.workingSetBytes(new LocalIO(), List.of(file), adapter))
+    assertThat(DistributedIndexSearch.workingSetBytes(new LocalIO(), List.of(file), adapter, OWNER))
         .isEqualTo(-1);
     java.nio.file.Files.delete(path);
     new PuffinIndexFileContainer()
         .write(
             Files.localOutput(path.toString()), List.of(IndexBlob.of("test-sizing", new byte[10])));
-    assertThat(DistributedIndexSearch.workingSetBytes(new LocalIO(), List.of(file), adapter))
-        .isEqualTo(IndexCacheMemory.residentBytes(10, 70));
+    assertThat(DistributedIndexSearch.workingSetBytes(new LocalIO(), List.of(file), adapter, OWNER))
+        .isEqualTo(admittedBytes(file, adapter))
+        .isPositive();
   }
 
   @Test
@@ -162,8 +166,34 @@ class TestDistributedIndexSearchSizing {
     java.nio.file.Files.write(bad, new byte[10]);
     assertThat(
             DistributedIndexSearch.workingSetBytes(
-                new LocalIO(), List.of(valid, file(bad.toString())), new SizedAdapter(70)))
+                new LocalIO(), List.of(valid, file(bad.toString())), new SizedAdapter(70), OWNER))
         .isEqualTo(-1);
+  }
+
+  /**
+   * The capacity the executor charges for one file of this reader: the admission it computes from
+   * the same memory descriptor, measured rather than derived from the estimate formula.
+   */
+  private static long admittedBytes(IndexFile file, IndexAdapter adapter) {
+    IndexFileMemory memory = IndexCacheMemory.resolveMemory(new LocalIO(), file, adapter);
+    if (memory == null) {
+      return -1;
+    }
+
+    IndexCacheProtocol.File prospect =
+        IndexCacheProtocol.File.builder()
+            .location(file.location())
+            .owner(OWNER)
+            .cacheKey(
+                DistributedIndexSearch.cacheKey(
+                    OWNER, DistributedIndexSearch.adapterKey(adapter), file.location()))
+            .memory(memory)
+            .estimatedBytes(IndexCacheMemory.residentBytes(memory))
+            .build();
+    return ExecutorIndexCache.Shape.empty()
+        .projectAdmission(null, 0, List.of(prospect))
+        .charge()
+        .residentBytes();
   }
 
   private IndexFile writeFile(String name) throws IOException {
