@@ -1188,6 +1188,15 @@ final class ExecutorIndexCache {
       return new Shape(model.state(), model.chargeSnapshot());
     }
 
+    boolean owns(String indexUuid, String cacheKey) {
+      if (indexUuid == null) {
+        return false;
+      }
+      ExecutorIndexCache model = new ExecutorIndexCache();
+      model.restore(state);
+      return model.ownership.keys(indexUuid).contains(cacheKey);
+    }
+
     Map<String, Long> holders() {
       Set<String> keys = new LinkedHashSet<>(state.probation().keySet());
       keys.addAll(state.protectedFiles().keySet());

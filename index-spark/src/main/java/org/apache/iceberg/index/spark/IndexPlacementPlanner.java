@@ -156,12 +156,7 @@ final class IndexPlacementPlanner {
         return "SIZE_UNKNOWN";
       }
     }
-    if (!known) {
-      return file.estimatedBytes() <= nodes.get(0).report.budgetBytes()
-          ? "INSUFFICIENT_CAPACITY"
-          : "FILE_TOO_LARGE";
-    }
-    return "FILE_TOO_LARGE";
+    return known ? "FILE_TOO_LARGE" : "SIZE_UNKNOWN";
   }
 
   private static final class WorkingNode {
@@ -176,10 +171,14 @@ final class IndexPlacementPlanner {
     }
 
     private boolean holds(IndexCacheProtocol.File file) {
-      return report.holders().containsKey(file.cacheKey());
+      return report.holders().containsKey(file.cacheKey())
+          && (shape == null || shape.owns(indexUuid, file.cacheKey()));
     }
 
     private boolean fits(IndexCacheProtocol.File file) {
+      if (shape == null || !shape.charge().known()) {
+        return false;
+      }
       try {
         return after(file) <= report.budgetBytes();
       } catch (RuntimeException e) {
@@ -190,10 +189,6 @@ final class IndexPlacementPlanner {
     private long after(IndexCacheProtocol.File file) {
       if (holds(file)) {
         return Math.addExact(report.usedBytes(), report.reservedBytes());
-      }
-      if (shape == null || !shape.charge().known()) {
-        return Math.addExact(
-            Math.addExact(report.usedBytes(), report.reservedBytes()), file.estimatedBytes());
       }
       ExecutorIndexCache.ChargeSnapshot current = shape.charge();
       ExecutorIndexCache.ChargeSnapshot projected =

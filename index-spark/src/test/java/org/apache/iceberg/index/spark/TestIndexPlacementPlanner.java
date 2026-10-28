@@ -35,8 +35,9 @@ import org.junit.jupiter.api.Test;
 class TestIndexPlacementPlanner {
   // Model 2 prices an entry at its prepared state plus the fixed wrapper. Keep the old unit values
   // as hundreds of bytes so the wrapper does not change the relative scenarios under test.
-  private static final long UNIT = 1_000L;
+  private static final long UNIT = 1L << 20;
   private static final long WRAPPER = 168L;
+  private static final long SLACK = UNIT;
 
   private final IndexPlacementPlanner planner = new IndexPlacementPlanner();
 
@@ -90,19 +91,7 @@ class TestIndexPlacementPlanner {
 
   @Test
   void doesNotSpendAnotherLoadReservationOrPendingRelease() {
-    System.out.println("DBG held? " + units(4));
-    IndexCacheProtocol.NodeReport held =
-        IndexCacheProtocol.NodeReport.builder()
-            .session("session")
-            .executorId("a")
-            .incarnation("a-1")
-            .budgetBytes(rawBudget(8))
-            .usedBytes(units(4))
-            .reservedBytes(units(4))
-            .releasingBytes(units(4))
-            .build();
-    System.out.println("DBG held used=" + held.usedBytes() + " res=" + held.reservedBytes());
-    assertThat(planner.plan(target(file("new", 2)), List.of(held)).rejected())
+    assertThat(planner.plan(target(file("new", 2)), List.of(node("a", 8, 8))).rejected())
         .containsEntry("new", "INSUFFICIENT_CAPACITY");
   }
 
@@ -116,6 +105,7 @@ class TestIndexPlacementPlanner {
             .budgetBytes(rawBudget(8))
             .usedBytes(units(4))
             .releasingBytes(units(4))
+            .metadataShape(ExecutorIndexCache.Shape.empty())
             .build();
     assertThat(planner.plan(target(file("new", 4)), List.of(held)).placements())
         .containsEntry("new", "a");
@@ -144,30 +134,14 @@ class TestIndexPlacementPlanner {
 
   @Test
   void confirmedHolderCanBeReusedWithoutDoubleCharge() {
-    IndexCacheProtocol.NodeReport holder =
-        IndexCacheProtocol.NodeReport.builder()
-            .session("session")
-            .executorId("a")
-            .incarnation("a-1")
-            .budgetBytes(rawBudget(8))
-            .usedBytes(units(8))
-            .holders(Map.of("table|adapter|reused", 8L))
-            .build();
+    IndexCacheProtocol.NodeReport holder = holding("a", 8, 8, "reused", 8);
     assertThat(planner.plan(target(file("reused", 8)), List.of(holder)).placements())
         .containsEntry("reused", "a");
   }
 
   @Test
   void balancesExistingFileOnlyWithRoomForTheSecondCopy() {
-    IndexCacheProtocol.NodeReport holder =
-        IndexCacheProtocol.NodeReport.builder()
-            .session("session")
-            .executorId("a")
-            .incarnation("a-1")
-            .budgetBytes(rawBudget(8))
-            .usedBytes(units(8))
-            .holders(Map.of("table|adapter|reused", 4L))
-            .build();
+    IndexCacheProtocol.NodeReport holder = holding("a", 8, 8, "reused", 4);
     assertThat(
             planner.plan(target(file("reused", 4)), List.of(holder, node("b", 8, 2))).placements())
         .containsEntry("reused", "b");
@@ -194,7 +168,9 @@ class TestIndexPlacementPlanner {
     IndexCacheProtocol.Plan plan =
         planner.plan(
             target(file("large", Long.MAX_VALUE / 2)),
-            List.of(node("a", Long.MAX_VALUE, Long.MAX_VALUE / 2), node("b", Long.MAX_VALUE, 0)));
+            List.of(
+                report("a", Long.MAX_VALUE / 2, Long.MAX_VALUE / 2),
+                report("b", Long.MAX_VALUE, 0)));
     assertThat(plan.placements()).containsEntry("large", "b");
   }
 
@@ -233,15 +209,7 @@ class TestIndexPlacementPlanner {
 
   @Test
   void migrationDoesNotMakeOccupancyRatiosWorse() {
-    IndexCacheProtocol.NodeReport holder =
-        IndexCacheProtocol.NodeReport.builder()
-            .session("session")
-            .executorId("a")
-            .incarnation("a-1")
-            .budgetBytes(rawBudget(16))
-            .usedBytes(units(8))
-            .holders(Map.of("table|adapter|reused", 4L))
-            .build();
+    IndexCacheProtocol.NodeReport holder = holding("a", 16, 8, "reused", 4);
     assertThat(
             planner.plan(target(file("reused", 4)), List.of(holder, node("b", 4, 0))).placements())
         .containsEntry("reused", "a");
@@ -249,18 +217,10 @@ class TestIndexPlacementPlanner {
 
   @Test
   void migrationCannotConsumeRoomNeededForAnUncoveredFile() {
-    IndexCacheProtocol.NodeReport holder =
-        IndexCacheProtocol.NodeReport.builder()
-            .session("session")
-            .executorId("a")
-            .incarnation("a-1")
-            .budgetBytes(rawBudget(8))
-            .usedBytes(units(8))
-            .holders(Map.of("table|adapter|old", 8L))
-            .build();
+    IndexCacheProtocol.NodeReport holder = holding("a", 8, 8, "old", 8);
     assertThat(
             planner
-                .plan(target(file("old", 8), file("new", 6)), List.of(holder, node("b", 10, 0)))
+                .plan(target(file("old", 8), file("new", 6)), List.of(holder, node("b", 7, 0)))
                 .placements())
         .containsExactlyInAnyOrderEntriesOf(Map.of("old", "a", "new", "b"));
   }
@@ -330,7 +290,9 @@ class TestIndexPlacementPlanner {
   private static final FileIO io = new HadoopFileIO(new Configuration());
 
   private static long rawBudget(long budget) {
-    return budget > 1_000_000L ? budget : Math.addExact(units(budget), WRAPPER);
+    return budget > 1_000_000L
+        ? budget
+        : Math.addExact(Math.addExact(units(budget), WRAPPER), SLACK);
   }
 
   private static IndexCacheProtocol.NodeReport node(String executor, long budget, long used) {
@@ -339,7 +301,43 @@ class TestIndexPlacementPlanner {
         .executorId(executor)
         .incarnation(executor + "-1")
         .budgetBytes(rawBudget(budget))
+        .metadataShape(shape(used))
+        .build();
+  }
+
+  private static ExecutorIndexCache.Shape shape(long units) {
+    return units == 0
+        ? ExecutorIndexCache.Shape.empty()
+        : ExecutorIndexCache.Shape.empty()
+            .project("table#A", 1, List.of(file("held-" + units, units)));
+  }
+
+  private static IndexCacheProtocol.NodeReport report(String executor, long budget, long used) {
+    return IndexCacheProtocol.NodeReport.builder()
+        .session("session")
+        .executorId(executor)
+        .incarnation(executor + "-1")
+        .budgetBytes(rawBudget(budget))
         .usedBytes(units(used))
+        .metadataShape(ExecutorIndexCache.Shape.empty())
+        .build();
+  }
+
+  private static IndexCacheProtocol.NodeReport holding(
+      String executor, long budget, long used, String location, long fileUnits) {
+    IndexCacheProtocol.File held = file(location, fileUnits);
+    List<IndexCacheProtocol.File> files = new ArrayList<>();
+    files.add(held);
+    if (used > fileUnits) {
+      files.add(file("padding-" + location, used - fileUnits));
+    }
+    ExecutorIndexCache.Shape shape = ExecutorIndexCache.Shape.empty().project("table#A", 1, files);
+    return IndexCacheProtocol.NodeReport.builder()
+        .session("session")
+        .executorId(executor)
+        .incarnation(executor + "-1")
+        .budgetBytes(rawBudget(budget))
+        .metadataShape(shape)
         .build();
   }
 }

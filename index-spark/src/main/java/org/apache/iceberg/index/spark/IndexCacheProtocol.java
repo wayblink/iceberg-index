@@ -364,10 +364,15 @@ final class IndexCacheProtocol {
     private NodeReport(Builder builder) {
       if (builder.metadataShape != null) {
         ExecutorIndexCache.ChargeSnapshot charge = builder.metadataShape.charge();
-        builder.usedBytes = charge.usedBytes();
-        builder.reservedBytes = charge.reservedBytes();
-        builder.releasingBytes = charge.releasingBytes();
-        builder.holders = builder.metadataShape.holders();
+        Map<String, Long> shapeHolders = builder.metadataShape.holders();
+        if (charge.usedBytes() != 0 || charge.reservedBytes() != 0) {
+          builder.usedBytes = charge.usedBytes();
+          builder.reservedBytes = charge.reservedBytes();
+          builder.releasingBytes = charge.releasingBytes();
+        }
+        if (!shapeHolders.isEmpty() || builder.holders.isEmpty()) {
+          builder.holders = shapeHolders;
+        }
       }
       Preconditions.checkArgument(
           builder.session != null && !builder.session.isEmpty(), "Application session is missing");
