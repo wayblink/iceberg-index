@@ -19,17 +19,21 @@
 package org.apache.iceberg.spark.procedures;
 
 import java.nio.ByteBuffer;
+import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Set;
 import org.apache.iceberg.Table;
+import org.apache.iceberg.index.IndexAdapter;
 import org.apache.iceberg.index.IndexBlob;
 import org.apache.iceberg.index.IndexFile;
 import org.apache.iceberg.index.IndexMetadata;
 import org.apache.iceberg.index.IndexQuery;
 import org.apache.iceberg.index.IndexReader;
 import org.apache.iceberg.index.IndexSnapshot;
+import org.apache.iceberg.index.IndexTypes;
 import org.apache.iceberg.index.PuffinIndexFileContainer;
+import org.apache.iceberg.index.spark.VectorIndexes;
 import org.apache.iceberg.index.vector.VectorIndexAdapter;
-import org.apache.iceberg.index.vector.VectorIndexDefinition;
 import org.apache.iceberg.index.vector.VectorPayloadHeader;
 import org.apache.iceberg.inmemory.InMemoryInputFile;
 import org.apache.iceberg.io.IOUtil;
@@ -48,16 +52,21 @@ import org.apache.spark.unsafe.types.UTF8String;
 /**
  * Reports whether the payloads of a table's indexes can be read by this build.
  *
- * <p>A payload names the kernel and version that wrote it, so a build whose kernel has moved on
+ * <p>A payload names the format and version that wrote it, so a build whose format has moved on
  * cannot read an index written before that, and the only fix is a rebuild. Until this existed the
  * mismatch surfaced as an error on the first query that touched the index, which is a bad time to
  * learn about it and a worse way to find the others.
+ *
+ * <p>A table holds indexes of more than one type, so every index is checked by the reader of its
+ * own type: what says an index is unreadable is a property of the type, a kernel version in the
+ * payload header for vectors and the blob type the manifest declares for text.
  */
 class CheckIndexesProcedure extends BaseProcedure {
 
   // package private so a test can pin the statement a row suggests without staging a broken index
-  static String refreshSuggestionFor(String catalog, String tableName, String column) {
-    return refreshSuggestion(catalog, tableName, column);
+  static String refreshSuggestionFor(
+      String catalog, String tableName, String column, String indexType) {
+    return refreshSuggestion(catalog, tableName, column, indexType);
   }
 
   private static final ProcedureParameter TABLE_PARAM =
@@ -130,7 +139,7 @@ class CheckIndexesProcedure extends BaseProcedure {
 
   private void checkTable(String catalog, Table table, String tableName, List<InternalRow> rows)
       throws java.io.IOException {
-    for (IndexMetadata metadata : org.apache.iceberg.index.spark.VectorIndexes.indexesOf(table)) {
+    for (IndexMetadata metadata : VectorIndexes.indexesOf(table)) {
       IndexSnapshot snapshot = metadata.latestSnapshot();
       String column = VectorIndexProcedures.columnName(table, metadata.definition().fieldId());
 
@@ -150,83 +159,200 @@ class CheckIndexesProcedure extends BaseProcedure {
         continue;
       }
 
-      VectorIndexAdapter adapter =
-          new VectorIndexAdapter((VectorIndexDefinition) metadata.definition());
-      VectorPayloadHeader header;
-      try {
-        header = readHeader(table, metadata, snapshot, adapter);
-      } catch (RuntimeException e) {
-        // a payload whose header cannot be read at all is exactly what this reports: the index has
-        // to be rebuilt, and the error says why
-        rows.add(
-            row(
-                table,
-                column,
-                metadata,
-                null,
-                -1,
-                adapter.kernel().payloadFormatVersion(),
-                false,
-                snapshot.sourceTableSnapshotId(),
-                isStale(table, snapshot),
-                "payload header is unreadable ("
-                    + e.getMessage()
-                    + "); "
-                    + refreshSuggestion(catalog, tableName, column)));
-        continue;
+      // the reader belongs to the index type, so a table holding indexes of several types is
+      // checked one type-specific way each rather than through the one type this knows best
+      IndexAdapter adapter =
+          IndexTypes.fromType(metadata.indexType()).createAdapter(metadata.definition());
+      if (adapter instanceof VectorIndexAdapter) {
+        checkVectorPayload(
+            catalog,
+            table,
+            tableName,
+            column,
+            metadata,
+            snapshot,
+            (VectorIndexAdapter) adapter,
+            rows);
+      } else {
+        checkDeclaredPayloads(catalog, table, tableName, column, metadata, snapshot, adapter, rows);
       }
+    }
+  }
 
-      if (header == null) {
-        rows.add(
-            row(
-                table,
-                column,
-                metadata,
-                null,
-                -1,
-                -1,
-                false,
-                snapshot.sourceTableSnapshotId(),
-                isStale(table, snapshot),
-                "no payload found in the index files; "
-                    + refreshSuggestion(catalog, tableName, column)));
-        continue;
-      }
-
-      boolean readable = header.readableBy(adapter.kernel());
-      int readerVersion = adapter.kernel().payloadFormatVersion();
+  /**
+   * Checks a vector index by the kernel version written inside the first payload, which is what a
+   * reader of this type matches on.
+   */
+  private void checkVectorPayload(
+      String catalog,
+      Table table,
+      String tableName,
+      String column,
+      IndexMetadata metadata,
+      IndexSnapshot snapshot,
+      VectorIndexAdapter adapter,
+      List<InternalRow> rows)
+      throws java.io.IOException {
+    String indexType = metadata.indexType();
+    VectorPayloadHeader header;
+    try {
+      header = readHeader(table, metadata, snapshot, adapter);
+    } catch (RuntimeException e) {
+      // a payload whose header cannot be read at all is exactly what this reports: the index has
+      // to be rebuilt, and the error says why
       rows.add(
           row(
               table,
               column,
               metadata,
-              header.kernel(),
-              header.kernelVersion(),
-              readerVersion,
-              readable,
+              null,
+              -1,
+              adapter.kernel().payloadFormatVersion(),
+              false,
               snapshot.sourceTableSnapshotId(),
               isStale(table, snapshot),
-              readable
-                  ? null
-                  : "payload was written by "
-                      + header
-                      + ", this build reads "
-                      + adapter.kernel().name()
-                      + " version "
-                      + readerVersion
-                      + "; "
-                      + refreshSuggestion(catalog, tableName, column)));
+              "payload header is unreadable ("
+                  + e.getMessage()
+                  + "); "
+                  + refreshSuggestion(catalog, tableName, column, indexType)));
+      return;
     }
+
+    if (header == null) {
+      rows.add(
+          row(
+              table,
+              column,
+              metadata,
+              null,
+              -1,
+              -1,
+              false,
+              snapshot.sourceTableSnapshotId(),
+              isStale(table, snapshot),
+              "no payload found in the index files; "
+                  + refreshSuggestion(catalog, tableName, column, indexType)));
+      return;
+    }
+
+    boolean readable = header.readableBy(adapter.kernel());
+    int readerVersion = adapter.kernel().payloadFormatVersion();
+    rows.add(
+        row(
+            table,
+            column,
+            metadata,
+            header.kernel(),
+            header.kernelVersion(),
+            readerVersion,
+            readable,
+            snapshot.sourceTableSnapshotId(),
+            isStale(table, snapshot),
+            readable
+                ? null
+                : "payload was written by "
+                    + header
+                    + ", this build reads "
+                    + adapter.kernel().name()
+                    + " version "
+                    + readerVersion
+                    + "; "
+                    + refreshSuggestion(catalog, tableName, column, indexType)));
+  }
+
+  /**
+   * Checks an index type whose payload version is part of the blob type instead of a header inside
+   * the payload, such as the text index.
+   *
+   * <p>Such a type says in its own adapter which blob types it reads, and the manifest declares the
+   * blob type of every index file, so the manifest alone answers whether the payloads of a snapshot
+   * can be read: no file has to be opened. A payload that declares a version this build does not
+   * read would be skipped by a query rather than fail it, which is why a partly readable snapshot
+   * is reported as needing a rebuild instead of as readable.
+   */
+  private void checkDeclaredPayloads(
+      String catalog,
+      Table table,
+      String tableName,
+      String column,
+      IndexMetadata metadata,
+      IndexSnapshot snapshot,
+      IndexAdapter adapter,
+      List<InternalRow> rows) {
+    String indexType = metadata.indexType();
+    Set<String> present = new LinkedHashSet<>();
+    Set<String> unreadable = new LinkedHashSet<>();
+    for (IndexFile file : VectorIndexes.indexFiles(table.io(), snapshot)) {
+      present.add(file.blobType());
+      if (!readablePayload(adapter, file.kind(), file.blobType())) {
+        unreadable.add(file.blobType());
+      }
+    }
+
+    if (present.isEmpty()) {
+      rows.add(
+          row(
+              table,
+              column,
+              metadata,
+              null,
+              -1,
+              -1,
+              false,
+              snapshot.sourceTableSnapshotId(),
+              isStale(table, snapshot),
+              "no payload found in the index files; "
+                  + refreshSuggestion(catalog, tableName, column, indexType)));
+      return;
+    }
+
+    boolean readable = unreadable.isEmpty();
+    rows.add(
+        row(
+            table,
+            column,
+            metadata,
+            null,
+            -1,
+            -1,
+            readable,
+            snapshot.sourceTableSnapshotId(),
+            isStale(table, snapshot),
+            readable
+                ? null
+                : "payloads were written as "
+                    + String.join(", ", unreadable)
+                    + ", this build reads "
+                    + String.join(", ", readableBlobTypes(adapter))
+                    + "; "
+                    + refreshSuggestion(catalog, tableName, column, indexType)));
+  }
+
+  // package private so a test can pin the decision without staging an index of another version
+  static boolean readablePayload(IndexAdapter adapter, IndexFile.Kind kind, String blobType) {
+    Set<String> readableTypes =
+        kind == IndexFile.Kind.ENTRY_BEARING
+            ? adapter.readableEntryBlobTypes()
+            : adapter.readableAuxiliaryBlobTypes();
+    return readableTypes.contains(blobType);
+  }
+
+  /** Every blob type this build reads for the index, which is what a rebuild has to produce. */
+  private static Set<String> readableBlobTypes(IndexAdapter adapter) {
+    Set<String> blobTypes = new LinkedHashSet<>(adapter.readableEntryBlobTypes());
+    blobTypes.addAll(adapter.readableAuxiliaryBlobTypes());
+    return blobTypes;
   }
 
   /** The statement that rebuilds the index, which is the only thing a mismatch leaves to do. */
-  private static String refreshSuggestion(String catalog, String tableName, String column) {
+  private static String refreshSuggestion(
+      String catalog, String tableName, String column, String indexType) {
     // a table named with or without its catalog both end up as catalog.namespace.table
     String bare =
         tableName.startsWith(catalog + ".") ? tableName.substring(catalog.length() + 1) : tableName;
     return String.format(
-        "run CALL %s.system.refresh_vector_index(table => '%s', column => '%s')",
-        catalog, catalog + "." + bare, column);
+        "run CALL %s.system.refresh_%s_index(table => '%s', column => '%s')",
+        catalog, indexType, catalog + "." + bare, column);
   }
 
   /** Reads the header of the first payload, which is where a mismatch shows up first. */

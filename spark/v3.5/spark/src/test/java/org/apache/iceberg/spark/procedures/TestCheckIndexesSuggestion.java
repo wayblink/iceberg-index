@@ -31,7 +31,7 @@ class TestCheckIndexesSuggestion {
     // caller called rather than reading one out of the table name
     assertThat(
             CheckIndexesProcedure.refreshSuggestionFor(
-                "spark_catalog", "spark_catalog.default.t", "embedding"))
+                "spark_catalog", "spark_catalog.default.t", "embedding", "vector"))
         .isEqualTo(
             "run CALL spark_catalog.system.refresh_vector_index(table => "
                 + "'spark_catalog.default.t', column => 'embedding')");
@@ -39,9 +39,19 @@ class TestCheckIndexesSuggestion {
 
   @Test
   public void aTableNamedWithoutItsCatalogGetsItBack() {
-    assertThat(CheckIndexesProcedure.refreshSuggestionFor("prod", "db.t", "embedding"))
+    assertThat(CheckIndexesProcedure.refreshSuggestionFor("prod", "db.t", "embedding", "vector"))
         .isEqualTo(
             "run CALL prod.system.refresh_vector_index(table => 'prod.db.t', column => "
                 + "'embedding')");
+  }
+
+  @Test
+  public void theStatementRefreshesTheIndexOfTheTypeThatNeedsIt() {
+    // a text index is rebuilt by the procedure of its own type; suggesting the vector one would
+    // hand the operator a statement that cannot fix what the row reports
+    assertThat(CheckIndexesProcedure.refreshSuggestionFor("prod", "db.documents", "body", "text"))
+        .isEqualTo(
+            "run CALL prod.system.refresh_text_index(table => 'prod.db.documents', column => "
+                + "'body')");
   }
 }

@@ -182,10 +182,30 @@ public final class VectorIndexes {
    * @return a two-element array: index file count and entry count
    */
   public static long[] counts(FileIO fileIO, IndexSnapshot snapshot) {
-    long indexFiles = 0;
     long entries = 0;
     if (snapshot == null) {
       return new long[] {0L, 0L};
+    }
+
+    List<IndexFile> files = indexFiles(fileIO, snapshot);
+    for (IndexFile indexFile : files) {
+      entries += indexFile.entryCount();
+    }
+
+    return new long[] {(long) files.size(), entries};
+  }
+
+  /**
+   * The index files of a snapshot, of every kind and blob type, read from its manifest list and
+   * manifests.
+   *
+   * <p>This is the unfiltered view: a caller that decides for itself what it can read, such as a
+   * check that reports payloads in a format this build cannot read, needs to see the files a typed
+   * reader would skip.
+   */
+  public static List<IndexFile> indexFiles(FileIO fileIO, IndexSnapshot snapshot) {
+    if (snapshot == null) {
+      return Lists.newArrayList();
     }
 
     List<IndexFile> files = Lists.newArrayList();
@@ -200,11 +220,6 @@ public final class VectorIndexes {
           "Failed to read index manifests of snapshot " + snapshot.snapshotId(), e);
     }
 
-    indexFiles = files.size();
-    for (IndexFile indexFile : files) {
-      entries += indexFile.entryCount();
-    }
-
-    return new long[] {indexFiles, entries};
+    return files;
   }
 }

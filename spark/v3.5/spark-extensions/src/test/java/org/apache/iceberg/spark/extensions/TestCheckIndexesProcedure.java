@@ -79,6 +79,40 @@ public class TestCheckIndexesProcedure extends ExtensionsTestBase {
     assertThat(names).contains("flat_second");
   }
 
+  @TestTemplate
+  public void indexPathTypesAreCheckedWithTheirOwnReader() {
+    String table = tableName("check_text_" + catalogName);
+    sql("CREATE TABLE %s (id bigint, embedding array<double>, body string) USING iceberg", table);
+    sql(
+        "INSERT INTO %s VALUES "
+            + "(1, array(1.0d, 0.0d), 'iceberg table format'), "
+            + "(2, array(0.0d, 1.0d), 'iceberg snapshot manifests'), "
+            + "(3, array(0.5d, 0.5d), 'parquet columnar storage')",
+        table);
+    sql(
+        "CALL %s.system.build_vector_index(table => '%s', column => 'embedding', dimension => 2)",
+        catalogName, table);
+    sql("CALL %s.system.build_text_index(table => '%s', column => 'body')", catalogName, table);
+
+    // one row per index of the table, whichever type it is: checking only the vector ones would
+    // report a table of text indexes as having nothing to check
+    List<Object[]> rows = sql("CALL %s.system.check_indexes(table => '%s')", catalogName, table);
+    assertThat(rows).hasSize(2);
+    assertThat(types(rows)).containsExactlyInAnyOrder("vector", "text");
+    assertThat(rows)
+        .allSatisfy(
+            row -> {
+              assertThat((Boolean) row[8]).as("readable: %s", row[4]).isTrue();
+              assertThat(row[11]).as("no suggestion for a readable index: %s", row[4]).isNull();
+            });
+  }
+
+  private static List<String> types(List<Object[]> rows) {
+    return rows.stream()
+        .map(row -> row[4].toString())
+        .collect(java.util.stream.Collectors.toList());
+  }
+
   private String tableLocation(Table table) {
     return table.name();
   }
