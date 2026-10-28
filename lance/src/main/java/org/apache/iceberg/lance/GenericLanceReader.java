@@ -51,6 +51,7 @@ public class GenericLanceReader {
           Schema icebergSchema,
           org.apache.arrow.vector.types.pojo.Schema arrowSchema,
           Map<Integer, ?> idToConstant) {
+    LanceRowTypes.checkReadable(icebergSchema);
     return entry -> {
       VectorSchemaRoot batch = entry.getKey();
       Map<Integer, ?> constants = entry.getValue();

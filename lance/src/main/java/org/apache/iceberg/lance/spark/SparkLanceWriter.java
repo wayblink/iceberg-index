@@ -22,6 +22,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.function.Function;
 import org.apache.iceberg.Schema;
+import org.apache.iceberg.lance.LanceRowTypes;
 import org.apache.iceberg.relocated.com.google.common.collect.Maps;
 import org.apache.iceberg.types.Types;
 import org.apache.spark.sql.catalyst.InternalRow;
@@ -43,6 +44,9 @@ public class SparkLanceWriter {
    * @return a function that extracts values from InternalRow into a name→value Map
    */
   public static Function<InternalRow, Map<String, Object>> buildWriter(Schema icebergSchema) {
+    // what a Lance data file can carry is a property of the format rather than of a row, so it is
+    // answered once, before the first row and with the columns named
+    LanceRowTypes.checkWritable(icebergSchema);
     List<Types.NestedField> columns = icebergSchema.columns();
     return row -> {
       Map<String, Object> values = Maps.newHashMapWithExpectedSize(columns.size());

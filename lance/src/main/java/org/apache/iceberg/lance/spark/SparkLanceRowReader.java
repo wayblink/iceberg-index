@@ -42,6 +42,7 @@ import org.apache.arrow.vector.VectorSchemaRoot;
 import org.apache.iceberg.Schema;
 import org.apache.iceberg.io.CloseableIterable;
 import org.apache.iceberg.io.CloseableIterator;
+import org.apache.iceberg.lance.LanceRowTypes;
 import org.apache.iceberg.types.Types;
 import org.apache.spark.sql.catalyst.InternalRow;
 import org.apache.spark.sql.catalyst.expressions.GenericInternalRow;
@@ -68,6 +69,9 @@ public class SparkLanceRowReader {
   public static Function<
           Map.Entry<VectorSchemaRoot, Map<Integer, ?>>, CloseableIterable<InternalRow>>
       buildReader(Schema expectedSchema, Map<Integer, ?> idToConstant) {
+    // a column the row path cannot carry fails here, naming it, rather than on the first row that
+    // holds a value: what a Lance data file can carry is a property of the format
+    LanceRowTypes.checkReadable(expectedSchema);
     return entry -> {
       VectorSchemaRoot batch = entry.getKey();
       Map<Integer, ?> constants = entry.getValue();

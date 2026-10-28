@@ -42,6 +42,7 @@ public class GenericLanceWriter {
    */
   public static Function<Record, Map<String, Object>> create(
       Schema icebergSchema, org.apache.arrow.vector.types.pojo.Schema arrowSchema) {
+    LanceRowTypes.checkWritable(icebergSchema);
     return record -> LanceArrowConverter.recordToMap(record, icebergSchema);
   }
 }

@@ -366,6 +366,7 @@ docker push hub.i.basemind.com/spark/sparkann-e2e:<tag>
 6. **`FLAT` 不作为生产查询手段**（它在规模上省不了开销），但它**不再被改写规则拒绝**：旧规则里"FLAT 代价等同扫描所以跳过"的判断已删除，`TestVectorIndexGuide.theRewriteUsesWhateverStructureTheIndexHas` 断言 FLAT 也会生成 `VectorSearchSource`。早先"FLAT 走 `ORDER BY` 拿不到结果"的观察对应旧行为；用户手册里"索引不能是 `FLAT`"一句已过期，改文档时以本条为准。
 7. **删除表/删除行的边界**：equality delete 的多键集已支持，`timestamp_nano` 键被明确拒绝（避免同微秒多行误删）；带删除的表上建索引前请确认删除文件格式（跟随数据格式，Lance 表是 `.lance`）。
 8. **回溯版的两项能力缺失（受 1.9.1 基线限制，见 §7.3）**：其一，取回（fetch-back）没有"只读指定 row 位置"的能力，命中后会把整文件读出来再按位置过滤，结果正确但比 1.10+ 慢，差值待 10M 基准量；其二，**不支持 Lance 文件格式**，索引只读 Parquet，基准对比里的 Lance 列不适用于回溯版。
+9. **Lance 数据文件只承载扁平列和它们的列表**（首版边界，不是待修 bug）：`struct`、`map`、元素为 struct 的 list 既写不进 Lance 文件也读不回来，顶层字段名也不能含点号（格式按路径解析）；建 writer/reader 时就报错并点名具体列（`LanceRowTypes`）。需要嵌套列的表请用 `'write.format.default' = 'parquet'`。这条影响验收口径：L1 的嵌套 JSON 值保真只在 Parquet 上验，Lance 侧验的是"清晰拒绝"而不是"能写能读"；写进发布清单（release manifest）的限制说明以此为准，别把 Lance 嵌套列算进本版的覆盖范围。
 
 ---
 

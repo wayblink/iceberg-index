@@ -19,6 +19,7 @@
 package org.apache.iceberg.spark.extensions;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 import java.nio.file.Path;
 import java.util.List;
@@ -95,6 +96,45 @@ class TestLanceFormatTable {
     assertThat(files).isNotEmpty();
     assertThat(files).allSatisfy(row -> assertThat(row.getString(0)).endsWith(".lance"));
     assertThat(files.stream().mapToLong(row -> row.getLong(1)).sum()).isEqualTo(3L);
+  }
+
+  @Test
+  public void refusesToWriteANestedColumn() {
+    // the release boundary of the format: a Lance data file carries flat columns and lists of them,
+    // and a table that asks for more has to say so when it is written rather than fail on a row or
+    // write a file nothing can read back
+    String nested = "local.db.lance_nested";
+    String flat = "local.db.lance_nested_parquet";
+    spark.sql("CREATE NAMESPACE IF NOT EXISTS local.db");
+    spark.sql("DROP TABLE IF EXISTS " + nested);
+    spark.sql("DROP TABLE IF EXISTS " + flat);
+    spark.sql(
+        "CREATE TABLE "
+            + nested
+            + " (id bigint, payload struct<a: int, b: string>) USING iceberg "
+            + "TBLPROPERTIES ('write.format.default' = 'lance')");
+    spark.sql(
+        "CREATE TABLE "
+            + flat
+            + " (id bigint, payload struct<a: int, b: string>) USING iceberg "
+            + "TBLPROPERTIES ('write.format.default' = 'parquet')");
+
+    assertThatThrownBy(
+            () ->
+                spark.sql("INSERT INTO " + nested + " VALUES (1, named_struct('a', 1, 'b', 'x'))"))
+        .hasStackTraceContaining("Lance data files carry only flat columns")
+        .hasStackTraceContaining("payload")
+        .hasStackTraceContaining("write.format.default");
+
+    // nothing was committed, so the table is not a half-written one to clean up
+    assertThat(spark.sql("SELECT count(*) FROM " + nested).head().getLong(0)).isZero();
+
+    // the same schema is what the caller can write today, in a format that carries it
+    spark.sql("INSERT INTO " + flat + " VALUES (1, named_struct('a', 1, 'b', 'x'))");
+    assertThat(spark.sql("SELECT payload.a, payload.b FROM " + flat).head().getInt(0)).isEqualTo(1);
+
+    spark.sql("DROP TABLE IF EXISTS " + nested);
+    spark.sql("DROP TABLE IF EXISTS " + flat);
   }
 
   @Test
