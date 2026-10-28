@@ -211,8 +211,8 @@ class TestRowsAtJson {
    *
    * <p>The value has to survive the read as well: a parquet writer stores such a name escaped
    * (`a.b` as `a_x2Eb`), so a read that asks for the column by its table name finds nothing and
-   * answers a null. The fetch-back therefore has to find the column the way Iceberg does, by
-   * field id.
+   * answers a null. The fetch-back therefore has to find the column the way Iceberg does, by field
+   * id.
    */
   @Test
   void aColumnWhoseNameContainsADotStillSerialises() throws Exception {
@@ -237,12 +237,7 @@ class TestRowsAtJson {
     List<FileScanTask> tasks = IndexEntries.scanTasks(table, table.currentSnapshot().snapshotId());
     Map<String, Map<Long, String>> onlyDotted =
         IndexEntries.rowsAtJson(
-            spark,
-            table,
-            positionsOfDeleted(tasks),
-            Lists.newArrayList("a.b"),
-            fullSchema,
-            tasks);
+            spark, table, positionsOfDeleted(tasks), Lists.newArrayList("a.b"), fullSchema, tasks);
     assertThat(onlyDotted.values().stream().flatMap(byPosition -> byPosition.values().stream()))
         .as("a fetch-back that asks for the column alone")
         .allSatisfy(value -> assertThat(value).isEqualTo("{\"a.b\":\"dotted\"}"));
