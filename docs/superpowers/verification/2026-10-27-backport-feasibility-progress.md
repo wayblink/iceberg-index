@@ -31,6 +31,16 @@
 
 本阶段没有移植后的产品交付、镜像发布或集群性能结论。
 
+## 用户指定的Spark源码基线
+
+后续#2762的Spark基线以用户指定的`https://gitlab.basemind.com/storage/spark/-/tree/step-spark-3.5`为准，不以shai `/opt/spark`安装或上游发行包代替。
+
+本次解析分支HEAD为`5f6465658458da1b30f8de27bf4657c2c193e6e1`，POM实际声明：Spark `3.5.7-STEP-rc3`、Scala `2.12.18`、外部Avro `1.11.4`、外部Parquet `1.13.1`；`ndp-repo` profile引用Iceberg runtime `1.9.1-STEP-rc3`。POM的`java.version=1.8`是构建属性，不能当作集群启动JDK的证据。
+
+早期源码追踪使用的detached `606d742b`与现分支HEAD不同；shai默认 `/opt/spark`实跑是Apache Spark3.5.8/Avro1.11.5/Java11，也不是上述目标。实验、编译与最终部署要记录匹配的commit与artifact，不能混用。
+
+此前实读vendor rc1仍是其内部依赖与shading的有效历史证据，但最终验收需核对指定分支对应的rc3构建物和厂内Iceberg源码，不能以rc1自动替代rc3。
+
 ## 实测一：厂内runtime的内部依赖
 
 在shai直接读取 `/data/workspace/vendor-jars/iceberg-spark-runtime-3.5_2.12-1.9.1-STEP-rc1.jar`：
