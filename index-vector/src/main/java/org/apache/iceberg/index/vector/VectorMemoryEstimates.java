@@ -66,7 +66,7 @@ final class VectorMemoryEstimates {
         + PreparedStructureSize.REFERENCE_BYTES
         + ";alignment="
         + PreparedStructureSize.ALIGNMENT
-        + ";compact-strings=true;representation=decoded-v2;processors="
+        + ";compact-strings=true;representation=in-place;processors="
         + processors;
   }
 

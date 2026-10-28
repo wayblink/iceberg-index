@@ -111,9 +111,9 @@ class TestVectorBuildMemory {
     assertThat(high.memory().structure())
         .containsEntry("quantizer-bits", 8L)
         .containsEntry("code-bytes", 32L);
-    // With a 16-byte header and 8-byte alignment, the code arrays retain 24 and 48 bytes.
-    assertThat(high.memory().preparedBytes() - low.memory().preparedBytes())
-        .isEqualTo(count * (48L - 24L));
+    // The records are read where they lie, so the difference is the codes in the snapshot itself:
+    // 28 more bytes per record, and the payload is already aligned to eight bytes.
+    assertThat(high.memory().preparedBytes() - low.memory().preparedBytes()).isEqualTo(count * 28L);
     assertEstimate(oneBit, low);
     assertEstimate(eightBits, high);
   }
@@ -302,7 +302,7 @@ class TestVectorBuildMemory {
   private static void assertEstimate(VectorIndexAdapter adapter, IndexBuildResult built) {
     assertThat(built.memory()).isNotNull();
     assertThat(built.memory().modelVersion()).isEqualTo(2);
-    assertThat(built.memory().runtimeProfile()).contains("representation=decoded-v2");
+    assertThat(built.memory().runtimeProfile()).contains("representation=in-place");
     assertThat(built.memory().payloadBytes()).isEqualTo(built.payload().remaining());
     assertThat(built.memory().preparedBytes())
         .isEqualTo(adapter.kernel().prepare(built.payload()).estimatedBytes());
