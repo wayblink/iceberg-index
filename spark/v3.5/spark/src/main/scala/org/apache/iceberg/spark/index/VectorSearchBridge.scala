@@ -30,6 +30,7 @@ import org.apache.iceberg.index.spark.{DistributedIndexSearch, IndexEntries, Ind
 import org.apache.iceberg.index.vector.VectorIndexAdapter
 import org.apache.spark.sql.{Row, RowFactory, SparkSession}
 import org.apache.spark.sql.catalyst.plans.logical.LeafNode
+import org.apache.spark.sql.catalyst.plans.logical.Statistics
 
 /**
  * The shared entry point for a vector search whose result keeps the index's own hits: {@code CALL
@@ -233,6 +234,24 @@ private[spark] case class VectorSearchHitsRequest(
     extends LeafNode {
 
   override protected def otherCopyArgs: Seq[AnyRef] = output :: Nil
+
+  /**
+   * The hits this request can answer with, which is all it ever returns.
+   *
+   * <p>A leaf of a plan has to estimate itself: an operator that sizes its input — a join does, a
+   * filter or a projection does not — asks for one while planning, and the default estimate for a
+   * leaf is not implemented. The contract bounds the answer tightly: one hit per query for each of
+   * the {@code topK} results asked for, and no residual scan to add uncovered rows, unlike the
+   * rewritten source.
+   */
+  override def computeStats: Statistics = {
+    val perQuery = math.max(0, topK).toLong
+    val rows = if (batch) perQuery * queries.size else perQuery
+    val bytesPerRow = output.foldLeft(8L) { (bytes, attribute) =>
+      bytes + attribute.dataType.defaultSize
+    }
+    Statistics(sizeInBytes = bytesPerRow * rows, rowCount = Some(rows))
+  }
 
   def queryVectors: JList[Array[Float]] = {
     val vectors = new java.util.ArrayList[Array[Float]](queries.size)

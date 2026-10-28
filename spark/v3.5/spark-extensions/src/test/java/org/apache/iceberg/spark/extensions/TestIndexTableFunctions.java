@@ -29,10 +29,12 @@ import org.apache.iceberg.index.vector.VectorIndexTypes;
 import org.apache.spark.sql.AnalysisException;
 import org.apache.spark.sql.Row;
 import org.apache.spark.sql.SparkSession;
+import org.apache.spark.sql.catalyst.plans.logical.LogicalPlan;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
+import scala.jdk.javaapi.CollectionConverters;
 
 /**
  * Tests the index table-valued functions: they must return exactly what the corresponding CALL
@@ -170,6 +172,53 @@ class TestIndexTableFunctions {
                     + "ON get_json_object(h.row, '$.id') = CAST(d.id AS string)")
             .collectAsList();
     assertThat(joined.get(0).getLong(0)).isEqualTo(2L);
+  }
+
+  /**
+   * A vector search is a leaf of the plan like any other, so an operator that estimates its input
+   * -- a join does, a filter or a projection does not -- has to be able to ask it for one.
+   */
+  @Test
+  public void aVectorSearchJoinsLikeAnyOtherTable() {
+    List<Row> joined =
+        spark
+            .sql(
+                "SELECT count(*) AS n FROM "
+                    + "vector_index_search('local.db.docs', 'embedding', array(1.0d, 0.0d), 10) h "
+                    + "JOIN local.db.docs d "
+                    + "ON get_json_object(h.row, '$.id') = CAST(d.id AS string)")
+            .collectAsList();
+
+    // every row of a four-row table is a hit of a search that asks for ten
+    assertThat(joined.get(0).getLong(0)).isEqualTo(4L);
+  }
+
+  @Test
+  public void aVectorSearchEstimatesItsOwnSize() {
+    // the answer is one hit per query per requested result, and the index never adds a residual
+    // scan
+    assertThat(
+            hitsEstimate("vector_index_search('local.db.docs', 'embedding', array(1.0d, 0.0d), 3)"))
+        .as("one query asking for three")
+        .isEqualTo(3L);
+    assertThat(
+            hitsEstimate(
+                "vector_index_search_batch('local.db.docs', 'embedding', "
+                    + "array('1.0,0.0', '0.0,1.0'), 3)"))
+        .as("two queries asking for three each")
+        .isEqualTo(6L);
+  }
+
+  /** The row count the function's leaf of the plan reports to whoever asks. */
+  private static long hitsEstimate(String call) {
+    LogicalPlan leaf =
+        CollectionConverters.asJava(
+                spark.sql("SELECT * FROM " + call).queryExecution().optimizedPlan().collectLeaves())
+            .stream()
+            .filter(node -> node.nodeName().equals("VectorSearchHitsRequest"))
+            .findFirst()
+            .orElseThrow(() -> new AssertionError("No hits request in the plan of: " + call));
+    return leaf.stats().rowCount().get().longValue();
   }
 
   @Test
