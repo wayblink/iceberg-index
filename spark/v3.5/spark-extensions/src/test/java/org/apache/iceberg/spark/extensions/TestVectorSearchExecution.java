@@ -356,6 +356,79 @@ class TestVectorSearchExecution {
                     .contains(frozenIndex));
   }
 
+  /**
+   * An operator above the lowered limit captures its child plan in a closure, so whatever the
+   * lowered node carries has to survive being serialised to an executor — even though the search
+   * itself runs on the driver.
+   */
+  @Test
+  void anAggregateOverARewrittenLimitAnswers() {
+    String table = tableWithIndex("exec_aggregate");
+    String inner = ordering(table, 3);
+
+    List<Row> rows = spark.sql(String.format("SELECT count(*) FROM (%s)", inner)).collectAsList();
+    assertThat(rows).hasSize(1);
+    assertThat(rows.get(0).getLong(0)).as("the three nearest rows were counted").isEqualTo(3L);
+
+    // what the node decided is still readable in the plan of the query, not only of the inner one
+    String plan = spark.sql("EXPLAIN " + inner).collectAsList().get(0).getString(0);
+    assertThat(plan).contains("VectorSearchSource");
+    assertThat(plan).as("the parameters and the barrier").contains("driverMaterialization=true");
+  }
+
+  @Test
+  void aGroupByOverARewrittenLimitAnswers() {
+    String table = tableWithIndex("exec_group_by");
+    String inner = ordering(table, 3);
+
+    List<Row> rows =
+        spark
+            .sql(String.format("SELECT id, count(*) FROM (%s) GROUP BY id ORDER BY id", inner))
+            .collectAsList();
+    assertThat(rows)
+        .as("the aggregate runs over the rows the index answered")
+        .extracting(row -> row.getLong(0))
+        .isNotEmpty()
+        .hasSizeLessThanOrEqualTo(3);
+  }
+
+  @Test
+  void aDistinctOverARewrittenLimitAnswers() {
+    String table = tableWithIndex("exec_distinct");
+    String inner = ordering(table, 3);
+
+    List<Row> rows =
+        spark.sql(String.format("SELECT DISTINCT id FROM (%s)", inner)).collectAsList();
+    assertThat(rows).hasSize(3);
+  }
+
+  @Test
+  void aJoinOverARewrittenLimitAnswers() {
+    String table = tableWithIndex("exec_join");
+    String inner = ordering(table, 3);
+
+    long joined =
+        spark
+            .sql(
+                String.format(
+                    "SELECT a.id FROM (%s) a JOIN local.db.%s b ON a.id = b.id", inner, table))
+            .collectAsList()
+            .size();
+    assertThat(joined).as("every answered row joined itself").isEqualTo(3L);
+  }
+
+  @Test
+  void aWindowOverARewrittenLimitAnswers() {
+    String table = tableWithIndex("exec_window");
+    String inner = ordering(table, 3);
+
+    List<Row> rows =
+        spark
+            .sql(String.format("SELECT id, row_number() OVER (ORDER BY id) FROM (%s)", inner))
+            .collectAsList();
+    assertThat(rows).hasSize(3);
+  }
+
   private static String ordering(String table, int limit) {
     return String.format(
         "SELECT id FROM local.db.%s ORDER BY vec_distance(embedding, array(1.0d, 0.0d)) LIMIT %d",

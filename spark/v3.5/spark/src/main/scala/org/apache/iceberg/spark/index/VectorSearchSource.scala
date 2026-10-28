@@ -20,6 +20,7 @@ package org.apache.iceberg.spark.index
 
 import org.apache.spark.sql.catalyst.expressions.Attribute
 import org.apache.spark.sql.catalyst.plans.logical.LeafNode
+import org.apache.spark.sql.catalyst.plans.logical.Statistics
 
 /**
  * The lowered vector source: the live rows of a frozen table snapshot that a vector search can
@@ -77,4 +78,17 @@ private[spark] case class VectorSearchSource(context: VectorSearchContext)(
 
   override def simpleString(maxFields: Int): String =
     s"VectorSearchSource[${stringArgs.mkString(", ")}]"
+
+  /**
+   * At most {@code k} rows, which is what the limit above asks for and all the index can answer with.
+   *
+   * <p>A leaf node has to estimate itself: an aggregate, a join or a distinct above the source asks
+   * for the size of its input while planning, and the default estimate for a leaf is not implemented.
+   * The answer is the whole record per row, so the width of the output is what makes up the estimate.
+   */
+  override def computeStats: Statistics = {
+    val rows = context.request.input.topK
+    val bytesPerRow = output.map(_.dataType.defaultSize).sum
+    Statistics(sizeInBytes = bytesPerRow.toLong * rows, rowCount = Some(rows))
+  }
 }

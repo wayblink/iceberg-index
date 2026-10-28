@@ -43,7 +43,7 @@ case class VectorSearchStrategy(spark: SparkSession) extends Strategy {
   // as the whole physical plan, so matching a nested node here would answer the query with that
   // node and drop the operators above it, including the limit
   override def apply(plan: LogicalPlan): Seq[SparkPlan] = plan match {
-    case source: VectorSearchSource => VectorSearchSourceExec(spark, source) :: Nil
+    case source: VectorSearchSource => VectorSearchSourceExec(spark, source, source.output) :: Nil
     case hits: VectorSearchHitsRequest => VectorSearchHitsRequestExec(spark, hits) :: Nil
     case _ => Nil
   }
@@ -75,10 +75,16 @@ private[spark] case class VectorSearchHitsRequestExec(
   override def simpleString(maxFields: Int): String = request.simpleString(maxFields)
 }
 
-private[spark] case class VectorSearchSourceExec(spark: SparkSession, source: VectorSearchSource)
+private[spark] case class VectorSearchSourceExec(
+    spark: SparkSession,
+    // an operator above captures its child plan in a closure and that closure travels to the
+    // executors, so this node is serialised even though the search runs on the driver. The context
+    // holds the frozen index snapshot, its metadata and the index files it lists, none of which can
+    // be sent: it is driver-only state, and the output attributes are kept beside it so that a
+    // deserialised copy still answers what the plan asks of a node (its schema, its metrics).
+    @transient private val source: VectorSearchSource,
+    override val output: Seq[Attribute])
     extends LeafExecNode {
-
-  override def output: Seq[Attribute] = source.output
 
   /**
    * What the driver barrier moved, so a query can be explained and measured without its rows.
@@ -152,5 +158,10 @@ private[spark] case class VectorSearchSourceExec(spark: SparkSession, source: Ve
   override def outputOrdering: Seq[org.apache.spark.sql.catalyst.expressions.SortOrder] = Nil
 
   override def simpleString(maxFields: Int): String =
-    s"VectorSearchSourceExec${source.simpleString(maxFields)}"
+    if (source == null) {
+      // a node that travelled to an executor carries no context: saying so is better than a null
+      "VectorSearchSourceExec[context available on the driver only]"
+    } else {
+      s"VectorSearchSourceExec${source.simpleString(maxFields)}"
+    }
 }
