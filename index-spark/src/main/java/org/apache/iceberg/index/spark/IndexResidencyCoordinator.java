@@ -51,14 +51,60 @@ final class IndexResidencyCoordinator {
     long nowNanos();
   }
 
-  private record Holder(
-      String location,
-      String cacheKey,
-      String executorId,
-      String incarnation,
-      long bytes,
-      String installedBy,
-      long epoch) {}
+  private static final class Holder {
+    private final String location;
+    private final String cacheKey;
+    private final String executorId;
+    private final String incarnation;
+    private final long bytes;
+    private final String installedBy;
+    private final long epoch;
+
+    private Holder(
+        String location,
+        String cacheKey,
+        String executorId,
+        String incarnation,
+        long bytes,
+        String installedBy,
+        long epoch) {
+      this.location = location;
+      this.cacheKey = cacheKey;
+      this.executorId = executorId;
+      this.incarnation = incarnation;
+      this.bytes = bytes;
+      this.installedBy = installedBy;
+      this.epoch = epoch;
+    }
+
+    String location() {
+      return location;
+    }
+
+    String cacheKey() {
+      return cacheKey;
+    }
+
+    String executorId() {
+      return executorId;
+    }
+
+    String incarnation() {
+      return incarnation;
+    }
+
+    long bytes() {
+      return bytes;
+    }
+
+    String installedBy() {
+      return installedBy;
+    }
+
+    long epoch() {
+      return epoch;
+    }
+  }
 
   private static final class IndexState {
     private final String indexUuid;

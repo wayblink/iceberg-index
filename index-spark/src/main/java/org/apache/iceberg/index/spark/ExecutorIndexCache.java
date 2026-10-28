@@ -594,7 +594,35 @@ final class ExecutorIndexCache {
     }
   }
 
-  private record ManagedLoad(String indexUuid, long epoch, String cacheKey, long generation) {}
+  private static final class ManagedLoad {
+    private final String indexUuid;
+    private final long epoch;
+    private final String cacheKey;
+    private final long generation;
+
+    private ManagedLoad(String indexUuid, long epoch, String cacheKey, long generation) {
+      this.indexUuid = indexUuid;
+      this.epoch = epoch;
+      this.cacheKey = cacheKey;
+      this.generation = generation;
+    }
+
+    String indexUuid() {
+      return indexUuid;
+    }
+
+    long epoch() {
+      return epoch;
+    }
+
+    String cacheKey() {
+      return cacheKey;
+    }
+
+    long generation() {
+      return generation;
+    }
+  }
 
   private final AtomicLong hits = new AtomicLong();
   private final AtomicLong misses = new AtomicLong();
@@ -641,21 +669,104 @@ final class ExecutorIndexCache {
 
   private ExecutorIndexCache() {}
 
-  private record State(
-      Texts texts,
-      OwnedMap<String, CachedFile> probation,
-      OwnedMap<String, CachedFile> protectedFiles,
-      OwnedMap<String, Integer> asked,
-      IndexCacheOwnership ownership,
-      OwnedMap<String, Set<String>> attribution,
-      OwnedMap<String, LoadMonitor> loading,
-      OwnedSet<Reservation> reservations,
-      OwnedMap<String, Long> reservedByOwner,
-      OwnedMap<String, Long> bytesByOwner,
-      OwnedMap<String, Integer> entriesByOwner,
-      long reservedBytes,
-      long bytes)
-      implements Serializable {}
+  private static final class State implements Serializable {
+    private static final long serialVersionUID = 1L;
+
+    private final Texts texts;
+    private final OwnedMap<String, CachedFile> probation;
+    private final OwnedMap<String, CachedFile> protectedFiles;
+    private final OwnedMap<String, Integer> asked;
+    private final IndexCacheOwnership ownership;
+    private final OwnedMap<String, Set<String>> attribution;
+    private final OwnedMap<String, LoadMonitor> loading;
+    private final OwnedSet<Reservation> reservations;
+    private final OwnedMap<String, Long> reservedByOwner;
+    private final OwnedMap<String, Long> bytesByOwner;
+    private final OwnedMap<String, Integer> entriesByOwner;
+    private final long reservedBytes;
+    private final long bytes;
+
+    private State(
+        Texts texts,
+        OwnedMap<String, CachedFile> probation,
+        OwnedMap<String, CachedFile> protectedFiles,
+        OwnedMap<String, Integer> asked,
+        IndexCacheOwnership ownership,
+        OwnedMap<String, Set<String>> attribution,
+        OwnedMap<String, LoadMonitor> loading,
+        OwnedSet<Reservation> reservations,
+        OwnedMap<String, Long> reservedByOwner,
+        OwnedMap<String, Long> bytesByOwner,
+        OwnedMap<String, Integer> entriesByOwner,
+        long reservedBytes,
+        long bytes) {
+      this.texts = texts;
+      this.probation = probation;
+      this.protectedFiles = protectedFiles;
+      this.asked = asked;
+      this.ownership = ownership;
+      this.attribution = attribution;
+      this.loading = loading;
+      this.reservations = reservations;
+      this.reservedByOwner = reservedByOwner;
+      this.bytesByOwner = bytesByOwner;
+      this.entriesByOwner = entriesByOwner;
+      this.reservedBytes = reservedBytes;
+      this.bytes = bytes;
+    }
+
+    Texts texts() {
+      return texts;
+    }
+
+    OwnedMap<String, CachedFile> probation() {
+      return probation;
+    }
+
+    OwnedMap<String, CachedFile> protectedFiles() {
+      return protectedFiles;
+    }
+
+    OwnedMap<String, Integer> asked() {
+      return asked;
+    }
+
+    IndexCacheOwnership ownership() {
+      return ownership;
+    }
+
+    OwnedMap<String, Set<String>> attribution() {
+      return attribution;
+    }
+
+    OwnedMap<String, LoadMonitor> loading() {
+      return loading;
+    }
+
+    OwnedSet<Reservation> reservations() {
+      return reservations;
+    }
+
+    OwnedMap<String, Long> reservedByOwner() {
+      return reservedByOwner;
+    }
+
+    OwnedMap<String, Long> bytesByOwner() {
+      return bytesByOwner;
+    }
+
+    OwnedMap<String, Integer> entriesByOwner() {
+      return entriesByOwner;
+    }
+
+    long reservedBytes() {
+      return reservedBytes;
+    }
+
+    long bytes() {
+      return bytes;
+    }
+  }
 
   private State state() {
     return new State(
@@ -710,14 +821,64 @@ final class ExecutorIndexCache {
     return admit(capacity, mutation, false, ignored -> {});
   }
 
-  private record OwnerCharges(Map<String, Long> effectiveBytes, long controlBytes) {}
+  private static final class OwnerCharges {
+    private final Map<String, Long> effectiveBytes;
+    private final long controlBytes;
 
-  private record AdmissionDelta(
-      Map<String, Long> beforeOwners,
-      Map<String, Long> afterOwners,
-      long beforeEffective,
-      long afterEffective,
-      long controlBytes) {
+    private OwnerCharges(Map<String, Long> effectiveBytes, long controlBytes) {
+      this.effectiveBytes = effectiveBytes;
+      this.controlBytes = controlBytes;
+    }
+
+    Map<String, Long> effectiveBytes() {
+      return effectiveBytes;
+    }
+
+    long controlBytes() {
+      return controlBytes;
+    }
+  }
+
+  private static final class AdmissionDelta {
+    private final Map<String, Long> beforeOwners;
+    private final Map<String, Long> afterOwners;
+    private final long beforeEffective;
+    private final long afterEffective;
+    private final long controlBytes;
+
+    private AdmissionDelta(
+        Map<String, Long> beforeOwners,
+        Map<String, Long> afterOwners,
+        long beforeEffective,
+        long afterEffective,
+        long controlBytes) {
+      this.beforeOwners = beforeOwners;
+      this.afterOwners = afterOwners;
+      this.beforeEffective = beforeEffective;
+      this.afterEffective = afterEffective;
+      this.controlBytes = controlBytes;
+    }
+
+    Map<String, Long> beforeOwners() {
+      return beforeOwners;
+    }
+
+    Map<String, Long> afterOwners() {
+      return afterOwners;
+    }
+
+    long beforeEffective() {
+      return beforeEffective;
+    }
+
+    long afterEffective() {
+      return afterEffective;
+    }
+
+    long controlBytes() {
+      return controlBytes;
+    }
+
     long ownerIncrement(String owner) {
       return afterOwners.getOrDefault(owner, 0L) - beforeOwners.getOrDefault(owner, 0L);
     }
@@ -814,8 +975,20 @@ final class ExecutorIndexCache {
     }
   }
 
-  private record SizedPrepared(long estimatedBytes)
-      implements IndexAdapter.PreparedSearch, Serializable {
+  private static final class SizedPrepared implements IndexAdapter.PreparedSearch, Serializable {
+    private static final long serialVersionUID = 1L;
+
+    private final long estimatedBytes;
+
+    private SizedPrepared(long estimatedBytes) {
+      this.estimatedBytes = estimatedBytes;
+    }
+
+    @Override
+    public long estimatedBytes() {
+      return estimatedBytes;
+    }
+
     @Override
     public List<IndexSearchResult> search(ByteBuffer query, int topK) {
       throw new UnsupportedOperationException("Metadata shape is not a searcher");
@@ -1841,17 +2014,76 @@ final class ExecutorIndexCache {
     return unloaded;
   }
 
-  record ChargeSnapshot(
-      long version,
-      boolean known,
-      long usedBytes,
-      long residentBytes,
-      long controlBytes,
-      long reservedBytes,
-      long releasingBytes,
-      int holders,
-      int groupRefs)
-      implements Serializable {}
+  static final class ChargeSnapshot implements Serializable {
+    private static final long serialVersionUID = 1L;
+
+    private final long version;
+    private final boolean known;
+    private final long usedBytes;
+    private final long residentBytes;
+    private final long controlBytes;
+    private final long reservedBytes;
+    private final long releasingBytes;
+    private final int holders;
+    private final int groupRefs;
+
+    ChargeSnapshot(
+        long version,
+        boolean known,
+        long usedBytes,
+        long residentBytes,
+        long controlBytes,
+        long reservedBytes,
+        long releasingBytes,
+        int holders,
+        int groupRefs) {
+      this.version = version;
+      this.known = known;
+      this.usedBytes = usedBytes;
+      this.residentBytes = residentBytes;
+      this.controlBytes = controlBytes;
+      this.reservedBytes = reservedBytes;
+      this.releasingBytes = releasingBytes;
+      this.holders = holders;
+      this.groupRefs = groupRefs;
+    }
+
+    long version() {
+      return version;
+    }
+
+    boolean known() {
+      return known;
+    }
+
+    long usedBytes() {
+      return usedBytes;
+    }
+
+    long residentBytes() {
+      return residentBytes;
+    }
+
+    long controlBytes() {
+      return controlBytes;
+    }
+
+    long reservedBytes() {
+      return reservedBytes;
+    }
+
+    long releasingBytes() {
+      return releasingBytes;
+    }
+
+    int holders() {
+      return holders;
+    }
+
+    int groupRefs() {
+      return groupRefs;
+    }
+  }
 
   private MetadataState metadataState(
       Texts ownedTexts, OwnedMap<String, Set<String>> associations) {

@@ -30,8 +30,31 @@ import org.apache.iceberg.relocated.com.google.common.base.Preconditions;
 
 /** Index target ownership, guarded by the executor cache's map lock. */
 final class IndexCacheOwnership implements Component, Serializable {
-  private record Target(long epoch, boolean paused, Set<String> keys)
-      implements Component, Serializable {
+  private static final class Target implements Component, Serializable {
+    private static final long serialVersionUID = 1L;
+
+    private final long epoch;
+    private final boolean paused;
+    private final Set<String> keys;
+
+    private Target(long epoch, boolean paused, Set<String> keys) {
+      this.epoch = epoch;
+      this.paused = paused;
+      this.keys = keys;
+    }
+
+    long epoch() {
+      return epoch;
+    }
+
+    boolean paused() {
+      return paused;
+    }
+
+    Set<String> keys() {
+      return keys;
+    }
+
     @Override
     public void charge(Components components) {
       if (components.object(this, 32)) {

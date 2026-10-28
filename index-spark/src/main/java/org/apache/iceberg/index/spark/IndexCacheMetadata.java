@@ -36,11 +36,39 @@ import java.util.Set;
 final class IndexCacheMetadata {
   private IndexCacheMetadata() {}
 
-  record MetadataState(
-      List<Component> residentRoots,
-      List<Component> controlRoots,
-      Texts texts,
-      long reservedBytes) {
+  static final class MetadataState {
+    private final List<Component> residentRoots;
+    private final List<Component> controlRoots;
+    private final Texts texts;
+    private final long reservedBytes;
+
+    MetadataState(
+        List<Component> residentRoots,
+        List<Component> controlRoots,
+        Texts texts,
+        long reservedBytes) {
+      this.residentRoots = residentRoots;
+      this.controlRoots = controlRoots;
+      this.texts = texts;
+      this.reservedBytes = reservedBytes;
+    }
+
+    List<Component> residentRoots() {
+      return residentRoots;
+    }
+
+    List<Component> controlRoots() {
+      return controlRoots;
+    }
+
+    Texts texts() {
+      return texts;
+    }
+
+    long reservedBytes() {
+      return reservedBytes;
+    }
+
     MetadataState withTexts(Texts ownedTexts) {
       return new MetadataState(residentRoots, controlRoots, ownedTexts, reservedBytes);
     }

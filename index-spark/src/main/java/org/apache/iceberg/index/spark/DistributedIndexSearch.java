@@ -596,10 +596,54 @@ public final class DistributedIndexSearch {
     }
   }
 
-  record LoadedFile(
-      ExecutorIndexCache.CachedFile file, long fileBytes, long payloadBytes, long preparedBytes) {}
+  static final class LoadedFile {
+    private final ExecutorIndexCache.CachedFile file;
+    private final long fileBytes;
+    private final long payloadBytes;
+    private final long preparedBytes;
 
-  private record PreparedFile(IndexAdapter.PreparedSearch searcher, long payloadBytes) {}
+    LoadedFile(
+        ExecutorIndexCache.CachedFile file, long fileBytes, long payloadBytes, long preparedBytes) {
+      this.file = file;
+      this.fileBytes = fileBytes;
+      this.payloadBytes = payloadBytes;
+      this.preparedBytes = preparedBytes;
+    }
+
+    ExecutorIndexCache.CachedFile file() {
+      return file;
+    }
+
+    long fileBytes() {
+      return fileBytes;
+    }
+
+    long payloadBytes() {
+      return payloadBytes;
+    }
+
+    long preparedBytes() {
+      return preparedBytes;
+    }
+  }
+
+  private static final class PreparedFile {
+    private final IndexAdapter.PreparedSearch searcher;
+    private final long payloadBytes;
+
+    private PreparedFile(IndexAdapter.PreparedSearch searcher, long payloadBytes) {
+      this.searcher = searcher;
+      this.payloadBytes = payloadBytes;
+    }
+
+    IndexAdapter.PreparedSearch searcher() {
+      return searcher;
+    }
+
+    long payloadBytes() {
+      return payloadBytes;
+    }
+  }
 
   static ExecutorIndexCache.CachedFile loadFile(FileIO io, String location, IndexAdapter adapter) {
     return loadFileState(io, location, adapter).file();

@@ -30,6 +30,7 @@ import java.security.NoSuchAlgorithmException;
 import java.util.HexFormat;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.concurrent.ConcurrentHashMap;
 import org.apache.iceberg.index.IndexAdapter;
 import org.apache.iceberg.index.IndexBuildResult;
@@ -56,26 +57,198 @@ final class IndexCacheMemory {
   private static final Map<ContextKey, IndexFileMemory> DESCRIPTORS = new ConcurrentHashMap<>();
   private static final Map<EstimateKey, IndexFileMemory> ESTIMATES = new ConcurrentHashMap<>();
 
-  private record ContextKey(Class<?> adapterType, String definition, String vm, int processors) {}
+  private static final class ContextKey {
+    private final Class<?> adapterType;
+    private final String definition;
+    private final String vm;
+    private final int processors;
 
-  private record EstimateKey(
-      ContextKey context,
-      String location,
-      IndexFile.Kind kind,
-      String blobType,
-      long entries,
-      IndexFileMemory declared,
-      int model,
-      String reader,
-      String profile) {}
+    private ContextKey(Class<?> adapterType, String definition, String vm, int processors) {
+      this.adapterType = adapterType;
+      this.definition = definition;
+      this.vm = vm;
+      this.processors = processors;
+    }
 
-  record ChargeProjection(
-      MetadataState afterState,
-      long usedBytes,
-      long residentBytes,
-      long controlBytes,
-      long reservedBytes,
-      long incrementBytes) {
+    Class<?> adapterType() {
+      return adapterType;
+    }
+
+    String definition() {
+      return definition;
+    }
+
+    String vm() {
+      return vm;
+    }
+
+    int processors() {
+      return processors;
+    }
+
+    @Override
+    public boolean equals(Object other) {
+      if (this == other) {
+        return true;
+      }
+      if (!(other instanceof ContextKey)) {
+        return false;
+      }
+      ContextKey that = (ContextKey) other;
+      return processors == that.processors
+          && Objects.equals(adapterType, that.adapterType)
+          && Objects.equals(definition, that.definition)
+          && Objects.equals(vm, that.vm);
+    }
+
+    @Override
+    public int hashCode() {
+      return Objects.hash(adapterType, definition, vm, processors);
+    }
+  }
+
+  private static final class EstimateKey {
+    private final ContextKey context;
+    private final String location;
+    private final IndexFile.Kind kind;
+    private final String blobType;
+    private final long entries;
+    private final IndexFileMemory declared;
+    private final int model;
+    private final String reader;
+    private final String profile;
+
+    private EstimateKey(
+        ContextKey context,
+        String location,
+        IndexFile.Kind kind,
+        String blobType,
+        long entries,
+        IndexFileMemory declared,
+        int model,
+        String reader,
+        String profile) {
+      this.context = context;
+      this.location = location;
+      this.kind = kind;
+      this.blobType = blobType;
+      this.entries = entries;
+      this.declared = declared;
+      this.model = model;
+      this.reader = reader;
+      this.profile = profile;
+    }
+
+    ContextKey context() {
+      return context;
+    }
+
+    String location() {
+      return location;
+    }
+
+    IndexFile.Kind kind() {
+      return kind;
+    }
+
+    String blobType() {
+      return blobType;
+    }
+
+    long entries() {
+      return entries;
+    }
+
+    IndexFileMemory declared() {
+      return declared;
+    }
+
+    int model() {
+      return model;
+    }
+
+    String reader() {
+      return reader;
+    }
+
+    String profile() {
+      return profile;
+    }
+
+    @Override
+    public boolean equals(Object other) {
+      if (this == other) {
+        return true;
+      }
+      if (!(other instanceof EstimateKey)) {
+        return false;
+      }
+      EstimateKey that = (EstimateKey) other;
+      return entries == that.entries
+          && model == that.model
+          && Objects.equals(context, that.context)
+          && Objects.equals(location, that.location)
+          && Objects.equals(kind, that.kind)
+          && Objects.equals(blobType, that.blobType)
+          && Objects.equals(declared, that.declared)
+          && Objects.equals(reader, that.reader)
+          && Objects.equals(profile, that.profile);
+    }
+
+    @Override
+    public int hashCode() {
+      return Objects.hash(
+          context, location, kind, blobType, entries, declared, model, reader, profile);
+    }
+  }
+
+  static final class ChargeProjection {
+    private final MetadataState afterState;
+    private final long usedBytes;
+    private final long residentBytes;
+    private final long controlBytes;
+    private final long reservedBytes;
+    private final long incrementBytes;
+
+    ChargeProjection(
+        MetadataState afterState,
+        long usedBytes,
+        long residentBytes,
+        long controlBytes,
+        long reservedBytes,
+        long incrementBytes) {
+      this.afterState = afterState;
+      this.usedBytes = usedBytes;
+      this.residentBytes = residentBytes;
+      this.controlBytes = controlBytes;
+      this.reservedBytes = reservedBytes;
+      this.incrementBytes = incrementBytes;
+    }
+
+    MetadataState afterState() {
+      return afterState;
+    }
+
+    long usedBytes() {
+      return usedBytes;
+    }
+
+    long residentBytes() {
+      return residentBytes;
+    }
+
+    long controlBytes() {
+      return controlBytes;
+    }
+
+    long reservedBytes() {
+      return reservedBytes;
+    }
+
+    long incrementBytes() {
+      return incrementBytes;
+    }
+
     long effectiveBytes() {
       return Math.addExact(usedBytes, reservedBytes);
     }
