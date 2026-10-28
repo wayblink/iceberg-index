@@ -38,6 +38,8 @@ import org.apache.iceberg.spark.Spark3Util;
 import org.apache.spark.sql.Dataset;
 import org.apache.spark.sql.Row;
 import org.apache.spark.sql.SparkSession;
+import org.apache.spark.sql.catalyst.expressions.Attribute;
+import org.apache.spark.sql.catalyst.plans.logical.LogicalPlan;
 import org.apache.spark.sql.execution.SparkPlan;
 import org.apache.spark.sql.execution.metric.SQLMetric;
 import org.junit.jupiter.api.AfterAll;
@@ -82,6 +84,96 @@ class TestVectorSearchExecution {
   static void stopSpark() {
     if (spark != null) {
       spark.stop();
+    }
+  }
+
+  @Test
+  void sourceStatisticsIncludeUncoveredRowsBeforeTheLimit() {
+    String table = tableWithIndex("exec_stats_partial");
+    int appendedRows = 20;
+    spark.sql(
+        String.format(
+            "INSERT INTO local.db.%s SELECT id, array(0.8d, 0.0d) FROM range(10, %d)",
+            table, 10 + appendedRows));
+    long tableRows = spark.table("local.db." + table).count();
+    Dataset<Row> frame = spark.sql(nearest(table, 1));
+
+    assertSourceEstimate(frame, tableRows);
+    assertThat(frame.collectAsList()).hasSize(1);
+    assertThat(metric(sourceExec(frame), "numOutputRows")).isEqualTo(appendedRows + 1L);
+  }
+
+  @Test
+  void sourceStatisticsDoNotApplyTheLimitBeforeOversampling() {
+    String table = tableWithIndex("exec_stats_oversampled");
+    long tableRows = spark.table("local.db." + table).count();
+    String parameter = "spark.iceberg.index.vector.over-sample";
+    scala.Option<String> previous = spark.conf().getOption(parameter);
+    spark.conf().set(parameter, "3");
+    try {
+      Dataset<Row> frame = spark.sql(nearest(table, 1));
+      assertSourceEstimate(frame, tableRows);
+      assertThat(frame.collectAsList()).hasSize(1);
+      assertThat(metric(sourceExec(frame), "numOutputRows")).isEqualTo(3L);
+    } finally {
+      if (previous.isDefined()) {
+        spark.conf().set(parameter, previous.get());
+      } else {
+        spark.conf().unset(parameter);
+      }
+    }
+  }
+
+  @Test
+  void sourceStatisticsIncludeAllRowsWhenNoFileIsCovered() {
+    String table = tableWithIndex("exec_stats_uncovered");
+    spark.sql(
+        String.format(
+            "CALL local.system.rewrite_data_files(table => 'db.%s', "
+                + "options => map('rewrite-all', 'true'))",
+            table));
+    long tableRows = spark.table("local.db." + table).count();
+    Dataset<Row> frame = spark.sql(nearest(table, 1));
+
+    assertSourceEstimate(frame, tableRows);
+    assertThat(frame.collectAsList()).hasSize(1);
+    assertThat(metric(sourceExec(frame), "numLiveCandidates")).isZero();
+    assertThat(metric(sourceExec(frame), "numOutputRows")).isEqualTo(tableRows);
+  }
+
+  @Test
+  void sourceStatisticsAreZeroForAnEmptySnapshot() {
+    String table = tableWithIndex("exec_stats_empty");
+    spark.sql(String.format("DELETE FROM local.db.%s", table));
+    long tableRows = spark.table("local.db." + table).count();
+    assertThat(tableRows).isZero();
+    Dataset<Row> frame = spark.sql(nearest(table, 1));
+
+    assertSourceEstimate(frame, tableRows);
+    assertThat(frame.collectAsList()).isEmpty();
+  }
+
+  /** The source is below the limit; its estimate bounds candidates and residual rows together. */
+  private static void assertSourceEstimate(Dataset<Row> frame, long tableRows) {
+    String group = "vector-source-statistics";
+    spark.sparkContext().setJobGroup(group, "Statistics read only frozen metadata", false);
+    try {
+      LogicalPlan source =
+          CollectionConverters.asJava(frame.queryExecution().optimizedPlan().collectLeaves())
+              .stream()
+              .filter(leaf -> leaf.nodeName().equals(SOURCE))
+              .findFirst()
+              .orElseThrow(() -> new AssertionError("No " + SOURCE + " in the logical plan"));
+      assertThat(source.stats().rowCount().get().longValue()).isEqualTo(tableRows);
+      long bytesPerRow = 8L;
+      for (Attribute attribute : CollectionConverters.asJava(source.output())) {
+        bytesPerRow += attribute.dataType().defaultSize();
+      }
+      assertThat(source.stats().sizeInBytes().longValue()).isEqualTo(bytesPerRow * tableRows);
+      frame.queryExecution().executedPlan();
+      assertThat(spark.sparkContext().statusTracker().getJobIdsForGroup(group)).isEmpty();
+    } finally {
+      spark.sparkContext().clearJobGroup();
     }
   }
 

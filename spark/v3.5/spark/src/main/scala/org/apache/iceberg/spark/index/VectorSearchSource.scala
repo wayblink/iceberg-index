@@ -18,6 +18,9 @@
  */
 package org.apache.iceberg.spark.index
 
+import scala.collection.JavaConverters._
+import scala.collection.mutable
+
 import org.apache.spark.sql.catalyst.expressions.Attribute
 import org.apache.spark.sql.catalyst.plans.logical.LeafNode
 import org.apache.spark.sql.catalyst.plans.logical.Statistics
@@ -80,15 +83,21 @@ private[spark] case class VectorSearchSource(context: VectorSearchContext)(
     s"VectorSearchSource[${stringArgs.mkString(", ")}]"
 
   /**
-   * At most {@code k} rows, which is what the limit above asks for and all the index can answer with.
+   * Estimates the source from its frozen data files, before the sort and limit above it.
    *
-   * <p>A leaf node has to estimate itself: an aggregate, a join or a distinct above the source asks
-   * for the size of its input while planning, and the default estimate for a leaf is not implemented.
-   * The answer is the whole record per row, so the width of the output is what makes up the estimate.
+   * <p>The source returns candidates and uncovered rows together, so its row count is not bounded
+   * by the query's k. File record counts give a conservative bound without reading rows or applying
+   * deletes; multiple scan tasks for the same file count that file once.
    */
   override def computeStats: Statistics = {
-    val rows = context.request.input.topK
-    val bytesPerRow = output.map(_.dataType.defaultSize).sum
-    Statistics(sizeInBytes = bytesPerRow.toLong * rows, rowCount = Some(rows))
+    val seen = mutable.HashSet.empty[String]
+    val rows = context.inputs.scanTasks.asScala.foldLeft(BigInt(0)) { (total, task) =>
+      val file = task.file()
+      if (seen.add(file.location().toString)) total + file.recordCount() else total
+    }
+    val bytesPerRow = output.foldLeft(BigInt(8)) { (bytes, attribute) =>
+      bytes + attribute.dataType.defaultSize
+    }
+    Statistics(sizeInBytes = bytesPerRow * rows, rowCount = Some(rows))
   }
 }
