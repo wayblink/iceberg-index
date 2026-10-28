@@ -113,7 +113,6 @@ public class IndexCachePlugin implements SparkPlugin {
 
   /** Executor side: polls for commands and executes them outside the control path. */
   static final class IndexCacheExecutorPlugin implements ExecutorPlugin {
-    private static final Logger LOG = LoggerFactory.getLogger(IndexCacheExecutorPlugin.class);
     private IndexCacheExecutorLoop loop;
 
     /**
@@ -125,7 +124,7 @@ public class IndexCachePlugin implements SparkPlugin {
     public void init(PluginContext pluginContext, Map<String, String> extraConf) {
       IndexCacheTypeRegistration.registerAll();
       IndexCacheWorkerConfig config = IndexCacheWorkerConfig.parse(extraConf);
-      long budget = budgetBytes(pluginContext.conf());
+      long budget = advertisedBudget(pluginContext.conf());
       IndexCacheControlChannel channel = pluginContext::ask;
       ExecutorIndexCacheWorker worker =
           new ExecutorIndexCacheWorker(
@@ -133,27 +132,29 @@ public class IndexCachePlugin implements SparkPlugin {
               pluginContext.executorID(),
               incarnation(pluginContext),
               ExecutorIndexCache.get(),
-              // the per-file ceiling is gone: the budget decides whether a file fits
-              ExecutorIndexCache.Config.of(true, Math.max(1L, budget)),
+              // the per-file ceiling is gone: the budget decides whether a file fits, and a budget
+              // of none is the same disabled cache a query sees
+              budget > 0
+                  ? ExecutorIndexCache.Config.of(true, budget)
+                  : ExecutorIndexCache.Config.disabled(),
               new IndexCacheReadContext(),
               config);
       loop = new IndexCacheExecutorLoop(channel, worker, config, budget);
       loop.start();
     }
 
-    /** The control channel only advertises space when the cache budget is configured. */
-    private static long budgetBytes(org.apache.spark.SparkConf conf) {
-      String configured = conf.get(ExecutorIndexCache.Config.BYTES, null);
-      if (configured == null || configured.isBlank()) {
-        return 0L;
-      }
-
-      try {
-        return Math.max(0L, Long.parseLong(configured.trim()));
-      } catch (NumberFormatException e) {
-        LOG.warn("Ignoring invalid {}: {}", ExecutorIndexCache.Config.BYTES, configured);
-        return 0L;
-      }
+    /**
+     * The budget this executor advertises, which is the one a query derives from the same heap when
+     * the application configures none.
+     *
+     * <p>The executor is where a load is refused, so this number is what turns a configured cache
+     * into a usable one: advertising nothing while a query derives a budget refused every load.
+     */
+    private static long advertisedBudget(org.apache.spark.SparkConf conf) {
+      return ExecutorIndexCache.Config.advertisedBudget(
+          conf.get(ExecutorIndexCache.Config.BYTES, null),
+          conf.get(ExecutorIndexCache.Config.EXECUTOR_MEMORY, null),
+          conf.get(ExecutorIndexCache.Config.HEAP_FRACTION, null));
     }
 
     private static String incarnation(PluginContext pluginContext) {

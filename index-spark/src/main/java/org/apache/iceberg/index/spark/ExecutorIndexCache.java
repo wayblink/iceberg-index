@@ -92,6 +92,15 @@ final class ExecutorIndexCache {
     static final String IDLE_TTL = "spark.iceberg.index.cache.idle-ttl";
     static final long MIN_BUDGET_BYTES = 512L * 1024L * 1024L;
 
+    /** The executor heap a budget is derived from when the application does not size one. */
+    static final String EXECUTOR_MEMORY = "spark.executor.memory";
+
+    /** The heap to assume when the application sizes no executor. */
+    static final String DEFAULT_EXECUTOR_MEMORY = "1g";
+
+    /** The default share of the executor heap a budget may use. */
+    static final String DEFAULT_HEAP_FRACTION = "0.25";
+
     private static final Config DISABLED = new Config(false, 0, Mode.STREAM, 0, "");
 
     private final boolean enabled;
@@ -268,11 +277,56 @@ final class ExecutorIndexCache {
     }
 
     private static long heapBytes(org.apache.spark.sql.SparkSession spark) {
-      return parseBytes(setting(spark, "spark.executor.memory", "1g"), "spark.executor.memory");
+      return parseBytes(setting(spark, EXECUTOR_MEMORY, DEFAULT_EXECUTOR_MEMORY), EXECUTOR_MEMORY);
     }
 
     private static double heapFraction(org.apache.spark.sql.SparkSession spark) {
-      String value = setting(spark, HEAP_FRACTION, "0.25");
+      return fraction(setting(spark, HEAP_FRACTION, DEFAULT_HEAP_FRACTION));
+    }
+
+    /**
+     * The budget an executor advertises, from the settings the application runs with.
+     *
+     * <p>An executor has no session, so this takes the values a session would read rather than a
+     * session: the configured budget when there is one, and otherwise the same automatic derivation
+     * a query makes when the working set is unknown. Advertising nothing while a query derives a
+     * budget is what made every load fail as a cache that is off on executors a query was filling.
+     *
+     * <p>Zero and negative values are how a run says it wants no cache, and they stay distinct from
+     * an unset value, which asks for the automatic budget.
+     *
+     * @param configuredBytes the configured budget, or null when none is configured
+     * @param executorMemory the executor heap, or null when the application did not size one
+     * @param heapFraction the share of that heap a budget may use, or null for the default
+     */
+    static long advertisedBudget(
+        String configuredBytes, String executorMemory, String heapFraction) {
+      boolean configured = configuredBytes != null && !configuredBytes.isBlank();
+      long configuredValue = configured ? parseBytes(configuredBytes, BYTES) : 0L;
+      if (configured && configuredValue <= 0) {
+        return 0L;
+      }
+
+      return derive(
+          configured ? configuredBytes : null,
+          configuredValue,
+          // an executor does not know the query's working set, so the budget falls back to the
+          // heap share a query uses in the same situation
+          0L,
+          1,
+          parseBytes(
+              executorMemory == null || executorMemory.isBlank()
+                  ? DEFAULT_EXECUTOR_MEMORY
+                  : executorMemory,
+              EXECUTOR_MEMORY),
+          fraction(
+              heapFraction == null || heapFraction.isBlank()
+                  ? DEFAULT_HEAP_FRACTION
+                  : heapFraction));
+    }
+
+    /** The share of the heap a budget may use. */
+    private static double fraction(String value) {
       try {
         double fraction = Double.parseDouble(value.trim());
         Preconditions.checkArgument(

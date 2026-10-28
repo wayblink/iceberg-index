@@ -90,6 +90,33 @@ class TestIndexCachePlugin {
   }
 
   @Test
+  void aLoadIsPlannedWhenNoBudgetWasConfigured() {
+    // what an executor advertises without a configured budget: the space is there, so the load has
+    // to be planned rather than refused as if the cache were turned off
+    long advertised = ExecutorIndexCache.Config.advertisedBudget(null, "4g", null);
+    control.receive(report(1, advertised, 0));
+
+    coordinator.acceptLoad(target("A", "f1"), IndexResidencyPolicy.parse("forever"), now);
+    IndexCacheProtocol.Reply reply = control.receive(report(2, advertised, 0));
+
+    assertThat(reply.commands())
+        .extracting(IndexCacheProtocol.Command::type)
+        .contains(IndexCacheProtocol.CommandType.LOAD);
+  }
+
+  @Test
+  void aLoadIsRefusedWhenTheBudgetIsExplicitlyZero() {
+    // zero still means no cache: a run that says so gets no load, and that has to stay
+    // distinguishable from a run that configured nothing
+    control.receive(report(1, 0, 0));
+
+    coordinator.acceptLoad(target("A", "f1"), IndexResidencyPolicy.parse("forever"), now);
+    IndexCacheProtocol.Reply reply = control.receive(report(2, 0, 0));
+
+    assertThat(reply.commands()).isEmpty();
+  }
+
+  @Test
   void driverAppliesAcknowledgements() {
     control.receive(report(1, 1_000, 0));
     String plan =

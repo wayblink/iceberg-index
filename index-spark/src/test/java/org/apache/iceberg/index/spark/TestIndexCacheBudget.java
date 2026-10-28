@@ -63,6 +63,46 @@ class TestIndexCacheBudget {
   }
 
   @Test
+  void anExecutorWithNoBudgetConfiguredAdvertisesTheAutomaticOne() {
+    // an executor has no session, so a run that sets no budget still has to advertise the space a
+    // query derives for the same heap; advertising none is what made a load fail as if the cache
+    // were off while the query treated it as on
+    assertThat(ExecutorIndexCache.Config.advertisedBudget(null, "4g", null))
+        .isEqualTo(ExecutorIndexCache.Config.MIN_BUDGET_BYTES);
+  }
+
+  @Test
+  void anExecutorAdvertisesTheShareOfItsOwnHeap() {
+    // the automatic budget is bounded by the heap, so an executor of 1 GB advertises a quarter of
+    // it rather than the floor
+    assertThat(ExecutorIndexCache.Config.advertisedBudget(null, "1g", null))
+        .isEqualTo((long) (1 * GB * 0.25));
+  }
+
+  @Test
+  void anExecutorAdvertisesABudgetWrittenWithAUnit() {
+    // the same setting a query reads takes a unit, and an executor that could only read a bare
+    // number would advertise a different budget for the same configuration
+    assertThat(ExecutorIndexCache.Config.advertisedBudget("2g", "4g", null)).isEqualTo(2 * GB);
+  }
+
+  @Test
+  void anExplicitZeroAdvertisesNothing() {
+    // zero is how a run says it wants no cache, and it has to stay distinguishable from unset
+    assertThat(ExecutorIndexCache.Config.advertisedBudget("0", "4g", null)).isZero();
+  }
+
+  @Test
+  void theExecutorAdvertisesTheBudgetAQueryDerivesForTheSameHeap() {
+    long heap = 8 * GB;
+    double fraction = 0.5;
+
+    assertThat(ExecutorIndexCache.Config.advertisedBudget(null, "8g", "0.5"))
+        .as("both sides derive their budget from the same heap and fraction")
+        .isEqualTo(ExecutorIndexCache.Config.derive(null, 0, 0, 1, heap, fraction));
+  }
+
+  @Test
   void neverDerivesMoreThanTheConfiguredBudgetCanBack() {
     // one executor of 1 GB cannot hold 800 MB of payload no matter what the working set is
     long budget = ExecutorIndexCache.Config.derive(null, 0, 100 * GB, 1, 1 * GB, 0.25);
