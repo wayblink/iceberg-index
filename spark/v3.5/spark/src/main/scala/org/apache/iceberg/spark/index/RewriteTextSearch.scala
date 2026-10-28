@@ -28,6 +28,7 @@ import org.apache.iceberg.index.spark.{IndexEntries, VectorIndexes}
 import org.apache.iceberg.index.text.TextIndexAdapter
 import org.apache.iceberg.index.text.TextIndexAdapter.CorpusStatistics
 import org.apache.iceberg.index.text.TextIndexDefinition
+import org.apache.spark.sql.catalyst.expressions.AttributeReference
 import org.apache.spark.sql.catalyst.expressions.Descending
 import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.expressions.Expression
@@ -252,8 +253,8 @@ case class RewriteTextSearch(spark: SparkSession) extends Rule[LogicalPlan] {
   /**
    * Binds the score expressions of one rewritten search to the statistics of its index.
    *
-   * <p>A score is bound only where it names the column and the query of that index, so a plan that
-   * holds more than one search binds each to its own.
+   * <p>A score is bound only when it reads the same attribute and query as the search. Attributes
+   * with the same name from different table relations do not share corpus statistics.
    *
    * <p>The binding reaches the nodes on the way down to the rewritten search as well as the ones
    * inside it: a projection that asks for the score of a matched row sits above the filter that
@@ -307,7 +308,11 @@ case class RewriteTextSearch(spark: SparkSession) extends Rule[LogicalPlan] {
 
   /** Whether a score expression is the one this index answers. */
   private def answers(score: TextScoreExpression, bound: BoundIndex): Boolean = {
-    textColumn(score).contains(bound.column) && queryText(score).contains(bound.query)
+    score.text match {
+      case attribute: AttributeReference =>
+        attribute.exprId == bound.attribute.exprId && queryText(score).contains(bound.query)
+      case _ => false
+    }
   }
 
   /** The index of the column a text expression reads, bound to the snapshot being read. */
@@ -318,6 +323,12 @@ case class RewriteTextSearch(spark: SparkSession) extends Rule[LogicalPlan] {
       score: TextScoreExpression,
       column: String,
       query: String): Option[BoundIndex] = {
+    val attribute = score.text match {
+      case reference: AttributeReference if scan.output.exists(_.exprId == reference.exprId) =>
+        reference
+      case _ => return None
+    }
+
     val index = VectorIndexes.findIndexOrNull(table, column, "text")
     if (index == null) {
       return None
@@ -354,7 +365,7 @@ case class RewriteTextSearch(spark: SparkSession) extends Rule[LogicalPlan] {
           return None
       }
 
-    Some(BoundIndex(snapshotId, definition, statistics, reader, column, query))
+    Some(BoundIndex(snapshotId, definition, statistics, reader, attribute, query))
   }
 
   /** Searches the index for the query of a score expression, which has to be a constant. */
@@ -391,7 +402,7 @@ case class RewriteTextSearch(spark: SparkSession) extends Rule[LogicalPlan] {
 
   private def textColumn(score: TextScoreExpression): Option[String] = {
     score.text match {
-      case attribute: org.apache.spark.sql.catalyst.expressions.AttributeReference =>
+      case attribute: AttributeReference =>
         Some(attribute.name)
       case _ =>
         None
@@ -417,7 +428,7 @@ case class RewriteTextSearch(spark: SparkSession) extends Rule[LogicalPlan] {
       definition: TextIndexDefinition,
       statistics: CorpusStatistics,
       reader: IndexReader,
-      column: String,
+      attribute: AttributeReference,
       query: String)
 
   private val EmptyRow: InternalRow = new GenericInternalRow(new Array[Any](0))

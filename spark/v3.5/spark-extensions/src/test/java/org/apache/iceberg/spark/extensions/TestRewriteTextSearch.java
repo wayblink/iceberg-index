@@ -212,6 +212,119 @@ class TestRewriteTextSearch {
     assertThat(rows).allSatisfy(row -> assertThat(row.getDouble(1)).isPositive());
   }
 
+  @Test
+  void rejectsAnUnboundScoreFromAnotherTablesSameNamedColumn() {
+    String first = indexedTextTable("docs_foreign_score_a", "(1, 'fox'), (2, 'fox dog dog dog')");
+    String second = indexedTextTable("docs_foreign_score_b", "(1, 'fox'), (2, 'dog')");
+    try {
+      double expected =
+          spark
+              .sql(
+                  String.format(
+                      "SELECT score FROM text_index_search('local.%s', 'body', 'fox', 10)", second))
+              .head()
+              .getDouble(0);
+      assertThat(expected).isCloseTo(Math.log(2), within(1e-9));
+
+      // Only a's match is bound. b's score must not borrow a's corpus statistics merely because
+      // its column and query have the same names; the unsupported expression stays unbound.
+      assertThatThrownBy(
+              () ->
+                  spark
+                      .sql(
+                          String.format(
+                              "SELECT b.id, text_score(b.body, 'fox') AS score FROM local.%s a "
+                                  + "CROSS JOIN local.%s b WHERE match(a.body, 'fox')",
+                              first, second))
+                      .collectAsList())
+          .hasStackTraceContaining("text_score needs a text index");
+    } finally {
+      spark.sql("DROP TABLE local." + first + " PURGE");
+      spark.sql("DROP TABLE local." + second + " PURGE");
+    }
+  }
+
+  @Test
+  void bindsTheMatchedAttributeAboveAJoin() {
+    String first = indexedTextTable("docs_join_score_a", "(1, 'fox'), (2, 'fox dog dog dog')");
+    String second = indexedTextTable("docs_join_score_b", "(1, 'fox'), (2, 'dog')");
+    try {
+      double expected =
+          spark
+              .sql(
+                  String.format(
+                      "SELECT score FROM text_index_search('local.%s', 'body', 'fox', 10) "
+                          + "WHERE get_json_object(row, '$.id') = '1'",
+                      first))
+              .head()
+              .getDouble(0);
+      List<Row> rows =
+          spark
+              .sql(
+                  String.format(
+                      "SELECT a.id, text_score(a.body, 'fox') AS score FROM local.%s a "
+                          + "CROSS JOIN local.%s b WHERE match(a.body, 'fox')",
+                      first, second))
+              .collectAsList();
+      assertThat(rows).hasSize(4);
+      assertThat(rows)
+          .filteredOn(row -> row.getLong(0) == 1)
+          .hasSize(2)
+          .allSatisfy(row -> assertThat(row.getDouble(1)).isCloseTo(expected, within(1e-9)));
+    } finally {
+      spark.sql("DROP TABLE local." + first + " PURGE");
+      spark.sql("DROP TABLE local." + second + " PURGE");
+    }
+  }
+
+  @Test
+  void bindsSameQueryBranchesToDifferentCorpora() {
+    String first = indexedTextTable("docs_same_query_a", "(1, 'fox'), (2, 'fox dog dog dog')");
+    String second = indexedTextTable("docs_same_query_b", "(1, 'fox'), (2, 'dog')");
+    try {
+      List<Row> expected =
+          spark
+              .sql(
+                  String.format(
+                      "SELECT 1 AS source, CAST(get_json_object(row, '$.id') AS bigint) AS id, score "
+                          + "FROM text_index_search('local.%s', 'body', 'fox', 10) UNION ALL "
+                          + "SELECT 2 AS source, CAST(get_json_object(row, '$.id') AS bigint) AS id, score "
+                          + "FROM text_index_search('local.%s', 'body', 'fox', 10) ORDER BY source, id",
+                      first, second))
+              .collectAsList();
+      List<Row> actual =
+          spark
+              .sql(
+                  String.format(
+                      "SELECT 1 AS source, id, text_score(body, 'fox') AS score FROM local.%s "
+                          + "WHERE match(body, 'fox') UNION ALL "
+                          + "SELECT 2 AS source, id, text_score(body, 'fox') AS score FROM local.%s "
+                          + "WHERE match(body, 'fox') ORDER BY source, id",
+                      first, second))
+              .collectAsList();
+      assertThat(actual).hasSameSizeAs(expected);
+      for (int i = 0; i < expected.size(); i++) {
+        assertThat(actual.get(i).getInt(0)).isEqualTo(expected.get(i).getInt(0));
+        assertThat(actual.get(i).getLong(1)).isEqualTo(expected.get(i).getLong(1));
+        assertThat(actual.get(i).getDouble(2))
+            .isCloseTo(expected.get(i).getDouble(2), within(1e-9));
+      }
+    } finally {
+      spark.sql("DROP TABLE local." + first + " PURGE");
+      spark.sql("DROP TABLE local." + second + " PURGE");
+    }
+  }
+
+  private static String indexedTextTable(String name, String documents) {
+    String table = "db." + name;
+    spark.sql(String.format("CREATE TABLE local.%s %s", table, COLUMNS));
+    spark.sql(String.format("INSERT INTO local.%s VALUES %s", table, documents));
+    spark.sql(
+        String.format(
+            "CALL local.system.build_text_index(table => '%s', column => 'body')", table));
+    return table;
+  }
+
   /** Creates the table without an index. */
   private static String table(String name) {
     String table = "db." + name;
