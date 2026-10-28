@@ -306,6 +306,24 @@ docker push hub.i.basemind.com/spark/sparkann-e2e:<tag>
 | `spark-extensions` 抽查（等值删除 / 检索执行 / 带删除的检索） | 62 项，0 失败 |
 | `spark-extensions` 全量（`*Vector*` / `*Index*`，含 16 个 `CALL` 过程） | 486 项里 49 失败：**45 项是嵌入 Hive metastore 的 `Broken pipe`**（隔离单跑该类 44 项 0 失败，属测试环境问题，不是移植代码）；**4 项是 Lance 写路径**（`BaseFileWriterFactory.newDataWriter` 没有 LANCE 分支，按 §7.3 决定不支持） |
 
+### 7.5.1 目标 Spark 发行版与候选镜像（2026-10-28）
+
+上游 tag 与本机构建是两件事，这里只记录**用指定源码构建出来的制品**：
+
+| 项 | 值 |
+|---|---|
+| Spark 源码 | `gitlab.basemind.com/storage/spark` 的 `step-spark-3.5`，`5f6465658458da1b30f8de27bf4657c2c193e6e1`（live `git ls-remote` 复核） |
+| 构建方式 | 厂内 `step-build.sh`（默认全 profile：`-Phive -Phive-thriftserver -Pconnect -Pkubernetes -Phadoop-cloud -Pndp-repo -Pjvm-profiler`），JDK 17.0.18、Scala 2.12.18、bundled Maven 3.9.6 |
+| 发行包 | `spark-3.5.7-STEP-rc3-bin-3.3.9-STEP-rc2.tgz`；`dist/RELEASE` = `3.5.7-STEP-rc3 (git revision 5f64656584)`；`spark-submit --version` 报 `Revision 5f6465658458da1b30f8de27bf4657c2c193e6e1` |
+| 发行包自带的关键依赖 | 已含厂内 fork：`gluten-package-1.6.0-spark35-celeborn050-step-rc4`、`celeborn-client-spark-3-shaded 0.5.0-STEP-rc3`、`alluxio-mount-aware-client-assembly 2.9.0-STEP-rc4`、`openlineage-spark 1.49.0-step1`，以及**待替换的** `iceberg-spark-runtime-3.5_2.12-1.9.1-STEP-rc3`、`avro-1.11.4`、`parquet-column-1.13.1` |
+| 候选镜像 | `iceberg-backport:1.9.1-shb.1-5f646565`（由该 dist 生成的 `spark:1.9.1-shb.1-5f646565` 再加一层：删 vendor Iceberg runtime、放入我们的 `1.9.1-shb.1`） |
+| 镜像内 runtime | 只有一个：`iceberg-spark-runtime-3.5_2.12-1.9.1-shb.1.jar`，sha256 `e7cc11d9c25c5e8fd9cca02814a06c72ce60d6bd31e9fca35c45d2955d581bca` |
+| 镜像内 Spark 库 | `parquet-column-1.13.1.jar`（sha256 `3ff4222b…`）、`avro-1.11.4.jar`（sha256 `eeba11b7…`），与 7.1 的"不动 Spark 外部 jar"一致 |
+
+**目标镜像上跑过的真实验收（`spark-sql -f`，本地 hadoop catalog，`local[2]`）**：建向量索引 → `list_indexes` 返回 1 行 → `EXPLAIN EXTENDED` 出现 `VectorSearchSource[metric=EUCLIDEAN, uncoveredFiles=0, indexSnapshot=1]` → `ORDER BY vec_distance(...) LIMIT 2` 返回 `1, 2` → `check_indexes` 返回 `needs_rebuild=false` → `index_cache_status` 可读；文本侧建 BM25 → `text_search` 返回 2 条带分数 → `check_indexes` 不再抛类型转换异常（即 §7.4 里那条 `#2796` 修复已在目标镜像中）。
+
+**仍未做的**：集群六条验收（k8s + 生产 catalog）与 10M 基准回归 —— 上面是单机 `local[2]` 的制品验收，不能替代 #2769。
+
 **这些通过只证明"代码在 1.9.1 上活着"，不证明生产可用。** 还没做、且必须做的：集群六条验收（`list_indexes`、建索引、SQL 查询走索引且与 L2 全扫逐行一致、`check_indexes`、杀 executor 后一致、缓存状态可读）、10M 基准回归（Parquet × 量化 1/2/3/4bit，并量出 7.3 里取回退化的实际代价）、镜像重建（此时不再需要替换 parquet/avro，只需删 vendor 的 `iceberg-spark-runtime` 并放入我们的 jar）。基线一换，之前所有集群召回/延迟数字全部失效。
 
 ### 7.6 升级矩阵
