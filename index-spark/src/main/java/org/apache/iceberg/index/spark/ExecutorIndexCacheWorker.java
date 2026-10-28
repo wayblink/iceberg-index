@@ -196,7 +196,7 @@ final class ExecutorIndexCacheWorker implements AutoCloseable {
 
     // Free space is checked before this command promises its own estimate: a first load must not
     // see its own reservation as if it were already used.
-    long free = cacheConfig.maxBytes() - cache.stats().bytes() - reservedBytes();
+    long free = cacheConfig.maxBytes() - cache.stats().bytes() - promisedBytes();
     if (estimate > free) {
       // Refuse before reading the file: a prepare that cannot be admitted only wastes I/O and the
       // temporary memory the driver is trying to protect.
@@ -298,14 +298,10 @@ final class ExecutorIndexCacheWorker implements AutoCloseable {
       String profile,
       long sequence,
       long budgetBytes,
-      long reservedBytes,
       long releasingBytes,
       Map<String, Long> accessAgeNanos) {
-    Map<String, Long> holders = holders();
-    long used = 0;
-    for (long bytes : holders.values()) {
-      used = Math.addExact(used, bytes);
-    }
+    ExecutorIndexCache.MemoryUsage memory = cache.memoryUsage();
+    Map<String, Long> holders = holders(memory.residentFiles());
 
     return IndexCacheProtocol.NodeReport.builder()
         .session(session)
@@ -313,8 +309,8 @@ final class ExecutorIndexCacheWorker implements AutoCloseable {
         .incarnation(incarnation)
         .sequence(sequence)
         .budgetBytes(budgetBytes)
-        .usedBytes(used)
-        .reservedBytes(reservedBytes)
+        .usedBytes(memory.usedBytes())
+        .reservedBytes(memory.reservedBytes())
         .releasingBytes(releasingBytes)
         .holders(holders)
         .profile(profile)
@@ -322,8 +318,8 @@ final class ExecutorIndexCacheWorker implements AutoCloseable {
         .build();
   }
 
-  /** Bytes promised to loads that have not finished yet. */
-  long reservedBytes() {
+  /** Estimates associated with pending control commands, not cache reservations. */
+  private long promisedBytes() {
     synchronized (stateLock) {
       long reserved = 0;
       for (long bytes : promised.values()) {
@@ -340,12 +336,16 @@ final class ExecutorIndexCacheWorker implements AutoCloseable {
    * reported.
    */
   Map<String, Long> holders() {
-    Set<String> resident = cache.residentKeys();
+    return holders(cache.memoryUsage().residentFiles());
+  }
+
+  private Map<String, Long> holders(Map<String, Long> resident) {
     synchronized (stateLock) {
       Map<String, Long> holders = new LinkedHashMap<>();
       for (Map.Entry<String, Installed> entry : installed.entrySet()) {
-        if (resident.contains(entry.getKey())) {
-          holders.put(entry.getKey(), entry.getValue().bytes());
+        Long bytes = resident.get(entry.getKey());
+        if (bytes != null) {
+          holders.put(entry.getKey(), bytes);
         }
       }
 
@@ -358,12 +358,7 @@ final class ExecutorIndexCacheWorker implements AutoCloseable {
   }
 
   long usedBytes() {
-    long used = 0;
-    for (long bytes : holders().values()) {
-      used = Math.addExact(used, bytes);
-    }
-
-    return used;
+    return cache.memoryUsage().usedBytes();
   }
 
   IndexCacheWorkerConfig config() {

@@ -1,0 +1,158 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+package org.apache.iceberg.index.spark;
+
+import static org.assertj.core.api.Assertions.assertThat;
+
+import java.util.Map;
+import org.apache.spark.sql.SparkSession;
+import org.junit.jupiter.api.Test;
+
+class TestPluginExecutorBudget {
+  private static final long MB = 1024L * 1024L;
+
+  @Test
+  void lazyQueryCannotExceedTheAdvertisedAutomaticBudget() {
+    SparkSession spark = start(null);
+    ExecutorIndexCache cache = ExecutorIndexCache.get();
+    try {
+      long advertised = ExecutorIndexCache.Config.advertisedBudget(null, "7g", null);
+      ExecutorIndexCache.Config query = ExecutorIndexCache.Config.from(spark, 600 * MB);
+      cache.file("larger-than-advertised", query, "test", () -> charged(600 * MB));
+      assertThat(cache.stats().bytes()).isLessThanOrEqualTo(advertised);
+      assertThat(cache.residentKeys()).isEmpty();
+    } finally {
+      cache.clear();
+      spark.stop();
+    }
+  }
+
+  @Test
+  void clearingEntriesDoesNotRemoveTheExecutorBudget() {
+    SparkSession spark = start(null);
+    ExecutorIndexCache cache = ExecutorIndexCache.get();
+    try {
+      cache.file(
+          "small", ExecutorIndexCache.Config.from(spark, 600 * MB), "test", () -> charged(MB));
+      assertThat(cache.stats().entries()).isEqualTo(1);
+      cache.clear();
+      cache.file(
+          "too-large-after-clear",
+          ExecutorIndexCache.Config.from(spark, 600 * MB),
+          "test",
+          () -> charged(600 * MB));
+      assertThat(cache.residentKeys()).isEmpty();
+    } finally {
+      cache.clear();
+      spark.stop();
+    }
+  }
+
+  @Test
+  void anExplicitZeroBudgetCannotBeOverriddenByAQuery() {
+    SparkSession spark = start("0");
+    ExecutorIndexCache cache = ExecutorIndexCache.get();
+    try {
+      spark.conf().set(ExecutorIndexCache.Config.BYTES, "1g");
+      cache.file(
+          "zero-budget", ExecutorIndexCache.Config.from(spark, MB), "test", () -> charged(MB));
+      assertThat(cache.residentKeys()).isEmpty();
+    } finally {
+      cache.clear();
+      spark.stop();
+    }
+  }
+
+  @Test
+  void nonpositiveBudgetsDisableQueryCaching() {
+    for (String configured : new String[] {"0", "-1"}) {
+      SparkSession spark = start(configured);
+      ExecutorIndexCache cache = ExecutorIndexCache.get();
+      try {
+        ExecutorIndexCache.Config query = ExecutorIndexCache.Config.from(spark, MB);
+        assertThat(query.enabled()).isFalse();
+        cache.file("disabled", query, "test", () -> charged(MB));
+        assertThat(cache.residentKeys()).isEmpty();
+      } finally {
+        cache.clear();
+        spark.stop();
+      }
+    }
+  }
+
+  @Test
+  void blankBudgetMeansAutomaticOnBothPaths() {
+    SparkSession spark = start(" ");
+    ExecutorIndexCache cache = ExecutorIndexCache.get();
+    try {
+      ExecutorIndexCache.Config query = ExecutorIndexCache.Config.from(spark, 0);
+      assertThat(query.maxBytes())
+          .isEqualTo(ExecutorIndexCache.Config.advertisedBudget(" ", "7g", null));
+    } finally {
+      cache.clear();
+      spark.stop();
+    }
+  }
+
+  @Test
+  void nodeReportIncludesLazyResidentBytes() {
+    SparkSession spark = start(null);
+    ExecutorIndexCache cache = ExecutorIndexCache.get();
+    try {
+      long budget = ExecutorIndexCache.Config.advertisedBudget(null, "7g", null);
+      cache.file("lazy", ExecutorIndexCache.Config.from(spark, MB), "test", () -> charged(MB));
+      ExecutorIndexCacheWorker observer =
+          new ExecutorIndexCacheWorker(
+              "observer",
+              "executor",
+              "incarnation",
+              cache,
+              ExecutorIndexCache.Config.of(true, budget),
+              command -> charged(MB),
+              IndexCacheWorkerConfig.parse(Map.of()));
+      assertThat(observer.report("test", 1, budget, 0, Map.of()).usedBytes()).isEqualTo(MB);
+    } finally {
+      cache.clear();
+      spark.stop();
+    }
+  }
+
+  private static SparkSession start(String configured) {
+    ExecutorIndexCache.get().clear();
+    SparkSession.Builder builder =
+        SparkSession.builder()
+            .master("local[2]")
+            .appName("plugin-executor-budget")
+            // Local executors initialize before Spark publishes its generated application ID.
+            .config("spark.app.id", "plugin-executor-budget-test")
+            .config("spark.ui.enabled", "false")
+            .config("spark.executor.memory", "7g")
+            .config("spark.plugins", IndexCachePlugin.class.getName())
+            .config(ExecutorIndexCache.Config.ENABLED, "true");
+    if (configured != null) {
+      builder.config(ExecutorIndexCache.Config.BYTES, configured);
+    }
+    return builder.getOrCreate();
+  }
+
+  private static ExecutorIndexCache.CachedFile charged(long bytes) {
+    // Exercise the real retained-state accounting without allocating a large payload buffer.
+    return ExecutorIndexCache.loaded(new byte[] {1}, null, bytes);
+  }
+}

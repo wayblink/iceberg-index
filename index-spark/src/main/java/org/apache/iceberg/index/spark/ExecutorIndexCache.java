@@ -175,7 +175,13 @@ final class ExecutorIndexCache {
       }
 
       String configured = setting(spark, BYTES, null);
+      if (configured != null && configured.isBlank()) {
+        configured = null;
+      }
       long configuredBytes = configured != null ? parseBytes(configured, BYTES) : 0L;
+      if (configured != null && configuredBytes <= 0) {
+        return DISABLED;
+      }
       int executors = executors(spark);
       long budget =
           derive(
@@ -567,6 +573,7 @@ final class ExecutorIndexCache {
         }
       };
   private final Object mapLock = new Object();
+  private ExecutorBudget executorBudget;
   private final IndexCacheOwnership ownership = new IndexCacheOwnership();
   private final Set<String> pendingReleases = new LinkedHashSet<>();
   // Observational associations do not confer residency ownership or protection.
@@ -616,6 +623,53 @@ final class ExecutorIndexCache {
   }
 
   private ExecutorIndexCache() {}
+
+  /** Binds admission to the capacity advertised by the executor's active plugin. */
+  ExecutorBudget bindExecutorBudget(long budgetBytes) {
+    Preconditions.checkArgument(budgetBytes >= 0, "Invalid executor cache budget: %s", budgetBytes);
+    synchronized (mapLock) {
+      Preconditions.checkState(executorBudget == null, "Executor cache budget is already bound");
+      Preconditions.checkState(
+          bytes <= budgetBytes && reservedBytes <= budgetBytes - bytes,
+          "Cannot bind executor cache budget %s: %s bytes resident and %s reserved",
+          budgetBytes,
+          bytes,
+          reservedBytes);
+      executorBudget = new ExecutorBudget(budgetBytes);
+      return executorBudget;
+    }
+  }
+
+  final class ExecutorBudget implements AutoCloseable {
+    private final long maxBytes;
+
+    private ExecutorBudget(long maxBytes) {
+      this.maxBytes = maxBytes;
+    }
+
+    @Override
+    public void close() {
+      synchronized (mapLock) {
+        if (executorBudget == this) {
+          executorBudget = null;
+          mapLock.notifyAll();
+        }
+      }
+    }
+  }
+
+  record MemoryUsage(long usedBytes, long reservedBytes, Map<String, Long> residentFiles) {}
+
+  /** One coherent snapshot of all retained files and reservations, including lazy queries. */
+  MemoryUsage memoryUsage() {
+    synchronized (mapLock) {
+      drainPendingReleases();
+      Map<String, Long> resident = new LinkedHashMap<>();
+      probation.forEach((key, file) -> resident.put(key, file.bytes()));
+      protectedFiles.forEach((key, file) -> resident.put(key, file.bytes()));
+      return new MemoryUsage(bytes, reservedBytes, Map.copyOf(resident));
+    }
+  }
 
   /**
    * The index file at the location, read and prepared at most once per executor.
@@ -1206,7 +1260,8 @@ final class ExecutorIndexCache {
   }
 
   private long budget(long configured) {
-    long capacity = configured;
+    long capacity =
+        executorBudget == null ? configured : Math.min(configured, executorBudget.maxBytes);
     for (Reservation reservation : reservations) {
       capacity = Math.min(capacity, reservation.budget);
     }

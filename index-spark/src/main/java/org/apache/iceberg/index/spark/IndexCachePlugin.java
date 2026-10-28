@@ -114,6 +114,7 @@ public class IndexCachePlugin implements SparkPlugin {
   /** Executor side: polls for commands and executes them outside the control path. */
   static final class IndexCacheExecutorPlugin implements ExecutorPlugin {
     private IndexCacheExecutorLoop loop;
+    private ExecutorIndexCache.ExecutorBudget budgetBinding;
 
     /**
      * Spark fills {@code extraConf} from {@code spark.plugins.internal.conf.<plugin class>.<key>},
@@ -125,22 +126,28 @@ public class IndexCachePlugin implements SparkPlugin {
       IndexCacheTypeRegistration.registerAll();
       IndexCacheWorkerConfig config = IndexCacheWorkerConfig.parse(extraConf);
       long budget = advertisedBudget(pluginContext.conf());
-      IndexCacheControlChannel channel = pluginContext::ask;
-      ExecutorIndexCacheWorker worker =
-          new ExecutorIndexCacheWorker(
-              pluginContext.conf().get("spark.app.id", ""),
-              pluginContext.executorID(),
-              incarnation(pluginContext),
-              ExecutorIndexCache.get(),
-              // the per-file ceiling is gone: the budget decides whether a file fits, and a budget
-              // of none is the same disabled cache a query sees
-              budget > 0
-                  ? ExecutorIndexCache.Config.of(true, budget)
-                  : ExecutorIndexCache.Config.disabled(),
-              new IndexCacheReadContext(),
-              config);
-      loop = new IndexCacheExecutorLoop(channel, worker, config, budget);
-      loop.start();
+      ExecutorIndexCache cache = ExecutorIndexCache.get();
+      budgetBinding = cache.bindExecutorBudget(budget);
+      try {
+        IndexCacheControlChannel channel = pluginContext::ask;
+        ExecutorIndexCacheWorker worker =
+            new ExecutorIndexCacheWorker(
+                pluginContext.conf().get("spark.app.id", ""),
+                pluginContext.executorID(),
+                incarnation(pluginContext),
+                cache,
+                // Query-specific budgets cannot expand this executor's advertised capacity.
+                budget > 0
+                    ? ExecutorIndexCache.Config.of(true, budget)
+                    : ExecutorIndexCache.Config.disabled(),
+                new IndexCacheReadContext(),
+                config);
+        loop = new IndexCacheExecutorLoop(channel, worker, config, budget);
+        loop.start();
+      } catch (RuntimeException e) {
+        shutdown();
+        throw e;
+      }
     }
 
     /**
@@ -171,6 +178,10 @@ public class IndexCachePlugin implements SparkPlugin {
       if (loop != null) {
         loop.close();
         loop = null;
+      }
+      if (budgetBinding != null) {
+        budgetBinding.close();
+        budgetBinding = null;
       }
     }
   }

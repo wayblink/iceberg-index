@@ -179,7 +179,7 @@ class TestExecutorIndexCacheWorker {
     assertThat(loading.await(30, TimeUnit.SECONDS)).isTrue();
 
     // The control channel must answer reports while a large prepare is still running.
-    IndexCacheProtocol.NodeReport report = worker.report("profile", 3, 1_000L, 0L, 0L, Map.of());
+    IndexCacheProtocol.NodeReport report = worker.report("profile", 3, 1_000L, 0L, Map.of());
     assertThat(report.sequence()).isEqualTo(3);
     assertThat(report.budgetBytes()).isEqualTo(1_000L);
 
@@ -250,7 +250,7 @@ class TestExecutorIndexCacheWorker {
     worker.execute(load("A", "f1", 1));
 
     IndexCacheProtocol.NodeReport report =
-        worker.report("profile", 7, 500L, 0L, 0L, Map.of("A", 5_000L));
+        worker.report("profile", 7, 500L, 0L, Map.of("A", 5_000L));
 
     assertThat(report.session()).isEqualTo(SESSION);
     assertThat(report.executorId()).isEqualTo(EXECUTOR);
@@ -484,7 +484,7 @@ class TestExecutorIndexCacheWorker {
     cache.releaseCopy("A", "adapter|A|f1");
 
     assertThat(worker.holders()).doesNotContainKey("adapter|A|f1");
-    assertThat(worker.report("p", 1, 1_000L, 0L, 0L, Map.of()).usedBytes()).isZero();
+    assertThat(worker.report("p", 1, 1_000L, 0L, Map.of()).usedBytes()).isZero();
   }
 
   @Test
