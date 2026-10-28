@@ -20,16 +20,12 @@ package org.apache.iceberg.spark.procedures;
 
 import java.util.List;
 import org.apache.iceberg.index.IndexMetadata;
-import org.apache.iceberg.index.IndexQuery;
-import org.apache.iceberg.index.IndexReader;
-import org.apache.iceberg.index.IndexSearchResult;
-import org.apache.iceberg.index.IndexSnapshot;
+import org.apache.iceberg.index.spark.IndexSearch;
 import org.apache.iceberg.index.text.TextIndexAdapter;
 import org.apache.iceberg.index.text.TextIndexDefinition;
 import org.apache.iceberg.relocated.com.google.common.collect.Lists;
 import org.apache.iceberg.spark.procedures.SparkProcedures.ProcedureBuilder;
 import org.apache.spark.sql.Row;
-import org.apache.spark.sql.RowFactory;
 import org.apache.spark.sql.catalyst.InternalRow;
 import org.apache.spark.sql.connector.catalog.TableCatalog;
 import org.apache.spark.sql.connector.iceberg.catalog.ProcedureParameter;
@@ -38,7 +34,6 @@ import org.apache.spark.sql.types.Metadata;
 import org.apache.spark.sql.types.StructField;
 import org.apache.spark.sql.types.StructType;
 import org.apache.spark.unsafe.types.UTF8String;
-import scala.Tuple2;
 
 /**
  * Searches a BM25 text index and resolves the matched rows.
@@ -98,7 +93,6 @@ class TextSearchProcedure extends BaseProcedure {
   public InternalRow[] call(InternalRow args) {
     VectorIndexProcedures.registerTextIndexType();
     ProcedureInput input = new ProcedureInput(spark(), tableCatalog(), PARAMETERS, args);
-    String tableName = input.asString(TABLE_PARAM);
     String column = input.asString(COLUMN_PARAM);
     String query = input.asString(QUERY_PARAM);
     int topK = input.asInt(K_PARAM);
@@ -111,75 +105,29 @@ class TextSearchProcedure extends BaseProcedure {
           }
 
           IndexMetadata metadata = VectorIndexProcedures.findIndex(table, column, "text");
-          IndexSnapshot snapshot = metadata.latestSnapshot();
-          if (snapshot == null) {
-            throw new IllegalArgumentException(
-                "Index for column " + column + " of table " + tableName + " has no snapshot");
-          }
+          TextIndexAdapter adapter =
+              new TextIndexAdapter((TextIndexDefinition) metadata.definition());
 
-          TextIndexDefinition definition = (TextIndexDefinition) metadata.definition();
-          TextIndexAdapter adapter = new TextIndexAdapter(definition);
-          List<IndexSearchResult> hits =
-              new IndexReader(metadata, table.io())
-                  .search(
-                      IndexQuery.of(
-                          snapshot.sourceTableSnapshotId(), adapter.encodeQuery(query), topK));
+          // the search the batch entry point runs, with one query: hit resolution has one
+          // implementation, which reads the rows through the table's own data format and applies
+          // its deletes, so a single query cannot answer with a row the table no longer holds
+          List<Row> hits =
+              IndexSearch.search(spark(), table, column, "text", adapter.encodeQuery(query), topK)
+                  .collectAsList();
 
-          List<Row> resolved = resolveRows(table, hits);
-          List<InternalRow> rows = Lists.newArrayListWithCapacity(resolved.size());
-          for (int i = 0; i < hits.size(); i++) {
-            IndexSearchResult hit = hits.get(i);
-            String row = resolved.get(i) == null ? null : resolved.get(i).getString(0);
+          List<InternalRow> rows = Lists.newArrayListWithCapacity(hits.size());
+          for (Row hit : hits) {
+            String row = hit.isNullAt(3) ? null : hit.getString(3);
             rows.add(
                 newInternalRow(
-                    UTF8String.fromString(hit.dataFile()),
-                    hit.rowPosition(),
-                    hit.score(),
+                    UTF8String.fromString(hit.getString(0)),
+                    hit.getLong(1),
+                    hit.getDouble(2),
                     row == null ? null : UTF8String.fromString(row)));
           }
 
           return rows.toArray(new InternalRow[0]);
         });
-  }
-
-  /** Reads the matched rows of each hit data file, serialized as JSON, in hit order. */
-  private List<Row> resolveRows(org.apache.iceberg.Table table, List<IndexSearchResult> hits) {
-    java.util.Map<String, java.util.Set<Long>> positionsByFile = new java.util.LinkedHashMap<>();
-    for (IndexSearchResult hit : hits) {
-      positionsByFile
-          .computeIfAbsent(hit.dataFile(), key -> new java.util.HashSet<>())
-          .add(hit.rowPosition());
-    }
-
-    java.util.Map<String, java.util.Map<Long, String>> rowsByFile = new java.util.HashMap<>();
-    for (java.util.Map.Entry<String, java.util.Set<Long>> entry : positionsByFile.entrySet()) {
-      String dataFile = entry.getKey();
-      java.util.Set<Long> positions = entry.getValue();
-      List<Tuple2<String, Long>> zipped =
-          spark()
-              .read()
-              .parquet(dataFile)
-              .toJSON()
-              .toJavaRDD()
-              .zipWithIndex()
-              .filter(tuple -> positions.contains(tuple._2()))
-              .collect();
-      java.util.Map<Long, String> rows = new java.util.HashMap<>();
-      for (Tuple2<String, Long> tuple : zipped) {
-        rows.put(tuple._2(), tuple._1());
-      }
-      rowsByFile.put(dataFile, rows);
-    }
-
-    List<Row> resolved = Lists.newArrayListWithCapacity(hits.size());
-    for (IndexSearchResult hit : hits) {
-      resolved.add(
-          RowFactory.create(
-              rowsByFile
-                  .getOrDefault(hit.dataFile(), new java.util.HashMap<>())
-                  .get(hit.rowPosition())));
-    }
-    return resolved;
   }
 
   @Override

@@ -46,6 +46,7 @@ public class TestTextIndexProcedures extends ExtensionsTestBase {
   public void removeTables() {
     sql("DROP TABLE IF EXISTS %s", tableName("text_build_" + catalogName));
     sql("DROP TABLE IF EXISTS %s", tableName("text_deletes_" + catalogName));
+    sql("DROP TABLE IF EXISTS %s", tableName("text_delete_unrefreshed_" + catalogName));
     sql("DROP TABLE IF EXISTS %s", tableName("text_refresh_" + catalogName));
     sql("DROP TABLE IF EXISTS %s", tableName("text_errors_" + catalogName));
     sql("DROP TABLE IF EXISTS %s", tableName("text_batch_" + catalogName));
@@ -155,6 +156,43 @@ public class TestTextIndexProcedures extends ExtensionsTestBase {
                 + "query => 'vector index', k => 1)",
             catalogName, tableName);
     assertThat(searchIds(searchOutput)).containsExactly(2L);
+  }
+
+  @TestTemplate
+  public void testTextSearchResolvesRowsFromTheLiveTable() {
+    String tableName = tableName("text_delete_unrefreshed_" + catalogName);
+    sql("CREATE TABLE %s (id bigint, body string) USING iceberg", tableName);
+    sql(
+        "INSERT INTO %s VALUES "
+            + "(1, 'iceberg table format'), "
+            + "(2, 'iceberg snapshot manifests')",
+        tableName);
+    sql("CALL %s.system.build_text_index(table => '%s', column => 'body')", catalogName, tableName);
+
+    // the index still covers the row that was deleted, so the hit is real and stays; the row
+    // behind it is not, and returning the deleted document would answer with data the table no
+    // longer holds
+    sql("DELETE FROM %s WHERE id = 1", tableName);
+
+    List<Object[]> single =
+        sql(
+            "CALL %s.system.text_search(table => '%s', column => 'body', "
+                + "query => 'iceberg', k => 2)",
+            catalogName, tableName);
+    assertThat(single).hasSize(2);
+    assertThat(single.stream().filter(row -> row[3] == null).count())
+        .as("the deleted document has a hit but no row")
+        .isEqualTo(1L);
+
+    List<Object[]> batch =
+        sql(
+            "CALL %s.system.text_search_batch(table => '%s', column => 'body', "
+                + "queries => array('iceberg'), k => 2)",
+            catalogName, tableName);
+    assertThat(batch).hasSize(2);
+    assertThat(batch.stream().filter(row -> row[4] == null).count())
+        .as("the batch entry point answers the same way")
+        .isEqualTo(1L);
   }
 
   @TestTemplate
