@@ -75,6 +75,18 @@ model=1、未知模型、缺失 memory、reader/runtimeProfile 不匹配的旧�
 
 验收同时核对可达数组与收费模型；仅 build 数字等于 prepare 数字不足以证明没有双方共同漏账。
 
+### 3.3 已确认的共享元数据与内部消息记账
+
+用户已确认将缓存额外状态E及driver/executor内部消息调整纳入C。固定的P加包装常数不能覆盖完整key、owner、map/set backing和会增长的ownership关联。缓存按可达组件的集合记账：同一物理文件、owner及共享backing在同一executor只计一次；跨executor的独立副本各自计费。文本身份保留完整值，不靠截短或换成不透明ID消除费用。
+
+区分索引驻留R、必要控制元数据Q及尚未占用的预留增量H。R包含prepared P及仍被驻留/lease持有的附加状态，最后引用释放后对应索引resident归零；Q包含仍需保留的epoch、paused策略等控制状态及其容器，单独计入总预算，不能以“控制面”为名漏掉增长。实际已用为R+Q，有效占用为R+Q+H；releasing是已用中的待释放子集，不再次相加。固定空管理器、锁和计数器为明确基底，不将扩大后的容器backing冒充空基底。
+
+owner/group信息显式沿内部消息传递，不能从缺席值推断零费用。原缺owner的三参数workingSet helper不能继续报告完整resident为known；现有查询转为包内owner-aware入口。规划、预留、接纳、ACK及状态上报消费同一个集合投影；ACK仍按现有计划/命令身份确认文件coverage，但预算不再通过逐file数字盲目累加。较旧或重复收费快照不回滚新状态，失败接纳不留下未收费的元数据，释放不因没有空闲预算而失败。
+
+仅调整index-spark包内状态和现有通信通道的消息内容，不新增网络服务、公开Java接口、SQL/CALL参数或运维开关，不改payload/manifest格式、调度/LRU/保护/删除语义。算法、模型、预算字段及测试必须一起迁移；当前E缓存根回归仍RED，本文不代表完成。
+
+实现与验证细则见`docs/2026-10-28-cache-owned-metadata-and-internal-protocol.md`。
+
 ## 4. IVF 编码与目录（#2776）
 
 ### 4.1 格式不变：大端、modified UTF-8、padded 步长

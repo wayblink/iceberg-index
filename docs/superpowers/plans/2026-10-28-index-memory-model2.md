@@ -27,7 +27,7 @@ under the License.
 
 **Tech Stack:** Java17、现有JUnit5/AssertJ、Spark3.5/Scala2.12、现有FileIO/Puffin；不新增依赖。
 
-**Spec:** `docs/2026-10-27-ivf-payload-in-place-design.md` §3/7/8，用户2026-10-28确认C/D边界修订。
+**Spec:** `docs/2026-10-27-ivf-payload-in-place-design.md` §3/7/8，用户2026-10-28确认C/D边界修订。用户进一步确认共享元数据和内部消息调整；剩余E以`docs/2026-10-28-cache-owned-metadata-and-internal-protocol.md`为细化实施合同。已有Task3/4的逐file常数或求和不能作为完整E交付，按补充设计E1–E4迁移；索引resident归零与总预算内的control费用必须分开。
 
 ## Global Constraints
 

@@ -59,6 +59,54 @@ class TestIndexCacheMemory {
   }
 
   @Test
+  void cacheRootChargeIncludesLongKeyAndOwnerStorage() throws ReflectiveOperationException {
+    VectorIndexAdapter adapter =
+        new VectorIndexAdapter(
+            VectorIndexDefinition.builder()
+                .fieldId(1)
+                .dimension(2)
+                .metric(Metric.EUCLIDEAN)
+                .structure(VectorStructure.FLAT)
+                .build());
+    IndexAdapter.PreparedSearch prepared = adapter.prepare(adapter.encodeEntries(List.of()));
+    ExecutorIndexCache cache = ExecutorIndexCache.get();
+    String owner = new String("owner".repeat(2_000).toCharArray());
+    String location = "file".repeat(2_000);
+    cache.clear();
+    try {
+      cache.file(
+          location,
+          ExecutorIndexCache.Config.of(true, 100_000).withOwner(owner),
+          DistributedIndexSearch.adapterKey(adapter),
+          () -> ExecutorIndexCache.loaded(0, prepared).withContext(adapter));
+      Field field = ExecutorIndexCache.class.getDeclaredField("protectedFiles");
+      field.setAccessible(true);
+      Map<?, ?> roots = (Map<?, ?>) field.get(cache);
+      assertThat(roots).hasSize(1);
+      IdentityHashMap<Object, Boolean> seen = new IdentityHashMap<>();
+      long lower = 0;
+      for (Map.Entry<?, ?> entry : roots.entrySet()) {
+        ExecutorIndexCache.CachedFile file = (ExecutorIndexCache.CachedFile) entry.getValue();
+        // Independently checked lower bounds: empty FLAT state, wrapper/lock and one map node.
+        // The receipt and ownership collections are deliberately omitted, so this is a lower
+        // bound, not an exact retained-heap measurement or the production charge formula.
+        lower += 112 + 112 + 40;
+        for (String value : List.of((String) entry.getKey(), file.owner())) {
+          if (seen.put(value, Boolean.TRUE) == null) {
+            long width = value.chars().anyMatch(character -> character > 255) ? 2 : 1;
+            lower += 24 + ((16 + width * value.length() + 7) / 8) * 8;
+          }
+        }
+      }
+      assertThat(cache.stats().bytes())
+          .as("Charge must cover the independently counted cache-root lower bound")
+          .isGreaterThanOrEqualTo(lower);
+    } finally {
+      cache.clear();
+    }
+  }
+
+  @Test
   void independentPreparedStateDoesNotRetainContainer() throws ReflectiveOperationException {
     byte[] container = new byte[20_000];
     byte[] state = new byte[] {10};
