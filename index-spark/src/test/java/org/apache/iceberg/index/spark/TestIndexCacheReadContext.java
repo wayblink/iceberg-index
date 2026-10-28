@@ -27,6 +27,9 @@ import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.nio.file.Path;
 import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.concurrent.atomic.AtomicInteger;
 import org.apache.iceberg.TestTables.LocalFileIO;
 import org.apache.iceberg.index.IndexAdapter;
 import org.apache.iceberg.index.IndexBlob;
@@ -40,11 +43,38 @@ import org.apache.iceberg.index.IndexTypes;
 import org.apache.iceberg.index.PuffinIndexFileContainer;
 import org.apache.iceberg.index.TestingIndexAdapter;
 import org.apache.iceberg.index.TestingIndexDefinition;
+import org.apache.iceberg.index.vector.VectorIndexAdapter;
+import org.apache.iceberg.index.vector.VectorIndexDefinition;
+import org.apache.iceberg.index.vector.VectorIndexTypes;
+import org.apache.iceberg.io.InputFile;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 
 class TestIndexCacheReadContext {
   private static final IndexDefinition DEFINITION = new Definition();
+
+  @Test
+  void readerProofIsIncludedInTheWrapperCharge() {
+    VectorIndexTypes.register();
+    VectorIndexAdapter adapter =
+        new VectorIndexAdapter(
+            VectorIndexDefinition.builder()
+                .fieldId(1)
+                .dimension(2)
+                .metric(VectorIndexDefinition.Metric.EUCLIDEAN)
+                .structure(VectorIndexDefinition.VectorStructure.FLAT)
+                .quantizer(VectorIndexDefinition.VectorQuantizer.NONE)
+                .properties(Map.of())
+                .build());
+    IndexAdapter.PreparedSearch prepared = adapter.prepare(adapter.encodeEntries(List.of()));
+    ExecutorIndexCache.CachedFile file =
+        ExecutorIndexCache.loaded(10, prepared).withContext(adapter);
+    assertThat(file.hasKnownContext()).isTrue();
+    // Independent lower bound: wrapper 64, lock+sync 56, receipt array header+SHA-256 48.
+    assertThat(file.bytes()).isGreaterThanOrEqualTo(prepared.estimatedBytes() + 64 + 56 + 48);
+  }
 
   @Test
   void unknownActualPreparedStateCannotUseACompatibleBuildEstimate(@TempDir Path temp)
@@ -75,7 +105,7 @@ class TestIndexCacheReadContext {
                   IndexCacheProtocol.File.builder()
                       .location(location)
                       .cacheKey("key")
-                      .estimatedBytes(192L)
+                      .estimatedBytes(IndexCacheMemory.residentBytes(memory))
                       .memory(memory)
                       .build())
               .definition(DEFINITION)
@@ -89,6 +119,260 @@ class TestIndexCacheReadContext {
     List<IndexSearchResult> hits =
         adapter.prepare(payload).search(ByteBuffer.wrap(TestingIndexAdapter.valuePayload(0)), 1);
     assertThat(hits).extracting(IndexSearchResult::score).containsExactly(10.0);
+  }
+
+  @Test
+  void warmUnknownQueryCannotBecomeManaged(@TempDir Path temp) throws IOException {
+    warmTakeover(temp, false);
+  }
+
+  @Test
+  void warmQueryCannotBypassCurrentRuntimeProfile(@TempDir Path temp) throws IOException {
+    warmTakeover(temp, true);
+  }
+
+  private void warmTakeover(Path temp, boolean mismatch) throws IOException {
+    IndexTypes.register(new UnknownPreparedType());
+    UnknownPreparedAdapter adapter = new UnknownPreparedAdapter();
+    AtomicInteger reads = new AtomicInteger();
+    try (LocalFileIO io =
+        new LocalFileIO() {
+          @Override
+          public InputFile newInputFile(String path) {
+            reads.incrementAndGet();
+            return super.newInputFile(path);
+          }
+        }) {
+      String location = temp.resolve("warm.puffin").toString();
+      ByteBuffer payload =
+          adapter.encodeEntries(
+              List.of(IndexEntry.of("data", 7, TestingIndexAdapter.valuePayload(10))));
+      byte[] bytes = new byte[payload.remaining()];
+      payload.get(bytes);
+      new PuffinIndexFileContainer()
+          .write(io.newOutputFile(location), List.of(IndexBlob.of(adapter.entryBlobType(), bytes)));
+      ExecutorIndexCache cache = ExecutorIndexCache.get();
+      cache.clear();
+      ExecutorIndexCache.Config config = ExecutorIndexCache.Config.of(true, 10_000);
+      String key =
+          DistributedIndexSearch.cacheKey("", DistributedIndexSearch.adapterKey(adapter), location);
+      try {
+        ExecutorIndexCache.CachedFile warm =
+            cache.file(
+                location,
+                config,
+                DistributedIndexSearch.adapterKey(adapter),
+                () -> DistributedIndexSearch.loadFile(io, location, adapter));
+        long charged = cache.stats().bytes();
+        reads.set(0);
+        IndexFileMemory memory = adapter.encodeEntriesWithMemory(List.of()).memory();
+        if (mismatch) {
+          memory = memory.toBuilder().runtimeProfile("processors=different-executor").build();
+        }
+        IndexCacheProtocol.Command command =
+            IndexCacheProtocol.Command.builder()
+                .session("session")
+                .executorId("executor")
+                .incarnation("incarnation")
+                .indexUuid("index")
+                .epoch(1)
+                .planId("plan")
+                .commandId("warm-command")
+                .type(IndexCacheProtocol.CommandType.LOAD)
+                .file(
+                    IndexCacheProtocol.File.builder()
+                        .location(location)
+                        .cacheKey(key)
+                        .estimatedBytes(IndexCacheMemory.residentBytes(memory))
+                        .memory(memory)
+                        .build())
+                .definition(DEFINITION)
+                .io(io)
+                .build();
+        try (ExecutorIndexCacheWorker worker =
+            new ExecutorIndexCacheWorker(
+                "session",
+                "executor",
+                "incarnation",
+                cache,
+                config,
+                new IndexCacheReadContext(),
+                IndexCacheWorkerConfig.parse(java.util.Map.of()))) {
+          IndexCacheProtocol.Ack ack = worker.execute(command);
+          assertThat(ack.status()).isNotEqualTo(IndexCacheProtocol.AckStatus.LOADED);
+          assertThat(reads).hasValue(0);
+          assertThat(cache.stats().bytes()).isEqualTo(charged);
+          try (ExecutorIndexCache.Lease lease = cache.acquireManaged("index", 1, key)) {
+            assertThat(lease).isNotNull();
+            IndexCacheReadContext context = new IndexCacheReadContext();
+            ExecutorIndexCache.Loader reuse =
+                new ExecutorIndexCache.Loader() {
+                  @Override
+                  public ExecutorIndexCache.CachedFile load() {
+                    return context.load(command);
+                  }
+
+                  @Override
+                  public void validate() {
+                    context.validate(command);
+                  }
+
+                  @Override
+                  public void validate(ExecutorIndexCache.CachedFile file) {
+                    context.validate(command, file);
+                  }
+                };
+            assertThatThrownBy(() -> cache.installManaged("index", 1, key, config, reuse))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining(mismatch ? "incompatible" : "unknown");
+            assertThat(reads).hasValue(0);
+            assertThat(cache.stats().bytes()).isEqualTo(charged);
+            List<IndexSearchResult> leasedResults =
+                lease
+                    .file()
+                    .searching(
+                        searcher ->
+                            searcher.search(
+                                ByteBuffer.wrap(TestingIndexAdapter.valuePayload(0)), 1));
+            assertThat(leasedResults).extracting(IndexSearchResult::score).containsExactly(10.0);
+          }
+          List<IndexSearchResult> results =
+              warm.searching(
+                  searcher ->
+                      searcher.search(ByteBuffer.wrap(TestingIndexAdapter.valuePayload(0)), 1));
+          assertThat(results).extracting(IndexSearchResult::score).containsExactly(10.0);
+        }
+      } finally {
+        cache.clear();
+      }
+    }
+  }
+
+  @ParameterizedTest
+  @ValueSource(booleans = {false, true})
+  void realFlatWarmLeaseRequiresTheCurrentProfile(boolean mismatch, @TempDir Path temp)
+      throws IOException {
+    VectorIndexTypes.register();
+    VectorIndexDefinition definition =
+        VectorIndexDefinition.builder()
+            .fieldId(1)
+            .dimension(2)
+            .metric(VectorIndexDefinition.Metric.EUCLIDEAN)
+            .structure(VectorIndexDefinition.VectorStructure.FLAT)
+            .quantizer(VectorIndexDefinition.VectorQuantizer.NONE)
+            .properties(Map.of())
+            .build();
+    VectorIndexAdapter adapter = new VectorIndexAdapter(definition);
+    AtomicInteger reads = new AtomicInteger();
+    try (LocalFileIO io =
+        new LocalFileIO() {
+          @Override
+          public InputFile newInputFile(String path) {
+            reads.incrementAndGet();
+            return super.newInputFile(path);
+          }
+        }) {
+      String location = temp.resolve("flat.puffin").toString();
+      IndexBuildResult built =
+          adapter.encodeEntriesWithMemory(
+              List.of(IndexEntry.of("data", 7, adapter.encodeVector(new float[] {3, 4}))));
+      byte[] bytes = new byte[built.payload().remaining()];
+      built.payload().duplicate().get(bytes);
+      new PuffinIndexFileContainer()
+          .write(io.newOutputFile(location), List.of(IndexBlob.of(adapter.entryBlobType(), bytes)));
+      ExecutorIndexCache cache = ExecutorIndexCache.get();
+      cache.clear();
+      ExecutorIndexCache.Config config = ExecutorIndexCache.Config.of(true, 10_000);
+      String adapterKey = DistributedIndexSearch.adapterKey(adapter);
+      String key = DistributedIndexSearch.cacheKey("", adapterKey, location);
+      try {
+        ExecutorIndexCache.CachedFile warm =
+            cache.file(
+                location,
+                config,
+                adapterKey,
+                () -> DistributedIndexSearch.loadFile(io, location, adapter));
+        cache.applyTarget("index", 1, Set.of(key));
+        try (ExecutorIndexCache.Lease lease = cache.acquireManaged("index", 1, key)) {
+          assertThat(lease).isNotNull();
+          long charged = cache.stats().bytes();
+          reads.set(0);
+          IndexFileMemory memory = built.memory();
+          assertThat(memory).isNotNull();
+          if (mismatch) {
+            memory =
+                memory.toBuilder()
+                    .runtimeProfile(
+                        memory
+                            .runtimeProfile()
+                            .replace(
+                                "processors=" + Runtime.getRuntime().availableProcessors(),
+                                "processors=999999"))
+                    .build();
+          }
+          IndexCacheProtocol.Command command =
+              IndexCacheProtocol.Command.builder()
+                  .session("session")
+                  .executorId("executor")
+                  .incarnation("incarnation")
+                  .indexUuid("index")
+                  .epoch(1)
+                  .planId("plan")
+                  .commandId("flat-command")
+                  .type(IndexCacheProtocol.CommandType.LOAD)
+                  .file(
+                      IndexCacheProtocol.File.builder()
+                          .location(location)
+                          .cacheKey(key)
+                          .estimatedBytes(IndexCacheMemory.residentBytes(memory))
+                          .memory(memory)
+                          .build())
+                  .definition(definition)
+                  .io(io)
+                  .build();
+          IndexCacheReadContext context = new IndexCacheReadContext();
+          ExecutorIndexCache.Loader loader =
+              new ExecutorIndexCache.Loader() {
+                @Override
+                public ExecutorIndexCache.CachedFile load() {
+                  return context.load(command);
+                }
+
+                @Override
+                public void validate() {
+                  context.validate(command);
+                }
+
+                @Override
+                public void validate(ExecutorIndexCache.CachedFile file) {
+                  context.validate(command, file);
+                }
+              };
+          if (mismatch) {
+            assertThatThrownBy(() -> cache.installManaged("index", 1, key, config, loader))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("incompatible");
+          } else {
+            assertThat(cache.installManaged("index", 1, key, config, loader)).isSameAs(warm);
+          }
+          assertThat(reads).hasValue(0);
+          assertThat(cache.stats().bytes()).isEqualTo(charged);
+          cache.releaseIndex("index", 2);
+          assertThat(cache.stats().bytes()).isEqualTo(charged);
+          List<IndexSearchResult> results =
+              lease
+                  .file()
+                  .searching(
+                      searcher ->
+                          searcher.search(
+                              ByteBuffer.wrap(adapter.encodeVector(new float[] {0, 0})), 1));
+          assertThat(results).extracting(IndexSearchResult::score).containsExactly(5.0);
+        }
+        assertThat(cache.stats().bytes()).isZero();
+      } finally {
+        cache.clear();
+      }
+    }
   }
 
   private static class UnknownPreparedAdapter extends TestingIndexAdapter {

@@ -41,6 +41,10 @@ final class ExecutorIndexCacheWorker implements AutoCloseable {
 
   interface Loader {
     ExecutorIndexCache.CachedFile load(IndexCacheProtocol.Command command);
+
+    default void validate(IndexCacheProtocol.Command command) {}
+
+    default void validate(IndexCacheProtocol.Command command, ExecutorIndexCache.CachedFile file) {}
   }
 
   private record Installed(long epoch, long bytes) {}
@@ -220,7 +224,22 @@ final class ExecutorIndexCacheWorker implements AutoCloseable {
                 command.epoch(),
                 cacheKey,
                 cacheConfig,
-                () -> loader.load(command));
+                new ExecutorIndexCache.Loader() {
+                  @Override
+                  public ExecutorIndexCache.CachedFile load() {
+                    return loader.load(command);
+                  }
+
+                  @Override
+                  public void validate() {
+                    loader.validate(command);
+                  }
+
+                  @Override
+                  public void validate(ExecutorIndexCache.CachedFile cached) {
+                    loader.validate(command, cached);
+                  }
+                });
         if (file == null) {
           // Admission refused: either this entry can never fit, or the space is momentarily taken.
           synchronized (stateLock) {

@@ -592,7 +592,8 @@ public final class DistributedIndexSearch {
     byte[] content = readPayload(io, location);
     PreparedFile prepared = prepareFile(content, adapter);
     return new LoadedFile(
-        ExecutorIndexCache.loaded(prepared.payloadBytes(), prepared.searcher()),
+        ExecutorIndexCache.loaded(prepared.payloadBytes(), prepared.searcher())
+            .withContext(adapter),
         content.length,
         prepared.payloadBytes(),
         prepared.searcher().estimatedBytes());

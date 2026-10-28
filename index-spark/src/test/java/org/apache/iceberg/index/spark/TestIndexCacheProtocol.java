@@ -52,7 +52,7 @@ class TestIndexCacheProtocol {
 
   @Test
   void fileSurvivesSerializationWithItsReadContextAndEstimate() {
-    IndexCacheProtocol.File file = file("f1", 2_560L);
+    IndexCacheProtocol.File file = file("f1");
 
     IndexCacheProtocol.File copy = roundTrip(file);
 
@@ -60,7 +60,7 @@ class TestIndexCacheProtocol {
     assertThat(copy.cacheKey()).isEqualTo("adapter|table#A|f1");
     assertThat(copy.kind()).isEqualTo("index");
     assertThat(copy.blobType()).isEqualTo("vector-hnsw");
-    assertThat(copy.estimatedBytes()).isEqualTo(2_560L);
+    assertThat(copy.estimatedBytes()).isEqualTo(IndexCacheMemory.residentBytes(MEMORY));
     assertThat(copy.memory()).isNotNull();
     assertThat(copy.memory().fileBytes()).isEqualTo(2_048L);
     assertThat(copy.memory().preparedBytes()).isEqualTo(2_448L);
@@ -76,7 +76,7 @@ class TestIndexCacheProtocol {
         IndexCacheProtocol.Target.builder()
             .indexUuid("table#A")
             .snapshotId(7)
-            .files(List.of(file("f1", 2_560L)))
+            .files(List.of(file("f1")))
             .definition(DEFINITION)
             .io(new HadoopFileIO(new Configuration()))
             .build();
@@ -105,7 +105,7 @@ class TestIndexCacheProtocol {
             .commandId("plan-9#2-LOAD")
             .type(IndexCacheProtocol.CommandType.LOAD)
             .mode("adapter")
-            .file(file("f1", 2_560L))
+            .file(file("f1"))
             .definition(DEFINITION)
             .io(new HadoopFileIO(new Configuration()))
             .sequence(11)
@@ -171,7 +171,7 @@ class TestIndexCacheProtocol {
             .epoch(4)
             .placements(Map.of("f1", "executor-1"))
             .rejected(Map.of("f2", "FILE_TOO_LARGE"))
-            .files(List.of(file("f1", 2_560L)))
+            .files(List.of(file("f1")))
             .build();
     assertThat(roundTrip(plan).rejected()).containsEntry("f2", "FILE_TOO_LARGE");
 
@@ -248,14 +248,14 @@ class TestIndexCacheProtocol {
         .hasMessageContaining("file");
   }
 
-  private static IndexCacheProtocol.File file(String location, long bytes) {
+  private static IndexCacheProtocol.File file(String location) {
     return IndexCacheProtocol.File.builder()
         .location(location)
         .cacheKey("adapter|table#A|" + location)
         .kind("index")
         .blobType("vector-hnsw")
         .payload(ByteBuffer.wrap("payload".getBytes(StandardCharsets.UTF_8)))
-        .estimatedBytes(bytes)
+        .estimatedBytes(IndexCacheMemory.residentBytes(MEMORY))
         .memory(MEMORY)
         .build();
   }

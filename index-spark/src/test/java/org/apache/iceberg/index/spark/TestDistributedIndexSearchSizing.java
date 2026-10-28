@@ -69,6 +69,60 @@ class TestDistributedIndexSearchSizing {
   }
 
   @Test
+  void genericPositiveEstimateIsUnknownOnUnsupportedWrapperLayout(@TempDir Path temp)
+      throws Exception {
+    Process child =
+        new ProcessBuilder(
+                System.getProperty("java.home") + "/bin/java",
+                "-XX:-UseCompressedOops",
+                "-cp",
+                System.getProperty("java.class.path"),
+                WrapperLayoutProbe.class.getName(),
+                temp.toString())
+            .redirectErrorStream(true)
+            .start();
+    try {
+      assertThat(child.waitFor(30, java.util.concurrent.TimeUnit.SECONDS)).isTrue();
+      String output =
+          new String(
+              child.getInputStream().readAllBytes(), java.nio.charset.StandardCharsets.UTF_8);
+      assertThat(child.exitValue()).as(output).isZero();
+    } finally {
+      child.destroyForcibly();
+    }
+  }
+
+  public static class WrapperLayoutProbe {
+    public static void main(String[] args) throws Exception {
+      Path location = Path.of(args[0], "unsupported.puffin");
+      SizedAdapter adapter = new SizedAdapter(70);
+      new PuffinIndexFileContainer()
+          .write(
+              Files.localOutput(location.toString()),
+              List.of(IndexBlob.of("test-sizing", new byte[10])));
+      if (adapter.encodeEntriesWithMemory(List.of()).memory().preparedBytes() <= 0) {
+        throw new AssertionError("Probe requires a generic positive P");
+      }
+      if (IndexCacheMemory.resolve(new LocalIO(), file(location.toString()), adapter) != null) {
+        throw new AssertionError("Unsupported wrapper layout was declared known");
+      }
+      if (IndexCacheMemory.compatible(
+          adapter.encodeEntriesWithMemory(List.of()).memory(), adapter)) {
+        throw new AssertionError("Unsupported wrapper layout passed managed compatibility");
+      }
+      ExecutorIndexCache.CachedFile loaded =
+          DistributedIndexSearch.loadFile(new LocalIO(), location.toString(), adapter);
+      if (loaded.hasKnownContext()) {
+        throw new AssertionError("Unsupported wrapper layout retained a known context receipt");
+      }
+      if (loaded.bytes() <= 0
+          || loaded.searching(searcher -> searcher.search(ByteBuffer.allocate(0), 1)) == null) {
+        throw new AssertionError("Legacy query fallback must stay usable");
+      }
+    }
+  }
+
+  @Test
   void cacheIdentityIncludesReaderDefinition() {
     assertThat(DistributedIndexSearch.adapterKey(new SizedAdapter(70)))
         .isNotEqualTo(DistributedIndexSearch.adapterKey(new SizedAdapter(170)));
@@ -81,8 +135,8 @@ class TestDistributedIndexSearchSizing {
         DistributedIndexSearch.workingSetBytes(new LocalIO(), List.of(file), new SizedAdapter(70));
     long second =
         DistributedIndexSearch.workingSetBytes(new LocalIO(), List.of(file), new SizedAdapter(170));
-    assertThat(first).isEqualTo(182);
-    assertThat(second).isEqualTo(282);
+    assertThat(first).isEqualTo(IndexCacheMemory.residentBytes(10, 70));
+    assertThat(second).isEqualTo(IndexCacheMemory.residentBytes(10, 170));
   }
 
   @Test
@@ -98,7 +152,7 @@ class TestDistributedIndexSearchSizing {
         .write(
             Files.localOutput(path.toString()), List.of(IndexBlob.of("test-sizing", new byte[10])));
     assertThat(DistributedIndexSearch.workingSetBytes(new LocalIO(), List.of(file), adapter))
-        .isEqualTo(182);
+        .isEqualTo(IndexCacheMemory.residentBytes(10, 70));
   }
 
   @Test

@@ -28,19 +28,40 @@ import org.apache.iceberg.relocated.com.google.common.base.Preconditions;
  */
 final class IndexCacheReadContext implements ExecutorIndexCacheWorker.Loader {
   @Override
-  public ExecutorIndexCache.CachedFile load(IndexCacheProtocol.Command command) {
-    IndexAdapter adapter =
-        IndexTypes.fromType(command.definition().type()).createAdapter(command.definition());
+  public void validate(IndexCacheProtocol.Command command) {
+    IndexAdapter adapter = adapter(command);
     Preconditions.checkArgument(
         IndexCacheMemory.compatible(command.file().memory(), adapter),
         "Index memory model, reader or runtime profile is incompatible: %s",
         command.file().location());
+  }
+
+  @Override
+  public void validate(IndexCacheProtocol.Command command, ExecutorIndexCache.CachedFile file) {
+    validate(command);
+    Preconditions.checkArgument(
+        file.hasKnownContext(), "Index prepared memory is unknown: %s", command.file().location());
+    Preconditions.checkArgument(
+        file.matchesContext(adapter(command)),
+        "Cached index memory model, reader or runtime profile is incompatible: %s",
+        command.file().location());
+  }
+
+  private static IndexAdapter adapter(IndexCacheProtocol.Command command) {
+    return IndexTypes.fromType(command.definition().type()).createAdapter(command.definition());
+  }
+
+  @Override
+  public ExecutorIndexCache.CachedFile load(IndexCacheProtocol.Command command) {
+    validate(command);
+    IndexAdapter adapter = adapter(command);
     DistributedIndexSearch.LoadedFile loaded =
         DistributedIndexSearch.loadFileState(command.io(), command.file().location(), adapter);
     Preconditions.checkArgument(
         loaded.preparedBytes() > 0,
         "Index prepared memory is unknown: %s",
         command.file().location());
+    validate(command, loaded.file());
     return loaded.file();
   }
 }

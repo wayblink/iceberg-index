@@ -18,10 +18,12 @@
  */
 package org.apache.iceberg.index.spark;
 
+import com.sun.management.HotSpotDiagnosticMXBean;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.ObjectOutputStream;
 import java.io.UncheckedIOException;
+import java.lang.management.ManagementFactory;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
@@ -40,10 +42,10 @@ import org.slf4j.LoggerFactory;
 
 /** Converts prepared-state estimates to a cache-entry charge under the current memory model. */
 final class IndexCacheMemory {
-  // Model 2 uses 16-byte object headers, 4-byte references and 8-byte alignment. The entry
-  // retains its own object (56 bytes), a ReentrantLock (24) and its empty synchronizer (32).
-  // Lock waiters exist only while queries are active and are not resident index state.
-  private static final long ENTRY_BYTES = 112;
+  // Fixed wrapper allowance: CachedFile (64), ReentrantLock (24), synchronizer (32),
+  // and an owned SHA-256 context receipt byte[32] (48). Waiters are query scratch.
+  // This wrapper bound alone does not include the cache maps and ownership associations.
+  private static final long ENTRY_BYTES = 168;
   private static final int MAX_ESTIMATES = 100_000;
   private static final Logger LOG = LoggerFactory.getLogger(IndexCacheMemory.class);
   private static final Map<ContextKey, IndexFileMemory> DESCRIPTORS = new ConcurrentHashMap<>();
@@ -66,6 +68,7 @@ final class IndexCacheMemory {
 
   /** Container and encoded payload lengths are diagnostic, not additional retained buffers. */
   static long residentBytes(IndexFileMemory memory) {
+    Preconditions.checkArgument(supportedLayout(), "Index cache wrapper layout is unsupported");
     Preconditions.checkArgument(memory != null, "Index file memory is unknown");
     Preconditions.checkArgument(
         memory.modelVersion() == 2, "Unsupported index memory model: %s", memory.modelVersion());
@@ -81,10 +84,13 @@ final class IndexCacheMemory {
 
   /** Re-estimation never pairs a current charge with the old manifest's model or profile. */
   static IndexFileMemory resolveMemory(FileIO io, IndexFile file, IndexAdapter adapter) {
+    if (!supportedLayout()) {
+      return null;
+    }
     try {
       ContextKey context = contextKey(adapter);
       IndexFileMemory descriptor = descriptor(adapter, context);
-      if (descriptor == null || descriptor.modelVersion() != 2) {
+      if (descriptor == null || descriptor.modelVersion() != 2 || descriptor.preparedBytes() <= 0) {
         return null;
       }
 
@@ -150,8 +156,49 @@ final class IndexCacheMemory {
     return memory;
   }
 
+  static IndexFileMemory currentDescriptor(IndexAdapter adapter) {
+    if (!supportedLayout()) {
+      return null;
+    }
+    try {
+      IndexFileMemory memory = descriptor(adapter, contextKey(adapter));
+      return memory != null && memory.modelVersion() == 2 && memory.preparedBytes() > 0
+          ? memory
+          : null;
+    } catch (RuntimeException e) {
+      return null;
+    }
+  }
+
+  static byte[] contextFingerprint(IndexAdapter adapter) {
+    if (currentDescriptor(adapter) == null) {
+      return null;
+    }
+    try {
+      return HexFormat.of().parseHex(readerKey(adapter));
+    } catch (RuntimeException e) {
+      return null;
+    }
+  }
+
+  static boolean supportedLayout() {
+    try {
+      HotSpotDiagnosticMXBean bean =
+          ManagementFactory.getPlatformMXBean(HotSpotDiagnosticMXBean.class);
+      return bean != null
+          && "17".equals(System.getProperty("java.specification.version"))
+          && "64".equals(System.getProperty("sun.arch.data.model"))
+          && "true".equals(bean.getVMOption("UseCompressedOops").getValue())
+          && "true".equals(bean.getVMOption("UseCompressedClassPointers").getValue())
+          && "8".equals(bean.getVMOption("ObjectAlignmentInBytes").getValue())
+          && "true".equals(bean.getVMOption("CompactStrings").getValue());
+    } catch (RuntimeException | LinkageError e) {
+      return false;
+    }
+  }
+
   static boolean compatible(IndexFileMemory memory, IndexAdapter adapter) {
-    if (memory == null || memory.modelVersion() != 2) {
+    if (!supportedLayout() || memory == null || memory.modelVersion() != 2) {
       return false;
     }
     try {
@@ -221,7 +268,7 @@ final class IndexCacheMemory {
 
   /** A missing prepared estimate retains the explicitly inexact legacy sizing fallback. */
   static long residentBytes(long inputBytes, long preparedBytes) {
-    return preparedBytes > 0
+    return preparedBytes > 0 && supportedLayout()
         ? Math.addExact(preparedBytes, ENTRY_BYTES)
         : Math.multiplyExact(inputBytes, 2);
   }

@@ -490,7 +490,7 @@ class TestIndexCacheControl {
                 IndexCacheProtocol.File.builder()
                     .location(indexFiles(built).get(0))
                     .cacheKey("key")
-                    .estimatedBytes(192L)
+                    .estimatedBytes(IndexCacheMemory.residentBytes(memory))
                     .memory(memory)
                     .build())
             .definition(built.metadata().definition())

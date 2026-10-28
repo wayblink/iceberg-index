@@ -243,7 +243,7 @@ class TestIndexCacheMemory {
         IndexFile file = published.get(0);
         ExecutorIndexCache.CachedFile loaded =
             DistributedIndexSearch.loadFile(fileIO, file.location(), adapter);
-        long expected = file.memory().preparedBytes() + 112;
+        long expected = IndexCacheMemory.residentBytes(file.memory());
         assertThat(file.memory().modelVersion()).isEqualTo(2);
         assertThat(loaded.bytes()).isEqualTo(expected);
         long planned = IndexCacheMemory.residentBytes(file.memory());

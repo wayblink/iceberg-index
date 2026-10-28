@@ -20,6 +20,7 @@ package org.apache.iceberg.index.spark;
 
 import java.io.Serializable;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Iterator;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
@@ -372,6 +373,7 @@ final class ExecutorIndexCache {
     private final String owner;
     private final IndexAdapter.PreparedSearch prepared;
     private final long bytes;
+    private final byte[] context;
     private final ReentrantLock searchLock = new ReentrantLock();
     private int uses;
     // Updated under mapLock; also observed by the search/eviction guards.
@@ -383,9 +385,32 @@ final class ExecutorIndexCache {
     private long lastAccessNanos = System.nanoTime();
 
     private CachedFile(String owner, IndexAdapter.PreparedSearch prepared, long bytes) {
+      this(owner, prepared, bytes, null);
+    }
+
+    private CachedFile(
+        String owner, IndexAdapter.PreparedSearch prepared, long bytes, byte[] context) {
       this.owner = owner;
       this.prepared = prepared;
       this.bytes = bytes;
+      this.context = context;
+    }
+
+    boolean hasKnownContext() {
+      return context != null;
+    }
+
+    boolean matchesContext(IndexAdapter adapter) {
+      byte[] current = IndexCacheMemory.contextFingerprint(adapter);
+      return context != null && current != null && Arrays.equals(context, current);
+    }
+
+    CachedFile withContext(IndexAdapter adapter) {
+      return new CachedFile(
+          owner,
+          prepared,
+          bytes,
+          prepared.estimatedBytes() > 0 ? IndexCacheMemory.contextFingerprint(adapter) : null);
     }
 
     /** Runs the body against the prepared structure, with this file's search held exclusively. */
@@ -421,7 +446,7 @@ final class ExecutorIndexCache {
     }
 
     CachedFile withOwner(String newOwner) {
-      return new CachedFile(newOwner, prepared, bytes);
+      return new CachedFile(newOwner, prepared, bytes, context);
     }
 
     private void touch() {
@@ -688,6 +713,7 @@ final class ExecutorIndexCache {
       return null;
     }
 
+    loader.validate();
     ManagedLoad load;
     synchronized (mapLock) {
       load = new ManagedLoad(indexUuid, epoch, cacheKey, generation);
@@ -705,6 +731,7 @@ final class ExecutorIndexCache {
           }
           CachedFile existing = find(cacheKey);
           if (existing != null) {
+            loader.validate(existing);
             if (!canReuse(existing, config, null)) {
               return null;
             }
@@ -718,6 +745,7 @@ final class ExecutorIndexCache {
         }
         try {
           CachedFile loaded = loader.load();
+          loader.validate(loaded);
           loads.incrementAndGet();
           CachedFile retained = put(cacheKey, loaded, config, reservation, load);
           synchronized (mapLock) {
@@ -1303,6 +1331,14 @@ final class ExecutorIndexCache {
   /** Produces the independent state prepared from an index file. */
   interface Loader {
     CachedFile load();
+
+    /**
+     * Control readers validate before both reuse and payload I/O. Policy-only loaders may opt out.
+     */
+    default void validate() {}
+
+    /** A positive policy fixture charge is not a reader/model proof. */
+    default void validate(CachedFile file) {}
   }
 
   /**
@@ -1315,10 +1351,10 @@ final class ExecutorIndexCache {
 
   static CachedFile loaded(long inputBytes, IndexAdapter.PreparedSearch prepared) {
     long preparedBytes = prepared.estimatedBytes();
-    if (preparedBytes <= 0) {
+    if (preparedBytes <= 0 || !IndexCacheMemory.supportedLayout()) {
       LOG.debug(
-          "Index cache size is estimated: prepared structure did not report its size; "
-              + "using {} input bytes as the inexact fallback",
+          "Index cache size is estimated: prepared size is unknown or the wrapper JVM layout "
+              + "is unsupported; using {} input bytes as the inexact fallback",
           inputBytes);
     }
     long bytes = IndexCacheMemory.residentBytes(inputBytes, preparedBytes);

@@ -46,7 +46,6 @@ class TestIndexCachePlugin {
   private static final String EXECUTOR = "executor-1";
   private static final String INCARNATION = "executor-1#1";
   private static final IndexDefinition DEFINITION = new VectorDefinition(2);
-  private static final long FILE_BYTES = 152L;
   private static final IndexFileMemory MEMORY =
       IndexFileMemory.builder()
           .fileBytes(80L)
@@ -57,6 +56,7 @@ class TestIndexCachePlugin {
           .runtimeProfile("reference-bytes=4")
           .structure(Map.of())
           .build();
+  private static final long FILE_BYTES = IndexCacheMemory.residentBytes(MEMORY);
 
   private final ExecutorIndexCache cache = ExecutorIndexCache.get();
   private final AtomicInteger loaderCalls = new AtomicInteger();
