@@ -28,10 +28,16 @@ import java.util.Map;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.iceberg.hadoop.HadoopFileIO;
 import org.apache.iceberg.index.IndexDefinition;
+import org.apache.iceberg.index.IndexFileMemory;
 import org.apache.iceberg.io.FileIO;
 import org.junit.jupiter.api.Test;
 
 class TestIndexPlacementPlanner {
+  // Model 2 prices an entry at its prepared state plus the fixed wrapper. Keep the old unit values
+  // as hundreds of bytes so the wrapper does not change the relative scenarios under test.
+  private static final long UNIT = 1_000L;
+  private static final long WRAPPER = 168L;
+
   private final IndexPlacementPlanner planner = new IndexPlacementPlanner();
 
   @Test
@@ -84,16 +90,18 @@ class TestIndexPlacementPlanner {
 
   @Test
   void doesNotSpendAnotherLoadReservationOrPendingRelease() {
+    System.out.println("DBG held? " + units(4));
     IndexCacheProtocol.NodeReport held =
         IndexCacheProtocol.NodeReport.builder()
             .session("session")
             .executorId("a")
             .incarnation("a-1")
-            .budgetBytes(8)
-            .usedBytes(4)
-            .reservedBytes(4)
-            .releasingBytes(4)
+            .budgetBytes(rawBudget(8))
+            .usedBytes(units(4))
+            .reservedBytes(units(4))
+            .releasingBytes(units(4))
             .build();
+    System.out.println("DBG held used=" + held.usedBytes() + " res=" + held.reservedBytes());
     assertThat(planner.plan(target(file("new", 2)), List.of(held)).rejected())
         .containsEntry("new", "INSUFFICIENT_CAPACITY");
   }
@@ -105,9 +113,9 @@ class TestIndexPlacementPlanner {
             .session("session")
             .executorId("a")
             .incarnation("a-1")
-            .budgetBytes(8)
-            .usedBytes(4)
-            .releasingBytes(4)
+            .budgetBytes(rawBudget(8))
+            .usedBytes(units(4))
+            .releasingBytes(units(4))
             .build();
     assertThat(planner.plan(target(file("new", 4)), List.of(held)).placements())
         .containsEntry("new", "a");
@@ -141,8 +149,8 @@ class TestIndexPlacementPlanner {
             .session("session")
             .executorId("a")
             .incarnation("a-1")
-            .budgetBytes(8)
-            .usedBytes(8)
+            .budgetBytes(rawBudget(8))
+            .usedBytes(units(8))
             .holders(Map.of("table|adapter|reused", 8L))
             .build();
     assertThat(planner.plan(target(file("reused", 8)), List.of(holder)).placements())
@@ -156,8 +164,8 @@ class TestIndexPlacementPlanner {
             .session("session")
             .executorId("a")
             .incarnation("a-1")
-            .budgetBytes(8)
-            .usedBytes(8)
+            .budgetBytes(rawBudget(8))
+            .usedBytes(units(8))
             .holders(Map.of("table|adapter|reused", 4L))
             .build();
     assertThat(
@@ -200,7 +208,7 @@ class TestIndexPlacementPlanner {
                     .incarnation("a-1")
                     .budgetBytes(Long.MAX_VALUE)
                     .usedBytes(Long.MAX_VALUE)
-                    .reservedBytes(1)
+                    .reservedBytes(units(1))
                     .build())
         .isInstanceOf(IllegalArgumentException.class);
   }
@@ -213,8 +221,8 @@ class TestIndexPlacementPlanner {
             .session("session")
             .executorId("a")
             .incarnation("a-1")
-            .budgetBytes(8)
-            .usedBytes(1)
+            .budgetBytes(rawBudget(8))
+            .usedBytes(units(1))
             .holders(holders)
             .build();
     holders.clear();
@@ -230,8 +238,8 @@ class TestIndexPlacementPlanner {
             .session("session")
             .executorId("a")
             .incarnation("a-1")
-            .budgetBytes(16)
-            .usedBytes(8)
+            .budgetBytes(rawBudget(16))
+            .usedBytes(units(8))
             .holders(Map.of("table|adapter|reused", 4L))
             .build();
     assertThat(
@@ -246,8 +254,8 @@ class TestIndexPlacementPlanner {
             .session("session")
             .executorId("a")
             .incarnation("a-1")
-            .budgetBytes(8)
-            .usedBytes(8)
+            .budgetBytes(rawBudget(8))
+            .usedBytes(units(8))
             .holders(Map.of("table|adapter|old", 8L))
             .build();
     assertThat(
@@ -258,11 +266,27 @@ class TestIndexPlacementPlanner {
   }
 
   private static IndexCacheProtocol.File file(String location, long bytes) {
+    long prepared = units(bytes);
+    IndexFileMemory memory =
+        IndexFileMemory.builder()
+            .payloadBytes(1)
+            .preparedBytes(prepared)
+            .modelVersion(2)
+            .readerId("test-reader")
+            .runtimeProfile(IndexCacheMemory.runtimeIdentity())
+            .structure(java.util.Map.of())
+            .build();
     return IndexCacheProtocol.File.builder()
         .location(location)
+        .owner("table")
         .cacheKey("table|adapter|" + location)
-        .estimatedBytes(bytes)
+        .memory(memory)
+        .estimatedBytes(IndexCacheMemory.residentBytes(memory))
         .build();
+  }
+
+  private static long units(long bytes) {
+    return bytes > 1_000_000L ? bytes : Math.multiplyExact(bytes, UNIT);
   }
 
   @Test
@@ -305,13 +329,17 @@ class TestIndexPlacementPlanner {
 
   private static final FileIO io = new HadoopFileIO(new Configuration());
 
+  private static long rawBudget(long budget) {
+    return budget > 1_000_000L ? budget : Math.addExact(units(budget), WRAPPER);
+  }
+
   private static IndexCacheProtocol.NodeReport node(String executor, long budget, long used) {
     return IndexCacheProtocol.NodeReport.builder()
         .session("session")
         .executorId(executor)
         .incarnation(executor + "-1")
-        .budgetBytes(budget)
-        .usedBytes(used)
+        .budgetBytes(rawBudget(budget))
+        .usedBytes(units(used))
         .build();
   }
 }

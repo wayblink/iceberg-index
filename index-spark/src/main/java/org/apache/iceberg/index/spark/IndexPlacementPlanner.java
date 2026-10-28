@@ -140,22 +140,28 @@ final class IndexPlacementPlanner {
 
     boolean known = false;
     for (WorkingNode node : nodes) {
-      if (node.shape != null && node.shape.charge().known()) {
-        known = true;
-        try {
-          ExecutorIndexCache.ChargeSnapshot empty =
-              ExecutorIndexCache.Shape.empty()
-                  .projectAdmission(node.indexUuid, Long.MAX_VALUE, List.of(file))
-                  .charge();
-          if (empty.usedBytes() <= node.report.budgetBytes()) {
-            return "INSUFFICIENT_CAPACITY";
-          }
-        } catch (RuntimeException e) {
-          return "SIZE_UNKNOWN";
+      if (node.shape == null || !node.shape.charge().known()) {
+        continue;
+      }
+      known = true;
+      try {
+        ExecutorIndexCache.ChargeSnapshot empty =
+            ExecutorIndexCache.Shape.empty()
+                .projectAdmission(node.indexUuid, Long.MAX_VALUE, List.of(file))
+                .charge();
+        if (empty.usedBytes() <= node.report.budgetBytes()) {
+          return "INSUFFICIENT_CAPACITY";
         }
+      } catch (RuntimeException e) {
+        return "SIZE_UNKNOWN";
       }
     }
-    return known ? "FILE_TOO_LARGE" : "SIZE_UNKNOWN";
+    if (!known) {
+      return file.estimatedBytes() <= nodes.get(0).report.budgetBytes()
+          ? "INSUFFICIENT_CAPACITY"
+          : "FILE_TOO_LARGE";
+    }
+    return "FILE_TOO_LARGE";
   }
 
   private static final class WorkingNode {
@@ -174,9 +180,6 @@ final class IndexPlacementPlanner {
     }
 
     private boolean fits(IndexCacheProtocol.File file) {
-      if (shape == null || !shape.charge().known()) {
-        return false;
-      }
       try {
         return after(file) <= report.budgetBytes();
       } catch (RuntimeException e) {
@@ -185,12 +188,31 @@ final class IndexPlacementPlanner {
     }
 
     private long after(IndexCacheProtocol.File file) {
+      if (holds(file)) {
+        return Math.addExact(report.usedBytes(), report.reservedBytes());
+      }
+      if (shape == null || !shape.charge().known()) {
+        return Math.addExact(
+            Math.addExact(report.usedBytes(), report.reservedBytes()), file.estimatedBytes());
+      }
+      ExecutorIndexCache.ChargeSnapshot current = shape.charge();
       ExecutorIndexCache.ChargeSnapshot projected =
           shape.projectAdmission(indexUuid, Long.MAX_VALUE, List.of(file)).charge();
-      return Math.addExact(projected.usedBytes(), projected.reservedBytes());
+      long incremental =
+          Math.subtractExact(
+              Math.addExact(projected.usedBytes(), projected.reservedBytes()),
+              Math.addExact(current.usedBytes(), current.reservedBytes()));
+      // Reservations made while planning an earlier file live in the shape; count whichever
+      // occupancy is larger so migration cannot spend room already promised to another file.
+      long baseUsed = Math.max(report.usedBytes(), current.usedBytes());
+      long baseReserved = Math.max(report.reservedBytes(), current.reservedBytes());
+      return Math.addExact(Math.addExact(baseUsed, baseReserved), incremental);
     }
 
     private void reserve(IndexCacheProtocol.File file) {
+      if (shape == null) {
+        shape = ExecutorIndexCache.Shape.empty();
+      }
       this.shape = shape.projectAdmission(indexUuid, Long.MAX_VALUE, List.of(file));
     }
   }
