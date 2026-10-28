@@ -598,15 +598,19 @@ TEMPLATE = r"""<!--
     var first = document.querySelector('details.doc');
     if (first) { first.open = true; }
   }
+  function reveal(id) {
+    var target = document.getElementById(id);
+    if (!target) { return; }
+    while (target) {
+      if (target.tagName === 'DETAILS') { target.open = true; }
+      target = target.parentElement;
+    }
+  }
   document.querySelectorAll('nav.toc a').forEach(function (link) {
-    link.addEventListener('click', function () {
-      var target = document.getElementById(link.getAttribute('href').slice(1));
-      while (target) {
-        if (target.tagName === 'DETAILS') { target.open = true; }
-        target = target.parentElement;
-      }
-    });
+    link.addEventListener('click', function () { reveal(link.getAttribute('href').slice(1)); });
   });
+  // a deep link into a collapsed section opens the sections that contain it
+  if (window.location.hash.length > 1) { reveal(decodeURIComponent(window.location.hash.slice(1))); }
   window.addEventListener('beforeprint', function () { setAll(true); });
 </script>
 </body>
