@@ -121,7 +121,8 @@ public interface IndexAdapter {
    */
   default PreparedSearch prepareAuxiliary(ByteBuffer payload) {
     ByteBuffer snapshot = snapshot(payload);
-    return (query, topK) -> searchAuxiliary(snapshot.duplicate(), query, topK);
+    return (query, topK) ->
+        searchAuxiliary(snapshot.duplicate().order(snapshot.order()), query, topK);
   }
 
   /**
@@ -134,14 +135,14 @@ public interface IndexAdapter {
    */
   default PreparedSearch prepare(ByteBuffer payload) {
     ByteBuffer snapshot = snapshot(payload);
-    return (query, topK) -> search(snapshot.duplicate(), query, topK);
+    return (query, topK) -> search(snapshot.duplicate().order(snapshot.order()), query, topK);
   }
 
   private static ByteBuffer snapshot(ByteBuffer payload) {
     Preconditions.checkArgument(payload != null, "Index payload is null");
     byte[] bytes = new byte[payload.remaining()];
     payload.duplicate().get(bytes);
-    return ByteBuffer.wrap(bytes);
+    return ByteBuffer.wrap(bytes).order(payload.order());
   }
 
   /** A loaded index payload that can be searched more than once. */

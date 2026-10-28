@@ -55,7 +55,7 @@ under the License.
 
 - [ ] 在上述测试增加两角色×heap window/slice/read-only/direct输入。使用真实TestingIndexAdapter编码条目；prepare后改原输入并清position/limit，返回的文件/行号/score必须与独立fixture一致。
 - [ ] 增加会消耗收到payload窗口的测试adapter；连续search仍收到完整窗口，caller position/limit保持不变。先运行目标测试，确认RED来自借用/窗口耗尽而非编码错误。
-- [ ] 默认prepare只复制有效窗口到独占数组，每次search传新可写duplicate view；私有helper共享两个角色实现，不增加public API。未知估计保持原行为。搜索SPI没有只读限制，不能强制read-only；用会写入相同内容的adapter验证两角色、四buffer形态仍可搜索。输入快照只隔离调用方，不额外承诺adapter自己修改状态后的结果不变。
+- [ ] 默认prepare只复制有效窗口到独占数组，捕获输入ByteOrder；每次search传新可写duplicate view并显式恢复该字节序（duplicate本身不会保留输入order）。私有helper共享两个角色实现，不增加public API。未知估计保持原行为。搜索SPI没有只读限制，不能强制read-only；用会写入相同内容的adapter验证两角色、四buffer形态仍可搜索。输入快照只隔离调用方，不额外承诺adapter自己修改状态后的结果不变。
 - [ ] 运行目标类和core索引测试全集，随后三个索引模块回归；确认GREEN，再提交具体两文件，提交含`Generated-by: pi`。
 
 ## Task 2: 各kernel可达结构与model=2
