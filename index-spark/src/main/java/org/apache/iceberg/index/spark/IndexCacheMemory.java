@@ -35,6 +35,11 @@ import org.apache.iceberg.index.IndexAdapter;
 import org.apache.iceberg.index.IndexBuildResult;
 import org.apache.iceberg.index.IndexFile;
 import org.apache.iceberg.index.IndexFileMemory;
+import org.apache.iceberg.index.spark.IndexCacheMetadata.Component;
+import org.apache.iceberg.index.spark.IndexCacheMetadata.Components;
+import org.apache.iceberg.index.spark.IndexCacheMetadata.MetadataState;
+import org.apache.iceberg.index.spark.IndexCacheMetadata.Mutation;
+import org.apache.iceberg.index.spark.IndexCacheMetadata.Texts;
 import org.apache.iceberg.io.FileIO;
 import org.apache.iceberg.relocated.com.google.common.base.Preconditions;
 import org.slf4j.Logger;
@@ -63,6 +68,58 @@ final class IndexCacheMemory {
       int model,
       String reader,
       String profile) {}
+
+  record ChargeProjection(
+      MetadataState afterState,
+      long usedBytes,
+      long residentBytes,
+      long controlBytes,
+      long reservedBytes,
+      long incrementBytes) {
+    long effectiveBytes() {
+      return Math.addExact(usedBytes, reservedBytes);
+    }
+  }
+
+  /**
+   * Projects a mutation without publishing nodes, growing the old pool, or retaining dead texts.
+   */
+  static ChargeProjection project(MetadataState before, Mutation mutation) {
+    Components previous = components(before);
+    MetadataState mutated = mutation.apply(before);
+    Texts ownedTexts = mutated.texts().copy();
+    MetadataState after = mutated.withTexts(ownedTexts);
+    Components components = new Components();
+    for (Component root : after.residentRoots()) {
+      components.root(root);
+    }
+    long resident = components.bytes();
+    for (Component root : after.controlRoots()) {
+      components.root(root);
+    }
+    ownedTexts.retain(components);
+    ownedTexts.charge(components);
+    long used = components.bytes();
+    return new ChargeProjection(
+        after,
+        used,
+        resident,
+        used - resident,
+        after.reservedBytes(),
+        Math.max(0, used - previous.bytes()));
+  }
+
+  private static Components components(MetadataState state) {
+    Components components = new Components();
+    for (Component root : state.residentRoots()) {
+      components.root(root);
+    }
+    for (Component root : state.controlRoots()) {
+      components.root(root);
+    }
+    state.texts().charge(components);
+    return components;
+  }
 
   private IndexCacheMemory() {}
 

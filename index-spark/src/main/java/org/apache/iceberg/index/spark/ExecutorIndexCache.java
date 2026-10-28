@@ -30,8 +30,10 @@ import java.util.Set;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.locks.ReentrantLock;
 import org.apache.iceberg.index.IndexAdapter;
+import org.apache.iceberg.index.spark.IndexCacheMemory.ChargeProjection;
 import org.apache.iceberg.index.spark.IndexCacheMetadata.Component;
 import org.apache.iceberg.index.spark.IndexCacheMetadata.Components;
+import org.apache.iceberg.index.spark.IndexCacheMetadata.MetadataState;
 import org.apache.iceberg.index.spark.IndexCacheMetadata.OwnedMap;
 import org.apache.iceberg.index.spark.IndexCacheMetadata.OwnedSet;
 import org.apache.iceberg.index.spark.IndexCacheMetadata.Texts;
@@ -377,6 +379,7 @@ final class ExecutorIndexCache {
     private final String owner;
     private final IndexAdapter.PreparedSearch prepared;
     private final long bytes;
+    private final long preparedBytes;
     private final byte[] context;
     private final ReentrantLock searchLock = new ReentrantLock();
     private int uses;
@@ -389,25 +392,30 @@ final class ExecutorIndexCache {
     private long lastAccessNanos = System.nanoTime();
 
     private CachedFile(String owner, IndexAdapter.PreparedSearch prepared, long bytes) {
-      this(owner, prepared, bytes, null);
+      this(owner, prepared, bytes, null, prepared.estimatedBytes());
     }
 
     private CachedFile(
-        String owner, IndexAdapter.PreparedSearch prepared, long bytes, byte[] context) {
+        String owner,
+        IndexAdapter.PreparedSearch prepared,
+        long bytes,
+        byte[] context,
+        long preparedBytes) {
       this.owner = owner;
       this.prepared = prepared;
       this.bytes = bytes;
       this.context = context;
+      this.preparedBytes = preparedBytes;
     }
 
     @Override
     public void charge(Components components) {
       if (components.object(this, 64)) {
-        components.object(searchLock, 24 + 32);
+        // ReentrantLock: one compressed synchronizer reference (16); its AQS state (32).
+        components.object(searchLock, 16 + 32);
         if (context != null) {
           components.object(context, IndexCacheMetadata.align(16L + context.length));
         }
-        long preparedBytes = prepared.estimatedBytes();
         components.object(prepared, preparedBytes > 0 ? preparedBytes : bytes);
         components.add(owner);
       }
@@ -427,7 +435,8 @@ final class ExecutorIndexCache {
           owner,
           prepared,
           bytes,
-          prepared.estimatedBytes() > 0 ? IndexCacheMemory.contextFingerprint(adapter) : null);
+          preparedBytes > 0 ? IndexCacheMemory.contextFingerprint(adapter) : null,
+          preparedBytes);
     }
 
     /** Runs the body against the prepared structure, with this file's search held exclusively. */
@@ -463,7 +472,7 @@ final class ExecutorIndexCache {
     }
 
     CachedFile withOwner(String newOwner) {
-      return new CachedFile(newOwner, prepared, bytes, context);
+      return new CachedFile(newOwner, prepared, bytes, context, preparedBytes);
     }
 
     private void touch() {
@@ -547,19 +556,20 @@ final class ExecutorIndexCache {
 
   // access order, so the first entry of the iteration is the least recently used
   private final Texts texts = new Texts();
-  private final Map<String, CachedFile> probation = new OwnedMap<>(true);
-  private final Map<String, CachedFile> protectedFiles = new OwnedMap<>(true);
+  private final OwnedMap<String, CachedFile> probation = new OwnedMap<>(true);
+  private final OwnedMap<String, CachedFile> protectedFiles = new OwnedMap<>(true);
   // how often a file has been asked for without being kept, for the PIN_HOT admission
-  private final Map<String, Integer> asked = new OwnedMap<>(true);
+  private final OwnedMap<String, Integer> asked = new OwnedMap<>(true);
   private final Object mapLock = new Object();
   private final IndexCacheOwnership ownership = new IndexCacheOwnership(texts);
-  private final Set<String> pendingReleases = new OwnedSet<>();
+  private final OwnedSet<String> pendingReleases = new OwnedSet<>();
   // Observational associations do not confer residency ownership or protection.
-  private final Map<String, Set<String>> attribution = new OwnedMap<>();
+  private OwnedMap<String, Set<String>> attribution = new OwnedMap<>();
+  private long metadataBudget = Long.MAX_VALUE;
   private long generation;
   private long chargeSequence;
   // Registered waiters keep the same monitor alive until every caller has left.
-  private final Map<String, LoadMonitor> loading = new OwnedMap<>();
+  private final OwnedMap<String, LoadMonitor> loading = new OwnedMap<>();
 
   private static final class LoadMonitor implements Component {
     private int callers;
@@ -580,8 +590,8 @@ final class ExecutorIndexCache {
 
   // room promised to loads in flight, and the budget those promises are against
   private long reservedBytes = 0;
-  private final Set<Reservation> reservations = new OwnedSet<>();
-  private final Map<String, Long> reservedByOwner = new OwnedMap<>();
+  private final OwnedSet<Reservation> reservations = new OwnedSet<>();
+  private final OwnedMap<String, Long> reservedByOwner = new OwnedMap<>();
 
   private static final class Reservation implements Component {
     private final String owner;
@@ -603,8 +613,8 @@ final class ExecutorIndexCache {
   }
 
   // what each table holds, so a share of the budget can be reserved per table
-  private final Map<String, Long> bytesByOwner = new OwnedMap<>();
-  private final Map<String, Integer> entriesByOwner = new OwnedMap<>();
+  private final OwnedMap<String, Long> bytesByOwner = new OwnedMap<>();
+  private final OwnedMap<String, Integer> entriesByOwner = new OwnedMap<>();
   private long lastSweepNanos = System.nanoTime();
   private static long sweepIntervalNanos = java.util.concurrent.TimeUnit.SECONDS.toNanos(30);
 
@@ -645,6 +655,7 @@ final class ExecutorIndexCache {
     boolean managed;
     CachedFile hit;
     synchronized (mapLock) {
+      metadataBudget = config.maxBytes();
       managed = ownership.isManagedKey(cacheKey);
       hit = managed ? null : lookup(cacheKey);
     }
@@ -697,13 +708,29 @@ final class ExecutorIndexCache {
         indexUuid != null && !indexUuid.isBlank(), "Index identity is empty");
     Preconditions.checkArgument(cacheKeys != null, "Index attribution keys are null");
     synchronized (mapLock) {
+      Texts afterTexts = texts.copy();
+      OwnedMap<String, Set<String>> afterAttribution = new OwnedMap<>(attribution);
       for (String key : cacheKeys) {
         if (probation.containsKey(key) || protectedFiles.containsKey(key)) {
-          attribution
-              .computeIfAbsent(texts.own(key), ignored -> new OwnedSet<>())
-              .add(texts.own(indexUuid));
+          Set<String> indexes = new OwnedSet<>(afterAttribution.getOrDefault(key, Set.of()));
+          indexes.add(afterTexts.own(indexUuid));
+          afterAttribution.put(afterTexts.own(key), indexes);
         }
       }
+      ChargeProjection projection =
+          IndexCacheMemory.project(
+              metadataState(texts, attribution),
+              before -> metadataState(afterTexts, afterAttribution));
+      try {
+        if (projection.incrementBytes() > 0
+            && projection.effectiveBytes() > budget(metadataBudget)) {
+          return;
+        }
+      } catch (ArithmeticException e) {
+        return;
+      }
+      attribution = afterAttribution;
+      texts.replace(projection.afterState().texts());
     }
   }
 
@@ -743,6 +770,7 @@ final class ExecutorIndexCache {
     loader.validate();
     ManagedLoad load;
     synchronized (mapLock) {
+      metadataBudget = config.maxBytes();
       load = new ManagedLoad(indexUuid, epoch, cacheKey, generation);
       if (!current(load)) {
         return null;
@@ -1315,24 +1343,30 @@ final class ExecutorIndexCache {
       int holders,
       int groupRefs) {}
 
+  private MetadataState metadataState(
+      Texts ownedTexts, OwnedMap<String, Set<String>> associations) {
+    return new MetadataState(
+        List.of(
+            probation,
+            protectedFiles,
+            pendingReleases,
+            associations,
+            bytesByOwner,
+            entriesByOwner,
+            loading,
+            reservations,
+            reservedByOwner),
+        List.of(ownership, asked),
+        ownedTexts,
+        reservedBytes);
+  }
+
   ChargeSnapshot chargeSnapshot() {
     synchronized (mapLock) {
       drainPendingReleases();
-      Components components = new Components();
-      components.root(probation);
-      components.root(protectedFiles);
-      components.root(pendingReleases);
-      components.root(attribution);
-      components.root(bytesByOwner);
-      components.root(entriesByOwner);
-      components.root(loading);
-      components.root(reservations);
-      components.root(reservedByOwner);
-      long resident = components.bytes();
-      components.add(ownership);
-      components.root(asked);
-      texts.retain(components);
-      texts.charge(components);
+      ChargeProjection projection =
+          IndexCacheMemory.project(metadataState(texts, attribution), before -> before);
+      texts.replace(projection.afterState().texts());
       Components releasing = new Components();
       for (String key : pendingReleases) {
         releasing.add(key);
@@ -1353,9 +1387,9 @@ final class ExecutorIndexCache {
       return new ChargeSnapshot(
           chargeSequence,
           known,
-          components.bytes(),
-          resident,
-          components.bytes() - resident,
+          projection.usedBytes(),
+          projection.residentBytes(),
+          projection.controlBytes(),
           reservedBytes,
           releasing.bytes(),
           holders,
@@ -1415,6 +1449,7 @@ final class ExecutorIndexCache {
         releaseIfUnowned(key);
       }
       asked.clear();
+      metadataBudget = Long.MAX_VALUE;
       chargeSnapshot();
       hits.set(0);
       misses.set(0);
@@ -1455,7 +1490,7 @@ final class ExecutorIndexCache {
           inputBytes);
     }
     long bytes = IndexCacheMemory.residentBytes(inputBytes, preparedBytes);
-    return new CachedFile("", prepared, bytes);
+    return new CachedFile("", prepared, bytes, null, preparedBytes);
   }
 
   static CachedFile loaded(byte[] payload, IndexAdapter.PreparedSearch prepared, long bytes) {

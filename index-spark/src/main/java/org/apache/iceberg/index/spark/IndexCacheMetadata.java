@@ -24,6 +24,7 @@ import java.util.AbstractSet;
 import java.util.Collection;
 import java.util.IdentityHashMap;
 import java.util.Iterator;
+import java.util.List;
 import java.util.Map;
 import java.util.NoSuchElementException;
 import java.util.Objects;
@@ -33,13 +34,38 @@ import java.util.Set;
 final class IndexCacheMetadata {
   private IndexCacheMetadata() {}
 
+  record MetadataState(
+      List<Component> residentRoots,
+      List<Component> controlRoots,
+      Texts texts,
+      long reservedBytes) {
+    MetadataState withTexts(Texts ownedTexts) {
+      return new MetadataState(residentRoots, controlRoots, ownedTexts, reservedBytes);
+    }
+  }
+
+  @FunctionalInterface
+  interface Mutation {
+    MetadataState apply(MetadataState before);
+  }
+
   interface Component {
     void charge(Components components);
   }
 
   /** A value canonicalizer. Its keys and values refer to the same owned string and backing. */
   static final class Texts {
-    private final OwnedMap<String, String> values = new OwnedMap<>();
+    private OwnedMap<String, String> values = new OwnedMap<>();
+
+    Texts copy() {
+      Texts copy = new Texts();
+      copy.values = new OwnedMap<>(values);
+      return copy;
+    }
+
+    void replace(Texts after) {
+      this.values = after.values;
+    }
 
     String own(String value) {
       String existing = values.get(value);
@@ -144,6 +170,14 @@ final class IndexCacheMetadata {
       this.accessOrder = accessOrder;
     }
 
+    OwnedMap(OwnedMap<? extends K, ? extends V> source) {
+      this(source.accessOrder);
+      if (source.table.length > 0) {
+        resize(source.table.length);
+      }
+      putAll(source);
+    }
+
     OwnedMap(Map<? extends K, ? extends V> source) {
       this();
       putAll(source);
@@ -171,6 +205,18 @@ final class IndexCacheMetadata {
       @Override
       public V getValue() {
         return value;
+      }
+
+      @Override
+      public boolean equals(Object other) {
+        return other instanceof Map.Entry<?, ?> entry
+            && Objects.equals(key, entry.getKey())
+            && Objects.equals(value, entry.getValue());
+      }
+
+      @Override
+      public int hashCode() {
+        return Objects.hashCode(key) ^ Objects.hashCode(value);
       }
 
       @Override

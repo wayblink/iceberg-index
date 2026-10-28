@@ -1032,7 +1032,9 @@ class TestExecutorIndexCacheReservations {
   @Test
   void optionalAttributionPreservesLazySharedFileBehavior() {
     String key = "table|adapter|unmanaged";
-    ExecutorIndexCache.Config config = ExecutorIndexCache.Config.of(true, 100).withOwner("table");
+    long budget = measuredAttributionBudget("table", "unmanaged", "table#A", "table#B");
+    ExecutorIndexCache.Config config =
+        ExecutorIndexCache.Config.of(true, budget).withOwner("table");
     ExecutorIndexCache.CachedFile file =
         cache.file(
             "unmanaged", config, "adapter", () -> ExecutorIndexCache.loaded(new byte[10], EMPTY));
@@ -1060,9 +1062,10 @@ class TestExecutorIndexCacheReservations {
   @Test
   void attributionDoesNotRenewAccessOrProtectIdleFile() throws Exception {
     String key = "table|adapter|unmanaged";
+    long budget = measuredAttributionBudget("table", "unmanaged", "table#A");
     ExecutorIndexCache.Config config =
         ExecutorIndexCache.Config.of(
-                true, 100, ExecutorIndexCache.Mode.PIN_ALL, TimeUnit.MINUTES.toMillis(30))
+                true, budget, ExecutorIndexCache.Mode.PIN_ALL, TimeUnit.MINUTES.toMillis(30))
             .withOwner("table");
     ExecutorIndexCache.CachedFile file =
         cache.file(
@@ -1089,19 +1092,28 @@ class TestExecutorIndexCacheReservations {
 
   @Test
   void attributionDoesNotChangeFairShareEviction() {
+    ExecutorIndexCache.Config measuring =
+        ExecutorIndexCache.Config.of(true, Long.MAX_VALUE, ExecutorIndexCache.Mode.PIN_HOT, 0);
+    askTwiceWithOwnedPrepared("a-old", measuring.withOwner("A"), 40_000);
+    askTwiceWithOwnedPrepared("b", measuring.withOwner("B"), 60_000);
+    cache.recordIndexAttribution("table#A", Set.of("A|adapter|a-old"));
+    cache.recordIndexAttribution("table#B", Set.of("A|adapter|a-old", "B|adapter|b"));
+    long budget = cache.chargeSnapshot().usedBytes();
+    cache.clear();
     ExecutorIndexCache.Config a =
-        ExecutorIndexCache.Config.of(true, 100, ExecutorIndexCache.Mode.PIN_HOT, 0).withOwner("A");
+        ExecutorIndexCache.Config.of(true, budget, ExecutorIndexCache.Mode.PIN_HOT, 0)
+            .withOwner("A");
     ExecutorIndexCache.Config b = a.withOwner("B");
-    askTwice("a-old", a, 40);
-    askTwice("b", b, 60);
+    askTwiceWithOwnedPrepared("a-old", a, 40_000);
+    askTwiceWithOwnedPrepared("b", b, 60_000);
     cache.recordIndexAttribution("table#A", Set.of("A|adapter|a-old"));
     cache.recordIndexAttribution("table#B", Set.of("A|adapter|a-old", "B|adapter|b"));
     assertThat(cache.indexAttribution().get("A|adapter|a-old"))
         .containsExactlyInAnyOrder("table#A", "table#B");
-    askTwice("a-new", a, 40);
+    askTwiceWithOwnedPrepared("a-new", a, 40_000);
     assertThat(cache.residentKeys()).containsExactlyInAnyOrder("B|adapter|b", "A|adapter|a-new");
     assertThat(cache.indexAttribution()).doesNotContainKey("A|adapter|a-old");
-    assertThat(cache.stats().bytes()).isEqualTo(100);
+    assertThat(cache.stats().bytes()).isEqualTo(100_000);
   }
 
   @Test
@@ -1109,6 +1121,52 @@ class TestExecutorIndexCacheReservations {
     cache.recordIndexAttribution("table#A", Set.of("table|adapter|missing"));
     assertThat(cache.indexAttribution()).isEmpty();
     assertThat(cache.stats().entries()).isZero();
+  }
+
+  private long measuredAttributionBudget(String owner, String location, String... indexes) {
+    cache.clear();
+    try {
+      cache.file(
+          location,
+          ExecutorIndexCache.Config.of(true, Long.MAX_VALUE).withOwner(owner),
+          "adapter",
+          () -> ExecutorIndexCache.loaded(new byte[10], EMPTY));
+      for (String index : indexes) {
+        cache.recordIndexAttribution(index, Set.of(owner + "|adapter|" + location));
+      }
+      return cache.chargeSnapshot().usedBytes();
+    } finally {
+      cache.clear();
+    }
+  }
+
+  private void askTwiceWithOwnedPrepared(
+      String location, ExecutorIndexCache.Config config, int bytes) {
+    for (int i = 0; i < 2; i++) {
+      cache.file(
+          location,
+          config,
+          "adapter",
+          () -> {
+            IndexAdapter.PreparedSearch prepared = ownedPrepared(bytes);
+            return ExecutorIndexCache.loaded(new byte[0], prepared, bytes);
+          });
+    }
+  }
+
+  private static IndexAdapter.PreparedSearch ownedPrepared(int bytes) {
+    byte[] state = new byte[bytes - 32];
+    return new IndexAdapter.PreparedSearch() {
+      @Override
+      public List<IndexSearchResult> search(ByteBuffer query, int topK) {
+        return List.of();
+      }
+
+      @Override
+      public long estimatedBytes() {
+        return 16 + ((16L + state.length + 7) / 8) * 8;
+      }
+    };
   }
 
   private static void awaitState(AtomicReference<Thread> thread, Thread.State state) {

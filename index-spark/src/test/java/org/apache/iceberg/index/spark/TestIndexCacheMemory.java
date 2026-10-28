@@ -23,15 +23,18 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 import java.io.IOException;
 import java.lang.reflect.Array;
+import java.lang.reflect.Constructor;
 import java.lang.reflect.Field;
 import java.lang.reflect.Modifier;
 import java.nio.ByteBuffer;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.IdentityHashMap;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.atomic.AtomicInteger;
 import org.apache.iceberg.TestTables.LocalFileIO;
 import org.apache.iceberg.index.IndexAdapter;
 import org.apache.iceberg.index.IndexEntry;
@@ -42,6 +45,7 @@ import org.apache.iceberg.index.IndexManifestList;
 import org.apache.iceberg.index.IndexSearchResult;
 import org.apache.iceberg.index.IndexSnapshotWriter;
 import org.apache.iceberg.index.PuffinIndexFileContainer;
+import org.apache.iceberg.index.spark.IndexCacheMetadata.OwnedMap;
 import org.apache.iceberg.index.vector.VectorIndexAdapter;
 import org.apache.iceberg.index.vector.VectorIndexDefinition;
 import org.apache.iceberg.index.vector.VectorIndexDefinition.Metric;
@@ -254,6 +258,161 @@ class TestIndexCacheMemory {
       }
     }
     return ((fields + 7) / 8) * 8 + children;
+  }
+
+  @Test
+  void optionalAttributionRejectsGrowthWithoutRetainingTextOrTable() {
+    ExecutorIndexCache cache = ExecutorIndexCache.get();
+    cache.clear();
+    try {
+      cache.file(
+          "file",
+          ExecutorIndexCache.Config.of(true, 100_000).withOwner("owner"),
+          "reader",
+          () -> ExecutorIndexCache.loaded(new byte[0], (query, topK) -> List.of(), 128));
+      cache.recordIndexAttribution("small", Set.of("owner|reader|file"));
+      long before = cache.chargeSnapshot().usedBytes();
+      cache.recordIndexAttribution("large".repeat(100_000), Set.of("owner|reader|file"));
+      assertThat(cache.indexAttribution().get("owner|reader|file")).containsExactly("small");
+      assertThat(cache.chargeSnapshot().usedBytes()).isEqualTo(before);
+    } finally {
+      cache.clear();
+    }
+  }
+
+  @Test
+  void metadataProjectionDoesNotReestimateLivePreparedState() {
+    ExecutorIndexCache cache = ExecutorIndexCache.get();
+    cache.clear();
+    AtomicInteger estimates = new AtomicInteger();
+    IndexAdapter.PreparedSearch prepared =
+        new IndexAdapter.PreparedSearch() {
+          @Override
+          public List<IndexSearchResult> search(ByteBuffer query, int topK) {
+            return List.of();
+          }
+
+          @Override
+          public long estimatedBytes() {
+            estimates.incrementAndGet();
+            return 128;
+          }
+        };
+    try {
+      cache.file(
+          "file",
+          ExecutorIndexCache.Config.of(true, 100_000).withOwner("owner"),
+          "reader",
+          () -> ExecutorIndexCache.loaded(0, prepared));
+      int published = estimates.get();
+      cache.chargeSnapshot();
+      cache.chargeSnapshot();
+      cache.recordIndexAttribution("index", Set.of("owner|reader|file"));
+      assertThat(estimates.get()).isEqualTo(published);
+    } finally {
+      cache.clear();
+    }
+  }
+
+  @Test
+  void eachExecutorOwnsItsOwnSharedOwnerCopy() throws ReflectiveOperationException {
+    Constructor<ExecutorIndexCache> constructor = ExecutorIndexCache.class.getDeclaredConstructor();
+    constructor.setAccessible(true);
+    ExecutorIndexCache first = constructor.newInstance();
+    ExecutorIndexCache second = constructor.newInstance();
+    String owner = "共享owner".repeat(1_000);
+    ExecutorIndexCache.Config config = ExecutorIndexCache.Config.of(true, 100_000).withOwner(owner);
+    try {
+      for (ExecutorIndexCache cache : List.of(first, second)) {
+        for (String location : List.of("first", "second")) {
+          cache.file(
+              location,
+              config,
+              "reader",
+              () -> ExecutorIndexCache.loaded(new byte[0], (query, topK) -> List.of(), 128));
+        }
+      }
+      Field field = ExecutorIndexCache.class.getDeclaredField("protectedFiles");
+      field.setAccessible(true);
+      Map<?, ?> firstFiles = (Map<?, ?>) field.get(first);
+      Map<?, ?> secondFiles = (Map<?, ?>) field.get(second);
+      String firstOwner = null;
+      String secondOwner = null;
+      for (Object file : firstFiles.values()) {
+        String value = ((ExecutorIndexCache.CachedFile) file).owner();
+        if (firstOwner != null) {
+          assertThat(value).isSameAs(firstOwner);
+        }
+        firstOwner = value;
+      }
+      for (Object file : secondFiles.values()) {
+        String value = ((ExecutorIndexCache.CachedFile) file).owner();
+        if (secondOwner != null) {
+          assertThat(value).isSameAs(secondOwner);
+        }
+        secondOwner = value;
+      }
+      assertThat(firstOwner).isEqualTo(secondOwner).isNotSameAs(secondOwner);
+      long ownerLower = 24 + ((16 + 2L * owner.length() + 7) / 8) * 8;
+      assertThat(first.chargeSnapshot().usedBytes() + second.chargeSnapshot().usedBytes())
+          .isGreaterThanOrEqualTo(2 * ownerLower);
+    } finally {
+      first.clear();
+      second.clear();
+    }
+  }
+
+  @Test
+  void lastLeaseReleasesResidentRootsButRetainedPolicyRemainsCharged() {
+    ExecutorIndexCache cache = ExecutorIndexCache.get();
+    cache.clear();
+    String key = "owner|reader|file";
+    try {
+      cache.applyTarget("index", 1, Set.of(key));
+      cache.installManaged(
+          "index",
+          1,
+          key,
+          ExecutorIndexCache.Config.of(true, 100_000).withOwner("owner"),
+          () -> ExecutorIndexCache.loaded(new byte[0], (query, topK) -> List.of(), 128));
+      ExecutorIndexCache.ChargeSnapshot before = cache.chargeSnapshot();
+      try (ExecutorIndexCache.Lease lease = cache.acquireManaged("index", 1, key)) {
+        assertThat(lease).isNotNull();
+        cache.releaseIndex("index", 2);
+        ExecutorIndexCache.ChargeSnapshot held = cache.chargeSnapshot();
+        assertThat(held.holders()).isEqualTo(1);
+        assertThat(held.residentBytes()).isPositive();
+        assertThat(held.usedBytes()).isEqualTo(held.residentBytes() + held.controlBytes());
+        assertThat(held.releasingBytes()).isPositive().isLessThanOrEqualTo(held.usedBytes());
+      }
+      ExecutorIndexCache.ChargeSnapshot after = cache.chargeSnapshot();
+      assertThat(after.version()).isGreaterThan(before.version());
+      assertThat(after.residentBytes()).isZero();
+      assertThat(after.controlBytes()).isPositive();
+      assertThat(after.usedBytes()).isEqualTo(after.controlBytes());
+      assertThat(after.groupRefs()).isZero();
+      assertThat(cache.stats().bytes()).isZero();
+    } finally {
+      cache.clear();
+    }
+  }
+
+  @Test
+  void metadataMapPreservesEntryValuesThroughResizeAndRemoval() {
+    OwnedMap<String, Long> owned = new OwnedMap<>();
+    Map<String, Long> reference = new LinkedHashMap<>();
+    for (int i = 0; i < 100; i++) {
+      owned.put("key" + i, (long) i);
+      reference.put("key" + i, (long) i);
+    }
+    for (int i = 0; i < 90; i++) {
+      owned.remove("key" + i);
+      reference.remove("key" + i);
+    }
+    assertThat(owned.entrySet()).containsAll(reference.entrySet());
+    assertThat(owned.hashCode()).isEqualTo(reference.hashCode());
+    owned.clear();
+    assertThat(owned.entrySet()).isEmpty();
   }
 
   @Test
