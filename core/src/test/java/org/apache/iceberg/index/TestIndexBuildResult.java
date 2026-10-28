@@ -22,6 +22,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
 import java.util.List;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
@@ -110,6 +111,44 @@ class TestIndexBuildResult {
   @EnumSource(BufferKind.class)
   void defaultPreparedAuxiliaryAllowsWritableSearchView(BufferKind kind) {
     assertWritableSearchView(kind, true);
+  }
+
+  @ParameterizedTest
+  @EnumSource(BufferKind.class)
+  void defaultPreparedEntriesKeepInputByteOrder(BufferKind kind) {
+    assertByteOrder(kind, false);
+  }
+
+  @ParameterizedTest
+  @EnumSource(BufferKind.class)
+  void defaultPreparedAuxiliaryKeepsInputByteOrder(BufferKind kind) {
+    assertByteOrder(kind, true);
+  }
+
+  private void assertByteOrder(BufferKind kind, boolean auxiliary) {
+    TestingIndexAdapter adapter =
+        new ConsumingAdapter() {
+          @Override
+          public ByteBuffer encodeEntries(List<IndexEntry> entries) {
+            ByteBuffer payload = ByteBuffer.allocate(Integer.BYTES).order(ByteOrder.LITTLE_ENDIAN);
+            payload.putInt(1);
+            payload.flip();
+            return payload;
+          }
+
+          @Override
+          public List<IndexSearchResult> search(ByteBuffer payload, ByteBuffer query, int topK) {
+            return List.of(IndexSearchResult.of("data", 7, payload.getInt()));
+          }
+        };
+    PayloadInput input = payloadInput(adapter, kind);
+    input.window().order(ByteOrder.LITTLE_ENDIAN);
+    IndexAdapter.PreparedSearch prepared =
+        auxiliary ? adapter.prepareAuxiliary(input.window()) : adapter.prepare(input.window());
+    ByteBuffer query = ByteBuffer.allocate(0);
+    assertThat(prepared.search(query, 1)).extracting(IndexSearchResult::score).containsExactly(1.0);
+    input.window().order(ByteOrder.BIG_ENDIAN);
+    assertThat(prepared.search(query, 1)).extracting(IndexSearchResult::score).containsExactly(1.0);
   }
 
   private void assertWritableSearchView(BufferKind kind, boolean auxiliary) {
