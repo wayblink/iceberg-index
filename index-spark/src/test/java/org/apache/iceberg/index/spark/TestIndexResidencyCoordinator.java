@@ -826,11 +826,16 @@ class TestIndexResidencyCoordinator {
             .build());
 
     clock.advance(60 * SECOND);
+    // the node keeps reporting; what moved is the access age the LRU reads, not whether the node is
+    // there. A node that really went quiet for this long is not a placement target any more.
+    coordinator.report(
+        withAccess(
+            holding("a", "a-1", 4, 100, 40, cacheKey("old", "o1"), 40), "old", 90 * SECOND));
     String hot =
         coordinator.acceptLoad(
             target("hot", "h1", 40), IndexResidencyPolicy.parse("0"), clock.now());
     ackFile(hot, "h1", IndexCacheProtocol.AckStatus.LOADED);
-    coordinator.report(holding("a", "a-1", 4, 100, 80, cacheKey("hot", "h1"), 40));
+    coordinator.report(holding("a", "a-1", 5, 100, 80, cacheKey("hot", "h1"), 40));
 
     String plan =
         coordinator.acceptLoad(

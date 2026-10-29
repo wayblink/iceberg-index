@@ -1649,7 +1649,15 @@ final class IndexResidencyCoordinator {
    */
   private List<IndexCacheProtocol.NodeReport> reportsFor(String planId) {
     List<IndexCacheProtocol.NodeReport> reports = new ArrayList<>();
+    long nowNanos = clock.nowNanos();
     for (NodeState node : nodes.values()) {
+      // a node nobody has heard from within the staleness bound cannot hold anything: a plan placed
+      // on it waits for an answer that will never come, and only the deadline ends that wait. It is
+      // also the node with the lowest occupancy, so without this it is the one the planner picks.
+      if (node.reportTimeNanos == 0 || nowNanos - node.reportTimeNanos > STALE_AFTER_NANOS) {
+        continue;
+      }
+
       // This plan is accounted for by the placements being planned. Other commands and every
       // ordinary-query reservation must remain unavailable.
       long others =

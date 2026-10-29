@@ -43,6 +43,10 @@ final class IndexCacheDriverControl {
   synchronized IndexCacheProtocol.Reply receive(Object message) {
     Preconditions.checkArgument(message != null, "Control message is null");
     if (message instanceof IndexCacheProtocol.NodeReport report) {
+      // a report is the only moment a node says it is still there, so this is where the ones that
+      // stopped are marked as lost: a copy on an executor that went away must stop counting as
+      // covered before the next plan is placed from it
+      coordinator.refresh(nowNanos());
       return coordinator.report(report);
     } else if (message instanceof IndexCacheProtocol.Ack ack) {
       coordinator.ack(ack);
