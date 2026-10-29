@@ -1435,8 +1435,14 @@ procedure uses it to delete exactly the files that attempt wrote before removing
 also the recovery path for index files written by executors of a job that died before the driver
 could record them: those files are unreferenced and are deleted by the same sweep.
 
-Do not run this while a build or refresh is in flight: files of in-progress writes are not yet
-referenced and would be deleted.
+A build writes its index files before it publishes the metadata that references them, so a sweep that
+ran in between would delete files a running build is about to point at. An attempt that has not
+written its completion marker is either running or dead, and the directory does not say which, so the
+sweep judges it by the last trace it left: the attempt directory, the newest ledger marker, and the
+files the ledger names. When any of those changed within the last hour the sweep leaves the whole
+index alone and reports the attempt in `in_flight_builds`; a stray attempt is collected by a later
+run. The window is measured from the last trace rather than from the attempt's creation, so a build
+that spends hours in one stage is still recognised as running.
 
 | Argument Name | Required? | Type   | Description        |
 |---------------|-----------|--------|--------------------|
@@ -1444,13 +1450,14 @@ referenced and would be deleted.
 
 #### Output
 
-| Output Name          | Type   | Description                        |
-|----------------------|--------|------------------------------------|
-| `index_uuid`         | string | UUID of the index                  |
-| `expired_snapshots`  | long   | Index snapshots dropped            |
-| `deleted_files`      | long   | Files deleted                      |
-| `deleted_bytes`      | long   | Bytes deleted                      |
-| `abandoned_attempts` | long   | Build attempts cleaned up          |
+| Output Name          | Type   | Description                                    |
+|----------------------|--------|------------------------------------------------|
+| `index_uuid`         | string | UUID of the index                              |
+| `expired_snapshots`  | long   | Index snapshots dropped                        |
+| `deleted_files`      | long   | Files deleted                                  |
+| `deleted_bytes`      | long   | Bytes deleted                                  |
+| `abandoned_attempts` | long   | Build attempts cleaned up                      |
+| `in_flight_builds`   | long   | Unfinished attempts that held the sweep back   |
 
 #### Examples
 

@@ -172,10 +172,10 @@ public class TestVectorIndexCleanup extends ExtensionsTestBase {
     writeFile(manifest);
     writeMarker(attemptDir, "ml", manifestList);
     writeFile(manifestList);
-    // an attempt that was just created cannot be told apart from one a build is writing now, so the
-    // sweep only treats it as dead once it has been sitting there
+    // an attempt that wrote something a moment ago cannot be told apart from one a build is writing
+    // now, so the sweep only treats it as dead once every trace it left has gone quiet
     FileSystem attemptFileSystem = attemptDir.getFileSystem(spark.sessionState().newHadoopConf());
-    attemptFileSystem.setTimes(attemptDir, 1_600_000_000_000L, -1L);
+    age(attemptFileSystem, attemptDir, indexFile, manifest, manifestList);
 
     List<Object[]> output =
         sql("CALL %s.system.cleanup_index_files(table => '%s')", catalogName, tableName);
@@ -222,14 +222,56 @@ public class TestVectorIndexCleanup extends ExtensionsTestBase {
     assertThat(indexFilesOnDisk(tableName)).as("nothing was swept").isEqualTo(filesBefore + 2);
     assertThat(readOrphanFile(tableName)).as("the orphan is still there").isNotNull();
 
-    // an attempt old enough to be dead no longer holds the sweep back
+    // an attempt that went quiet long ago no longer holds the sweep back
     FileSystem fileSystem = attemptDir.getFileSystem(spark.sessionState().newHadoopConf());
-    fileSystem.setTimes(attemptDir, 1_600_000_000_000L, -1L);
+    age(fileSystem, attemptDir, inFlightFile);
 
     output = sql("CALL %s.system.cleanup_index_files(table => '%s')", catalogName, tableName);
     assertThat(((Number) output.get(0)[5]).longValue()).as("in-flight builds").isZero();
     assertThat(readOrphanFile(tableName)).as("the orphan is gone").isNull();
     assertThat(fileSystem.exists(new Path(inFlightFile))).as("the dead attempt's file").isFalse();
+  }
+
+  @TestTemplate
+  public void testKeepsHoldingTheSweepBackForABuildThatHasBeenRunningForHours() throws Exception {
+    String tableName = tableName("vectors_cleanup_long_build_" + catalogName);
+    sql("CREATE TABLE %s (id bigint, embedding array<double>) USING iceberg", tableName);
+    sql("INSERT INTO %s SELECT id, array(CAST(id AS double), 0.0) FROM range(0, 10)", tableName);
+    sql(
+        "CALL %s.system.build_vector_index("
+            + "table => '%s', column => 'embedding', dimension => 2, metric => 'euclidean')",
+        catalogName, tableName);
+
+    Path indexDir = indexDirectory(tableName);
+    int filesBefore = indexFilesOnDisk(tableName);
+    writeOrphanFile(tableName);
+
+    // a distributed build writes its files from executors and records them as they finish, so the
+    // attempt directory can be hours old while the build is still going: the trace that matters is
+    // the one it left most recently, not when it started
+    Path attemptDir = new Path(indexDir, "staging/long-build");
+    String written = indexDir + "/data/index-file-1-0-long-build.puffin";
+    writeMarker(attemptDir, "f0", written);
+    writeFile(written);
+    FileSystem fileSystem = attemptDir.getFileSystem(spark.sessionState().newHadoopConf());
+    fileSystem.setTimes(attemptDir, 1_600_000_000_000L, -1L);
+    for (FileStatus marker : fileSystem.listStatus(attemptDir)) {
+      fileSystem.setTimes(marker.getPath(), 1_600_000_000_000L, -1L);
+    }
+
+    // the build is still writing: the file it recorded last is fresh
+    FileStatus justWritten = fileSystem.getFileStatus(new Path(written));
+    assertThat(justWritten.getModificationTime()).isGreaterThan(1_600_000_000_000L);
+
+    List<Object[]> output =
+        sql("CALL %s.system.cleanup_index_files(table => '%s')", catalogName, tableName);
+    assertThat(((Number) output.get(0)[5]).longValue()).as("in-flight builds").isEqualTo(1L);
+    assertThat(((Number) output.get(0)[2]).longValue()).as("deleted files").isZero();
+    assertThat(fileSystem.exists(new Path(written)))
+        .as("the file a running build just wrote")
+        .isTrue();
+    assertThat(readOrphanFile(tableName)).as("the orphan is still there").isNotNull();
+    assertThat(indexFilesOnDisk(tableName)).isEqualTo(filesBefore + 2);
   }
 
   @TestTemplate
@@ -269,6 +311,23 @@ public class TestVectorIndexCleanup extends ExtensionsTestBase {
     RemoteIterator<LocatedFileStatus> files = fileSystem.listFiles(dataDir, false);
     assertThat(files.hasNext()).isTrue();
     return files.next().getPath();
+  }
+
+  /**
+   * Moves every trace an attempt left into the past, which is what a dead attempt looks like.
+   *
+   * <p>Liveness is read from the newest of the attempt directory, its ledger markers and the files
+   * the ledger names, so ageing one of the three says nothing.
+   */
+  private void age(FileSystem fileSystem, Path attemptDir, String... files) throws Exception {
+    fileSystem.setTimes(attemptDir, 1_600_000_000_000L, -1L);
+    for (FileStatus marker : fileSystem.listStatus(attemptDir)) {
+      fileSystem.setTimes(marker.getPath(), 1_600_000_000_000L, -1L);
+    }
+
+    for (String file : files) {
+      fileSystem.setTimes(new Path(file), 1_600_000_000_000L, -1L);
+    }
   }
 
   private void writeMarker(Path attemptDir, String marker, String path) throws Exception {
