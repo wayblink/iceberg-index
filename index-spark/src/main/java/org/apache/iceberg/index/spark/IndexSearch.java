@@ -214,8 +214,12 @@ public final class IndexSearch {
       columns.add(field.name());
     }
 
+    // the read is given the table's own schema for these columns rather than the file's: a column
+    // added after a file was written is absent from that file, and telling Spark which columns were
+    // asked for is what turns the absence into a null instead of a missing field
+    StructType readSchema = IndexEntries.sparkSchema(table, columns);
     Map<String, Map<Long, Row>> rowsByFile =
-        IndexEntries.rowsAt(spark, table, snapshotId, positionsByFile, columns, null);
+        IndexEntries.rowsAt(spark, table, snapshotId, positionsByFile, columns, readSchema);
 
     Map<String, Map<Long, String>> jsonByFile = Maps.newHashMap();
     for (Map.Entry<String, Map<Long, Row>> entry : rowsByFile.entrySet()) {

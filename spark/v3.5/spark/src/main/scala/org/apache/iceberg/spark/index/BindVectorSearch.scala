@@ -30,7 +30,6 @@ import org.apache.iceberg.index.{IndexFile, IndexManifest, IndexManifestList, In
 import org.apache.iceberg.index.spark.{IndexEntries, VectorIndexes}
 import org.apache.iceberg.index.vector.{VectorIndexAdapter, VectorIndexDefinition}
 import org.apache.iceberg.spark.{Spark3Util, SparkSchemaUtil}
-import org.apache.iceberg.util.SnapshotUtil
 import org.apache.spark.sql.SparkSession
 
 private[spark] object BindVectorSearch {
@@ -83,11 +82,14 @@ private[spark] object BindVectorSearch {
       return NoApplicableVectorIndex
     }
     val definition = metadata.definition().asInstanceOf[VectorIndexDefinition]
-    val schema = SnapshotUtil.schemaFor(frozen, snapshot.snapshotId())
+    // the column is looked up in the table's schema rather than the snapshot's: a column added
+    // after a snapshot was written belongs to the table, and the rows of that snapshot simply have
+    // no value for it, which is a row without a vector rather than a query that cannot be answered
+    val schema = frozen.schema()
     val field = schema.findField(input.column)
     require(
       field != null,
-      s"Cannot find vector column ${input.column} in snapshot ${snapshot.snapshotId()}")
+      s"Cannot find vector column ${input.column} in table ${frozen.name()}")
     require(
       definition.fieldId() == field.fieldId(),
       s"Vector index ${metadata.indexUuid()} does not match column ${input.column}")

@@ -180,6 +180,9 @@ public final class IndexEntries {
     columnsToRead.add(column);
     columnsToRead.addAll(deletes.keyColumns());
     List<String> readColumns = Lists.newArrayList(columnsToRead);
+    // the read is told which columns were asked for, so a column the data file predates comes back
+    // as null rather than as a missing field the row lookup then fails on
+    StructType readSchema = sparkSchema(table, readColumns);
 
     JavaRDD<Row> rows = null;
     for (FileScanTask task : taskList) {
@@ -191,7 +194,7 @@ public final class IndexEntries {
       // the corpus statistics its scores are computed from
       boolean skipNulls = adapter.skipsNullValues();
       JavaRDD<Row> fileRows =
-          liveRowsOf(spark, tableSchema, task, readColumns, null, null, deletes, conf)
+          liveRowsOf(spark, tableSchema, task, readColumns, null, readSchema, deletes, conf)
               .filter(
                   (Function<Tuple2<Long, Row>, Boolean>)
                       entry -> !skipNulls || hasValue(entry._2(), columnIndex, skipped))
@@ -957,6 +960,28 @@ public final class IndexEntries {
       fields[i] =
           new StructField(field.name(), field.dataType(), field.nullable(), field.metadata());
     }
+    return new StructType(fields);
+  }
+
+  /**
+   * The Spark schema of the given columns as the table declares them.
+   *
+   * <p>A fetch-back reads a data file that may predate a column, so the read has to be told which
+   * columns were asked for: a column the file does not carry then comes back as null, which is what
+   * the build already treats as a row without a value, instead of failing on a field the file never
+   * wrote.
+   */
+  public static StructType sparkSchema(Table table, List<String> columns) {
+    StructField[] fields = new StructField[columns.size()];
+    for (int i = 0; i < fields.length; i++) {
+      Types.NestedField column = table.schema().findField(columns.get(i));
+      Preconditions.checkArgument(
+          column != null, "Column is not in the table schema: %s", columns.get(i));
+      fields[i] =
+          new StructField(
+              column.name(), toSparkType(column.type()), column.isOptional(), Metadata.empty());
+    }
+
     return new StructType(fields);
   }
 

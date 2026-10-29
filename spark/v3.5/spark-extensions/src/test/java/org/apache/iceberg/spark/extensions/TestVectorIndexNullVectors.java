@@ -160,6 +160,24 @@ class TestVectorIndexNullVectors {
         .collect(Collectors.toList());
   }
 
+  @Test
+  void aColumnAddedAfterTheRowsWereWrittenIsSkippedNotFailed() {
+    String table = "vector_column_added";
+    spark.sql("CREATE TABLE local.db." + table + " (id bigint) USING iceberg");
+    spark.sql("INSERT INTO local.db." + table + " VALUES (1), (2)");
+    spark.sql("ALTER TABLE local.db." + table + " ADD COLUMN embedding array<double>");
+
+    // every row predates the column, so none of them has a vector: the build leaves them out the
+    // way it leaves out a null, rather than failing on a field the data file never wrote
+    spark.sql(
+        "CALL local.system.build_vector_index(table => 'db."
+            + table
+            + "', column => 'embedding', dimension => 2, metric => 'cosine', structure => 'flat')");
+
+    assertThat(entries(table)).isZero();
+    assertThat(nearest(table, 5)).isEmpty();
+  }
+
   private static long entries(String table) {
     Row index = spark.sql("CALL local.system.list_indexes(table => 'db." + table + "')").first();
     return index.getLong(6);
