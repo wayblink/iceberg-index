@@ -138,7 +138,16 @@ case class RewriteVectorSearch(spark: SparkSession) extends Rule[LogicalPlan] {
           case BoundVectorSearch(context) =>
             val bindMillis = (System.nanoTime() - bindStart) / 1000000L
             val resolved = bindDecisions(context, k)
-            if (resolved == null) {
+            val indexMetric = context.inputs.definition.metric()
+            if (resolved != null && distance.explicitMetric && indexMetric != distance.metric) {
+              // the query named a metric the index was not built with. Answering it from this index
+              // would change the question, so the index is left alone and the scan answers it
+              logger.warn(
+                "Not using the vector index of column {} for a metric {} query because the index " +
+                  "is {}: the query is answered by a scan",
+                Array[Object](column, distance.metric.name(), indexMetric.name()): _*)
+              None
+            } else if (resolved == null) {
               None
             } else {
               val source = VectorSearchSource(resolved)(scan.output)

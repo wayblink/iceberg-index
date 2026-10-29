@@ -20,6 +20,8 @@ package org.apache.iceberg.spark.extensions
 
 import org.apache.spark.sql.SparkSessionExtensions
 import org.apache.spark.sql.catalyst.FunctionIdentifier
+import org.apache.iceberg.index.vector.VectorIndexDefinition.Metric
+import org.apache.spark.sql.AnalysisException
 import org.apache.spark.sql.catalyst.expressions.Expression
 import org.apache.spark.sql.catalyst.expressions.ExpressionInfo
 import org.apache.spark.sql.catalyst.analysis.CheckViews
@@ -40,6 +42,43 @@ class IcebergSparkSessionExtensions extends (SparkSessionExtensions => Unit) {
   private val TEXT_SCORE = "text_score"
   private val TEXT_MATCH = "match"
 
+  /**
+   * The metric the query named, or cosine when it named none.
+   *
+   * <p>A named metric is taken literally: it is never replaced by whatever an index happens to use,
+   * because that would answer a question the caller did not ask.
+   */
+  private def metricOf(args: Seq[Expression]): Metric = {
+    if (args.size < 2) {
+      throw new AnalysisException(
+        "vec_distance needs a vector and a query vector",
+        Map.empty[String, String])
+    }
+
+    if (args.size == 2) {
+      Metric.COSINE
+    } else {
+      val name = args(2) match {
+        case org.apache.spark.sql.catalyst.expressions.Literal(value: org.apache.spark.unsafe.types.UTF8String, _) =>
+          value.toString
+        case _ =>
+          throw new AnalysisException(
+            "The metric of vec_distance must be a constant: cosine, dot_product or euclidean",
+            Map.empty[String, String])
+      }
+
+      name.trim.toLowerCase(java.util.Locale.ROOT) match {
+        case "cosine" | "cos" => Metric.COSINE
+        case "dot" | "dot_product" | "inner_product" | "ip" => Metric.DOT_PRODUCT
+        case "euclidean" | "l2" => Metric.EUCLIDEAN
+        case other =>
+          throw new AnalysisException(
+            s"Unknown metric for vec_distance: $other, expected cosine, dot_product or euclidean",
+            Map.empty[String, String])
+      }
+    }
+  }
+
   override def apply(extensions: SparkSessionExtensions): Unit = {
     // the index types the engine ships with. IndexTypes is a static registry that fails fast on an
     // unknown type, so a session that has not registered them can neither build nor read an index,
@@ -59,12 +98,15 @@ class IcebergSparkSessionExtensions extends (SparkSessionExtensions => Unit) {
     extensions.injectFunction {
       (
         new FunctionIdentifier(VEC_DISTANCE),
-        new ExpressionInfo(VEC_DISTANCE, "vec_distance(vector, query): distance to a query vector"),
+        new ExpressionInfo(
+          VEC_DISTANCE,
+          "vec_distance(vector, query[, metric]): distance to a query vector"),
         (args: Seq[Expression]) =>
           org.apache.iceberg.spark.index.VectorDistanceExpression(
-            org.apache.iceberg.index.vector.VectorIndexDefinition.Metric.COSINE,
-            args(0),
-            args(1)))
+            metricOf(args),
+            args.head,
+            args(1),
+            args.size > 2))
     }
     extensions.injectOptimizerRule { spark =>
       org.apache.iceberg.spark.index.RewriteVectorSearch(spark)

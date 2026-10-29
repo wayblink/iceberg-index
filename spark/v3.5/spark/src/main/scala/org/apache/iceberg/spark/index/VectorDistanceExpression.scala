@@ -30,12 +30,20 @@ import org.apache.spark.sql.types.DoubleType
 /**
  * The distance between a vector column and a query vector, for which smaller always means closer.
  *
- * <p>The metric is not part of the function signature: the expression defaults to cosine, and the
- * rewrite rule specializes it to the metric of the index it finds, so a query follows the index it
- * uses. The math itself lives in {@link VectorDistance}, which is also what the index adapter scores
- * with, so the two can never drift apart.
+ * <p>A query that names its metric gets exactly that metric: the rewrite rule only answers it from
+ * an index that was built with the same one, and otherwise leaves the query to a scan. A query that
+ * names none follows the index it is answered from, which is the only way an unindexed scan and an
+ * indexed read can keep returning the same rows. The math itself lives in {@link VectorDistance},
+ * which is also what the index adapter scores with, so the two can never drift apart.
+ *
+ * <p>{@code explicitMetric} records which of the two the query asked for, because a metric of cosine
+ * means "cosine was asked for" in one case and "nothing was asked for" in the other.
  */
-case class VectorDistanceExpression(metric: Metric, vector: Expression, query: Expression)
+case class VectorDistanceExpression(
+    metric: Metric,
+    vector: Expression,
+    query: Expression,
+    explicitMetric: Boolean = false)
     extends Expression
     with CodegenFallback {
 
@@ -68,6 +76,6 @@ case class VectorDistanceExpression(metric: Metric, vector: Expression, query: E
 
   override protected def withNewChildrenInternal(
       newChildren: IndexedSeq[Expression]): Expression = {
-    copy(metric, newChildren(0), newChildren(1))
+    copy(metric, newChildren(0), newChildren(1), explicitMetric)
   }
 }

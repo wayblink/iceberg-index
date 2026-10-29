@@ -645,6 +645,84 @@ class TestRewriteVectorSearch {
         .collectAsList();
   }
 
+  @Test
+  public void usesAMatchingIndexWhenTheMetricIsSpelledOut() {
+    String table = tableWithIndex("docs_explicit_cosine", "hnsw");
+
+    // the same question as the two-argument form, now said out loud
+    String explicit =
+        String.format(
+            "SELECT id FROM local.%s "
+                + "ORDER BY vec_distance(embedding, array(0.9d, 0.1d), 'cosine') LIMIT 2",
+            table);
+    assertThat(planOf(table, explicit)).contains("VectorSearchSource");
+    assertThat(spark.sql(explicit).collectAsList()).containsExactlyElementsOf(search(table, 2));
+  }
+
+  @Test
+  public void refusesTheIndexWhenTheSpelledOutMetricIsAnother() {
+    // the index answers cosine; the query asks for euclidean. Re-binding the query to the index
+    // metric would answer a question nobody asked, so the index is left alone and the table is
+    // scanned with the distance the query named
+    String table = tableWithIndex("docs_explicit_euclidean", "hnsw");
+
+    String mismatched =
+        String.format(
+            "SELECT id, vec_distance(embedding, array(0.9d, 0.1d), 'euclidean') AS d "
+                + "FROM local.%s ORDER BY d LIMIT 2",
+            table);
+    assertThat(planOf(table, mismatched)).doesNotContain("VectorSearchSource");
+
+    List<Row> hits = spark.sql(mismatched).collectAsList();
+    assertThat(hits.get(0).getLong(0)).isEqualTo(1L);
+    // euclidean distance between (1.0, 0.0) and (0.9, 0.1), not a cosine similarity
+    assertThat(hits.get(0).getDouble(1)).isCloseTo(Math.sqrt(0.02d), within(1e-6d));
+
+    // the same table still answers the cosine question from the index
+    assertThat(planOf(table, nearestNeighbour(table, 2))).contains("VectorSearchSource");
+  }
+
+  @Test
+  public void computesTheSpelledOutMetricWithoutAnIndex() {
+    String table = table("docs_explicit_scan");
+
+    Row euclidean =
+        spark
+            .sql(
+                String.format(
+                    "SELECT vec_distance(embedding, array(0.9d, 0.1d), 'euclidean') FROM local.%s "
+                        + "WHERE id = 1",
+                    table))
+            .head();
+    assertThat(euclidean.getDouble(0)).isCloseTo(Math.sqrt(0.02d), within(1e-6d));
+
+    // the two-argument form keeps the cosine distance it has always computed
+    Row cosine =
+        spark
+            .sql(
+                String.format(
+                    "SELECT vec_distance(embedding, array(0.9d, 0.1d)) FROM local.%s WHERE id = 1",
+                    table))
+            .head();
+    assertThat(cosine.getDouble(0)).isCloseTo(1.0d - 0.9d / Math.sqrt(0.82d), within(1e-6d));
+  }
+
+  @Test
+  public void rejectsAMetricItDoesNotKnow() {
+    String table = table("docs_explicit_unknown");
+
+    assertThatThrownBy(
+            () ->
+                spark
+                    .sql(
+                        String.format(
+                            "SELECT vec_distance(embedding, array(0.9d, 0.1d), 'manhattan') "
+                                + "FROM local.%s",
+                            table))
+                    .collectAsList())
+        .hasMessageContaining("manhattan");
+  }
+
   /** Creates the table without an index. */
   private static String table(String name) {
     String table = "db." + name;
