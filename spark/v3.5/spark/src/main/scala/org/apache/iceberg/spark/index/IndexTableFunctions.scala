@@ -32,6 +32,26 @@ import org.apache.spark.sql.SparkSession
 import org.apache.spark.sql.SparkSessionExtensions
 import org.apache.spark.sql.catalyst.expressions.ExpressionInfo
 import org.apache.spark.sql.catalyst.plans.logical.LogicalPlan
+import org.apache.iceberg.index.spark.VectorIndexes
+import org.apache.iceberg.index.vector.VectorIndexDefinition.Metric
+import org.apache.iceberg.index.vector.VectorIndexTypes
+import org.apache.iceberg.spark.Spark3Util
+import org.apache.spark.sql.catalyst.expressions.Alias
+import org.apache.spark.sql.catalyst.expressions.Attribute
+import org.apache.spark.sql.catalyst.expressions.Ascending
+import org.apache.spark.sql.catalyst.expressions.Literal
+import org.apache.spark.sql.catalyst.expressions.NamedArgumentExpression
+import org.apache.spark.sql.catalyst.expressions.NullsFirst
+import org.apache.spark.sql.catalyst.expressions.SortOrder
+import org.apache.spark.sql.catalyst.plans.logical.GlobalLimit
+import org.apache.spark.sql.catalyst.plans.logical.Project
+import org.apache.spark.sql.catalyst.plans.logical.Sort
+import org.apache.spark.sql.execution.datasources.v2.DataSourceV2Relation
+import org.apache.iceberg.relocated.com.google.common.base.Preconditions
+import org.apache.spark.sql.connector.catalog.TableCatalog
+import org.apache.spark.sql.util.CaseInsensitiveStringMap
+import java.util.Locale
+
 
 /**
  * Registers the index table-valued functions: functions that take a table, a column and a query and
@@ -44,11 +64,22 @@ import org.apache.spark.sql.catalyst.plans.logical.LogicalPlan
  */
 object IndexTableFunctions {
 
+  private val VECTOR_SEARCH = "vector_search"
+  private val VECTOR_COLUMN = "vector_column"
+  private val DISTANCE_COLUMN = "_distance"
   private val VECTOR_INDEX_SEARCH = "vector_index_search"
   private val VECTOR_INDEX_SEARCH_BATCH = "vector_index_search_batch"
   private val TEXT_INDEX_SEARCH = "text_index_search"
 
   def register(extensions: SparkSessionExtensions): Unit = {
+    extensions.injectTableFunction(
+      (
+        new FunctionIdentifier(VECTOR_SEARCH),
+        new ExpressionInfo(
+          VECTOR_SEARCH,
+          "vector_search(table, query_vector, k, vector_column, distance_type, columns): the "
+            + "nearest rows of a table"),
+        vectorSearch))
     extensions.injectTableFunction(
       (
         new FunctionIdentifier(VECTOR_INDEX_SEARCH),
@@ -71,6 +102,182 @@ object IndexTableFunctions {
           TEXT_INDEX_SEARCH,
           "text_index_search(table, column, query, k): searches a BM25 text index"),
         textIndexSearch))
+  }
+
+
+  /**
+   * The nearest rows of a table, as the table's own columns plus the distance that chose them.
+   *
+   * <p>The relation is built as an ordinary projection over a sort over a limit, so the search is
+   * answered by the same rewrite, snapshot binding and live-row handling that an `ORDER BY` query
+   * uses. What the caller gets is a business row, not an index address: a hit that no longer
+   * resolves is not a row, and a table whose files the index does not cover is still scanned for
+   * them.
+   *
+   * <p>The metric is always named to the distance, so a query never changes meaning because of the
+   * index that happens to answer it; when no index matches the metric, the scan answers instead.
+   */
+  private def analysisError(message: String): Nothing =
+    throw new IllegalArgumentException(message)
+
+  private def vectorSearch(args: Seq[Expression]): LogicalPlan = {
+    val spark = SparkSession.active
+    VectorIndexTypes.register()
+
+    val arguments = new TableFunctionArguments("vector_search", args)
+    arguments.requireOnly(
+      required = Seq("table", "query_vector"),
+      optional = Seq(
+        "k",
+        "num_results",
+        "limit",
+        VECTOR_COLUMN,
+        "distance_type",
+        "columns"))
+
+    val tableName = arguments.string("table")
+    val query = arguments.expression("query_vector")
+    val k = arguments
+      .int("k")
+      .orElse(arguments.int("num_results"))
+      .orElse(arguments.int("limit"))
+      .getOrElse(10)
+    val column = arguments.string(VECTOR_COLUMN)
+    val metric = arguments.metric("distance_type")
+    val columns = arguments.strings("columns")
+
+    Preconditions.checkArgument(k > 0, "vector_search needs a positive number of results, got %s", k)
+
+    val catalogAndIdent = Spark3Util.catalogAndIdentifier(spark, tableName)
+    val catalog = catalogAndIdent.catalog()
+    val ident = catalogAndIdent.identifier()
+    val table = catalog.asInstanceOf[TableCatalog].loadTable(ident)
+    val relation = DataSourceV2Relation.create(
+      table,
+      Some(catalog),
+      Some(ident),
+      CaseInsensitiveStringMap.empty())
+
+    def columnOf(name: String): Attribute = {
+      relation.output
+        .find(attribute => attribute.name.equalsIgnoreCase(name))
+        .getOrElse(
+          analysisError(
+            s"Column $name does not exist in $tableName; the table has " +
+              relation.output.map(_.name).mkString(", ")))
+    }
+
+    val vector = columnOf(column)
+    val selected =
+      if (columns.isEmpty) relation.output else columns.map(columnOf)
+    if (selected.exists(attribute => attribute.name.equalsIgnoreCase(DISTANCE_COLUMN))) {
+      analysisError(
+        s"$tableName already has a column named $DISTANCE_COLUMN, so the distance cannot be added")
+    }
+
+    val distance = VectorDistanceExpression(metric, vector, query, explicitMetric = true)
+    val ordered = Sort(Seq(SortOrder(distance, Ascending, NullsFirst, Seq.empty)), global = true, relation)
+    val limited = GlobalLimit(Literal(k), ordered)
+    Project(selected :+ Alias(distance, DISTANCE_COLUMN)(), limited)
+  }
+
+  /** The named and positional arguments of a table function, refusing what it does not know. */
+  private class TableFunctionArguments(name: String, args: Seq[Expression]) {
+    private val named = scala.collection.mutable.LinkedHashMap.empty[String, Expression]
+    private val positional = scala.collection.mutable.ArrayBuffer.empty[Expression]
+
+    args.foreach { argument =>
+      argument match {
+        case NamedArgumentExpression(key, value) =>
+          if (named.contains(key.toLowerCase(Locale.ROOT))) {
+            analysisError(s"$name was given $key more than once")
+          }
+
+          named.put(key.toLowerCase(Locale.ROOT), value)
+        case other =>
+          positional += other
+      }
+    }
+
+    private val positionalNames = Seq("table", "query_vector", "k", VECTOR_COLUMN)
+    positional.zipWithIndex.foreach { case (value, index) =>
+      if (index >= positionalNames.length) {
+        analysisError(s"$name takes at most ${positionalNames.length} arguments")
+      }
+
+      named.put(positionalNames(index), value)
+    }
+
+    def requireOnly(required: Seq[String], optional: Seq[String]): Unit = {
+      val known = required ++ optional
+      named.keys.find(key => !known.contains(key)).foreach { unknown =>
+        analysisError(
+          s"$name does not have an argument $unknown; it takes ${known.mkString(", ")}")
+      }
+
+      required.find(key => !named.contains(key)).foreach { missing =>
+        analysisError(s"$name needs $missing")
+      }
+    }
+
+    def expression(key: String): Expression = named(key)
+
+    def string(key: String): String = {
+      named.get(key) match {
+        case Some(value) if value.foldable => value.eval().toString
+        case Some(_) =>
+          analysisError(s"$key of $name must be a constant")
+        case None =>
+          analysisError(s"$name needs $key")
+      }
+    }
+
+    def strings(key: String): Seq[String] = {
+      named.get(key) match {
+        case None => Seq.empty
+        case Some(value) if !value.foldable =>
+          analysisError(s"$key of $name must be a constant")
+        case Some(value) =>
+          value.eval() match {
+            case array: ArrayData =>
+              (0 until array.numElements()).map(index => array.getUTF8String(index).toString)
+            case other =>
+              analysisError(s"$key of $name must be an array of names, got $other")
+          }
+      }
+    }
+
+    def int(key: String): Option[Int] = {
+      named.get(key).map { value =>
+        if (!value.foldable) {
+          analysisError(s"$key of $name must be a constant")
+        }
+
+        value.eval() match {
+          case number: Number => number.intValue()
+          case other => analysisError(s"$key of $name must be a number, got $other")
+        }
+      }
+    }
+
+    def metric(key: String): Metric = {
+      named.get(key) match {
+        case None => Metric.COSINE
+        case Some(value) =>
+          if (!value.foldable) {
+            analysisError(s"$key of $name must be a constant")
+          }
+
+          value.eval().toString.toLowerCase(Locale.ROOT) match {
+            case "cosine" | "cos" => Metric.COSINE
+            case "dot" | "dot_product" | "inner_product" | "ip" => Metric.DOT_PRODUCT
+            case "euclidean" | "l2" => Metric.EUCLIDEAN
+            case other =>
+              analysisError(
+                s"Unknown distance_type $other: expected cosine, dot_product or euclidean")
+          }
+      }
+    }
   }
 
   private def vectorIndexSearch(args: Seq[Expression]): LogicalPlan = {
