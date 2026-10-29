@@ -275,6 +275,35 @@ class TestIndexCachePlugin {
   }
 
   @Test
+  void anAcknowledgementThatCannotBeSentDoesNotSilenceTheReport() {
+    control.receive(report(1, 1_000, 0));
+    String plan =
+        coordinator.acceptLoad(target("A", "f1"), IndexResidencyPolicy.parse("forever"), now);
+    List<Object> sent = new ArrayList<>();
+    IndexCacheRunner runner =
+        runner(
+            message -> {
+              if (message instanceof IndexCacheProtocol.Ack) {
+                throw new IllegalStateException("this acknowledgement cannot be sent");
+              }
+              return control.receive(message);
+            },
+            sent);
+
+    for (int i = 0; i < 3; i++) {
+      runner.loop.pollOnce();
+    }
+
+    // The report is what says this executor is alive and what it holds, so it must not wait behind
+    // an acknowledgement that keeps failing.
+    assertThat(sent.stream().filter(message -> message instanceof IndexCacheProtocol.NodeReport))
+        .as("every round reports, whatever the acknowledgement did")
+        .hasSize(3);
+    // The acknowledgement is kept instead of dropped, so the driver's re-send is answered.
+    assertThat(coordinator.result(plan).status()).isEqualTo(IndexCacheProtocol.Status.PENDING);
+  }
+
+  @Test
   void aBusyExecutorIsAskedAgainAndTheLimitIsEnforced() {
     control.receive(report(1, 1_000, 0));
     String plan =

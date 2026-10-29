@@ -99,7 +99,12 @@ final class IndexCacheExecutorLoop implements AutoCloseable {
       // Peek first: if the round trip fails the acknowledgement stays queued and the command stays
       // in flight, so the driver's re-send is answered instead of being skipped forever.
       while ((ack = pendingAcks.peek()) != null) {
-        channel.ask(ack);
+        if (!send(ack)) {
+          // the report is what says this executor is alive and what it holds, so it must not queue
+          // up behind an acknowledgement that keeps failing
+          break;
+        }
+
         pendingAcks.poll();
         submitted.remove(ack.commandId());
       }
@@ -145,6 +150,25 @@ final class IndexCacheExecutorLoop implements AutoCloseable {
       LOG.debug("Index cache control round trip failed; the next poll retries", e);
     } finally {
       polling.set(false);
+    }
+  }
+
+  /**
+   * Sends one acknowledgement, and says whether the queue may move past it.
+   *
+   * <p>A failure is retried: the usual cause is a driver that is briefly unreachable, and the
+   * driver answers a lost acknowledgement by re-sending the command. The message stays at the head
+   * of the queue so the retry answers that re-send instead of skipping the command forever.
+   */
+  private boolean send(IndexCacheProtocol.Ack ack) throws InterruptedException {
+    try {
+      channel.ask(ack);
+      return true;
+    } catch (InterruptedException e) {
+      throw e;
+    } catch (Exception e) {
+      LOG.debug("Index cache acknowledgement {} did not reach the driver; retrying", ack.commandId(), e);
+      return false;
     }
   }
 
