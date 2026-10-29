@@ -30,6 +30,7 @@ import org.apache.iceberg.SortDirection
 import org.apache.iceberg.expressions.Term
 import org.apache.iceberg.spark.Spark3Util
 import org.apache.spark.sql.AnalysisException
+import org.apache.spark.sql.SparkSession
 import org.apache.spark.sql.catalyst.expressions.Expression
 import org.apache.spark.sql.catalyst.expressions.Literal
 import org.apache.spark.sql.catalyst.parser.ParserInterface
@@ -76,6 +77,36 @@ class IcebergSqlExtensionsAstBuilder(delegate: ParserInterface)
     val name = toSeq(ctx.multipartIdentifier.parts).map(_.getText)
     val args = toSeq(ctx.callArgument).map(typedVisit[CallArgument])
     CallStatement(name, args)
+  }
+
+  /**
+   * Answer SHOW INDEXES FROM with the procedure that already lists them.
+   *
+   * <p>The listing takes a table name and answers from the catalog the call names, so a qualified
+   * identifier keeps its own catalog and an unqualified one follows the session default. Keeping
+   * one implementation means the two spellings cannot drift into different columns or filters.
+   */
+  override def visitShowIndexes(ctx: ShowIndexesContext): CallStatement = withOrigin(ctx) {
+    val parts = toSeq(ctx.multipartIdentifier.parts).map(part => unquote(part.getText))
+    val (catalog, table) =
+      if (parts.size >= 3) {
+        (parts.head, parts.tail.mkString("."))
+      } else {
+        (SparkSession.active.sessionState.catalogManager.currentCatalog.name(), parts.mkString("."))
+      }
+
+    CallStatement(
+      Seq(catalog, "system", "list_indexes"),
+      Seq(PositionalArgument(Literal(table))))
+  }
+
+  /** Backticks quote a name; the catalog and the table do not contain them. */
+  private def unquote(part: String): String = {
+    if (part.length >= 2 && part.startsWith("`") && part.endsWith("`")) {
+      part.substring(1, part.length - 1)
+    } else {
+      part
+    }
   }
 
   /**

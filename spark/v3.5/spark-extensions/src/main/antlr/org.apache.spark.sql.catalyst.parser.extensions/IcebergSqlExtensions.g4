@@ -67,6 +67,7 @@ singleStatement
 
 statement
     : CALL multipartIdentifier '(' (callArgument (',' callArgument)*)? ')'                  #call
+    | SHOW INDEXES FROM multipartIdentifier                                                 #showIndexes
     | ALTER TABLE multipartIdentifier ADD PARTITION FIELD transform (AS name=identifier)?   #addPartitionField
     | ALTER TABLE multipartIdentifier DROP PARTITION FIELD transform                        #dropPartitionField
     | ALTER TABLE multipartIdentifier REPLACE PARTITION FIELD transform WITH transform (AS name=identifier)? #replacePartitionField
@@ -216,7 +217,7 @@ nonReserved
     : ADD | ALTER | AS | ASC | BRANCH | BY | CALL | CREATE | DAYS | DESC | DROP | EXISTS | FIELD | FIRST | HOURS | IF | LAST | NOT | NULLS | OF | OR | ORDERED | PARTITION | TABLE | WRITE
     | DISTRIBUTED | LOCALLY | MINUTES | MONTHS | UNORDERED | REPLACE | RETAIN | VERSION | WITH | IDENTIFIER_KW | FIELDS | SET | SNAPSHOT | SNAPSHOTS
     | TAG | TRUE | FALSE
-    | MAP
+    | MAP | SHOW | INDEXES
     ;
 
 snapshotId
@@ -270,6 +271,9 @@ SNAPSHOT: 'SNAPSHOT';
 SNAPSHOTS: 'SNAPSHOTS';
 TABLE: 'TABLE';
 TAG: 'TAG';
+SHOW: 'SHOW';
+INDEXES: 'INDEXES';
+FROM: 'FROM';
 UNORDERED: 'UNORDERED';
 VERSION: 'VERSION';
 WITH: 'WITH';

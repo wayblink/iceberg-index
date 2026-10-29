@@ -138,7 +138,8 @@ class IcebergSparkSqlExtensionsParser(delegate: ParserInterface)
       .replaceAll("`", "")
       .trim()
 
-    isIcebergProcedure(normalized) || (normalized
+    isIcebergProcedure(normalized) ||
+    normalized.startsWith("show indexes") || (normalized
       .startsWith("alter table") && (normalized.contains("add partition field") ||
       normalized.contains("drop partition field") ||
       normalized.contains("replace partition field") ||
