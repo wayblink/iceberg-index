@@ -74,7 +74,12 @@ final class IndexResidencyPolicy {
     return forever;
   }
 
-  /** Returns the finite duration, or zero for indefinite protection. */
+  /**
+   * The finite duration, or zero when this policy carries none.
+   *
+   * <p>Zero does not mean indefinite: a policy that protects forever and one that protects for no
+   * time both store zero here, and {@link #forever()} is what tells them apart.
+   */
   long durationNanos() {
     return durationNanos;
   }

@@ -122,20 +122,6 @@ object IndexTableFunctions {
       .analyzed
   }
 
-  private def vectorPayload(
-      spark: SparkSession,
-      tableName: String,
-      column: String,
-      query: Array[Double]): java.nio.ByteBuffer = {
-    val table = Spark3Util.loadIcebergTable(spark, tableName)
-    val definition = org.apache.iceberg.index.spark.VectorIndexes
-      .findIndex(table, column, "vector")
-      .definition()
-      .asInstanceOf[org.apache.iceberg.index.vector.VectorIndexDefinition]
-    new org.apache.iceberg.index.vector.VectorIndexAdapter(definition)
-      .encodeQuery(query.map(_.toFloat))
-  }
-
   private def indexDefinition(
       spark: SparkSession,
       tableName: String,

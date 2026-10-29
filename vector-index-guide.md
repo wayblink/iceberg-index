@@ -232,7 +232,6 @@ CALL local.system.refresh_vector_index(table => 'db.docs', column => 'embedding'
 | `spark.iceberg.index.cache.enabled` | `false` | 总开关 |
 | `spark.iceberg.index.cache.bytes` | 不设=自动 | 每 executor 预算；显式给值就用该值，低于工作集的 0.9 会 WARN |
 | `spark.iceberg.index.cache.heap-fraction` | `0.25` | 自动预算的堆占比上限 |
-| `spark.iceberg.index.cache.max-entry-bytes` | `256m` | 单个索引文件上限，超过的不进缓存 |
 | `spark.iceberg.index.cache.mode` | `auto` | `auto`/`PIN_ALL`/`PIN_HOT`/`STREAM` |
 | `spark.iceberg.index.cache.idle-ttl` | `30m` | 空闲多久后报告视为过期 |
 | `spark.iceberg.index.schedule.locality` | `true` | 把 task 派到已持有该索引文件的 executor |

@@ -74,7 +74,8 @@ final class IndexPlacementPlanner {
       }
     }
 
-    // Reserve uncovered files before spending space on a second copy of an existing file.
+    // Every file has a home by now; this gives an existing copy a second one, so losing an executor
+    // costs a reload rather than an uncovered file.
     for (IndexCacheProtocol.File file : files) {
       WorkingNode current = chosen.get(file.location());
       if (current == null || !current.holds(file)) {
