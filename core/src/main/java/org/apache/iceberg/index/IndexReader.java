@@ -91,7 +91,7 @@ public final class IndexReader {
     IndexAdapter adapter =
         IndexTypes.fromType(metadata.indexType()).createAdapter(metadata.definition());
 
-    Readable readable = readable(adapter, readManifestList(snapshot));
+    ReadableFiles readable = readable(adapter, readManifestList(snapshot));
     checkReadable(readable, adapter);
     if (adapter.searchesAllPayloadsTogether()) {
       return searchCorrelated(adapter, readable, query);
@@ -127,7 +127,7 @@ public final class IndexReader {
    * type this one does not know; a reader that can decode none of the files is a different case and
    * {@link #checkReadable} fails.
    */
-  private Readable readable(IndexAdapter adapter, IndexManifestList manifestList) {
+  private ReadableFiles readable(IndexAdapter adapter, IndexManifestList manifestList) {
     Set<String> entryBlobTypes = adapter.readableEntryBlobTypes();
     Set<String> auxiliaryBlobTypes = adapter.readableAuxiliaryBlobTypes();
     List<IndexFile> entry = Lists.newArrayList();
@@ -147,7 +147,7 @@ public final class IndexReader {
       }
     }
 
-    return new Readable(entry, auxiliary, skippedBlobTypes);
+    return new ReadableFiles(entry, auxiliary, skippedBlobTypes);
   }
 
   /**
@@ -157,7 +157,7 @@ public final class IndexReader {
    * would be empty, the same as a search that matched nothing, so the caller could not tell a
    * broken index from an empty result. Failing says which types were expected and which were found.
    */
-  private void checkReadable(Readable readable, IndexAdapter adapter) {
+  private void checkReadable(ReadableFiles readable, IndexAdapter adapter) {
     if (readable.all().isEmpty() && !readable.skippedBlobTypes().isEmpty()) {
       throw new IllegalStateException(
           "Index "
@@ -177,12 +177,12 @@ public final class IndexReader {
         .build();
   }
 
-  private static final class Readable {
+  private static final class ReadableFiles {
     private final List<IndexFile> entry;
     private final List<IndexFile> auxiliary;
     private final Set<String> skippedBlobTypes;
 
-    private Readable(
+    private ReadableFiles(
         List<IndexFile> entry, List<IndexFile> auxiliary, Set<String> skippedBlobTypes) {
       this.entry = entry;
       this.auxiliary = auxiliary;
@@ -212,7 +212,7 @@ public final class IndexReader {
    * scoring. See {@link IndexAdapter#searchesAllPayloadsTogether()}.
    */
   private List<IndexSearchResult> searchCorrelated(
-      IndexAdapter adapter, Readable readable, IndexQuery query) {
+      IndexAdapter adapter, ReadableFiles readable, IndexQuery query) {
     Payloads payloads = readPayloads(readable);
 
     List<IndexSearchResult> results = Lists.newArrayList();
@@ -243,7 +243,7 @@ public final class IndexReader {
     IndexAdapter adapter =
         IndexTypes.fromType(metadata.indexType()).createAdapter(metadata.definition());
 
-    Readable readable = readable(adapter, readManifestList(snapshot));
+    ReadableFiles readable = readable(adapter, readManifestList(snapshot));
     checkReadable(readable, adapter);
     return readable.all();
   }
@@ -260,7 +260,7 @@ public final class IndexReader {
     IndexAdapter adapter =
         IndexTypes.fromType(metadata.indexType()).createAdapter(metadata.definition());
 
-    Readable readable = readable(adapter, readManifestList(snapshot));
+    ReadableFiles readable = readable(adapter, readManifestList(snapshot));
     checkReadable(readable, adapter);
     Payloads payloads = readPayloads(readable);
     List<ByteBuffer> statisticsPayloads =
@@ -271,7 +271,7 @@ public final class IndexReader {
   }
 
   /** The payloads of the given index files, by kind. */
-  private Payloads readPayloads(Readable readable) {
+  private Payloads readPayloads(ReadableFiles readable) {
     List<ByteBuffer> entryPayloads = Lists.newArrayListWithCapacity(readable.entry().size());
     for (IndexFile indexFile : readable.entry()) {
       IndexBlob blob = readBlob(indexFile.location(), indexFile.blobType());
