@@ -84,6 +84,9 @@ final class ExecutorIndexCache {
   }
 
   /** Settings travel to the executors with the job, so they are read once on the driver. */
+  private static final java.util.concurrent.atomic.AtomicBoolean FLOOR_WARNED =
+      new java.util.concurrent.atomic.AtomicBoolean();
+
   static final class Config implements Serializable {
     static final String ENABLED = "spark.iceberg.index.cache.enabled";
     static final String BYTES = "spark.iceberg.index.cache.bytes";
@@ -266,6 +269,18 @@ final class ExecutorIndexCache {
         }
 
         return configuredBytes;
+      }
+
+      if (perExecutor <= 0 && !FLOOR_WARNED.getAndSet(true)) {
+        // Falling back to the floor is the honest answer for an unknown working set, but it also
+        // means the cache will evict what it just loaded, which should not need a debug session to
+        // discover. Said once per JVM: the cause is a property of the table and the runtime.
+        LOG.warn(
+            "The query's index working set is unknown, so the cache budget stays at the {} byte"
+                + " floor instead of being sized for this query. Repeated queries will not be"
+                + " served from the cache. Set {} to size it explicitly.",
+            MIN_BUDGET_BYTES,
+            BYTES);
       }
 
       long wanted = perExecutor > 0 ? (long) (perExecutor * 1.2) : MIN_BUDGET_BYTES;

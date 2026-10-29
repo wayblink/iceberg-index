@@ -18,8 +18,6 @@
  */
 package org.apache.iceberg.index.vector;
 
-import com.sun.management.HotSpotDiagnosticMXBean;
-import java.lang.management.ManagementFactory;
 import java.nio.ByteBuffer;
 import java.util.Map;
 import org.apache.iceberg.index.IndexBuildResult;
@@ -71,19 +69,7 @@ final class VectorMemoryEstimates {
   }
 
   static boolean supportedLayout() {
-    try {
-      HotSpotDiagnosticMXBean bean =
-          ManagementFactory.getPlatformMXBean(HotSpotDiagnosticMXBean.class);
-      return bean != null
-          && "17".equals(System.getProperty("java.specification.version"))
-          && "64".equals(System.getProperty("sun.arch.data.model"))
-          && "true".equals(bean.getVMOption("UseCompressedOops").getValue())
-          && "true".equals(bean.getVMOption("UseCompressedClassPointers").getValue())
-          && "8".equals(bean.getVMOption("ObjectAlignmentInBytes").getValue())
-          && "true".equals(bean.getVMOption("CompactStrings").getValue());
-    } catch (RuntimeException | LinkageError e) {
-      return false;
-    }
+    return JvmLayout.supported();
   }
 
   static long knownBytes(long bytes) {

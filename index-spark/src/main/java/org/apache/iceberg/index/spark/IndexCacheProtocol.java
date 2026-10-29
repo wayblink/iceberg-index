@@ -416,12 +416,16 @@ final class IndexCacheProtocol {
       return releasingBytes;
     }
 
+    // A report that was serialized before these fields existed deserializes without running the
+    // constructor, so each map answers empty rather than null: the fields are additive, and a
+    // reader
+    // of an older message has nothing to attribute.
     Map<String, Long> holders() {
-      return holders;
+      return holders == null ? Map.of() : holders;
     }
 
     Map<String, Long> reservedByPlan() {
-      return reservedByPlan;
+      return reservedByPlan == null ? Map.of() : reservedByPlan;
     }
 
     Map<String, Long> reservedByCommand() {

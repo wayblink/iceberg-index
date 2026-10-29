@@ -24,6 +24,8 @@ import java.util.Comparator;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
 import org.apache.iceberg.Table;
 import org.apache.iceberg.index.IndexAdapter;
@@ -582,6 +584,26 @@ public final class DistributedIndexSearch {
   private static final Map<String, Long> KNOWN_PREPARED_BYTES =
       new java.util.concurrent.ConcurrentHashMap<>();
 
+  private static final Set<String> WARNED_ESTIMATE_REASONS = ConcurrentHashMap.newKeySet();
+
+  /**
+   * Reports an estimate that fell back to the container length, once per reason.
+   *
+   * <p>A derived budget is sized from these estimates, so a silent fallback is a query that looks
+   * measured and is not. It is not a query failure: the container length is a lower bound of what
+   * the prepared structure costs, so the budget stays usable.
+   */
+  private static void warnEstimateFallback(String reason, RuntimeException cause) {
+    if (WARNED_ESTIMATE_REASONS.add(reason)) {
+      LOG.warn(
+          "{}; the index cache budget falls back to the index file's container length, so a"
+              + " derived budget may under-cover this query. Raise the reporting if this table is"
+              + " meant to be served from the cache.",
+          reason,
+          cause);
+    }
+  }
+
   static ExecutorIndexCache.CachedFile loadFile(FileIO io, String location, IndexAdapter adapter) {
     byte[] content = readPayload(io, location);
     return ExecutorIndexCache.loaded(content, prepareFile(content, adapter));
@@ -616,7 +638,7 @@ public final class DistributedIndexSearch {
     } catch (RuntimeException e) {
       // a size only sizes a budget: an index file this build cannot read is reported elsewhere, and
       // failing the query here would turn an unreadable index into an unanswerable query
-      LOG.debug("Could not measure the prepared size of index file {}", location, e);
+      warnEstimateFallback("the prepared size of an index file could not be measured", e);
       return sizeOf(io, location);
     }
 
@@ -642,7 +664,7 @@ public final class DistributedIndexSearch {
     } catch (RuntimeException e) {
       // a size is only used to size a budget, so an unreadable one leaves the budget to its
       // defaults rather than failing the query
-      LOG.debug("Could not read the size of index file {}", location, e);
+      warnEstimateFallback("the length of an index file could not be read", e);
       return 0L;
     }
 

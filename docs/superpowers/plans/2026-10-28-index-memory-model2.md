@@ -32,7 +32,7 @@ under the License.
 ## Global Constraints
 
 - 独立`card/2780`，工作树`/Users/jyxc-dz-0101035/workspace/iceberg-wt/2780`，基底`ede87bcd8ff2bfc8f1d3d67d20ac97038104865d`。只add具体文件，不自动merge/push main。
-- C当前IVF的P为独立对象图S，不人为长期保留已解码的U；D才持U+M，届时必须完整记U及数组头。HNSW图/映射、FLAT entries/字节分别按实际引用计算。
+- C当前IVF的P为独立对象图S，不人为长期保留已解码的U；D才持U+M，届时必须完整记U及数组头。HNSW图/映射、FLAT entries/字节分别按实际引用计算。（现状：D已随本分支落地，IVF/FLAT 的P已包含原地保留的payload快照U与数组头，`IvfKernel.preparedBytes` 以 `PreparedStructureSize.bytes(payload.length)` 记账；C阶段的独立S描述只用于理解历史口径。）
 - 保持payload编码/manifest格式，不重建旧索引、不强制重写旧manifest。保留IndexBlob/IndexEntry公开复制合同。
 - 不新增public接口、配置或依赖，不改默认值，不重写BM25统计、图算法或调度策略。现有默认prepare方法内部实现可修改，签名不变。
 - model=2的P包含自有数组，不含已释放外部输入/query scratch。C/U长度仅诊断；固定JVM布局的结构估计不是精确retained heap实测。
