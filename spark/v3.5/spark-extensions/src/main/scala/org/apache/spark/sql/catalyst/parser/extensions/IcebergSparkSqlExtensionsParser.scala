@@ -150,6 +150,8 @@ class IcebergSparkSqlExtensionsParser(delegate: ParserInterface)
       normalized.contains("set identifier fields") ||
       normalized.contains("drop identifier fields") ||
       normalized.contains("create index") ||
+      normalized.contains("refresh index") ||
+      normalized.contains("drop index") ||
       isSnapshotRefDdl(normalized)))
   }
 

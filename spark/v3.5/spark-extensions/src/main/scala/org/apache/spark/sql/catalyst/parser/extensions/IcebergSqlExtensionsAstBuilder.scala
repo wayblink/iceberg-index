@@ -48,7 +48,9 @@ import org.apache.spark.sql.catalyst.plans.logical.DropPartitionField
 import org.apache.spark.sql.catalyst.plans.logical.DropTag
 import org.apache.spark.sql.catalyst.plans.logical.LogicalPlan
 import org.apache.spark.sql.catalyst.plans.logical.NamedArgument
+import org.apache.spark.sql.catalyst.plans.logical.DropIndexStatement
 import org.apache.spark.sql.catalyst.plans.logical.PositionalArgument
+import org.apache.spark.sql.catalyst.plans.logical.RefreshIndexStatement
 import org.apache.spark.sql.catalyst.plans.logical.ReplacePartitionField
 import org.apache.spark.sql.catalyst.plans.logical.SetIdentifierFields
 import org.apache.spark.sql.catalyst.plans.logical.SetWriteDistributionAndOrdering
@@ -142,6 +144,16 @@ class IcebergSqlExtensionsAstBuilder(delegate: ParserInterface)
         optionArgs
 
     CallStatement(Seq(catalog, "system", procedure), args)
+  }
+
+  override def visitRefreshIndex(ctx: RefreshIndexContext): RefreshIndexStatement = withOrigin(ctx) {
+    val parts = toSeq(ctx.multipartIdentifier.parts).map(part => unquote(part.getText))
+    RefreshIndexStatement(parts, unquote(ctx.indexName.getText))
+  }
+
+  override def visitDropIndex(ctx: DropIndexContext): DropIndexStatement = withOrigin(ctx) {
+    val parts = toSeq(ctx.multipartIdentifier.parts).map(part => unquote(part.getText))
+    DropIndexStatement(parts, unquote(ctx.indexName.getText))
   }
 
   /** Splits a multipart name the way the session resolves it: a catalog when one is named. */

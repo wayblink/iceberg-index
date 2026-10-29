@@ -72,6 +72,8 @@ statement
       USING indexMethod=identifier
       '(' indexedColumn=multipartIdentifier ')'
       (WITH '(' indexOptions ')')?                                                       #createIndex
+    | ALTER TABLE multipartIdentifier REFRESH INDEX indexName=identifier                   #refreshIndex
+    | ALTER TABLE multipartIdentifier DROP INDEX indexName=identifier                      #dropIndex
     | ALTER TABLE multipartIdentifier ADD PARTITION FIELD transform (AS name=identifier)?   #addPartitionField
     | ALTER TABLE multipartIdentifier DROP PARTITION FIELD transform                        #dropPartitionField
     | ALTER TABLE multipartIdentifier REPLACE PARTITION FIELD transform WITH transform (AS name=identifier)? #replacePartitionField
@@ -236,7 +238,7 @@ nonReserved
     : ADD | ALTER | AS | ASC | BRANCH | BY | CALL | CREATE | DAYS | DESC | DROP | EXISTS | FIELD | FIRST | HOURS | IF | LAST | NOT | NULLS | OF | OR | ORDERED | PARTITION | TABLE | WRITE
     | DISTRIBUTED | LOCALLY | MINUTES | MONTHS | UNORDERED | REPLACE | RETAIN | VERSION | WITH | IDENTIFIER_KW | FIELDS | SET | SNAPSHOT | SNAPSHOTS
     | TAG | TRUE | FALSE
-    | MAP | SHOW | INDEXES | INDEX | USING
+    | MAP | SHOW | INDEXES | INDEX | USING | REFRESH
     ;
 
 snapshotId
@@ -295,6 +297,7 @@ INDEXES: 'INDEXES';
 FROM: 'FROM';
 INDEX: 'INDEX';
 USING: 'USING';
+REFRESH: 'REFRESH';
 UNORDERED: 'UNORDERED';
 VERSION: 'VERSION';
 WITH: 'WITH';

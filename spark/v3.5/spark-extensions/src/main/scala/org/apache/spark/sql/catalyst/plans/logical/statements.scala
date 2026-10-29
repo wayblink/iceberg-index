@@ -25,6 +25,12 @@ import org.apache.spark.sql.catalyst.expressions.Expression
  */
 case class CallStatement(name: Seq[String], args: Seq[CallArgument]) extends LeafParsedStatement
 
+/** ALTER TABLE ... REFRESH INDEX, resolved to the refresh procedure once the table is known. */
+case class RefreshIndexStatement(table: Seq[String], name: String) extends LeafParsedStatement
+
+/** ALTER TABLE ... DROP INDEX, resolved to the drop procedure once the table is known. */
+case class DropIndexStatement(table: Seq[String], name: String) extends LeafParsedStatement
+
 /**
  * An argument in a CALL statement.
  */
