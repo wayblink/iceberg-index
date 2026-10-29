@@ -202,21 +202,27 @@ public final class SparkIndexBuilder {
       return currentMetadata;
     }
 
-    Set<String> staleFiles = Sets.union(removedFiles, Sets.union(newFiles, deleteChangedFiles));
-    // an index file can cover several data files, so a change to any of them rewrites the whole
-    // file: the rebuild set is expanded through the parent's index files, which are the record of
-    // what was grouped together. Looking at the current assignment would miss the group of a data
-    // file that was removed, because it is no longer part of the snapshot.
-    List<IndexFile> parentFiles = indexFiles(fileIO, previous);
-    Set<String> rebuildFiles = IndexGrouping.expandToGroups(parentFiles, staleFiles);
-
-    List<IndexFile> carried = Lists.newArrayList();
-    for (IndexFile indexFile : parentFiles) {
-      if (Sets.intersection(Sets.newHashSet(indexFile.coveredDataFiles()), rebuildFiles)
-          .isEmpty()) {
-        carried.add(indexFile);
-      }
+    // a refresh appends: it builds segments for the data files the parent does not cover and
+    // leaves every existing segment where it is. A data file whose entries changed, or one that a
+    // rewrite replaced, is not re-indexed here: that rewrites segments, costs as much as a rebuild,
+    // and belongs to an explicit rebuild or a merge of the index.
+    Set<String> staleFiles = Sets.union(removedFiles, deleteChangedFiles);
+    if (!staleFiles.isEmpty()) {
+      LOG.warn(
+          "Index {} of table {} does not cover {} data files whose contents changed since it was "
+              + "built. They are left as they are: a refresh appends, it does not rewrite "
+              + "segments. Rebuild the index to cover them.",
+          currentMetadata.indexUuid(),
+          table.name(),
+          staleFiles.size());
     }
+
+    if (newFiles.isEmpty()) {
+      return currentMetadata;
+    }
+
+    List<IndexFile> carried = Lists.newArrayList(indexFiles(fileIO, previous));
+    Set<String> rebuildFiles = newFiles;
 
     IndexSnapshotWriter writer = new IndexSnapshotWriter(fileIO);
     List<IndexFile> indexFiles;
