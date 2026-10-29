@@ -395,6 +395,10 @@ docker push hub.i.basemind.com/spark/sparkann-e2e:<tag>
 
 **决定 B：长期维护一条 `step-1.9-index` 分支，基线跟厂内 `step-1.9`，不跟上游。** 厂内 `step-1.9` 每次前进时在该分支上 `git rebase step-1.9`，冲突面按 §7.2 预期仍集中在那 13 个改造文件；rebase 后必须重跑 §7.5 的单测矩阵。不这么做的反例是"把索引改动做成一个 250 文件的 patch 序列发给厂内"：厂内一旦改了 `step-1.9`，patch 会静默不再 apply，而没有一个分支去承接 rebase，问题要等到下次发版才暴露。**明确不做的事**：不把这条分支 rebase 到我们主仓的 `main`（1.12 基线），那等于把新基线带回 1.9.1。
 
+**分支与已发布产物的绑定（2026-10-29 补齐）。** `step-1.9-index` 就是发布基线，**任何对外产物都必须能从它的某个提交构建出来**。这条在收口时补过一次：镜像与 10M 回归用的 jar 来自一个临时分支（比长期分支多两个提交：`version.txt=1.9.1-shb.1` 与 `#2796` 的 `check_indexes` 修复），已经把这两个提交 cherry-pick 回 `step-1.9-index`（`48b1699f2`、`6ae54c7cb`），并核对了重建 jar 与已部署 jar 的条目：23797 个条目里只有 `iceberg-build.properties`（记录 commit id）不同，其余逐字节相同。教训：**"验收用的产物"和"长期分支"一旦分叉，下次发版就会悄悄退回带缺陷的版本**。
+
+**与主仓 `main` 的关系：不合并，只单向搬。** `main` 是 1.12 fork，与 `step-1.9-index` 的共同祖先停在 `apache-iceberg-1.9.0`，中间隔了 2600 多个提交；把 `main` 合并进来等于把 1.12 的写侧能力塞进 1.9.1 产品，正是本方案要避免的。需要复用 `main` 上的修复时，用 `git cherry-pick -x` 单独搬（`#2796` 就是这么来的），并在提交信息里留来源。
+
 **决定 C：发布物命名由 `version.txt` 决定，取 `1.9.1-shb.N`。** 厂内 `step-1.9` 自己就是用 `version.txt` 定版本的（当前是 `1.9.1-STEP-rc3`），`build.gradle` 的 `getProjectVersion()` 先读 `version.txt`、读不到才从 git tag 推 MAJOR.MINOR+1-SNAPSHOT。所以回溯分支只需把 `version.txt` 改成 `1.9.1-shb.N`，产物自然是 `iceberg-spark-runtime-3.5_2.12-1.9.1-shb.N`，Scala 固定 `_2.12`。N 的规则：每个对外发布（镜像或仓库制品）递增 1，同一 N 不得重复发布；发布说明必须写三件事——基线 `1.9.1`（厂内 `step-1.9` 哪个 commit）、**不支持 variant**、**仅 Spark 3.5 / Scala 2.12**。不这么做的反例：靠 git tag 推版本会得到 `1.10.0-SNAPSHOT` 这种"看起来比厂内还新"的号，运维在集群里看到两个 Iceberg 版本时无法判断谁是我们的构建。
 
 **决定 D：厂内补丁风险从"未知"降级为"有源码"，但仍要记录制品与源码的对应关系。** 源码已在 `gitlab.basemind.com/storage/iceberg` 的 `step-1.9`，不再需要"向厂内索取补丁清单"。剩下的风险是**制品与源码的对应关系没有记录**：基础镜像里那个 `1.9.1-STEP-rc1` jar 的 manifest 没有 commit 信息，而当前源码声明的版本号是 `1.9.1-STEP-rc3`，两者不是同一个构建。所以每份发布记录必须写：源码 commit、jar 的 sha256、jar 内 `pom.properties` 里的 shaded Avro/Parquet 版本。验收以厂内 jar 的实际行为为准，不以"类集合一致"为由跳过集群验收。
