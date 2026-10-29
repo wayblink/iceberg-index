@@ -416,13 +416,25 @@ public class DeleteOrphanFilesSparkAction extends BaseSparkAction<DeleteOrphanFi
     // metadata rather than table metadata, so without this they would be reported as orphans
     String indexRoot = indexRoot();
     return actualFileIdentDS.filter(
-        (FilterFunction<FileURI>) file -> !file.getUriAsString().startsWith(indexRoot));
+        (FilterFunction<FileURI>) file -> !isUnderIndexRoot(file, indexRoot));
   }
 
-  /** The directory the sidecar index files of this table live in. */
+  /**
+   * The directory the sidecar index files of this table live in.
+   *
+   * <p>Both sides of the comparison go through {@link Path#toUri()}: a table location is stored the
+   * way it was written, which usually carries a scheme, and a directory listing hands back what the
+   * filesystem reports, which often does not. Comparing the two as plain strings finds nothing when
+   * they are spelled differently, and every file it fails to exclude is then deleted.
+   */
   private String indexRoot() {
-    String tableLocation = table.location().replaceAll("/+$", "");
-    return tableLocation + "/" + SidecarIndexCatalog.INDEXES_DIR + "/";
+    URI location = new Path(table.location()).toUri();
+    String path = location.getPath() == null ? "" : location.getPath();
+    return path.replaceAll("/+$", "") + "/" + SidecarIndexCatalog.INDEXES_DIR + "/";
+  }
+
+  private static boolean isUnderIndexRoot(FileURI file, String indexRoot) {
+    return file.getPath() != null && file.getPath().startsWith(indexRoot);
   }
 
   private Dataset<String> listedFileDS() {
