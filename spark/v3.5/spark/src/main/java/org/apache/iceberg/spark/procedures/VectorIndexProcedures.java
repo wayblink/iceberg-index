@@ -20,6 +20,7 @@ package org.apache.iceberg.spark.procedures;
 
 import org.apache.iceberg.Table;
 import org.apache.iceberg.index.IndexMetadata;
+import org.apache.iceberg.index.IndexSnapshot;
 import org.apache.iceberg.index.SidecarIndexCatalog;
 import org.apache.iceberg.index.spark.VectorIndexes;
 import org.apache.spark.sql.connector.iceberg.catalog.ProcedureParameter;
@@ -48,6 +49,33 @@ final class VectorIndexProcedures {
   /** Returns the sidecar index catalog for the given table. */
   static SidecarIndexCatalog indexCatalog(Table table) {
     return VectorIndexes.indexCatalog(table);
+  }
+
+  /**
+   * Publishes a built snapshot on top of the index metadata as it stands.
+   *
+   * <p>The snapshot is appended to whatever the catalog holds when the publication lands, not to
+   * the metadata this build started from: two publishers that read the same index (a scheduled
+   * refresh and a rebuild, or two refreshes) would otherwise each write a document containing only
+   * their own snapshot, and the one that landed first would be lost without anyone noticing.
+   *
+   * <p>The append is skipped when the metadata already names the snapshot, because a publication
+   * that lost a race is retried against the newer document.
+   */
+  static void publishSnapshot(
+      SidecarIndexCatalog catalog, Table table, String indexUuid, IndexSnapshot snapshot) {
+    catalog.updateIndex(
+        table.location(),
+        indexUuid,
+        current -> {
+          for (IndexSnapshot existing : current.snapshots()) {
+            if (existing.snapshotId() == snapshot.snapshotId()) {
+              return current;
+            }
+          }
+
+          return current.withSnapshot(snapshot);
+        });
   }
 
   /** Resolves the field ID of the vector column, failing if the column does not exist. */

@@ -186,7 +186,14 @@ class CleanupIndexFilesProcedure extends BaseProcedure {
     int abandonedAttempts = cleanupStaging(table, metadata, nowMillis);
 
     if (expiredSnapshots > 0) {
-      catalog.updateIndex(withoutSnapshots(metadata, retained));
+      // the rule is re-applied to the metadata as it stands when the publication lands: a refresh
+      // that published while this sweep was running has a snapshot that may still be live, and
+      // dropping it because the copy read at the start did not name it would delete an index the
+      // table is using
+      catalog.updateIndex(
+          table.location(),
+          metadata.indexUuid(),
+          current -> withoutSnapshots(current, liveSnapshots(current, liveTableSnapshotIds)));
     }
 
     return newInternalRow(
@@ -196,6 +203,19 @@ class CleanupIndexFilesProcedure extends BaseProcedure {
         deletedBytes,
         (long) abandonedAttempts,
         (long) inFlight);
+  }
+
+  /** The suffix of index snapshots whose source table snapshot still exists. */
+  private static List<IndexSnapshot> liveSnapshots(
+      IndexMetadata metadata, Set<Long> liveTableSnapshotIds) {
+    List<IndexSnapshot> snapshots = metadata.snapshots();
+    int retainedFrom = 0;
+    while (retainedFrom < snapshots.size()
+        && !liveTableSnapshotIds.contains(snapshots.get(retainedFrom).sourceTableSnapshotId())) {
+      retainedFrom++;
+    }
+
+    return snapshots.subList(retainedFrom, snapshots.size());
   }
 
   private static Set<Long> liveTableSnapshotIds(Table table) {

@@ -117,7 +117,8 @@ class RefreshVectorIndexProcedure extends BaseProcedure {
             return new InternalRow[] {row};
           }
 
-          catalog.updateIndex(updated);
+          VectorIndexProcedures.publishSnapshot(
+              catalog, table, metadata.indexUuid(), updated.latestSnapshot());
           long[] counts = VectorIndexProcedures.counts(table.io(), updated.latestSnapshot());
           InternalRow row =
               newInternalRow(

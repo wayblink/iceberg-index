@@ -22,14 +22,27 @@ import static java.nio.charset.StandardCharsets.UTF_8;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
+import com.google.common.collect.Lists;
 import java.io.File;
 import java.io.IOException;
+import java.io.UncheckedIOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.List;
+import java.util.concurrent.CyclicBarrier;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import org.apache.iceberg.TestTables.LocalFileIO;
+import org.apache.iceberg.exceptions.CommitFailedException;
 import org.apache.iceberg.index.IndexFile.Kind;
 import org.apache.iceberg.index.IndexManifestList.ManifestRef;
+import org.apache.iceberg.io.FileIO;
+import org.apache.iceberg.io.InputFile;
+import org.apache.iceberg.io.OutputFile;
+import org.apache.iceberg.io.PositionOutputStream;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
@@ -85,6 +98,125 @@ class TestSidecarIndexCatalog {
     assertThat(fileIO.newInputFile(claimed).getLength())
         .as("the metadata file another writer claimed is left alone")
         .isZero();
+  }
+
+  @Test
+  public void failsWhenAnotherPublisherSupersedesThePointerItself(@TempDir Path tempDir)
+      throws IOException {
+    // the pointer is a small file overwritten in place, so a publisher that writes the other slot
+    // can move the index past a publication that has just landed. Reading the pointer back across
+    // both slots turns that into a failure instead of a publication nobody will follow
+    LocalFileIO delegate = new LocalFileIO();
+    AtomicBoolean armed = new AtomicBoolean();
+    AtomicBoolean superseded = new AtomicBoolean();
+    FileIO racing =
+        new FileIO() {
+          @Override
+          public InputFile newInputFile(String path) {
+            return delegate.newInputFile(path);
+          }
+
+          @Override
+          public OutputFile newOutputFile(String path) {
+            if (armed.get()
+                && path.contains("index-metadata-pointer-")
+                && superseded.compareAndSet(false, true)) {
+              writePointerOfAnotherPublisher(delegate, path);
+            }
+
+            return delegate.newOutputFile(path);
+          }
+
+          @Override
+          public void deleteFile(String path) {
+            delegate.deleteFile(path);
+          }
+        };
+
+    IndexCatalog catalog = new SidecarIndexCatalog(racing);
+    String tableLocation = tempDir.resolve("table").toString();
+    IndexMetadata created = catalog.createIndex(request(tableLocation, "index-uuid"));
+    IndexMetadata updated = withSnapshot(created, writeSnapshot(delegate, created));
+    armed.set(true);
+
+    assertThatThrownBy(() -> catalog.updateIndex(updated))
+        .isInstanceOf(CommitFailedException.class)
+        .hasMessageContaining("pointer");
+  }
+
+  @Test
+  public void appliesAChangeAgainWhenAnotherPublisherGotThereFirst(@TempDir Path tempDir)
+      throws IOException {
+    // the change lands a competing publication on its first invocation, which makes the caller's
+    // base stale in exactly the way a concurrent publisher does; the change has to be re-applied to
+    // the newer document rather than published above a snapshot it never saw
+    LocalFileIO fileIO = new LocalFileIO();
+    IndexCatalog catalog = new SidecarIndexCatalog(fileIO);
+    String tableLocation = tempDir.resolve("table").toString();
+    IndexMetadata created = catalog.createIndex(request(tableLocation, "index-uuid"));
+    IndexMetadata first = withSnapshot(created, writeSnapshot(fileIO, created, 1), 1, 10);
+    IndexMetadata second = withSnapshot(first, writeSnapshot(fileIO, first, 2), 2, 11);
+    AtomicBoolean landed = new AtomicBoolean();
+
+    IndexMetadata published =
+        catalog.updateIndex(
+            tableLocation,
+            "index-uuid",
+            current -> {
+              if (landed.compareAndSet(false, true)) {
+                // another publisher appends its own snapshot between this one's read and its
+                // publish
+                catalog.updateIndex(
+                    tableLocation, "index-uuid", seen -> append(seen, first.latestSnapshot()));
+              }
+
+              return append(current, second.latestSnapshot());
+            });
+
+    assertThat(published.snapshots())
+        .extracting(IndexSnapshot::sourceTableSnapshotId)
+        .as("the change was applied to the document the competing publisher left behind")
+        .containsExactly(10L, 11L);
+    assertThat(catalog.loadIndex(tableLocation, "index-uuid").snapshots())
+        .extracting(IndexSnapshot::sourceTableSnapshotId)
+        .containsExactly(10L, 11L);
+  }
+
+  @Test
+  public void twoConcurrentPublishersKeepBothSnapshots(@TempDir Path tempDir) throws Exception {
+    LocalFileIO fileIO = new LocalFileIO();
+    IndexCatalog catalog = new SidecarIndexCatalog(fileIO);
+    String tableLocation = tempDir.resolve("table").toString();
+    IndexMetadata created = catalog.createIndex(request(tableLocation, "index-uuid"));
+    IndexMetadata first = withSnapshot(created, writeSnapshot(fileIO, created, 1), 1, 10);
+    IndexMetadata second = withSnapshot(first, writeSnapshot(fileIO, first, 2), 2, 11);
+    IndexSnapshot[] snapshots = {first.latestSnapshot(), second.latestSnapshot()};
+
+    CyclicBarrier start = new CyclicBarrier(2);
+    ExecutorService pool = Executors.newFixedThreadPool(2);
+    try {
+      List<Future<IndexMetadata>> published = Lists.newArrayList();
+      for (IndexSnapshot snapshot : snapshots) {
+        published.add(
+            pool.submit(
+                () -> {
+                  start.await();
+                  return catalog.updateIndex(
+                      tableLocation, "index-uuid", current -> append(current, snapshot));
+                }));
+      }
+
+      for (Future<IndexMetadata> future : published) {
+        future.get(2, TimeUnit.MINUTES);
+      }
+    } finally {
+      pool.shutdownNow();
+    }
+
+    assertThat(catalog.loadIndex(tableLocation, "index-uuid").snapshots())
+        .extracting(IndexSnapshot::sourceTableSnapshotId)
+        .as("neither publisher's snapshot is lost to the other")
+        .containsExactlyInAnyOrder(10L, 11L);
   }
 
   @Test
@@ -293,7 +425,50 @@ class TestSidecarIndexCatalog {
     return manifestList;
   }
 
+  /**
+   * Writes a pointer that names a later generation, the way a publisher that just finished would.
+   *
+   * <p>The slot is the other one, so the publication under test lands in its own slot and is only
+   * visible as superseded when the two slots are compared. The generation is far above anything a
+   * handful of publications reaches, which is what makes it "later" without knowing the value the
+   * publication under test picked.
+   */
+  private static void writePointerOfAnotherPublisher(LocalFileIO fileIO, String pointerPath) {
+    int slot = pointerPath.endsWith("pointer-0.json") ? 1 : 0;
+    String other = pointerPath.replaceAll("pointer-\\d\\.json$", "pointer-" + slot + ".json");
+    // the slot was written by an earlier publication, so this one replaces it the way a publisher
+    // that is switching slots would
+    try (PositionOutputStream out = fileIO.newOutputFile(other).createOrOverwrite()) {
+      out.write(
+          "{\"generation\":999999,\"metadata-file\":\"claimed-by-another-publisher\"}"
+              .getBytes(UTF_8));
+    } catch (IOException e) {
+      throw new UncheckedIOException(e);
+    }
+  }
+
   private static IndexMetadata withSnapshot(IndexMetadata metadata, String manifestList) {
+    return withSnapshot(metadata, manifestList, 1, 10);
+  }
+
+  /**
+   * Appends a snapshot unless it is already there.
+   *
+   * <p>A change given to {@code updateIndex(table, uuid, change)} may be applied more than once, so
+   * it has to be safe on a document that already carries its result.
+   */
+  private static IndexMetadata append(IndexMetadata metadata, IndexSnapshot snapshot) {
+    for (IndexSnapshot existing : metadata.snapshots()) {
+      if (existing.snapshotId() == snapshot.snapshotId()) {
+        return metadata;
+      }
+    }
+
+    return metadata.withSnapshot(snapshot);
+  }
+
+  private static IndexMetadata withSnapshot(
+      IndexMetadata metadata, String manifestList, long snapshotId, long sourceTableSnapshotId) {
     return IndexMetadata.builder()
         .indexUuid(metadata.indexUuid())
         .tableUuid(metadata.tableUuid())
@@ -303,8 +478,8 @@ class TestSidecarIndexCatalog {
         .properties(metadata.properties())
         .addSnapshot(
             IndexSnapshot.builder()
-                .snapshotId(1)
-                .sourceTableSnapshotId(10)
+                .snapshotId(snapshotId)
+                .sourceTableSnapshotId(sourceTableSnapshotId)
                 .timestampMillis(20)
                 .indexManifestList(manifestList)
                 .build())

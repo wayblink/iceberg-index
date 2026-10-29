@@ -216,7 +216,8 @@ class BuildVectorIndexProcedure extends BaseProcedure {
           }
 
           forgetFailedAttempt(table, fieldId);
-          catalog.updateIndex(updated);
+          VectorIndexProcedures.publishSnapshot(
+              catalog, table, indexUuid, updated.latestSnapshot());
 
           IndexSnapshot snapshot = updated.latestSnapshot();
           long[] counts = VectorIndexProcedures.counts(table.io(), snapshot);
@@ -322,12 +323,11 @@ class BuildVectorIndexProcedure extends BaseProcedure {
   }
 
   /**
-   * Reads the structure from the {@code structure} parameter, or from the {@code mode} parameter
+   * The definition of the index being built.
+   *
+   * <p>The structure comes from the {@code structure} parameter, or from the {@code mode} parameter
    * that named it before the two axes were separated: {@code EXACT} meant a flat scan and {@code
    * HNSW} meant a graph.
-   */
-  /**
-   * The definition of the index being built.
    *
    * <p>The graph's parameters are only written when the structure is a graph: a structure that
    * reads another one's options reports it, so writing them anyway would turn every IVF build into

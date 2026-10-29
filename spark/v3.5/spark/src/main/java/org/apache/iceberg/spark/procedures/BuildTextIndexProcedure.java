@@ -164,7 +164,8 @@ class BuildTextIndexProcedure extends BaseProcedure {
           IndexMetadata updated =
               SparkIndexBuilder.build(
                   spark(), table, created, sourceSnapshotId, column, System.currentTimeMillis());
-          catalog.updateIndex(updated);
+          VectorIndexProcedures.publishSnapshot(
+              catalog, table, indexUuid, updated.latestSnapshot());
 
           IndexSnapshot snapshot = updated.latestSnapshot();
           long[] counts = VectorIndexProcedures.counts(table.io(), snapshot);

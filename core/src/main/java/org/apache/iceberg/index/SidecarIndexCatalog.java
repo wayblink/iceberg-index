@@ -23,10 +23,10 @@ import java.io.FileNotFoundException;
 import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.nio.charset.StandardCharsets;
-import java.nio.file.FileAlreadyExistsException;
 import java.nio.file.NoSuchFileException;
 import java.util.List;
 import java.util.UUID;
+import java.util.function.UnaryOperator;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 import org.apache.iceberg.Table;
@@ -268,6 +268,69 @@ public final class SidecarIndexCatalog implements IndexCatalog {
     return metadata;
   }
 
+  /**
+   * Applies a change to the metadata as it stands, and publishes it above whatever generation is
+   * current when it finally lands.
+   *
+   * <p>A change is applied to a document, and the generation it is published into is claimed by
+   * creating that generation's file. When the claim fails, another publisher wrote a document after
+   * this one read the metadata, so the change is applied again to the newer document rather than
+   * published above a state it never saw: that is what keeps a publisher that appends a snapshot
+   * from dropping one another publisher appended in the same window.
+   *
+   * <p>The change must be idempotent, because a retry hands it a document that may already carry
+   * its result. {@link #updateIndex(IndexMetadata)} cannot re-apply anything, because it replaces
+   * the document with the one the caller assembled from a copy it read earlier.
+   */
+  @Override
+  public IndexMetadata updateIndex(
+      String tableLocation, String indexUuid, UnaryOperator<IndexMetadata> change) {
+    Preconditions.checkArgument(
+        tableLocation != null && !tableLocation.isEmpty(), "Table location is empty");
+    Preconditions.checkArgument(indexUuid != null && !indexUuid.isEmpty(), "Index UUID is empty");
+    Preconditions.checkNotNull(change, "Index metadata change is null");
+
+    for (int attempt = 1; attempt <= MAX_REGISTRY_ATTEMPTS; attempt += 1) {
+      IndexMetadata current = loadIndex(tableLocation, indexUuid);
+      String indexLocation = current.location();
+      Pointer pointer = currentPointer(indexLocation);
+      long generation = (pointer == null ? 0 : pointer.generation) + 1;
+      IndexMetadata next = change.apply(current);
+      Preconditions.checkArgument(
+          next != null, "Index metadata change returned null for index %s", indexUuid);
+      Preconditions.checkArgument(
+          indexUuid.equals(next.indexUuid()),
+          "Index metadata change returned index %s, expected %s",
+          next.indexUuid(),
+          indexUuid);
+      Preconditions.checkArgument(
+          indexLocation.equals(next.location()),
+          "Index metadata change moved index %s from %s to %s",
+          indexUuid,
+          indexLocation,
+          next.location());
+
+      // the claim is the whole point: exactly the generation after the one this change was
+      // computed from. A file that already exists there means the document moved under us
+      String file = metadataPath(indexLocation, generation);
+      if (claimGeneration(file, IndexMetadataParser.toJson(next))) {
+        publishPointer(indexLocation, generation, file);
+        return next;
+      }
+
+      if (attempt == MAX_REGISTRY_ATTEMPTS) {
+        throw new CommitFailedException(
+            "Failed to update index metadata at %s after %s attempts: another publisher kept"
+                + " writing a newer generation",
+            indexLocation, MAX_REGISTRY_ATTEMPTS);
+      }
+
+      backoff(attempt);
+    }
+
+    throw new CommitFailedException("Failed to update index metadata for index %s", indexUuid);
+  }
+
   @Override
   public boolean dropIndex(String tableLocation, String indexUuid, boolean purge) {
     Preconditions.checkArgument(
@@ -442,10 +505,11 @@ public final class SidecarIndexCatalog implements IndexCatalog {
    * Publishes a metadata document into a generation no other writer holds, and points the index at
    * it.
    *
-   * <p>A generation is claimed by creating its file, never by overwriting one: the name is derived
-   * from the generation, so whichever writer creates it first owns it and the rest move on to a
-   * later one. Overwriting would let two publishers that both read generation N write the same
-   * file, one silently replacing the other, and would let a reader catch it half written.
+   * <p>A generation is claimed by writing its file and reading it back: the name is derived from
+   * the generation, so a writer that finds its own document where it wrote it owns that generation,
+   * and a writer that finds someone else's moves on to a later one. Without the read-back two
+   * publishers that both read generation N could write the same file and one would silently replace
+   * the other, and a reader could catch the file half written.
    *
    * @param baseGeneration the newest generation the caller has seen
    */
@@ -454,7 +518,7 @@ public final class SidecarIndexCatalog implements IndexCatalog {
     for (int attempt = 1; attempt <= MAX_REGISTRY_ATTEMPTS; attempt += 1) {
       long generation = baseGeneration + attempt;
       String file = metadataPath(indexLocation, generation);
-      if (writeIfAbsent(file, json)) {
+      if (claimGeneration(file, json)) {
         publishPointer(indexLocation, generation, file);
         return;
       }
@@ -471,34 +535,51 @@ public final class SidecarIndexCatalog implements IndexCatalog {
   }
 
   /**
-   * Writes a file only when it does not exist, and says whether this writer created it.
+   * Claims one generation for this writer, and says whether it won it.
    *
-   * <p>The probe is not what makes this exclusive; the create is. A racing writer loses at the
-   * filesystem, where create refuses an existing path, and reports false instead of replacing it.
+   * <p>The claim is the file: its name carries the generation, so whoever owns that file owns that
+   * generation and everyone else has to publish above it. {@link FileIO} has no exclusive create to
+   * build that on, though — the local one probes and then opens, which two writers can pass at the
+   * same moment, and an object store overwrites without asking at all. So the claim is read back:
+   * the writer that wrote the document this file now holds won, and a writer that finds someone
+   * else's bytes there retries into a later generation instead of reporting a publication that will
+   * never be followed.
+   *
+   * @return true when the file holds this writer's document
    */
-  private boolean writeIfAbsent(String path, String content) {
+  private boolean claimGeneration(String path, String content) {
     if (fileIO.newInputFile(path).exists()) {
       return false;
     }
 
     try (PositionOutputStream out = fileIO.newOutputFile(path).create()) {
       out.write(content.getBytes(StandardCharsets.UTF_8));
-      return true;
     } catch (IOException e) {
-      if (e instanceof FileAlreadyExistsException || fileIO.newInputFile(path).exists()) {
+      if (fileIO.newInputFile(path).exists()) {
+        // another writer created it first, or create() refuses an existing path
         return false;
       }
 
       throw new UncheckedIOException("Failed to write " + path, e);
+    } catch (RuntimeException e) {
+      if (fileIO.newInputFile(path).exists()) {
+        return false;
+      }
+
+      throw e;
     }
+
+    return content.equals(readIfExists(path));
   }
 
   /**
    * Points the index at a metadata file, and checks that the pointer kept its value.
    *
    * <p>The pointer files are overwritten in place, so a concurrent writer can replace the one just
-   * written. Reading it back turns that into a failure rather than a silent loss: the caller learns
-   * that the metadata it published is not the one readers will follow.
+   * written. Reading the pointer back across both slots turns that into a failure rather than a
+   * silent loss: the caller learns that the metadata it published is not the one readers will
+   * follow. A writer that reads only the slot it wrote would miss a publication that landed in the
+   * other one, which is the case that leaves a snapshot behind as an unreferenced file.
    */
   private void publishPointer(String indexLocation, long generation, String metadataFile) {
     // the slots alternate the way they did when each write took the other one; the generation
@@ -516,11 +597,11 @@ public final class SidecarIndexCatalog implements IndexCatalog {
             false),
         false);
 
-    Pointer published = readPointer(indexLocation, slot);
+    Pointer published = currentPointer(indexLocation);
     if (published == null || published.generation != generation) {
       throw new CommitFailedException(
-          "Index metadata at %s was published as generation %s, but the pointer was replaced by"
-              + " generation %s while it was being written",
+          "Index metadata at %s was published as generation %s, but the pointer names generation %s"
+              + " instead: another publisher moved it while this one was writing",
           indexLocation, generation, published == null ? "none" : published.generation);
     }
   }
@@ -554,7 +635,7 @@ public final class SidecarIndexCatalog implements IndexCatalog {
     try {
       JsonNode node = JsonUtil.parse(json, unused -> unused);
       return new Pointer(
-          JsonUtil.getInt(POINTER_GENERATION, node),
+          JsonUtil.getLong(POINTER_GENERATION, node),
           JsonUtil.getString(POINTER_METADATA_FILE, node));
     } catch (RuntimeException e) {
       // a pointer is a two-number document, so a parse failure means the file was truncated by a
