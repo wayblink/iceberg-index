@@ -23,6 +23,7 @@ import java.io.FileNotFoundException;
 import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.FileAlreadyExistsException;
 import java.nio.file.NoSuchFileException;
 import java.util.List;
 import java.util.UUID;
@@ -76,12 +77,17 @@ import org.slf4j.LoggerFactory;
  * <p>The pointer is a file name relative to the {@code indexes} directory, not an absolute path, so
  * it keeps working when the table is registered or moved under a different location.
  *
- * <p>Publishing an index snapshot is atomic: a new metadata version is written as a new file and
+ * <p>Publishing an index snapshot is ordered: a new metadata version is created as a new file and
  * only then does the pointer switch to it, so a reader always sees either the previous or the new
  * metadata root, never a partially written one. A crash before the pointer switch leaves the new
- * version as an unreferenced file, which is harmless. The pointer alternates between two slots and
- * is never overwritten in place, so a crash cannot truncate it either; a reader picks the slot with
- * the higher generation.
+ * version as an unreferenced file, which is harmless.
+ *
+ * <p>The metadata file is created rather than overwritten, and its name carries the generation, so
+ * the writer that creates it first owns that generation: a second publisher that read the same
+ * pointer moves on to a later one instead of replacing a document a reader may be following. The
+ * pointer alternates between two slots, which is a small file a crash could truncate; a reader then
+ * falls back to the other slot, and a writer that finds its pointer replaced fails rather than
+ * reporting a publication nobody will follow.
  */
 public final class SidecarIndexCatalog implements IndexCatalog {
 
@@ -179,7 +185,7 @@ public final class SidecarIndexCatalog implements IndexCatalog {
             .build();
     // the index tree is written first: registering an index whose metadata does not exist yet
     // would publish an index that cannot be loaded
-    writeMetadata(metadata, 1, 0);
+    publish(metadata, indexLocation, 0);
     try {
       register(tableLocation, request.tableUuid(), request.indexUuid());
     } catch (RuntimeException e) {
@@ -256,10 +262,9 @@ public final class SidecarIndexCatalog implements IndexCatalog {
     Preconditions.checkNotNull(metadata, "Index metadata is null");
     Preconditions.checkArgument(
         metadata.location() != null && !metadata.location().isEmpty(), "Index location is empty");
-    Pointer current = currentPointer(metadata.location());
-    long nextGeneration = current == null ? 1 : current.generation + 1;
-    int nextSlot = current == null ? 0 : (current.slot + 1) % POINTER_SLOTS;
-    writeMetadata(metadata, nextGeneration, nextSlot);
+    String indexLocation = metadata.location();
+    Pointer current = currentPointer(indexLocation);
+    publish(metadata, indexLocation, current == null ? 0 : current.generation);
     return metadata;
   }
 
@@ -433,23 +438,91 @@ public final class SidecarIndexCatalog implements IndexCatalog {
     deleteIfExists(legacyMetadataPath(indexLocation));
   }
 
-  /** Writes a metadata version as a new file and then switches the pointer to it. */
-  private void writeMetadata(IndexMetadata metadata, long generation, int slot) {
-    String indexLocation = metadata.location();
-    writeString(
-        metadataPath(indexLocation, generation), IndexMetadataParser.toJson(metadata), false);
+  /**
+   * Publishes a metadata document into a generation no other writer holds, and points the index at
+   * it.
+   *
+   * <p>A generation is claimed by creating its file, never by overwriting one: the name is derived
+   * from the generation, so whichever writer creates it first owns it and the rest move on to a
+   * later one. Overwriting would let two publishers that both read generation N write the same
+   * file, one silently replacing the other, and would let a reader catch it half written.
+   *
+   * @param baseGeneration the newest generation the caller has seen
+   */
+  private void publish(IndexMetadata metadata, String indexLocation, long baseGeneration) {
+    String json = IndexMetadataParser.toJson(metadata);
+    for (int attempt = 1; attempt <= MAX_REGISTRY_ATTEMPTS; attempt += 1) {
+      long generation = baseGeneration + attempt;
+      String file = metadataPath(indexLocation, generation);
+      if (writeIfAbsent(file, json)) {
+        publishPointer(indexLocation, generation, file);
+        return;
+      }
+
+      if (attempt == MAX_REGISTRY_ATTEMPTS) {
+        throw new CommitFailedException(
+            "Failed to publish index metadata at %s: the next %s generations were all taken, "
+                + "another writer kept publishing",
+            indexLocation, MAX_REGISTRY_ATTEMPTS);
+      }
+
+      backoff(attempt);
+    }
+  }
+
+  /**
+   * Writes a file only when it does not exist, and says whether this writer created it.
+   *
+   * <p>The probe is not what makes this exclusive; the create is. A racing writer loses at the
+   * filesystem, where create refuses an existing path, and reports false instead of replacing it.
+   */
+  private boolean writeIfAbsent(String path, String content) {
+    if (fileIO.newInputFile(path).exists()) {
+      return false;
+    }
+
+    try (PositionOutputStream out = fileIO.newOutputFile(path).create()) {
+      out.write(content.getBytes(StandardCharsets.UTF_8));
+      return true;
+    } catch (IOException e) {
+      if (e instanceof FileAlreadyExistsException || fileIO.newInputFile(path).exists()) {
+        return false;
+      }
+
+      throw new UncheckedIOException("Failed to write " + path, e);
+    }
+  }
+
+  /**
+   * Points the index at a metadata file, and checks that the pointer kept its value.
+   *
+   * <p>The pointer files are overwritten in place, so a concurrent writer can replace the one just
+   * written. Reading it back turns that into a failure rather than a silent loss: the caller learns
+   * that the metadata it published is not the one readers will follow.
+   */
+  private void publishPointer(String indexLocation, long generation, String metadataFile) {
+    // the slots alternate the way they did when each write took the other one; the generation
+    // is what decides now, so a retry into a later generation also moves the slot
+    int slot = (int) ((generation - 1) % POINTER_SLOTS);
     writeString(
         pointerPath(indexLocation, slot),
         JsonUtil.generate(
             generator -> {
               generator.writeStartObject();
               generator.writeNumberField(POINTER_GENERATION, generation);
-              generator.writeStringField(
-                  POINTER_METADATA_FILE, metadataPath(indexLocation, generation));
+              generator.writeStringField(POINTER_METADATA_FILE, metadataFile);
               generator.writeEndObject();
             },
             false),
         false);
+
+    Pointer published = readPointer(indexLocation, slot);
+    if (published == null || published.generation != generation) {
+      throw new CommitFailedException(
+          "Index metadata at %s was published as generation %s, but the pointer was replaced by"
+              + " generation %s while it was being written",
+          indexLocation, generation, published == null ? "none" : published.generation);
+    }
   }
 
   /** Reads the current metadata JSON, following the pointer, with a legacy layout fallback. */
@@ -482,10 +555,10 @@ public final class SidecarIndexCatalog implements IndexCatalog {
       JsonNode node = JsonUtil.parse(json, unused -> unused);
       return new Pointer(
           JsonUtil.getInt(POINTER_GENERATION, node),
-          JsonUtil.getString(POINTER_METADATA_FILE, node),
-          slot);
+          JsonUtil.getString(POINTER_METADATA_FILE, node));
     } catch (RuntimeException e) {
-      // a pointer is written once and never overwritten, so this only happens on corruption
+      // a pointer is a two-number document, so a parse failure means the file was truncated by a
+      // writer that did not finish; the other slot is tried next
       return null;
     }
   }
@@ -493,12 +566,10 @@ public final class SidecarIndexCatalog implements IndexCatalog {
   private static final class Pointer {
     private final long generation;
     private final String file;
-    private final int slot;
 
-    private Pointer(long generation, String file, int slot) {
+    private Pointer(long generation, String file) {
       this.generation = generation;
       this.file = file;
-      this.slot = slot;
     }
   }
 

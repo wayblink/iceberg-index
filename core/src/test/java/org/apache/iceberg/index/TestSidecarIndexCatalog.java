@@ -66,6 +66,28 @@ class TestSidecarIndexCatalog {
   }
 
   @Test
+  public void skipsAGenerationAnotherWriterAlreadyClaimed(@TempDir Path tempDir)
+      throws IOException {
+    LocalFileIO fileIO = new LocalFileIO();
+    IndexCatalog catalog = new SidecarIndexCatalog(fileIO);
+    String tableLocation = tempDir.resolve("table").toString();
+    IndexMetadata created = catalog.createIndex(request(tableLocation, "index-uuid"));
+
+    // another publisher already took generation 2, which it does by creating that file; this one
+    // has to publish above it rather than replace a document a reader may already be following
+    String claimed = created.location() + "/metadata/index-metadata-v1-g2.json";
+    fileIO.newOutputFile(claimed).create().close();
+
+    IndexMetadata updated = withSnapshot(created, writeSnapshot(fileIO, created));
+    catalog.updateIndex(updated);
+
+    assertThat(catalog.loadIndex(tableLocation, "index-uuid")).isEqualTo(updated);
+    assertThat(fileIO.newInputFile(claimed).getLength())
+        .as("the metadata file another writer claimed is left alone")
+        .isZero();
+  }
+
+  @Test
   public void updatesIndexMetadata(@TempDir Path tempDir) throws IOException {
     LocalFileIO fileIO = new LocalFileIO();
     IndexCatalog catalog = new SidecarIndexCatalog(fileIO);
