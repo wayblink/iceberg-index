@@ -33,6 +33,21 @@ class TestPuffinIndexFileContainer {
   private final IndexFileContainer container = new PuffinIndexFileContainer();
 
   @Test
+  public void aBlobTakesOwnershipOfThePayloadItIsGiven() {
+    // a container hands over the bytes it has just read, and a reader hands them straight to an
+    // adapter: every copy on that path is another copy of a file that can be hundreds of megabytes
+    byte[] payload = {1, 2, 3};
+
+    IndexBlob blob = IndexBlob.of("iceberg-testing-entries-v1", payload);
+
+    assertThat(blob.payloadUnsafe())
+        .as("the payload is not copied on construction")
+        .isSameAs(payload);
+    assertThat(blob.payload()).as("the public accessor still copies").isNotSameAs(payload);
+    assertThat(blob.payload()).containsExactly(1, 2, 3);
+  }
+
+  @Test
   public void roundTripsMultipleBlobs(@TempDir Path tempDir) throws IOException {
     String location = tempDir.resolve("index-file-1.puffin").toString();
     IndexBlob first = IndexBlob.of("iceberg-vector-entries-v1", new byte[] {1, 2, 3, 4});

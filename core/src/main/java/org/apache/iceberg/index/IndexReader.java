@@ -101,13 +101,14 @@ public final class IndexReader {
     for (IndexFile indexFile : readable.entry()) {
       IndexBlob blob = readBlob(indexFile.location(), indexFile.blobType());
       results.addAll(
-          adapter.search(ByteBuffer.wrap(blob.payload()), query.payload(), query.topK()));
+          adapter.search(ByteBuffer.wrap(blob.payloadUnsafe()), query.payload(), query.topK()));
     }
 
     for (IndexFile indexFile : readable.auxiliary()) {
       IndexBlob blob = readBlob(indexFile.location(), indexFile.blobType());
       results.addAll(
-          adapter.searchAuxiliary(ByteBuffer.wrap(blob.payload()), query.payload(), query.topK()));
+          adapter.searchAuxiliary(
+              ByteBuffer.wrap(blob.payloadUnsafe()), query.payload(), query.topK()));
     }
 
     results.sort(adapter.resultComparator());
@@ -275,14 +276,14 @@ public final class IndexReader {
     List<ByteBuffer> entryPayloads = Lists.newArrayListWithCapacity(readable.entry().size());
     for (IndexFile indexFile : readable.entry()) {
       IndexBlob blob = readBlob(indexFile.location(), indexFile.blobType());
-      entryPayloads.add(ByteBuffer.wrap(blob.payload()));
+      entryPayloads.add(ByteBuffer.wrap(blob.payloadUnsafe()));
     }
 
     List<ByteBuffer> auxiliaryPayloads =
         Lists.newArrayListWithCapacity(readable.auxiliary().size());
     for (IndexFile indexFile : readable.auxiliary()) {
       IndexBlob blob = readBlob(indexFile.location(), indexFile.blobType());
-      auxiliaryPayloads.add(ByteBuffer.wrap(blob.payload()));
+      auxiliaryPayloads.add(ByteBuffer.wrap(blob.payloadUnsafe()));
     }
 
     return new Payloads(entryPayloads, auxiliaryPayloads);

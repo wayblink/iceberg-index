@@ -38,9 +38,16 @@ public final class IndexBlob {
     Preconditions.checkArgument(type != null && !type.isEmpty(), "Blob type is empty");
     Preconditions.checkNotNull(payload, "Blob payload is null");
     this.type = type;
-    this.payload = payload.clone();
+    this.payload = payload;
   }
 
+  /**
+   * Wraps a payload this blob takes ownership of.
+   *
+   * <p>The array is not copied: a container that has just read a blob already holds the only
+   * reference to it, and copying a large index file again is what doubles the peak memory of a
+   * query. The caller must not keep using the array afterwards.
+   */
   public static IndexBlob of(String type, byte[] payload) {
     return new IndexBlob(type, payload);
   }
@@ -52,6 +59,17 @@ public final class IndexBlob {
   /** Returns a copy so callers cannot mutate the blob payload. */
   public byte[] payload() {
     return payload.clone();
+  }
+
+  /**
+   * The payload itself, for a reader that only reads it.
+   *
+   * <p>Every accessor that copies is a second copy of a file that can be hundreds of megabytes, so
+   * the reader that hands the bytes straight to an adapter takes them directly. The array is
+   * shared, not cloned: a caller that writes to it changes this blob.
+   */
+  byte[] payloadUnsafe() {
+    return payload;
   }
 
   @Override
