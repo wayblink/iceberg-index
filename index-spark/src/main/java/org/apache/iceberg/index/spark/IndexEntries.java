@@ -1314,10 +1314,7 @@ public final class IndexEntries {
       case STRING:
         return "string:" + value;
       case DATE:
-        return "date:"
-            + (value instanceof Number
-                ? ((Number) value).intValue()
-                : ((java.sql.Date) value).toLocalDate().toEpochDay());
+        return "date:" + epochDay(value);
       case TIME:
         return "time:"
             + (value instanceof Number
@@ -1351,6 +1348,25 @@ public final class IndexEntries {
       default:
         return type.typeId() + ":" + value;
     }
+  }
+
+  /**
+   * The day number of a date key, whatever Java type carries it.
+   *
+   * <p>A row of a data file is read as {@code LocalDate}, a delete written through Spark carries
+   * the day as a number, and a reader predating {@code LocalDate} hands back {@code java.sql.Date}.
+   * All three name one day, so all three have to produce one key: admitting only one of them turns
+   * the others into a class-cast failure when the index is built.
+   */
+  private static long epochDay(Object value) {
+    if (value instanceof Number) {
+      return ((Number) value).intValue();
+    } else if (value instanceof java.time.LocalDate) {
+      return ((java.time.LocalDate) value).toEpochDay();
+    } else if (value instanceof java.sql.Date) {
+      return ((java.sql.Date) value).toLocalDate().toEpochDay();
+    }
+    throw new IllegalArgumentException("Unsupported value for a date key: " + value);
   }
 
   /** The bytes of a binary value, which the data and delete readers hand back differently. */

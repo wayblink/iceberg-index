@@ -21,6 +21,7 @@ package org.apache.iceberg.index.spark;
 import static org.assertj.core.api.Assertions.assertThat;
 
 import java.math.BigDecimal;
+import java.time.LocalDate;
 import org.apache.iceberg.types.Types;
 import org.junit.jupiter.api.Test;
 
@@ -40,5 +41,18 @@ class TestEqualityKeyEncoding {
     assertThat(IndexEntries.encodedValue(type, new BigDecimal("-1.20")))
         .isEqualTo(IndexEntries.encodedValue(type, new BigDecimal("-1.2")))
         .isNotEqualTo(IndexEntries.encodedValue(type, new BigDecimal("1.2")));
+  }
+
+  @Test
+  public void aDateKeysTheSameWhateverJavaTypeCarriesIt() {
+    Types.DateType type = Types.DateType.get();
+    LocalDate day = LocalDate.of(2024, 1, 1);
+
+    // the rows of a data file are read as LocalDate, a delete written by Spark carries the same day
+    // as a number, and a reader that predates LocalDate hands back java.sql.Date: all three name
+    // one day, so all three have to produce one key
+    assertThat(IndexEntries.encodedValue(type, day))
+        .isEqualTo(IndexEntries.encodedValue(type, day.toEpochDay()))
+        .isEqualTo(IndexEntries.encodedValue(type, java.sql.Date.valueOf(day)));
   }
 }
