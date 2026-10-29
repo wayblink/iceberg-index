@@ -63,6 +63,14 @@ import org.apache.iceberg.index.IndexSearchResult;
  * several index files. A kernel whose graph traversal measures something else still has to report
  * the score this way, which usually means re-scoring its candidates against the stored vectors.
  *
+ * <p>A kernel that cannot re-score, because the payload carries no vectors to re-score against (a
+ * quantizer exists to make sure it does not), reports an estimate of the same quantity instead.
+ * That estimate orders candidates correctly near the top and is what a caller may sort by; it is
+ * not what a caller may compare across queries as if it were the distance, and only a caller that
+ * re-scores the rows it kept can ask for the exact value. The query layer is where that happens: it
+ * re-scores the candidates it kept against the rows themselves, so the score a query returns is
+ * exact while the set of candidates it draws from is what the estimate chose.
+ *
  * <p>Serializable because an adapter carries its kernel to the executors that build and search; a
  * kernel that keeps something that cannot be shipped turns every task into a serialization failure.
  */

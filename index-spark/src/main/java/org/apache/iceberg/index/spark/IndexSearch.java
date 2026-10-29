@@ -61,7 +61,15 @@ public final class IndexSearch {
   /** Column of the row position of a matched row. */
   public static final String POSITION_COLUMN = "pos";
 
-  /** Column of the score of a hit. */
+  /**
+   * Column of the score of a hit, as the index ordered it.
+   *
+   * <p>This is the index's own score: for a structured or quantized index it is an estimate of the
+   * distance, the same quantity in the same direction but not the exact value, and it orders the
+   * candidates the index was willing to consider rather than the table. A query written as {@code
+   * ORDER BY vec_distance(...)} is the one that returns exact distances, because the sort re-scores
+   * the rows it keeps; a caller comparing scores across queries should use that form.
+   */
   public static final String SCORE_COLUMN = "score";
 
   /** Column of the matched row as a JSON object. */
