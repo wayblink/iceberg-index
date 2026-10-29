@@ -19,7 +19,7 @@ under the License.
 
 # 索引通用内存与加载优化：IVF 原地布局、向量公共 Top-K
 
-状态：**修订稿，已完成独立只读技术复审（无阻断），待人工确认；不是实现完成或性能验证报告。** 本稿替代已打回的初稿，对应独立伞卡 #2773、设计卡 #2779，处置评审备注 #2952、#3006。源码核对基线为 `002552ffe`。本轮只修改设计和卡片，不修改产品代码，不运行 Java 或集群性能测试。
+状态：**设计已获开发确认，A/B已收口；用户于2026-10-28确认C/D分工修订：C按当前实际可达状态记账并释放无用容器，D再引入独占U的原地布局。不是实现完成或性能验证报告。** 本稿替代已打回的初稿，对应独立伞卡 #2773、设计卡 #2779，处置评审备注 #2952、#3006。原设计源码核对基线为 `002552ffe`；C实施基底为 `ede87bcd8`。本次仅修订阶段分工，不调整收益验收门槛。
 
 ## 1. 目标、分工与范围
 
@@ -55,7 +55,9 @@ IVF 当前 `readList` 为记录分配 `IvfEntry`、code/vector/factors 数组，
 
 ### 3.1 核心实现先采用可证明的独占路径
 
-保持公开 `prepare(ByteBuffer)` 签名。IVF prepare 对调用方的 `[position, limit)` 做防御性快照，内部保存独占 U；快照不修改输入 position/limit，不受调用方后来写入原数组影响。只读 ByteBuffer 不能证明 backing array 不被其他引用修改，不能凭 `isReadOnly()` 借用。read-only、direct、非零 arrayOffset 和 slice 均有回归样本。
+保持公开 `prepare(ByteBuffer)` 签名，并对调用方的 `[position, limit)` 做防御性快照。快照不修改输入 position/limit，不受调用方后来写入原数组影响。只读 ByteBuffer 不能证明 backing array 不被其他引用修改，不能凭 `isReadOnly()` 借用。read-only、direct、非零 arrayOffset 和 slice 均有回归样本。
+
+C按当前表示的实际引用处理所有权：IVF目前把快照解码成独立对象图S，prepare结束后无需保留原编码U，因此不为阶段分工人为增加无用U或虚加U费用。C先保证独立状态、完整记账及无用C释放。D切换到原地布局时才保留独占快照U，以U+M替代S，并完整计入U及数组头。该阶段调整不改变最终原地布局目标。
 
 初始实现允许 `blob.payload()` 与 prepare 间仍有暂态复制，不以公共“零复制”改造为前置。prepared 不保留整个 Puffin 文件或外部 InputFile。加载完成后无用 C 不进入缓存根对象；其他 adapter 若保留解压输入，须按其真实引用计费，不一刀切释放。缓存释放/eviction 不破坏仍被 lease 使用的 searcher。
 
@@ -65,13 +67,25 @@ IVF 当前 `readList` 为记录分配 `IvfEntry`、code/vector/factors 数组，
 
 采用新的内存 **modelVersion=2**，不改变 payload 的 v1/v2、reader 编码版本或 manifest 存储格式。`payloadBytes` 仍为 **blob 压缩前的编码 payload 长度 U**，`fileBytes` 仍为物理容器 C，二者保留诊断用途，不能自动相加作为常驻。
 
-新模型的 `preparedBytes`/运行时 `estimatedBytes()` 描述 searcher 实际可达的独占状态 P：IVF 为 U+M，HNSW 为实际图/映射，FLAT 为实际保留的 entries/字节。排除已经释放的调用方输入和 query scratch；内部持有的快照 U 必须计入。澄清相关 javadoc：排除外部输入缓冲，不是排除 searcher 自己拥有的数组。
+新模型的 `preparedBytes`/运行时 `estimatedBytes()` 描述 searcher 实际可达的独占状态 P：C阶段IVF为实际独立S，D原地布局为U+M；HNSW为实际图/映射，FLAT为实际保留的entries/字节。排除已经释放的调用方输入和query scratch；只要内部持有快照U，就必须完整计入，不能借本次分工调整漏记。澄清相关javadoc：排除外部输入缓冲，不是排除searcher自己拥有的数组。模型仍是明确JVM布局下的结构估计，不是精确retained heap实测。
 
 新缓存 resident 以 P 为主，再加确实被缓存额外保留且不属于 P 的状态 E。共享数组按身份只计一次；slice 若保留大 backing array，计完整数组。核心独占路径 E 中没有 C。`IndexCacheMemory` 的新模型转换不再无条件加 `fileBytes`；build、runtime、manifest→placement 使用同一估算函数，不能一边报 U+M、一边仍加 C。
 
 model=1、未知模型、缺失 memory、reader/runtimeProfile 不匹配的旧估算不能直接用于精确容量决策：由统一 resolver 加载并按当前模型重估，或返回显式 unknown，不能返回0、不能继续声称严格预算已获保证。保留既有 legacy fallback 的明确“不准确估算”标识；managed 规划不得把 unknown 当已知可容纳。新估算可按不可变文件身份、reader、model、runtime 缓存；升级使旧缓存失效。无需重建或重写旧 payload，也不强制更新旧 manifest。跨 kernel 的 model 标记与公式一起升级，不能统一换版本号却保留不一致语义。
 
 验收同时核对可达数组与收费模型；仅 build 数字等于 prepare 数字不足以证明没有双方共同漏账。
+
+### 3.3 已确认的共享元数据与内部消息记账
+
+用户已确认将缓存额外状态E及driver/executor内部消息调整纳入C。固定的P加包装常数不能覆盖完整key、owner、map/set backing和会增长的ownership关联。缓存按可达组件的集合记账：同一物理文件、owner及共享backing在同一executor只计一次；跨executor的独立副本各自计费。文本身份保留完整值，不靠截短或换成不透明ID消除费用。
+
+区分索引驻留R、必要控制元数据Q及尚未占用的预留增量H。R包含prepared P及仍被驻留/lease持有的附加状态，最后引用释放后对应索引resident归零；Q包含仍需保留的epoch、paused策略等控制状态及其容器，单独计入总预算，不能以“控制面”为名漏掉增长。实际已用为R+Q，有效占用为R+Q+H；releasing是已用中的待释放子集，不再次相加。固定空管理器、锁和计数器为明确基底，不将扩大后的容器backing冒充空基底。
+
+owner/group信息显式沿内部消息传递，不能从缺席值推断零费用。原缺owner的三参数workingSet helper不能继续报告完整resident为known；现有查询转为包内owner-aware入口。规划、预留、接纳、ACK及状态上报消费同一个集合投影；ACK仍按现有计划/命令身份确认文件coverage，但预算不再通过逐file数字盲目累加。较旧或重复收费快照不回滚新状态，失败接纳不留下未收费的元数据，释放不因没有空闲预算而失败。
+
+仅调整index-spark包内状态和现有通信通道的消息内容，不新增网络服务、公开Java接口、SQL/CALL参数或运维开关，不改payload/manifest格式、调度/LRU/保护/删除语义。算法、模型、预算字段及测试必须一起迁移；当前E缓存根回归仍RED，本文不代表完成。
+
+实现与验证细则见`docs/2026-10-28-cache-owned-metadata-and-internal-protocol.md`。
 
 ## 4. IVF 编码与目录（#2776）
 
@@ -161,16 +175,16 @@ FLAT独立测分配、排序和精确结果，不套用IVF内存门槛。所有�
 |---|---|
 | A #2779 | 本修订稿、四项确定错误和新增边界逐条处置，双份逐字节保存并独立复审 |
 | B #2775 | 固定改前基线与独立探针，不确认尚未测量的收益 |
-| C #2780 | 独占状态、model=2真实记账与旧估算resolver，公共adapter合同 |
-| D #2776 | 包内向量工具+IVF目录/完整校验/原地打分/有界堆 |
+| C #2780 | 当前表示的独立状态、model=2真实记账与旧估算resolver、公共adapter快照合同；IVF不人为长期保留已解码输入U |
+| D #2776 | 包内向量工具+IVF独占U/目录/完整校验/原地打分/有界堆，以U+M替代S并完整计U |
 | E #2778 | IVF核心回归、配对测量、集群smoke及容量证据 |
 | F #2774 | 后续公共拷贝链减少，逐kernel验证 |
 | G #2777 | 后续driver估算读取优化，真实codec路径和回退 |
 | H #2782 | FLAT第二真实调用方及独立验收 |
 
-依赖保持 A→B→C→D→E，E→F/G/H；F/G/H可分别推进，不是D/E前置。不使用初稿P0/P1/P2顺序，不预设工期和未验证的收益。首次落地保持中心/量化器算术和公开复制合同，centroid选择、signs共享等可另行测量，不强制捎带。
+开发依赖按用户最新顺序为A→B→C→D，D开发就绪后F/G/H可分别开发；耗时完整验收#2778在全部开发后执行。每项开发保留必要小TDD、编译、格式和轻量代码复核，不提前跑全core/完整Spark回归/大资源与10M100M性能作业。开发卡完成仅表示开发就绪，不表示最终验收通过；#2773必须等待统一完整验收结束才关闭。F/G/H仍不是D的前置，中心/量化器算术及公开复制合同不变。
 
-本稿独立只读技术复审未发现阻断项，人工确认仍待完成。A移入review不意味着整个#2773完成，B及实现仍受A完成状态阻塞。仓库`docs/`为权威版本，umem保存同格式同字节副本并校验sha256；模型、布局或验收发生变化，两份一起更新。
+原稿已完成独立只读技术复审并获开发确认，A/B已收口。C/D分工修订已获用户确认；C、D及后续交付仍须分别实施和复审，不意味着整个#2773完成。plain的≥30%适用范围仍待确认，本次没有调整§7.2正式门槛。仓库`docs/`为权威版本，umem保存同格式同字节副本并校验sha256；模型、布局或验收发生变化，两份一起更新。
 
 ## 9. 评审处置索引
 

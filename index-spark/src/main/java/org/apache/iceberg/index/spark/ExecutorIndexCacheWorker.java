@@ -18,8 +18,8 @@
  */
 package org.apache.iceberg.index.spark;
 
-import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
+import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
@@ -41,14 +41,17 @@ final class ExecutorIndexCacheWorker implements AutoCloseable {
 
   interface Loader {
     ExecutorIndexCache.CachedFile load(IndexCacheProtocol.Command command);
-  }
 
-  private record Installed(long epoch, long bytes) {}
+    default void validate(IndexCacheProtocol.Command command) {}
+
+    default void validate(IndexCacheProtocol.Command command, ExecutorIndexCache.CachedFile file) {}
+  }
 
   private enum TargetDecision {
     APPLIED,
     STALE,
-    WAIT_REFERENCES
+    WAIT_REFERENCES,
+    BUSY
   }
 
   private final String session;
@@ -59,10 +62,6 @@ final class ExecutorIndexCacheWorker implements AutoCloseable {
   private final Loader loader;
   private final IndexCacheWorkerConfig config;
   private final Map<String, IndexCacheProtocol.Ack> completed = new ConcurrentHashMap<>();
-  private final Map<String, Installed> installed = new LinkedHashMap<>();
-  private final Map<String, Set<String>> targetKeys = new LinkedHashMap<>();
-  private final Map<String, Long> targetEpoch = new LinkedHashMap<>();
-  private final Map<String, Long> promised = new LinkedHashMap<>();
   private final AtomicBoolean closed = new AtomicBoolean(false);
   private final Object stateLock = new Object();
   private final Map<String, Object> locks = new ConcurrentHashMap<>();
@@ -85,6 +84,7 @@ final class ExecutorIndexCacheWorker implements AutoCloseable {
     this.incarnation = incarnation;
     this.cache = Objects.requireNonNull(cache, "Cache is null");
     this.cacheConfig = Objects.requireNonNull(cacheConfig, "Cache config is null");
+    cache.configureBudget(cacheConfig.maxBytes());
     this.loader = Objects.requireNonNull(loader, "Loader is null");
     this.config = Objects.requireNonNull(config, "Config is null");
   }
@@ -99,7 +99,7 @@ final class ExecutorIndexCacheWorker implements AutoCloseable {
 
     IndexCacheProtocol.Ack previous = completed.get(command.commandId());
     if (previous != null) {
-      return previous;
+      return previous.copy().metadataShape(cache.shape()).build();
     }
 
     // Only retries of the same command serialize; a slow load must not block reports or other
@@ -109,7 +109,7 @@ final class ExecutorIndexCacheWorker implements AutoCloseable {
       synchronized (commandLock) {
         previous = completed.get(command.commandId());
         if (previous != null) {
-          return previous;
+          return previous.copy().metadataShape(cache.shape()).build();
         }
 
         if (!session.equals(command.session())) {
@@ -135,7 +135,8 @@ final class ExecutorIndexCacheWorker implements AutoCloseable {
       IndexCacheProtocol.Command command, IndexCacheProtocol.Ack ack) {
     if (!BUSY.equals(ack.reason()) && !WAIT_REFERENCES.equals(ack.reason())) {
       // A transient refusal must stay retryable: caching it would make every re-send a no-op.
-      completed.put(command.commandId(), ack);
+      // Idempotence retains command outcome, not historical full-cache graphs.
+      completed.put(command.commandId(), ack.copy().metadataShape(null).build());
     }
 
     return ack;
@@ -151,26 +152,27 @@ final class ExecutorIndexCacheWorker implements AutoCloseable {
    */
   private TargetDecision ensureTarget(String indexUuid, long epoch, String cacheKey) {
     synchronized (stateLock) {
-      Long applied = targetEpoch.get(indexUuid);
-      if (applied != null && epoch < applied) {
+      long applied = cache.managedEpoch(indexUuid);
+      if (applied >= 0 && epoch < applied) {
         return TargetDecision.STALE;
       }
 
       // Only the first takeover has to wait: later epochs keep the same managed copies valid, so
       // re-applying a target does not invalidate what a query already holds.
-      if (applied == null && cache.hasReferencesInUse()) {
+      if (applied < 0 && cache.hasReferencesInUse()) {
         return TargetDecision.WAIT_REFERENCES;
       }
 
-      Set<String> keys = targetKeys.computeIfAbsent(indexUuid, ignored -> new LinkedHashSet<>());
+      Set<String> keys = new LinkedHashSet<>(cache.managedKeys(indexUuid));
       keys.add(cacheKey);
-      if (applied == null || epoch > applied) {
+      if (applied < 0 || epoch > applied) {
         cache.applyTarget(indexUuid, epoch, keys);
-        targetEpoch.put(indexUuid, epoch);
       } else {
         cache.addManagedKeys(indexUuid, epoch, Set.of(cacheKey));
       }
-
+      if (!cache.mayAdmit(indexUuid, epoch, cacheKey)) {
+        return TargetDecision.BUSY;
+      }
       return TargetDecision.APPLIED;
     }
   }
@@ -178,7 +180,10 @@ final class ExecutorIndexCacheWorker implements AutoCloseable {
   private IndexCacheProtocol.Ack load(IndexCacheProtocol.Command command) {
     String cacheKey = command.file().cacheKey();
     Long estimate = command.file().estimatedBytes();
-    if (estimate == null) {
+    if (estimate == null
+        || command.file().owner() == null
+        || command.file().owner().isBlank()
+        || command.file().memory() == null) {
       // Unknown size is not zero: without a bound the executor cannot promise the space.
       return reject(command, "SIZE_UNKNOWN");
     }
@@ -187,24 +192,25 @@ final class ExecutorIndexCacheWorker implements AutoCloseable {
       return reject(command, "STALE_EPOCH");
     }
 
+    try {
+      ExecutorIndexCache.Shape projected =
+          cache
+              .shape()
+              .projectAdmission(command.indexUuid(), command.epoch(), List.of(command.file()));
+      if (projected.charge().usedBytes() + projected.charge().reservedBytes()
+          > cacheConfig.maxBytes()) {
+        return reject(command, BUSY);
+      }
+    } catch (RuntimeException e) {
+      return reject(command, "SIZE_UNKNOWN");
+    }
     TargetDecision decision = ensureTarget(command.indexUuid(), command.epoch(), cacheKey);
     if (decision == TargetDecision.STALE) {
       return reject(command, "STALE_EPOCH");
     } else if (decision == TargetDecision.WAIT_REFERENCES) {
       return reject(command, WAIT_REFERENCES);
-    }
-
-    // Free space is checked before this command promises its own estimate: a first load must not
-    // see its own reservation as if it were already used.
-    long free = cacheConfig.maxBytes() - cache.stats().bytes() - promisedBytes();
-    if (estimate > free) {
-      // Refuse before reading the file: a prepare that cannot be admitted only wastes I/O and the
-      // temporary memory the driver is trying to protect.
+    } else if (decision == TargetDecision.BUSY) {
       return reject(command, BUSY);
-    }
-
-    synchronized (stateLock) {
-      promised.put(command.commandId(), estimate);
     }
 
     long startedAt = System.nanoTime();
@@ -219,33 +225,39 @@ final class ExecutorIndexCacheWorker implements AutoCloseable {
                 command.indexUuid(),
                 command.epoch(),
                 cacheKey,
-                cacheConfig,
+                cacheConfig.withOwner(command.file().owner()),
                 estimate,
                 command.planId(),
                 command.commandId(),
-                () -> loader.load(command));
+                new ExecutorIndexCache.Loader() {
+                  @Override
+                  public ExecutorIndexCache.CachedFile load() {
+                    return loader.load(command);
+                  }
+
+                  @Override
+                  public void validate() {
+                    loader.validate(command);
+                  }
+
+                  @Override
+                  public void validate(ExecutorIndexCache.CachedFile cached) {
+                    loader.validate(command, cached);
+                  }
+                });
         if (file == null) {
           // Admission refused: either this entry can never fit, or the space is momentarily taken.
-          synchronized (stateLock) {
-            promised.remove(command.commandId());
-          }
-
           return reject(command, "BUSY");
         }
 
-        synchronized (stateLock) {
-          installed.put(cacheKey, new Installed(command.epoch(), file.bytes()));
-          promised.remove(command.commandId());
-        }
-
-        return ack(command, IndexCacheProtocol.AckStatus.LOADED, file.bytes(), null);
+        return ack(
+            command,
+            IndexCacheProtocol.AckStatus.LOADED,
+            cache.shape().residentBytes(Set.of(cacheKey)),
+            null);
       } catch (RuntimeException e) {
         last = e;
       }
-    }
-
-    synchronized (stateLock) {
-      promised.remove(command.commandId());
     }
 
     long elapsedMillis = (System.nanoTime() - startedAt) / 1_000_000L;
@@ -260,12 +272,8 @@ final class ExecutorIndexCacheWorker implements AutoCloseable {
 
   private IndexCacheProtocol.Ack release(IndexCacheProtocol.Command command) {
     String cacheKey = command.file().cacheKey();
-    Installed copy;
-    synchronized (stateLock) {
-      copy = installed.get(cacheKey);
-    }
-
-    if (copy != null && copy.epoch() > command.epoch()) {
+    long appliedEpoch = cache.managedEpoch(command.indexUuid());
+    if (appliedEpoch > command.epoch()) {
       // A newer load installed this copy; an older release must not delete it.
       return reject(command, "STALE_EPOCH");
     }
@@ -274,23 +282,7 @@ final class ExecutorIndexCacheWorker implements AutoCloseable {
     // also removes a pending admission so a load that is still preparing cannot publish afterwards.
     cache.releaseCopy(command.indexUuid(), cacheKey);
 
-    synchronized (stateLock) {
-      Set<String> keys = targetKeys.get(command.indexUuid());
-      if (keys != null) {
-        keys.remove(cacheKey);
-      }
-    }
-
-    synchronized (stateLock) {
-      // The physical copy may still be shared with another index, so only stop reporting it when
-      // the cache no longer holds it at all.
-      if (!cache.residentKeys().contains(cacheKey)) {
-        installed.remove(cacheKey);
-      }
-    }
-
-    return ack(
-        command, IndexCacheProtocol.AckStatus.RELEASED, copy == null ? 0 : copy.bytes(), null);
+    return ack(command, IndexCacheProtocol.AckStatus.RELEASED, 0, null);
   }
 
   /**
@@ -301,8 +293,21 @@ final class ExecutorIndexCacheWorker implements AutoCloseable {
       String profile,
       long sequence,
       long budgetBytes,
+      long reservedBytes,
       long releasingBytes,
       Map<String, Long> accessAgeNanos) {
+    IndexCacheProtocol.NodeReport report =
+        report(profile, sequence, budgetBytes, releasingBytes, accessAgeNanos);
+    return report.copy().reservedBytes(Math.max(report.reservedBytes(), reservedBytes)).build();
+  }
+
+  IndexCacheProtocol.NodeReport report(
+      String profile,
+      long sequence,
+      long budgetBytes,
+      long releasingBytes,
+      Map<String, Long> accessAgeNanos) {
+    ExecutorIndexCache.Shape shape = cache.shape();
     ExecutorIndexCache.MemoryUsage memory = cache.memoryUsage();
 
     return IndexCacheProtocol.NodeReport.builder()
@@ -314,26 +319,18 @@ final class ExecutorIndexCacheWorker implements AutoCloseable {
         .usedBytes(memory.usedBytes())
         .reservedBytes(memory.reservedBytes())
         .releasingBytes(releasingBytes)
-        // Physical residency is not a managed ownership ACK. Including lazy keys prevents a
-        // later managed reuse from charging the same retained file a second time.
         .holders(memory.residentFiles())
         .reservedByPlan(memory.reservedByPlan())
         .reservedByCommand(memory.reservedByCommand())
+        .metadataShape(shape)
         .profile(profile)
         .accessAgeNanos(accessAgeNanos == null ? Map.of() : accessAgeNanos)
         .build();
   }
 
-  /** Estimates associated with pending control commands, not cache reservations. */
-  private long promisedBytes() {
-    synchronized (stateLock) {
-      long reserved = 0;
-      for (long bytes : promised.values()) {
-        reserved = Math.addExact(reserved, bytes);
-      }
-
-      return reserved;
-    }
+  /** Bytes promised to loads that have not finished yet. */
+  long reservedBytes() {
+    return cache.chargeSnapshot().reservedBytes();
   }
 
   /**
@@ -342,21 +339,7 @@ final class ExecutorIndexCacheWorker implements AutoCloseable {
    * reported.
    */
   Map<String, Long> holders() {
-    return holders(cache.memoryUsage().residentFiles());
-  }
-
-  private Map<String, Long> holders(Map<String, Long> resident) {
-    synchronized (stateLock) {
-      Map<String, Long> holders = new LinkedHashMap<>();
-      for (Map.Entry<String, Installed> entry : installed.entrySet()) {
-        Long bytes = resident.get(entry.getKey());
-        if (bytes != null) {
-          holders.put(entry.getKey(), bytes);
-        }
-      }
-
-      return holders;
-    }
+    return cache.shape().holders();
   }
 
   Set<String> residentKeys() {
@@ -364,7 +347,7 @@ final class ExecutorIndexCacheWorker implements AutoCloseable {
   }
 
   long usedBytes() {
-    return cache.memoryUsage().usedBytes();
+    return cache.chargeSnapshot().usedBytes();
   }
 
   IndexCacheWorkerConfig config() {
@@ -379,10 +362,7 @@ final class ExecutorIndexCacheWorker implements AutoCloseable {
   public void close() {
     closed.set(true);
     completed.clear();
-    synchronized (stateLock) {
-      // Nothing will be admitted any more, so the promised space must not keep inflating reports.
-      promised.clear();
-    }
+    // In-flight cache reservations are released by their load's finally block.
   }
 
   /** Acknowledgement for a command that failed outside the loader, for example admission code. */
@@ -409,6 +389,7 @@ final class ExecutorIndexCacheWorker implements AutoCloseable {
         .sequence(command.sequence())
         .status(status)
         .bytes(bytes)
+        .metadataShape(cache.shape())
         .reason(reason)
         .build();
   }

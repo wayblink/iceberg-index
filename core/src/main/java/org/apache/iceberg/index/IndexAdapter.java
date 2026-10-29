@@ -23,6 +23,7 @@ import java.util.Comparator;
 import java.util.List;
 import java.util.Set;
 import javax.annotation.Nullable;
+import org.apache.iceberg.relocated.com.google.common.base.Preconditions;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableSet;
 import org.apache.iceberg.relocated.com.google.common.collect.Lists;
 
@@ -119,7 +120,9 @@ public interface IndexAdapter {
    * @return a searcher over the loaded payload
    */
   default PreparedSearch prepareAuxiliary(ByteBuffer payload) {
-    return (query, topK) -> searchAuxiliary(payload, query, topK);
+    ByteBuffer snapshot = snapshot(payload);
+    return (query, topK) ->
+        searchAuxiliary(snapshot.duplicate().order(snapshot.order()), query, topK);
   }
 
   /**
@@ -131,7 +134,15 @@ public interface IndexAdapter {
    * @return a searcher over the loaded payload
    */
   default PreparedSearch prepare(ByteBuffer payload) {
-    return (query, topK) -> search(payload, query, topK);
+    ByteBuffer snapshot = snapshot(payload);
+    return (query, topK) -> search(snapshot.duplicate().order(snapshot.order()), query, topK);
+  }
+
+  private static ByteBuffer snapshot(ByteBuffer payload) {
+    Preconditions.checkArgument(payload != null, "Index payload is null");
+    byte[] bytes = new byte[payload.remaining()];
+    payload.duplicate().get(bytes);
+    return ByteBuffer.wrap(bytes).order(payload.order());
   }
 
   /** A loaded index payload that can be searched more than once. */

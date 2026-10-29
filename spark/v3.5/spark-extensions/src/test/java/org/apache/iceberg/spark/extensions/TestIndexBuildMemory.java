@@ -148,7 +148,7 @@ public class TestIndexBuildMemory extends ExtensionsTestBase {
         assertThat(memory).isNotNull();
         assertThat(memory.fileBytes())
             .isEqualTo(table.io().newInputFile(file.location()).getLength());
-        assertThat(memory.modelVersion()).isEqualTo(1);
+        assertThat(memory.modelVersion()).isEqualTo(2);
         assertThat(memory.readerId()).isEqualTo(readerId);
         assertThat(memory.runtimeProfile())
             .contains("reference-bytes=4", "alignment=8", "compact-strings=true");

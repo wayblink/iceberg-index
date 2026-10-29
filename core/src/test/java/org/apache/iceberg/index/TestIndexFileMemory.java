@@ -75,11 +75,38 @@ class TestIndexFileMemory {
         .hasMessageContaining("prepared bytes");
   }
 
-  @Test
-  void rejectsResidentSizeOverflow() {
-    assertThatThrownBy(() -> builder().payloadBytes(Long.MAX_VALUE).preparedBytes(1).build())
+  @ParameterizedTest
+  @ValueSource(ints = {1, 99})
+  void rejectsResidentSizeOverflowForModelsWithoutTheModelTwoContract(int modelVersion) {
+    assertThatThrownBy(
+            () ->
+                builder()
+                    .modelVersion(modelVersion)
+                    .payloadBytes(Long.MAX_VALUE)
+                    .preparedBytes(1)
+                    .build())
         .isInstanceOf(IllegalArgumentException.class)
         .hasMessageContaining("overflow");
+  }
+
+  @Test
+  void modelTwoDoesNotAddDiagnosticPayloadToPreparedState() {
+    IndexFileMemory memory =
+        builder()
+            .modelVersion(2)
+            .payloadBytes(Long.MAX_VALUE)
+            .preparedBytes(Long.MAX_VALUE)
+            .build();
+    assertThat(memory.payloadBytes()).isEqualTo(Long.MAX_VALUE);
+    assertThat(memory.preparedBytes()).isEqualTo(Long.MAX_VALUE);
+    assertThat(memory.toBuilder().fileBytes(Long.MAX_VALUE).build().preparedBytes())
+        .isEqualTo(Long.MAX_VALUE);
+  }
+
+  @Test
+  void modelOneRetainsItsAdditionBoundary() {
+    assertThat(builder().payloadBytes(Long.MAX_VALUE - 1).preparedBytes(1).build().payloadBytes())
+        .isEqualTo(Long.MAX_VALUE - 1);
   }
 
   @Test

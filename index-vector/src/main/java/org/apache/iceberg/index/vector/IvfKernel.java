@@ -18,14 +18,12 @@
  */
 package org.apache.iceberg.index.vector;
 
-import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
-import java.io.DataInputStream;
 import java.io.DataOutputStream;
 import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.nio.ByteBuffer;
-import java.util.IdentityHashMap;
+import java.util.Arrays;
 import java.util.List;
 import java.util.Map;
 import org.apache.iceberg.index.IndexAdapter.PreparedSearch;
@@ -66,6 +64,18 @@ public final class IvfKernel implements VectorKernel {
   private static final int QUANTIZED_FORMAT_VERSION = 2;
 
   private static final int MAX_ITERATIONS = 25;
+
+  /**
+   * The retained fields of the prepared roots, in the layout the estimate describes: the loaded
+   * payload, the searcher and the scoring object.
+   */
+  private static final long LOADED_FIELDS =
+      7L * PreparedStructureSize.REFERENCE_BYTES + Integer.BYTES;
+
+  private static final long SEARCHER_FIELDS =
+      2L * PreparedStructureSize.REFERENCE_BYTES + 3L * Integer.BYTES + 2L * Long.BYTES;
+
+  private static final long SCORING_FIELDS = PreparedStructureSize.REFERENCE_BYTES;
 
   private final int dimension;
   private final IvfOptions options;
@@ -124,12 +134,6 @@ public final class IvfKernel implements VectorKernel {
     int listCount = options.nlistFor(count);
     float[][] centroids = listCount == 0 ? new float[0][] : train(vectors, listCount);
     int[][] assignments = assign(vectors, centroids);
-    long memberListsBytes = 0;
-    long entryBytes = entryBytes();
-    for (int[] members : assignments) {
-      memberListsBytes += PreparedStructureSize.nestedList(members.length, entryBytes);
-    }
-
     long quantizerBytes = 0;
     ByteArrayOutputStream payload = new ByteArrayOutputStream();
     try (DataOutputStream out = new DataOutputStream(payload)) {
@@ -171,11 +175,19 @@ public final class IvfKernel implements VectorKernel {
       throw new UncheckedIOException("Failed to encode the IVF index payload", e);
     }
 
+    byte[] encoded = payload.toByteArray();
     long dictionaryBytes = VectorMemoryEstimates.dictionaryBytes(dataFiles);
     return VectorMemoryEstimates.result(
         this,
-        ByteBuffer.wrap(payload.toByteArray()),
-        preparedBytes(centroids.length, memberListsBytes, dictionaryBytes, quantizerBytes),
+        ByteBuffer.wrap(encoded),
+        preparedBytes(
+            encoded.length,
+            centroids.length,
+            dataFiles.size(),
+            dictionaryBytes,
+            dimension,
+            isQuantized(),
+            quantizerBytes),
         Runtime.getRuntime().availableProcessors(),
         Map.of(
             "entry-count",
@@ -188,8 +200,10 @@ public final class IvfKernel implements VectorKernel {
             (long) dataFiles.size(),
             "data-file-string-bytes",
             dictionaryBytes,
-            "member-list-bytes",
-            memberListsBytes,
+            "payload-bytes",
+            (long) encoded.length,
+            "list-directory-bytes",
+            2L * PreparedStructureSize.ints(centroids.length),
             "quantizer-bytes",
             quantizerBytes,
             "quantizer-bits",
@@ -268,103 +282,323 @@ public final class IvfKernel implements VectorKernel {
 
   @Override
   public PreparedSearch prepare(ByteBuffer payload) {
-    Loaded loaded = load(VectorPayloads.toBytes(payload));
+    // the snapshot is this searcher's own array: the caller may reuse or mutate what it passed
+    byte[] snapshot = VectorPayloads.toBytes(payload);
+    Loaded loaded = load(snapshot);
+    long stride =
+        isQuantized()
+            ? IvfLayout.quantizedStride(IvfLayout.codeBytes(quantizer.padded(), quantizer.bits()))
+            : IvfLayout.plainStride(dimension);
     return new ListSearcher(
-        loaded, dimension, options.nprobe(), scoring.metric(), preparedBytes(loaded));
+        loaded,
+        dimension,
+        options.nprobe(),
+        scoring.metric(),
+        stride,
+        isQuantized() ? quantizer.codeBytes() : 0,
+        preparedBytes(loaded));
   }
 
   /**
-   * What the decoded lists cost: every entry with the vector or the code it was stored as, the
-   * centroids the search compares the query against, and the per-list centres a quantized index
-   * keeps to score with.
+   * What a prepared searcher actually holds: the snapshot U, the list directory, the trained
+   * centroids, the data file dictionary, and a quantizer per list.
    *
-   * <p>A quantized list is the case a single factor gets most wrong: its entries hold a handful of
-   * bytes each where an unquantized entry holds a whole vector.
+   * <p>There is no per-record object any more: a record is read where it lies, so its cost is the
+   * bytes the payload already holds. The dictionary is counted by identity, once per retained
+   * string, and roots are counted separately from the arrays they point at.
    */
-  private long preparedBytes(Loaded loaded) {
-    long dictionaryBytes = 0;
-    long memberListsBytes = 0;
-    long entryBytes = entryBytes();
-    // Decoded entries share dictionary strings, regardless of the identity of the build inputs.
-    IdentityHashMap<String, Boolean> dataFiles = new IdentityHashMap<>();
-    for (List<IvfEntry> members : loaded.lists) {
-      memberListsBytes += PreparedStructureSize.nestedList(members.size(), entryBytes);
-      for (IvfEntry entry : members) {
-        if (dataFiles.put(entry.dataFile, Boolean.TRUE) == null) {
-          dictionaryBytes += PreparedStructureSize.string(entry.dataFile);
-        }
-      }
+  private static long preparedBytes(
+      long payloadBytes,
+      int listCount,
+      int dataFileCount,
+      long dictionaryBytes,
+      int dimension,
+      boolean quantized,
+      long quantizerBytes) {
+    long bytes =
+        PreparedStructureSize.object(LOADED_FIELDS)
+            + PreparedStructureSize.object(SEARCHER_FIELDS)
+            + PreparedStructureSize.object(SCORING_FIELDS)
+            + PreparedStructureSize.bytes((int) payloadBytes)
+            + PreparedStructureSize.ints(listCount)
+            + PreparedStructureSize.ints(listCount)
+            + PreparedStructureSize.references(listCount)
+            + (long) listCount * PreparedStructureSize.floats(dimension)
+            + PreparedStructureSize.references(dataFileCount)
+            + dictionaryBytes;
+    if (quantized) {
+      bytes +=
+          PreparedStructureSize.references(listCount)
+              + (long) listCount * PreparedStructureSize.floats(dimension)
+              + PreparedStructureSize.references(listCount)
+              + quantizerBytes;
     }
 
+    return bytes;
+  }
+
+  private static long preparedBytes(Loaded loaded) {
+    PreparedStructureSize.Receipt receipt = new PreparedStructureSize.Receipt();
     long quantizerBytes = 0;
     if (loaded.listQuantizers != null) {
       for (RaBitQQuantizer listQuantizer : loaded.listQuantizers) {
-        quantizerBytes += listQuantizer.estimatedBytes();
+        quantizerBytes += listQuantizer.estimatedBytes(receipt);
       }
     }
 
     return preparedBytes(
-        loaded.centroids.length, memberListsBytes, dictionaryBytes, quantizerBytes);
+        loaded.payload.length,
+        loaded.listStarts.length,
+        loaded.dataFiles.length,
+        VectorMemoryEstimates.dictionaryBytes(Arrays.asList(loaded.dataFiles)),
+        loaded.centroids.length == 0 ? 0 : loaded.centroids[0].length,
+        loaded.listQuantizers != null,
+        quantizerBytes);
   }
 
-  private long preparedBytes(
-      int listCount, long memberListsBytes, long dictionaryBytes, long quantizerBytes) {
-    long total =
-        PreparedStructureSize.object(4L * PreparedStructureSize.REFERENCE_BYTES)
-            + PreparedStructureSize.object(
-                2L * PreparedStructureSize.REFERENCE_BYTES + 2L * Integer.BYTES + Long.BYTES)
-            + PreparedStructureSize.object(PreparedStructureSize.REFERENCE_BYTES)
-            + PreparedStructureSize.references(listCount)
-            + (long) listCount * PreparedStructureSize.floats(dimension)
-            + PreparedStructureSize.nestedList(listCount, 0)
-            + memberListsBytes
-            + dictionaryBytes
-            + PreparedStructureSize.references(listCount);
+  /** Validates the payload header and leaves the reader at the first kernel field. */
+  private void readHeader(VectorPayloadReader in) {
+    VectorPayloadHeader header = VectorPayloadHeader.of(in.payload());
+    Preconditions.checkArgument(
+        header.readableBy(this),
+        "IVF payload was written by %s; this build reads kernel %s version %s",
+        header,
+        NAME,
+        payloadVersion());
+    in.position(Integer.BYTES);
+    if (!header.legacy()) {
+      int nameLength = in.readUnsignedShort();
+      in.skip(nameLength + (long) Integer.BYTES, "the payload header");
+    }
+  }
+
+  /**
+   * Reads the snapshot into a list directory and verifies every record it points at.
+   *
+   * <p>Every record is checked, including those of lists a search would not visit, so a corrupt
+   * payload fails when it is loaded rather than when a query happens to probe the wrong list. The
+   * counts are bounded by the bytes that are actually present before anything is allocated from
+   * them.
+   */
+  private Loaded load(byte[] bytes) {
+    VectorPayloadReader in = new VectorPayloadReader(bytes);
+    readHeader(in);
+    int dims = in.readInt();
+    Preconditions.checkArgument(
+        dims == dimension, "IVF payload has %s dimensions, the index has %s", dims, dimension);
+    int bits = 0;
+    long seed = 0L;
     if (isQuantized()) {
-      total += (long) listCount * PreparedStructureSize.floats(dimension);
-      total += PreparedStructureSize.references(listCount) + quantizerBytes;
+      bits = in.readInt();
+      seed = in.readLong();
+      if (bits != quantizer.bits()) {
+        throw new IllegalArgumentException(
+            "IVF payload was written with "
+                + bits
+                + " bits per dimension, this index reads "
+                + quantizer.bits());
+      }
     }
 
-    return total;
-  }
+    int listCount = in.readInt();
+    Preconditions.checkArgument(listCount >= 0, "Invalid IVF list count: %s", listCount);
+    long minimumPerList = minimumBytesPerList();
+    Preconditions.checkArgument(
+        (long) listCount * minimumPerList <= in.remaining(),
+        "Invalid IVF list count %s: the %s-byte payload ends before those centroids and list"
+            + " headers (each list needs %s bytes, at most %s fit)",
+        listCount,
+        in.remaining(),
+        minimumPerList,
+        in.remaining() / minimumPerList);
 
-  /** Object fields and payload retained by an entry; its list slot is counted separately. */
-  private long entryBytes() {
-    long payload =
+    long centroidBytes = (long) listCount * dimension * Float.BYTES;
+    Preconditions.checkArgument(
+        centroidBytes <= in.remaining(),
+        "IVF payload ends inside the centroids: %s bytes remain, %s needed",
+        in.remaining(),
+        centroidBytes);
+    float[][] centroids = new float[listCount][dimension];
+    for (int list = 0; list < listCount; list++) {
+      for (int d = 0; d < dimension; d++) {
+        centroids[list][d] = in.readFloat();
+      }
+    }
+
+    String[] dataFiles = readDataFiles(in);
+    int entryCount = in.readInt();
+    Preconditions.checkArgument(entryCount >= 0, "Invalid IVF entry count: %s", entryCount);
+
+    long stride =
         isQuantized()
-            ? PreparedStructureSize.bytes(quantizer.codeBytes())
-                + PreparedStructureSize.floats(RaBitQQuantizer.FACTORS)
-            : PreparedStructureSize.floats(dimension);
-    return PreparedStructureSize.entry(
-        Long.BYTES + 4L * PreparedStructureSize.REFERENCE_BYTES, payload);
+            ? IvfLayout.quantizedStride(IvfLayout.codeBytes(quantizer.padded(), bits))
+            : IvfLayout.plainStride(dimension);
+    int[] listStarts = new int[listCount];
+    int[] listCounts = new int[listCount];
+    float[][] listCenters = isQuantized() ? new float[listCount][] : null;
+    long records = 0;
+    for (int list = 0; list < listCount; list++) {
+      if (isQuantized()) {
+        float[] center = new float[dimension];
+        for (int d = 0; d < dimension; d++) {
+          center[d] = in.readFloat();
+        }
+        listCenters[list] = center;
+      }
+
+      int count = in.readInt();
+      String where = "IVF list " + list;
+      Preconditions.checkArgument(count >= 0, "Invalid %s record count: %s", where, count);
+      int recordStart = in.position();
+      long end = IvfLayout.recordEnd(recordStart, count, stride, where);
+      Preconditions.checkArgument(
+          end <= in.limit(),
+          "%s has %s records of %s bytes from byte %s, ending at %s after the %s-byte payload",
+          where,
+          count,
+          stride,
+          recordStart,
+          end,
+          in.limit());
+      for (int record = 0; record < count; record++) {
+        long offset = recordStart + (long) record * stride;
+        int dataFileIndex = in.intAt(offset);
+        Preconditions.checkArgument(
+            dataFileIndex >= 0 && dataFileIndex < dataFiles.length,
+            "Invalid IVF data file index %s at %s record %s: the dictionary holds %s data files",
+            dataFileIndex,
+            where,
+            record,
+            dataFiles.length);
+      }
+
+      in.position((int) end);
+      listStarts[list] = recordStart;
+      listCounts[list] = count;
+      records += count;
+    }
+
+    Preconditions.checkArgument(
+        records == entryCount,
+        "Invalid IVF entry count %s: the lists hold %s record%s",
+        entryCount,
+        records,
+        records == 1 ? "" : "s");
+
+    RaBitQQuantizer[] listQuantizers = null;
+    if (isQuantized()) {
+      listQuantizers = new RaBitQQuantizer[listCount];
+      for (int list = 0; list < listCount; list++) {
+        listQuantizers[list] = new RaBitQQuantizer(dimension, seed, bits, listCenters[list]);
+      }
+    }
+
+    return new Loaded(
+        bytes,
+        listStarts,
+        listCounts,
+        centroids,
+        listCenters,
+        dataFiles,
+        listQuantizers,
+        entryCount);
   }
 
-  /** A prepared search over the decoded lists, which reports what it holds. */
+  /** The least a list can occupy: its centroid, and its own centre and count when quantized. */
+  private long minimumBytesPerList() {
+    return (long) Float.BYTES * dimension + IvfLayout.listHeader(dimension, isQuantized());
+  }
+
+  private static String[] readDataFiles(VectorPayloadReader in) {
+    int dataFileCount = in.readInt();
+    Preconditions.checkArgument(
+        dataFileCount >= 0, "Invalid IVF data file count: %s", dataFileCount);
+    Preconditions.checkArgument(
+        (long) dataFileCount * Short.BYTES <= in.remaining(),
+        "Invalid IVF data file count %s: the payload holds %s bytes, enough for at most %s",
+        dataFileCount,
+        in.remaining(),
+        in.remaining() / Short.BYTES);
+    String[] dataFiles = new String[dataFileCount];
+    for (int i = 0; i < dataFileCount; i++) {
+      try {
+        dataFiles[i] = in.readUTF();
+      } catch (IllegalArgumentException e) {
+        throw new IllegalArgumentException(
+            "IVF data file dictionary entry " + i + " is truncated: " + e.getMessage(), e);
+      }
+    }
+
+    return dataFiles;
+  }
+
+  /** The loaded payload: its snapshot, a directory into it, and the metadata a search needs. */
+  private static final class Loaded {
+    private final byte[] payload;
+    private final int[] listStarts;
+    private final int[] listCounts;
+    private final float[][] centroids;
+    private final float[][] listCenters;
+    private final String[] dataFiles;
+    private final RaBitQQuantizer[] listQuantizers;
+    private final int entryCount;
+
+    private Loaded(
+        byte[] payload,
+        int[] listStarts,
+        int[] listCounts,
+        float[][] centroids,
+        float[][] listCenters,
+        String[] dataFiles,
+        RaBitQQuantizer[] listQuantizers,
+        int entryCount) {
+      this.payload = payload;
+      this.listStarts = listStarts;
+      this.listCounts = listCounts;
+      this.centroids = centroids;
+      this.listCenters = listCenters;
+      this.dataFiles = dataFiles;
+      this.listQuantizers = listQuantizers;
+      this.entryCount = entryCount;
+    }
+  }
+
+  /** A prepared search that reads records where they lie and keeps a bounded top-k. */
   private static final class ListSearcher implements PreparedSearch {
     private final Loaded loaded;
     private final int dimension;
     private final int nprobe;
     private final VectorScoring scoring;
     private final long bytes;
+    private final long stride;
+    private final int codeBytes;
 
     private ListSearcher(
-        Loaded loaded, int dimension, int nprobe, VectorIndexDefinition.Metric metric, long bytes) {
+        Loaded loaded,
+        int dimension,
+        int nprobe,
+        VectorIndexDefinition.Metric metric,
+        long stride,
+        int codeBytes,
+        long bytes) {
       this.loaded = loaded;
       this.dimension = dimension;
       this.nprobe = nprobe;
       this.scoring = new VectorScoring(metric);
+      this.stride = stride;
+      this.codeBytes = codeBytes;
       this.bytes = bytes;
     }
 
     @Override
     public long estimatedBytes() {
-      return bytes;
+      return VectorMemoryEstimates.knownBytes(bytes);
     }
 
     @Override
     public List<IndexSearchResult> search(ByteBuffer query, int topK) {
       Preconditions.checkArgument(topK >= 0, "Top-k must be non-negative: %s", topK);
-      if (topK == 0 || loaded.lists.isEmpty()) {
+      if (topK == 0 || loaded.entryCount == 0 || loaded.centroids.length == 0) {
         return ImmutableList.of();
       }
 
@@ -372,208 +606,105 @@ public final class IvfKernel implements VectorKernel {
           VectorPayloads.decodeVector(VectorPayloads.toBytes(query), dimension, "Query");
       // the partitions worth visiting, chosen by the same measure the vectors were partitioned by
       int visited = Math.min(nprobe, loaded.centroids.length);
-      List<IndexSearchResult> results = Lists.newArrayList();
-      for (int list : nearestCentroids(queryVector, loaded.centroids, visited, scoring)) {
-        if (loaded.listQuantizers != null) {
-          scoreQuantizedList(queryVector, loaded, list, results, scoring);
-        } else {
-          for (IvfEntry entry : loaded.lists.get(list)) {
-            results.add(
-                IndexSearchResult.of(
-                    entry.dataFile, entry.rowPosition, scoring.score(queryVector, entry.vector)));
-          }
-        }
+      int[] lists = nearestCentroids(queryVector, loaded.centroids, visited, scoring);
+      long candidates = 0;
+      for (int list : lists) {
+        candidates = Math.addExact(candidates, loaded.listCounts[list]);
       }
 
-      results.sort(scoring.comparator());
-      return results.size() > topK
-          ? ImmutableList.copyOf(results.subList(0, topK))
-          : ImmutableList.copyOf(results);
-    }
-  }
-
-  /** Reads the centroids and the lists of a payload, once per payload that is searched. */
-  private Loaded load(byte[] bytes) {
-    try (DataInputStream in = new DataInputStream(new ByteArrayInputStream(bytes))) {
-      VectorPayloads.readHeader(in, NAME, payloadVersion(), "IVF");
-      int dims = in.readInt();
-      Preconditions.checkArgument(
-          dims == dimension, "IVF payload has %s dimensions, the index has %s", dims, dimension);
-      // read conditionally rather than by passing a dummy, and checked with a plain if because
-      // Preconditions evaluates its message arguments before it decides whether to throw
-      int bits = 0;
-      long seed = 0L;
-      if (isQuantized()) {
-        bits = in.readInt();
-        seed = in.readLong();
-        if (bits != quantizer.bits()) {
-          throw new IllegalArgumentException(
-              "IVF payload was written with "
-                  + bits
-                  + " bits per dimension, this index reads "
-                  + quantizer.bits());
-        }
-      }
-
-      int listCount = in.readInt();
-      Preconditions.checkArgument(listCount >= 0, "Invalid IVF list count: %s", listCount);
-      float[][] centroids = new float[listCount][dimension];
-      for (int list = 0; list < listCount; list++) {
-        for (int d = 0; d < dimension; d++) {
-          centroids[list][d] = in.readFloat();
-        }
-      }
-
-      String[] dataFiles = readDataFiles(in);
-      int entryCount = in.readInt();
-      Preconditions.checkArgument(entryCount >= 0, "Invalid IVF entry count: %s", entryCount);
-      List<List<IvfEntry>> lists = Lists.newArrayListWithCapacity(listCount);
-      float[][] listCenters = new float[listCount][];
-      for (int list = 0; list < listCount; list++) {
-        if (isQuantized()) {
-          float[] listCenter = new float[dimension];
-          for (int d = 0; d < dimension; d++) {
-            listCenter[d] = in.readFloat();
-          }
-          listCenters[list] = listCenter;
-        }
-        lists.add(readList(in, dataFiles));
-      }
-
-      RaBitQQuantizer[] listQuantizers = null;
-      if (isQuantized()) {
-        listQuantizers = new RaBitQQuantizer[listCount];
-        for (int list = 0; list < listCount; list++) {
-          listQuantizers[list] =
-              new RaBitQQuantizer(dimension, seed, quantizer.bits(), listCenters[list]);
-        }
-      }
-
-      return new Loaded(centroids, lists, listCenters, listQuantizers);
-    } catch (IOException e) {
-      throw new UncheckedIOException("Failed to load the IVF index payload", e);
-    }
-  }
-
-  private static String[] readDataFiles(DataInputStream in) throws IOException {
-    int dataFileCount = in.readInt();
-    Preconditions.checkArgument(
-        dataFileCount >= 0, "Invalid IVF data file count: %s", dataFileCount);
-    String[] dataFiles = new String[dataFileCount];
-    for (int i = 0; i < dataFileCount; i++) {
-      dataFiles[i] = in.readUTF();
-    }
-    return dataFiles;
-  }
-
-  private List<IvfEntry> readList(DataInputStream in, String[] dataFiles) throws IOException {
-    int listSize = in.readInt();
-    Preconditions.checkArgument(listSize >= 0, "Invalid IVF list size: %s", listSize);
-    List<IvfEntry> members = Lists.newArrayListWithCapacity(listSize);
-    byte[] code = isQuantized() ? new byte[quantizer.codeBytes()] : null;
-    for (int i = 0; i < listSize; i++) {
-      int dataFileIndex = in.readInt();
-      Preconditions.checkArgument(
-          dataFileIndex >= 0 && dataFileIndex < dataFiles.length,
-          "Invalid IVF data file index: %s",
-          dataFileIndex);
-      long rowPosition = in.readLong();
-      if (isQuantized()) {
-        in.readFully(code);
-        float[] factors = new float[RaBitQQuantizer.FACTORS];
-        for (int f = 0; f < factors.length; f++) {
-          factors[f] = in.readFloat();
-        }
-        members.add(new IvfEntry(dataFiles[dataFileIndex], rowPosition, code.clone(), factors));
+      VectorTopK top = new VectorTopK(topK, candidates, scoring, index -> loaded.dataFiles[index]);
+      VectorPayloadReader reader = new VectorPayloadReader(loaded.payload);
+      if (loaded.listQuantizers == null) {
+        scorePlainLists(queryVector, lists, reader, top);
       } else {
-        float[] vector = new float[dimension];
-        for (int d = 0; d < dimension; d++) {
-          vector[d] = in.readFloat();
+        scoreQuantizedLists(queryVector, lists, reader, top);
+      }
+
+      return top.results();
+    }
+
+    /**
+     * Scores the records of unquantized lists, reading each vector into one search-private array.
+     */
+    private void scorePlainLists(
+        float[] queryVector, int[] lists, VectorPayloadReader reader, VectorTopK top) {
+      float[] vector = new float[dimension];
+      for (int list : lists) {
+        int count = loaded.listCounts[list];
+        long offset = loaded.listStarts[list];
+        for (int record = 0; record < count; record++, offset += stride) {
+          int dataFileIndex = reader.intAt(offset);
+          long rowPosition = reader.longAt(offset + Integer.BYTES);
+          long vectorBase = offset + Integer.BYTES + Long.BYTES;
+          for (int d = 0; d < dimension; d++) {
+            vector[d] = reader.floatAt(vectorBase + (long) Float.BYTES * d);
+          }
+
+          top.offer(dataFileIndex, rowPosition, scoring.score(queryVector, vector));
         }
-        members.add(new IvfEntry(dataFiles[dataFileIndex], rowPosition, vector));
       }
     }
-    return members;
-  }
 
-  /** A decoded payload: the centroids that partition it, and the vectors under each of them. */
-  private static final class Loaded {
-    private final float[][] centroids;
-    private final List<List<IvfEntry>> lists;
-    private final float[][] listCenters;
-    private final RaBitQQuantizer[] listQuantizers;
+    /**
+     * Scores the records of quantized lists from their codes in place.
+     *
+     * <p>The query is centred and rotated once per list, as before; only the code and the three
+     * factors are read per record, and the arithmetic is the quantizer's own, in the same order and
+     * at the same precision as when the code was a decoded array.
+     */
+    private void scoreQuantizedLists(
+        float[] queryVector, int[] lists, VectorPayloadReader reader, VectorTopK top) {
+      float[] factors = new float[RaBitQQuantizer.FACTORS];
+      for (int list : lists) {
+        RaBitQQuantizer listQuantizer = loaded.listQuantizers[list];
+        float[] center = loaded.listCenters[list];
+        float[] rotatedQuery = listQuantizer.rotateQuery(queryVector);
+        double queryLengthSquared = 0.0;
+        for (int d = 0; d < dimension; d++) {
+          double difference = queryVector[d] - center[d];
+          queryLengthSquared += difference * difference;
+        }
 
-    private Loaded(
-        float[][] centroids,
-        List<List<IvfEntry>> lists,
-        float[][] listCenters,
-        RaBitQQuantizer[] listQuantizers) {
-      this.centroids = centroids;
-      this.lists = lists;
-      this.listCenters = listCenters;
-      this.listQuantizers = listQuantizers;
-    }
-  }
+        double centerSquared = 0.0;
+        double querySquared = 0.0;
+        for (int d = 0; d < dimension; d++) {
+          centerSquared += (double) center[d] * center[d];
+          querySquared += (double) queryVector[d] * queryVector[d];
+        }
 
-  /**
-   * Scores one list whose vectors are stored as codes.
-   *
-   * <p>Each list has its own centre, so the query is turned into a residual against it before it is
-   * rotated; the estimate is then of the distance between two residuals, which is the distance
-   * between the vectors themselves. The code is a candidate generator: it orders a wide set well
-   * and the top of it badly, so what it returns is meant to be re-scored exactly.
-   */
-  private static void scoreQuantizedList(
-      float[] queryVector,
-      Loaded loaded,
-      int list,
-      List<IndexSearchResult> results,
-      VectorScoring scoring) {
-    int dimension = queryVector.length;
-    RaBitQQuantizer listQuantizer = loaded.listQuantizers[list];
-    float[] rotatedQuery = listQuantizer.rotateQuery(queryVector);
-    double queryLengthSquared = 0.0;
-    float[] center = loaded.listCenters[list];
-    for (int d = 0; d < dimension; d++) {
-      double difference = queryVector[d] - center[d];
-      queryLengthSquared += difference * difference;
-    }
+        int count = loaded.listCounts[list];
+        long offset = loaded.listStarts[list];
+        for (int record = 0; record < count; record++, offset += stride) {
+          int dataFileIndex = reader.intAt(offset);
+          long rowPosition = reader.longAt(offset + Integer.BYTES);
+          long codeBase = offset + Integer.BYTES + Long.BYTES;
+          long factorsBase = codeBase + codeBytes;
+          for (int f = 0; f < factors.length; f++) {
+            factors[f] = reader.floatAt(factorsBase + (long) Float.BYTES * f);
+          }
 
-    double centerSquared = 0.0;
-    double querySquared = 0.0;
-    for (int d = 0; d < dimension; d++) {
-      centerSquared += (double) center[d] * center[d];
-      querySquared += (double) queryVector[d] * queryVector[d];
-    }
-
-    for (IvfEntry entry : loaded.lists.get(list)) {
-      double score;
-      switch (scoring.metric()) {
-        case EUCLIDEAN:
-          score =
-              Math.sqrt(
-                  listQuantizer.estimatedDistanceSquared(
-                      entry.code, 0, entry.factors, rotatedQuery, queryLengthSquared));
-          break;
-        case DOT_PRODUCT:
-          score =
-              listQuantizer.estimatedInnerProduct(
-                  entry.code, 0, entry.factors, rotatedQuery, queryVector);
-          break;
-        case COSINE:
-          double inner =
-              listQuantizer.estimatedInnerProduct(
-                  entry.code, 0, entry.factors, rotatedQuery, queryVector);
-          double vectorSquared = RaBitQQuantizer.squaredLength(entry.factors, centerSquared);
-          score =
-              vectorSquared <= 0.0 || querySquared <= 0.0
-                  ? 0.0
-                  : inner / (Math.sqrt(vectorSquared) * Math.sqrt(querySquared));
-          break;
-        default:
-          throw new IllegalStateException("Unknown vector index metric: " + scoring.metric());
+          double score =
+              switch (scoring.metric()) {
+                case EUCLIDEAN ->
+                    Math.sqrt(
+                        listQuantizer.estimatedDistanceSquared(
+                            loaded.payload, codeBase, factors, rotatedQuery, queryLengthSquared));
+                case DOT_PRODUCT ->
+                    listQuantizer.estimatedInnerProduct(
+                        loaded.payload, codeBase, factors, rotatedQuery, queryVector);
+                case COSINE -> {
+                  double inner =
+                      listQuantizer.estimatedInnerProduct(
+                          loaded.payload, codeBase, factors, rotatedQuery, queryVector);
+                  double vectorSquared = RaBitQQuantizer.squaredLength(factors, centerSquared);
+                  yield vectorSquared <= 0.0 || querySquared <= 0.0
+                      ? 0.0
+                      : inner / (Math.sqrt(vectorSquared) * Math.sqrt(querySquared));
+                }
+              };
+          top.offer(dataFileIndex, rowPosition, score);
+        }
       }
-      results.add(IndexSearchResult.of(entry.dataFile, entry.rowPosition, score));
     }
   }
 
@@ -714,38 +845,6 @@ public final class IvfKernel implements VectorKernel {
       squared += (double) value * value;
     }
     return Math.sqrt(squared);
-  }
-
-  /** A vector in a list, with the row it came from. */
-  private static final class IvfEntry {
-    private final String dataFile;
-    private final long rowPosition;
-
-    /** The vector itself, or null when the entry holds a code. */
-    private final float[] vector;
-
-    /** The code of the vector, or null when the entry holds the vector. */
-    private final byte[] code;
-
-    /** The numbers stored with a code: length, correction, dot with the list's centre. */
-    private final float[] factors;
-
-    private IvfEntry(String dataFile, long rowPosition, float[] vector) {
-      this(dataFile, rowPosition, vector, null, null);
-    }
-
-    private IvfEntry(String dataFile, long rowPosition, byte[] code, float[] factors) {
-      this(dataFile, rowPosition, null, code, factors);
-    }
-
-    private IvfEntry(
-        String dataFile, long rowPosition, float[] vector, byte[] code, float[] factors) {
-      this.dataFile = dataFile;
-      this.rowPosition = rowPosition;
-      this.vector = vector;
-      this.code = code;
-      this.factors = factors;
-    }
   }
 
   /** The same partitioning, with the vectors stored as codes rather than as themselves. */

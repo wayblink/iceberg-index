@@ -19,17 +19,29 @@
 package org.apache.iceberg.index.spark;
 
 import java.io.Serializable;
+import java.nio.ByteBuffer;
 import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.IdentityHashMap;
 import java.util.Iterator;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
-import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.locks.ReentrantLock;
+import java.util.function.Consumer;
 import org.apache.iceberg.index.IndexAdapter;
+import org.apache.iceberg.index.IndexFileMemory;
+import org.apache.iceberg.index.IndexSearchResult;
+import org.apache.iceberg.index.spark.IndexCacheMemory.ChargeProjection;
+import org.apache.iceberg.index.spark.IndexCacheMetadata.Component;
+import org.apache.iceberg.index.spark.IndexCacheMetadata.Components;
+import org.apache.iceberg.index.spark.IndexCacheMetadata.MetadataState;
+import org.apache.iceberg.index.spark.IndexCacheMetadata.OwnedMap;
+import org.apache.iceberg.index.spark.IndexCacheMetadata.OwnedSet;
+import org.apache.iceberg.index.spark.IndexCacheMetadata.Texts;
 import org.apache.iceberg.relocated.com.google.common.base.Preconditions;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -209,15 +221,24 @@ final class ExecutorIndexCache {
         return Mode.valueOf(configured.trim().toUpperCase(java.util.Locale.ROOT).replace('-', '_'));
       }
 
-      if (workingSetBytes <= 0) {
+      if (workingSetBytes < 0) {
+        // Unknown capacity cannot promise full residency. Legacy queries may still admit a hot
+        // entry using the explicitly inexact per-file fallback; managed loads require a bound.
+        return Mode.PIN_HOT;
+      }
+      if (workingSetBytes == 0) {
         return Mode.PIN_ALL;
       }
 
-      // compared in the same unit as the budget: what the payloads become, not what they weigh
-      long capacity = budgetPerExecutor * Math.max(1, executors);
+      long capacity;
+      try {
+        capacity = Math.multiplyExact(budgetPerExecutor, Math.max(1, executors));
+      } catch (ArithmeticException e) {
+        capacity = Long.MAX_VALUE;
+      }
       if (workingSetBytes <= capacity) {
         return Mode.PIN_ALL;
-      } else if (workingSetBytes <= 2 * capacity) {
+      } else if (workingSetBytes - capacity <= capacity) {
         return Mode.PIN_HOT;
       } else {
         return Mode.STREAM;
@@ -419,31 +440,83 @@ final class ExecutorIndexCache {
   }
 
   /** One index file as an executor remembers it. */
-  static final class CachedFile {
+  static final class CachedFile implements Component, Serializable {
     private final String owner;
-    private final byte[] payload;
     private final IndexAdapter.PreparedSearch prepared;
     private final long bytes;
+    private final long preparedBytes;
+    private final byte[] context;
     private final ReentrantLock searchLock = new ReentrantLock();
     private int uses;
     // Updated under mapLock; also observed by the search/eviction guards.
     private volatile int leases;
+    // Marking a release uses existing wrapper storage, never allocates under budget pressure.
+    private boolean releasing;
+    private boolean modelInUse;
     // a PIN_ALL entry: the working set fits, so it is never evicted to make room
     private boolean pinned;
     // a 2Q entry: asked for twice, so it outranks an entry seen once
     private boolean protectedRank;
     private long lastAccessNanos = System.nanoTime();
 
-    private CachedFile(
-        String owner, byte[] payload, IndexAdapter.PreparedSearch prepared, long bytes) {
-      this.owner = owner;
-      this.payload = payload;
-      this.prepared = prepared;
-      this.bytes = bytes;
+    private CachedFile(String owner, IndexAdapter.PreparedSearch prepared, long bytes) {
+      // A caller that states the charge itself has no prepared searcher to ask; its zero prepared
+      // size is the honest answer, not a reason to fail the fixture or the policy path.
+      this(owner, prepared, bytes, null, prepared == null ? 0L : prepared.estimatedBytes());
     }
 
-    byte[] payload() {
-      return payload;
+    private CachedFile(
+        String owner,
+        IndexAdapter.PreparedSearch prepared,
+        long bytes,
+        byte[] context,
+        long preparedBytes) {
+      this.owner = owner;
+      this.prepared = prepared;
+      this.bytes = bytes;
+      this.context = context;
+      this.preparedBytes = preparedBytes;
+    }
+
+    @Override
+    public void charge(Components components) {
+      if (prepared == null) {
+        // A fixture that states its whole charge owns no prepared object and no separate owner
+        // text to attribute it to, so the stated bytes are the charge.
+        components.addBytes(bytes);
+        return;
+      }
+      if (components.object(this, 64)) {
+        // ReentrantLock: one compressed synchronizer reference (16); its AQS state (32).
+        components.object(searchLock, 16 + 32);
+        if (context != null) {
+          components.object(context, IndexCacheMetadata.align(16L + context.length));
+        }
+        components.object(prepared, preparedBytes > 0 ? preparedBytes : bytes);
+        components.add(owner);
+      }
+    }
+
+    long preparedBytes() {
+      return preparedBytes;
+    }
+
+    boolean hasKnownContext() {
+      return context != null;
+    }
+
+    boolean matchesContext(IndexAdapter adapter) {
+      byte[] current = IndexCacheMemory.contextFingerprint(adapter);
+      return context != null && current != null && Arrays.equals(context, current);
+    }
+
+    CachedFile withContext(IndexAdapter adapter) {
+      return new CachedFile(
+          owner,
+          prepared,
+          bytes,
+          preparedBytes > 0 ? IndexCacheMemory.contextFingerprint(adapter) : null,
+          preparedBytes);
     }
 
     /** Runs the body against the prepared structure, with this file's search held exclusively. */
@@ -458,7 +531,7 @@ final class ExecutorIndexCache {
 
     /** Whether a query lease or an active search prevents this file from being released. */
     boolean inUse() {
-      if (leases > 0 || searchLock.isHeldByCurrentThread()) {
+      if (modelInUse || leases > 0 || searchLock.isHeldByCurrentThread()) {
         return true;
       }
 
@@ -479,7 +552,7 @@ final class ExecutorIndexCache {
     }
 
     CachedFile withOwner(String newOwner) {
-      return new CachedFile(newOwner, payload, prepared, bytes);
+      return new CachedFile(newOwner, prepared, bytes, context, preparedBytes);
     }
 
     private void touch() {
@@ -562,37 +635,81 @@ final class ExecutorIndexCache {
   }
 
   // access order, so the first entry of the iteration is the least recently used
-  private final Map<String, CachedFile> probation = new LinkedHashMap<>(16, 0.75f, true);
-  private final Map<String, CachedFile> protectedFiles = new LinkedHashMap<>(16, 0.75f, true);
+  private Texts texts = new Texts();
+  private OwnedMap<String, CachedFile> probation = new OwnedMap<>(true);
+  private OwnedMap<String, CachedFile> protectedFiles = new OwnedMap<>(true);
   // how often a file has been asked for without being kept, for the PIN_HOT admission
-  private final Map<String, Integer> asked =
-      new LinkedHashMap<>(16, 0.75f, true) {
-        @Override
-        protected boolean removeEldestEntry(Map.Entry<String, Integer> eldest) {
-          return size() > 100_000;
-        }
-      };
+  private OwnedMap<String, Integer> asked = new OwnedMap<>(true);
   private final Object mapLock = new Object();
   private ExecutorBudget executorBudget;
-  private final IndexCacheOwnership ownership = new IndexCacheOwnership();
-  private final Set<String> pendingReleases = new LinkedHashSet<>();
+  private IndexCacheOwnership ownership = new IndexCacheOwnership(texts);
   // Observational associations do not confer residency ownership or protection.
-  private final Map<String, Set<String>> attribution = new LinkedHashMap<>();
+  private OwnedMap<String, Set<String>> attribution = new OwnedMap<>();
+  private long metadataBudget = Long.MAX_VALUE;
   private long generation;
+  private long chargeSequence;
   // Registered waiters keep the same monitor alive until every caller has left.
-  private final ConcurrentHashMap<String, LoadMonitor> loading = new ConcurrentHashMap<>();
+  private OwnedMap<String, LoadMonitor> loading = new OwnedMap<>();
 
-  private static final class LoadMonitor {
+  private static final class LoadMonitor implements Component, Serializable {
     private int callers;
+    private String owner;
+
+    @Override
+    public void charge(Components components) {
+      if (components.object(this, 24)) {
+        components.add(owner);
+      }
+    }
   }
 
-  private record ManagedLoad(
-      String indexUuid,
-      long epoch,
-      String cacheKey,
-      long generation,
-      String planId,
-      String commandId) {}
+  private static final class ManagedLoad {
+    private final String indexUuid;
+    private final long epoch;
+    private final String cacheKey;
+    private final long generation;
+    private final String planId;
+    private final String commandId;
+
+    private ManagedLoad(
+        String indexUuid,
+        long epoch,
+        String cacheKey,
+        long generation,
+        String planId,
+        String commandId) {
+      this.indexUuid = indexUuid;
+      this.epoch = epoch;
+      this.cacheKey = cacheKey;
+      this.generation = generation;
+      this.planId = planId;
+      this.commandId = commandId;
+    }
+
+    String indexUuid() {
+      return indexUuid;
+    }
+
+    long epoch() {
+      return epoch;
+    }
+
+    String cacheKey() {
+      return cacheKey;
+    }
+
+    long generation() {
+      return generation;
+    }
+
+    String planId() {
+      return planId;
+    }
+
+    String commandId() {
+      return commandId;
+    }
+  }
 
   private final AtomicLong hits = new AtomicLong();
   private final AtomicLong misses = new AtomicLong();
@@ -602,15 +719,24 @@ final class ExecutorIndexCache {
 
   // room promised to loads in flight, and the budget those promises are against
   private long reservedBytes = 0;
-  private final Set<Reservation> reservations = new LinkedHashSet<>();
-  private final Map<String, Long> reservedByOwner = new LinkedHashMap<>();
+  private OwnedSet<Reservation> reservations = new OwnedSet<>();
+  private OwnedMap<String, Long> reservedByOwner = new OwnedMap<>();
 
-  private static final class Reservation {
-    private final String owner;
-    private final long bytes;
+  private static final class Reservation implements Component, Serializable {
+    private String owner;
+    private String cacheKey;
+    private long bytes;
     private final long budget;
     private final String planId;
     private final String commandId;
+
+    @Override
+    public void charge(Components components) {
+      if (components.object(this, 40)) {
+        components.add(owner);
+        components.add(cacheKey);
+      }
+    }
 
     private Reservation(String owner, long bytes, long budget, String planId, String commandId) {
       this.owner = owner;
@@ -622,8 +748,8 @@ final class ExecutorIndexCache {
   }
 
   // what each table holds, so a share of the budget can be reserved per table
-  private final Map<String, Long> bytesByOwner = new LinkedHashMap<>();
-  private final Map<String, Integer> entriesByOwner = new LinkedHashMap<>();
+  private OwnedMap<String, Long> bytesByOwner = new OwnedMap<>();
+  private OwnedMap<String, Integer> entriesByOwner = new OwnedMap<>();
   private long lastSweepNanos = System.nanoTime();
   private static long sweepIntervalNanos = java.util.concurrent.TimeUnit.SECONDS.toNanos(30);
 
@@ -633,6 +759,632 @@ final class ExecutorIndexCache {
   }
 
   private ExecutorIndexCache() {}
+
+  private static final class State implements Serializable {
+    private static final long serialVersionUID = 1L;
+
+    private final Texts texts;
+    private final OwnedMap<String, CachedFile> probation;
+    private final OwnedMap<String, CachedFile> protectedFiles;
+    private final OwnedMap<String, Integer> asked;
+    private final IndexCacheOwnership ownership;
+    private final OwnedMap<String, Set<String>> attribution;
+    private final OwnedMap<String, LoadMonitor> loading;
+    private final OwnedSet<Reservation> reservations;
+    private final OwnedMap<String, Long> reservedByOwner;
+    private final OwnedMap<String, Long> bytesByOwner;
+    private final OwnedMap<String, Integer> entriesByOwner;
+    private final long reservedBytes;
+    private final long bytes;
+
+    private State(
+        Texts texts,
+        OwnedMap<String, CachedFile> probation,
+        OwnedMap<String, CachedFile> protectedFiles,
+        OwnedMap<String, Integer> asked,
+        IndexCacheOwnership ownership,
+        OwnedMap<String, Set<String>> attribution,
+        OwnedMap<String, LoadMonitor> loading,
+        OwnedSet<Reservation> reservations,
+        OwnedMap<String, Long> reservedByOwner,
+        OwnedMap<String, Long> bytesByOwner,
+        OwnedMap<String, Integer> entriesByOwner,
+        long reservedBytes,
+        long bytes) {
+      this.texts = texts;
+      this.probation = probation;
+      this.protectedFiles = protectedFiles;
+      this.asked = asked;
+      this.ownership = ownership;
+      this.attribution = attribution;
+      this.loading = loading;
+      this.reservations = reservations;
+      this.reservedByOwner = reservedByOwner;
+      this.bytesByOwner = bytesByOwner;
+      this.entriesByOwner = entriesByOwner;
+      this.reservedBytes = reservedBytes;
+      this.bytes = bytes;
+    }
+
+    Texts texts() {
+      return texts;
+    }
+
+    OwnedMap<String, CachedFile> probation() {
+      return probation;
+    }
+
+    OwnedMap<String, CachedFile> protectedFiles() {
+      return protectedFiles;
+    }
+
+    OwnedMap<String, Integer> asked() {
+      return asked;
+    }
+
+    IndexCacheOwnership ownership() {
+      return ownership;
+    }
+
+    OwnedMap<String, Set<String>> attribution() {
+      return attribution;
+    }
+
+    OwnedMap<String, LoadMonitor> loading() {
+      return loading;
+    }
+
+    OwnedSet<Reservation> reservations() {
+      return reservations;
+    }
+
+    OwnedMap<String, Long> reservedByOwner() {
+      return reservedByOwner;
+    }
+
+    OwnedMap<String, Long> bytesByOwner() {
+      return bytesByOwner;
+    }
+
+    OwnedMap<String, Integer> entriesByOwner() {
+      return entriesByOwner;
+    }
+
+    long reservedBytes() {
+      return reservedBytes;
+    }
+
+    long bytes() {
+      return bytes;
+    }
+  }
+
+  private State state() {
+    return new State(
+        texts,
+        probation,
+        protectedFiles,
+        asked,
+        ownership,
+        attribution,
+        loading,
+        reservations,
+        reservedByOwner,
+        bytesByOwner,
+        entriesByOwner,
+        reservedBytes,
+        bytes);
+  }
+
+  private void restore(State state) {
+    this.texts = state.texts();
+    this.probation = state.probation();
+    this.protectedFiles = state.protectedFiles();
+    this.asked = state.asked();
+    this.ownership = state.ownership();
+    this.attribution = state.attribution();
+    this.loading = state.loading();
+    this.reservations = state.reservations();
+    this.reservedByOwner = state.reservedByOwner();
+    this.bytesByOwner = state.bytesByOwner();
+    this.entriesByOwner = state.entriesByOwner();
+    this.reservedBytes = state.reservedBytes();
+    this.bytes = state.bytes();
+  }
+
+  private void detachState() {
+    texts = texts.copy();
+    probation = new OwnedMap<>(probation);
+    protectedFiles = new OwnedMap<>(protectedFiles);
+    asked = new OwnedMap<>(asked);
+    ownership = ownership.copy(texts);
+    attribution = new OwnedMap<>(attribution);
+    attribution.replaceAll((key, indexes) -> new OwnedSet<>(indexes));
+    loading = new OwnedMap<>(loading);
+    reservations = new OwnedSet<>(reservations);
+    reservedByOwner = new OwnedMap<>(reservedByOwner);
+    bytesByOwner = new OwnedMap<>(bytesByOwner);
+    entriesByOwner = new OwnedMap<>(entriesByOwner);
+  }
+
+  /** All growing mutations publish one capacity-visible after-state under mapLock. */
+  private boolean admit(long capacity, Runnable mutation) {
+    return admit(capacity, mutation, false, ignored -> {});
+  }
+
+  private static final class OwnerCharges {
+    private final Map<String, Long> effectiveBytes;
+    private final long controlBytes;
+
+    private OwnerCharges(Map<String, Long> effectiveBytes, long controlBytes) {
+      this.effectiveBytes = effectiveBytes;
+      this.controlBytes = controlBytes;
+    }
+
+    Map<String, Long> effectiveBytes() {
+      return effectiveBytes;
+    }
+
+    long controlBytes() {
+      return controlBytes;
+    }
+  }
+
+  private static final class AdmissionDelta {
+    private final Map<String, Long> beforeOwners;
+    private final Map<String, Long> afterOwners;
+    private final long beforeEffective;
+    private final long afterEffective;
+    private final long controlBytes;
+
+    private AdmissionDelta(
+        Map<String, Long> beforeOwners,
+        Map<String, Long> afterOwners,
+        long beforeEffective,
+        long afterEffective,
+        long controlBytes) {
+      this.beforeOwners = beforeOwners;
+      this.afterOwners = afterOwners;
+      this.beforeEffective = beforeEffective;
+      this.afterEffective = afterEffective;
+      this.controlBytes = controlBytes;
+    }
+
+    Map<String, Long> beforeOwners() {
+      return beforeOwners;
+    }
+
+    Map<String, Long> afterOwners() {
+      return afterOwners;
+    }
+
+    long beforeEffective() {
+      return beforeEffective;
+    }
+
+    long afterEffective() {
+      return afterEffective;
+    }
+
+    long controlBytes() {
+      return controlBytes;
+    }
+
+    long ownerIncrement(String owner) {
+      return afterOwners.getOrDefault(owner, 0L) - beforeOwners.getOrDefault(owner, 0L);
+    }
+  }
+
+  private OwnerCharges ownerCharges() {
+    Components components = new Components();
+    Map<String, Long> charges = new LinkedHashMap<>();
+    Set<String> owners = new LinkedHashSet<>(entriesByOwner.keySet());
+    owners.addAll(reservedByOwner.keySet());
+    loading.values().forEach(monitor -> owners.add(monitor.owner));
+    for (String owner : owners) {
+      long before = components.bytes();
+      Set<String> keys = new LinkedHashSet<>();
+      probation.forEach(
+          (key, file) -> {
+            if (owner.equals(file.owner())) {
+              keys.add(key);
+            }
+          });
+      protectedFiles.forEach(
+          (key, file) -> {
+            if (owner.equals(file.owner())) {
+              keys.add(key);
+            }
+          });
+      probation.chargeEntries(components, keys);
+      protectedFiles.chargeEntries(components, keys);
+      attribution.chargeEntries(components, keys);
+      bytesByOwner.chargeEntries(components, Set.of(owner));
+      entriesByOwner.chargeEntries(components, Set.of(owner));
+      Set<String> loadingKeys = new LinkedHashSet<>();
+      loading.forEach(
+          (key, monitor) -> {
+            if (owner.equals(monitor.owner)) {
+              loadingKeys.add(key);
+            }
+          });
+      loading.chargeEntries(components, loadingKeys);
+      Set<Reservation> promises = new LinkedHashSet<>();
+      for (Reservation promise : reservations) {
+        if (owner.equals(promise.owner)) {
+          promises.add(promise);
+        }
+      }
+      reservations.chargeEntries(components, promises);
+      reservedByOwner.chargeEntries(components, Set.of(owner));
+      texts.chargeResident(components);
+      charges.put(
+          owner,
+          Math.addExact(components.bytes() - before, reservedByOwner.getOrDefault(owner, 0L)));
+    }
+    long resident = components.bytes();
+    components.root(ownership);
+    components.root(asked);
+    texts.charge(components);
+    return new OwnerCharges(charges, components.bytes() - resident);
+  }
+
+  private boolean admit(
+      long capacity, Runnable mutation, boolean shrinking, Consumer<AdmissionDelta> increment) {
+    State before = state();
+    MetadataState previous = metadataState(texts, attribution);
+    OwnerCharges beforeCharges = ownerCharges();
+    detachState();
+    try {
+      mutation.run();
+      ChargeProjection projection =
+          IndexCacheMemory.project(previous, ignored -> metadataState(texts, attribution));
+      long previousEffective =
+          IndexCacheMemory.project(previous, unchanged -> unchanged).effectiveBytes();
+      long afterEffective = projection.effectiveBytes();
+      texts.replace(projection.afterState().texts());
+      OwnerCharges afterCharges = ownerCharges();
+      increment.accept(
+          new AdmissionDelta(
+              beforeCharges.effectiveBytes(),
+              afterCharges.effectiveBytes(),
+              previousEffective,
+              afterEffective,
+              afterCharges.controlBytes()));
+      if (afterEffective > capacity && (!shrinking || afterEffective > previousEffective)) {
+        restore(before);
+        return false;
+      }
+      texts.replace(projection.afterState().texts());
+      return true;
+    } catch (ArithmeticException e) {
+      restore(before);
+      return false;
+    } catch (RuntimeException e) {
+      restore(before);
+      throw e;
+    }
+  }
+
+  private static final class SizedPrepared implements IndexAdapter.PreparedSearch, Serializable {
+    private static final long serialVersionUID = 1L;
+
+    private final long estimatedBytes;
+
+    private SizedPrepared(long estimatedBytes) {
+      this.estimatedBytes = estimatedBytes;
+    }
+
+    @Override
+    public long estimatedBytes() {
+      return estimatedBytes;
+    }
+
+    @Override
+    public List<IndexSearchResult> search(ByteBuffer query, int topK) {
+      throw new UnsupportedOperationException("Metadata shape is not a searcher");
+    }
+  }
+
+  /**
+   * Detached capacity-visible roots, with prepared state replaced by identity-preserving quotes.
+   */
+  static final class Shape implements Serializable {
+    private final State state;
+    private final ChargeSnapshot charge;
+    private final String runtime;
+    private final Set<String> pendingLoads;
+
+    private Shape(State state, ChargeSnapshot charge) {
+      this(state, charge, Set.of());
+    }
+
+    private Shape(State state, ChargeSnapshot charge, Set<String> pendingLoads) {
+      this.state = state;
+      this.charge = charge;
+      this.runtime = IndexCacheMemory.runtimeIdentity();
+      this.pendingLoads = Set.copyOf(pendingLoads);
+    }
+
+    boolean compatibleRuntime() {
+      return charge.known()
+          && runtime.equals(IndexCacheMemory.runtimeIdentity())
+          && IndexCacheMemory.supportedLayout();
+    }
+
+    Shape unknownCharge() {
+      return new Shape(
+          state,
+          new ChargeSnapshot(
+              charge.version(),
+              false,
+              charge.usedBytes(),
+              charge.residentBytes(),
+              charge.controlBytes(),
+              charge.reservedBytes(),
+              charge.releasingBytes(),
+              charge.holders(),
+              charge.groupRefs()),
+          pendingLoads);
+    }
+
+    ChargeSnapshot charge() {
+      return charge;
+    }
+
+    static Shape empty() {
+      return new ExecutorIndexCache().shape();
+    }
+
+    Shape project(String indexUuid, long epoch, List<IndexCacheProtocol.File> files) {
+      Preconditions.checkArgument(compatibleRuntime(), "Index cache runtime profile is unknown");
+      ExecutorIndexCache model = new ExecutorIndexCache();
+      model.restore(state);
+      // A projection is newer than the snapshot it came from. A fresh model starts at zero, so
+      // without this the projected shape would be rejected as an older report by the driver.
+      model.chargeSequence = charge.version();
+      model.detachModel();
+      Set<String> keys = new LinkedHashSet<>();
+      for (IndexCacheProtocol.File file : files) {
+        Preconditions.checkArgument(
+            file.owner() != null && !file.owner().isBlank(), "Index owner is unknown");
+        IndexFileMemory memory = file.memory();
+        Preconditions.checkArgument(
+            memory != null && memory.modelVersion() == 2 && memory.preparedBytes() > 0,
+            "Index memory is unknown");
+        keys.add(file.cacheKey());
+        if (model.find(file.cacheKey()) == null) {
+          for (Reservation reservation : new ArrayList<>(model.reservations)) {
+            if (file.cacheKey().equals(reservation.cacheKey)) {
+              model.releaseReservation(reservation);
+            }
+          }
+          String owner = model.texts.own(file.owner());
+          CachedFile retained =
+              new CachedFile(
+                  owner,
+                  new SizedPrepared(memory.preparedBytes()),
+                  IndexCacheMemory.residentBytes(memory),
+                  new byte[32],
+                  memory.preparedBytes());
+          retained.pinned = true;
+          model.protectedFiles.put(model.texts.own(file.cacheKey()), retained);
+          model.bytes += retained.bytes();
+          model.bytesByOwner.merge(owner, retained.bytes(), Long::sum);
+          model.entriesByOwner.merge(owner, 1, Integer::sum);
+        }
+      }
+      if (indexUuid != null) {
+        if (model.ownership.hasTarget(indexUuid)) {
+          Set<String> existing = new LinkedHashSet<>(model.ownership.keys(indexUuid));
+          existing.addAll(keys);
+          model.ownership.applyTarget(indexUuid, epoch, existing);
+          model.ownership.addKeys(indexUuid, epoch, keys);
+        } else {
+          model.ownership.applyTarget(indexUuid, epoch, keys);
+        }
+      }
+      ChargeSnapshot next = model.chargeSnapshot();
+      return new Shape(
+          model.state(),
+          new ChargeSnapshot(
+              next.version(),
+              charge.known() && next.known(),
+              next.usedBytes(),
+              next.residentBytes(),
+              next.controlBytes(),
+              next.reservedBytes(),
+              next.releasingBytes(),
+              next.holders(),
+              next.groupRefs()),
+          pendingLoads);
+    }
+
+    Shape projectAdmission(String indexUuid, long epoch, List<IndexCacheProtocol.File> files) {
+      Set<String> pending = new LinkedHashSet<>(pendingLoads);
+      for (IndexCacheProtocol.File file : files) {
+        if (!state.probation().containsKey(file.cacheKey())
+            && !state.protectedFiles().containsKey(file.cacheKey())) {
+          pending.add(file.cacheKey());
+        }
+      }
+      Shape after = project(indexUuid, epoch, files);
+      long peak = after.effectiveAdmissionBytes(pending);
+      ChargeSnapshot charge = after.charge();
+      return new Shape(
+          after.state,
+          new ChargeSnapshot(
+              charge.version(),
+              charge.known(),
+              charge.usedBytes(),
+              charge.residentBytes(),
+              charge.controlBytes(),
+              peak - charge.usedBytes(),
+              charge.releasingBytes(),
+              charge.holders(),
+              charge.groupRefs()),
+          pending);
+    }
+
+    /** Peak metadata for the specified cold publications; no prepared estimate is re-invoked. */
+    long effectiveAdmissionBytes(Set<String> keys) {
+      ExecutorIndexCache model = new ExecutorIndexCache();
+      model.restore(state);
+      model.detachModel();
+      for (String key : keys) {
+        CachedFile file = model.find(key);
+        if (file != null && !model.loading.containsKey(key)) {
+          LoadMonitor monitor = new LoadMonitor();
+          monitor.owner = file.owner();
+          monitor.callers = 1;
+          model.loading.put(model.texts.own(key), monitor);
+        }
+      }
+      ChargeSnapshot publication = model.chargeSnapshot();
+      for (String key : keys) {
+        CachedFile file = model.find(key);
+        if (file == null) {
+          continue;
+        }
+        model.protectedFiles.remove(key);
+        model.probation.remove(key);
+        model.attribution.remove(key);
+        model.bytes -= file.bytes();
+        model.bytesByOwner.computeIfPresent(
+            file.owner(), (owner, held) -> held - file.bytes() <= 0 ? null : held - file.bytes());
+        model.entriesByOwner.computeIfPresent(
+            file.owner(), (owner, held) -> held <= 1 ? null : held - 1);
+        boolean promised =
+            model.reservations.stream().anyMatch(reservation -> key.equals(reservation.cacheKey));
+        if (!promised) {
+          Reservation reservation =
+              new Reservation(file.owner(), file.bytes(), Long.MAX_VALUE, null, null);
+          reservation.cacheKey = model.texts.own(key);
+          model.reservations.add(reservation);
+          model.reservedByOwner.merge(file.owner(), file.bytes(), Long::sum);
+        }
+      }
+      ChargeSnapshot preparation = model.chargeSnapshot();
+      return Math.addExact(
+          Math.max(publication.usedBytes(), preparation.usedBytes()), state.reservedBytes());
+    }
+
+    Shape releaseKeys(String indexUuid, Set<String> keys) {
+      ExecutorIndexCache model = new ExecutorIndexCache();
+      model.restore(state);
+      model.chargeSequence = charge.version();
+      model.detachModel();
+      for (String key : keys) {
+        model.releaseCopy(indexUuid, key);
+      }
+      return new Shape(model.state(), model.chargeSnapshot());
+    }
+
+    boolean owns(String indexUuid, String cacheKey) {
+      if (indexUuid == null) {
+        return false;
+      }
+      ExecutorIndexCache model = new ExecutorIndexCache();
+      model.restore(state);
+      return model.ownership.keys(indexUuid).contains(cacheKey);
+    }
+
+    Map<String, Long> holders() {
+      Set<String> keys = new LinkedHashSet<>(state.probation().keySet());
+      keys.addAll(state.protectedFiles().keySet());
+      Map<String, Long> result = new LinkedHashMap<>();
+      keys.forEach(key -> result.put(key, residentBytes(Set.of(key))));
+      return result;
+    }
+
+    long residentBytes(Set<String> keys) {
+      Components components = new Components();
+      state.probation().chargeEntries(components, keys);
+      state.protectedFiles().chargeEntries(components, keys);
+      state.attribution().chargeEntries(components, keys);
+      Set<String> owners = new LinkedHashSet<>();
+      for (String key : keys) {
+        CachedFile file = state.probation().peek(key);
+        if (file == null) {
+          file = state.protectedFiles().peek(key);
+        }
+        if (file != null) {
+          owners.add(file.owner());
+        }
+      }
+      state.bytesByOwner().chargeEntries(components, owners);
+      state.entriesByOwner().chargeEntries(components, owners);
+      state.texts().chargeResident(components);
+      return components.bytes();
+    }
+  }
+
+  private void detachModel() {
+    detachState();
+    IdentityHashMap<IndexAdapter.PreparedSearch, SizedPrepared> prepared = new IdentityHashMap<>();
+    probation.replaceAll((key, file) -> modeled(file, prepared));
+    protectedFiles.replaceAll((key, file) -> modeled(file, prepared));
+  }
+
+  Shape shape() {
+    synchronized (mapLock) {
+      ChargeSnapshot charge = chargeSnapshot();
+      ExecutorIndexCache model = new ExecutorIndexCache();
+      model.restore(state());
+      model.detachState();
+      IdentityHashMap<IndexAdapter.PreparedSearch, SizedPrepared> prepared =
+          new IdentityHashMap<>();
+      model.probation.replaceAll((key, file) -> modeled(file, prepared));
+      model.protectedFiles.replaceAll((key, file) -> modeled(file, prepared));
+      return new Shape(model.state(), charge);
+    }
+  }
+
+  private static CachedFile modeled(
+      CachedFile file, IdentityHashMap<IndexAdapter.PreparedSearch, SizedPrepared> prepared) {
+    SizedPrepared quote =
+        prepared.computeIfAbsent(
+            file.prepared,
+            ignored -> new SizedPrepared(file.preparedBytes > 0 ? file.preparedBytes : file.bytes));
+    CachedFile copy =
+        new CachedFile(file.owner, quote, file.bytes, file.context, file.preparedBytes);
+    copy.pinned = file.pinned;
+    copy.releasing = file.releasing;
+    copy.leases = file.leases;
+    copy.modelInUse = file.inUse();
+    return copy;
+  }
+
+  void configureBudget(long capacity) {
+    synchronized (mapLock) {
+      metadataBudget = capacity;
+    }
+  }
+
+  long managedEpoch(String indexUuid) {
+    synchronized (mapLock) {
+      return ownership.epoch(indexUuid);
+    }
+  }
+
+  Set<String> managedKeys(String indexUuid) {
+    synchronized (mapLock) {
+      return ownership.keys(indexUuid);
+    }
+  }
+
+  boolean mayAdmit(String indexUuid, long epoch, String cacheKey) {
+    synchronized (mapLock) {
+      return ownership.mayAdmit(indexUuid, epoch, cacheKey);
+    }
+  }
+
+  private long usedBytes() {
+    ChargeProjection projection =
+        IndexCacheMemory.project(metadataState(texts, attribution), before -> before);
+    texts.replace(projection.afterState().texts());
+    return projection.usedBytes();
+  }
 
   /** Binds admission to the capacity advertised by the executor's active plugin. */
   ExecutorBudget bindExecutorBudget(long budgetBytes) {
@@ -735,6 +1487,7 @@ final class ExecutorIndexCache {
     CachedFile hit;
     long loadGeneration;
     synchronized (mapLock) {
+      metadataBudget = config.maxBytes();
       loadGeneration = generation;
       managed = ownership.isManagedKey(cacheKey);
       hit = managed ? null : lookup(cacheKey);
@@ -748,7 +1501,10 @@ final class ExecutorIndexCache {
       return hit;
     }
 
-    LoadMonitor monitor = loadingMonitor(cacheKey);
+    LoadMonitor monitor = loadingMonitor(cacheKey, config.owner());
+    if (monitor == null) {
+      return loader.load();
+    }
     synchronized (monitor) {
       try {
         synchronized (mapLock) {
@@ -768,7 +1524,7 @@ final class ExecutorIndexCache {
           return loader.load();
         }
 
-        Reservation reservation = reserve(config, null, sizeHint);
+        Reservation reservation = reserve(config, null, sizeHint, cacheKey);
         try {
           CachedFile loaded = loader.load();
           loads.incrementAndGet();
@@ -788,11 +1544,29 @@ final class ExecutorIndexCache {
         indexUuid != null && !indexUuid.isBlank(), "Index identity is empty");
     Preconditions.checkArgument(cacheKeys != null, "Index attribution keys are null");
     synchronized (mapLock) {
+      Texts afterTexts = texts.copy();
+      OwnedMap<String, Set<String>> afterAttribution = new OwnedMap<>(attribution);
       for (String key : cacheKeys) {
         if (probation.containsKey(key) || protectedFiles.containsKey(key)) {
-          attribution.computeIfAbsent(key, ignored -> new LinkedHashSet<>()).add(indexUuid);
+          Set<String> indexes = new OwnedSet<>(afterAttribution.getOrDefault(key, Set.of()));
+          indexes.add(afterTexts.own(indexUuid));
+          afterAttribution.put(afterTexts.own(key), indexes);
         }
       }
+      ChargeProjection projection =
+          IndexCacheMemory.project(
+              metadataState(texts, attribution),
+              before -> metadataState(afterTexts, afterAttribution));
+      try {
+        if (projection.incrementBytes() > 0
+            && projection.effectiveBytes() > budget(metadataBudget)) {
+          return;
+        }
+      } catch (ArithmeticException e) {
+        return;
+      }
+      attribution = afterAttribution;
+      texts.replace(projection.afterState().texts());
     }
   }
 
@@ -809,7 +1583,11 @@ final class ExecutorIndexCache {
   void applyTarget(String indexUuid, long epoch, Set<String> cacheKeys) {
     synchronized (mapLock) {
       Set<String> previous = ownership.keys(indexUuid);
-      ownership.applyTarget(indexUuid, epoch, cacheKeys);
+      if (!admit(
+          budget(metadataBudget), () -> ownership.applyTarget(indexUuid, epoch, cacheKeys),
+          previous.containsAll(cacheKeys), ignored -> {})) {
+        return;
+      }
       for (String key : previous) {
         releaseIfUnowned(key);
       }
@@ -841,15 +1619,29 @@ final class ExecutorIndexCache {
       return null;
     }
 
+    loader.validate();
     ManagedLoad load;
     synchronized (mapLock) {
+      metadataBudget = config.maxBytes();
       load = new ManagedLoad(indexUuid, epoch, cacheKey, generation, planId, commandId);
       if (!current(load)) {
         return null;
       }
+      CachedFile existing = find(cacheKey);
+      if (existing != null) {
+        loader.validate(existing);
+        if (!canReuse(existing, config, null)) {
+          return null;
+        }
+        existing.releasing = false;
+        return existing;
+      }
     }
 
-    LoadMonitor monitor = loadingMonitor(cacheKey);
+    LoadMonitor monitor = loadingMonitor(cacheKey, config.owner());
+    if (monitor == null) {
+      return null;
+    }
     synchronized (monitor) {
       try {
         synchronized (mapLock) {
@@ -858,19 +1650,21 @@ final class ExecutorIndexCache {
           }
           CachedFile existing = find(cacheKey);
           if (existing != null) {
+            loader.validate(existing);
             if (!canReuse(existing, config, null)) {
               return null;
             }
-            pendingReleases.remove(cacheKey);
+            existing.releasing = false;
             return existing;
           }
         }
-        Reservation reservation = reserve(config, load, sizeHint);
+        Reservation reservation = reserve(config, load, sizeHint, cacheKey);
         if (reservation == null) {
           return null;
         }
         try {
           CachedFile loaded = loader.load();
+          loader.validate(loaded);
           loads.incrementAndGet();
           CachedFile retained = put(cacheKey, loaded, config, reservation, load, load.generation());
           synchronized (mapLock) {
@@ -945,7 +1739,7 @@ final class ExecutorIndexCache {
   /** Adds keys to an index's current target, so a plan can arrive file by file. */
   void addManagedKeys(String indexUuid, long epoch, Set<String> cacheKeys) {
     synchronized (mapLock) {
-      ownership.addKeys(indexUuid, epoch, cacheKeys);
+      admit(budget(metadataBudget), () -> ownership.addKeys(indexUuid, epoch, cacheKeys));
       mapLock.notifyAll();
     }
   }
@@ -962,6 +1756,9 @@ final class ExecutorIndexCache {
 
   void releaseIndex(String indexUuid, long epoch) {
     synchronized (mapLock) {
+      if (!ownership.hasTarget(indexUuid)) {
+        return;
+      }
       Set<String> keys = ownership.keys(indexUuid);
       ownership.offload(indexUuid, epoch);
       ownership.release(indexUuid, epoch);
@@ -997,7 +1794,7 @@ final class ExecutorIndexCache {
           CachedFile released = file;
           this.file = null;
           released.leases -= 1;
-          if (pendingReleases.contains(cacheKey)) {
+          if (released.releasing) {
             releaseIfUnowned(cacheKey);
           }
           mapLock.notifyAll();
@@ -1006,25 +1803,35 @@ final class ExecutorIndexCache {
     }
   }
 
-  private LoadMonitor loadingMonitor(String cacheKey) {
-    return loading.compute(
-        cacheKey,
-        (ignored, existing) -> {
-          LoadMonitor monitor = existing == null ? new LoadMonitor() : existing;
-          monitor.callers = Math.incrementExact(monitor.callers);
-          return monitor;
-        });
+  private LoadMonitor loadingMonitor(String cacheKey, String owner) {
+    synchronized (mapLock) {
+      LoadMonitor monitor = loading.get(cacheKey);
+      if (monitor == null) {
+        LoadMonitor created = new LoadMonitor();
+        if (!admit(
+            budget(metadataBudget),
+            () -> {
+              created.owner = texts.own(owner);
+              loading.put(texts.own(cacheKey), created);
+            })) {
+          return null;
+        }
+        monitor = created;
+      }
+      monitor.callers = Math.incrementExact(monitor.callers);
+      return monitor;
+    }
   }
 
   private void releaseLoadingMonitor(String cacheKey, LoadMonitor monitor) {
-    loading.computeIfPresent(
-        cacheKey,
-        (ignored, existing) -> {
-          Preconditions.checkState(
-              existing == monitor, "Index loading monitor changed: %s", cacheKey);
-          existing.callers -= 1;
-          return existing.callers == 0 ? null : existing;
-        });
+    synchronized (mapLock) {
+      LoadMonitor existing = loading.get(cacheKey);
+      Preconditions.checkState(existing == monitor, "Index loading monitor changed: %s", cacheKey);
+      existing.callers -= 1;
+      if (existing.callers == 0) {
+        loading.remove(cacheKey);
+      }
+    }
   }
 
   private boolean current(ManagedLoad load) {
@@ -1034,7 +1841,7 @@ final class ExecutorIndexCache {
 
   private boolean canReuse(CachedFile file, Config config, Reservation reservation) {
     long otherReservations = reservedBytes - (reservation == null ? 0 : reservation.bytes);
-    return bytes <= budget(config.maxBytes()) - otherReservations;
+    return usedBytes() <= budget(config.maxBytes()) - otherReservations;
   }
 
   private CachedFile find(String cacheKey) {
@@ -1043,36 +1850,54 @@ final class ExecutorIndexCache {
   }
 
   private void releaseIfUnowned(String cacheKey) {
-    if (ownership.isOwned(cacheKey)) {
-      pendingReleases.remove(cacheKey);
-      return;
-    }
     CachedFile file = find(cacheKey);
     if (file == null) {
-      pendingReleases.remove(cacheKey);
+      return;
+    }
+    if (ownership.isOwned(cacheKey)) {
+      file.releasing = false;
     } else if (file.inUse()) {
-      pendingReleases.add(cacheKey);
+      file.releasing = true;
     } else {
       protectedFiles.remove(cacheKey);
       probation.remove(cacheKey);
       attribution.remove(cacheKey);
-      pendingReleases.remove(cacheKey);
       release(file);
     }
   }
 
   private void drainPendingReleases() {
-    if (!pendingReleases.isEmpty()) {
-      for (String key : new ArrayList<>(pendingReleases)) {
-        releaseIfUnowned(key);
-      }
-    }
+    List<String> keys = new ArrayList<>();
+    probation.forEach(
+        (key, file) -> {
+          if (file.releasing) {
+            keys.add(key);
+          }
+        });
+    protectedFiles.forEach(
+        (key, file) -> {
+          if (file.releasing) {
+            keys.add(key);
+          }
+        });
+    keys.forEach(this::releaseIfUnowned);
   }
 
   private boolean askedBefore(String cacheKey) {
     synchronized (mapLock) {
-      int times = asked.merge(cacheKey, 1, Integer::sum);
-      return times > 1;
+      int previous = asked.getOrDefault(cacheKey, 0);
+      boolean accepted =
+          admit(
+              budget(metadataBudget),
+              () -> {
+                asked.put(texts.own(cacheKey), Math.incrementExact(previous));
+                if (asked.size() > 100_000) {
+                  Iterator<String> oldest = asked.keySet().iterator();
+                  oldest.next();
+                  oldest.remove();
+                }
+              });
+      return accepted && previous > 0;
     }
   }
 
@@ -1092,9 +1917,13 @@ final class ExecutorIndexCache {
       file.touch();
       if (file.uses >= 1 && !file.pinned) {
         // a file asked for twice is what a repeated query looks like, so it outranks one seen once
-        probation.remove(cacheKey);
-        file.protectedRank = true;
-        protectedFiles.put(cacheKey, file);
+        CachedFile retained = file;
+        admit(
+            budget(metadataBudget),
+            () -> {
+              probation.remove(cacheKey);
+              protectedFiles.put(texts.own(cacheKey), retained);
+            });
       }
 
       return file;
@@ -1118,81 +1947,55 @@ final class ExecutorIndexCache {
       if (existing != null) {
         return load == null || canReuse(existing, config, reservation) ? existing : null;
       }
-      long capacity = budget(config.maxBytes());
-      // Reclaim any extra room before admitting the measured entry. Other loads keep their
-      // promises.
-      long otherReservations = reservedBytes - reservation.bytes;
-      long available = Math.max(0L, capacity - otherReservations);
-      evict(Math.max(0L, available - file.bytes()), capacity, reservation, file.bytes());
-      if (file.bytes() > available - bytes) {
-        LOG.debug("Not caching {}: no room within the {} byte budget", cacheKey, capacity);
+      if (reservation == null || file.bytes() > budget(config.maxBytes())) {
         return file;
       }
-
-      releaseReservation(reservation);
-
-      // the loader does not know which table it is loading for, so the entry is stamped here
-      file = file.withOwner(config.owner());
-      file.pinned = config.mode() == Mode.PIN_ALL;
-      // an admitted PIN_HOT entry starts on probation: being asked twice earns it a place, being
-      // asked again is what earns it protection
-      if (file.pinned) {
-        protectedFiles.put(cacheKey, file);
-      } else {
-        probation.put(cacheKey, file);
-      }
-
-      bytes += file.bytes();
-      bytesByOwner.merge(file.owner(), file.bytes(), Long::sum);
-      entriesByOwner.merge(file.owner(), 1, Integer::sum);
-      LOG.debug("Cached {} ({} bytes, mode {})", cacheKey, file.bytes(), config.mode());
-      return file;
-    }
-  }
-
-  /**
-   * Makes room, evicting the least recently used file that is neither protected nor in use.
-   *
-   * <p>A PIN_ALL entry is not evicted to make room: the mode exists because the working set fits,
-   * so evicting one would mean the fit was wrong, and the caller learns that from a budget warning
-   * rather than from a cache that quietly does nothing.
-   */
-  private void evict(
-      long maxBytes, long fairnessBudget, Reservation reservation, long incomingBytes) {
-    boolean warned = false;
-    while (bytes > maxBytes) {
-      // the table holding the most beyond its fair share goes first, so one large index cannot
-      // crowd out a small one that is also being queried
-      Map.Entry<String, CachedFile> victim =
-          mostOverQuota(fairnessBudget, reservation, incomingBytes);
-      if (victim == null) {
-        victim = oldestEvictable(probation, false);
-      }
-
-      if (victim == null) {
-        victim = oldestEvictable(protectedFiles, true);
-      }
-
-      if (victim == null) {
-        // everything resident is protected or being searched; the new file is not kept
-        return;
-      }
-
-      release(victim.getValue());
-      attribution.remove(victim.getKey());
-      if (protectedFiles.remove(victim.getKey()) == null) {
+      long capacity = budget(config.maxBytes());
+      CachedFile stamped = file.withOwner(config.owner());
+      stamped.pinned = config.mode() == Mode.PIN_ALL;
+      AdmissionDelta[] projected = new AdmissionDelta[1];
+      while (!admit(
+          capacity,
+          () -> {
+            releaseReservation(reservation);
+            String ownedKey = texts.own(cacheKey);
+            CachedFile retained = stamped.withOwner(texts.own(config.owner()));
+            retained.pinned = stamped.pinned;
+            if (retained.pinned) {
+              protectedFiles.put(ownedKey, retained);
+            } else {
+              probation.put(ownedKey, retained);
+            }
+            bytes += retained.bytes();
+            bytesByOwner.merge(retained.owner(), retained.bytes(), Long::sum);
+            entriesByOwner.merge(retained.owner(), 1, Integer::sum);
+          },
+          false,
+          delta -> projected[0] = delta)) {
+        if (projected[0] == null) {
+          return file;
+        }
+        Map.Entry<String, CachedFile> victim = mostOverQuota(capacity, projected[0]);
+        if (victim == null) {
+          victim = oldestEvictable(probation, false);
+        }
+        if (victim == null) {
+          victim = oldestEvictable(protectedFiles, true);
+        }
+        if (victim == null) {
+          LOG.debug("Not caching {}: no room within the {} byte budget", cacheKey, capacity);
+          return file;
+        }
+        release(victim.getValue());
+        attribution.remove(victim.getKey());
+        protectedFiles.remove(victim.getKey());
         probation.remove(victim.getKey());
+        if (evictions.incrementAndGet() == 1 && hits.get() == 0) {
+          LOG.warn(
+              "The index cache evicted an entry before serving a hit: budget {} bytes", capacity);
+        }
       }
-
-      if (evictions.incrementAndGet() == 1 && hits.get() == 0 && !warned) {
-        warned = true;
-        LOG.warn(
-            "The index cache evicted an entry before it served a single hit: budget {} bytes. "
-                + "The budget is likely below the working set, so raise {}, unset it to derive "
-                + "one, or turn the cache off.",
-            maxBytes,
-            Config.BYTES);
-      }
+      return find(cacheKey);
     }
   }
 
@@ -1204,13 +2007,15 @@ final class ExecutorIndexCache {
    * table asks for it back, which is what "borrowed" means here.
    */
   private Map.Entry<String, CachedFile> mostOverQuota(
-      long fairnessBudget, Reservation reservation, long incomingBytes) {
-    Map<String, Long> occupied = new LinkedHashMap<>(bytesByOwner);
-    reservedByOwner.forEach((owner, held) -> occupied.merge(owner, held, Long::sum));
-    // The arriving entry replaces its own promise, not another table's share.
-    occupied.merge(reservation.owner, incomingBytes - reservation.bytes, Long::sum);
+      long fairnessBudget, AdmissionDelta projection) {
+    Map<String, Long> occupied = new LinkedHashMap<>(projection.beforeOwners());
+    for (String owner : projection.afterOwners().keySet()) {
+      occupied.put(
+          owner, Math.addExact(occupied.getOrDefault(owner, 0L), projection.ownerIncrement(owner)));
+    }
+    occupied.keySet().retainAll(projection.afterOwners().keySet());
     int owners = Math.max(1, occupied.size());
-    long quota = fairnessBudget / owners;
+    long quota = Math.max(0L, fairnessBudget - projection.controlBytes()) / owners;
     String worst = null;
     long worstExcess = 0;
     for (Map.Entry<String, Long> entry : occupied.entrySet()) {
@@ -1254,11 +2059,7 @@ final class ExecutorIndexCache {
    * the file without retaining it. This bounds cache accounting, not the heap used by arbitrary
    * loaders or uncached searches.
    */
-  private Reservation reserve(Config config) {
-    return reserve(config, null, 0L);
-  }
-
-  private Reservation reserve(Config config, ManagedLoad load, long sizeHint) {
+  private Reservation reserve(Config config, ManagedLoad load, long sizeHint, String cacheKey) {
     synchronized (mapLock) {
       long requested = expectedEntryBytes(config, sizeHint);
       while (true) {
@@ -1267,20 +2068,54 @@ final class ExecutorIndexCache {
         }
         drainPendingReleases();
         long capacity = budget(config.maxBytes());
-        long spare = Math.max(0L, capacity - bytes - reservedBytes);
+        long spare = Math.max(0L, capacity - usedBytes() - reservedBytes);
         if (spare >= requested || reservations.isEmpty()) {
-          long held = Math.min(requested, spare);
           Reservation reservation =
               new Reservation(
                   config.owner(),
-                  held,
+                  0,
                   config.maxBytes(),
                   load == null ? null : load.planId(),
                   load == null ? null : load.commandId());
-          reservations.add(reservation);
-          reservedBytes += held;
-          reservedByOwner.merge(config.owner(), held, Long::sum);
-          return reservation;
+          AdmissionDelta[] projected = new AdmissionDelta[1];
+          boolean accepted =
+              admit(
+                  capacity,
+                  () -> {
+                    String owner = texts.own(config.owner());
+                    reservation.owner = owner;
+                    reservation.cacheKey = texts.own(cacheKey);
+                    reservations.add(reservation);
+                    reservedByOwner.merge(owner, 0L, Long::sum);
+                    long available = Math.max(0L, capacity - usedBytes() - reservedBytes);
+                    reservation.bytes = Math.min(requested, available);
+                    reservedBytes += reservation.bytes;
+                    reservedByOwner.merge(owner, reservation.bytes, Long::sum);
+                  },
+                  false,
+                  delta -> projected[0] = delta);
+          if (accepted) {
+            return reservation;
+          }
+
+          // The reservation itself costs control bytes. When resident entries can make room for
+          // it, reclaim them here so the caller can load and then be admitted normally.
+          Map.Entry<String, CachedFile> victim = mostOverQuota(capacity, projected[0]);
+          if (victim == null) {
+            victim = oldestEvictable(probation, false);
+          }
+          if (victim == null) {
+            victim = oldestEvictable(protectedFiles, true);
+          }
+          if (victim == null) {
+            return null;
+          }
+          release(victim.getValue());
+          attribution.remove(victim.getKey());
+          protectedFiles.remove(victim.getKey());
+          probation.remove(victim.getKey());
+          evictions.incrementAndGet();
+          continue;
         }
 
         try {
@@ -1405,6 +2240,140 @@ final class ExecutorIndexCache {
     return unloaded;
   }
 
+  static final class ChargeSnapshot implements Serializable {
+    private static final long serialVersionUID = 1L;
+
+    private final long version;
+    private final boolean known;
+    private final long usedBytes;
+    private final long residentBytes;
+    private final long controlBytes;
+    private final long reservedBytes;
+    private final long releasingBytes;
+    private final int holders;
+    private final int groupRefs;
+
+    ChargeSnapshot(
+        long version,
+        boolean known,
+        long usedBytes,
+        long residentBytes,
+        long controlBytes,
+        long reservedBytes,
+        long releasingBytes,
+        int holders,
+        int groupRefs) {
+      this.version = version;
+      this.known = known;
+      this.usedBytes = usedBytes;
+      this.residentBytes = residentBytes;
+      this.controlBytes = controlBytes;
+      this.reservedBytes = reservedBytes;
+      this.releasingBytes = releasingBytes;
+      this.holders = holders;
+      this.groupRefs = groupRefs;
+    }
+
+    long version() {
+      return version;
+    }
+
+    boolean known() {
+      return known;
+    }
+
+    long usedBytes() {
+      return usedBytes;
+    }
+
+    long residentBytes() {
+      return residentBytes;
+    }
+
+    long controlBytes() {
+      return controlBytes;
+    }
+
+    long reservedBytes() {
+      return reservedBytes;
+    }
+
+    long releasingBytes() {
+      return releasingBytes;
+    }
+
+    int holders() {
+      return holders;
+    }
+
+    int groupRefs() {
+      return groupRefs;
+    }
+  }
+
+  private MetadataState metadataState(
+      Texts ownedTexts, OwnedMap<String, Set<String>> associations) {
+    return new MetadataState(
+        List.of(
+            probation,
+            protectedFiles,
+            associations,
+            bytesByOwner,
+            entriesByOwner,
+            loading,
+            reservations,
+            reservedByOwner),
+        List.of(ownership, asked),
+        ownedTexts,
+        reservedBytes);
+  }
+
+  ChargeSnapshot chargeSnapshot() {
+    synchronized (mapLock) {
+      drainPendingReleases();
+      ChargeProjection projection =
+          IndexCacheMemory.project(metadataState(texts, attribution), before -> before);
+      texts.replace(projection.afterState().texts());
+      Components releasing = new Components();
+      probation.forEach(
+          (key, file) -> {
+            if (file.releasing) {
+              releasing.add(key);
+              releasing.add(file);
+            }
+          });
+      protectedFiles.forEach(
+          (key, file) -> {
+            if (file.releasing) {
+              releasing.add(key);
+              releasing.add(file);
+            }
+          });
+      int holders = 0;
+      boolean known = IndexCacheMemory.supportedLayout();
+      for (CachedFile file : probation.values()) {
+        known &= file.hasKnownContext() && file.owner() != null && !file.owner().isBlank();
+        holders = Math.addExact(holders, file.leases);
+      }
+      for (CachedFile file : protectedFiles.values()) {
+        known &= file.hasKnownContext() && file.owner() != null && !file.owner().isBlank();
+        holders = Math.addExact(holders, file.leases);
+      }
+      // Snapshot sequence is monotonic even across clear; it is not the controller policy epoch.
+      chargeSequence = Math.incrementExact(chargeSequence);
+      return new ChargeSnapshot(
+          chargeSequence,
+          known,
+          projection.usedBytes(),
+          projection.residentBytes(),
+          projection.controlBytes(),
+          reservedBytes,
+          releasing.bytes(),
+          holders,
+          ownership.groupRefs());
+    }
+  }
+
   Stats stats() {
     synchronized (mapLock) {
       drainPendingReleases();
@@ -1413,7 +2382,7 @@ final class ExecutorIndexCache {
           misses.get(),
           loads.get(),
           evictions.get(),
-          bytes,
+          chargeSnapshot().residentBytes(),
           probation.size() + protectedFiles.size());
     }
   }
@@ -1430,20 +2399,23 @@ final class ExecutorIndexCache {
 
   /** The report this executor sends back at the end of a task. */
   IndexCacheLocations.Report report(String executorId, String host) {
-    Stats stats = stats();
-    return new IndexCacheLocations.Report(
-        executorId,
-        host,
-        EPOCH,
-        System.nanoTime(),
-        keys(),
-        stats.hits(),
-        stats.misses(),
-        stats.loads(),
-        stats.evictions(),
-        stats.bytes(),
-        stats.entries(),
-        System.currentTimeMillis());
+    synchronized (mapLock) {
+      Stats stats = stats();
+      return new IndexCacheLocations.Report(
+              executorId,
+              host,
+              EPOCH,
+              System.nanoTime(),
+              keys(),
+              stats.hits(),
+              stats.misses(),
+              stats.loads(),
+              stats.evictions(),
+              stats.bytes(),
+              stats.entries(),
+              System.currentTimeMillis())
+          .withMetadata(shape());
+    }
   }
 
   /** Resets the cache for tests, deferring release of entries that are still in use. */
@@ -1457,6 +2429,8 @@ final class ExecutorIndexCache {
         releaseIfUnowned(key);
       }
       asked.clear();
+      metadataBudget = Long.MAX_VALUE;
+      chargeSnapshot();
       hits.set(0);
       misses.set(0);
       loads.set(0);
@@ -1466,30 +2440,41 @@ final class ExecutorIndexCache {
     }
   }
 
-  /** Produces an index file's payload and the structure prepared from it. */
+  /** Produces the independent state prepared from an index file. */
   interface Loader {
     CachedFile load();
+
+    /**
+     * Control readers validate before both reuse and payload I/O. Policy-only loaders may opt out.
+     */
+    default void validate() {}
+
+    /** A positive policy fixture charge is not a reader/model proof. */
+    default void validate(CachedFile file) {}
   }
 
   /**
-   * An entry whose cost is the payload plus whatever the prepared structure adds to it. A searcher
-   * that expands the payload says so; one that does not is charged the payload twice, once for its
-   * bytes and once for reading them.
+   * Keeps only prepared state. Input bytes contribute to the explicitly inexact legacy fallback
+   * when the searcher cannot report its retained memory, but the cache does not retain that input.
    */
   static CachedFile loaded(byte[] payload, IndexAdapter.PreparedSearch prepared) {
+    return loaded(payload.length, prepared);
+  }
+
+  static CachedFile loaded(long inputBytes, IndexAdapter.PreparedSearch prepared) {
     long preparedBytes = prepared.estimatedBytes();
-    if (preparedBytes <= 0) {
+    if (preparedBytes <= 0 || !IndexCacheMemory.supportedLayout()) {
       LOG.debug(
-          "Index cache size is estimated: prepared structure did not report its size; "
-              + "using {} payload bytes as the fallback",
-          payload.length);
+          "Index cache size is estimated: prepared size is unknown or the wrapper JVM layout "
+              + "is unsupported; using {} input bytes as the inexact fallback",
+          inputBytes);
     }
-    long bytes = IndexCacheMemory.residentBytes(payload.length, preparedBytes);
-    return new CachedFile("", payload, prepared, bytes);
+    long bytes = IndexCacheMemory.residentBytes(inputBytes, preparedBytes);
+    return new CachedFile("", prepared, bytes, null, preparedBytes);
   }
 
   static CachedFile loaded(byte[] payload, IndexAdapter.PreparedSearch prepared, long bytes) {
-    return new CachedFile("", payload, prepared, bytes);
+    return new CachedFile("", prepared, bytes);
   }
 
   Set<String> residentKeys() {

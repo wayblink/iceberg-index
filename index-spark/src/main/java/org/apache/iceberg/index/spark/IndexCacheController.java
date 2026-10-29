@@ -23,7 +23,9 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import org.apache.iceberg.Table;
+import org.apache.iceberg.index.IndexAdapter;
 import org.apache.iceberg.index.IndexFile;
+import org.apache.iceberg.index.IndexFileMemory;
 import org.apache.iceberg.index.IndexMetadata;
 import org.apache.iceberg.index.IndexQuery;
 import org.apache.iceberg.index.IndexReader;
@@ -139,21 +141,26 @@ final class IndexCacheController {
     // The payload and top-k are unused here: this call only resolves the snapshot and lists files.
     List<IndexFile> files = reader.indexFiles(IndexQuery.of(snapshotId, ByteBuffer.allocate(0), 1));
 
+    IndexAdapter adapter =
+        IndexTypes.fromType(metadata.indexType()).createAdapter(metadata.definition());
     List<IndexCacheProtocol.File> planned = new ArrayList<>(files.size());
     for (IndexFile file : files) {
+      IndexFileMemory memory = IndexCacheMemory.resolveMemory(table.io(), file, adapter);
       planned.add(
           IndexCacheProtocol.File.builder()
               .location(file.location())
               .cacheKey(cacheKey(table, metadata, file.location()))
+              .owner(table.location())
               .kind(file.kind().name())
               .blobType(file.blobType())
-              .estimatedBytes(estimate(file))
-              .memory(file.memory())
+              .estimatedBytes(memory == null ? null : IndexCacheMemory.residentBytes(memory))
+              .memory(memory)
               .build());
     }
 
     return IndexCacheProtocol.Target.builder()
         .indexUuid(metadata.indexUuid())
+        .owner(table.location())
         .snapshotId(snapshotId)
         .files(planned)
         .definition(metadata.definition())
@@ -170,15 +177,6 @@ final class IndexCacheController {
   private static String adapterKey(IndexMetadata metadata) {
     return DistributedIndexSearch.adapterKey(
         IndexTypes.fromType(metadata.indexType()).createAdapter(metadata.definition()));
-  }
-
-  private static Long estimate(IndexFile file) {
-    if (file.memory() == null || file.memory().fileBytes() == null) {
-      // Unknown size stays unknown: the planner must not treat it as zero.
-      return null;
-    }
-
-    return IndexCacheMemory.residentBytes(file.memory());
   }
 
   static Map<String, String> placements(IndexCacheDriverControl control, String planId) {
