@@ -195,8 +195,11 @@ public final class RaBitQQuantizer implements java.io.Serializable {
     java.util.Arrays.fill(code, offset, offset + codeBytes(), (byte) 0);
 
     float[] rotated = rotate(vector);
+    // the transform spreads the energy over the padded array, so the length is summed there too:
+    // summing over the dimension alone would miss whatever sits in the padding and scale the
+    // length, and every estimate with it, by sqrt(dimension / padded)
     double norm = 0.0;
-    for (int i = 0; i < dimension; i++) {
+    for (int i = 0; i < padded; i++) {
       norm += (double) rotated[i] * rotated[i];
     }
 

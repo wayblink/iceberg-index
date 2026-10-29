@@ -19,6 +19,7 @@
 package org.apache.iceberg.index.vector;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.withinPercentage;
 
 import java.util.Comparator;
 import java.util.List;
@@ -48,6 +49,36 @@ class TestRaBitQQuantizer {
     // estimate, and this records where the estimate becomes good enough to order a cluster
     for (int bits : new int[] {1, 2, 3, 4}) {
       measureBits(bits);
+    }
+  }
+
+  @Test
+  public void storesTheLengthOfTheCentredVectorAtEveryDimension() {
+    // the transform pads a vector up to a power of two and spreads its energy over the padding, so
+    // the length has to be summed over the padded array; summing over the dimension alone drops
+    // whatever sits in the padding and scales the stored length by sqrt(dimension / padded), which
+    // shifts every estimate and, because the ratio varies per vector, the ranking with it
+    for (int dimension : new int[] {128, 384, 768, 1536}) {
+      float[][] vectors = randomVectors(16, dimension, 11L);
+      RaBitQQuantizer quantizer = RaBitQQuantizer.train(vectors, dimension, SEED, 4);
+      float[] center = quantizer.center();
+      float[] factors = new float[RaBitQQuantizer.FACTORS];
+      byte[] code = new byte[quantizer.codeBytes()];
+
+      for (float[] vector : vectors) {
+        quantizer.encode(vector, code, 0, factors);
+        double expected = 0.0;
+        for (int d = 0; d < dimension; d++) {
+          double centred = vector[d] - center[d];
+          expected += centred * centred;
+        }
+
+        assertThat((double) factors[0])
+            .as(
+                "stored length at dimension %s, against the centred vector it stands for",
+                dimension)
+            .isCloseTo(Math.sqrt(expected), withinPercentage(1.0));
+      }
     }
   }
 
