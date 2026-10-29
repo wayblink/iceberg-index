@@ -19,7 +19,6 @@
 package org.apache.iceberg.spark.index
 
 import org.apache.iceberg.index.text.TextIndexTypes
-import org.apache.iceberg.index.text.TextIndexTypes
 import org.apache.iceberg.index.vector.VectorIndexTypes
 import org.apache.iceberg.spark.Spark3Util
 import org.apache.iceberg.index.spark.IndexSearch
@@ -35,9 +34,6 @@ import org.apache.spark.sql.catalyst.expressions.ExpressionInfo
 import org.apache.spark.sql.catalyst.plans.logical.LogicalPlan
 import org.apache.iceberg.index.spark.VectorIndexes
 import org.apache.iceberg.index.vector.VectorIndexDefinition.Metric
-import org.apache.iceberg.index.text.TextIndexTypes
-import org.apache.iceberg.index.vector.VectorIndexTypes
-import org.apache.iceberg.spark.Spark3Util
 import org.apache.spark.sql.catalyst.expressions.Alias
 import org.apache.spark.sql.catalyst.expressions.Attribute
 import org.apache.spark.sql.catalyst.expressions.Ascending
@@ -145,7 +141,10 @@ object IndexTableFunctions {
     val spark = SparkSession.active
     TextIndexTypes.register()
 
-    val arguments = new TableFunctionArguments(TEXT_SEARCH, args)
+    val arguments = new TableFunctionArguments(
+      TEXT_SEARCH,
+      args,
+      Seq("table", "query", "search_columns", "k"))
     arguments.requireOnly(
       required = Seq("table", "search_columns"),
       optional = Seq("query", "query_string", "limit", "k", "num_results", "columns"))
@@ -190,7 +189,7 @@ object IndexTableFunctions {
 
     val vector = columnOf(searched.head)
     val selected = if (columns.isEmpty) relation.output else columns.map(columnOf)
-    if (selected.exists(attribute => attribute.name.equalsIgnoreCase(SCORE_COLUMN))) {
+    if (relation.output.exists(attribute => attribute.name.equalsIgnoreCase(SCORE_COLUMN))) {
       analysisError(s"$tableName already has a column named $SCORE_COLUMN")
     }
 
@@ -207,7 +206,10 @@ object IndexTableFunctions {
     val spark = SparkSession.active
     VectorIndexTypes.register()
 
-    val arguments = new TableFunctionArguments("vector_search", args)
+    val arguments = new TableFunctionArguments(
+      "vector_search",
+      args,
+      Seq("table", "query_vector", "k", VECTOR_COLUMN))
     arguments.requireOnly(
       required = Seq("table", "query_vector"),
       optional = Seq(
@@ -226,7 +228,11 @@ object IndexTableFunctions {
       .orElse(arguments.int("limit"))
       .getOrElse(10)
     val column = arguments.string(VECTOR_COLUMN)
-    val metric = arguments.metric("distance_type")
+    // the function states its metric, and cosine when the caller names none. Leaving it unnamed to
+    // follow the index would need the projected distance to be re-bound to the index metric, which
+    // the rewrite only does for the ordering, not for a projection above the limit; until that is
+    // fixed, a stated metric is the only way to keep the ordering and the returned distance equal.
+    val named = arguments.metric("distance_type")
     val columns = arguments.strings("columns")
 
     Preconditions.checkArgument(k > 0, "vector_search needs a positive number of results, got %s", k)
@@ -251,21 +257,29 @@ object IndexTableFunctions {
     }
 
     val vector = columnOf(column)
-    val selected =
-      if (columns.isEmpty) relation.output else columns.map(columnOf)
-    if (selected.exists(attribute => attribute.name.equalsIgnoreCase(DISTANCE_COLUMN))) {
+    val selected = if (columns.isEmpty) relation.output else columns.map(columnOf)
+    // the caller's list is not the only thing that ends up in the output, so the table itself decides
+    // whether the distance can be added without a duplicate name
+    if (relation.output.exists(attribute => attribute.name.equalsIgnoreCase(DISTANCE_COLUMN))) {
       analysisError(
         s"$tableName already has a column named $DISTANCE_COLUMN, so the distance cannot be added")
     }
 
-    val distance = VectorDistanceExpression(metric, vector, query, explicitMetric = true)
+    val distance = VectorDistanceExpression(
+      named.getOrElse(Metric.COSINE),
+      vector,
+      query,
+      explicitMetric = true)
     val ordered = Sort(Seq(SortOrder(distance, Ascending, NullsFirst, Seq.empty)), global = true, relation)
     val limited = GlobalLimit(Literal(k), ordered)
     Project(selected :+ Alias(distance, DISTANCE_COLUMN)(), limited)
   }
 
   /** The named and positional arguments of a table function, refusing what it does not know. */
-  private class TableFunctionArguments(name: String, args: Seq[Expression]) {
+  private class TableFunctionArguments(
+      name: String,
+      args: Seq[Expression],
+      positionalNames: Seq[String]) {
     private val named = scala.collection.mutable.LinkedHashMap.empty[String, Expression]
     private val positional = scala.collection.mutable.ArrayBuffer.empty[Expression]
 
@@ -282,10 +296,13 @@ object IndexTableFunctions {
       }
     }
 
-    private val positionalNames = Seq("table", "query_vector", "k", VECTOR_COLUMN)
     positional.zipWithIndex.foreach { case (value, index) =>
       if (index >= positionalNames.length) {
         analysisError(s"$name takes at most ${positionalNames.length} arguments")
+      }
+
+      if (named.contains(positionalNames(index))) {
+        analysisError(s"$name was given ${positionalNames(index)} both by name and by position")
       }
 
       named.put(positionalNames(index), value)
@@ -353,22 +370,22 @@ object IndexTableFunctions {
       }
     }
 
-    def metric(key: String): Metric = {
+    def metric(key: String): Option[Metric] = {
       named.get(key) match {
-        case None => Metric.COSINE
+        case None => None
         case Some(value) =>
           if (!value.foldable) {
             analysisError(s"$key of $name must be a constant")
           }
 
-          value.eval().toString.toLowerCase(Locale.ROOT) match {
+          Some(value.eval().toString.toLowerCase(Locale.ROOT) match {
             case "cosine" | "cos" => Metric.COSINE
             case "dot" | "dot_product" | "inner_product" | "ip" => Metric.DOT_PRODUCT
             case "euclidean" | "l2" => Metric.EUCLIDEAN
             case other =>
               analysisError(
                 s"Unknown distance_type $other: expected cosine, dot_product or euclidean")
-          }
+          })
       }
     }
   }

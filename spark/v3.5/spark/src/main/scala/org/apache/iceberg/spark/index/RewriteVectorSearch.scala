@@ -157,7 +157,9 @@ case class RewriteVectorSearch(spark: SparkSession) extends Rule[LogicalPlan] {
               val metric = resolved.inputs.definition.metric()
               val lowered = bindMetric(limit, distance, metric).transformDown {
                 case relation: DataSourceV2Relation if relation eq scan => source
-                case node: Sort if node.order.exists(_.child eq distance) =>
+                // the ordering holds a copy of the distance made during analysis, so it is matched by
+                // what it means rather than by which object it is
+                case node: Sort if node.order.exists(_.child.semanticEquals(distance)) =>
                   node.copy(order =
                     node.order.map(order => order.copy(child = distance.copy(metric = metric))))
               }
@@ -207,7 +209,7 @@ case class RewriteVectorSearch(spark: SparkSession) extends Rule[LogicalPlan] {
     plan.transformDown {
       case project: Project =>
         val rewritten = project.projectList.map {
-          case alias: Alias if alias.child eq distance =>
+          case alias: Alias if alias.child.semanticEquals(distance) =>
             // the projection keeps its name and its expression id, so the attribute the sort orders
             // by still refers to the distance, now measured the way the index measures it
             Alias(distance.copy(metric = metric), alias.name)(

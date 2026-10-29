@@ -55,6 +55,13 @@ class IcebergSparkSessionExtensions extends (SparkSessionExtensions => Unit) {
         Map.empty[String, String])
     }
 
+    if (args.size > 3) {
+      throw new AnalysisException(
+        s"vec_distance takes a vector, a query vector and an optional metric, got ${args.size} " +
+          "arguments",
+        Map.empty[String, String])
+    }
+
     if (args.size == 2) {
       Metric.COSINE
     } else {
@@ -89,9 +96,10 @@ class IcebergSparkSessionExtensions extends (SparkSessionExtensions => Unit) {
    */
   private def textArguments(name: String, args: Seq[Expression]): (Expression, Expression) = {
     if (args.size != 2) {
-      throw new IllegalArgumentException(
+      throw new AnalysisException(
         s"$name takes a column and a query, got ${args.size} arguments: options are not supported " +
-          "by the text index yet")
+          "by the text index yet",
+        Map.empty[String, String])
     }
 
     (args(0), args(1))

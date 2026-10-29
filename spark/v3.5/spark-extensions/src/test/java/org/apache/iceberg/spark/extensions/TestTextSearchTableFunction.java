@@ -163,6 +163,23 @@ class TestTextSearchTableFunction {
   }
 
   @Test
+  public void takesTheArgumentsInTheOrderItsSignatureNames() {
+    String table = tableWithIndex("ts_positional");
+
+    // the positional form names the searched column, not a vector: the two functions do not share a
+    // positional list, and confusing them would silently search the wrong argument
+    List<Row> hits =
+        spark
+            .sql(
+                String.format(
+                    "SELECT id FROM search('local.%s', 'error 1064', array('body'), 2)", table))
+            .collectAsList();
+
+    assertThat(hits).hasSize(2);
+    assertThat(hits).extracting(row -> row.getLong(0)).doesNotContain(3L);
+  }
+
+  @Test
   public void refusesWhatItCannotAnswer() {
     String table = tableWithIndex("ts_refusals");
 

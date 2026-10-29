@@ -219,9 +219,44 @@ class TestVectorSearchTableFunction {
         .hasMessageContaining("_distance");
   }
 
+  @Test
+  public void refusesADistanceColumnEvenWhenItIsNotProjected() {
+    String table = "db.vs_distance_hidden";
+    spark.sql(
+        String.format(
+            "CREATE TABLE local.%s (id bigint, _distance double, embedding array<double>) "
+                + "USING iceberg",
+            table));
+    spark.sql(String.format("INSERT INTO local.%s VALUES (1, 0.5d, array(1.0d, 0.0d))", table));
+
+    assertThatThrownBy(
+            () ->
+                spark
+                    .sql(
+                        String.format(
+                            "SELECT * FROM vector_search(table => 'local.%s', "
+                                + "query_vector => array(1.0d, 0.0d), vector_column => 'embedding', "
+                                + "k => 1, columns => array('id'))",
+                            table))
+                    .collectAsList())
+        .hasMessageContaining("_distance");
+  }
+
   private static String planOf(String query) {
     var execution = spark.sql(query).queryExecution();
     return execution.optimizedPlan().toString() + execution.executedPlan().toString();
+  }
+
+  private static String tableWithMetric(String name, String metric) {
+    String table = "db." + name;
+    spark.sql(String.format("CREATE TABLE local.%s %s", table, COLUMNS));
+    spark.sql(String.format("INSERT INTO local.%s VALUES %s", table, VECTORS));
+    spark.sql(
+        String.format(
+            "CALL local.system.build_vector_index(table => '%s', column => 'embedding', "
+                + "dimension => 2, metric => '%s')",
+            table, metric));
+    return table;
   }
 
   /** Creates the table and builds a vector index over its embedding column. */
