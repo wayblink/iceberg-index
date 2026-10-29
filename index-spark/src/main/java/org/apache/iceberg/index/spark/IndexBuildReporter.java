@@ -58,7 +58,6 @@ public final class IndexBuildReporter implements Closeable {
   private final LongSupplier filesFailed;
   private final LongSupplier rows;
   private final ScheduledExecutorService publisher;
-  private volatile boolean reporting;
   private volatile boolean finished = false;
 
   /**
@@ -89,7 +88,9 @@ public final class IndexBuildReporter implements Closeable {
             filesBuilt,
             filesFailed,
             rows);
-    reporter.reporting = reporter.publish(IndexBuildStatus.State.RUNNING, null, reporter.now());
+    // a first report that cannot be written does not turn reporting off: the build is expensive to
+    // repeat, and the one report that matters most is the final one
+    reporter.publish(IndexBuildStatus.State.RUNNING, null, reporter.now());
     reporter.schedule(intervalMillis);
     return reporter;
   }
@@ -167,7 +168,14 @@ public final class IndexBuildReporter implements Closeable {
 
   /** Writes the counters as they stand, as a report that the build is still running. */
   void publishProgress() {
-    if (reporting) {
+    // the check and the write share a lock with the final report: a scheduled progress write that
+    // passed its check before the build finished must not land after the final one, or a finished
+    // build reads as running for as long as anyone keeps looking
+    synchronized (this) {
+      if (finished) {
+        return;
+      }
+
       publish(IndexBuildStatus.State.RUNNING, null, now());
     }
   }
@@ -183,12 +191,14 @@ public final class IndexBuildReporter implements Closeable {
   }
 
   private void finishWith(IndexBuildStatus.State state, String error) {
-    if (finished) {
-      return;
-    }
+    synchronized (this) {
+      if (finished) {
+        return;
+      }
 
-    finished = true;
-    if (reporting) {
+      finished = true;
+      // the final report is written even when an earlier one failed: a build that died must not be
+      // left looking like one that is still running
       publish(state, error, now());
     }
   }
@@ -233,7 +243,10 @@ public final class IndexBuildReporter implements Closeable {
 
   @Override
   public void close() {
-    finished = true;
+    synchronized (this) {
+      finished = true;
+    }
+
     publisher.shutdownNow();
   }
 }

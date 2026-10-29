@@ -20,8 +20,11 @@ package org.apache.iceberg.index.spark;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
+import java.io.IOException;
+import java.io.UncheckedIOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import org.apache.iceberg.TestTables.LocalFileIO;
 import org.apache.iceberg.index.spark.IndexBuildStatus.State;
@@ -187,6 +190,57 @@ class TestIndexBuildStatus {
       assertThat(read.filesBuilt()).isZero();
       assertThat(read.updatedAtMillis()).isGreaterThanOrEqualTo(read.startedAtMillis());
     }
+  }
+
+  @Test
+  void aReportThatCannotBeWrittenDoesNotSilenceTheOutcome() {
+    // reporting used to be switched off by the first failed write, so a build whose storage
+    // hiccuped
+    // once at the start never reported its outcome: it read as running for as long as anyone looked
+    AtomicInteger writes = new AtomicInteger();
+    FileIO flaky =
+        new FileIO() {
+          private final FileIO delegate = new LocalFileIO();
+
+          @Override
+          public InputFile newInputFile(String path) {
+            return delegate.newInputFile(path);
+          }
+
+          @Override
+          public OutputFile newOutputFile(String path) {
+            if (writes.incrementAndGet() == 1) {
+              throw new UncheckedIOException(new IOException("storage is briefly unavailable"));
+            }
+
+            return delegate.newOutputFile(path);
+          }
+
+          @Override
+          public void deleteFile(String path) {
+            delegate.deleteFile(path);
+          }
+        };
+
+    try (IndexBuildReporter reporter =
+        IndexBuildReporter.start(
+            flaky,
+            statusDir,
+            INDEX_UUID,
+            COLUMN,
+            SOURCE_SNAPSHOT,
+            () -> 1L,
+            () -> 0L,
+            () -> 0L,
+            () -> 0L,
+            Long.MAX_VALUE)) {
+      reporter.failed(new IllegalStateException("the build failed"));
+    }
+
+    IndexBuildStatus read = IndexBuildStatus.read(io, statusDir);
+    assertThat(read).as("the outcome of a build whose first report failed").isNotNull();
+    assertThat(read.state()).isEqualTo(State.FAILED);
+    assertThat(read.error()).contains("the build failed");
   }
 
   @Test
