@@ -411,6 +411,7 @@ public final class IvfKernel implements VectorKernel {
         in.remaining(),
         minimumPerList,
         in.remaining() / minimumPerList);
+    checkStructureFits(listCount);
 
     long centroidBytes = (long) listCount * dimension * Float.BYTES;
     Preconditions.checkArgument(
@@ -505,8 +506,58 @@ public final class IvfKernel implements VectorKernel {
   }
 
   /** The least a list can occupy: its centroid, and its own centre and count when quantized. */
+  /** The header every Java array carries, which a per-list allocation pays once. */
+  private static final int ARRAY_HEADER_BYTES = 16;
+
+  /** The fields of a {@link RaBitQQuantizer} beyond the arrays it references. */
+  private static final int QUANTIZER_BYTES = 48;
+
+  /**
+   * The structures an index payload may size, which is the ceiling on the payload itself.
+   *
+   * <p>A real index spends far less than this on structures: the centres and quantizers of a
+   * million-vector file with a thousand lists come to tens of megabytes against hundreds of
+   * megabytes of payload. The bound exists for a corrupted count, not for a large index.
+   */
+  static final long MAX_STRUCTURE_BYTES = Integer.MAX_VALUE;
+
   private long minimumBytesPerList() {
     return (long) Float.BYTES * dimension + IvfLayout.listHeader(dimension, isQuantized());
+  }
+
+  /**
+   * The bytes a list costs beyond its own payload bytes.
+   *
+   * <p>The centre is allocated per list, and a quantized list also builds a {@link RaBitQQuantizer}
+   * that clones that centre and carries its own copy of the signs. Those allocations are sized by
+   * the list count, which is a four-byte field: without a bound, a payload of a few gigabytes names
+   * enough lists to ask for tens of gigabytes of structures.
+   */
+  long structureBytesPerList() {
+    long centre = ARRAY_HEADER_BYTES + (long) Float.BYTES * dimension;
+    if (!isQuantized()) {
+      return centre;
+    }
+
+    int padded = Integer.highestOneBit(Math.max(1, dimension) - 1) * 2;
+    long signs = ARRAY_HEADER_BYTES + (long) Float.BYTES * padded;
+    return centre + QUANTIZER_BYTES + centre + signs;
+  }
+
+  /**
+   * Refuses a list count whose structures would not fit in what an index payload may size.
+   *
+   * <p>Package private so the bound is testable: a test cannot build the two gigabyte payload the
+   * check exists for, but it can ask the arithmetic directly.
+   */
+  void checkStructureFits(int listCount) {
+    long structureBytes = (long) listCount * structureBytesPerList();
+    Preconditions.checkArgument(
+        structureBytes <= MAX_STRUCTURE_BYTES,
+        "IVF list count %s needs %s bytes of structures, more than the %s an index payload may size",
+        listCount,
+        structureBytes,
+        MAX_STRUCTURE_BYTES);
   }
 
   private static String[] readDataFiles(VectorPayloadReader in) {

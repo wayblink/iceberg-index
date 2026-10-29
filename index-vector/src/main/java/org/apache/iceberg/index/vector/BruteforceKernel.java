@@ -151,6 +151,11 @@ public final class BruteforceKernel implements VectorKernel {
     return ImmutableList.copyOf(decodeEntries(payload).entries);
   }
 
+  /** The fewest bytes one entry can occupy, which bounds how many of them may follow. */
+  private long minimumBytesPerEntry() {
+    return RECORD_PREFIX + VALUE_PREFIX + (long) Float.BYTES * dimension;
+  }
+
   private DecodedEntries decodeEntries(ByteBuffer payload) {
     Preconditions.checkNotNull(payload, "Entry payload is null");
     byte[] bytes = VectorPayloads.toBytes(payload);
@@ -166,6 +171,18 @@ public final class BruteforceKernel implements VectorKernel {
 
       int entryCount = in.readInt();
       Preconditions.checkArgument(entryCount >= 0, "Invalid vector entry count: %s", entryCount);
+      long minimumPerEntry = minimumBytesPerEntry();
+      // a count is four bytes wide and the entries it names are at least this large each, so a
+      // payload that ends here cannot be claiming them
+      int remaining = VectorPayloads.remaining(in);
+      Preconditions.checkArgument(
+          (long) entryCount * minimumPerEntry <= remaining,
+          "Invalid vector entry count %s: the %s-byte payload ends before those entries (each entry"
+              + " needs %s bytes, at most %s fit)",
+          entryCount,
+          remaining,
+          minimumPerEntry,
+          remaining / minimumPerEntry);
       List<IndexEntry> entries = Lists.newArrayListWithCapacity(entryCount);
       for (int i = 0; i < entryCount; i++) {
         int dataFileIndex = in.readInt();
@@ -245,7 +262,7 @@ public final class BruteforceKernel implements VectorKernel {
     int entryCount = in.readInt();
     Preconditions.checkArgument(entryCount >= 0, "Invalid vector entry count: %s", entryCount);
 
-    long minimumPerEntry = RECORD_PREFIX + VALUE_PREFIX + (long) Float.BYTES * dimension;
+    long minimumPerEntry = minimumBytesPerEntry();
     Preconditions.checkArgument(
         (long) entryCount * minimumPerEntry <= in.remaining(),
         "Invalid vector entry count %s: the %s-byte payload ends before those entries (each entry"

@@ -21,6 +21,7 @@ package org.apache.iceberg.index.vector;
 import java.io.DataInputStream;
 import java.io.DataOutputStream;
 import java.io.IOException;
+import java.io.UncheckedIOException;
 import java.nio.ByteBuffer;
 import java.util.List;
 import org.apache.iceberg.index.IndexEntry;
@@ -58,6 +59,22 @@ final class VectorPayloads {
     out.writeInt(PAYLOAD_HEADER);
     out.writeUTF(kernel);
     out.writeInt(kernelVersion);
+  }
+
+  /**
+   * How many bytes are left, which is what every count in a payload has to be checked against.
+   *
+   * <p>A {@link DataInputStream} only reports this with a checked exception, and the counts that
+   * follow are four bytes wide: a field that claims two billion entries has to fail where it is
+   * read rather than at the array allocation, where the executor dies of an {@code
+   * OutOfMemoryError} that says nothing about the payload.
+   */
+  static int remaining(DataInputStream in) {
+    try {
+      return in.available();
+    } catch (IOException e) {
+      throw new UncheckedIOException("Failed to read an index payload", e);
+    }
   }
 
   static void readHeader(

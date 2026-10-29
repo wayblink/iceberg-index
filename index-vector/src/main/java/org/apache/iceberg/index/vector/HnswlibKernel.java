@@ -61,6 +61,9 @@ public final class HnswlibKernel implements VectorKernel {
 
   private static final int FORMAT_VERSION = 1;
 
+  /** The two length bytes every {@link DataInputStream#readUTF()} string carries at least. */
+  private static final int MIN_UTF_BYTES = 2;
+
   private static final ProgressListener NO_PROGRESS = (workDone, max) -> {};
 
   /**
@@ -198,11 +201,24 @@ public final class HnswlibKernel implements VectorKernel {
       VectorPayloads.readHeader(in, NAME, FORMAT_VERSION, "HNSW");
       int graphLength = in.readInt();
       Preconditions.checkArgument(graphLength >= 0, "Invalid HNSW graph length: %s", graphLength);
+      int graphRemaining = VectorPayloads.remaining(in);
+      Preconditions.checkArgument(
+          graphLength <= graphRemaining,
+          "HNSW payload ends inside the graph: %s bytes remain, %s needed",
+          graphRemaining,
+          graphLength);
       byte[] graph = new byte[graphLength];
       in.readFully(graph);
       int dataFileCount = in.readInt();
       Preconditions.checkArgument(
           dataFileCount >= 0, "Invalid HNSW data file count: %s", dataFileCount);
+      int dictionaryRemaining = VectorPayloads.remaining(in);
+      long minimumDictionaryBytes = (long) dataFileCount * MIN_UTF_BYTES;
+      Preconditions.checkArgument(
+          minimumDictionaryBytes <= dictionaryRemaining,
+          "HNSW payload ends inside the data file dictionary: %s bytes remain, %s needed",
+          dictionaryRemaining,
+          minimumDictionaryBytes);
       String[] dictionary = new String[dataFileCount];
       for (int i = 0; i < dataFileCount; i++) {
         dictionary[i] = in.readUTF();
@@ -211,6 +227,17 @@ public final class HnswlibKernel implements VectorKernel {
       int mappingCount = in.readInt();
       Preconditions.checkArgument(
           mappingCount >= 0, "Invalid HNSW mapping count: %s", mappingCount);
+      int mappingRemaining = VectorPayloads.remaining(in);
+      long bytesPerMapping = Integer.BYTES + Long.BYTES;
+      long minimumMappingBytes = (long) mappingCount * bytesPerMapping;
+      Preconditions.checkArgument(
+          minimumMappingBytes <= mappingRemaining,
+          "Invalid HNSW mapping count %s: the %s-byte payload ends before those mappings (each"
+              + " mapping needs %s bytes, at most %s fit)",
+          mappingCount,
+          mappingRemaining,
+          bytesPerMapping,
+          mappingRemaining / bytesPerMapping);
       String[] dataFiles = new String[mappingCount];
       long[] positions = new long[mappingCount];
       for (int i = 0; i < mappingCount; i++) {
