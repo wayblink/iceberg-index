@@ -88,17 +88,71 @@ class IcebergSqlExtensionsAstBuilder(delegate: ParserInterface)
    */
   override def visitShowIndexes(ctx: ShowIndexesContext): CallStatement = withOrigin(ctx) {
     val parts = toSeq(ctx.multipartIdentifier.parts).map(part => unquote(part.getText))
-    val (catalog, table) =
-      if (parts.size >= 3) {
-        (parts.head, parts.tail.mkString("."))
-      } else {
-        (SparkSession.active.sessionState.catalogManager.currentCatalog.name(), parts.mkString("."))
-      }
+    val (catalog, table) = catalogAndTable(parts)
 
     CallStatement(
       Seq(catalog, "system", "list_indexes"),
       Seq(PositionalArgument(Literal(table))))
   }
+
+  /**
+   * Answer CREATE INDEX with the procedure that already builds the index.
+   *
+   * <p>The index name is the DDL name and the `WITH` keys are the procedure's own parameters, so the
+   * statement is a spelling rather than a second set of knobs whose meaning could drift. A method
+   * with no build here is refused instead of being registered in name only.
+   */
+  override def visitCreateIndex(ctx: CreateIndexContext): CallStatement = withOrigin(ctx) {
+    val parts = toSeq(ctx.multipartIdentifier(0).parts).map(part => unquote(part.getText))
+    val (catalog, table) = catalogAndTable(parts)
+    val name = Option(ctx.indexName).map(node => unquote(node.getText)).orNull
+    val method = unquote(ctx.indexMethod.getText).toLowerCase(Locale.ROOT)
+    val column = toSeq(ctx.indexedColumn.parts).map(part => unquote(part.getText)).mkString(".")
+
+    val procedure = method match {
+      case "vector" =>
+        "build_vector_index"
+      case "fts" | "inverted" =>
+        if (name != null) {
+          throw new AnalysisException(
+            "A text index cannot be named yet: drop the index name, or build it with " +
+              "CALL system.build_text_index(table => '...', column => '...')")
+        }
+
+        "build_text_index"
+      case other =>
+        throw new AnalysisException(
+          s"Unsupported index method: $other, supported methods are vector and fts")
+    }
+
+    val options = Option(ctx.indexOptions).map(nodes => toSeq(nodes.indexOption)).getOrElse(Seq.empty)
+    val seen = scala.collection.mutable.LinkedHashSet.empty[String]
+    val optionArgs = options.map { option =>
+      val key = unquote(option.key.getText).toLowerCase(Locale.ROOT)
+      if (!seen.add(key)) {
+        throw new AnalysisException(s"Duplicate index option: $key")
+      }
+
+      NamedArgument(key, delegate.parseExpression(option.optionValue.getText))
+    }
+
+    val args =
+      Seq(NamedArgument("table", Literal(table)), NamedArgument("column", Literal(column))) ++
+        (if (name != null) Seq(NamedArgument("name", Literal(name))) else Seq.empty) ++
+        optionArgs
+
+    CallStatement(Seq(catalog, "system", procedure), args)
+  }
+
+  /** Splits a multipart name the way the session resolves it: a catalog when one is named. */
+  private def catalogAndTable(parts: Seq[String]): (String, String) = {
+    if (parts.size >= 3) {
+      (parts.head, parts.tail.mkString("."))
+    } else {
+      (SparkSession.active.sessionState.catalogManager.currentCatalog.name(), parts.mkString("."))
+    }
+  }
+
 
   /** Backticks quote a name; the catalog and the table do not contain them. */
   private def unquote(part: String): String = {

@@ -149,6 +149,7 @@ class IcebergSparkSqlExtensionsParser(delegate: ParserInterface)
       normalized.contains("write unordered") ||
       normalized.contains("set identifier fields") ||
       normalized.contains("drop identifier fields") ||
+      normalized.contains("create index") ||
       isSnapshotRefDdl(normalized)))
   }
 
