@@ -24,6 +24,7 @@ import java.nio.charset.StandardCharsets;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.TimeUnit;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.fs.FileSystem;
 import org.apache.hadoop.fs.LocatedFileStatus;
@@ -83,6 +84,14 @@ class CleanupIndexFilesProcedure extends BaseProcedure {
   private static final String MANIFEST_MARKER_PREFIX = "m";
   private static final String MANIFEST_LIST_MARKER = "ml";
 
+  /**
+   * How long an unfinished attempt is treated as a build that is still running.
+   *
+   * <p>Long enough to cover the gap between an executor writing index files and the driver
+   * publishing the metadata that references them; a stray attempt is cleaned on a later run.
+   */
+  private static final long IN_FLIGHT_WINDOW_MILLIS = TimeUnit.MINUTES.toMillis(60);
+
   private static final ProcedureParameter TABLE_PARAM =
       requiredInParameter("table", DataTypes.StringType);
   private static final ProcedureParameter[] PARAMETERS = new ProcedureParameter[] {TABLE_PARAM};
@@ -94,7 +103,8 @@ class CleanupIndexFilesProcedure extends BaseProcedure {
             new StructField("expired_snapshots", DataTypes.LongType, false, Metadata.empty()),
             new StructField("deleted_files", DataTypes.LongType, false, Metadata.empty()),
             new StructField("deleted_bytes", DataTypes.LongType, false, Metadata.empty()),
-            new StructField("abandoned_attempts", DataTypes.LongType, false, Metadata.empty())
+            new StructField("abandoned_attempts", DataTypes.LongType, false, Metadata.empty()),
+            new StructField("in_flight_builds", DataTypes.LongType, false, Metadata.empty())
           });
 
   public static ProcedureBuilder builder() {
@@ -153,8 +163,18 @@ class CleanupIndexFilesProcedure extends BaseProcedure {
     List<IndexSnapshot> retained = snapshots.subList(retainedFrom, snapshots.size());
     int expiredSnapshots = retainedFrom;
 
-    Set<String> referenced = referencedFiles(table.io(), retained);
-    Map<String, Long> orphans = orphanFiles(table, metadata, referenced);
+    long nowMillis = System.currentTimeMillis();
+    // a build writes its files before the metadata that references them is published, so an orphan
+    // sweep that runs in between deletes files the build is about to point at. An attempt without
+    // its completion marker cannot be told apart from one that died, so a recent one holds the
+    // sweep back rather than being guessed at
+    int inFlight = inFlightAttempts(table, metadata, nowMillis);
+    Map<String, Long> orphans = Maps.newHashMap();
+    if (inFlight == 0) {
+      Set<String> referenced = referencedFiles(table.io(), retained);
+      orphans = orphanFiles(table, metadata, referenced);
+    }
+
     long deletedBytes = 0L;
     for (long size : orphans.values()) {
       deletedBytes += size;
@@ -163,7 +183,7 @@ class CleanupIndexFilesProcedure extends BaseProcedure {
 
     // the staging sweep runs last: the orphan sweep above already deletes the files an abandoned
     // attempt left under data/ and snapshots/, so this only has to drop the ledgers themselves
-    int abandonedAttempts = cleanupStaging(table, metadata);
+    int abandonedAttempts = cleanupStaging(table, metadata, nowMillis);
 
     if (expiredSnapshots > 0) {
       catalog.updateIndex(withoutSnapshots(metadata, retained));
@@ -174,7 +194,8 @@ class CleanupIndexFilesProcedure extends BaseProcedure {
         (long) expiredSnapshots,
         (long) orphans.size(),
         deletedBytes,
-        (long) abandonedAttempts);
+        (long) abandonedAttempts,
+        (long) inFlight);
   }
 
   private static Set<Long> liveTableSnapshotIds(Table table) {
@@ -265,11 +286,65 @@ class CleanupIndexFilesProcedure extends BaseProcedure {
   }
 
   /**
+   * Counts the attempt directories a build may still be writing into.
+   *
+   * <p>This is the same judgement {@link #cleanupStaging} makes per directory: an attempt without
+   * its completion marker is either running now or died, and only its age separates the two.
+   */
+  private int inFlightAttempts(Table table, IndexMetadata metadata, long nowMillis) {
+    try {
+      Configuration conf = spark().sessionState().newHadoopConf();
+      Path stagingDir = new Path(metadata.location(), SidecarIndexCatalog.STAGING_DIR);
+      FileSystem fileSystem = stagingDir.getFileSystem(conf);
+      if (!fileSystem.exists(stagingDir)) {
+        return 0;
+      }
+
+      int inFlight = 0;
+      RemoteIterator<LocatedFileStatus> attempts = fileSystem.listLocatedStatus(stagingDir);
+      while (attempts.hasNext()) {
+        LocatedFileStatus attempt = attempts.next();
+        if (!attempt.isDirectory()) {
+          continue;
+        }
+
+        Path attemptDir = attempt.getPath();
+        if (mayBeInFlight(
+            attempt,
+            !ledgerPaths(fileSystem, attemptDir).isEmpty(),
+            fileSystem.exists(new Path(attemptDir, COMPLETE_MARKER)),
+            nowMillis)) {
+          inFlight += 1;
+        }
+      }
+
+      return inFlight;
+    } catch (IOException e) {
+      throw new UncheckedIOException("Failed to list staging of index " + metadata.indexUuid(), e);
+    }
+  }
+
+  /**
+   * Whether a build may still be writing into an attempt directory.
+   *
+   * <p>An attempt that has not written its completion marker is either in flight or dead, and
+   * nothing in the directory says which. Its age is the only signal, so a recent one is left alone:
+   * deleting the files it names would leave the metadata a running build is about to publish
+   * pointing at nothing.
+   */
+  private static boolean mayBeInFlight(
+      LocatedFileStatus attempt, boolean hasLedger, boolean complete, long nowMillis) {
+    return hasLedger
+        && !complete
+        && nowMillis - attempt.getModificationTime() < IN_FLIGHT_WINDOW_MILLIS;
+  }
+
+  /**
    * Cleans up the attempt ledgers of an index. An attempt that did not complete may have written
    * files that only its ledger knows about, so they are deleted first; ledgers that do carry the
    * completion marker are dropped on their own. Returns the number of abandoned attempts.
    */
-  private int cleanupStaging(Table table, IndexMetadata metadata) {
+  private int cleanupStaging(Table table, IndexMetadata metadata, long nowMillis) {
     int abandoned = 0;
     try {
       Configuration conf = spark().sessionState().newHadoopConf();
@@ -288,7 +363,14 @@ class CleanupIndexFilesProcedure extends BaseProcedure {
         }
 
         List<String> ledger = ledgerPaths(fileSystem, attemptDir);
-        if (!ledger.isEmpty() && !fileSystem.exists(new Path(attemptDir, COMPLETE_MARKER))) {
+        boolean complete = fileSystem.exists(new Path(attemptDir, COMPLETE_MARKER));
+        if (mayBeInFlight(attempt, !ledger.isEmpty(), complete, nowMillis)) {
+          // a build may be writing this attempt right now, and the files its ledger names are not
+          // garbage yet
+          continue;
+        }
+
+        if (!ledger.isEmpty() && !complete) {
           // the attempt died before completing: the files its ledger names are garbage
           abandoned += 1;
           for (String path : ledger) {

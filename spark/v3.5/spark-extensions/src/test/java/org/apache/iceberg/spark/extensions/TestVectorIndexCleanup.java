@@ -172,6 +172,10 @@ public class TestVectorIndexCleanup extends ExtensionsTestBase {
     writeFile(manifest);
     writeMarker(attemptDir, "ml", manifestList);
     writeFile(manifestList);
+    // an attempt that was just created cannot be told apart from one a build is writing now, so the
+    // sweep only treats it as dead once it has been sitting there
+    FileSystem attemptFileSystem = attemptDir.getFileSystem(spark.sessionState().newHadoopConf());
+    attemptFileSystem.setTimes(attemptDir, 1_600_000_000_000L, -1L);
 
     List<Object[]> output =
         sql("CALL %s.system.cleanup_index_files(table => '%s')", catalogName, tableName);
@@ -188,6 +192,44 @@ public class TestVectorIndexCleanup extends ExtensionsTestBase {
     // the files of the live index snapshot are untouched
     assertThat(indexFilesOnDisk(tableName)).isEqualTo(filesBefore);
     assertThat(searchIds(tableName, 3)).containsExactly(0L, 1L, 2L);
+  }
+
+  @TestTemplate
+  public void testHoldsTheSweepBackWhileABuildMayBeRunning() throws Exception {
+    String tableName = tableName("vectors_cleanup_in_flight_" + catalogName);
+    sql("CREATE TABLE %s (id bigint, embedding array<double>) USING iceberg", tableName);
+    sql("INSERT INTO %s SELECT id, array(CAST(id AS double), 0.0) FROM range(0, 10)", tableName);
+    sql(
+        "CALL %s.system.build_vector_index("
+            + "table => '%s', column => 'embedding', dimension => 2, metric => 'euclidean')",
+        catalogName, tableName);
+
+    Path indexDir = indexDirectory(tableName);
+    int filesBefore = indexFilesOnDisk(tableName);
+    writeOrphanFile(tableName);
+
+    // an attempt without its completion marker is either running now or dead, and nothing in the
+    // directory says which: a fresh one is the shape of a build that is writing right now
+    Path attemptDir = new Path(indexDir, "staging/in-flight-attempt");
+    String inFlightFile = indexDir + "/data/index-file-1-0-in-flight.puffin";
+    writeMarker(attemptDir, "f0", inFlightFile);
+    writeFile(inFlightFile);
+
+    List<Object[]> output =
+        sql("CALL %s.system.cleanup_index_files(table => '%s')", catalogName, tableName);
+    assertThat(((Number) output.get(0)[2]).longValue()).as("deleted files").isZero();
+    assertThat(((Number) output.get(0)[5]).longValue()).as("in-flight builds").isEqualTo(1L);
+    assertThat(indexFilesOnDisk(tableName)).as("nothing was swept").isEqualTo(filesBefore + 2);
+    assertThat(readOrphanFile(tableName)).as("the orphan is still there").isNotNull();
+
+    // an attempt old enough to be dead no longer holds the sweep back
+    FileSystem fileSystem = attemptDir.getFileSystem(spark.sessionState().newHadoopConf());
+    fileSystem.setTimes(attemptDir, 1_600_000_000_000L, -1L);
+
+    output = sql("CALL %s.system.cleanup_index_files(table => '%s')", catalogName, tableName);
+    assertThat(((Number) output.get(0)[5]).longValue()).as("in-flight builds").isZero();
+    assertThat(readOrphanFile(tableName)).as("the orphan is gone").isNull();
+    assertThat(fileSystem.exists(new Path(inFlightFile))).as("the dead attempt's file").isFalse();
   }
 
   @TestTemplate
