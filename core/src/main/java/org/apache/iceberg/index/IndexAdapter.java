@@ -104,11 +104,6 @@ public interface IndexAdapter {
   }
 
   /**
-   * Searches all auxiliary payloads of a snapshot together.
-   *
-   * <p>Like {@link #searchAll}, but for auxiliary payloads.
-   */
-  /**
    * Loads the auxiliary payload of one index file so that several queries can search it without
    * decoding it again.
    *
@@ -161,6 +156,11 @@ public interface IndexAdapter {
     }
   }
 
+  /**
+   * Searches all auxiliary payloads of a snapshot together.
+   *
+   * <p>Like {@link #searchAll}, but for auxiliary payloads.
+   */
   default List<IndexSearchResult> searchAuxiliaryAll(
       List<ByteBuffer> payloads, ByteBuffer query, int topK) {
     return searchAndMerge(payloads, payload -> searchAuxiliary(payload, query, topK), topK);

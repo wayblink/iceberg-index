@@ -57,7 +57,7 @@ class TestPluginExecutorBudget {
               + "')";
       assertThat(spark.sql(load).head().getString(0)).isEqualTo("COMPLETE");
       assertThat(spark.sql(query).collectAsList()).containsExactlyElementsOf(expected);
-      assertThat(IndexCacheControl.status(spark, false))
+      assertThat(IndexCacheControl.status(spark))
           .isNotEmpty()
           .allSatisfy(
               status -> {

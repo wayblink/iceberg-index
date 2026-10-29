@@ -797,9 +797,6 @@ final class IndexResidencyCoordinator {
   }
 
   /**
-   * Keeps only a bounded window of finished plans, so a long-lived driver does not grow forever.
-   */
-  /**
    * Keeps a bounded window of finished plans. A load that reported COMPLETE counts as finished even
    * though nothing overwrites its state: only the last {@value #PLAN_WINDOW} plans are kept, so a
    * long-lived driver does not accumulate every plan it ever ran.

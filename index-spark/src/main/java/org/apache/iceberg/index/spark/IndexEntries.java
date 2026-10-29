@@ -1229,9 +1229,10 @@ public final class IndexEntries {
    * Reads the equality keys removed by the given equality delete files, one key per delete row. The
    * key is the values of the equality columns in field id order, with a null marker for nulls.
    *
-   * <p>Equality delete files contain one column per equality field id, in field id order; the
-   * column name falls back to the field id when the name is not the table's field name. As with
-   * position deletes, the file is read in its own format rather than as parquet.
+   * <p>Equality delete files contain one column per equality field id, in field id order. The file
+   * is read through a projection built from the table's own fields, so the record carries the
+   * table's names for those ids whatever the file spells them: the values are then read by name. As
+   * with position deletes, the file is read in its own format rather than as parquet.
    */
   private static Set<String> readEqualityKeys(
       FileIO io, Collection<DeleteFile> equalityDeletes, List<Types.NestedField> keyFields) {

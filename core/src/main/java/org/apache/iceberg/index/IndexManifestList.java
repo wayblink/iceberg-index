@@ -104,7 +104,12 @@ public final class IndexManifestList {
     return manifests;
   }
 
-  /** A reference to one index manifest, with summary statistics for pruning. */
+  /**
+   * A reference to one index manifest, with the size of what it holds.
+   *
+   * <p>The counts are written so a reader can size the snapshot without opening every manifest, and
+   * they are part of the list format rather than a hint: nothing skips a manifest on them today.
+   */
   public static final class ManifestRef {
 
     private final String location;

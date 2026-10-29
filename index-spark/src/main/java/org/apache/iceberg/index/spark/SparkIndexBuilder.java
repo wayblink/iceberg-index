@@ -407,8 +407,8 @@ public final class SparkIndexBuilder {
     // A build of a large table runs for tens of minutes and reports nothing until it ends, which
     // makes a stuck one indistinguishable from a slow one. The counters are what the progress lines
     // are printed from, and the same ones the report publishes: how many index files of how many,
-    // and how many have failed. A group that fails costs its own index file and the build carries
-    // on, so the failed count is real news and not simply the exception that ended the attempt.
+    // and how many have failed. The count is recorded before the failure that ends the build is
+    // rethrown, so a reader of the status sees which group failed rather than only that one did.
     LongAccumulator filesBuilt = progress.built;
     LongAccumulator filesFailed = progress.failed;
     LongAccumulator rowsWritten = progress.rows;

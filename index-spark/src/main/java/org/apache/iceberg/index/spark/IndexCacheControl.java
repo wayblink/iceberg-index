@@ -63,11 +63,13 @@ public final class IndexCacheControl {
   }
 
   /**
-   * What each executor last reported about residency. {@code refresh} is accepted for symmetry with
-   * the query statistics procedure: the control channel polls on its own, so a read cannot force a
-   * new report without waiting for the next poll.
+   * What each executor last reported about residency.
+   *
+   * <p>This reads the last report; it cannot force a new one, because the control channel polls on
+   * its own schedule. A caller that needs the present state after an idle period asks {@link
+   * IndexCacheStatus#refresh}, which runs a job to collect it.
    */
-  public static List<Status> status(SparkSession spark, boolean refresh) {
+  public static List<Status> status(SparkSession spark) {
     return statusOf(controlOf(spark), System.nanoTime());
   }
 
