@@ -256,10 +256,14 @@ case class RewriteVectorSearch(spark: SparkSession) extends Rule[LogicalPlan] {
    * The scan of an eligible plan, if everything between the limit and it keeps rows as they are.
    *
    * <p>A {@code IsNotNull} guard on the vector column is one of them: it stays above the source and
-   * filters both branches, so it needs no special handling. A null vector row is not a gap in the
-   * answer either way: an index is only ever built over rows whose vector exists (the build refuses
-   * a null), so a covered file holds no null, and a null appended later sits in an uncovered file
-   * and reaches the answer through the scan branch, which Spark orders as it always does.
+   * filters both branches, so it needs no special handling.
+   *
+   * <p>A row whose vector is null is not part of the answer, and that holds whether or not a guard
+   * is present: the build skips such a row, so the index carries no entry for it, and the scan
+   * branch filters it out as well so both branches answer the same question. A distance needs a
+   * vector, so a row without one has no place in a distance ordering. Note that unmodified Spark
+   * would sort that row first under {@code ASC} (nulls sort first by default), so a rewritten
+   * search returns exactly the rows whose vector exists.
    */
   private def eligibleChain(limit: GlobalLimit): Option[EligibleChain] = {
     val allowed = mutable.ListBuffer.empty[LogicalPlan]
