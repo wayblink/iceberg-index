@@ -130,6 +130,39 @@ class TestTextSearchTableFunction {
   }
 
   @Test
+  public void ranksByTheNameTheScoreWasGiven() {
+    String table = tableWithIndex("ts_alias");
+
+    // naming the score and ordering by the name is how a caller reads it; the name has to resolve
+    // to
+    // the score of this query and not to anything else the table may call the same
+    List<Row> byName =
+        spark
+            .sql(
+                String.format(
+                    "SELECT id, text_score(body, 'error 1064') AS _score FROM local.%s "
+                        + "ORDER BY _score DESC LIMIT 2",
+                    table))
+            .collectAsList();
+
+    List<Row> byExpression =
+        spark
+            .sql(
+                String.format(
+                    "SELECT id, text_score(body, 'error 1064') AS _score FROM local.%s "
+                        + "ORDER BY text_score(body, 'error 1064') DESC LIMIT 2",
+                    table))
+            .collectAsList();
+
+    assertThat(byName)
+        .extracting(row -> row.getLong(0))
+        .containsExactly(byExpression.get(0).getLong(0), byExpression.get(1).getLong(0));
+    assertThat(byName.get(0).getDouble(1))
+        .isCloseTo(byExpression.get(0).getDouble(1), within(1e-9d));
+    assertThat(byName.get(0).getDouble(1)).isPositive();
+  }
+
+  @Test
   public void refusesWhatItCannotAnswer() {
     String table = tableWithIndex("ts_refusals");
 

@@ -28,6 +28,7 @@ import org.apache.iceberg.index.spark.{IndexEntries, VectorIndexes}
 import org.apache.iceberg.index.text.TextIndexAdapter
 import org.apache.iceberg.index.text.TextIndexAdapter.CorpusStatistics
 import org.apache.iceberg.index.text.TextIndexDefinition
+import org.apache.spark.sql.catalyst.expressions.Alias
 import org.apache.spark.sql.catalyst.expressions.AttributeReference
 import org.apache.spark.sql.catalyst.expressions.Descending
 import org.apache.spark.sql.catalyst.InternalRow
@@ -74,8 +75,7 @@ case class RewriteTextSearch(spark: SparkSession) extends Rule[LogicalPlan] {
       // the ranking form: a limit over a global sort, with the projection in between
       case node @ GlobalLimit(k, _) =>
         globalSort(node) match {
-          case Some(sort) =>
-            val score = sort.order.head.child.asInstanceOf[TextScoreExpression]
+          case Some((sort, score)) =>
             rewrite(node, k, score) match {
               case Some((replacement, bound)) =>
                 rewrittenSearches.append((replacement, bound))
@@ -100,15 +100,40 @@ case class RewriteTextSearch(spark: SparkSession) extends Rule[LogicalPlan] {
     }
   }
 
-  /** The global sort of a limit node, if its ordering is a descending text score. */
-  private def globalSort(limit: LogicalPlan): Option[Sort] = {
+  /**
+   * The global sort of a limit node and the score it orders by.
+   *
+   * <p>A score can be ordered by where it is written or by the name it was given: `ORDER BY
+   * text_score(...) DESC` and `SELECT ... text_score(...) AS _score ... ORDER BY _score DESC` are
+   * the same question, and the second is the form a caller reaches for once the column has a name.
+   * The name is resolved through the projection's own attribute identity, never through the text of
+   * the name, so a table column that happens to be called the same does not stand in for a score.
+   */
+  private def globalSort(limit: LogicalPlan): Option[(Sort, TextScoreExpression)] = {
     limit.collectFirst {
-      case sort @ Sort(Seq(order), true, _) if isDescendingScore(order) => sort
-    }
+      case sort @ Sort(Seq(order), true, _) if order.direction == Descending =>
+        scoreOf(order.child, limit).map(score => (sort, score))
+    }.flatten
   }
 
-  private def isDescendingScore(order: SortOrder): Boolean = {
-    order.direction == Descending && order.child.isInstanceOf[TextScoreExpression]
+  /** The score an ordering names, whether it holds the expression or an alias of it. */
+  private def scoreOf(child: Expression, plan: LogicalPlan): Option[TextScoreExpression] = {
+    child match {
+      case score: TextScoreExpression =>
+        Some(score)
+      case attribute: AttributeReference =>
+        val aliases = plan.collect { case node =>
+          node.expressions.flatMap(_.collect { case alias: Alias => alias })
+        }
+        aliases.flatten.collectFirst {
+          case alias
+              if alias.child.isInstanceOf[TextScoreExpression] &&
+                alias.toAttribute.exprId == attribute.exprId =>
+            alias.child.asInstanceOf[TextScoreExpression]
+        }
+      case _ =>
+        None
+    }
   }
 
   /** Rewrites a limit-over-sort node, or says it cannot, with the index it was bound to. */
