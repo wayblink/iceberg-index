@@ -21,6 +21,7 @@ package org.apache.iceberg.spark.index
 import scala.collection.JavaConverters._
 import scala.collection.mutable
 
+import org.apache.iceberg.index.vector.VectorIndexDefinition
 import org.apache.spark.sql.catalyst.expressions.Attribute
 import org.apache.spark.sql.catalyst.plans.logical.LeafNode
 import org.apache.spark.sql.catalyst.plans.logical.Statistics
@@ -70,6 +71,7 @@ private[spark] case class VectorSearchSource(context: VectorSearchContext)(
       s"column=${context.request.input.column}",
       s"k=${context.request.input.topK}",
       s"metric=${context.inputs.definition.metric()}",
+      s"result=${resultContract}",
       overSample,
       budget,
       s"index=${context.inputs.indexMetadata.indexUuid()}",
@@ -77,6 +79,25 @@ private[spark] case class VectorSearchSource(context: VectorSearchContext)(
       s"indexSnapshot=${context.inputs.indexSnapshot.snapshotId}",
       s"uncoveredFiles=${context.inputs.uncoveredDataFiles.size}",
       "driverMaterialization=true")
+  }
+
+  /**
+   * Whether the answer can be the exact top-k, given how the index stores and organises vectors.
+   *
+   * <p>The index orders candidates by an estimate and the sort above this node re-scores the ones it
+   * keeps, so the rows that come back carry exact distances; what is not exact is the set of
+   * candidates, which a flat scan over unquantized vectors enumerates in full and any other
+   * structure samples. Saying which of the two a plan is keeps the approximation visible in an
+   * EXPLAIN rather than only in a log line.
+   */
+  private def resultContract: String = {
+    val definition = context.inputs.definition
+    if (definition.structure() == VectorIndexDefinition.VectorStructure.FLAT
+        && definition.quantizer() == VectorIndexDefinition.VectorQuantizer.NONE) {
+      "exact"
+    } else {
+      "approximate"
+    }
   }
 
   override def simpleString(maxFields: Int): String =

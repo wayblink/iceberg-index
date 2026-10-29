@@ -233,6 +233,38 @@ class TestVectorSearchPlanning {
     assertThat(context.queryVectors().get(0)).containsExactly(1.0F, 0.0F);
   }
 
+  @Test
+  void planSaysWhetherTheAnswerCanBeExact() throws Exception {
+    // a flat scan over unquantized vectors enumerates every candidate, so its answer is the exact
+    // top-k; every other structure samples, and the plan has to say so where a reader will look
+    tableWithIndex("planning_exact");
+    assertThat(planOf("planning_exact")).contains("result=exact");
+
+    spark.sql(
+        "CREATE TABLE local.db.planning_approximate (id bigint, embedding array<double> NOT NULL) "
+            + "USING iceberg");
+    spark.sql(
+        "INSERT INTO local.db.planning_approximate VALUES (1, array(1.0d, 0.0d)), "
+            + "(2, array(0.0d, 1.0d))");
+    spark.sql(
+        "CALL local.system.build_vector_index(table => 'db.planning_approximate', "
+            + "column => 'embedding', dimension => 2, metric => 'cosine', structure => 'IVF', "
+            + "quantizer => 'RABITQ')");
+
+    assertThat(planOf("planning_approximate")).contains("result=approximate");
+  }
+
+  private static String planOf(String name) {
+    return spark
+        .sql(
+            "SELECT id FROM local.db."
+                + name
+                + " ORDER BY vec_distance(embedding, array(1.0d, 0.0d)) LIMIT 2")
+        .queryExecution()
+        .optimizedPlan()
+        .toString();
+  }
+
   private static VectorBindingResult bind(Table table, Long snapshotId, String contract) {
     return BindVectorSearch.bind(
         spark,

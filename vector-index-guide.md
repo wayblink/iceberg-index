@@ -139,6 +139,8 @@ SET `spark.iceberg.index.vector.over-sample`=10;   -- 默认 1，即不放宽
 
 经验值：`IVF·3bit` 约 10 倍、`IVF·1bit` 约 50–100 倍才能把真实 top-10 包进候选集；`HNSW` 一般 1–3 倍。放宽不是免费的，倍数直接乘在回表行数上。
 
+`EXPLAIN` 会把这个决定摊开：`VectorSearchSource` 带 `result=exact` 或 `result=approximate`。只有 `FLAT` 且无量化时才是 `exact`（候选枚举完整）；看到 `approximate` 又没设 `over-sample`，就是明确接受了"候选集里可能没有真正的最近邻"——分数和顺序仍然精确，因为排序节点会对着原始向量重算，但被粗筛漏掉的行不会回来。
+
 默认值 1 意味着"每个结果只要一个候选"，对近似 kernel 就是不开候选放宽——实测 32 行的 `IVF·4bit` 表在 over=1 下第一名是 29、真实最近邻是 30，over=10 才对上。所以近似索引上不要把默认值当成够用。
 
 ### 4.2 过程（要行引用、或要批量）

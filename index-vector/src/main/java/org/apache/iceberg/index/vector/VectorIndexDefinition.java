@@ -51,7 +51,8 @@ public final class VectorIndexDefinition implements IndexDefinition {
     /** A navigable small-world graph over the vectors. */
     HNSW,
     /**
-     * Vectors clustered around centroids, searched by visiting the nearest lists. Not implemented.
+     * Vectors clustered around centroids, searched by visiting the nearest lists, which is
+     * approximate: a vector whose nearest list was not visited is never found.
      */
     IVF
   }
@@ -59,15 +60,17 @@ public final class VectorIndexDefinition implements IndexDefinition {
   /**
    * How a vector is stored, which is independent of how the vectors are organised.
    *
-   * <p>A quantizer trades accuracy of the stored form for size. <strong>Not implemented
-   * yet:</strong> no kernel applies {@link #RABITQ}, so asking for it fails rather than silently
-   * falling back.
+   * <p>A quantizer trades accuracy of the stored form for size: a code is smaller than the vector
+   * it stands for, so the distance computed from it is an estimate. The index layer orders
+   * candidates by that estimate, and the query layer re-scores the ones it keeps against the rows
+   * themselves, which is what turns an estimate into the distance a caller sees.
    */
   public enum VectorQuantizer {
     /** The vector as it was given. */
     NONE,
     /**
-     * One bit per dimension, scored approximately and re-ranked against the rows. Not implemented.
+     * One bit per dimension, scored approximately to pick candidates and re-scored exactly against
+     * the rows before the answer is returned.
      */
     RABITQ
   }
