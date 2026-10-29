@@ -2,7 +2,7 @@
 
 面向系统运维与平台方：这套东西怎么装、用户怎么用、发布走哪条路、出问题怎么处置。
 
-**事实基线**：仓库 `~/workspace/iceberg`（fork 自 Apache Iceberg，版本号沿用），验证集群为 shai 上的 k8s Spark 3.5.7（`spark.kubernetes.namespace=spark`），验证用镜像是 `hub.i.basemind.com/spark/sparkann-e2e:20261023b`。本文标注了哪些结论来自实测、哪些仍是建议——**"建议"部分在采纳前需要评审**。
+**事实基线（2026-10-28）**：源码基线是**厂内** Iceberg `step-1.9`（不是上游 tag，见 §7.1）；验证集群是 `sh-a-spark` 的 `spark` 命名空间（Spark 3.5.7-STEP-rc3）；当前候选镜像是 `hub.i.basemind.com/spark/sparkann-e2e:2769-5f646565`（由指定 Spark 源码构建，见 §7.5.1）。本文逐项标注了哪些结论来自实测、哪些仍是建议——**"建议"部分在采纳前需要评审**；涉及基线、镜像内容与验收的结论，一律以 §7 的实测为准。
 
 ---
 
@@ -114,13 +114,13 @@ SET spark.iceberg.index.vector.over-sample = 100;
 
 | 选项 | 做法 | 优点 | 代价 | 判断 |
 |---|---|---|---|---|
-| **A. 打进 Spark 镜像**（当前做法） | 基础镜像上删掉 vendor 的 `iceberg-spark-runtime`、`parquet-*`、`avro-*`，把我们的 shaded runtime jar 放进 `/opt/spark/jars` | 不改厂内 Spark；一个 jar 覆盖全部；已验证可跑 | 镜像与代码版本强绑（#2756 就是这么来的）；每次升级重建镜像 | **短期采用** |
+| **A. 打进 Spark 镜像**（当前做法） | 基础镜像上只删掉 vendor 的 `iceberg-spark-runtime`，把我们的 shaded runtime jar 放进 `/opt/spark/jars`；Spark 自带的 `parquet-*`、`avro-*` **不动**（见 §7.1） | 不改厂内 Spark；一个 jar 覆盖全部；已验证可跑 | 镜像与代码版本强绑（#2756 就是这么来的）；每次升级重建镜像 | **短期采用** |
 | **B. 合入厂内 Iceberg fork** | 把 `core/index-*`、`spark/v3.5` 的改动作为 fork 的常规分支维护 | 版本可追溯、可发版、CI 覆盖 | 需与上游保持 rebase；需要 revapi 门禁 | **中期采用**（本质上仓库已经是 fork，正式化即可） |
 | **C. 合入厂内 Spark 仓库** | 修改 Spark 内核 | —— | 我们只注入 session extension、函数、一条 optimizer rule 和一个 planner strategy，**不修改 Spark 任何代码** | **不做**，没有理由 |
 
 **结论**：A 现在用，B 收口长期，C 明确否掉。理由是"只要不改 Spark 内核，就不要碰 Spark 的发布节奏"——我们与 Spark 的契约只是 `spark.sql.extensions` 注入点，这个契约稳定且不需要 fork。
 
-**为什么必须删 vendor 的 jar**（不是可选优化）：厂内镜像的 `/opt/spark/jars` 在 JVM 自己的 classpath 上，`iceberg-spark-runtime-1.9.1` 会遮蔽我们的 jar，导致 session extension 解析到 1.9.1 那份、`vec_distance` 不存在、所有查询退化成扫描；`parquet-1.13.1` 也无法服务后续需要的 parquet-variant。用 `spark.jars` 传递不行：child-first loader 加载不到 session extension。所以只能烘进镜像并删除被替换的 jar。
+**为什么必须删 vendor 的 jar**（不是可选优化）：厂内镜像的 `/opt/spark/jars` 在 JVM 自己的 classpath 上，`iceberg-spark-runtime-1.9.1` 会遮蔽我们的 jar，导致 session extension 解析到 1.9.1 那份、`vec_distance` 不存在、所有查询退化成扫描；（不涉及 parquet/avro：回溯版不替换它们，见 §7.1。）用 `spark.jars` 传递不行：child-first loader 加载不到 session extension。所以只能烘进镜像并删除被替换的 jar。
 
 ### 3.1 版本与产物命名
 
@@ -151,7 +151,7 @@ export JAVA_HOME=/opt/homebrew/opt/openjdk@17
 ```
 cd /data/workspace/sparkann
 # Dockerfile 只做两件事：删掉 vendor 的 iceberg-spark-runtime、拷入我们的 jar
-# parquet / avro 跟随 Spark 自带版本，不再替换（见 §7.1）
+# parquet / avro 不替换：Iceberg 自带 shaded 依赖在 runtime jar 内部（见 §7.1）
 docker build -t hub.i.basemind.com/spark/sparkann-e2e:<tag> .
 docker push hub.i.basemind.com/spark/sparkann-e2e:<tag>
 ```
@@ -407,12 +407,12 @@ docker push hub.i.basemind.com/spark/sparkann-e2e:<tag>
 
 1. **镜像与构建器版本必须对齐**（#2756）。当前没有自动门禁，只靠发布清单里的 smoke。**建议在 CI 增加断言**：镜像内 `IndexManifest` 可读版本集合 ⊇ 构建器 `FORMAT_VERSION`。
 2. **驻留管理未收口**（#2391，7/9）。`load_index`/`offload_index` 的语义已定（按 index 粒度、固定保护期、索引级 LRU），实现仍在推进；生产先别依赖手工驻留。
-3. **nprobe 未系统扫**。10M 只测了 150、100M 只测了 32；已有独立测量显示 10M 从 150 降到 32 还能快约 2 倍而 recall 几乎不变——**默认值很可能偏保守**，这是上线后第一个该调的旋钮。
+3. **nprobe 未系统扫**。旧报告 10M 用 150、100M 用 32；回溯版的 10M 回归用的是 **32**，over-sample 100 时 recall 天花板 0.983 与旧基线一致（§7.5.3），说明 32 在 10M 可用，但**没有做 32↔150 的同轮对照**，也没扫 100M。这是上线后第一个该调的旋钮，调它要按 §7.5.3 的口径同时记录 recall 而不是只看延迟。
 4. **只在 Hive catalog 上验证过**。REST catalog 的元数据更新路径（`MetadataUpdate` 序列化）有单测覆盖，但没有端到端跑过；用 REST catalog 上线前要单独验收。
 5. **无 DDL**。所有索引操作是 `CALL` 过程，用户文档要按过程写，不要承诺 `CREATE INDEX`。
 6. **`FLAT` 不作为生产查询手段**（它在规模上省不了开销），但它**不再被改写规则拒绝**：旧规则里"FLAT 代价等同扫描所以跳过"的判断已删除，`TestVectorIndexGuide.theRewriteUsesWhateverStructureTheIndexHas` 断言 FLAT 也会生成 `VectorSearchSource`。早先"FLAT 走 `ORDER BY` 拿不到结果"的观察对应旧行为；用户手册里"索引不能是 `FLAT`"一句已过期，改文档时以本条为准。
 7. **删除表/删除行的边界**：equality delete 的多键集已支持，`timestamp_nano` 键被明确拒绝（避免同微秒多行误删）；带删除的表上建索引前请确认删除文件格式（跟随数据格式，Lance 表是 `.lance`）。
-8. **回溯版的两项能力缺失（受 1.9.1 基线限制，见 §7.3）**：其一，取回（fetch-back）没有"只读指定 row 位置"的能力，命中后会把整文件读出来再按位置过滤，结果正确但比 1.10+ 慢，差值待 10M 基准量；其二，**不支持 Lance 文件格式**，索引只读 Parquet，基准对比里的 Lance 列不适用于回溯版。
+8. **回溯版的两项能力缺失（受 1.9.1 基线限制，见 §7.3）**：其一，取回（fetch-back）没有"只读指定 row 位置"的能力，命中后会把整文件读出来再按位置过滤，结果正确但比 1.10+ 慢，差值待 10M 基准量；其二，**不支持 Lance 文件格式**，索引只读 Parquet，基准对比里的 Lance 列不适用于回溯版。10M 回归显示取回退化没有让整体数字变差（§7.5.3：天花板与旧基线一致、延迟同量级或更快），但这不等于"整文件读没有代价"——代价被 10M 的缓存与候选预算盖住了，100M 未测，所以 100M 之前先补 Parquet 位置读。
 9. **Lance 数据文件只承载扁平列和它们的列表**（首版边界，不是待修 bug）：`struct`、`map`、元素为 struct 的 list 既写不进 Lance 文件也读不回来，顶层字段名也不能含点号（格式按路径解析）；建 writer/reader 时就报错并点名具体列（`LanceRowTypes`）。需要嵌套列的表请用 `'write.format.default' = 'parquet'`。这条影响验收口径：L1 的嵌套 JSON 值保真只在 Parquet 上验，Lance 侧验的是"清晰拒绝"而不是"能写能读"；写进发布清单（release manifest）的限制说明以此为准，别把 Lance 嵌套列算进本版的覆盖范围。
 
 ---
@@ -426,8 +426,11 @@ docker push hub.i.basemind.com/spark/sparkann-e2e:<tag>
 - [ ] `over-sample` 默认值写进集群配置（建议 100），并在用户文档里说明它是什么
 - [ ] 建索引用的 principal 有表元数据写权限
 - [ ] 回滚方案演练过：旧镜像 + 新索引的唯一问题是读不了 v2，确认窗口内不建索引
-- [ ] 基线符合 §7.1：Iceberg 取厂内 1.9.1、parquet/avro 取 Spark 自带版本；镜像不再替换 parquet/avro
-- [ ] §7.4 的四类验证都重跑过（基线变更会让旧的召回/延迟数字失效）
+- [ ] 基线符合 §7.1：Iceberg 取厂内 `step-1.9`；**不替换** Spark 的 parquet/avro jar（内部 shaded 1.15.2 / 1.12.0 随 runtime jar 走）
+- [ ] 镜像内只有一个 Iceberg runtime，且其 sha256 与发布记录一致；`RELEASE` 里的 Spark revision 与指定源码一致（§7.5.1）
+- [ ] 集群六条验收在**该镜像**上重跑过（§7.5.2），不是只跑过单测
+- [ ] §7.7 的四类验证都重跑过（基线变更会让旧的召回/延迟数字失效）
+- [ ] 10M 回归与旧报告对比过（§7.5.3）；要发 100M 就先补 Parquet 位置读，再测
 - [ ] 监控采集 `index_cache_status` 与查询 P99
 - [ ] 用户文档按 `CALL` 过程写，附"参数怎么选"表（§2.1）
 

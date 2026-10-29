@@ -43,6 +43,7 @@
   .kpi .foot { color:var(--muted); font-size:12px; }
 </style></head><body><div class="wrap">
 <h1>Iceberg 向量索引基准 · 结论摘要（SIFT 10M / 100M）</h1>
+<p class="sub"><strong>数据来源说明（2026-10-28 更新）</strong>：本报告的数字来自<b>回溯前的基线</b>（Iceberg fork 1.12 线，Parquet 1.17.1 / Avro 1.12.2）。回溯到厂内 1.9.1 之后用同一套 harness 在 10M 上重测过一轮：召回天花板相同（0.983）、延迟同量级或更快，因此<b>本页数字没有替换，仍然有效</b>；差异与其原因见 <code>docs/vector-index-deployment-guide.md</code> §7.5.3。该页的 Lance 两列在回溯版上不适用（回溯版不支持 Lance 文件格式，见同文档 §7.3）。</p>
 <p class="sub">伞卡 #1948 的收口摘要 · 数据取自 <code>tools/vector-benchmark/results/</code> 下的
 benchmark 日志，与详细报告同源，未经二次加工</p>
 <div class="kpis"><div class="kpi"><div class="label">10M · Parquet</div><div class="value">6.5 s</div><div class="foot">IVF·1bit over 100 · 扫描的 2.4×</div></div><div class="kpi"><div class="label">10M · Lance</div><div class="value">4.4 s</div><div class="foot">IVF·1bit over 100 · 扫描的 4.3×</div></div><div class="kpi"><div class="label">100M · Parquet</div><div class="value">51.7 s</div><div class="foot">IVF·3bit over 10 · 扫描的 2.8×</div></div><div class="kpi"><div class="label">100M · Lance</div><div class="value">13.5 s</div><div class="foot">IVF·1bit over 100 · 扫描的 9.9×</div></div></div><div class="card verdict">
