@@ -137,6 +137,91 @@ class TestIndexReader {
   }
 
   @Test
+  public void refusesToAnswerWhenItCannotReadAnyFile(@TempDir Path tempDir) throws IOException {
+    // a reader from an older build that meets index files written by a newer one reads no file at
+    // all; answering with no hits is indistinguishable from a search that found nothing, and the
+    // files stay counted as covered, so a residual scan would not bring the rows back either
+    LocalFileIO fileIO = new LocalFileIO();
+    TestingIndexAdapter adapter = new TestingIndexAdapter(TestingIndexDefinition.of(4));
+    IndexFileContainer container = new PuffinIndexFileContainer();
+    String unreadableType = "iceberg-testing-entries-v2";
+
+    String indexFile = tempDir.resolve("index-file-1.puffin").toString();
+    container.write(
+        fileIO.newOutputFile(indexFile),
+        List.of(IndexBlob.of(unreadableType, TestingIndexAdapter.valuePayload(10))));
+
+    IndexSnapshot snapshot =
+        snapshotFor(
+            fileIO, manifestFor(tempDir, fileIO, indexFile, unreadableType, "data-1.parquet"), 20);
+
+    IndexReader reader = new IndexReader(metadataFor(tempDir, snapshot), fileIO);
+    assertThatThrownBy(() -> reader.search(IndexQuery.of(20, query(5), 10)))
+        .isInstanceOf(IllegalStateException.class)
+        .hasMessageContaining("index-uuid")
+        .hasMessageContaining(adapter.entryBlobType())
+        .hasMessageContaining(unreadableType);
+  }
+
+  @Test
+  public void reportsFilesItCannotReadAsUncovered(@TempDir Path tempDir) throws IOException {
+    // skipping a file is only safe if the skip also takes it out of the coverage claim: the row
+    // filter that trims the index answer is the same test that decides which files a residual scan
+    // has to read, so a file that was skipped and still counted as covered loses its rows
+    LocalFileIO fileIO = new LocalFileIO();
+    TestingIndexAdapter adapter = new TestingIndexAdapter(TestingIndexDefinition.of(4));
+    IndexFileContainer container = new PuffinIndexFileContainer();
+
+    String readableFile = tempDir.resolve("index-file-1.puffin").toString();
+    container.write(
+        fileIO.newOutputFile(readableFile),
+        List.of(
+            IndexBlob.of(
+                adapter.entryBlobType(),
+                adapter
+                    .encodeEntries(
+                        List.of(
+                            IndexEntry.of(
+                                "data-1.parquet", 0, TestingIndexAdapter.valuePayload(10))))
+                    .array())));
+
+    String unreadableFile = tempDir.resolve("index-file-2.puffin").toString();
+    container.write(
+        fileIO.newOutputFile(unreadableFile),
+        List.of(IndexBlob.of("iceberg-testing-entries-v2", TestingIndexAdapter.valuePayload(99))));
+
+    String manifest = tempDir.resolve("index-manifest-1.imn").toString();
+    IndexManifest.write(
+        fileIO.newOutputFile(manifest),
+        List.of(
+            IndexFile.builder()
+                .location(readableFile)
+                .kind(Kind.ENTRY_BEARING)
+                .blobType(adapter.entryBlobType())
+                .entryCount(1)
+                .coveredDataFiles(List.of("data-1.parquet"))
+                .build(),
+            IndexFile.builder()
+                .location(unreadableFile)
+                .kind(Kind.ENTRY_BEARING)
+                .blobType("iceberg-testing-entries-v2")
+                .entryCount(1)
+                .coveredDataFiles(List.of("data-2.parquet"))
+                .build()));
+
+    IndexSnapshot snapshot = snapshotFor(fileIO, manifest, 20);
+    IndexReader reader = new IndexReader(metadataFor(tempDir, snapshot), fileIO);
+
+    assertThat(reader.search(IndexQuery.of(20, query(5), 10)))
+        .extracting(IndexSearchResult::dataFile)
+        .containsExactly("data-1.parquet");
+    assertThat(
+            reader.uncoveredDataFiles(
+                20, List.of("data-1.parquet", "data-2.parquet", "data-3.parquet")))
+        .containsExactly("data-2.parquet", "data-3.parquet");
+  }
+
+  @Test
   public void atOrBeforeAnswersFromTheNewestSnapshotItCanUse(@TempDir Path tempDir)
       throws IOException {
     LocalFileIO fileIO = new LocalFileIO();
@@ -287,6 +372,46 @@ class TestIndexReader {
         .snapshotId(snapshotId)
         .sourceTableSnapshotId(sourceTableSnapshotId)
         .timestampMillis(snapshotId)
+        .indexManifestList(list)
+        .build();
+  }
+
+  private static IndexMetadata metadataFor(Path tempDir, IndexSnapshot snapshot) {
+    return IndexMetadata.builder()
+        .indexUuid("index-uuid")
+        .tableUuid("table-uuid")
+        .location(tempDir.toString())
+        .definition(TestingIndexDefinition.of(4))
+        .addSnapshot(snapshot)
+        .build();
+  }
+
+  /** Writes one manifest holding a single file and returns its location. */
+  private static String manifestFor(
+      Path tempDir, LocalFileIO fileIO, String indexFile, String blobType, String dataFile)
+      throws IOException {
+    String manifest = tempDir.resolve("index-manifest-1.imn").toString();
+    IndexManifest.write(
+        fileIO.newOutputFile(manifest),
+        List.of(
+            IndexFile.builder()
+                .location(indexFile)
+                .kind(Kind.ENTRY_BEARING)
+                .blobType(blobType)
+                .entryCount(1)
+                .coveredDataFiles(List.of(dataFile))
+                .build()));
+    return manifest;
+  }
+
+  private static IndexSnapshot snapshotFor(LocalFileIO fileIO, String manifest, long sourceId)
+      throws IOException {
+    String list = manifest.replace(".imn", ".iml");
+    IndexManifestList.write(fileIO.newOutputFile(list), List.of(ManifestRef.of(manifest, 1, 1)));
+    return IndexSnapshot.builder()
+        .snapshotId(sourceId + 1)
+        .sourceTableSnapshotId(sourceId)
+        .timestampMillis(sourceId)
         .indexManifestList(list)
         .build();
   }

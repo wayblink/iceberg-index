@@ -91,31 +91,23 @@ public final class IndexReader {
     IndexAdapter adapter =
         IndexTypes.fromType(metadata.indexType()).createAdapter(metadata.definition());
 
-    IndexManifestList manifestList = readManifestList(snapshot);
+    Readable readable = readable(adapter, readManifestList(snapshot));
+    checkReadable(readable, adapter);
     if (adapter.searchesAllPayloadsTogether()) {
-      return searchCorrelated(adapter, manifestList, query);
+      return searchCorrelated(adapter, readable, query);
     }
 
-    Set<String> auxiliaryBlobTypes = adapter.readableAuxiliaryBlobTypes();
-    Set<String> entryBlobTypes = adapter.readableEntryBlobTypes();
     List<IndexSearchResult> results = Lists.newArrayList();
-    for (IndexManifestList.ManifestRef ref : manifestList.manifests()) {
-      IndexManifest manifest = readManifest(ref.location());
-      for (IndexFile indexFile : manifest.indexFiles()) {
-        if (indexFile.kind() == IndexFile.Kind.ENTRY_BEARING
-            && entryBlobTypes.contains(indexFile.blobType())) {
-          IndexBlob blob = readBlob(indexFile.location(), indexFile.blobType());
-          results.addAll(
-              adapter.search(ByteBuffer.wrap(blob.payload()), query.payload(), query.topK()));
-        } else if (indexFile.kind() == IndexFile.Kind.AUXILIARY
-            && auxiliaryBlobTypes.contains(indexFile.blobType())) {
-          IndexBlob blob = readBlob(indexFile.location(), indexFile.blobType());
-          results.addAll(
-              adapter.searchAuxiliary(
-                  ByteBuffer.wrap(blob.payload()), query.payload(), query.topK()));
-        }
-        // other payload types are skipped for forward compatibility
-      }
+    for (IndexFile indexFile : readable.entry()) {
+      IndexBlob blob = readBlob(indexFile.location(), indexFile.blobType());
+      results.addAll(
+          adapter.search(ByteBuffer.wrap(blob.payload()), query.payload(), query.topK()));
+    }
+
+    for (IndexFile indexFile : readable.auxiliary()) {
+      IndexBlob blob = readBlob(indexFile.location(), indexFile.blobType());
+      results.addAll(
+          adapter.searchAuxiliary(ByteBuffer.wrap(blob.payload()), query.payload(), query.topK()));
     }
 
     results.sort(adapter.resultComparator());
@@ -126,13 +118,102 @@ public final class IndexReader {
   }
 
   /**
+   * The index files of a snapshot this reader can decode, and the blob types of the files it has to
+   * skip.
+   *
+   * <p>A file the reader cannot decode is recorded rather than dropped, because the caller has to
+   * stop claiming coverage for it: a skipped file answers nothing, so its rows have to come from a
+   * residual scan. That is what forward compatibility looks like when a newer build has written a
+   * type this one does not know; a reader that can decode none of the files is a different case and
+   * {@link #checkReadable} fails.
+   */
+  private Readable readable(IndexAdapter adapter, IndexManifestList manifestList) {
+    Set<String> entryBlobTypes = adapter.readableEntryBlobTypes();
+    Set<String> auxiliaryBlobTypes = adapter.readableAuxiliaryBlobTypes();
+    List<IndexFile> entry = Lists.newArrayList();
+    List<IndexFile> auxiliary = Lists.newArrayList();
+    Set<String> skippedBlobTypes = Sets.newLinkedHashSet();
+    for (IndexManifestList.ManifestRef ref : manifestList.manifests()) {
+      for (IndexFile indexFile : readManifest(ref.location()).indexFiles()) {
+        if (indexFile.kind() == IndexFile.Kind.ENTRY_BEARING
+            && entryBlobTypes.contains(indexFile.blobType())) {
+          entry.add(indexFile);
+        } else if (indexFile.kind() == IndexFile.Kind.AUXILIARY
+            && auxiliaryBlobTypes.contains(indexFile.blobType())) {
+          auxiliary.add(indexFile);
+        } else {
+          skippedBlobTypes.add(indexFile.blobType());
+        }
+      }
+    }
+
+    return new Readable(entry, auxiliary, skippedBlobTypes);
+  }
+
+  /**
+   * Refuses a snapshot none of whose files this build can decode.
+   *
+   * <p>When every file is skipped there is no forward compatibility left to preserve: the answer
+   * would be empty, the same as a search that matched nothing, so the caller could not tell a
+   * broken index from an empty result. Failing says which types were expected and which were found.
+   */
+  private void checkReadable(Readable readable, IndexAdapter adapter) {
+    if (readable.all().isEmpty() && !readable.skippedBlobTypes().isEmpty()) {
+      throw new IllegalStateException(
+          "Index "
+              + metadata.indexUuid()
+              + " has no file this reader can decode: it reads "
+              + expectedBlobTypes(adapter)
+              + ", the files carry "
+              + readable.skippedBlobTypes()
+              + "; rebuild the index or read it with a version that knows these types");
+    }
+  }
+
+  private static Set<String> expectedBlobTypes(IndexAdapter adapter) {
+    return ImmutableSet.<String>builder()
+        .addAll(adapter.readableEntryBlobTypes())
+        .addAll(adapter.readableAuxiliaryBlobTypes())
+        .build();
+  }
+
+  private static final class Readable {
+    private final List<IndexFile> entry;
+    private final List<IndexFile> auxiliary;
+    private final Set<String> skippedBlobTypes;
+
+    private Readable(
+        List<IndexFile> entry, List<IndexFile> auxiliary, Set<String> skippedBlobTypes) {
+      this.entry = entry;
+      this.auxiliary = auxiliary;
+      this.skippedBlobTypes = skippedBlobTypes;
+    }
+
+    private List<IndexFile> entry() {
+      return entry;
+    }
+
+    private List<IndexFile> auxiliary() {
+      return auxiliary;
+    }
+
+    private Set<String> skippedBlobTypes() {
+      return skippedBlobTypes;
+    }
+
+    private List<IndexFile> all() {
+      return ImmutableList.<IndexFile>builder().addAll(entry).addAll(auxiliary).build();
+    }
+  }
+
+  /**
    * Searches with an adapter that needs all payloads of the snapshot together: the payloads of each
    * kind are collected and handed to the adapter, which merges the statistics they carry before
    * scoring. See {@link IndexAdapter#searchesAllPayloadsTogether()}.
    */
   private List<IndexSearchResult> searchCorrelated(
-      IndexAdapter adapter, IndexManifestList manifestList, IndexQuery query) {
-    Payloads payloads = readPayloads(adapter, manifestList);
+      IndexAdapter adapter, Readable readable, IndexQuery query) {
+    Payloads payloads = readPayloads(readable);
 
     List<IndexSearchResult> results = Lists.newArrayList();
     if (!payloads.entry.isEmpty()) {
@@ -162,25 +243,9 @@ public final class IndexReader {
     IndexAdapter adapter =
         IndexTypes.fromType(metadata.indexType()).createAdapter(metadata.definition());
 
-    Set<String> auxiliaryBlobTypes = adapter.readableAuxiliaryBlobTypes();
-    Set<String> entryBlobTypes = adapter.readableEntryBlobTypes();
-    List<IndexFile> files = Lists.newArrayList();
-    for (IndexManifestList.ManifestRef ref : readManifestList(snapshot).manifests()) {
-      for (IndexFile indexFile : readManifest(ref.location()).indexFiles()) {
-        boolean carriesEntries =
-            indexFile.kind() == IndexFile.Kind.ENTRY_BEARING
-                && entryBlobTypes.contains(indexFile.blobType());
-        boolean carriesAuxiliary =
-            indexFile.kind() == IndexFile.Kind.AUXILIARY
-                && auxiliaryBlobTypes.contains(indexFile.blobType());
-        if (carriesEntries || carriesAuxiliary) {
-          files.add(indexFile);
-        }
-        // other payload types are skipped for forward compatibility
-      }
-    }
-
-    return ImmutableList.copyOf(files);
+    Readable readable = readable(adapter, readManifestList(snapshot));
+    checkReadable(readable, adapter);
+    return readable.all();
   }
 
   /**
@@ -195,7 +260,9 @@ public final class IndexReader {
     IndexAdapter adapter =
         IndexTypes.fromType(metadata.indexType()).createAdapter(metadata.definition());
 
-    Payloads payloads = readPayloads(adapter, readManifestList(snapshot));
+    Readable readable = readable(adapter, readManifestList(snapshot));
+    checkReadable(readable, adapter);
+    Payloads payloads = readPayloads(readable);
     List<ByteBuffer> statisticsPayloads =
         adapter.writesAuxiliaryFiles() && !payloads.auxiliary.isEmpty()
             ? payloads.auxiliary
@@ -203,26 +270,19 @@ public final class IndexReader {
     return adapter.searchStatistics(statisticsPayloads);
   }
 
-  /** The payloads of every index file of a snapshot, by kind. */
-  private Payloads readPayloads(IndexAdapter adapter, IndexManifestList manifestList) {
-    Set<String> auxiliaryBlobTypes = adapter.readableAuxiliaryBlobTypes();
-    Set<String> entryBlobTypes = adapter.readableEntryBlobTypes();
-    List<ByteBuffer> entryPayloads = Lists.newArrayList();
-    List<ByteBuffer> auxiliaryPayloads = Lists.newArrayList();
-    for (IndexManifestList.ManifestRef ref : manifestList.manifests()) {
-      IndexManifest manifest = readManifest(ref.location());
-      for (IndexFile indexFile : manifest.indexFiles()) {
-        if (indexFile.kind() == IndexFile.Kind.ENTRY_BEARING
-            && entryBlobTypes.contains(indexFile.blobType())) {
-          IndexBlob blob = readBlob(indexFile.location(), indexFile.blobType());
-          entryPayloads.add(ByteBuffer.wrap(blob.payload()));
-        } else if (indexFile.kind() == IndexFile.Kind.AUXILIARY
-            && auxiliaryBlobTypes.contains(indexFile.blobType())) {
-          IndexBlob blob = readBlob(indexFile.location(), indexFile.blobType());
-          auxiliaryPayloads.add(ByteBuffer.wrap(blob.payload()));
-        }
-        // other payload types are skipped for forward compatibility
-      }
+  /** The payloads of the given index files, by kind. */
+  private Payloads readPayloads(Readable readable) {
+    List<ByteBuffer> entryPayloads = Lists.newArrayListWithCapacity(readable.entry().size());
+    for (IndexFile indexFile : readable.entry()) {
+      IndexBlob blob = readBlob(indexFile.location(), indexFile.blobType());
+      entryPayloads.add(ByteBuffer.wrap(blob.payload()));
+    }
+
+    List<ByteBuffer> auxiliaryPayloads =
+        Lists.newArrayListWithCapacity(readable.auxiliary().size());
+    for (IndexFile indexFile : readable.auxiliary()) {
+      IndexBlob blob = readBlob(indexFile.location(), indexFile.blobType());
+      auxiliaryPayloads.add(ByteBuffer.wrap(blob.payload()));
     }
 
     return new Payloads(entryPayloads, auxiliaryPayloads);
@@ -258,10 +318,14 @@ public final class IndexReader {
     Preconditions.checkNotNull(query, "Index query is null");
     Preconditions.checkNotNull(sourceDataFiles, "Source data files are null");
     IndexSnapshot snapshot = snapshotForQuery(query);
-    IndexManifestList manifestList = readManifestList(snapshot);
+    IndexAdapter adapter =
+        IndexTypes.fromType(metadata.indexType()).createAdapter(metadata.definition());
+
+    // only the files this reader can decode cover the data files they name: a file that is skipped
+    // answers nothing, so its rows have to come from a residual scan rather than from the index
     Set<String> indexed = Sets.newLinkedHashSet();
-    for (IndexManifestList.ManifestRef ref : manifestList.manifests()) {
-      indexed.addAll(readManifest(ref.location()).indexedDataFiles());
+    for (IndexFile indexFile : readable(adapter, readManifestList(snapshot)).all()) {
+      indexed.addAll(indexFile.coveredDataFiles());
     }
 
     Set<String> uncovered = Sets.newLinkedHashSet();
