@@ -19,6 +19,7 @@
 package org.apache.iceberg.spark.index
 
 import org.apache.iceberg.index.text.TextIndexTypes
+import org.apache.iceberg.index.text.TextIndexTypes
 import org.apache.iceberg.index.vector.VectorIndexTypes
 import org.apache.iceberg.spark.Spark3Util
 import org.apache.iceberg.index.spark.IndexSearch
@@ -34,11 +35,13 @@ import org.apache.spark.sql.catalyst.expressions.ExpressionInfo
 import org.apache.spark.sql.catalyst.plans.logical.LogicalPlan
 import org.apache.iceberg.index.spark.VectorIndexes
 import org.apache.iceberg.index.vector.VectorIndexDefinition.Metric
+import org.apache.iceberg.index.text.TextIndexTypes
 import org.apache.iceberg.index.vector.VectorIndexTypes
 import org.apache.iceberg.spark.Spark3Util
 import org.apache.spark.sql.catalyst.expressions.Alias
 import org.apache.spark.sql.catalyst.expressions.Attribute
 import org.apache.spark.sql.catalyst.expressions.Ascending
+import org.apache.spark.sql.catalyst.expressions.Descending
 import org.apache.spark.sql.catalyst.expressions.Literal
 import org.apache.spark.sql.catalyst.expressions.NamedArgumentExpression
 import org.apache.spark.sql.catalyst.expressions.NullsFirst
@@ -65,13 +68,22 @@ import java.util.Locale
 object IndexTableFunctions {
 
   private val VECTOR_SEARCH = "vector_search"
+  private val TEXT_SEARCH = "search"
   private val VECTOR_COLUMN = "vector_column"
   private val DISTANCE_COLUMN = "_distance"
+  private val SCORE_COLUMN = "_score"
   private val VECTOR_INDEX_SEARCH = "vector_index_search"
   private val VECTOR_INDEX_SEARCH_BATCH = "vector_index_search_batch"
   private val TEXT_INDEX_SEARCH = "text_index_search"
 
   def register(extensions: SparkSessionExtensions): Unit = {
+    extensions.injectTableFunction(
+      (
+        new FunctionIdentifier(TEXT_SEARCH),
+        new ExpressionInfo(
+          TEXT_SEARCH,
+          "search(table, query, search_columns, limit): rows ranked by a text index"),
+        textSearch))
     extensions.injectTableFunction(
       (
         new FunctionIdentifier(VECTOR_SEARCH),
@@ -119,6 +131,77 @@ object IndexTableFunctions {
    */
   private def analysisError(message: String): Nothing =
     throw new IllegalArgumentException(message)
+
+
+  /**
+   * The rows a text index ranks for a query, as the table's own columns plus the score.
+   *
+   * <p>Like the vector function, this is an ordinary projection over a sort over a limit, so the
+   * search is answered by the rewrite that binds the score to the index statistics. Naming one
+   * column is required: a text index belongs to one column, and asking for several would need a
+   * fusion rule that does not exist yet.
+   */
+  private def textSearch(args: Seq[Expression]): LogicalPlan = {
+    val spark = SparkSession.active
+    TextIndexTypes.register()
+
+    val arguments = new TableFunctionArguments(TEXT_SEARCH, args)
+    arguments.requireOnly(
+      required = Seq("table", "search_columns"),
+      optional = Seq("query", "query_string", "limit", "k", "num_results", "columns"))
+
+    val tableName = arguments.string("table")
+    val query = arguments
+      .stringOption("query")
+      .orElse(arguments.stringOption("query_string"))
+      .getOrElse(analysisError("search needs query"))
+    val searched = arguments.strings("search_columns")
+    val k = arguments
+      .int("limit")
+      .orElse(arguments.int("k"))
+      .orElse(arguments.int("num_results"))
+      .getOrElse(10)
+    val columns = arguments.strings("columns")
+
+    Preconditions.checkArgument(
+      searched.size == 1,
+      "search needs exactly one column in search_columns, got %s",
+      searched.size)
+    Preconditions.checkArgument(k > 0, "search needs a positive number of rows, got %s", k)
+
+    val catalogAndIdent = Spark3Util.catalogAndIdentifier(spark, tableName)
+    val catalog = catalogAndIdent.catalog()
+    val ident = catalogAndIdent.identifier()
+    val table = catalog.asInstanceOf[TableCatalog].loadTable(ident)
+    val relation = DataSourceV2Relation.create(
+      table,
+      Some(catalog),
+      Some(ident),
+      CaseInsensitiveStringMap.empty())
+
+    def columnOf(name: String): Attribute = {
+      relation.output
+        .find(attribute => attribute.name.equalsIgnoreCase(name))
+        .getOrElse(
+          analysisError(
+            s"Column $name does not exist in $tableName; the table has " +
+              relation.output.map(_.name).mkString(", ")))
+    }
+
+    val vector = columnOf(searched.head)
+    val selected = if (columns.isEmpty) relation.output else columns.map(columnOf)
+    if (selected.exists(attribute => attribute.name.equalsIgnoreCase(SCORE_COLUMN))) {
+      analysisError(s"$tableName already has a column named $SCORE_COLUMN")
+    }
+
+    // the score is the whole search here: the rule finds the query and the searched column in the
+    // expression, binds its statistics from the index of that column, and the projection above then
+    // reads the score it produced
+    val score = TextScoreExpression(null, null, vector, Literal(query))
+    val ordered = Sort(Seq(SortOrder(score, Descending, NullsFirst, Seq.empty)), global = true, relation)
+    val limited = GlobalLimit(Literal(k), ordered)
+    Project(selected :+ Alias(score, SCORE_COLUMN)(), limited)
+  }
 
   private def vectorSearch(args: Seq[Expression]): LogicalPlan = {
     val spark = SparkSession.active
@@ -229,6 +312,16 @@ object IndexTableFunctions {
           analysisError(s"$key of $name must be a constant")
         case None =>
           analysisError(s"$name needs $key")
+      }
+    }
+
+    def stringOption(key: String): Option[String] = {
+      named.get(key).map { value =>
+        if (!value.foldable) {
+          analysisError(s"$key of $name must be a constant")
+        }
+
+        value.eval().toString
       }
     }
 

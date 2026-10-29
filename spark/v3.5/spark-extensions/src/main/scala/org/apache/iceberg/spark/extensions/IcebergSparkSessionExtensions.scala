@@ -79,6 +79,24 @@ class IcebergSparkSessionExtensions extends (SparkSessionExtensions => Unit) {
     }
   }
 
+
+  /**
+   * The column and the query of a text function, refusing a call with anything else.
+   *
+   * <p>A third argument would otherwise be dropped in silence, and a caller who wrote
+   * `match(body, 'error', 'operator=AND')` would believe the options were applied. Until the text
+   * index can answer options, an extra argument is an error rather than a no-op.
+   */
+  private def textArguments(name: String, args: Seq[Expression]): (Expression, Expression) = {
+    if (args.size != 2) {
+      throw new IllegalArgumentException(
+        s"$name takes a column and a query, got ${args.size} arguments: options are not supported " +
+          "by the text index yet")
+    }
+
+    (args(0), args(1))
+  }
+
   override def apply(extensions: SparkSessionExtensions): Unit = {
     // the index types the engine ships with. IndexTypes is a static registry that fails fast on an
     // unknown type, so a session that has not registered them can neither build nor read an index,
@@ -123,19 +141,23 @@ class IcebergSparkSessionExtensions extends (SparkSessionExtensions => Unit) {
       (
         new FunctionIdentifier(TEXT_SCORE),
         new ExpressionInfo(TEXT_SCORE, "text_score(text, query): BM25 score against a query"),
-        (args: Seq[Expression]) =>
+        (args: Seq[Expression]) => {
           // the rewrite rule binds the definition and the statistics to the index it finds
-          org.apache.iceberg.spark.index.TextScoreExpression(null, null, args(0), args(1)))
+          val (text, query) = textArguments(TEXT_SCORE, args)
+          org.apache.iceberg.spark.index.TextScoreExpression(null, null, text, query)
+        })
     }
     extensions.injectFunction {
       (
         new FunctionIdentifier(TEXT_MATCH),
         new ExpressionInfo(TEXT_MATCH, "match(text, query): whether a text matches a query"),
-        (args: Seq[Expression]) =>
+        (args: Seq[Expression]) => {
+          val (text, query) = textArguments(TEXT_MATCH, args)
           org.apache.iceberg.spark.index.TextMatchExpression(
             null,
             null,
-            org.apache.iceberg.spark.index.TextScoreExpression(null, null, args(0), args(1))))
+            org.apache.iceberg.spark.index.TextScoreExpression(null, null, text, query))
+        })
     }
     extensions.injectOptimizerRule { spark =>
       org.apache.iceberg.spark.index.RewriteTextSearch(spark)
