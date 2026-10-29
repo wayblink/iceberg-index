@@ -514,6 +514,35 @@ public final class SparkIndexBuilder {
               .build());
     }
 
+    // A data file whose rows are all deleted, or whose rows carry no indexable value, produces no
+    // entries, but it is still a data file of the snapshot. An index that does not name it leaves a
+    // reader unable to tell "nothing to find here" from "this file was never indexed", and the text
+    // rewrite refuses to bind such an index to the snapshot at all.
+    Set<String> expected =
+        onlyFiles != null
+            ? Sets.newHashSet(onlyFiles)
+            : Sets.newHashSet(IndexEntries.dataFiles(table, sourceTableSnapshotId));
+    Set<String> covered = Sets.newHashSet();
+    for (IndexFile indexFile : indexFiles) {
+      covered.addAll(indexFile.coveredDataFiles());
+    }
+
+    Set<String> coveredByNothing = Sets.difference(expected, covered);
+    if (!coveredByNothing.isEmpty()) {
+      indexFiles.add(
+          writeEmptyCoverageFile(
+              table,
+              indexLocation,
+              snapshotId,
+              adapter,
+              writesAuxiliary,
+              buildThreads,
+              coveredByNothing,
+              writer,
+              indexFileRows.size(),
+              filesBuilt));
+    }
+
     if (progress.skipped() > 0) {
       // a build that leaves rows out is a fact about the table, not a detail of the run: whoever
       // reads the log should see it without turning on debug logging
@@ -612,6 +641,79 @@ public final class SparkIndexBuilder {
   private static final String SKIPPED_ACCUMULATOR = "iceberg.index.build.skipped-null-vectors";
 
   /** How many data files the group at this partition index was assigned. */
+  /**
+   * Records data files that need no entries as covered, in one index file of their own.
+   *
+   * <p>The file is written the way a group's file is written, so a reader sees a normal payload
+   * with no entries rather than a special case.
+   */
+  private static IndexFile writeEmptyCoverageFile(
+      Table table,
+      String indexLocation,
+      long snapshotId,
+      IndexAdapter adapter,
+      boolean writesAuxiliary,
+      int buildThreads,
+      Set<String> coveredDataFiles,
+      IndexSnapshotWriter writer,
+      int sequence,
+      LongAccumulator filesBuilt) {
+    FileIO fileIO = table.io();
+    IndexFileContainer fileContainer = new PuffinIndexFileContainer();
+    String location =
+        indexLocation
+            + "/"
+            + DATA_DIR
+            + "/index-file-"
+            + snapshotId
+            + "-"
+            + sequence
+            + "-"
+            + UUID.randomUUID();
+    List<IndexEntry> noEntries = Lists.newArrayList();
+    String blobType;
+    IndexBuildResult built;
+    IndexFile.Kind kind;
+    if (writesAuxiliary) {
+      blobType = adapter.auxiliaryBlobType();
+      built = adapter.encodeAuxiliaryPayloadWithMemory(noEntries, buildThreads);
+      kind = IndexFile.Kind.AUXILIARY;
+    } else {
+      blobType = adapter.entryBlobType();
+      built = adapter.encodeEntriesWithMemory(noEntries);
+      kind = IndexFile.Kind.ENTRY_BEARING;
+    }
+
+    IndexFileMemory memory = built.memory();
+    IndexPayloadLimits.checkFits(built.payload().remaining(), 0, location);
+    try {
+      fileContainer.write(
+          fileIO.newOutputFile(location),
+          List.of(IndexBlob.of(blobType, ByteBuffers.toByteArray(built.payload()))));
+    } catch (java.io.IOException e) {
+      throw new java.io.UncheckedIOException("Cannot write " + location, e);
+    }
+    if (memory != null) {
+      memory = memory.toBuilder().fileBytes(fileIO.newInputFile(location).getLength()).build();
+    }
+
+    filesBuilt.add(1);
+    writer.record(indexLocation, FILE_MARKER_PREFIX + sequence, location);
+    LOG.info(
+        "Wrote {} covering {} data files that carry no entries for {}",
+        location,
+        coveredDataFiles.size(),
+        table.name());
+    return IndexFile.builder()
+        .location(location)
+        .kind(kind)
+        .blobType(blobType)
+        .entryCount(0)
+        .coveredDataFiles(Lists.newArrayList(coveredDataFiles))
+        .memory(memory)
+        .build();
+  }
+
   private static int dataFileCount(Map<Integer, List<FileScanTask>> tasksByIndexFile, int index) {
     List<FileScanTask> tasks = tasksByIndexFile.get(index);
     return tasks == null ? 0 : tasks.size();

@@ -24,7 +24,12 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import java.util.List;
 import java.util.stream.Collectors;
 import org.apache.iceberg.ParameterizedTestExtension;
+import org.apache.iceberg.Table;
+import org.apache.iceberg.index.IndexReader;
+import org.apache.iceberg.index.spark.IndexEntries;
+import org.apache.iceberg.index.spark.VectorIndexes;
 import org.apache.iceberg.index.text.TextIndexTypes;
+import org.apache.iceberg.spark.Spark3Util;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.TestTemplate;
@@ -212,7 +217,7 @@ public class TestMultipleIndexesPerTable extends ExtensionsTestBase {
   }
 
   @TestTemplate
-  public void testRefreshRewritesTheWholeGroup() {
+  public void testRefreshRewritesTheWholeGroup() throws Exception {
     String tableName = tableName("multi_index_group_refresh_" + catalogName);
     sql("CREATE TABLE %s (id bigint, body string) USING iceberg", tableName);
     // one row per statement, so each statement writes exactly one data file
@@ -239,11 +244,18 @@ public class TestMultipleIndexesPerTable extends ExtensionsTestBase {
 
     List<Object[]> after =
         sql("CALL %s.system.list_indexes(table => '%s')", catalogName, tableName);
-    // the groups are repacked, because the rewritten data file sorts differently: the file count
-    // may move, but every remaining row is still indexed and no group is left half empty
+    // the groups are repacked, because the rewritten data file sorts differently, and a data file
+    // whose rows were all deleted is now covered by an index file of its own: the file count may
+    // move, but no data file of the snapshot is left out and every remaining row is still indexed
     long indexFiles = ((Number) after.get(0)[5]).longValue();
-    assertThat(indexFiles).isBetween(1L, 2L);
+    assertThat(indexFiles).isBetween(1L, 3L);
     assertThat(((Number) after.get(0)[6]).longValue()).isEqualTo(3L);
+    Table table = Spark3Util.loadIcebergTable(spark, tableName);
+    long snapshot = table.currentSnapshot().snapshotId();
+    assertThat(
+            new IndexReader(VectorIndexes.findIndex(table, "body", "text", null), table)
+                .uncoveredDataFiles(snapshot, IndexEntries.dataFiles(table, snapshot)))
+        .isEmpty();
 
     // the deleted row is gone from the index and the others are still found
     List<Object[]> deleted =

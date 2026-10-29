@@ -24,7 +24,13 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import java.util.List;
 import java.util.stream.Collectors;
 import org.apache.iceberg.ParameterizedTestExtension;
+import org.apache.iceberg.Table;
+import org.apache.iceberg.index.IndexMetadata;
+import org.apache.iceberg.index.IndexReader;
+import org.apache.iceberg.index.spark.IndexEntries;
+import org.apache.iceberg.index.spark.VectorIndexes;
 import org.apache.iceberg.index.text.TextIndexTypes;
+import org.apache.iceberg.spark.Spark3Util;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.TestTemplate;
@@ -156,6 +162,69 @@ public class TestTextIndexProcedures extends ExtensionsTestBase {
                 + "query => 'vector index', k => 1)",
             catalogName, tableName);
     assertThat(searchIds(searchOutput)).containsExactly(2L);
+  }
+
+  @TestTemplate
+  public void testRefreshCoversADataFileWhoseRowsWereAllDeleted() throws Exception {
+    String tableName = tableName("text_emptied_" + catalogName);
+    // merge-on-read keeps the data file a delete emptied, which copy-on-write would remove
+    sql(
+        "CREATE TABLE %s (id bigint, body string) USING iceberg "
+            + "TBLPROPERTIES ('format-version' = '2', 'write.delete.mode' = 'merge-on-read')",
+        tableName);
+    // two data files of one row each, so deleting one row empties a whole file
+    sql("INSERT INTO %s VALUES (1, 'iceberg table format')", tableName);
+    sql("INSERT INTO %s VALUES (2, 'iceberg vector index')", tableName);
+    sql("CALL %s.system.build_text_index(table => '%s', column => 'body')", catalogName, tableName);
+
+    // the delete is written the way a job writes one: a position delete file of its own, so the
+    // data file it empties stays part of the snapshot
+    Table table = Spark3Util.loadIcebergTable(spark, tableName);
+    org.apache.iceberg.DataFile target = null;
+    for (org.apache.iceberg.FileScanTask task : table.newScan().planFiles()) {
+      if (target == null
+          || task.file().location().toString().compareTo(target.location().toString()) < 0) {
+        target = task.file();
+      }
+    }
+    assertThat(target).isNotNull();
+    org.apache.iceberg.deletes.PositionDeleteWriter<org.apache.iceberg.data.Record> writer =
+        org.apache.iceberg.formats.FormatModelRegistry
+            .<org.apache.iceberg.data.Record>positionDeleteWriteBuilder(
+                org.apache.iceberg.FileFormat.PARQUET,
+                org.apache.iceberg.encryption.EncryptedFiles.plainAsEncryptedOutput(
+                    table.io().newOutputFile(table.location() + "/data/probe-pos.parquet")))
+            .spec(org.apache.iceberg.PartitionSpec.unpartitioned())
+            .build();
+    try (writer) {
+      writer.write(
+          org.apache.iceberg.deletes.PositionDelete.<org.apache.iceberg.data.Record>create()
+              .set(target.location().toString(), 0L));
+    }
+    table.newRowDelta().addDeletes(writer.toDeleteFile()).commit();
+    sql(
+        "CALL %s.system.refresh_text_index(table => '%s', column => 'body')",
+        catalogName, tableName);
+
+    // a data file whose rows are all deleted is still a data file of the snapshot. An index that
+    // leaves it out cannot be bound to that snapshot, and a text query then refuses to run even
+    // though every live row is indexed.
+    table = Spark3Util.loadIcebergTable(spark, tableName);
+    long snapshot = table.currentSnapshot().snapshotId();
+    IndexMetadata metadata = VectorIndexes.findIndex(table, "body", "text", null);
+    List<String> dataFiles = IndexEntries.dataFiles(table, snapshot);
+    IndexReader reader = new IndexReader(metadata, table);
+    assertThat(dataFiles).hasSize(2);
+    assertThat(reader.uncoveredDataFiles(snapshot, dataFiles)).isEmpty();
+
+    // and the query that needs that binding runs
+    assertThat(
+            searchIds(
+                sql(
+                    "CALL %s.system.text_search(table => '%s', column => 'body', "
+                        + "query => 'iceberg', k => 10)",
+                    catalogName, tableName)))
+        .hasSize(1);
   }
 
   @TestTemplate
