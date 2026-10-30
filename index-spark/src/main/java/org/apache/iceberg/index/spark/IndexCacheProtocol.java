@@ -805,6 +805,18 @@ final class IndexCacheProtocol {
     }
   }
 
+  /**
+   * What an executor answers for one command.
+   *
+   * <p>It carries the increment of the executor's charge state and not the state itself: a load of
+   * a thousand files would otherwise send a thousand snapshots of the same cache back to the
+   * driver. The driver applies the increment to the state its last report described; a periodic
+   * {@link NodeReport} remains the only message that carries the whole picture.
+   *
+   * <p>The shape of the message changed while {@code serialVersionUID} stayed {@code 1}: the driver
+   * and the executors of one application run the same jar, so both sides change together, and an
+   * old message simply answers with fields this version does not read (they default to zero).
+   */
   static final class Ack implements Serializable {
     private static final long serialVersionUID = 1L;
     private final String session;
@@ -816,8 +828,9 @@ final class IndexCacheProtocol {
     private final long sequence;
     private final AckStatus status;
     private final long bytes;
+    private final long chargeVersion;
+    private final long controlBytes;
     private final String reason;
-    private final ExecutorIndexCache.Shape metadataShape;
 
     private Ack(Builder builder) {
       Preconditions.checkArgument(builder.session != null, "ACK session is missing");
@@ -830,6 +843,10 @@ final class IndexCacheProtocol {
           builder.sequence >= 0, "ACK sequence is invalid: %s", builder.sequence);
       Preconditions.checkArgument(builder.status != null, "ACK status is missing");
       Preconditions.checkArgument(builder.bytes >= 0, "ACK bytes are negative: %s", builder.bytes);
+      Preconditions.checkArgument(
+          builder.chargeVersion >= 0, "ACK charge version is invalid: %s", builder.chargeVersion);
+      Preconditions.checkArgument(
+          builder.controlBytes >= 0, "ACK control bytes are negative: %s", builder.controlBytes);
       this.session = builder.session;
       this.planId = builder.planId;
       this.commandId = builder.commandId;
@@ -839,8 +856,9 @@ final class IndexCacheProtocol {
       this.sequence = builder.sequence;
       this.status = builder.status;
       this.bytes = builder.bytes;
+      this.chargeVersion = builder.chargeVersion;
+      this.controlBytes = builder.controlBytes;
       this.reason = builder.reason;
-      this.metadataShape = builder.metadataShape;
     }
 
     static Builder builder() {
@@ -879,12 +897,22 @@ final class IndexCacheProtocol {
       return status;
     }
 
+    /** The bytes of the copy this answer is about, as the executor retained them. */
     long bytes() {
       return bytes;
     }
 
-    ExecutorIndexCache.Shape metadataShape() {
-      return metadataShape;
+    /**
+     * The executor's charge sequence after this command, which orders answers and reports so an
+     * older one cannot overwrite a newer state.
+     */
+    long chargeVersion() {
+      return chargeVersion;
+    }
+
+    /** The control overhead the executor charges for its state after this command. */
+    long controlBytes() {
+      return controlBytes;
     }
 
     Builder copy() {
@@ -898,8 +926,9 @@ final class IndexCacheProtocol {
           .sequence(sequence)
           .status(status)
           .bytes(bytes)
-          .reason(reason)
-          .metadataShape(metadataShape);
+          .chargeVersion(chargeVersion)
+          .controlBytes(controlBytes)
+          .reason(reason);
     }
 
     String reason() {
@@ -916,8 +945,9 @@ final class IndexCacheProtocol {
       private long sequence;
       private AckStatus status;
       private long bytes;
+      private long chargeVersion;
+      private long controlBytes;
       private String reason;
-      private ExecutorIndexCache.Shape metadataShape;
 
       Builder session(String value) {
         this.session = value;
@@ -964,13 +994,18 @@ final class IndexCacheProtocol {
         return this;
       }
 
-      Builder reason(String value) {
-        this.reason = value;
+      Builder chargeVersion(long value) {
+        this.chargeVersion = value;
         return this;
       }
 
-      Builder metadataShape(ExecutorIndexCache.Shape value) {
-        this.metadataShape = value;
+      Builder controlBytes(long value) {
+        this.controlBytes = value;
+        return this;
+      }
+
+      Builder reason(String value) {
+        this.reason = value;
         return this;
       }
 

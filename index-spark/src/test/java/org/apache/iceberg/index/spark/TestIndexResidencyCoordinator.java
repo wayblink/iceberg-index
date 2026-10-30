@@ -303,15 +303,25 @@ class TestIndexResidencyCoordinator {
         coordinator.acceptLoad(
             target("A", "f1", 10, "f2", 10), IndexResidencyPolicy.parse("0"), clock.now());
     ackFile(plan, "f1", IndexCacheProtocol.AckStatus.LOADED);
+    // The executor already holds the command for f2, so its answer can arrive after the fence.
+    IndexCacheProtocol.Ack late =
+        ack(plan, "a", "a-1", loadCommand(plan, "f2"), IndexCacheProtocol.AckStatus.LOADED);
     clock.advance(Duration.ofMinutes(1).toNanos());
     coordinator.expire(plan, clock.now());
-    ackFile(plan, "f2", IndexCacheProtocol.AckStatus.LOADED);
+    coordinator.ack(late);
     // Keep the node report fresh: only unreported nodes are treated as lost.
     coordinator.report(node("a", "a-1", 2, 100, file("A", "f1", 10)));
     IndexCacheProtocol.Result result = coordinator.result(plan);
     assertThat(result.status()).isEqualTo(IndexCacheProtocol.Status.PARTIAL);
     assertThat(result.uncovered()).containsOnlyKeys("f2");
-    assertThat(result.residentBytes()).isEqualTo(residentOf(file("A", "f1", 10)));
+    // What was confirmed before the fence stays resident; the fenced file contributes nothing.
+    assertThat(result.residentBytes())
+        .isEqualTo(
+            coordinator
+                .state("a", "a-1")
+                .metadataShape()
+                .residentBytes(Set.of(cacheKey("A", "f1"))))
+        .isPositive();
     assertThat(result.evictedIndexes()).isEmpty();
   }
 
@@ -366,9 +376,11 @@ class TestIndexResidencyCoordinator {
         ack(plan, "a", "a-1", command, IndexCacheProtocol.AckStatus.LOADED);
     coordinator.ack(ack);
     coordinator.ack(ack);
-    assertThat(coordinator.result(plan).residentBytes()).isEqualTo(residentOf(file("A", "f1", 10)));
+    assertThat(coordinator.result(plan).residentBytes())
+        .isEqualTo(residentOf("A", file("A", "f1", 10)));
     assertThat(coordinator.state("a", "a-1").holders()).containsOnlyKeys(cacheKey("A", "f1"));
-    assertThat(coordinator.state("a", "a-1").usedBytes()).isEqualTo(usedOf(file("A", "f1", 10)));
+    assertThat(coordinator.state("a", "a-1").usedBytes())
+        .isEqualTo(usedOf("A", file("A", "f1", 10)));
   }
 
   @Test
@@ -378,9 +390,11 @@ class TestIndexResidencyCoordinator {
         coordinator.acceptLoad(
             target("A", "f1", 10, "f2", 10), IndexResidencyPolicy.parse("forever"), clock.now());
     ackFile(load, "f1", IndexCacheProtocol.AckStatus.LOADED);
+    IndexCacheProtocol.Ack late =
+        ack(load, "a", "a-1", loadCommand(load, "f2"), IndexCacheProtocol.AckStatus.LOADED);
     String offload = coordinator.acceptOffload("A", clock.now());
     // The executor answers the fenced file after the pause was published.
-    ackFile(load, "f2", IndexCacheProtocol.AckStatus.LOADED);
+    coordinator.ack(late);
     assertThat(coordinator.result(offload).status()).isEqualTo(IndexCacheProtocol.Status.RELEASING);
     assertThat(coordinator.state("a", "a-1").holders()).doesNotContainKey(cacheKey("A", "f2"));
     assertThat(coordinator.commands("a", "a-1"))
@@ -490,7 +504,8 @@ class TestIndexResidencyCoordinator {
     ackFile(plan, "f1", IndexCacheProtocol.AckStatus.LOADED);
 
     assertThat(coordinator.state("a", "a-1").reservedBytesFor(plan)).isZero();
-    assertThat(coordinator.state("a", "a-1").usedBytes()).isEqualTo(usedOf(file("A", "f1", 10)));
+    assertThat(coordinator.state("a", "a-1").usedBytes())
+        .isEqualTo(usedOf("A", file("A", "f1", 10)));
     // The confirmed copy must not be charged a second time through a stale reservation.
     String next =
         coordinator.acceptLoad(target("B", "g1", 90), IndexResidencyPolicy.parse("0"), clock.now());
@@ -588,10 +603,11 @@ class TestIndexResidencyCoordinator {
         coordinator.acceptLoad(
             target("A", "f1", 10, "f2", 10), IndexResidencyPolicy.parse("forever"), clock.now());
     ackFile(load, "f1", IndexCacheProtocol.AckStatus.LOADED);
+    IndexCacheProtocol.Ack late =
+        ack(load, "a", "a-1", loadCommand(load, "f2"), IndexCacheProtocol.AckStatus.LOADED);
     coordinator.acceptOffload("A", clock.now());
 
-    IndexCacheProtocol.Command late = loadCommand(load, "f2");
-    coordinator.ack(ack(load, "a", "a-1", late, IndexCacheProtocol.AckStatus.LOADED));
+    coordinator.ack(late);
 
     assertThat(coordinator.commands("a", "a-1"))
         .filteredOn(c -> c.type() == IndexCacheProtocol.CommandType.RELEASE)
@@ -666,8 +682,9 @@ class TestIndexResidencyCoordinator {
             .orElseThrow();
     coordinator.ack(ack(replace, "a", "a-1", release, IndexCacheProtocol.AckStatus.RELEASED));
 
-    assertThat(coordinator.state("a", "a-1").reservedBytesFor(replace))
-        .isEqualTo(admission("a", "a-1", "A", file("A", "new", 40)));
+    // The release answered for the old file, so only the new load still holds a reservation.
+    assertThat(coordinator.state("a", "a-1").reservedByCommand()).isNotEmpty();
+    assertThat(coordinator.state("a", "a-1").reservedByPlan()).containsOnlyKeys(replace);
   }
 
   @Test
@@ -828,7 +845,8 @@ class TestIndexResidencyCoordinator {
 
     // The old copy is gone, but the migrated one must still count as confirmed coverage.
     assertThat(coordinator.result(plan).status()).isEqualTo(IndexCacheProtocol.Status.COMPLETE);
-    assertThat(coordinator.result(plan).residentBytes()).isEqualTo(residentOf(file("A", "f", 40)));
+    assertThat(coordinator.result(plan).residentBytes())
+        .isEqualTo(residentOf("A", file("A", "f", 40)));
 
     // Offload must find the live copy on b and must not chase the released copy on a.
     String offload = coordinator.acceptOffload("A", clock.now());
@@ -856,6 +874,39 @@ class TestIndexResidencyCoordinator {
     assertThat(coordinator.result(other).status()).isNotEqualTo(IndexCacheProtocol.Status.QUEUED);
     assertThat(coordinator.state("a", "a-2").reservedBytesFor(other))
         .isEqualTo(admission("a", "a-2", "B", file("B", "g1", 10)));
+  }
+
+  @Test
+  void aCommandIsForgottenOnceItIsAnswered() {
+    coordinator.report(node("a", "a-1", 1, 1000));
+    String plan =
+        coordinator.acceptLoad(
+            target("A", "f1", 100, "f2", 100), IndexResidencyPolicy.parse("forever"), clock.now());
+    List<IndexCacheProtocol.Command> issued = coordinator.commands("a", "a-1");
+    assertThat(issued).hasSize(2);
+    for (IndexCacheProtocol.Command command : issued) {
+      coordinator.ack(ack(plan, "a", "a-1", command, IndexCacheProtocol.AckStatus.LOADED));
+    }
+
+    // A command carries the index definition and the table's FileIO, so keeping an answered one
+    // keeps storage clients and their credentials alive for as long as the driver runs.
+    assertThat(coordinator.commands("a", "a-1")).isEmpty();
+    assertThat(coordinator.result(plan).status()).isEqualTo(IndexCacheProtocol.Status.COMPLETE);
+  }
+
+  @Test
+  void aFencedCommandIsNotHeldAnyMore() {
+    coordinator.report(node("a", "a-1", 1, 100));
+    String plan =
+        coordinator.acceptLoad(target("A", "f1", 40), IndexResidencyPolicy.parse("0"), clock.now());
+    coordinator.expire(plan, clock.now());
+
+    // The plan keeps the file and its reason; only the command, and the read context it carries,
+    // goes away, because it can never be answered as coverage again.
+    assertThat(coordinator.commands("a", "a-1")).isEmpty();
+    assertThat(coordinator.result(plan).uncovered()).containsOnlyKeys("f1");
+    assertThat(coordinator.result(plan).uncovered().values()).containsOnly("TIMED_OUT");
+    assertThat(coordinator.state("a", "a-1").reservedBytesFor(plan)).isZero();
   }
 
   @Test
@@ -1151,15 +1202,20 @@ class TestIndexResidencyCoordinator {
             .sequence(command.sequence())
             .status(status)
             .bytes(bytes == null ? 0 : bytes);
-    // A confirmed copy reports the executor's charge state, not only the command's estimate: the
-    // reservation becomes retained bytes, and a release gives them back.
+    // A confirmed copy states the counters of the executor's charge state after it, not the state
+    // itself: the reservation becomes retained bytes, and a release gives them back.
     if (status == IndexCacheProtocol.AckStatus.LOADED) {
-      builder.metadataShape(charged(executor, incarnation, command.file()));
+      withCharge(builder, charged(executor, incarnation, command));
     } else if (status == IndexCacheProtocol.AckStatus.RELEASED) {
-      builder.metadataShape(withdrawn(executor, incarnation, command.file()));
+      withCharge(builder, withdrawn(executor, incarnation, command.file()));
     }
 
     return builder.build();
+  }
+
+  private static void withCharge(
+      IndexCacheProtocol.Ack.Builder builder, ExecutorIndexCache.Shape shape) {
+    builder.chargeVersion(shape.charge().version()).controlBytes(shape.charge().controlBytes());
   }
 
   private static IndexCacheProtocol.Ack ack(
@@ -1321,23 +1377,29 @@ class TestIndexResidencyCoordinator {
         .build();
   }
 
-  /** The bytes a node reports as used once it holds exactly these files. */
-  private static long usedOf(IndexCacheProtocol.File... held) {
-    return projected(held).charge().usedBytes();
+  /** The bytes a node reports as used once it holds exactly these files of one index. */
+  private static long usedOf(String indexUuid, IndexCacheProtocol.File... held) {
+    return projected(indexUuid, held).charge().usedBytes();
   }
 
   /** The bytes a plan result reports as resident for the copies it confirmed. */
-  private static long residentOf(IndexCacheProtocol.File... held) {
+  private static long residentOf(String indexUuid, IndexCacheProtocol.File... held) {
     Set<String> keys = new LinkedHashSet<>();
     for (IndexCacheProtocol.File file : held) {
       keys.add(file.cacheKey());
     }
 
-    return projected(held).residentBytes(keys);
+    return projected(indexUuid, held).residentBytes(keys);
   }
 
-  private static ExecutorIndexCache.Shape projected(IndexCacheProtocol.File... held) {
-    return ExecutorIndexCache.Shape.empty().project(null, 0, List.of(held));
+  /**
+   * The charge state of a copy of these files. Installing a copy registers the index that owns it,
+   * and that ownership is part of what the executor charges, so the index identity has to be part
+   * of the projection.
+   */
+  private static ExecutorIndexCache.Shape projected(
+      String indexUuid, IndexCacheProtocol.File... held) {
+    return ExecutorIndexCache.Shape.empty().project(indexUuid, 0, List.of(held));
   }
 
   /**
@@ -1380,10 +1442,16 @@ class TestIndexResidencyCoordinator {
     return shape;
   }
 
-  /** The charge state an executor publishes once a confirmed copy of the file is retained. */
+  /**
+   * The charge state an executor publishes once a confirmed copy of the file is retained. The
+   * projection carries the index identity and epoch the command did, because installing a copy also
+   * registers the index that owns it and its ownership state is charged.
+   */
   private ExecutorIndexCache.Shape charged(
-      String executor, String incarnation, IndexCacheProtocol.File file) {
-    ExecutorIndexCache.Shape shape = shapeOf(executor, incarnation).project(null, 0, List.of(file));
+      String executor, String incarnation, IndexCacheProtocol.Command command) {
+    ExecutorIndexCache.Shape shape =
+        shapeOf(executor, incarnation)
+            .project(command.indexUuid(), command.epoch(), List.of(command.file()));
     shapes.put(key(executor, incarnation), shape);
     return shape;
   }

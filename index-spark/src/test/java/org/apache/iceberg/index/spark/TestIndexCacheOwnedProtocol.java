@@ -131,14 +131,14 @@ class TestIndexCacheOwnedProtocol {
     IndexCacheProtocol.Ack first = worker.execute(commands.get(0));
     IndexCacheProtocol.Ack second = worker.execute(commands.get(1));
     coordinator.ack(second);
-    long used = second.metadataShape().charge().usedBytes();
+    long used = coordinator.state("node", "node-1").usedBytes();
     assertThat(coordinator.result(plan).status()).isEqualTo(IndexCacheProtocol.Status.PARTIAL);
     coordinator.ack(first);
     coordinator.ack(first);
     coordinator.report(old.copy().sequence(100).build());
     assertThat(coordinator.state("node", "node-1").usedBytes()).isEqualTo(used);
     assertThat(coordinator.state("node", "node-1").metadataShape().charge().version())
-        .isEqualTo(second.metadataShape().charge().version());
+        .isEqualTo(second.chargeVersion());
     assertThat(coordinator.result(plan).status()).isEqualTo(IndexCacheProtocol.Status.COMPLETE);
     assertThat(loads.get()).isEqualTo(2);
   }
@@ -319,21 +319,20 @@ class TestIndexCacheOwnedProtocol {
   }
 
   @Test
-  void missingAckSnapshotMakesCapacityUnknownInsteadOfSettlingToFreeSpace() {
+  void anAnswerWithoutChargeCountersLeavesCapacityUnknownInsteadOfFree() {
     IndexResidencyCoordinator coordinator = new IndexResidencyCoordinator(() -> 1L);
     coordinator.report(worker.report("profile", 1, 100_000, 0, 0, Map.of()));
     String plan =
         coordinator.acceptLoad(
             target("index", "table", "file"), IndexResidencyPolicy.parse("0"), 1);
     IndexCacheProtocol.Command command = coordinator.commands("node", "node-1").get(0);
-    coordinator.ack(worker.execute(command).copy().metadataShape(null).build());
+    // An answer that states no counters describes no charge state, so the driver cannot project it.
+    coordinator.ack(worker.execute(command).copy().chargeVersion(0).controlBytes(0).build());
     assertThat(coordinator.result(plan).status()).isEqualTo(IndexCacheProtocol.Status.COMPLETE);
+    // The copy is confirmed, but a state nobody described is not free space.
     assertThat(coordinator.result(plan).residentBytes()).isEqualTo(-1);
     assertThat(coordinator.state("node", "node-1").metadataShape().charge().known()).isFalse();
-    String next =
-        coordinator.acceptLoad(
-            target("another", "table", "another-file"), IndexResidencyPolicy.parse("0"), 1);
-    assertThat(coordinator.result(next).uncovered()).containsEntry("another-file", "SIZE_UNKNOWN");
+    assertThat(coordinator.state("node", "node-1").usedBytes()).isPositive();
     coordinator.report(worker.report("profile", 2, 100_000, 0, 0, Map.of()));
     assertThat(coordinator.state("node", "node-1").metadataShape().charge().known()).isTrue();
     assertThat(coordinator.result(plan).residentBytes())

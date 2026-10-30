@@ -200,6 +200,9 @@ class TestIndexCacheControl {
               // The driver hands the command out on the next report, then the executor answers.
               IndexCacheProtocol.Reply reply = control.receive(node(2L));
               for (IndexCacheProtocol.Command command : reply.commands()) {
+                ExecutorIndexCache.Shape charged =
+                    ExecutorIndexCache.Shape.empty()
+                        .project(command.indexUuid(), command.epoch(), List.of(command.file()));
                 control.receive(
                     IndexCacheProtocol.Ack.builder()
                         .session("application-1")
@@ -214,10 +217,8 @@ class TestIndexCacheControl {
                             command.file().estimatedBytes() == null
                                 ? 0
                                 : command.file().estimatedBytes())
-                        .metadataShape(
-                            ExecutorIndexCache.Shape.empty()
-                                .project(
-                                    command.indexUuid(), command.epoch(), List.of(command.file())))
+                        .chargeVersion(charged.charge().version())
+                        .controlBytes(charged.charge().controlBytes())
                         .build());
               }
             });
@@ -411,9 +412,6 @@ class TestIndexCacheControl {
             .sequence(command.sequence())
             .status(IndexCacheProtocol.AckStatus.LOADED)
             .bytes(command.file().estimatedBytes())
-            .metadataShape(
-                ExecutorIndexCache.Shape.empty()
-                    .project(command.indexUuid(), command.epoch(), List.of(command.file())))
             .build());
 
     IndexCacheProtocol.Result offload =
@@ -674,15 +672,18 @@ class TestIndexCacheControl {
             .status(status)
             .bytes(bytes);
     if (status == IndexCacheProtocol.AckStatus.LOADED) {
-      // A loaded copy reports the executor's capacity state, not only the command's estimate.
-      ack.metadataShape(
+      // A loaded copy states the counters of the executor's capacity after it, not the state.
+      ExecutorIndexCache.Shape charged =
           ExecutorIndexCache.Shape.empty()
-              .project(command.indexUuid(), command.epoch(), List.of(command.file())));
+              .project(command.indexUuid(), command.epoch(), List.of(command.file()));
+      ack.chargeVersion(charged.charge().version()).controlBytes(charged.charge().controlBytes());
     } else if (status == IndexCacheProtocol.AckStatus.RELEASED) {
-      ack.metadataShape(
+      ExecutorIndexCache.Shape withdrawn =
           ExecutorIndexCache.Shape.empty()
               .project(command.indexUuid(), command.epoch(), List.of(command.file()))
-              .releaseKeys(command.indexUuid(), Set.of(command.file().cacheKey())));
+              .releaseKeys(command.indexUuid(), Set.of(command.file().cacheKey()));
+      ack.chargeVersion(withdrawn.charge().version())
+          .controlBytes(withdrawn.charge().controlBytes());
     }
     return ack.build();
   }

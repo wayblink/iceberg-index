@@ -109,9 +109,12 @@ class TestIndexCachePlugin {
 
     IndexCacheProtocol.Result result = coordinator.result(plan);
     assertThat(result.status()).isEqualTo(IndexCacheProtocol.Status.COMPLETE);
-    // Resident bytes come back from the executor's shape, not from the size the command carried.
+    // Resident bytes follow the executed copy, not the size the command estimated.
     assertThat(result.residentBytes())
-        .isEqualTo(loaded.metadataShape().residentBytes(Set.of(command.file().cacheKey())))
+        .isEqualTo(
+            ExecutorIndexCache.Shape.empty()
+                .project(INDEX_UUID, command.epoch(), List.of(command.file()))
+                .residentBytes(Set.of(command.file().cacheKey())))
         .isPositive();
   }
 
@@ -384,11 +387,11 @@ class TestIndexCachePlugin {
   }
 
   /**
-   * The acknowledgement an executor that loaded this command would send: its own capacity shape,
-   * with the copy's resident size read back from that shape.
+   * The acknowledgement an executor that loaded this command would send: the counters of its charge
+   * state after the copy, with the copy's resident size read back from that state.
    */
   private IndexCacheProtocol.Ack loadedAck(IndexCacheProtocol.Command command) {
-    // A synthetic ACK must carry a newer shape version than the report it follows. The executor's
+    // A synthetic ACK must carry a newer charge version than the report it follows. The executor's
     // cache increments its snapshot version on each committed state; do the same here.
     ExecutorIndexCache.get().chargeSnapshot();
     ExecutorIndexCache.Shape shape =
@@ -405,7 +408,8 @@ class TestIndexCachePlugin {
         .sequence(command.sequence())
         .status(IndexCacheProtocol.AckStatus.LOADED)
         .bytes(shape.residentBytes(Set.of(command.file().cacheKey())))
-        .metadataShape(shape)
+        .chargeVersion(shape.charge().version())
+        .controlBytes(shape.charge().controlBytes())
         .build();
   }
 

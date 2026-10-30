@@ -216,21 +216,21 @@ class TestExecutorIndexCacheWorker {
   }
 
   @Test
-  void acknowledgementCarriesStatusOnly() throws Exception {
-    // A large payload: the acknowledgement reports the committed charge, so its own encoding must
-    // not grow with the bytes the executor prepared. It also must not carry the read context.
+  void acknowledgementCarriesTheChargeIncrementNotTheState() throws Exception {
+    // A large payload: the acknowledgement reports the committed charge as a few counters, so its
+    // own encoding must not grow with the bytes the executor prepared, must not carry the read
+    // context, and must not carry a snapshot of everything this executor holds.
     byte[] payload = new byte[64 * 1024];
     IndexCacheProtocol.Ack ack = worker.execute(load("A", "f1", 1, payload));
 
     assertThat(ack.status()).isEqualTo(IndexCacheProtocol.AckStatus.LOADED);
-    assertThat(ack.metadataShape()).isNotNull();
-    assertThat(ack.metadataShape().charge().residentBytes()).isPositive();
+    assertThat(ack.chargeVersion()).isPositive();
+    assertThat(ack.controlBytes()).isNotNegative();
     assertThat(serializedSize(ack))
         .as("the ACK must not ship the prepared payload")
         .isLessThan(payload.length / 4);
 
-    Set<Class<?>> allowed =
-        Set.of(IndexCacheProtocol.AckStatus.class, ExecutorIndexCache.Shape.class, String.class);
+    Set<Class<?>> allowed = Set.of(IndexCacheProtocol.AckStatus.class, String.class);
     for (Field field : ack.getClass().getDeclaredFields()) {
       if (Modifier.isStatic(field.getModifiers())) {
         continue;
@@ -238,21 +238,10 @@ class TestExecutorIndexCacheWorker {
 
       Class<?> type = field.getType();
       assertThat(type.isPrimitive() || allowed.contains(type))
-          .as("ACK field %s must not carry payloads or read context", field.getName())
+          .as(
+              "ACK field %s must not carry payloads, read context or a charge snapshot",
+              field.getName())
           .isTrue();
-    }
-
-    // The shape is a metadata projection: no index definition or FileIO (the read context) and no
-    // payload buffer may appear in it.
-    for (Field field : ack.metadataShape().getClass().getDeclaredFields()) {
-      Class<?> type = field.getType();
-      assertThat(
-              type == IndexDefinition.class
-                  || type == org.apache.iceberg.io.FileIO.class
-                  || type == byte[].class
-                  || type == java.nio.ByteBuffer.class)
-          .as("ACK shape field %s must not carry payloads or read context", field.getName())
-          .isFalse();
     }
   }
 

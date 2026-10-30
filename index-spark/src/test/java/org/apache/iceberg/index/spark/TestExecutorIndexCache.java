@@ -48,6 +48,15 @@ class TestExecutorIndexCache {
   }
 
   @Test
+  void aQueryReportsWhatTheExecutorHoldsOnce() {
+    // A query runs one task per index file, and each of those tasks would otherwise send the whole
+    // picture of this executor's cache to the driver: a thousand files, a thousand copies.
+    assertThat(cache.reportOnce("query-1", "1", "host")).isNotNull();
+    assertThat(cache.reportOnce("query-1", "1", "host")).isNull();
+    assertThat(cache.reportOnce("query-2", "1", "host")).isNotNull();
+  }
+
+  @Test
   void loadsEachFileOnce() {
     AtomicInteger loads = new AtomicInteger();
     ExecutorIndexCache.Config enabled = config(1024 * 1024);

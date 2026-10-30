@@ -160,6 +160,9 @@ final class IndexResidencyCoordinator {
     private long snapshotId;
     private IndexCacheProtocol.Status terminalStatus;
     private final List<IndexCacheProtocol.File> files = new ArrayList<>();
+    // The file each cache key was planned as, in the shape a projection needs; a release plan may
+    // name one key on two executors, so this map only answers "what does this key look like".
+    private final Map<String, IndexCacheProtocol.File> plannedByKey = new LinkedHashMap<>();
     private final Map<String, String> rejected = new LinkedHashMap<>();
     private final Map<String, String> failed = new LinkedHashMap<>();
     private final Map<String, PlanFile> commands = new LinkedHashMap<>();
@@ -209,6 +212,15 @@ final class IndexResidencyCoordinator {
 
     private PlanFile command(String commandId) {
       return commands.get(commandId);
+    }
+
+    private IndexCacheProtocol.File planned(String cacheKey) {
+      return plannedByKey.get(cacheKey);
+    }
+
+    private void addFile(IndexCacheProtocol.File file) {
+      plannedByKey.putIfAbsent(file.cacheKey(), file);
+      files.add(file);
     }
   }
 
@@ -262,14 +274,12 @@ final class IndexResidencyCoordinator {
     private IndexCacheProtocol.NodeReport report;
     private long reportTimeNanos;
     private final List<IndexCacheProtocol.Command> queue = new ArrayList<>();
-    private final List<IndexCacheProtocol.Command> issued = new ArrayList<>();
+    // Commands still waiting for an answer, by identity. A command carries the index definition and
+    // the table's FileIO, so an answered or fenced one is dropped instead of being kept for as long
+    // as the driver runs.
+    private final Map<String, IndexCacheProtocol.Command> issued = new LinkedHashMap<>();
     private final Map<String, Long> reservedByCommand = new LinkedHashMap<>();
     private final Map<String, String> planOfCommand = new LinkedHashMap<>();
-    private final Set<String> commands = new LinkedHashSet<>();
-
-    private void issued(String commandId) {
-      commands.add(commandId);
-    }
 
     private NodeState(IndexCacheProtocol.NodeReport report, long nowNanos) {
       this.report = report;
@@ -287,12 +297,54 @@ final class IndexResidencyCoordinator {
       this.reportTimeNanos = nowNanos;
     }
 
-    private void observeShape(ExecutorIndexCache.Shape incoming) {
-      ExecutorIndexCache.Shape current = report.metadataShape();
-      if (incoming != null
-          && (current == null || incoming.charge().version() > current.charge().version())) {
-        report = report.copy().metadataShape(incoming).build();
+    /**
+     * Applies what an answer says about this executor's capacity. An answer carries the charge
+     * counters, not a copy of the executor's state, so the planned file is projected onto the state
+     * the driver already has; the next report is what corrects any drift.
+     *
+     * @return whether the node's occupancy is now described by the shape, in which case the caller
+     *     must not charge the answer's bytes a second time
+     */
+    private boolean observeAck(
+        IndexCacheProtocol.Ack ack, PlanState plan, IndexCacheProtocol.File file) {
+      ExecutorIndexCache.Shape shape = report.metadataShape();
+      if (shape == null || ack.chargeVersion() == 0) {
+        // An answer without counters describes no state, so only the bytes it states can be
+        // charged, and a capacity nobody described must not read as free space.
+        if (shape != null) {
+          report = report.copy().metadataShape(shape.unknownCharge()).build();
+        }
+
+        return false;
       }
+
+      if (ack.chargeVersion() < shape.charge().version()) {
+        // A newer statement about this node is already known, so this answer adds nothing.
+        return true;
+      }
+
+      ExecutorIndexCache.Shape next = null;
+      if (shape.charge().known() && shape.compatibleRuntime()) {
+        try {
+          next = shape.project(plan.indexUuid, ack.epoch(), List.of(file));
+        } catch (RuntimeException e) {
+          next = null;
+        }
+      }
+
+      if (next == null) {
+        // Without a projection the capacity stays unknown until a report states it again, and the
+        // bytes this answer carries are all the driver can charge.
+        report = report.copy().metadataShape(shape.unknownCharge()).build();
+        return false;
+      }
+
+      report =
+          report
+              .copy()
+              .metadataShape(next.withCharge(ack.chargeVersion(), ack.controlBytes()))
+              .build();
+      return true;
     }
 
     private boolean holds(String cacheKey) {
@@ -304,7 +356,7 @@ final class IndexResidencyCoordinator {
       if (shape == null || !shape.charge().known()) {
         return null;
       }
-      for (IndexCacheProtocol.Command command : issued) {
+      for (IndexCacheProtocol.Command command : issued.values()) {
         if (reservedByCommand.containsKey(command.commandId())
             && !command.planId().equals(excludedPlan)) {
           try {
@@ -356,12 +408,8 @@ final class IndexResidencyCoordinator {
       if (plan != null) {
         return plan;
       }
-      for (IndexCacheProtocol.Command command : issued) {
-        if (command.commandId().equals(commandId)) {
-          return command.planId();
-        }
-      }
-      return null;
+      IndexCacheProtocol.Command command = issued.get(commandId);
+      return command == null ? null : command.planId();
     }
 
     private Map<String, Long> effectiveReservedByPlan() {
@@ -436,22 +484,23 @@ final class IndexResidencyCoordinator {
       planOfCommand.put(commandId, planId);
     }
 
-    /** Releases exactly the promise made by this command; other commands keep theirs. */
+    /**
+     * Releases exactly the promise made by this command; other commands keep theirs. The command
+     * itself is dropped too: it can never be answered as coverage any more, so neither the read
+     * context it carries nor its place in the reply queue is worth keeping.
+     */
     private void settle(String commandId) {
       reservedByCommand.remove(commandId);
       planOfCommand.remove(commandId);
+      issued.remove(commandId);
+      queue.removeIf(command -> command.commandId().equals(commandId));
     }
 
     /** Puts a command back at the head of the queue after a transient refusal. */
     private void requeue(String commandId) {
-      for (IndexCacheProtocol.Command command : issued) {
-        if (command.commandId().equals(commandId)) {
-          if (!queue.contains(command)) {
-            queue.add(0, command);
-          }
-
-          return;
-        }
+      IndexCacheProtocol.Command command = issued.get(commandId);
+      if (command != null && !queue.contains(command)) {
+        queue.add(0, command);
       }
     }
 
@@ -461,10 +510,15 @@ final class IndexResidencyCoordinator {
     }
 
     private void enqueue(IndexCacheProtocol.Command command) {
-      if (commands.add(command.commandId())) {
-        queue.add(command);
-        issued.add(command);
-      }
+      // Command identities are unique per plan, so a re-enqueue of one that is still outstanding is
+      // a programming error rather than a case to absorb.
+      Preconditions.checkState(
+          !issued.containsKey(command.commandId()),
+          "Command %s is already issued to %s",
+          command.commandId(),
+          report.executorId());
+      queue.add(command);
+      issued.put(command.commandId(), command);
     }
   }
 
@@ -534,7 +588,7 @@ final class IndexResidencyCoordinator {
     }
 
     PlanState plan = new PlanState("plan-" + (++planCount), target.indexUuid(), index.epoch, null);
-    plan.files.addAll(target.files());
+    target.files().forEach(plan::addFile);
     plan.snapshotId = target.snapshotId();
     plans.put(plan.planId, plan);
     lastPlanId = plan.planId;
@@ -576,7 +630,7 @@ final class IndexResidencyCoordinator {
 
     plan.snapshotId = index.snapshotId;
     for (Holder holder : toRelease) {
-      plan.files.add(
+      plan.addFile(
           IndexCacheProtocol.File.builder()
               .location(holder.location())
               .cacheKey(holder.cacheKey())
@@ -796,24 +850,19 @@ final class IndexResidencyCoordinator {
       return;
     }
 
-    IndexCacheProtocol.Command issued =
-        node.issued.stream()
-            .filter(command -> command.commandId().equals(ack.commandId()))
-            .findFirst()
-            .orElse(null);
-    if (issued == null
-        || !issued.planId().equals(ack.planId())
+    IndexCacheProtocol.Command issued = node.issued.get(ack.commandId());
+    if (issued == null) {
+      // The command was settled, so it can no longer confirm coverage. A copy it may still have
+      // left behind is released from the plan, which keeps the command identity without the read
+      // context the settled command carried.
+      releaseSettledCopy(ack, node);
+      return;
+    }
+
+    if (!issued.planId().equals(ack.planId())
         || issued.epoch() != ack.epoch()
         || issued.sequence() != ack.sequence()) {
       return;
-    }
-    if (ack.metadataShape() == null
-        && node.reservedByCommand.containsKey(ack.commandId())
-        && (ack.status() == IndexCacheProtocol.AckStatus.LOADED
-            || ack.status() == IndexCacheProtocol.AckStatus.RELEASED)
-        && node.report.metadataShape() != null) {
-      node.report =
-          node.report.copy().metadataShape(node.report.metadataShape().unknownCharge()).build();
     }
     PlanState plan = plans.get(ack.planId());
     if (plan == null) {
@@ -824,9 +873,19 @@ final class IndexResidencyCoordinator {
     if (command == null || command.bytes < 0) {
       return;
     }
-    if (ack.status() != IndexCacheProtocol.AckStatus.LOADED
-        || !plan.fenced.contains(command.cacheKey)) {
-      node.observeShape(ack.metadataShape());
+
+    IndexCacheProtocol.File file = plan.planned(command.cacheKey);
+    if (file == null) {
+      return;
+    }
+
+    // Only an answer that installs a copy says something about the capacity, and a copy whose plan
+    // was fenced never counts as coverage, so its bytes are not charged to the plan. A release is
+    // left to the next report: an executor keeps a copy a query is still reading, so the driver
+    // cannot tell from the answer alone whether the bytes are gone.
+    boolean counted = true;
+    if (ack.status() == IndexCacheProtocol.AckStatus.LOADED) {
+      counted = plan.fenced.contains(command.cacheKey) || node.observeAck(ack, plan, file);
     }
 
     IndexState index = indexes.get(plan.indexUuid);
@@ -904,9 +963,9 @@ final class IndexResidencyCoordinator {
       }
 
       long retained = ack.bytes() > 0 ? ack.bytes() : command.bytes;
-      if (ack.metadataShape() == null && ack.bytes() > 0) {
-        // A report without a charge shape still states what the executor retained. Charge that,
-        // not the command's estimate, so an executor that prepared a smaller structure is not
+      if (!counted && ack.bytes() > 0) {
+        // An answer the driver could not project still states what the executor retained. Charge
+        // that, not the command's estimate, so an executor that prepared a smaller structure is not
         // billed for the room it never took.
         node.acknowledgeReservation(ack.commandId());
         long previous = node.report.holders().getOrDefault(command.cacheKey, 0L);
@@ -930,6 +989,32 @@ final class IndexResidencyCoordinator {
       plan.failed.put(command.location, ack.reason() == null ? ack.status().name() : ack.reason());
       node.settle(ack.commandId());
     }
+  }
+
+  /**
+   * Releases a copy an executor installed for a command the driver no longer tracks, so a load that
+   * raced with its plan being fenced or superseded does not leave the file resident forever.
+   */
+  private void releaseSettledCopy(IndexCacheProtocol.Ack ack, NodeState node) {
+    if (ack.status() != IndexCacheProtocol.AckStatus.LOADED) {
+      return;
+    }
+
+    PlanState plan = plans.get(ack.planId());
+    if (plan == null) {
+      return;
+    }
+
+    PlanFile command = plan.command(ack.commandId());
+    if (command == null
+        || command.type != IndexCacheProtocol.CommandType.LOAD
+        || !command.executorId.equals(ack.executorId())
+        || !command.incarnation.equals(ack.incarnation())
+        || plan.loaded.containsKey(command.cacheKey)) {
+      return;
+    }
+
+    releaseOrphan(plan, node, command);
   }
 
   /**
@@ -1192,7 +1277,7 @@ final class IndexResidencyCoordinator {
     NodeState node = nodes.get(executorId);
     return node == null || !node.report.incarnation().equals(incarnation)
         ? List.of()
-        : new ArrayList<>(node.issued);
+        : new ArrayList<>(node.issued.values());
   }
 
   private void materialize(

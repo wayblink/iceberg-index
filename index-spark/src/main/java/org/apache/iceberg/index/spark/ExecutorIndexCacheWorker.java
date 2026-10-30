@@ -99,7 +99,7 @@ final class ExecutorIndexCacheWorker implements AutoCloseable {
 
     IndexCacheProtocol.Ack previous = completed.get(command.commandId());
     if (previous != null) {
-      return previous.copy().metadataShape(cache.shape()).build();
+      return withCurrentCharge(previous);
     }
 
     // Only retries of the same command serialize; a slow load must not block reports or other
@@ -109,7 +109,7 @@ final class ExecutorIndexCacheWorker implements AutoCloseable {
       synchronized (commandLock) {
         previous = completed.get(command.commandId());
         if (previous != null) {
-          return previous.copy().metadataShape(cache.shape()).build();
+          return withCurrentCharge(previous);
         }
 
         if (!session.equals(command.session())) {
@@ -135,11 +135,19 @@ final class ExecutorIndexCacheWorker implements AutoCloseable {
       IndexCacheProtocol.Command command, IndexCacheProtocol.Ack ack) {
     if (!BUSY.equals(ack.reason()) && !WAIT_REFERENCES.equals(ack.reason())) {
       // A transient refusal must stay retryable: caching it would make every re-send a no-op.
-      // Idempotence retains command outcome, not historical full-cache graphs.
-      completed.put(command.commandId(), ack.copy().metadataShape(null).build());
+      completed.put(command.commandId(), ack);
     }
 
     return ack;
+  }
+
+  /** A repeated answer states the cache as it is now, because the first one may be stale. */
+  private IndexCacheProtocol.Ack withCurrentCharge(IndexCacheProtocol.Ack previous) {
+    return previous
+        .copy()
+        .chargeVersion(cache.chargeVersion())
+        .controlBytes(cache.controlBytes())
+        .build();
   }
 
   /**
@@ -379,6 +387,9 @@ final class ExecutorIndexCacheWorker implements AutoCloseable {
       IndexCacheProtocol.AckStatus status,
       long bytes,
       String reason) {
+    // The charge counters travel, not the charge state: the driver projects this command onto the
+    // state its last report described, so one answer costs a few numbers instead of a copy of every
+    // entry the executor holds.
     return IndexCacheProtocol.Ack.builder()
         .session(session)
         .planId(command.planId())
@@ -389,7 +400,8 @@ final class ExecutorIndexCacheWorker implements AutoCloseable {
         .sequence(command.sequence())
         .status(status)
         .bytes(bytes)
-        .metadataShape(cache.shape())
+        .chargeVersion(cache.chargeVersion())
+        .controlBytes(cache.controlBytes())
         .reason(reason)
         .build();
   }
