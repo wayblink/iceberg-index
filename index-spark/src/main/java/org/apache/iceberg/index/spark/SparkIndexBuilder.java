@@ -312,6 +312,18 @@ public final class SparkIndexBuilder {
               writer,
               progress,
               reporter);
+      long failedFiles = progress.failed.value();
+      if (failedFiles > 0) {
+        // the build published what it could: the files that failed are not covered, and a query
+        // scans them instead of searching them. Saying so here is the only place the operator is
+        // guaranteed to look; the status report keeps the count, and check_indexes reports the gap.
+        LOG.warn(
+            "Index build for table {} finished with {} data files not indexed; the index covers the "
+                + "rest and queries scan the uncovered files until a refresh appends them",
+            table.name(),
+            failedFiles);
+      }
+
       reporter.succeeded();
       return indexFiles;
     } catch (Exception | Error e) {

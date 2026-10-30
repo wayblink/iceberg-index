@@ -366,7 +366,7 @@ SHOW INDEXES FROM local.db.docs;   -- 只有 FROM，没有 IN
 | 想知道 | 命令 | 关键列 |
 |---|---|---|
 | 这张表有哪些索引、参数是什么、建到哪个快照 | `CALL … list_indexes(table => 'db.t')` / `SHOW INDEXES FROM …` | `index_uuid, column, index_type, source_snapshot_id, status, index_files, entries, definition, index_name` |
-| 索引还能不能被这个版本读、落后多少 | `CALL … check_indexes(table => 'db.t')` | `readable, writer, writer_version, reader_version, stale, suggestion` |
+| 索引还能不能被这个版本读、落后多少、漏了多少文件 | `CALL … check_indexes(table => 'db.t')` | `readable, writer, writer_version, reader_version, stale, uncovered_data_files, suggestion` |
 | 构建到哪一步、上次为什么失败 | `CALL … index_build_status(table => 'db.t')` | `state, started_at, updated_at, age_ms, stale, files_built, files_total, files_failed, rows, error` |
 | 集群缓存装了什么、命中率如何 | `CALL … index_cache_status()` | `executor_id, host, epoch, mode, entries, bytes, hits, misses, loads, evictions, coverage, working_set_bytes, reported_at, age_ms, stale` |
 
@@ -480,7 +480,7 @@ CALL local.system.offload_index(table => 'db.docs', index => '<uuid>');
 
 **9.9 大索引的跨节点放置。** 装不进单节点缓存的规模（如 100M HNSW），目前只能"装得下多少装多少"，没有分片放置与均衡调度。
 
-**9.10 构建部分失败仍报成功。** 如果某些索引文件构建失败但整体任务没抛异常，状态会显示 `SUCCEEDED`。判断完整性看 `entries` 与 `files_built`，或跑 `check_indexes`。
+**9.10 构建部分失败仍报成功，是设计而不是缺陷。** `state = SUCCEEDED` 说的是“这次构建跑完并发布了”，不是“每个数据文件都被索引”。默认语义下，某些索引文件构建失败时任务不抛异常、已成功的那部分照常发布，失败组的数据文件由查询时的残差扫描兜住——**结果仍然正确，只是那些文件每次都要扫**。判断完整性看 `index_build_status` 的 `files_failed`，以及 `check_indexes` 的 `uncovered_data_files`（未覆盖数据文件数）与 `suggestion`（会给 `refresh_vector_index` 的补齐语句；刷新只追加段，成本低）。构建日志里也会有一条 WARN 报出失败文件数。
 
 ---
 

@@ -33,6 +33,39 @@ import org.junit.jupiter.api.TestTemplate;
  */
 public class TestCheckIndexesProcedure extends ExtensionsTestBase {
 
+  private List<Object[]> check(String tableName) {
+    return sql("CALL %s.system.check_indexes(table => '%s')", catalogName, tableName);
+  }
+
+  @TestTemplate
+  public void reportsTheFilesAnIndexDoesNotCover() {
+    String tableName = tableName("check_coverage_" + catalogName);
+    sql("CREATE TABLE %s (id bigint, embedding array<double>) USING iceberg", tableName);
+    sql("INSERT INTO %s VALUES (1, array(1.0, 0.0))", tableName);
+    sql(
+        "CALL %s.system.build_vector_index(table => '%s', column => 'embedding', dimension => 2)",
+        catalogName, tableName);
+
+    Object[] covered = check(tableName).get(0);
+    assertThat(covered[11]).as("a covered index reports no gap").isEqualTo(0L);
+    assertThat(covered[12]).as("and therefore suggests nothing").isNull();
+
+    // a file nobody indexed yet: the query still answers, it just scans that file
+    sql("INSERT INTO %s VALUES (2, array(0.0, 1.0))", tableName);
+    Object[] gap = check(tableName).get(0);
+    assertThat(gap[11]).as("the appended file is not covered").isEqualTo(1L);
+    assertThat((String) gap[12]).as("the report says what closes the gap")
+        .contains("1 data files")
+        .contains("refresh_vector_index");
+
+    sql("CALL %s.system.refresh_vector_index(table => '%s', column => 'embedding')", catalogName, tableName);
+    Object[] healed = check(tableName).get(0);
+    assertThat(healed[11]).as("a refresh appends the file and closes the gap").isEqualTo(0L);
+    assertThat(healed[12]).as("nothing left to suggest").isNull();
+
+    sql("DROP TABLE IF EXISTS %s", tableName);
+  }
+
   @TestTemplate
   public void aReadableIndexIsReportedAsSuch() {
     String table = tableName("check_ok_" + catalogName);
@@ -46,7 +79,8 @@ public class TestCheckIndexesProcedure extends ExtensionsTestBase {
     assertThat((String) row[5]).as("the kernel that wrote it").isNotNull();
     assertThat((Integer) row[6]).as("its payload version").isEqualTo((Integer) row[7]);
     assertThat((Boolean) row[10]).as("stale").isFalse();
-    assertThat(row[11]).as("no suggestion for a readable index").isNull();
+    assertThat(row[11]).as("a fully covered index reports no gap").isEqualTo(0L);
+    assertThat(row[12]).as("no suggestion for a readable index").isNull();
   }
 
   @TestTemplate
@@ -103,7 +137,8 @@ public class TestCheckIndexesProcedure extends ExtensionsTestBase {
         .allSatisfy(
             row -> {
               assertThat((Boolean) row[8]).as("readable: %s", row[4]).isTrue();
-              assertThat(row[11]).as("no suggestion for a readable index: %s", row[4]).isNull();
+              assertThat(row[11]).as("a fully covered index reports no gap: %s", row[4]).isEqualTo(0L);
+              assertThat(row[12]).as("no suggestion for a readable index: %s", row[4]).isNull();
             });
   }
 

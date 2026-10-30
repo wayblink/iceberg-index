@@ -32,6 +32,7 @@ import org.apache.iceberg.index.IndexReader;
 import org.apache.iceberg.index.IndexSnapshot;
 import org.apache.iceberg.index.IndexTypes;
 import org.apache.iceberg.index.PuffinIndexFileContainer;
+import org.apache.iceberg.index.spark.IndexEntries;
 import org.apache.iceberg.index.spark.VectorIndexes;
 import org.apache.iceberg.index.vector.VectorIndexAdapter;
 import org.apache.iceberg.index.vector.VectorPayloadHeader;
@@ -39,6 +40,7 @@ import org.apache.iceberg.inmemory.InMemoryInputFile;
 import org.apache.iceberg.io.IOUtil;
 import org.apache.iceberg.io.InputFile;
 import org.apache.iceberg.relocated.com.google.common.collect.Lists;
+import org.apache.iceberg.relocated.com.google.common.collect.Sets;
 import org.apache.iceberg.spark.procedures.SparkProcedures.ProcedureBuilder;
 import org.apache.spark.sql.catalyst.InternalRow;
 import org.apache.spark.sql.connector.catalog.TableCatalog;
@@ -88,6 +90,7 @@ class CheckIndexesProcedure extends BaseProcedure {
             new StructField("readable", DataTypes.BooleanType, false, Metadata.empty()),
             new StructField("source_snapshot_id", DataTypes.LongType, true, Metadata.empty()),
             new StructField("stale", DataTypes.BooleanType, false, Metadata.empty()),
+            new StructField("uncovered_data_files", DataTypes.LongType, true, Metadata.empty()),
             new StructField("suggestion", DataTypes.StringType, true, Metadata.empty())
           });
 
@@ -142,6 +145,10 @@ class CheckIndexesProcedure extends BaseProcedure {
     for (IndexMetadata metadata : VectorIndexes.indexesOf(table)) {
       IndexSnapshot snapshot = metadata.latestSnapshot();
       String column = VectorIndexProcedures.columnName(table, metadata.definition().fieldId());
+      // what this index does not cover: a build that lost a group, an append nobody refreshed, or a
+      // rewrite that replaced a covered file. Queries still answer correctly - the uncovered files
+      // are scanned - but every one of them is a slower path, so the count belongs in the report.
+      Long uncovered = uncoveredDataFiles(table, snapshot);
 
       if (snapshot == null) {
         rows.add(
@@ -155,6 +162,7 @@ class CheckIndexesProcedure extends BaseProcedure {
                 false,
                 null,
                 false,
+                uncovered,
                 "the index has no snapshot; build or refresh it"));
         continue;
       }
@@ -172,9 +180,11 @@ class CheckIndexesProcedure extends BaseProcedure {
             metadata,
             snapshot,
             (VectorIndexAdapter) adapter,
+            uncovered,
             rows);
       } else {
-        checkDeclaredPayloads(catalog, table, tableName, column, metadata, snapshot, adapter, rows);
+        checkDeclaredPayloads(
+            catalog, table, tableName, column, metadata, snapshot, adapter, uncovered, rows);
       }
     }
   }
@@ -191,6 +201,7 @@ class CheckIndexesProcedure extends BaseProcedure {
       IndexMetadata metadata,
       IndexSnapshot snapshot,
       VectorIndexAdapter adapter,
+      Long uncovered,
       List<InternalRow> rows)
       throws java.io.IOException {
     String indexType = metadata.indexType();
@@ -211,6 +222,7 @@ class CheckIndexesProcedure extends BaseProcedure {
               false,
               snapshot.sourceTableSnapshotId(),
               isStale(table, snapshot),
+              uncovered,
               "payload header is unreadable ("
                   + e.getMessage()
                   + "); "
@@ -230,6 +242,7 @@ class CheckIndexesProcedure extends BaseProcedure {
               false,
               snapshot.sourceTableSnapshotId(),
               isStale(table, snapshot),
+              uncovered,
               "no payload found in the index files; "
                   + refreshSuggestion(catalog, tableName, column, indexType)));
       return;
@@ -248,8 +261,9 @@ class CheckIndexesProcedure extends BaseProcedure {
             readable,
             snapshot.sourceTableSnapshotId(),
             isStale(table, snapshot),
+            uncovered,
             readable
-                ? null
+                ? incompleteCoverageSuggestion(catalog, tableName, column, indexType, uncovered)
                 : "payload was written by "
                     + header
                     + ", this build reads "
@@ -278,6 +292,7 @@ class CheckIndexesProcedure extends BaseProcedure {
       IndexMetadata metadata,
       IndexSnapshot snapshot,
       IndexAdapter adapter,
+      Long uncovered,
       List<InternalRow> rows) {
     String indexType = metadata.indexType();
     Set<String> present = new LinkedHashSet<>();
@@ -301,6 +316,7 @@ class CheckIndexesProcedure extends BaseProcedure {
               false,
               snapshot.sourceTableSnapshotId(),
               isStale(table, snapshot),
+              uncovered,
               "no payload found in the index files; "
                   + refreshSuggestion(catalog, tableName, column, indexType)));
       return;
@@ -318,6 +334,7 @@ class CheckIndexesProcedure extends BaseProcedure {
             readable,
             snapshot.sourceTableSnapshotId(),
             isStale(table, snapshot),
+            uncovered,
             readable
                 ? null
                 : "payloads were written as "
@@ -390,6 +407,53 @@ class CheckIndexesProcedure extends BaseProcedure {
         && table.currentSnapshot().snapshotId() != snapshot.sourceTableSnapshotId();
   }
 
+  /**
+   * How many data files of the current snapshot the index does not cover.
+   *
+   * <p>Coverage is a file-level property the manifest states, so this reads the manifest rather than
+   * the table data. It is null when there is no snapshot: nothing is known about coverage then, and
+   * a zero would read as "fully covered".
+   */
+  /**
+   * The line a fully readable index gets: nothing, or what to do about the files it does not cover.
+   *
+   * <p>A gap is not damage - a query scans those files and still answers - so the suggestion says
+   * what closes it rather than that something is broken. A refresh only appends segments, which is
+   * why it is offered first.
+   */
+  private static String incompleteCoverageSuggestion(
+      String catalog, String tableName, String column, String indexType, Long uncovered) {
+    if (uncovered == null || uncovered == 0L) {
+      return null;
+    }
+
+    return uncovered
+        + " data files of the current snapshot are not covered by this index, so a query scans them"
+        + " each time; "
+        + refreshSuggestion(catalog, tableName, column, indexType);
+  }
+
+  private static Long uncoveredDataFiles(Table table, IndexSnapshot snapshot) {
+    if (snapshot == null || table.currentSnapshot() == null) {
+      return null;
+    }
+
+    Set<String> covered = Sets.newHashSet();
+    for (IndexFile file : VectorIndexes.indexFiles(table.io(), snapshot)) {
+      covered.addAll(file.coveredDataFiles());
+    }
+
+    List<String> dataFiles = IndexEntries.dataFiles(table, table.currentSnapshot().snapshotId());
+    int uncovered = 0;
+    for (String dataFile : dataFiles) {
+      if (!covered.contains(dataFile)) {
+        uncovered += 1;
+      }
+    }
+
+    return (long) uncovered;
+  }
+
   private InternalRow row(
       Table table,
       String column,
@@ -400,6 +464,7 @@ class CheckIndexesProcedure extends BaseProcedure {
       boolean readable,
       Long sourceSnapshotId,
       boolean stale,
+      Long uncoveredDataFiles,
       String suggestion) {
     return newInternalRow(
         UTF8String.fromString(table.name()),
@@ -413,6 +478,7 @@ class CheckIndexesProcedure extends BaseProcedure {
         readable,
         sourceSnapshotId,
         stale,
+        uncoveredDataFiles,
         suggestion == null ? null : UTF8String.fromString(suggestion));
   }
 
