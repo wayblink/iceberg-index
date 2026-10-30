@@ -476,7 +476,15 @@ CALL local.system.offload_index(table => 'db.docs', index => '<uuid>');
 
 **9.6 中文不可用。** 见 5.1。
 
-**9.7 过程与地址类表函数不补候选。** `vector_search` 拿到 top-k 后如果有行已被删除，不回头补第 k+1 名，那些位置以 `row = NULL` 返回；改写路径会补。要严格 k 条用改写写法。
+**9.7 过程按 `coverage` 决定“给命中还是给活行”。** `vector_search` 的 `coverage` 有三个值，默认 `table`：
+
+| `coverage` | 返回什么 | 被删行怎么处理 |
+|---|---|---|
+| `table`（默认） | 表的**活行**（`row` 是业务 JSON） | 被丢弃；不足 k 条时用未覆盖文件/更深候选补齐 |
+| `indexed` | 活行，但只在索引覆盖的文件里找，不扫未覆盖文件 | 被丢弃，可能不足 k 条 |
+| `index_hits` | 索引命中本身（地址 + 分数 + `row`） | 保留该 hit，`row = NULL` |
+
+所以要“命中里能看到占位空行”用 `coverage => 'index_hits'`；要“像查询一样拿可用的活行”用默认的 `table`。改写路径（`ORDER BY vec_distance`）等价于 `table`，会补候选；`index_hits` 不补，因此可能少于 k 条。
 
 **9.8 地址类表函数用索引最新快照**，不按源表快照对齐，删除后的行仍可能返回命中。
 

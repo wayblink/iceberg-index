@@ -308,7 +308,7 @@ class TestVectorIndexGuide {
         .isEqualTo(exact.get(0).getLong(0));
   }
 
-  /** §4.2 and §9 · a row deleted after the build keeps its place but loses its row. */
+  /** §4.2 and §9 · a deleted row is gone from the live answer and null in the index hits. */
   @Test
   void aRowDeletedAfterTheBuildComesBackWithoutItsRow() {
     createTable("deleted", 8);
@@ -319,15 +319,35 @@ class TestVectorIndexGuide {
 
     spark.sql("DELETE FROM local.db.deleted WHERE id = 1");
 
-    List<Row> hits =
+    // the default coverage is `table`: the procedure answers with live rows, so a deleted row is
+    // not
+    // among them and nothing is returned with a null row
+    List<Row> live =
         spark
             .sql(
                 "CALL local.system.vector_search(table => 'db.deleted', column => 'embedding', "
                     + "query => array(1.0d, 0.0d), k => 3)")
             .collectAsList();
-    assertThat(hits).as("the procedure returns the candidates it was asked for").isNotEmpty();
+    assertThat(live).as("the procedure answers with the rows the table still holds").isNotEmpty();
+    assertThat(live.stream().map(row -> row.isNullAt(3)))
+        .as("a live row is never reported as a missing one")
+        .doesNotContain(true);
+    assertThat(live.stream().map(row -> row.getString(3)))
+        .as("and the row that was deleted is not one of them")
+        .noneMatch(json -> json.contains("\"id\":1,"));
+
+    // asking for coverage => 'index' returns the hits themselves: the deleted row keeps its place
+    // in
+    // the index and loses only its row, which is what a caller inspecting the index sees
+    List<Row> hits =
+        spark
+            .sql(
+                "CALL local.system.vector_search(table => 'db.deleted', column => 'embedding', "
+                    + "query => array(1.0d, 0.0d), k => 3, coverage => 'index_hits')")
+            .collectAsList();
+    assertThat(hits).as("the index returns the candidates it was asked for").hasSize(3);
     assertThat(hits.stream().map(row -> row.isNullAt(3)))
-        .as("the deleted row has no row to return")
+        .as("a row deleted since the build has no row to return")
         .contains(true);
 
     // the rewrite path fills the hole from the next candidate instead, which is what asking an
@@ -433,6 +453,7 @@ class TestVectorIndexGuide {
             "readable",
             "source_snapshot_id",
             "stale",
+            "uncovered_data_files",
             "suggestion");
 
     assertThat(spark.sql("CALL local.system.index_build_status(table => 'db.status')").columns())
