@@ -4,7 +4,7 @@
 
 文中 `local` 指会话里的 Iceberg catalog 名，实际用 `spark_catalog`、`hive`、`rest` 等都可以。
 
-范围：只覆盖向量索引。文本索引（`build_text_index` / `text_search` / `text_score` / `match`）是另一套过程，参考 `docs/docs/spark-procedures.md` 里的 text search 一节。
+范围：只覆盖向量索引。想看覆盖向量与全文两套能力、按"要做什么"组织的完整手册，看 `docs/index-user-guide.md`；文本索引的过程细节参考 `docs/docs/spark-procedures.md` 里的 text search 一节。
 
 ## 0. 前置条件
 
@@ -257,12 +257,12 @@ CALL local.system.cleanup_index_files(table => 'db.docs');
 
 ## 9. 已知限制
 
-- **单索引文件 2 GB**：读 payload 走 `byte[]`，超过上限会在查询时报错，规避方式是调小 `max_entries_per_index_file`。建索引时目前没有预检护栏。
+- **单索引文件 2 GB**：读 payload 走 `byte[]`，超过上限会在查询时报错，规避方式是调小 `max_entries_per_index_file`。构建期有 `IndexPayloadLimits` 检查，但它在 payload 已经编码成 `byte[]` 之后才跑：超限时整次构建失败，而不是在分组阶段就提示。
 - **非 identity 分区不改写**：`bucket`/`truncate`/时间变换分区的表走自动改写会退化成扫描。
 - **`FLAT` 索引不参与改写**：它逐条打分，改写只会更慢。
 - **索引不自动维护**：新数据要手动 `refresh_vector_index`，没有后台自动刷新。
 - **大索引的跨节点放置**：`100M HNSW` 这类装不进单节点缓存的规模，目前只能"装得下多少装多少"，没有分片放置与均衡调度。
-- **文本索引的失败记录**：构建失败时索引目录回滚，它的失败报告不会留在表级路径上（向量索引会留）。
+- **文本索引的失败不留痕迹、也不回滚**：`build_text_index` 没有回滚路径，`createIndex` 先注册，构建失败后注册留在 registry 里但没有任何发布快照（`list_indexes` 显示 `status = NULL`、`index_files = 0`），而且没有失败报告。后果是同列重试会被 "An index already exists for column …" 拒绝，且当前版本没有能删文本索引的 SQL 入口——只能走 Java API 或手工清理。向量索引则会回滚并把失败报告留在 `indexes/build-status/<field-id>/`。
 - **`refresh` 的进度口径**：`files_total` 是本次要重建的索引文件数，不是全量。
 - **过程入口不补候选**：`vector_search` 拿到 top-k 后如果有些行已被删除，它不回头补第 k+1 名，那些位置会以 `row = NULL` 返回；自动改写路径会补（最多重试 8 次）。需要严格 k 条时用改写写法。
 

@@ -464,7 +464,7 @@ CALL local.system.offload_index(table => 'db.docs', index => '<uuid>');
 
 **9.1 空向量行不进结果集。** 建索引前就存在的 `NULL` 向量行不在索引里，查询的残差分支也会过滤掉。这是产品定义（没有向量的行没有"距离"），但要注意它与"未建索引时 Spark 用 `ASC` 默认 `NULLS FIRST` 把 null 排最前"不一致——同一个查询，加不加索引，行集可能不同。
 
-**9.2 单索引文件 2 GB。** 读 payload 走 `byte[]`，超限在查询时报错；规避方式是调小 `max_entries_per_index_file`。
+**9.2 单索引文件 2 GB。** 读 payload 走 `byte[]`，超限在查询时报错；规避方式是调小 `max_entries_per_index_file`。构建期有检查，但它在 payload 已经编码成 `byte[]` 之后才跑：超限时整次构建失败，而不是在分组阶段就提示。
 
 **9.3 非 identity 分区不改写。** 见 3.3。
 

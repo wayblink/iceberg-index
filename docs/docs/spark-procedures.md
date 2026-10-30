@@ -1172,6 +1172,11 @@ CALL catalog_name.system.build_vector_index(
     max_m => 16, ef_construction => 200, ef_search => 50);
 ```
 
+`max_entries_per_index_file` groups data files into one index file (default 1,000,000 entries, and a
+data file is never split). Grouping is what lets an HNSW graph reach a neighbour that lives in
+another data file, which is the reason to raise it; a graph built per data file cannot. The cost is
+less parallelism during the build and a larger file to load per task.
+
 ### `refresh_vector_index`
 
 Refreshes an existing vector index against the table's current snapshot. Index files of unchanged
@@ -1344,10 +1349,12 @@ CALL catalog_name.system.build_text_index(
     table => 'db.documents', column => 'body', k1 => 1.2, length_norm => 0.75);
 ```
 
-Grouping several data files into one index file is what makes an HNSW graph span more than a single
-data file, which is the reason to do it. `max_entries_per_index_file` sets the budget: data files are
-packed until the budget is reached, and each pack becomes one index file. Zero, the default, keeps
-one index file per data file. The budget is a property of the index, so refreshes keep it.
+`max_entries_per_index_file` sets the budget: data files are packed until the budget is reached, and
+each pack becomes one index file. The default is 1,000,000 entries and a data file is never split, so
+a table with large data files keeps one index file per data file while a table with many small ones
+sees them merged. Fewer, larger index files mean fewer files to open per query and one set of local
+statistics covering more rows, at the cost of reading more per file. The budget is a property of the
+index, so refreshes keep it.
 
 Because an index file records every data file it covers, a refresh rewrites an index file as a whole
 when any of its data files changes, and it rebuilds every data file that file covered. A data file
@@ -1355,9 +1362,9 @@ that was rewritten gets a new name, so the packing of its group can change; the 
 and complete either way.
 
 ```sql
--- two data files' worth of entries per index file
-CALL catalog_name.system.build_vector_index(
-    table => 'db.documents', column => 'embedding', dimension => 128,
+-- pack several small data files into one index file
+CALL catalog_name.system.build_text_index(
+    table => 'db.documents', column => 'body',
     max_entries_per_index_file => 20000);
 ```
 
@@ -1614,9 +1621,11 @@ query.
 Both need a text index on the column, and both are answered from an index snapshot bound to exactly
 the snapshot being read. A BM25 score depends on corpus statistics, the document frequency of the
 query terms and the average document length, so an older snapshot would give scores a full scan
-cannot reproduce, and the data files it does not cover would not be scored at all. An index that is
-behind therefore means the query scans, and a query on a column without a text index says so
-instead of returning rows in an arbitrary order.
+cannot reproduce, and the data files it does not cover would not be scored at all. A text index that
+is behind is therefore not usable at all: the rewrite declines, the score expression is left
+unbound, and the query fails with a message asking for a text index that does exist. The remedy is
+`refresh_text_index`, not a rescan. A query on a column with no text index at all fails the same way,
+which is why the message names the column rather than the snapshot.
 
 Unlike `vec_distance`, `text_score` cannot be computed without an index: the statistics it needs
 live in the index, not in the row.
