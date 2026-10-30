@@ -32,7 +32,7 @@
 **（1）`CALL` 过程**（原有写法，参数最全，仍在支持）
 **（2）`ALTER TABLE … CREATE INDEX`**（与 Lance-Spark 对齐的 DDL，见 2.1.1）
 
-> 注意：**索引只能建在 Iceberg catalog 的表上，并且语句里的表名要带 catalog 前缀**（例如 `hms.db.docs`）。如果把 Iceberg 表建在会话目录（`spark_catalog`，即 Hive 会话目录）里，建表会成功，但之后的任何读取都会报 `iceberg is not a valid Spark SQL Data Source`——这不是索引层的问题，是 1.9.1 的 `IcebergSource` 只实现了 V2 provider，而 Hive 表读走 V1 路径。两种解法：始终用 Iceberg catalog 限定名，或把 `spark.sql.catalog.spark_catalog` 配成 `org.apache.iceberg.spark.SparkSessionCatalog`。（2026-10-30 在 A 集群镜像上实测。）
+> 注意：**索引只能建在 Iceberg catalog 的表上，并且语句里的表名要带 catalog 前缀**（例如 `hms.db.docs`）。如果把 Iceberg 表建在会话目录（`spark_catalog`，即 Hive 会话目录）里，建表会成功，但之后的任何读取都会报 `iceberg is not a valid Spark SQL Data Source`——这不是索引层的问题，是 1.9.1 的 `IcebergSource` 只实现了 V2 provider，而 Hive 表读走 V1 路径。两种解法：始终用 Iceberg catalog 限定名，或把 `spark.sql.catalog.spark_catalog` 配成 `org.apache.iceberg.spark.SparkSessionCatalog`。（实测。）
 
 ```
 CALL prod.system.build_vector_index(
@@ -119,6 +119,21 @@ SET spark.iceberg.index.vector.over-sample = 100;
 **近似 kernel 要拿到与精确扫描一致的结果，必须放大 over-sample。** 集群验收实测：200k 行、16 维、IVF+RaBitQ 4bit、`nprobe=1024`、`nlist=256` 时，`over-sample` 为默认值 1 的 Top-10 与 L2 真值**不同**（召回不满）；把 `spark.iceberg.index.vector.over-sample` 设成 4000 后，Top-10 与 L2 真值逐行一致。也就是说"索引结果 = 精确结果"不是默认行为，而是候选预算足够的产物。
 
 **注意度量**：`vec_distance` 默认算余弦，只有在被改写命中时才特化成索引的 metric。所以"手写一个不走索引的对照查询"时，`vec_distance(...) + 0.0d` 这种写法其实是余弦排序——若索引是 EUCLIDEAN，两者排序不同，会出现"精确索引也差一行"的假象。做对照必须自己写 L2 表达式。
+
+### 2.1.1 索引 DDL（与 Lance-Spark 对齐，2026-10-30 起）
+
+```
+SHOW INDEXES FROM hms.db.docs;
+
+ALTER TABLE hms.db.docs CREATE INDEX docs_ivf_1bit USING vector (embedding)
+  WITH (dimension = 128, metric = 'euclidean', structure = 'IVF',
+        options = map('nprobe', '32', 'rabitq-bits', '1'));
+ALTER TABLE hms.db.docs CREATE INDEX USING fts (body);   -- 文本索引暂时没有名字
+ALTER TABLE hms.db.docs REFRESH INDEX docs_ivf_1bit;      -- 补段：只追未覆盖文件
+ALTER TABLE hms.db.docs DROP INDEX docs_ivf_1bit;
+```
+
+要点：`WITH` 的键就是 `CALL` 的参数名，值按 SQL 表达式解析（支持 `map(...)`），未知键/缺 `dimension`/重复键/非法 method 都在**分析期**报错；**文本索引不带名字**（带名字会明确报错并提示用 `CALL build_text_index`），`REFRESH/DROP` 也按名寻址不到它；`DROP` 沿用默认 `purge=true`；`OPTIMIZE INDEX`、短语/多列/混合检索未实现。
 
 ### 2.3 运维过程（都是 `CALL`）
 
@@ -437,6 +452,8 @@ docker push hub.i.basemind.com/spark/sparkann-e2e:<tag>
 ## 8. 已知缺口（上线前必须知道）
 
 这些不是"以后再说"，而是会影响运维决策的现状：
+
+0. **构建“成功”不等于“全覆盖”**（2026-10-30）。`state=SUCCEEDED` 只表示本次构建跑完并发布；某个索引文件写失败时 `files_failed` 非 0，`check_indexes` 的 `uncovered_data_files` 报漏掉的数据文件数并给出 `refresh_vector_index` 建议（补段，便宜）。查询结果不受影响，只是这些文件每次被扫描。运维应把 `files_failed>0` 或 `uncovered_data_files>0` 当告警，而不是成功。
 
 1. **镜像与构建器版本必须对齐**（#2756）。当前没有自动门禁，只靠发布清单里的 smoke。**建议在 CI 增加断言**：镜像内 `IndexManifest` 可读版本集合 ⊇ 构建器 `FORMAT_VERSION`。
 2. **驻留管理未收口**（#2391，7/9）。`load_index`/`offload_index` 的语义已定（按 index 粒度、固定保护期、索引级 LRU），实现仍在推进；生产先别依赖手工驻留。
