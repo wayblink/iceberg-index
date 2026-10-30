@@ -225,7 +225,9 @@ class TestExecutorIndexCacheWorker {
 
     assertThat(ack.status()).isEqualTo(IndexCacheProtocol.AckStatus.LOADED);
     assertThat(ack.chargeVersion()).isPositive();
-    assertThat(ack.controlBytes()).isNotNegative();
+    assertThat(ack.controlBytes())
+        .as("the answer states the overhead the cache charges, not a placeholder")
+        .isEqualTo(cache.chargeSnapshot().controlBytes());
     assertThat(serializedSize(ack))
         .as("the ACK must not ship the prepared payload")
         .isLessThan(payload.length / 4);

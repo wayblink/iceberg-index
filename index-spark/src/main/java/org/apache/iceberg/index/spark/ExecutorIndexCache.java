@@ -664,6 +664,9 @@ final class ExecutorIndexCache {
   private long metadataBudget = Long.MAX_VALUE;
   private long generation;
   private long chargeSequence;
+  // the control overhead the last charge projection stated, so an acknowledgement does not build a
+  // projection of the whole cache just to read one number
+  private long chargedControlBytes;
   // The last query this executor reported for, so a query with many tasks reports once.
   private final AtomicReference<String> reportedQuery = new AtomicReference<>();
   // Registered waiters keep the same monitor alive until every caller has left.
@@ -2403,6 +2406,7 @@ final class ExecutorIndexCache {
       }
       // Snapshot sequence is monotonic even across clear; it is not the controller policy epoch.
       chargeSequence = Math.incrementExact(chargeSequence);
+      chargedControlBytes = projection.controlBytes();
       return new ChargeSnapshot(
           chargeSequence,
           known,
@@ -2469,10 +2473,15 @@ final class ExecutorIndexCache {
 
   /**
    * The control overhead this executor charges for its state, which a report alone would restate.
+   *
+   * <p>Read from the last charge projection rather than by building a new one: an acknowledgement
+   * follows a load that already projected the state, and a projection per answer is what made a
+   * query over a thousand index files contend with admission on every one of them. The value is
+   * corrected by the next projection, and a {@code NodeReport} restates it in full.
    */
   long controlBytes() {
     synchronized (mapLock) {
-      return chargeSnapshot().controlBytes();
+      return chargedControlBytes;
     }
   }
 
