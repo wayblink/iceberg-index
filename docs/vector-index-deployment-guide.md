@@ -27,7 +27,12 @@
 
 ### 2.1 建索引
 
-没有 `CREATE INDEX` 这样的 DDL——**全部通过 `CALL` 过程**。这是有意的：索引参数多、且需要回显构建结果，过程比语法更好演进。
+有两种写法，语义相同、由同一套过程执行：
+
+**（1）`CALL` 过程**（原有写法，参数最全，仍在支持）
+**（2）`ALTER TABLE … CREATE INDEX`**（与 Lance-Spark 对齐的 DDL，见 2.1.1）
+
+> 注意：**索引只能建在 Iceberg catalog 的表上，并且语句里的表名要带 catalog 前缀**（例如 `hms.db.docs`）。如果把 Iceberg 表建在会话目录（`spark_catalog`，即 Hive 会话目录）里，建表会成功，但之后的任何读取都会报 `iceberg is not a valid Spark SQL Data Source`——这不是索引层的问题，是 1.9.1 的 `IcebergSource` 只实现了 V2 provider，而 Hive 表读走 V1 路径。两种解法：始终用 Iceberg catalog 限定名，或把 `spark.sql.catalog.spark_catalog` 配成 `org.apache.iceberg.spark.SparkSessionCatalog`。（2026-10-30 在 A 集群镜像上实测。）
 
 ```
 CALL prod.system.build_vector_index(
@@ -56,6 +61,30 @@ CALL prod.system.build_vector_index(
 `4bit` 在四张实测表上没有一处优于 3bit（recall 不需要它、体积最大），**不建议作为默认**。
 
 **埋点提示**：`rabitq-bits` 与 `nprobe` 写在索引定义里，同一个列上可以并存多个不同参数的索引（用 `name` 区分），这是做 A/B 对比的正确方式，也是 benchmark 的做法。
+
+### 2.1.1 索引 DDL（与 Lance-Spark 对齐）
+
+```
+SHOW INDEXES FROM hms.db.docs;
+
+ALTER TABLE hms.db.docs
+  CREATE INDEX docs_ivf_1bit USING vector (embedding)
+  WITH (dimension = 128, metric = 'euclidean', structure = 'IVF',
+        options = map('nprobe', '32', 'rabitq-bits', '1'));
+
+ALTER TABLE hms.db.docs CREATE INDEX USING fts (body);   -- 文本索引暂时没有名字
+
+ALTER TABLE hms.db.docs REFRESH INDEX docs_ivf_1bit;      -- 补段：只追未覆盖文件
+ALTER TABLE hms.db.docs DROP INDEX docs_ivf_1bit;
+```
+
+行为要点（2026-10-30 起）：
+
+- `CREATE INDEX` 的 `WITH` 键就是 `CALL` 过程的参数名，值按 SQL 表达式解析（支持 `map(...)`）；未知键、缺 `dimension`、重复键、非法 method 都在**分析期**报错。
+- **文本索引还没有名字**：`CREATE INDEX USING fts` 不能带名字，带名字会明确报错并提示改用 `CALL build_text_index`；`REFRESH/DROP INDEX` 也按名寻址不到它。
+- **`REFRESH` 是“补段”**：只为当前快照中未被子段覆盖的数据文件建新段，已有段原样保留。已覆盖文件的内容发生变化（被 rewrite 替换、或有了删除文件）时**不会再重建**，只打 WARN 并提示重建——这是与旧实现的语义差异，旧作业若依赖“刷新会顺带修正旧组”需要改成显式重建。
+- `DROP INDEX` 沿用既有默认 `purge=true`（连索引文件一起删），与 Lance-Spark 只摘登记不同。
+- 未实现、不要承诺：`OPTIMIZE INDEX`、短语/多列/混合检索。
 
 ### 2.2 查询
 
@@ -413,11 +442,12 @@ docker push hub.i.basemind.com/spark/sparkann-e2e:<tag>
 2. **驻留管理未收口**（#2391，7/9）。`load_index`/`offload_index` 的语义已定（按 index 粒度、固定保护期、索引级 LRU），实现仍在推进；生产先别依赖手工驻留。
 3. **nprobe 未系统扫**。旧报告 10M 用 150、100M 用 32；回溯版的 10M 回归用的是 **32**，over-sample 100 时 recall 天花板 0.983 与旧基线一致（§7.5.3），说明 32 在 10M 可用，但**没有做 32↔150 的同轮对照**，也没扫 100M。这是上线后第一个该调的旋钮，调它要按 §7.5.3 的口径同时记录 recall 而不是只看延迟。
 4. **只在 Hive catalog 上验证过**。REST catalog 的元数据更新路径（`MetadataUpdate` 序列化）有单测覆盖，但没有端到端跑过；用 REST catalog 上线前要单独验收。
-5. **无 DDL**。所有索引操作是 `CALL` 过程，用户文档要按过程写，不要承诺 `CREATE INDEX`。
+5. **DDL 与 `CALL` 并存**（2026-10-30 起）。`SHOW/`CREATE/`REFRESH/`DROP INDEX` 已实现并经 A 集群镜像 smoke；`CALL` 过程仍是参数最全的入口。文本索引尚无名字，`OPTIMIZE INDEX` 与短语/多列/混合检索未实现。
 6. **`FLAT` 不作为生产查询手段**（它在规模上省不了开销），但它**不再被改写规则拒绝**：旧规则里"FLAT 代价等同扫描所以跳过"的判断已删除，`TestVectorIndexGuide.theRewriteUsesWhateverStructureTheIndexHas` 断言 FLAT 也会生成 `VectorSearchSource`。早先"FLAT 走 `ORDER BY` 拿不到结果"的观察对应旧行为；用户手册里"索引不能是 `FLAT`"一句已过期，改文档时以本条为准。
-7. **删除表/删除行的边界**：equality delete 的多键集已支持，`timestamp_nano` 键被明确拒绝（避免同微秒多行误删）；带删除的表上建索引前请确认删除文件格式（跟随数据格式，Lance 表是 `.lance`）。
-8. **回溯版的两项能力缺失（受 1.9.1 基线限制，见 §7.3）**：其一，取回（fetch-back）没有"只读指定 row 位置"的能力，命中后会把整文件读出来再按位置过滤，结果正确但比 1.10+ 慢，差值待 10M 基准量；其二，**不支持 Lance 文件格式**，索引只读 Parquet，基准对比里的 Lance 列不适用于回溯版。10M 回归显示取回退化没有让整体数字变差（§7.5.3：天花板与旧基线一致、延迟同量级或更快），但这不等于"整文件读没有代价"——代价被 10M 的缓存与候选预算盖住了，100M 未测，所以 100M 之前先补 Parquet 位置读。
-9. **Lance 数据文件只承载扁平列和它们的列表**（首版边界，不是待修 bug）：`struct`、`map`、元素为 struct 的 list 既写不进 Lance 文件也读不回来，顶层字段名也不能含点号（格式按路径解析）；建 writer/reader 时就报错并点名具体列（`LanceRowTypes`）。需要嵌套列的表请用 `'write.format.default' = 'parquet'`。这条影响验收口径：L1 的嵌套 JSON 值保真只在 Parquet 上验，Lance 侧验的是"清晰拒绝"而不是"能写能读"；写进发布清单（release manifest）的限制说明以此为准，别把 Lance 嵌套列算进本版的覆盖范围。
+7. **Iceberg 表必须建在 Iceberg catalog 下**。建在会话目录（`spark_catalog`/Hive）的 Iceberg 表能建不能读，报 `iceberg is not a valid Spark SQL Data Source`；这类表上也不能建索引。见 2.1 的说明。
+8. **删除表/删除行的边界**：equality delete 的多键集已支持，`timestamp_nano` 键被明确拒绝（避免同微秒多行误删）；带删除的表上建索引前请确认删除文件格式（跟随数据格式，Lance 表是 `.lance`）。
+9. **取回（fetch-back）的位置读**：命中后按位置只读需要的那几页——`FormatModelRegistry.readBuilder(...).positions(...)`，格式忽略位置时整文件读一遍再按位置过滤，结果不变。
+10. **Lance 数据文件只承载扁平列和它们的列表**（首版边界，不是待修 bug）：`struct`、`map`、元素为 struct 的 list 既写不进 Lance 文件也读不回来，顶层字段名也不能含点号（格式按路径解析）；建 writer/reader 时就报错并点名具体列（`LanceRowTypes`）。需要嵌套列的表请用 `'write.format.default' = 'parquet'`。这条影响验收口径：嵌套 JSON 值保真只在 Parquet 上验，Lance 侧验的是"清晰拒绝"而不是"能写能读"；写进发布清单（release manifest）的限制说明以此为准，别把 Lance 嵌套列算进本版的覆盖范围。
 
 ---
 
