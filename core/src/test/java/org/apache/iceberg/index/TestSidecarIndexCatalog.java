@@ -79,25 +79,34 @@ class TestSidecarIndexCatalog {
   }
 
   @Test
-  public void skipsAGenerationAnotherWriterAlreadyClaimed(@TempDir Path tempDir)
+  public void publishesAboveTheGenerationAnotherWriterClaimed(@TempDir Path tempDir)
       throws IOException {
     LocalFileIO fileIO = new LocalFileIO();
     IndexCatalog catalog = new SidecarIndexCatalog(fileIO);
     String tableLocation = tempDir.resolve("table").toString();
     IndexMetadata created = catalog.createIndex(request(tableLocation, "index-uuid"));
 
-    // another publisher already took generation 2, which it does by creating that file; this one
-    // has to publish above it rather than replace a document a reader may already be following
-    String claimed = created.location() + "/metadata/index-metadata-v1-g2.json";
-    fileIO.newOutputFile(claimed).create().close();
+    // another publisher already claimed generation 2: its slot names its document, which is what a
+    // claim is now. This one has to publish above that claim rather than replace a document a
+    // reader may already be following
+    IndexMetadata claimed = withSnapshot(created, writeSnapshot(fileIO, created, 2), 2, 11);
+    File claimedFile = new File(created.location() + "/metadata/index-metadata-v1-g2.json");
+    Files.write(claimedFile.toPath(), IndexMetadataParser.toJson(claimed).getBytes(UTF_8));
+    Files.write(
+        Path.of(created.location() + "/metadata/index-metadata-pointer-1.json"),
+        ("{\"generation\":2,\"metadata-file\":\"" + claimedFile + "\"}").getBytes(UTF_8));
 
     IndexMetadata updated = withSnapshot(created, writeSnapshot(fileIO, created));
     catalog.updateIndex(updated);
 
-    assertThat(catalog.loadIndex(tableLocation, "index-uuid")).isEqualTo(updated);
-    assertThat(fileIO.newInputFile(claimed).getLength())
-        .as("the metadata file another writer claimed is left alone")
-        .isZero();
+    assertThat(pointerGeneration(new File(created.location() + "/metadata"), 0)).isEqualTo(3);
+    assertThat(new String(Files.readAllBytes(claimedFile.toPath()), UTF_8))
+        .as("the document another writer claimed is left alone")
+        .isEqualTo(IndexMetadataParser.toJson(claimed));
+    assertThat(
+            IndexMetadataParser.fromJson(
+                new String(Files.readAllBytes(claimedFile.toPath()), UTF_8)))
+        .isEqualTo(claimed);
   }
 
   @Test
@@ -180,6 +189,68 @@ class TestSidecarIndexCatalog {
     assertThat(catalog.loadIndex(tableLocation, "index-uuid").snapshots())
         .extracting(IndexSnapshot::sourceTableSnapshotId)
         .containsExactly(10L, 11L);
+  }
+
+  @Test
+  public void readsTheGenerationWithTheDocumentItAppliesTo(@TempDir Path tempDir)
+      throws IOException {
+    // A change is applied to a document, and the generation it is published into has to come from
+    // the same read. A publisher that reads the document at generation N and then learns about
+    // generation N+1 from a second read of the pointer publishes a document that never saw the
+    // snapshot published at N+1, and claims the generation after it. Neither the claim nor the
+    // pointer read-back notices: both only ask whether the generation this writer wrote was taken,
+    // never whether the document it derived that generation from is still the current one.
+    LocalFileIO delegate = new LocalFileIO();
+    IndexCatalog bootstrap = new SidecarIndexCatalog(delegate);
+    String tableLocation = tempDir.resolve("table").toString();
+    IndexMetadata created = bootstrap.createIndex(request(tableLocation, "index-uuid"));
+    IndexMetadata first = withSnapshot(created, writeSnapshot(delegate, created, 1), 1, 10);
+    IndexMetadata second = withSnapshot(first, writeSnapshot(delegate, first, 2), 2, 11);
+
+    AtomicBoolean raced = new AtomicBoolean();
+    IndexCatalog competitor = new SidecarIndexCatalog(delegate);
+    FileIO racing =
+        new FileIO() {
+          @Override
+          public InputFile newInputFile(String path) {
+            // the document is read after the pointer has been resolved, which is exactly where a
+            // second pointer read used to be spliced in
+            if (path.matches(".*index-metadata-v1-g\\d+\\.json$")
+                && raced.compareAndSet(false, true)) {
+              System.out.println("HOOK fires on " + path);
+              competitor.updateIndex(
+                  tableLocation, "index-uuid", seen -> append(seen, first.latestSnapshot()));
+            }
+
+            return delegate.newInputFile(path);
+          }
+
+          @Override
+          public OutputFile newOutputFile(String path) {
+            return delegate.newOutputFile(path);
+          }
+
+          @Override
+          public void deleteFile(String path) {
+            delegate.deleteFile(path);
+          }
+        };
+
+    IndexCatalog catalog = new SidecarIndexCatalog(racing);
+    IndexMetadata published =
+        catalog.updateIndex(
+            tableLocation, "index-uuid", current -> append(current, second.latestSnapshot()));
+
+    assertThat(pointerGeneration(new File(created.location() + "/metadata"), 0))
+        .as("the publication claimed the generation after the document it read")
+        .isEqualTo(3);
+    assertThat(published.snapshots())
+        .extracting(IndexSnapshot::sourceTableSnapshotId)
+        .containsExactlyInAnyOrder(10L, 11L);
+    assertThat(catalog.loadIndex(tableLocation, "index-uuid").snapshots())
+        .extracting(IndexSnapshot::sourceTableSnapshotId)
+        .as("neither the competing snapshot nor this one is dropped")
+        .containsExactlyInAnyOrder(10L, 11L);
   }
 
   @Test
