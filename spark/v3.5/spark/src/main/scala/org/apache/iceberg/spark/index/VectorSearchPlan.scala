@@ -32,6 +32,14 @@ import org.apache.spark.sql.catalyst.expressions.{Attribute, AttributeReference}
 import org.apache.spark.sql.catalyst.plans.logical.LeafNode
 import org.apache.spark.sql.types.StructType
 
+/**
+ * What a vector request promises about the rows it returns.
+ *
+ * <p>This is the caller's choice, not a decision the code makes for them: an index can be behind the
+ * table, and the two honest answers to that are "search only what the index covers" and "search the
+ * whole table, scanning what the index does not cover". Neither is a fallback for the other, and
+ * nothing here degrades into a scan on its own.
+ */
 private[spark] sealed trait VectorResultContract {
   def name: String
 }
@@ -40,14 +48,65 @@ private[spark] object VectorResultContract {
   case object TableLiveTopK extends VectorResultContract {
     override val name: String = "TABLE_LIVE_TOPK"
   }
+  /**
+   * The nearest live rows of the whole table, answered as hits.
+   *
+   * <p>The same answer {@link TableLiveTopK} gives, in the shape the procedures return: the row
+   * reference, the exact distance and the row. It is a separate contract because the shape is part of
+   * what a contract promises, and a caller of a procedure asks for hits while the rewrite asks for
+   * rows.
+   */
+  case object TableCovered extends VectorResultContract {
+    override val name: String = "TABLE_COVERED"
+  }
+
+  /**
+   * The live rows of the files the index covers, and nothing else.
+   *
+   * <p>A hit is dropped when its data file is not in the queried snapshot or its position has no live
+   * row, and the search widens until it has k live rows or the kernel runs out. The files the index
+   * does not cover are not read, so the answer can be shorter than k: it is exact about the rows it
+   * could have found.
+   */
+  case object IndexCovered extends VectorResultContract {
+    override val name: String = "INDEX_COVERED"
+  }
+
+  /**
+   * The index's own hits, as the index produced them.
+   *
+   * <p>A hit whose row was removed is kept with a null row, the score is the index's estimate, and
+   * the files the index does not cover are not read. This is a diagnostic view of the index, not a
+   * contract a query result can carry.
+   */
   case object IndexHits extends VectorResultContract {
     override val name: String = "INDEX_HITS"
   }
 
+  /** The coverage modes a caller may name, in the vocabulary the procedures accept. */
+  val CoverageModes: Set[String] = Set("table", "indexed", "index_hits")
+
   def fromName(name: String): VectorResultContract = name match {
     case "TABLE_LIVE_TOPK" => TableLiveTopK
+    case "TABLE_COVERED" => TableCovered
+    case "INDEX_COVERED" => IndexCovered
     case "INDEX_HITS" => IndexHits
     case _ => throw new IllegalArgumentException(s"Unknown vector result contract: $name")
+  }
+
+  /**
+   * The contract a {@code coverage} argument names.
+   *
+   * <p>{@code table} is the default because a query that silently answers from a subset of the table
+   * is the failure mode this whole distinction exists to prevent.
+   */
+  def forCoverage(coverage: String): VectorResultContract = coverage match {
+    case "table" => TableCovered
+    case "indexed" => IndexCovered
+    case "index_hits" => IndexHits
+    case other =>
+      throw new IllegalArgumentException(
+        s"Invalid coverage: '$other'; expected one of table, indexed, index_hits")
   }
 }
 
@@ -82,6 +141,8 @@ private[spark] object VectorSearchRequest {
       batch: Boolean): VectorSearchRequest = {
     require(table != null, "Vector source table cannot be null")
     val contract = VectorResultContract.fromName(contractName)
+    // the rewritten source answers with table rows; the coverage modes and the hit view answer with
+    // hits, which carry the file, the position and the score of what they found
     val schema = if (contract == VectorResultContract.TableLiveTopK) {
       SparkSchemaUtil.convert(table.schema())
     } else if (batch) {

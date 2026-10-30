@@ -152,15 +152,16 @@ class TestIndexTableFunctions {
     List<Row> hits =
         spark
             .sql(
+                // the score is the distance from the query, so a nearer row has the smaller one
                 "SELECT get_json_object(row, '$.id') AS id, score FROM "
                     + "vector_index_search('local.db.docs', 'embedding', array(1.0d, 0.0d), 10) "
-                    + "WHERE score > 0.5 ORDER BY score DESC LIMIT 2")
+                    + "WHERE score < 1.0 ORDER BY score ASC LIMIT 2")
             .collectAsList();
 
     assertThat(hits).hasSize(2);
     assertThat(hits.get(0).getString(0)).isEqualTo("1");
-    // scores descend
-    assertThat(hits.get(0).getDouble(1)).isGreaterThanOrEqualTo(hits.get(1).getDouble(1));
+    // distances ascend
+    assertThat(hits.get(0).getDouble(1)).isLessThanOrEqualTo(hits.get(1).getDouble(1));
 
     // the function can be joined against the table
     List<Row> joined =

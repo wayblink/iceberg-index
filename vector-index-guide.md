@@ -155,7 +155,17 @@ CALL local.system.vector_search_batch(
   queries => array('0.95,0.05', '0.0,0.95'), k => 10);
 ```
 
-输出 `data_file, pos, score, row`（批量多一列 `query_id`）。`row` 为 NULL 表示这条命中指向的行已经不在表里（建索引之后被删除，或所在文件已经不属���当前快照）。`row` 是整行的 JSON 字符串，用 `get_json_object(row, '$.id')` 取字段。`score` 的方向随 metric：`cosine`/`dot_product` 越大越近，`euclidean` 越小越近；行的顺序永远"最靠前的在前"。
+输出 `data_file, pos, score, row`（批量多一列 `query_id`）。`score` 是这条行到查询的**距离**，方向和 `vec_distance` 一致（越小越近），行按它升序。`row` 是整行的 JSON 字符串，用 `get_json_object(row, '$.id')` 取字段。
+
+索引落后于表时，用 `coverage` 说清这次要问哪一个问题：
+
+| `coverage` | 查什么 | 结果可能少于 k？ |
+|---|---|---|
+| `table`（默认） | 索引 + 索引没覆盖的文件做暴力扫描，两路合并取最近的 k 条 | 不会，等价于全表扫描的答案 |
+| `indexed` | 只查索引覆盖到的文件 | 会 |
+| `index_hits` | 索引自己的原始命中（可能指向已删除的行/已换掉的文件） | 不会，但它不是"结果" |
+
+两档都会先对着被查询的快照判活：命中的文件已不在快照里、或该位置的行已删除，这条就不算答案，`table`/`indexed` 会继续往下找候选，而不是拿一条 `row = NULL` 充数。`index_hits` 是诊断口径，`row` 可以是 NULL——想确认"索引里到底有什么"时用它，不要拿它当查询结果。
 
 批量入口的意义不只是省事：它对同一批查询只把每个索引文件加载一次、每个命中的数据文件只读一次，所以 N 条查询的代价接近一次单查询（实测 10M 上批量摊销后每查询 105–169 ms，单查询是 3.6–6.4 s）。
 
@@ -247,13 +257,15 @@ CALL local.system.refresh_vector_index(table => 'db.docs', column => 'embedding'
 -- 删索引；purge 默认 true，连索引文件一起删
 CALL local.system.drop_vector_index(table => 'db.docs', column => 'embedding', purge => true);
 
--- 清掉过期索引快照与失败构建留下的文件；不要在构建/刷新进行中执行
+-- 清掉过期索引快照与失败构建留下的文件
 CALL local.system.cleanup_index_files(table => 'db.docs');
 ```
 
 索引文件在 `<table>/indexes/` 下（`indexmeta.v{N}` 注册表、每个索引一棵 `metadata/snapshots/data` 树，加上 `status/` 里的构建报告），生命周期独立于表快照：`expire_snapshots`、`rewrite_data_files`、`remove_orphan_files` 都不碰它，否则会把每个索引文件都当成孤儿。清理只认 `cleanup_index_files`；`drop_vector_index` 带 `purge => true` 时连构建报告一起删。
 
 存储侧的规则（比如 S3 lifecycle policy）需要显式排除这个目录。
+
+`cleanup_index_files` 与构建并发运行时是安全的：未完成、且最近一小时有活动的构建 attempt 会让整次清理跳过孤儿扫描（输出里的 `in_flight_builds` 是它挡下的次数）。判据是"最后一次留痕"（attempt 目录、最新台账 marker、台账点名的文件），而不是"attempt 什么时候创建"，所以跑了几小时的大构建不会被误判成死账本。
 
 ## 9. 已知限制
 
@@ -264,7 +276,8 @@ CALL local.system.cleanup_index_files(table => 'db.docs');
 - **大索引的跨节点放置**：`100M HNSW` 这类装不进单节点缓存的规模，目前只能"装得下多少装多少"，没有分片放置与均衡调度。
 - **文本索引的失败不留痕迹、也不回滚**：`build_text_index` 没有回滚路径，`createIndex` 先注册，构建失败后注册留在 registry 里但没有任何发布快照（`list_indexes` 显示 `status = NULL`、`index_files = 0`），而且没有失败报告。后果是同列重试会被 "An index already exists for column …" 拒绝，且当前版本没有能删文本索引的 SQL 入口——只能走 Java API 或手工清理。向量索引则会回滚并把失败报告留在 `indexes/build-status/<field-id>/`。
 - **`refresh` 的进度口径**：`files_total` 是本次要重建的索引文件数，不是全量。
-- **过程入口不补候选**：`vector_search` 拿到 top-k 后如果有些行已被删除，它不回头补第 k+1 名，那些位置会以 `row = NULL` 返回；自动改写路径会补（最多重试 8 次）。需要严格 k 条时用改写写法。
+- **`indexed` 模式会少返回**：索引没覆盖的新文件不在它的检索范围里，所以行数可能小于 k。这是定义，不是缺陷；要完整答案用默认的 `table` 模式，或先 `refresh_vector_index`。
+- **`index_hits` 不是结果**：`row` 可能为 NULL、分数是索引估算值，它回答的是"索引里有什么"，不是"表里最近的是谁"。
 
 ## 10. 排错
 

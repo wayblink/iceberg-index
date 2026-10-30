@@ -402,6 +402,33 @@ public final class IndexEntries {
     return liveRows(spark, table, dataFiles, columns, readSchema, scanTasks(table, snapshotId));
   }
 
+  /**
+   * The live rows of the given data files, each with the file and the position it came from.
+   *
+   * <p>The dataset form of {@link #liveRows} drops the reference of a row: it is the row that a
+   * scan returns, and a scan has no need for where the row sits. A caller that has to report which
+   * row it picked, or that scores rows itself and wants to answer with their references, needs the
+   * pair, and reading the files again to recover it would double the work.
+   */
+  public static JavaPairRDD<String, Tuple2<Long, Row>> liveRowsWithPositions(
+      SparkSession spark,
+      Table table,
+      Collection<String> dataFiles,
+      List<String> columns,
+      StructType readSchema,
+      List<FileScanTask> scanTasks) {
+    List<FileScanTask> tasks = Lists.newArrayList();
+    for (FileScanTask task : scanTasks) {
+      if (dataFiles.contains(task.file().location().toString())) {
+        tasks.add(task);
+      }
+    }
+
+    // no positions for any file, which this path reads as "every row of the file"
+    Map<String, Collection<Long>> everyRow = Maps.newHashMap();
+    return liveRowsRdd(spark, table, everyRow, columns, readSchema, tasks);
+  }
+
   /** Reads all live rows of the given data files, from scan tasks that were already planned. */
   public static Dataset<Row> liveRows(
       SparkSession spark,

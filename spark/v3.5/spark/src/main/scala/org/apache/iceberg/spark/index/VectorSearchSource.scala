@@ -77,6 +77,7 @@ private[spark] case class VectorSearchSource(context: VectorSearchContext)(
       s"index=${context.inputs.indexMetadata.indexUuid()}",
       s"tableSnapshot=${context.inputs.tableSnapshot.snapshotId()}",
       s"indexSnapshot=${context.inputs.indexSnapshot.snapshotId}",
+      s"coveredFiles=${context.inputs.dataFiles.size - context.inputs.uncoveredDataFiles.size}",
       s"uncoveredFiles=${context.inputs.uncoveredDataFiles.size}",
       "driverMaterialization=true")
   }

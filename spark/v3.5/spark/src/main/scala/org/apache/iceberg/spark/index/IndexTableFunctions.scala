@@ -403,6 +403,8 @@ object IndexTableFunctions {
     // not while the plan is being built, and not while it is optimized
     val queries = new java.util.ArrayList[Array[Float]]()
     queries.add(query.map(_.toFloat))
+    // a table function has no parameter for the coverage mode, so it answers for the whole table:
+    // the mode that can be short is the one a caller has to ask for by name
     VectorSearchCalls.planOf(tableName, column, null, queries, topK, batch = false)
   }
 

@@ -61,6 +61,8 @@ class VectorSearchBatchProcedure extends BaseProcedure {
 
   private static final ProcedureParameter INDEX_PARAM =
       optionalInParameter("index", DataTypes.StringType);
+  private static final ProcedureParameter COVERAGE_PARAM =
+      optionalInParameter("coverage", DataTypes.StringType);
   private static final ProcedureParameter QUERY_TABLE_PARAM =
       optionalInParameter("query_table", DataTypes.StringType);
   private static final ProcedureParameter QUERY_ID_COLUMN_PARAM =
@@ -77,7 +79,8 @@ class VectorSearchBatchProcedure extends BaseProcedure {
         QUERY_TABLE_PARAM,
         QUERY_ID_COLUMN_PARAM,
         VECTOR_COLUMN_PARAM,
-        INDEX_PARAM
+        INDEX_PARAM,
+        COVERAGE_PARAM
       };
 
   private static final StructType OUTPUT_TYPE =
@@ -133,9 +136,11 @@ class VectorSearchBatchProcedure extends BaseProcedure {
           // one plan for the whole batch: the same parameter decision as the other entry points,
           // and one row resolution per hit file rather than one per query
           String indexArgument = input.isProvided(INDEX_PARAM) ? input.asString(INDEX_PARAM) : null;
+          String coverage =
+              input.isProvided(COVERAGE_PARAM) ? input.asString(COVERAGE_PARAM) : "table";
           org.apache.iceberg.spark.index.VectorSearchHitsPlan plan =
               org.apache.iceberg.spark.index.VectorSearchCalls.plan(
-                  spark(), table, column, indexArgument, queryVectors, topK, true);
+                  spark(), table, column, indexArgument, queryVectors, topK, true, coverage);
           List<Row> hits = org.apache.iceberg.spark.index.VectorSearchCalls.search(plan, spark());
 
           List<InternalRow> rows = Lists.newArrayListWithCapacity(hits.size());

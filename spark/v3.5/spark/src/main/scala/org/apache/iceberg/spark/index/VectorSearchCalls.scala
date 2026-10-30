@@ -45,8 +45,10 @@ private[spark] object VectorSearchCalls {
       indexArgument: String,
       queries: JList[Array[Float]],
       k: Int,
-      batch: Boolean): VectorSearchHitsPlan = {
-    VectorSearchBridge.plan(spark, table, column, indexArgument, queries, k, null, batch) match {
+      batch: Boolean,
+      coverage: String): VectorSearchHitsPlan = {
+    VectorSearchBridge.plan(
+      spark, table, column, indexArgument, queries, k, null, batch, coverage) match {
       case BoundVectorSearch(context) => VectorSearchHitsPlan(context, batch)
       case NoApplicableVectorIndex =>
         throw new IllegalArgumentException(
@@ -100,10 +102,16 @@ private[spark] object VectorSearchCalls {
       indexArgument: String,
       queries: JList[Array[Float]],
       k: Int,
-      batch: Boolean): JList[Row] =
-    search(plan(spark, table, column, indexArgument, queries, k, batch), spark)
+      batch: Boolean,
+      coverage: String): JList[Row] =
+    search(plan(spark, table, column, indexArgument, queries, k, batch, coverage), spark)
 
-  /** Loads the table of a request and searches it; the table function's execution path. */
+  /**
+   * Loads the table of a request and searches it; the table function's execution path.
+   *
+   * <p>A table function has no coverage parameter, so it answers for the whole table. Only a caller
+   * that names the mode through a procedure can ask for the index-only answer.
+   */
   def searchRequested(spark: SparkSession, request: VectorSearchHitsRequest): JList[Row] = {
     val queries = new java.util.ArrayList[Array[Float]](request.queries.size)
     request.queries.foreach(query => queries.add(query.toArray))
@@ -114,6 +122,7 @@ private[spark] object VectorSearchCalls {
       request.indexArgument,
       queries,
       request.topK,
-      request.batch)
+      request.batch,
+      "table")
   }
 }

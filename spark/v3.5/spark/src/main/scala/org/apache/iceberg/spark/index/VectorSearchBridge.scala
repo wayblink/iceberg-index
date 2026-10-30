@@ -27,10 +27,11 @@ import scala.collection.mutable
 import org.apache.iceberg.index.{IndexQuery, IndexSearchResult}
 import org.apache.iceberg.index.IndexQuery.Consistency
 import org.apache.iceberg.index.spark.{DistributedIndexSearch, IndexEntries, IndexSearch}
-import org.apache.iceberg.index.vector.VectorIndexAdapter
+import org.apache.iceberg.index.vector.{VectorDistance, VectorIndexAdapter}
 import org.apache.spark.sql.{Row, RowFactory, SparkSession}
 import org.apache.spark.sql.catalyst.plans.logical.LeafNode
 import org.apache.spark.sql.catalyst.plans.logical.Statistics
+import org.apache.spark.sql.types.{StructField, StructType}
 
 /**
  * The shared entry point for a vector search whose result keeps the index's own hits: {@code CALL
@@ -57,14 +58,16 @@ private[spark] object VectorSearchBridge {
       queries: JList[Array[Float]],
       k: Int,
       tableSnapshotId: JLong,
-      batch: Boolean): VectorBindingResult = {
+      batch: Boolean,
+      coverage: String): VectorBindingResult = {
+    val contract = VectorResultContract.forCoverage(coverage)
     val request = VectorSearchRequest.forTable(
       table,
       column,
       queries,
       k,
       tableSnapshotId,
-      VectorResultContract.IndexHits.name,
+      contract.name,
       indexArgument,
       batch)
     BindVectorSearch.bind(spark, request) match {
@@ -87,8 +90,18 @@ private[spark] object VectorSearchBridge {
     }
   }
 
-  /** Searches a planned request and returns its hits, one row per hit. */
+  /**
+   * Searches a planned request, and returns what its contract promises.
+   *
+   * <p>The hit view returns the index's own hits; the two coverage modes return the live rows of the
+   * requested snapshot, scored with the metric the query asks for, which is the number
+   * {@code ORDER BY vec_distance} would produce for the same row.
+   */
   def execute(spark: SparkSession, context: VectorSearchContext): JList[Row] = {
+    if (context.request.input.contract != VectorResultContract.IndexHits) {
+      return nearestRows(spark, context)
+    }
+
     val request = context.request.input
     val batch = request.batch
     val schema = if (batch) IndexSearch.RESULT_SCHEMA else IndexSearch.SINGLE_RESULT_SCHEMA
@@ -182,6 +195,266 @@ private[spark] object VectorSearchBridge {
   }
 
   /**
+   * The nearest live rows of the requested snapshot, under the contract's coverage mode.
+   *
+   * <p>Every candidate is resolved against the frozen table snapshot before it can be answered with:
+   * a hit whose data file the snapshot no longer has, or whose position no longer holds a live row,
+   * is dropped. That is the same rule the rewritten query applies, and it is what makes a deleted
+   * row impossible to return from either mode.
+   *
+   * <p>The table mode adds the rows of the files the index does not cover, scored the same way, and
+   * takes the k nearest of both together, so its answer is the answer a scan would give. The indexed
+   * mode stops at the index, so its answer can be shorter than k.
+   *
+   * <p>A batch is answered one query at a time: the scan of the uncovered files is a per-query
+   * scoring pass, and sharing one pass across queries is an optimization this mode does not need yet.
+   */
+  private def nearestRows(spark: SparkSession, context: VectorSearchContext): JList[Row] = {
+    val request = context.request.input
+    val schema = structOf(context.request.output)
+    if (request.topK <= 0 || request.queries.isEmpty) {
+      return spark.createDataFrame(new java.util.ArrayList[Row](), schema).collectAsList()
+    }
+
+    val answered = mutable.ListBuffer.empty[Row]
+    request.queries.zipWithIndex.foreach {
+      case (queryVector, queryId) =>
+        val query = queryVector.toArray
+        val indexed = indexCandidates(spark, context, query)
+        val scanned =
+          if (request.contract == VectorResultContract.IndexCovered) {
+            Seq.empty
+          } else {
+            uncoveredCandidates(spark, context, query)
+          }
+
+        val best = (indexed ++ scanned).sortBy(candidate => candidate._3).take(request.topK)
+        // the selected rows are read once more, as JSON: it is at most k rows per query, and it
+        // keeps the row's own schema deciding its shape
+        val json = rowsJsonOf(spark, context, best.map(candidate => (candidate._1, candidate._2)))
+        best.foreach {
+          case (dataFile, position, distance, _) =>
+            val rowJson =
+              Option(json.get(dataFile))
+                .flatMap(byPosition => Option(byPosition.get(JLong.valueOf(position))))
+                .orNull
+            answered += (if (request.batch) {
+                           RowFactory.create(
+                             Integer.valueOf(queryId),
+                             dataFile,
+                             JLong.valueOf(position),
+                             java.lang.Double.valueOf(distance),
+                             rowJson)
+                         } else {
+                           RowFactory.create(
+                             dataFile,
+                             JLong.valueOf(position),
+                             java.lang.Double.valueOf(distance),
+                             rowJson)
+                         })
+        }
+    }
+
+    spark.createDataFrame(answered.asJava, schema).collectAsList()
+  }
+
+  /**
+   * The live rows the index covers that are nearest to one query, with their exact distance.
+   *
+   * <p>The search widens while it has fewer than k live rows: a deleted row keeps its place in the
+   * index, and answering with k minus the deleted ones would report a short answer for a table that
+   * has nothing wrong with it.
+   */
+  private def indexCandidates(
+      spark: SparkSession,
+      context: VectorSearchContext,
+      query: Array[Float]): Seq[(String, Long, Double, Row)] = {
+    val inputs = context.inputs
+    val request = context.request.input
+    val metric = inputs.definition.metric()
+    val names = columnNames(context)
+    val vectorIndex = names.indexOf(request.column)
+    val adapter = new VectorIndexAdapter(inputs.definition)
+    val payload = adapter.encodeQuery(query)
+
+    val found = mutable.LinkedHashMap.empty[(String, Long), Row]
+    var budget = context.budget
+    var round = 0
+    var done = false
+    while (!done && round < 10) {
+      round += 1
+      val outcome = DistributedIndexSearch.search(
+        spark,
+        inputs.indexMetadata,
+        inputs.table,
+        IndexQuery
+          .of(inputs.indexSnapshot.sourceTableSnapshotId(), payload, budget.initial)
+          .withConsistency(Consistency.AT_OR_BEFORE))
+
+      // a hit of a file the snapshot no longer has is not a candidate at all: the row it names is
+      // gone, and scoring it would let a rewritten-away file occupy a place in the answer
+      val fresh = outcome
+        .hits()
+        .asScala
+        .filter(hit => inputs.dataFiles.contains(hit.dataFile()))
+        .filterNot(hit => found.contains((hit.dataFile(), hit.rowPosition())))
+
+      if (fresh.nonEmpty) {
+        val byFile = fresh
+          .groupBy(hit => hit.dataFile())
+          .map {
+            case (dataFile, hits) =>
+              dataFile -> hits.map(hit => JLong.valueOf(hit.rowPosition())).toSet.asJava
+          }
+          .asJava
+        val rowsByFile = IndexEntries.rowsAt(
+          spark,
+          inputs.table,
+          byFile,
+          names.toList.asJava,
+          inputs.readSchema,
+          inputs.scanTasks)
+        fresh.foreach { hit =>
+          val row =
+            Option(rowsByFile.get(hit.dataFile()))
+              .flatMap(byPosition => Option(byPosition.get(JLong.valueOf(hit.rowPosition()))))
+              .orNull
+          if (row != null && (vectorIndex < 0 || !row.isNullAt(vectorIndex))) {
+            found.put((hit.dataFile(), hit.rowPosition()), row)
+          }
+        }
+      }
+
+      if (found.size >= request.topK || !outcome.moreHits() || budget.initial == 0) {
+        done = true
+      } else {
+        val next =
+          VectorCandidateBudget.nextOrNull(budget.initial, found.size, request.topK, budget.entryUpperBound)
+        if (next == null) {
+          done = true
+        } else {
+          budget = next
+        }
+      }
+    }
+
+    found.map {
+      case ((dataFile, position), row) =>
+        (dataFile, position, distanceOf(metric, row, vectorIndex, query), row)
+    }.toSeq
+  }
+
+  /**
+   * The k nearest live rows of the files the index does not cover, scored on the cluster.
+   *
+   * <p>This is the scan the table mode adds, and the reason it can answer with the whole table: a
+   * file an index built earlier never saw is read here instead of being left out. Only k rows per
+   * query come back to the driver.
+   */
+  private def uncoveredCandidates(
+      spark: SparkSession,
+      context: VectorSearchContext,
+      query: Array[Float]): Seq[(String, Long, Double, Row)] = {
+    val inputs = context.inputs
+    val request = context.request.input
+    val uncovered = inputs.uncoveredDataFiles
+    if (uncovered.isEmpty) {
+      return Seq.empty
+    }
+
+    val names = columnNames(context)
+    val vectorIndex = names.indexOf(request.column)
+    val rows = IndexEntries.liveRowsWithPositions(
+      spark,
+      inputs.table,
+      uncovered.asJava,
+      names.toList.asJava,
+      inputs.readSchema,
+      inputs.scanTasks)
+    if (rows == null) {
+      return Seq.empty
+    }
+
+    val metric = inputs.definition.metric()
+    val broadcast = spark.sparkContext.broadcast(query)
+    rows.rdd
+      .filter(entry => vectorIndex < 0 || !entry._2._2.isNullAt(vectorIndex))
+      .map {
+        entry =>
+          val row = entry._2._2
+          (row, entry._1, entry._2._1, distanceOf(metric, row, vectorIndex, broadcast.value))
+      }
+      // a row without a vector is not a candidate, and neither branch may answer with one: the two
+      // have to answer the same question
+      .takeOrdered(request.topK)(
+        Ordering.by[(Row, String, java.lang.Long, Double), Double](scored => scored._4))
+      .map {
+        scored => (scored._2, scored._3.longValue(), scored._4, scored._1)
+      }
+      .toSeq
+  }
+
+  /** The schema a request answers with, which is what its output attributes declare. */
+  private def structOf(output: Seq[org.apache.spark.sql.catalyst.expressions.Attribute]): StructType = {
+    new StructType(
+      output
+        .map(attribute => StructField(attribute.name, attribute.dataType, attribute.nullable))
+        .toArray)
+  }
+
+  private def columnNames(context: VectorSearchContext): Seq[String] = {
+    context.inputs.table.schema().columns().asScala.map(column => column.name()).toSeq
+  }
+
+  /** The distance of one row's vector from the query, which is what the rewrite sorts by. */
+  private def distanceOf(
+      metric: org.apache.iceberg.index.vector.VectorIndexDefinition.Metric,
+      row: Row,
+      vectorIndex: Int,
+      query: Array[Float]): Double = {
+    if (vectorIndex < 0 || row.isNullAt(vectorIndex)) {
+      return Double.PositiveInfinity
+    }
+
+    val values = row.getList[AnyRef](vectorIndex)
+    val vector = new Array[Float](values.size())
+    var i = 0
+    while (i < vector.length) {
+      vector(i) = values.get(i).asInstanceOf[java.lang.Number].floatValue()
+      i += 1
+    }
+
+    VectorDistance.distance(metric, vector, query)
+  }
+
+  /** The JSON of the selected rows, keyed by data file and then by position. */
+  private def rowsJsonOf(
+      spark: SparkSession,
+      context: VectorSearchContext,
+      selected: Seq[(String, Long)]): java.util.Map[String, java.util.Map[JLong, String]] = {
+    val inputs = context.inputs
+    if (selected.isEmpty) {
+      return java.util.Collections.emptyMap()
+    }
+
+    val positions = selected
+      .groupBy(selected => selected._1)
+      .map {
+        case (dataFile, rows) =>
+          dataFile -> rows.map(row => JLong.valueOf(row._2)).toSet.asJava
+      }
+      .asJava
+
+    IndexEntries.rowsAtJson(
+      spark,
+      inputs.table,
+      positions,
+      columnNames(context).toList.asJava,
+      inputs.readSchema,
+      inputs.scanTasks)
+  }
+
+  /**
    * The JSON of each hit's live row, keyed by data file and then by position.
    *
    * <p>The JSON is serialised where the row is read: a lookup resolves a whole record per hit, and
@@ -260,8 +533,9 @@ private[spark] case class VectorSearchHitsRequest(
   }
 
   override def simpleString(maxFields: Int): String =
-    s"VectorSearchHits[contract=INDEX_HITS, batch=$batch, table=$tableName, column=$column, " +
-      s"k=$topK, queries=${queries.size}, driverMaterialization=true]"
+    s"VectorSearchHits[contract=INDEX_HITS (table functions answer for the whole table), " +
+      s"batch=$batch, table=$tableName, column=$column, k=$topK, queries=${queries.size}, " +
+      s"driverMaterialization=true]"
 }
 
 /** A planned index-hit search whose request has already been bound to its snapshots. */
@@ -272,8 +546,11 @@ private[spark] case class VectorSearchHitsPlan(context: VectorSearchContext, bat
     context.request.output
 
   override def simpleString(maxFields: Int): String =
-    s"VectorSearchHits[contract=INDEX_HITS, batch=$batch, k=${context.request.input.topK}, " +
+    s"VectorSearchHits[contract=${context.request.input.contract.name}, " +
+      s"batch=$batch, k=${context.request.input.topK}, " +
       s"index=${context.inputs.indexMetadata.indexUuid()}, " +
       s"indexSnapshot=${context.inputs.indexSnapshot.snapshotId}, " +
-      s"tableSnapshot=${context.inputs.tableSnapshot.snapshotId()}, driverMaterialization=true]"
+      s"tableSnapshot=${context.inputs.tableSnapshot.snapshotId()}, " +
+      s"coveredFiles=${context.inputs.dataFiles.size - context.inputs.uncoveredDataFiles.size}, " +
+      s"uncoveredFiles=${context.inputs.uncoveredDataFiles.size}, driverMaterialization=true]"
 }

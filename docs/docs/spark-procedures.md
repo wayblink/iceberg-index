@@ -1241,15 +1241,35 @@ for a text index like `{"field-id":3,"k1":1.2,"length-norm":0.75,"min-token-leng
 ### `vector_search`
 
 Searches a vector index and resolves the matched rows. Returns the row reference (`_file` + `_pos`)
-of each hit with its score, plus the matched row itself as a JSON string, ordered by score
-descending.
+of each answer with its distance, plus the matched row itself as a JSON string, ordered by distance
+ascending: smaller is closer, whatever the metric.
 
-| Argument Name | Required? | Type          | Description                     |
-|---------------|-----------|---------------|---------------------------------|
-| `table`       | ✔️        | string        | Name of the table               |
-| `column`      | ✔️        | string        | Name of the indexed column      |
-| `query`       | ✔️        | array<double> | Query vector (same dimension)   |
-| `k`           | ✔️        | int           | Number of results to return     |
+| Argument Name | Required? | Type          | Description                                  |
+|---------------|-----------|---------------|----------------------------------------------|
+| `table`       | ✔️        | string        | Name of the table                            |
+| `column`      | ✔️        | string        | Name of the indexed column                   |
+| `query`       | ✔️        | array<double> | Query vector (same dimension)                |
+| `k`           | ✔️        | int           | Number of results to return                  |
+| `coverage`    |           | string        | `table` (default), `indexed` or `index_hits` |
+
+`coverage` decides what is searched when the index is behind the table:
+
+| Value        | What is searched                                                                 | Can be shorter than `k`? |
+|--------------|----------------------------------------------------------------------------------|--------------------------|
+| `table`      | The index, plus a scan of the files the index does not cover: the full-scan answer | No                       |
+| `indexed`    | Only the files the index covers                                                   | Yes                      |
+| `index_hits` | The index's own hits, as the index produced them (diagnostic view)                 | No                       |
+
+In every mode a hit is resolved against the queried snapshot first: a hit whose data file the
+snapshot no longer has, or whose position no longer holds a live row, is not an answer. `table` and
+`indexed` drop such a hit and keep searching; `index_hits` reports it with a null `row`, because what
+it reports is the index, not a result. `score` is the distance the query asks for, so it is the number
+`ORDER BY vec_distance(...)` sorts by; in `index_hits` it is the index's own estimate.
+
+!!! note
+    `indexed` is exact about the rows it could have found, and says nothing about the rows it could
+    not: a file appended after the last build is not searched. Use it when a fast answer over what is
+    indexed is worth more than a complete one, and run `refresh_vector_index` to close the gap.
 
 #### Output
 
@@ -1257,7 +1277,7 @@ descending.
 |-------------|--------|------------------------------------------|
 | `data_file` | string | Data file of the matched row             |
 | `pos`       | long   | Row position within the data file (`_pos`) |
-| `score`     | double | Similarity or distance score             |
+| `score`     | double | Distance from the query                  |
 | `row`       | string | Matched row as a JSON object             |
 
 !!! note
@@ -1266,9 +1286,11 @@ descending.
 
 ### `vector_search_batch`
 
-Searches a vector index for many queries at once and resolves the matched rows. Every hit carries
-the index of the query it belongs to (`query_id`), its row reference, score and the matched row as a
-JSON string. Rows are ordered by query and then by score.
+Searches a vector index for many queries at once and resolves the matched rows. Every answer carries
+the index of the query it belongs to (`query_id`), its row reference, distance and the matched row as
+a JSON string. Rows are ordered by query and then by distance. `coverage` means the same as in
+`vector_search`; the whole-table mode answers one query at a time, so a batch of N queries runs N
+scans of the uncovered files.
 
 Queries are passed as an array of strings, one comma-separated list of numbers per query. Unlike
 repeated single searches, the matched rows of all queries are resolved by reading each hit data
@@ -1282,6 +1304,7 @@ per query per hit data file (measured on SIFT data: 50 queries in ~1.3s as one b
 | `column`      | ✔️        | string        | Name of the indexed column                   |
 | `queries`     | ✔️        | array<string> | Query vectors, each a comma-separated list   |
 | `k`           | ✔️        | int           | Number of results per query                  |
+| `coverage`    |           | string        | `table` (default), `indexed` or `index_hits` |
 
 #### Output
 
@@ -1290,7 +1313,7 @@ per query per hit data file (measured on SIFT data: 50 queries in ~1.3s as one b
 | `query_id`  | int    | Index of the query in the `queries` argument   |
 | `data_file` | string | Data file of the matched row                   |
 | `pos`       | long   | Row position within the data file (`_pos`)     |
-| `score`     | double | Similarity or distance score                   |
+| `score`     | double | Distance from the query                        |
 | `row`       | string | Matched row as a JSON object                   |
 
 #### Examples

@@ -53,8 +53,14 @@ class VectorSearchProcedure extends BaseProcedure {
 
   private static final ProcedureParameter INDEX_PARAM =
       optionalInParameter("index", DataTypes.StringType);
+
+  private static final ProcedureParameter COVERAGE_PARAM =
+      optionalInParameter("coverage", DataTypes.StringType);
+
   private static final ProcedureParameter[] PARAMETERS =
-      new ProcedureParameter[] {TABLE_PARAM, COLUMN_PARAM, QUERY_PARAM, K_PARAM, INDEX_PARAM};
+      new ProcedureParameter[] {
+        TABLE_PARAM, COLUMN_PARAM, QUERY_PARAM, K_PARAM, INDEX_PARAM, COVERAGE_PARAM
+      };
 
   private static final StructType OUTPUT_TYPE =
       new StructType(
@@ -107,6 +113,8 @@ class VectorSearchProcedure extends BaseProcedure {
           // the same planning and parameter decisions the other vector entry points use: an
           // explicit setting is kept, and only an unset multiplier is decided here
           String indexArgument = input.isProvided(INDEX_PARAM) ? input.asString(INDEX_PARAM) : null;
+          String coverage =
+              input.isProvided(COVERAGE_PARAM) ? input.asString(COVERAGE_PARAM) : "table";
           org.apache.iceberg.spark.index.VectorSearchHitsPlan plan =
               org.apache.iceberg.spark.index.VectorSearchCalls.plan(
                   spark(),
@@ -115,7 +123,8 @@ class VectorSearchProcedure extends BaseProcedure {
                   indexArgument,
                   List.of(toFloats(queryDoubles)),
                   topK,
-                  false);
+                  false,
+                  coverage);
           List<org.apache.spark.sql.Row> hits =
               org.apache.iceberg.spark.index.VectorSearchCalls.search(plan, spark());
 

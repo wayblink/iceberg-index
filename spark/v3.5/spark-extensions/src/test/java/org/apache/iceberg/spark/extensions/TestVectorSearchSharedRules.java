@@ -306,12 +306,44 @@ class TestVectorSearchSharedRules {
         spark
             .sql(
                 "CALL local.system.vector_search(table => 'db.shared_replaced_files', "
-                    + "column => 'embedding', query => array(1.0d, 0.0d), k => 2)")
+                    + "column => 'embedding', query => array(1.0d, 0.0d), k => 2, "
+                    + "coverage => 'index_hits')")
             .collectAsList();
-    // the hits point at files this snapshot no longer has: the contract keeps them and reports the
-    // missing row, rather than dropping them and answering with a shorter list
+    // the diagnostic view reports the index itself: the hits point at files this snapshot no longer
+    // has, and it keeps them with a missing row rather than answering with a shorter list. A
+    // coverage mode drops them instead, which is the difference the coverage tests assert.
     assertThat(hits).hasSize(2);
     assertThat(hits).allMatch(row -> row.isNullAt(3));
+
+    // and the default mode answers for the table, where those files are gone and their rows with
+    // them
+    assertThat(
+            spark
+                .sql(
+                    "CALL local.system.vector_search(table => 'db.shared_replaced_files', "
+                        + "column => 'embedding', query => array(1.0d, 0.0d), k => 2)")
+                .collectAsList())
+        .extracting(row -> row.getString(3))
+        .allSatisfy(json -> assertThat(json).contains("\"id\":1"));
+  }
+
+  @Test
+  void theIndexedModeDropsAHitWhoseFileIsGone() throws Exception {
+    tableWithIndex("shared_replaced_indexed");
+    spark.sql(
+        "INSERT OVERWRITE local.db.shared_replaced_indexed "
+            + "VALUES (10, array(1.0d, 0.0d)), (11, array(0.0d, 1.0d))");
+
+    // every index hit points at a file the snapshot replaced, so there is nothing the index covers
+    // to answer with: the mode is exact about that, and does not widen into a scan
+    assertThat(
+            spark
+                .sql(
+                    "CALL local.system.vector_search(table => 'db.shared_replaced_indexed', "
+                        + "column => 'embedding', query => array(1.0d, 0.0d), k => 2, "
+                        + "coverage => 'indexed')")
+                .collectAsList())
+        .isEmpty();
   }
 
   @Test
@@ -364,7 +396,8 @@ class TestVectorSearchSharedRules {
             List.of(new float[] {1.0F, 0.0F}),
             2,
             null,
-            "INDEX_HITS".equals(contract));
+            "INDEX_HITS".equals(contract),
+            "INDEX_HITS".equals(contract) ? "index_hits" : "table");
     assertThat(result).isInstanceOf(BoundVectorSearch.class);
     return result.context();
   }
