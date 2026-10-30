@@ -41,8 +41,12 @@ final class IndexCacheController {
   static final long DEFAULT_WAIT_NANOS = java.time.Duration.ofSeconds(60).toNanos();
 
   /**
-   * Waits until every file of the plan is terminal or the deadline passes. A cluster with no
-   * executor cannot answer, so that case returns at once instead of blocking the caller.
+   * Waits until every file of the plan is terminal or the wait can no longer end well.
+   *
+   * <p>The wait ends on the deadline, and also when no executor is recent enough to answer it. In
+   * both cases the plan is ended rather than merely abandoned: an executor that never answered
+   * holds the space the plan promised, and the driver would count it as taken by the next load.
+   * Only a plan that covered every file is left as it is.
    */
   static IndexCacheProtocol.Result await(
       IndexCacheDriverControl control, String planId, long deadlineNanos) {
@@ -63,7 +67,13 @@ final class IndexCacheController {
       result = control.result(planId);
     }
 
-    return result;
+    if (result.status() == IndexCacheProtocol.Status.COMPLETE) {
+      return result;
+    }
+
+    // The caller is no longer waiting, so the unfinished files are failures now: ending the plan
+    // here is what keeps its reservations and unanswered promises from outliving the wait.
+    return control.expire(planId, control.nowNanos());
   }
 
   private static boolean terminal(IndexCacheProtocol.Status status) {

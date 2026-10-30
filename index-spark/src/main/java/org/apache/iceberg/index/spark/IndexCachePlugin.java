@@ -78,7 +78,6 @@ public class IndexCachePlugin implements SparkPlugin {
       for (String key :
           List.of(
               IndexCacheWorkerConfig.POLL_INTERVAL,
-              IndexCacheWorkerConfig.STALE_AFTER,
               IndexCacheWorkerConfig.MAX_COMMANDS,
               IndexCacheWorkerConfig.MAX_CONCURRENT,
               IndexCacheWorkerConfig.TIMEOUT,

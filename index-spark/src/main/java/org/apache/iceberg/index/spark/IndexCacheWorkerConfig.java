@@ -25,14 +25,12 @@ import org.apache.iceberg.relocated.com.google.common.base.Preconditions;
 final class IndexCacheWorkerConfig {
   static final String PREFIX = "spark.iceberg.index.cache.";
   static final String POLL_INTERVAL = PREFIX + "control.poll-interval";
-  static final String STALE_AFTER = PREFIX + "control.stale-after";
   static final String MAX_COMMANDS = PREFIX + "control.max-commands";
   static final String MAX_CONCURRENT = PREFIX + "load.max-concurrent";
   static final String TIMEOUT = PREFIX + "load.timeout";
   static final String MAX_ATTEMPTS = PREFIX + "load.max-attempts";
 
   private final long pollMillis;
-  private final long staleAfterMillis;
   private final int maxCommands;
   private final int maxConcurrentLoads;
   private final long operationTimeoutMillis;
@@ -40,13 +38,11 @@ final class IndexCacheWorkerConfig {
 
   private IndexCacheWorkerConfig(
       long pollMillis,
-      long staleAfterMillis,
       int maxCommands,
       int maxConcurrentLoads,
       long operationTimeoutMillis,
       int maxAttempts) {
     this.pollMillis = pollMillis;
-    this.staleAfterMillis = staleAfterMillis;
     this.maxCommands = maxCommands;
     this.maxConcurrentLoads = maxConcurrentLoads;
     this.operationTimeoutMillis = operationTimeoutMillis;
@@ -57,7 +53,6 @@ final class IndexCacheWorkerConfig {
     Map<String, String> values = settings == null ? Map.of() : settings;
     return new IndexCacheWorkerConfig(
         seconds(values, POLL_INTERVAL, 1),
-        seconds(values, STALE_AFTER, 10),
         (int) positive(values, MAX_COMMANDS, 64),
         (int) positive(values, MAX_CONCURRENT, 1),
         seconds(values, TIMEOUT, 600),
@@ -102,10 +97,6 @@ final class IndexCacheWorkerConfig {
 
   long pollMillis() {
     return pollMillis;
-  }
-
-  long staleAfterMillis() {
-    return staleAfterMillis;
   }
 
   int maxCommands() {

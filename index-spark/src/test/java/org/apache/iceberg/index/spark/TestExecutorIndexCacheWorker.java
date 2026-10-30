@@ -543,6 +543,17 @@ class TestExecutorIndexCacheWorker {
         .isEqualTo(TimeUnit.MINUTES.toMillis(10));
   }
 
+  @Test
+  void aControlKeyWithoutAReaderIsNotParsed() {
+    // The staleness bound is IndexResidencyCoordinator.STALE_AFTER_NANOS, not a setting: a key that
+    // is parsed but never read made an operator believe it could be tuned.
+    assertThat(
+            IndexCacheWorkerConfig.parse(
+                    Map.of("spark.iceberg.index.cache.control.stale-after", "not-a-number"))
+                .pollMillis())
+        .isEqualTo(1_000L);
+  }
+
   private static boolean awaitLatch(CountDownLatch latch) {
     try {
       return latch.await(30, TimeUnit.SECONDS);

@@ -73,6 +73,16 @@ final class IndexCacheDriverControl {
     return coordinator.result(planId);
   }
 
+  /**
+   * Ends a plan whose deadline passed, and answers with its final state. A caller that stops
+   * waiting calls this instead of simply giving up, so the plan does not keep the space it promised
+   * nor the promises an executor may still answer.
+   */
+  synchronized IndexCacheProtocol.Result expire(String planId, long nowNanos) {
+    coordinator.expire(planId, nowNanos);
+    return coordinator.result(planId);
+  }
+
   synchronized void recordAccess(String indexUuid, long nowNanos) {
     coordinator.recordAccess(indexUuid, nowNanos);
   }

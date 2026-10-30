@@ -980,8 +980,11 @@ final class IndexResidencyCoordinator {
   }
 
   /**
-   * Ends a plan that exceeded its deadline: success stays confirmed, unfinished files are fenced
-   * and cancelled so no late ACK can backfill them.
+   * Ends a plan that exceeded its deadline: success stays confirmed, unfinished files are marked
+   * {@code TIMED_OUT} and their reservations released, so no late ACK can backfill them.
+   *
+   * <p>Called by whoever waited for the plan and stopped waiting, which is the control channel's
+   * {@code await}; nothing inside the coordinator reaches the deadline on its own.
    */
   void expire(String planId, long nowNanos) {
     PlanState plan = plans.get(planId);

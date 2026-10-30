@@ -40,8 +40,9 @@ class TestIndexCacheControl {
     IndexCacheDriverControl control = new IndexCacheDriverControl(coordinator);
     control.receive(node());
 
-    IndexCacheProtocol.Result result =
-        IndexCacheController.load(control, built.table(), built.metadata(), "30m", BASE, BASE);
+    // Planning is inspected before anything waits: a plan that is allowed to reach its deadline is
+    // ended by it, which is what the deadline tests below cover.
+    IndexCacheProtocol.Result result = control.result(plan(control, built, "30m"));
 
     assertThat(result.status()).isEqualTo(IndexCacheProtocol.Status.PENDING);
     assertThat(result.protection().deadlineNanos())
@@ -218,6 +219,63 @@ class TestIndexCacheControl {
   }
 
   @Test
+  void aPlanThatPassesItsDeadlineIsFencedInsteadOfStayingPending() {
+    TestIndexFixtures.BuiltIndex built =
+        TestIndexFixtures.build(tempDir, "idx-deadline", "data-1.parquet", "data-2.parquet");
+    MutableClock clock = new MutableClock(BASE);
+    IndexResidencyCoordinator coordinator = new IndexResidencyCoordinator(clock);
+    IndexCacheDriverControl control = new IndexCacheDriverControl(coordinator);
+    control.receive(node());
+    String planId =
+        control.acceptLoad(
+            IndexCacheController.target(built.table(), built.metadata()),
+            IndexResidencyPolicy.parse("30m"),
+            clock.nowNanos());
+    assertThat(control.result(planId).status()).isEqualTo(IndexCacheProtocol.Status.PENDING);
+    // the space the plan promised is what the next load would count as taken
+    assertThat(coordinator.state("executor-1", "executor-1#1").reservedByCommand()).isNotEmpty();
+
+    clock.advance(Duration.ofMinutes(1).toNanos());
+    IndexCacheProtocol.Result result =
+        IndexCacheController.await(control, planId, clock.nowNanos());
+
+    // A deadline that ends the wait must also end the plan: the executor never answered, so the
+    // files are not resident and their reservations may not outlive the caller's patience.
+    assertThat(result.status()).isEqualTo(IndexCacheProtocol.Status.FAILED);
+    assertThat(result.uncovered()).hasSize(indexFiles(built).size());
+    assertThat(result.uncovered().values()).containsOnly("TIMED_OUT");
+    assertThat(coordinator.state("executor-1", "executor-1#1").reservedByCommand()).isEmpty();
+    assertThat(coordinator.state("executor-1", "executor-1#1").reservedByPlan()).isEmpty();
+  }
+
+  @Test
+  void aDeadExecutorDoesNotKeepAPlanInFlightPastItsDeadline() {
+    // refresh() only decides a node is gone once nothing is queued for it, so a node that never
+    // answers its command leaves the plan waiting; the deadline is the only end of that wait.
+    TestIndexFixtures.BuiltIndex built =
+        TestIndexFixtures.build(tempDir, "idx-dead", "data-1.parquet");
+    MutableClock clock = new MutableClock(BASE);
+    IndexResidencyCoordinator coordinator = new IndexResidencyCoordinator(clock);
+    IndexCacheDriverControl control = new IndexCacheDriverControl(coordinator);
+    control.receive(node());
+    String planId =
+        control.acceptLoad(
+            IndexCacheController.target(built.table(), built.metadata()),
+            IndexResidencyPolicy.parse("30m"),
+            clock.nowNanos());
+
+    clock.advance(IndexResidencyCoordinator.STALE_AFTER_NANOS + Duration.ofSeconds(1).toNanos());
+    assertThat(control.hasLiveExecutors(clock.nowNanos())).isFalse();
+    IndexCacheProtocol.Result result =
+        IndexCacheController.await(control, planId, clock.nowNanos());
+
+    assertThat(result.status()).isEqualTo(IndexCacheProtocol.Status.FAILED);
+    assertThat(result.uncovered().values()).containsOnly("TIMED_OUT");
+    assertThat(coordinator.state("executor-1", "executor-1#1").reservedByCommand()).isEmpty();
+    assertThat(coordinator.state("executor-1", "executor-1#1").reservedByPlan()).isEmpty();
+  }
+
+  @Test
   void fileRowsCarryThePlannedBytes() {
     TestIndexFixtures.BuiltIndex built =
         TestIndexFixtures.build(tempDir, "idx-1", "data-1.parquet");
@@ -291,8 +349,7 @@ class TestIndexCacheControl {
     IndexResidencyCoordinator coordinator = new IndexResidencyCoordinator(() -> BASE);
     IndexCacheDriverControl control = new IndexCacheDriverControl(coordinator);
     control.receive(node());
-    IndexCacheProtocol.Result load =
-        IndexCacheController.load(control, built.table(), built.metadata(), "forever", BASE, BASE);
+    IndexCacheProtocol.Result load = control.result(plan(control, built, "forever"));
     IndexCacheProtocol.Command command =
         coordinator.commands("executor-1", "executor-1#1").stream()
             .filter(c -> c.type() == IndexCacheProtocol.CommandType.LOAD)
@@ -322,8 +379,7 @@ class TestIndexCacheControl {
     IndexResidencyCoordinator coordinator = new IndexResidencyCoordinator(() -> BASE);
     IndexCacheDriverControl control = new IndexCacheDriverControl(coordinator);
     control.receive(node());
-    IndexCacheProtocol.Result load =
-        IndexCacheController.load(control, built.table(), built.metadata(), "forever", BASE, BASE);
+    IndexCacheProtocol.Result load = control.result(plan(control, built, "forever"));
     IndexCacheProtocol.Command command = coordinator.commands("executor-1", "executor-1#1").get(0);
     control.receive(
         IndexCacheProtocol.Ack.builder()
@@ -443,6 +499,18 @@ class TestIndexCacheControl {
             .toList();
   }
 
+  /**
+   * Plans a load without waiting for it, so a test can inspect what the plan issued. Waiting is a
+   * separate concern: a plan whose deadline passes is ended by it.
+   */
+  private static String plan(
+      IndexCacheDriverControl control, TestIndexFixtures.BuiltIndex built, String retainFor) {
+    return control.acceptLoad(
+        IndexCacheController.target(built.table(), built.metadata()),
+        IndexResidencyPolicy.parse(retainFor),
+        BASE);
+  }
+
   private static IndexCacheProtocol.Ack ack(
       String planId,
       IndexCacheProtocol.Command command,
@@ -478,6 +546,24 @@ class TestIndexCacheControl {
         .status(status)
         .bytes(bytes)
         .build();
+  }
+
+  /** A clock the test moves by hand, so a deadline passes without waiting for it. */
+  private static final class MutableClock implements IndexResidencyCoordinator.Clock {
+    private long now;
+
+    private MutableClock(long now) {
+      this.now = now;
+    }
+
+    private void advance(long nanos) {
+      this.now += nanos;
+    }
+
+    @Override
+    public long nowNanos() {
+      return now;
+    }
   }
 
   private static IndexCacheProtocol.NodeReport nodeFor(String executorId, long sequence) {

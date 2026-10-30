@@ -448,7 +448,6 @@ CALL local.system.offload_index(table => 'db.docs', index => '<uuid>');
 | `load.max-concurrent` | `1` | 生效（加载线程池大小） |
 | `load.timeout` | `600s` | 生效 |
 | `load.max-attempts` | `3` | 生效 |
-| `control.stale-after` | `10s` | **解析后没有读者，设了没用** |
 
 **陷阱**：executor 侧只认 Spark 注入的 `spark.plugins.internal.conf.<IndexCachePlugin 的类名>.<key>`，只有 driver 侧才回退到裸键 `spark.iceberg.index.cache.*`。直接用裸键 `--conf` 传时，executor 收到的仍是默认值。要改 executor 行为，必须用注入形式。
 
