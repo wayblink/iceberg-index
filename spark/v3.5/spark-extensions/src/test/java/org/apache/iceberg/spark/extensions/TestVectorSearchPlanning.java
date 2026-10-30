@@ -40,6 +40,7 @@ import org.apache.iceberg.spark.index.BindVectorSearch;
 import org.apache.iceberg.spark.index.VectorBindingResult;
 import org.apache.iceberg.spark.index.VectorSearchContext;
 import org.apache.iceberg.spark.index.VectorSearchRequest;
+import org.apache.spark.sql.Row;
 import org.apache.spark.sql.SparkSession;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
@@ -47,6 +48,8 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
 class TestVectorSearchPlanning {
+  private static final String OVER_SAMPLE = "spark.iceberg.index.vector.over-sample";
+
   private static SparkSession spark;
 
   @BeforeAll
@@ -240,18 +243,101 @@ class TestVectorSearchPlanning {
     tableWithIndex("planning_exact");
     assertThat(planOf("planning_exact")).contains("result=exact");
 
-    spark.sql(
-        "CREATE TABLE local.db.planning_approximate (id bigint, embedding array<double> NOT NULL) "
-            + "USING iceberg");
-    spark.sql(
-        "INSERT INTO local.db.planning_approximate VALUES (1, array(1.0d, 0.0d)), "
-            + "(2, array(0.0d, 1.0d))");
-    spark.sql(
-        "CALL local.system.build_vector_index(table => 'db.planning_approximate', "
-            + "column => 'embedding', dimension => 2, metric => 'cosine', structure => 'IVF', "
-            + "quantizer => 'RABITQ')");
+    // an approximate structure is used once the caller has said how many candidates to ask for,
+    // because one candidate per hit is not a candidate set the nearest rows are in
+    createApproximateTable("planning_approximate");
+    try {
+      spark.conf().set(OVER_SAMPLE, "10");
+      assertThat(planOf("planning_approximate")).contains("result=approximate");
+    } finally {
+      spark.conf().unset(OVER_SAMPLE);
+    }
+  }
 
-    assertThat(planOf("planning_approximate")).contains("result=approximate");
+  /**
+   * An approximate kernel ranks candidates by an estimate, so asking it for k rows asks for k
+   * estimates and not for the k nearest rows: with no over-sample configured the rewrite stands
+   * aside and the scan answers, instead of answering from an index that cannot answer.
+   */
+  @Test
+  void anApproximateIndexIsLeftToTheScanWithoutAnExplicitOverSample() {
+    createApproximateTable("planning_approx_default");
+
+    assertThat(plan(nearestOf("planning_approx_default")))
+        .as("one candidate per hit cannot contain the true top-k, so the index is not asked")
+        .doesNotContain("VectorSearchSource")
+        .doesNotContain("result=approximate")
+        .contains("RelationV2[");
+
+    try {
+      // an explicitly configured multiplier is the caller accepting the approximation, and the
+      // rewrite resumes with the widening it asks for
+      spark.conf().set(OVER_SAMPLE, "10");
+      assertThat(plan(nearestOf("planning_approx_default")))
+          .contains("VectorSearchSource")
+          .contains("result=approximate")
+          .contains("overSample=10");
+    } finally {
+      spark.conf().unset(OVER_SAMPLE);
+    }
+  }
+
+  /**
+   * The answer of the default configuration is the answer of a full scan, on a table where the
+   * index's own first candidate is not the nearest row.
+   */
+  @Test
+  void theDefaultConfigurationReturnsWhatAFullScanReturns() {
+    createApproximateTable("planning_approx_correct");
+    String nearest = nearestOf("planning_approx_correct");
+    // the same ordering with an addition the rewrite does not recognise, so the table is scanned
+    List<Row> scanned = spark.sql(nearest.replace("LIMIT 1", "+ 0.0d LIMIT 1")).collectAsList();
+
+    assertThat(spark.sql(nearest).collectAsList())
+        .as("a default configuration may be slower than an index, but it is not wrong")
+        .isEqualTo(scanned);
+
+    try {
+      // the fixture is one where a single candidate per hit really is not the nearest row: a kernel
+      // that no longer diverges here would make this test pass for the wrong reason
+      spark.conf().set(OVER_SAMPLE, "1");
+      assertThat(spark.sql(nearest).collectAsList())
+          .as("the fixture must be one where the index's first candidate is not the answer")
+          .isNotEqualTo(scanned);
+    } finally {
+      spark.conf().unset(OVER_SAMPLE);
+    }
+  }
+
+  private static String nearestOf(String name) {
+    return "SELECT id FROM local.db."
+        + name
+        + " ORDER BY vec_distance(embedding, array(0.95d, 0.05d)) LIMIT 1";
+  }
+
+  private static String plan(String query) {
+    return spark.sql(query).queryExecution().optimizedPlan().toString();
+  }
+
+  /**
+   * A table of 32 vectors on the line x + y = 32, with an IVF index over 1-bit codes, which is the
+   * shape whose first candidate under one candidate per hit is not the nearest row.
+   */
+  private static void createApproximateTable(String name) {
+    spark.sql("CREATE NAMESPACE IF NOT EXISTS local.db");
+    spark.sql(
+        "CREATE TABLE local.db."
+            + name
+            + " (id bigint, embedding array<double> NOT NULL) USING iceberg");
+    spark.sql(
+        "INSERT INTO local.db."
+            + name
+            + " SELECT id, array(CAST(id AS double), CAST(32 - id AS double)) FROM range(0, 32)");
+    spark.sql(
+        "CALL local.system.build_vector_index(table => 'db."
+            + name
+            + "', column => 'embedding', dimension => 2, metric => 'cosine', "
+            + "structure => 'IVF', quantizer => 'RABITQ', options => map('nprobe', '32'))");
   }
 
   private static String planOf(String name) {

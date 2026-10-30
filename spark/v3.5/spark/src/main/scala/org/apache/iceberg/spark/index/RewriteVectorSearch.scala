@@ -138,7 +138,8 @@ case class RewriteVectorSearch(spark: SparkSession) extends Rule[LogicalPlan] {
           case BoundVectorSearch(context) =>
             val bindMillis = (System.nanoTime() - bindStart) / 1000000L
             val resolved = bindDecisions(context, k)
-            val indexMetric = context.inputs.definition.metric()
+            val definition = context.inputs.definition
+            val indexMetric = definition.metric()
             if (resolved != null && distance.explicitMetric && indexMetric != distance.metric) {
               // the query named a metric the index was not built with. Answering it from this index
               // would change the question, so the index is left alone and the scan answers it
@@ -148,6 +149,27 @@ case class RewriteVectorSearch(spark: SparkSession) extends Rule[LogicalPlan] {
                 Array[Object](column, distance.metric.name(), indexMetric.name()): _*)
               None
             } else if (resolved == null) {
+              None
+            } else if (context.rawParameters.overSample == null
+                && !VectorSearchSource.enumeratesEveryCandidate(definition)) {
+              // the kernel ranks candidates by an estimate, so answering a top-k question with k of
+              // them returns whatever the estimate preferred rather than the nearest rows: without
+              // a budget the caller chose, the scan answers instead of answering wrongly
+              logger.warn(
+                "Not using the vector index of column {} (field {}, {}/{}) for a top-{} query: " +
+                  "that kernel ranks candidates by an estimate, so asking it for {} of them would " +
+                  "leave true nearest rows out of the answer. {} is not set, so the query is " +
+                  "answered by a scan. To have this index answer instead, set it explicitly, for " +
+                  "example SET `{}`=10 (about 10 for IVF 3bit, 50 to 100 for 1bit).",
+                Array[Object](
+                  column,
+                  Integer.valueOf(definition.fieldId()),
+                  definition.structure().name(),
+                  definition.quantizer().name(),
+                  Integer.valueOf(k),
+                  Integer.valueOf(k),
+                  VectorQueryParameters.OverSampleConf,
+                  VectorQueryParameters.OverSampleConf): _*)
               None
             } else {
               val source = VectorSearchSource(resolved)(scan.output)

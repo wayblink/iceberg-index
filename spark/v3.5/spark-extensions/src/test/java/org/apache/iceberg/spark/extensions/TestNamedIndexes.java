@@ -203,6 +203,8 @@ public class TestNamedIndexes extends ExtensionsTestBase {
     String ivf = uuidOf(table, "ivf");
     String flat = uuidOf(table, "flat_bruteforce");
     try {
+      // the ivf index is approximate, so it answers only once the caller has widened the candidates
+      spark.conf().set("spark.iceberg.index.vector.over-sample", "10");
       // either arm answers when it is named, and the plan says which index was resolved
       spark.conf().set("spark.iceberg.index.vector.name", "ivf");
       assertThat(planOf(query, table)).contains("VectorSearchSource").contains("index=" + ivf);
@@ -217,6 +219,7 @@ public class TestNamedIndexes extends ExtensionsTestBase {
       assertThat(sql(query, table)).hasSize(3);
     } finally {
       spark.conf().unset("spark.iceberg.index.vector.name");
+      spark.conf().unset("spark.iceberg.index.vector.over-sample");
     }
   }
 

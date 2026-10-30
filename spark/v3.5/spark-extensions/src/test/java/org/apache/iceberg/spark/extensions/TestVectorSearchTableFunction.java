@@ -147,14 +147,20 @@ class TestVectorSearchTableFunction {
     assertThat(row.getLong(0)).isEqualTo(1L);
     assertThat(row.getDouble(1)).isCloseTo(Math.sqrt(0.02d), within(1e-6d));
 
-    // the cosine question is answered from the index, so the two metric paths really do differ
+    // the cosine question is answered from the index, so the two metric paths really do differ; a
+    // cosine kernel is approximate, so it answers only once the candidates are widened
     String cosine =
         String.format(
             "SELECT id FROM vector_search("
                 + "table => 'local.%s', query_vector => array(0.9d, 0.1d), "
                 + "vector_column => 'embedding', k => 1, distance_type => 'cosine')",
             table);
-    assertThat(planOf(cosine)).contains("VectorSearchSource");
+    try {
+      spark.conf().set("spark.iceberg.index.vector.over-sample", "10");
+      assertThat(planOf(cosine)).contains("VectorSearchSource");
+    } finally {
+      spark.conf().unset("spark.iceberg.index.vector.over-sample");
+    }
     assertThat(planOf(query)).doesNotContain("VectorSearchSource");
   }
 

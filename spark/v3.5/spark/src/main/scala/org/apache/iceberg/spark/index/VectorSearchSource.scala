@@ -26,6 +26,24 @@ import org.apache.spark.sql.catalyst.expressions.Attribute
 import org.apache.spark.sql.catalyst.plans.logical.LeafNode
 import org.apache.spark.sql.catalyst.plans.logical.Statistics
 
+private[spark] object VectorSearchSource {
+
+  /**
+   * Whether searching this index compares every vector there is, whatever candidate budget it is
+   * given.
+   *
+   * <p>A flat structure over unquantized vectors walks every entry and scores the stored vector
+   * itself, so any subset of candidates it is asked for still contains the nearest rows in order.
+   * Every other structure, a graph, a clustered list or a quantized code, orders candidates by an
+   * estimate, so the rows it lists are a sample: a larger budget widens the sample, it does not make
+   * the set complete. Saying which of the two an index is keeps one answer for both the plan and the
+   * rule that decides whether to rewrite a query into a search at all.
+   */
+  def enumeratesEveryCandidate(definition: VectorIndexDefinition): Boolean =
+    definition.structure() == VectorIndexDefinition.VectorStructure.FLAT &&
+      definition.quantizer() == VectorIndexDefinition.VectorQuantizer.NONE
+}
+
 /**
  * The lowered vector source: the live rows of a frozen table snapshot that a vector search can
  * return, produced by an index candidate branch plus, for a complete-table query, a scan of the
@@ -92,9 +110,7 @@ private[spark] case class VectorSearchSource(context: VectorSearchContext)(
    * EXPLAIN rather than only in a log line.
    */
   private def resultContract: String = {
-    val definition = context.inputs.definition
-    if (definition.structure() == VectorIndexDefinition.VectorStructure.FLAT
-        && definition.quantizer() == VectorIndexDefinition.VectorQuantizer.NONE) {
+    if (VectorSearchSource.enumeratesEveryCandidate(context.inputs.definition)) {
       "exact"
     } else {
       "approximate"

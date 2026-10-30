@@ -212,8 +212,18 @@ class TestVectorIndexGuide {
             + "table => 'db.ivf_idx', column => 'embedding', dimension => 2, structure => 'IVF', "
             + "quantizer => 'RABITQ')");
     assertThat(planOf("db.ivf_idx"))
-        .as("an approximate index is used, with the candidates wide enough to re-score")
-        .contains("VectorSearchSource");
+        .as("an approximate kernel asked for k candidates cannot find the true top-k")
+        .doesNotContain("VectorSearchSource");
+
+    // §4.1 · the manual's own statement: the multiplier is what lets an approximate index answer
+    try {
+      spark.sql("SET `spark.iceberg.index.vector.over-sample`=10");
+      assertThat(planOf("db.ivf_idx"))
+          .as("an approximate index is used once the candidates are widened")
+          .contains("VectorSearchSource");
+    } finally {
+      spark.conf().unset("spark.iceberg.index.vector.over-sample");
+    }
   }
 
   /**
@@ -320,13 +330,21 @@ class TestVectorIndexGuide {
         .as("the deleted row has no row to return")
         .contains(true);
 
-    // the rewrite path fills the hole from the next candidate instead
-    List<Row> rewritten =
-        spark
-            .sql(
-                "SELECT id FROM local.db.deleted "
-                    + "ORDER BY vec_distance(embedding, array(1.0d, 0.0d)) LIMIT 3")
-            .collectAsList();
+    // the rewrite path fills the hole from the next candidate instead, which is what asking an
+    // approximate index for more candidates than hits buys: without the multiplier the query would
+    // be scanned, and a plain scan needs no widening at all
+    List<Row> rewritten;
+    try {
+      spark.sql("SET `spark.iceberg.index.vector.over-sample`=10");
+      rewritten =
+          spark
+              .sql(
+                  "SELECT id FROM local.db.deleted "
+                      + "ORDER BY vec_distance(embedding, array(1.0d, 0.0d)) LIMIT 3")
+              .collectAsList();
+    } finally {
+      spark.conf().unset("spark.iceberg.index.vector.over-sample");
+    }
     assertThat(rewritten).hasSize(3);
     assertThat(rewritten).noneMatch(row -> row.getLong(0) == 1L);
   }

@@ -1610,13 +1610,18 @@ than one sort key, or a filter other than `IS NOT NULL` on the vector column kee
 A warning is logged when the matched rows cannot be read back, and when the type of an index is not
 registered in the session.
 
-Every structure (`FLAT`, `HNSW`, `IVF`) is used with its candidates widened and then re-scored
-exactly, so the query still returns its true nearest neighbours: how many more candidates to ask for
-is `spark.iceberg.index.vector.over-sample` (default 1, which is only right for a kernel that scores
-exactly; a value that is not a positive integer is an error rather than a silent 1). This paragraph
-describes the `ORDER BY` rewrite: `CALL system.vector_search` and the vector table functions keep the
-index's own score and order and do not re-score or scan uncovered files. `EXPLAIN` shows whether the
-rewrite happened, by the absence of the table scan:
+Every structure is available to the rewrite, but an approximate one (`HNSW`, `IVF`, or any quantized
+index) is used only when the caller says how many candidates to ask for: such a kernel ranks
+candidates by an estimate, so asking it for `k` of them returns whichever rows the estimate
+preferred, and the true nearest rows may never be listed. With `spark.iceberg.index.vector.over-sample`
+unset the query is left as it is and answered by a scan — exact, and slower — with a warning that
+names the column, the structure of the index and the setting to configure. Setting it to a positive
+integer lets the index answer, with its candidates widened and then re-scored exactly against the
+rows; a value that is not a positive integer is an error rather than a silent 1. An exact index
+(`FLAT` over unquantized vectors) needs no such setting, because it enumerates every candidate.
+This paragraph describes the `ORDER BY` rewrite: `CALL system.vector_search` and the vector table
+functions keep the index's own score and order and do not re-score or scan uncovered files.
+`EXPLAIN` shows whether the rewrite happened, by the presence of the vector source:
 
 ```sql
 EXPLAIN SELECT id FROM local.db.docs

@@ -123,25 +123,28 @@ LIMIT 10;
 1. 列上有向量索引（多个索引时用 `spark.iceberg.index.vector.name` 指定，否则规则不动手）；
 2. 索引类型已在会话注册；
 3. 表只有 identity 分区（bucket/truncate/时间 transform 不行，它们的列值不在数据文件路径里）；
-4. 形状是"单表 + 单一升序距离 + 可折叠的正数 `LIMIT`"，从 `LIMIT` 到扫描之间只有投影、子查询别名、以及向量列上的 `IS NOT NULL`。
+4. 形状是"单表 + 单一升序距离 + 可折叠的正数 `LIMIT`"，从 `LIMIT` 到扫描之间只有投影、子查询别名、以及向量列上的 `IS NOT NULL`；
+5. 索引要么枚举全部候选（`FLAT` 且无量化），要么调用方显式配置了 `over-sample`——近似结构没有候选倍数时不做近似。
 
-距离写在 `ORDER BY` 里，或者先 `SELECT ... AS d` 再 `ORDER BY d`，两种都改写。反过来，`Join`、`Aggregate`、`Window`、`OFFSET`、多排序列（`ORDER BY dist, id`）、以及任何其它过滤条件都会让规则退让——带普通 `WHERE` 谓词的查询会退回全表扫描，这是已知取舍（谓词下推常把 `isnotnull` 并进同一个 `Filter`，所以 `WHERE embedding IS NOT NULL AND id < 50` 也不命中）。索引覆盖率为 0 时仍然改写：候选分支空转，未覆盖部分由残差扫描答全表。用 `EXPLAIN` 验证是否改写：没有 `TableScan` 就说明命中了。
+距离写在 `ORDER BY` 里，或者先 `SELECT ... AS d` 再 `ORDER BY d`，两种都改写。反过来，`Join`、`Aggregate`、`Window`、`OFFSET`、多排序列（`ORDER BY dist, id`）、以及任何其它过滤条件都会让规则退让——带普通 `WHERE` 谓词的查询会退回全表扫描，这是已知取舍（谓词下推常把 `isnotnull` 并进同一个 `Filter`，所以 `WHERE embedding IS NOT NULL AND id < 50` 也不命中）。索引覆盖率为 0 时仍然改写：候选分支空转，未覆盖部分由残差扫描答全表。用 `EXPLAIN` 验证是否改写：计划里出现 `VectorSearchSource` 就是命中了。
 
 `FLAT`（精确索引）也参与改写。早先的规则因为"`FLAT` 每个条目都要打分、代价等同扫描"把它排除在外，现在这条成本判断已移除——能不能用索引只看正确性，不看代价。所以 `FLAT` 也会走到索引路径，只是省不了多少开销：候选就是全部条目，重排后仍然是全量打分。做"不走索引"的对照时，用改写认不出来的写法（如距离后加 `+ 0.0d`）。
 
-近似结构（`HNSW`/`IVF`）需要放宽候选再精确重排，候选倍数靠会话配置：
+近似结构（`HNSW`/`IVF`，以及带量化的 `FLAT`）不枚举全部条目：kernel 按估算距离给出候选，再由排序节点对着原始向量把取回的那批重排。只给 k 个候选时，候选集里可能根本没有真正的最近邻——答案就是错的，而且错得不显眼（顺序看上去正常）。所以**未配置候选倍数时，规则不改写**：查询退回普通扫描 + 排序，结果精确，代价是不走索引；日志里有一条 WARNING 写明索引的列与字段、索引结构（如 `IVF/RABITQ`）、为什么退让，以及要让索引参与需要显式设哪个配置。
+
+要让近似索引参与，显式给出倍数：
 
 ```sql
-SET `spark.iceberg.index.vector.over-sample`=10;   -- 默认 1，即不放宽
+SET `spark.iceberg.index.vector.over-sample`=10;
 ```
 
 配置名里带点和短横，`SET` 必须用反引号把它包起来，否则解析器直接报语法错误（`SET key=value` 的 key 只接受标识符）。第一节里列的其它配置同理。
 
 经验值：`IVF·3bit` 约 10 倍、`IVF·1bit` 约 50–100 倍才能把真实 top-10 包进候选集；`HNSW` 一般 1–3 倍。放宽不是免费的，倍数直接乘在回表行数上。
 
-`EXPLAIN` 会把这个决定摊开：`VectorSearchSource` 带 `result=exact` 或 `result=approximate`。只有 `FLAT` 且无量化时才是 `exact`（候选枚举完整）；看到 `approximate` 又没设 `over-sample`，就是明确接受了"候选集里可能没有真正的最近邻"——分数和顺序仍然精确，因为排序节点会对着原始向量重算，但被粗筛漏掉的行不会回来。
+`EXPLAIN` 会把这个决定摊开：走索引的计划里 `VectorSearchSource` 带 `result=exact` 或 `result=approximate`（只有 `FLAT` 且无量化才是 `exact`，候选枚举完整）；没走索引的计划里两者都没有。看到 `approximate` 说明候选集仍可能漏掉真正的最近邻——分数和顺序是精确的（排序节点会重算），但被粗筛漏掉的行不会回来。
 
-默认值 1 意味着"每个结果只要一个候选"，对近似 kernel 就是不开候选放宽——实测 32 行的 `IVF·4bit` 表在 over=1 下第一名是 29、真实最近邻是 30，over=10 才对上。所以近似索引上不要把默认值当成够用。
+倍数没有一个可以当默认用：默认的 1 就是"每个结果只要一个候选"，那正是本规则退让的情形（实测 32 行的 `IVF·4bit` 表在 over=1 下第一名是 29、真实最近邻是 30，over=10 才对上）。有依据的默认倍率要等实测标定，在那之前按上面的经验值显式设置。
 
 ### 4.2 过程（要行引用、或要批量）
 
@@ -245,7 +248,7 @@ CALL local.system.refresh_vector_index(table => 'db.docs', column => 'embedding'
 | `spark.iceberg.index.cache.mode` | `auto` | `auto`/`PIN_ALL`/`PIN_HOT`/`STREAM` |
 | `spark.iceberg.index.cache.idle-ttl` | `30m` | 空闲多久后报告视为过期 |
 | `spark.iceberg.index.schedule.locality` | `true` | 把 task 派到已持有该索引文件的 executor |
-| `spark.iceberg.index.vector.over-sample` | `1` | 查询期候选放宽倍数（近似结构必调） |
+| `spark.iceberg.index.vector.over-sample` | 不设=不改写近似索引 | 查询期候选放宽倍数 |
 
 自动预算的口径值得记住：它按**整个工作集**（所有索引文件 prepare 之后占的内存）× 1.2 算，再被 `堆大小 × heap-fraction` 截住。不是"每个 executor 分 1/N"——因为任何一个 task 都可能被派到任何 executor。10M（39 个索引文件、prepared 约 2.4 GB）在 4 × 16g 上因此能装下全部文件，coverage 实测 1.00；而这个策略在 100M HNSW（prepared 远超 4 GB 上限）上**不成立**，那时只会加载装得下的部分。
 
@@ -289,7 +292,7 @@ CALL local.system.cleanup_index_files(table => 'db.docs');
 | `vector_search` 返回行数少于 `k` | 索引落后，或命中行已被删除 | `refresh_vector_index`，或改用自动改写（会补残差扫描） |
 | `No vector index exists` | 列上没有向量索引 | `build_vector_index` |
 | `does not match index dimension` | 查询向量长度与索引维度不符 | 对齐长度 |
-| 查询没走索引（`EXPLAIN` 里有 `TableScan`） | 结构是 `FLAT`、分区不是 identity、索引没覆盖任何文件、类型未注册 | 按第 4.1 节逐条排查；确认会话加载了 `spark.sql.extensions` |
+| 查询没走索引（`EXPLAIN` 里没有 `VectorSearchSource`） | 分区不是 identity、索引没覆盖任何文件、类型未注册，或近似结构没设 `over-sample` | 按第 4.1 节逐条排查；确认会话加载了 `spark.sql.extensions` |
 | 召回明显偏低 | 近似结构下 over-sample 太小 | `SET spark.iceberg.index.vector.over-sample=10`（1bit 需要 50–100） |
 | 查询很慢、`index_cache_status` 显示 `coverage` 低 | 缓存没开或预算不足 | 开 `cache.enabled`，别把 `cache.bytes` 设得比工作集小 |
 | `index_cache_status()` 返回 0 行 | 缓存没开，或配置用 `--conf` 传但版本较旧 | 用会话 `SET` 或新版镜像 |

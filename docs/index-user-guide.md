@@ -216,16 +216,19 @@ SELECT id, title, _distance FROM vector_search(
 1. 列上有向量索引；同列多个时必须用 `spark.iceberg.index.vector.name` 指定，否则不动手；
 2. 表只有 identity 分区；
 3. 形态是"单表 + 唯一一个升序距离排序 + 可折叠的正数 `LIMIT`"，中间只有投影、子查询别名、以及向量列上的 `IS NOT NULL`；
-4. 显式 `metric`（如果写了第三参数）与索引的 metric 一致，否则只 WARN 并退扫描。
+4. 显式 `metric`（如果写了第三参数）与索引的 metric 一致，否则只 WARN 并退扫描；
+5. 索引要么枚举全部候选（`FLAT` 且无量化），要么显式配置了 `over-sample`——近似结构没有候选倍数时不做近似（4.4）。
 
 反过来，`DESC`、多个排序键、`OFFSET`、join、聚合、窗口、任何非 `IS NOT NULL` 的过滤（包括 `WHERE year = 2020`）、非 identity 分区、`LIMIT` 不是字面量——都会让规则退让，退回全表扫描。
 
 一个容易忽略的细节：改写后排序键会被绑定成**索引的 metric**。所以不带第三参数的 `ORDER BY vec_distance(col, q)` 是按索引的 metric 计算的，与"没有索引时全扫描默认 COSINE"可能不是同一个量。
 
-### 4.4 近似结构要调 over-sample
+### 4.4 近似结构要显式调 over-sample
+
+近似结构（`HNSW`/`IVF`，以及带量化的 `FLAT`）不枚举全部条目，kernel 按估算距离给出候选。只给 k 个候选时，候选集里可能没有真正的最近邻，所以**没配置倍数时改写规则不改写**：查询退回扫描 + 排序，精确但慢，日志里有一条 WARNING 说明原因。要让索引参与：
 
 ```sql
-SET `spark.iceberg.index.vector.over-sample`=10;   -- 默认 1，即不放宽
+SET `spark.iceberg.index.vector.over-sample`=10;
 ```
 
 配置名里有点和短横，`SET` 必须用反引号包起来，否则解析器报语法错误。
@@ -234,7 +237,7 @@ SET `spark.iceberg.index.vector.over-sample`=10;   -- 默认 1，即不放宽
 
 这个参数只存在于 conf 里，没有对应的 `CALL` 参数；表函数也只能通过它影响。
 
-`EXPLAIN` 会标出来：计划里的 `VectorSearchSource` 带 `result=exact` 或 `result=approximate`。只有 `FLAT` 且无量化才是 `exact`；看到 `approximate` 又没设 `over-sample`，就是明确接受了"候选集里可能没有真正的最近邻"。
+`EXPLAIN` 会标出来：计划里的 `VectorSearchSource` 带 `result=exact` 或 `result=approximate`。只有 `FLAT` 且无量化才是 `exact`；看到 `approximate` 说明候选集仍可能漏掉真正的最近邻（分数和顺序是精确的，被粗筛漏掉的行不会回来）。没走索引的计划里两者都没有。
 
 ### 4.5 刷新与删除
 
@@ -428,7 +431,7 @@ CALL local.system.offload_index(table => 'db.docs', index => '<uuid>');
 
 | 键 | 默认 | 作用 |
 |---|---|---|
-| `spark.iceberg.index.vector.over-sample` | `1` | 候选放宽倍数 |
+| `spark.iceberg.index.vector.over-sample` | 不设 | 候选放宽倍数；近似结构不设则不改写 |
 | `spark.iceberg.index.vector.name` | 不设 | 同列多索引时选哪个 |
 | `spark.iceberg.index.cache.enabled` | `false` | 缓存开关 |
 | `spark.iceberg.index.cache.bytes` | 自动 | 每 executor 预算 |
@@ -492,7 +495,7 @@ CALL local.system.offload_index(table => 'db.docs', index => '<uuid>');
 | `ABANDONED` | driver 在构建中退出 | 重新构建，再 `cleanup_index_files` |
 | `No vector index exists` | 列上没有向量索引 | `build_vector_index` |
 | `does not match index dimension` | 查询向量长度与索引维度不符 | 对齐长度 |
-| 查询没走索引（`EXPLAIN` 有 `TableScan`） | 形态/分区/metric 不满足，或没加载扩展 | 按 4.3 逐条排查 |
+| 查询没走索引（`EXPLAIN` 里没有 `VectorSearchSource`） | 形态/分区/metric 不满足、近似结构没设 `over-sample`，或没加载扩展 | 按 4.3 逐条排查；近似结构按 4.4 设倍数 |
 | 召回明显偏低 | 近似结构下 over-sample 太小 | 设到 10，1bit 需要 50–100 |
 | 查询慢、`coverage` 低 | 缓存没开或预算不足 | 开 `cache.enabled` |
 | `SET` 报 `INVALID_SET_SYNTAX` | 键名有 `.` 和 `-` | 用反引号包键名 |

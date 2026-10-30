@@ -37,7 +37,9 @@ import org.apache.spark.sql.types.Metadata;
 import org.apache.spark.sql.types.StructField;
 import org.apache.spark.sql.types.StructType;
 import org.junit.jupiter.api.AfterAll;
+import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeAll;
+import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
@@ -46,10 +48,18 @@ import org.junit.jupiter.api.io.TempDir;
  * exact index bound to the snapshot being read, the query must return what a full scan returns, and
  * in every other case the plan must be the one Spark would produce anyway.
  *
+ * <p>An approximate kernel ranks candidates by an estimate, so it answers a top-k query only when
+ * the caller has said how many candidates to ask for; with no multiplier configured the query is
+ * scanned instead (see {@code TestVectorSearchPlanning}). These tests are about the rewrite and the
+ * re-scoring that follows it, so they run with a candidate budget configured, which is also what a
+ * session in production needs for an approximate index to be used at all.
+ *
  * <p>Every test uses a table of its own, because an index belongs to a column and a table, so two
  * tests cannot share one.
  */
 class TestRewriteVectorSearch {
+
+  private static final String OVER_SAMPLE = "spark.iceberg.index.vector.over-sample";
 
   private static final String COLUMNS =
       "(id bigint, body string, embedding array<double>) USING iceberg";
@@ -84,6 +94,16 @@ class TestRewriteVectorSearch {
     if (spark != null) {
       spark.stop();
     }
+  }
+
+  @BeforeEach
+  void configureTheCandidateBudget() {
+    spark.conf().set(OVER_SAMPLE, "10");
+  }
+
+  @AfterEach
+  void clearTheCandidateBudget() {
+    spark.conf().unset(OVER_SAMPLE);
   }
 
   @Test
