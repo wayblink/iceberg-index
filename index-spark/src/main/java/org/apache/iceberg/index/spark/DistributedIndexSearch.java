@@ -167,8 +167,6 @@ public final class DistributedIndexSearch {
     // from, so a broadcast copy of it would update nothing
     org.apache.spark.util.CollectionAccumulator<IndexCacheLocations.Report> cacheReports =
         cacheReports(context, cacheRef.getValue());
-    // identifies this search, so its tasks report this executor's cache once instead of once each
-    String queryRun = java.util.UUID.randomUUID().toString();
 
     // the limit is captured as a primitive: the query itself is not serializable. One more than the
     // query asks for is kept, because that is what says whether there is another round to ask for.
@@ -227,7 +225,7 @@ public final class DistributedIndexSearch {
                             TimeUnit.MILLISECONDS.convert(
                                 System.nanoTime() - searchStart, TimeUnit.NANOSECONDS));
                       }
-                      reportCache(cacheReports, queryRun);
+                      reportCache(cacheReports);
                       return fileHits.iterator();
                     })
             .takeOrdered(localTopK, hitOrder(adapter));
@@ -315,8 +313,6 @@ public final class DistributedIndexSearch {
     // from, so a broadcast copy of it would update nothing
     org.apache.spark.util.CollectionAccumulator<IndexCacheLocations.Report> cacheReports =
         cacheReports(context, cacheRef.getValue());
-    // identifies this search, so its tasks report this executor's cache once instead of once each
-    String queryRun = java.util.UUID.randomUUID().toString();
 
     // one more than the widest query asks for is kept per query, because that is what says whether
     // there is another round to ask for
@@ -381,7 +377,7 @@ public final class DistributedIndexSearch {
                             TimeUnit.MILLISECONDS.convert(
                                 System.nanoTime() - searchStart, TimeUnit.NANOSECONDS));
                       }
-                      reportCache(cacheReports, queryRun);
+                      reportCache(cacheReports);
                       return batchHits.iterator();
                     });
 
@@ -492,13 +488,13 @@ public final class DistributedIndexSearch {
   /**
    * Sends this executor's view of its cache back, so the driver's location table stays current.
    *
-   * <p>Called from every task of a query, but only the first task of one query on one executor
-   * reports: the view is the same on all of them, and a query over a thousand index files would
-   * otherwise push a thousand copies of it through the accumulator.
+   * <p>Called from every task of a query, and each call reports: the view is what the executor
+   * holds *now*, and a query's last task is the only point at which the cache it filled is
+   * described. Reporting once per query instead would describe the state of its first task, and
+   * `index_cache_status` would then show a cache that never filled.
    */
   static void reportCache(
-      org.apache.spark.util.CollectionAccumulator<IndexCacheLocations.Report> reports,
-      String queryId) {
+      org.apache.spark.util.CollectionAccumulator<IndexCacheLocations.Report> reports) {
     if (reports == null) {
       return;
     }
@@ -515,11 +511,7 @@ public final class DistributedIndexSearch {
       host = "unknown";
     }
 
-    IndexCacheLocations.Report report =
-        ExecutorIndexCache.get().reportOnce(queryId, executor, host);
-    if (report != null) {
-      reports.add(report);
-    }
+    reports.add(ExecutorIndexCache.get().report(executor, host));
   }
 
   /** Folds the executors' reports into the location table and says what the query had cached. */

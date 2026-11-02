@@ -48,12 +48,17 @@ class TestExecutorIndexCache {
   }
 
   @Test
-  void aQueryReportsWhatTheExecutorHoldsOnce() {
-    // A query runs one task per index file, and each of those tasks would otherwise send the whole
-    // picture of this executor's cache to the driver: a thousand files, a thousand copies.
-    assertThat(cache.reportOnce("query-1", "1", "host")).isNotNull();
-    assertThat(cache.reportOnce("query-1", "1", "host")).isNull();
-    assertThat(cache.reportOnce("query-2", "1", "host")).isNotNull();
+  void eachReportDescribesWhatTheExecutorHoldsThen() {
+    // Every task of a query reports, because the last one is the only point at which the cache the
+    // query filled is described. Reporting once per query would describe its first task instead,
+    // and `index_cache_status` would show a cache that never filled.
+    assertThat(cache.report("1", "host").entries()).isZero();
+    cache.file(
+        "s3://bucket/index.puffin",
+        config(1024 * 1024),
+        "adapter",
+        () -> load(new AtomicInteger(), 100));
+    assertThat(cache.report("1", "host").entries()).isEqualTo(1L);
   }
 
   @Test

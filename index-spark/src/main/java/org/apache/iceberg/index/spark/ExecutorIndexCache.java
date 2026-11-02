@@ -30,7 +30,6 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.atomic.AtomicLong;
-import java.util.concurrent.atomic.AtomicReference;
 import java.util.concurrent.locks.ReentrantLock;
 import java.util.function.Consumer;
 import org.apache.iceberg.index.IndexAdapter;
@@ -667,8 +666,6 @@ final class ExecutorIndexCache {
   // the control overhead the last charge projection stated, so an acknowledgement does not build a
   // projection of the whole cache just to read one number
   private long chargedControlBytes;
-  // The last query this executor reported for, so a query with many tasks reports once.
-  private final AtomicReference<String> reportedQuery = new AtomicReference<>();
   // Registered waiters keep the same monitor alive until every caller has left.
   private OwnedMap<String, LoadMonitor> loading = new OwnedMap<>();
 
@@ -2441,27 +2438,6 @@ final class ExecutorIndexCache {
       keys.addAll(protectedFiles.keySet());
       return IndexCacheLocations.sortedHashes(keys);
     }
-  }
-
-  /**
-   * The report for one query, sent by the first of its tasks that runs on this executor.
-   *
-   * <p>A query runs one task per index file, and every task would otherwise send a complete
-   * snapshot of what this executor holds, so a query over a thousand files would send the same
-   * picture a thousand times. The picture only places later tasks, and a stale one costs a task
-   * that runs elsewhere, so one report per executor per query is enough; the newest query wins and
-   * an interleaving of two queries can at worst report twice.
-   *
-   * @return the report, or null when another task of the same query already reported
-   */
-  IndexCacheLocations.Report reportOnce(String queryId, String executorId, String host) {
-    String reported = reportedQuery.get();
-    if (queryId != null && queryId.equals(reported)) {
-      return null;
-    }
-
-    reportedQuery.set(queryId);
-    return report(executorId, host);
   }
 
   /** The sequence of the current charge state, which orders answers against later reports. */
