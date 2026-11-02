@@ -242,7 +242,7 @@ CALL local.system.refresh_vector_index(table => 'db.docs', column => 'embedding'
 
 | 配置 | 默认 | 说明 |
 |---|---|---|
-| `spark.iceberg.index.cache.enabled` | `false` | 总开关 |
+| `spark.iceberg.index.cache.enabled` | `false` | 总开关；关掉时 executor 不广告预算，`load_index` 以 `CACHE_DISABLED` 失败 |
 | `spark.iceberg.index.cache.bytes` | 不设=自动 | 每 executor 预算；显式给值就用该值，低于工作集的 0.9 会 WARN |
 | `spark.iceberg.index.cache.heap-fraction` | `0.25` | 自动预算的堆占比上限 |
 | `spark.iceberg.index.cache.mode` | `auto` | `auto`/`PIN_ALL`/`PIN_HOT`/`STREAM` |

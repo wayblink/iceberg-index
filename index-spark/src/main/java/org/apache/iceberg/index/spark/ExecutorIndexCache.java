@@ -332,17 +332,31 @@ final class ExecutorIndexCache {
      *
      * <p>An executor has no session, so this takes the values a session would read rather than a
      * session: the configured budget when there is one, and otherwise the same automatic derivation
-     * a query makes when the working set is unknown. Advertising nothing while a query derives a
-     * budget is what made every load fail as a cache that is off on executors a query was filling.
+     * a query makes when the working set is unknown.
+     *
+     * <p>The switch comes first, and it is read the way a query reads it: a run that does not turn
+     * the cache on has no budget to advertise. Advertising the derived budget while the queries saw
+     * no cache is what let an application with the cache off answer a load with COMPLETE, fill an
+     * executor no query would read from, and report a budget its queries did not have.
      *
      * <p>Zero and negative values are how a run says it wants no cache, and they stay distinct from
      * an unset value, which asks for the automatic budget.
      *
+     * @param enabled the cache switch, or null when the run set none, which is off
      * @param configuredBytes the configured budget, or null when none is configured
      * @param executorMemory the executor heap, or null when the application did not size one
      * @param heapFraction the share of that heap a budget may use, or null for the default
      */
     static long advertisedBudget(
+        String enabled, String configuredBytes, String executorMemory, String heapFraction) {
+      if (!Boolean.parseBoolean(enabled)) {
+        return 0L;
+      }
+
+      return sizedBudget(configuredBytes, executorMemory, heapFraction);
+    }
+
+    private static long sizedBudget(
         String configuredBytes, String executorMemory, String heapFraction) {
       boolean configured = configuredBytes != null && !configuredBytes.isBlank();
       long configuredValue = configured ? parseBytes(configuredBytes, BYTES) : 0L;

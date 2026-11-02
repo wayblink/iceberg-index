@@ -238,7 +238,7 @@ docker push hub.i.basemind.com/spark/sparkann-e2e:<tag>
 
 ### 5.2 缓存预算
 
-`spark.iceberg.index.cache.enabled`（**默认 false**，必须显式打开；只设 `bytes` 不会启用）、`spark.iceberg.index.cache.bytes`（每个执行器的预算，默认按工作集与堆推导）、`spark.iceberg.index.cache.mode`。缓存关闭时 `index_cache_status()` **返回 0 行**（它不会报“未启用”），2026-10-30 在 A 集群实测：只设 `bytes` 时 0 行，加上 `enabled=true` 后每个执行器与 driver 各一行（`mode=PIN_ALL`、`entries`、`bytes`、`coverage`）。经验：**索引装不进缓存时会退化成"每次查询读自己的索引文件"**，100M 的 HNSW（23.7 GB / 6 执行器）就是这样废掉的——它的延迟等于全表扫描。所以缓存预算要按"最大索引 ÷ 执行器数"给，宁多勿少。
+`spark.iceberg.index.cache.enabled`（**默认 false**，必须显式打开；只设 `bytes` 不会启用）、`spark.iceberg.index.cache.bytes`（每个执行器的预算，默认按工作集与堆推导）、`spark.iceberg.index.cache.mode`。开关是两侧共读的：关掉时执行器不广告预算，`load_index` 会以 `CACHE_DISABLED` 失败，查询也不会使用缓存——不会出现"加载报 COMPLETE、查询却看不到缓存"的分裂。缓存关闭时 `index_cache_status()` **返回 0 行**（它不会报"未启用"），2026-10-30 在 A 集群实测：只设 `bytes` 时 0 行，加上 `enabled=true` 后每个执行器与 driver 各一行（`mode=PIN_ALL`、`entries`、`bytes`、`coverage`）。经验：**索引装不进缓存时会退化成"每次查询读自己的索引文件"**，100M 的 HNSW（23.7 GB / 6 执行器）就是这样废掉的——它的延迟等于全表扫描。所以缓存预算要按"最大索引 ÷ 执行器数"给，宁多勿少。
 
 ### 5.3 驻留与放置
 

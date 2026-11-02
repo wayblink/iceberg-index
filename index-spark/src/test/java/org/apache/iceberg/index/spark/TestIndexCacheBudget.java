@@ -85,7 +85,7 @@ class TestIndexCacheBudget {
     // an executor has no session, so a run that sets no budget still has to advertise the space a
     // query derives for the same heap; advertising none is what made a load fail as if the cache
     // were off while the query treated it as on
-    assertThat(ExecutorIndexCache.Config.advertisedBudget(null, "4g", null))
+    assertThat(ExecutorIndexCache.Config.advertisedBudget("true", null, "4g", null))
         .isEqualTo(ExecutorIndexCache.Config.MIN_BUDGET_BYTES);
   }
 
@@ -93,7 +93,7 @@ class TestIndexCacheBudget {
   void anExecutorAdvertisesTheShareOfItsOwnHeap() {
     // the automatic budget is bounded by the heap, so an executor of 1 GB advertises a quarter of
     // it rather than the floor
-    assertThat(ExecutorIndexCache.Config.advertisedBudget(null, "1g", null))
+    assertThat(ExecutorIndexCache.Config.advertisedBudget("true", null, "1g", null))
         .isEqualTo((long) (1 * GB * 0.25));
   }
 
@@ -101,13 +101,14 @@ class TestIndexCacheBudget {
   void anExecutorAdvertisesABudgetWrittenWithAUnit() {
     // the same setting a query reads takes a unit, and an executor that could only read a bare
     // number would advertise a different budget for the same configuration
-    assertThat(ExecutorIndexCache.Config.advertisedBudget("2g", "4g", null)).isEqualTo(2 * GB);
+    assertThat(ExecutorIndexCache.Config.advertisedBudget("true", "2g", "4g", null))
+        .isEqualTo(2 * GB);
   }
 
   @Test
   void anExplicitZeroAdvertisesNothing() {
     // zero is how a run says it wants no cache, and it has to stay distinguishable from unset
-    assertThat(ExecutorIndexCache.Config.advertisedBudget("0", "4g", null)).isZero();
+    assertThat(ExecutorIndexCache.Config.advertisedBudget("true", "0", "4g", null)).isZero();
   }
 
   @Test
@@ -115,9 +116,34 @@ class TestIndexCacheBudget {
     long heap = 8 * GB;
     double fraction = 0.5;
 
-    assertThat(ExecutorIndexCache.Config.advertisedBudget(null, "8g", "0.5"))
+    assertThat(ExecutorIndexCache.Config.advertisedBudget("true", null, "8g", "0.5"))
         .as("both sides derive their budget from the same heap and fraction")
         .isEqualTo(ExecutorIndexCache.Config.derive(null, 0, 0, 1, heap, fraction));
+  }
+
+  @Test
+  void aCacheThatIsOffAdvertisesNothing() {
+    // The executor is where a load is admitted, so it has to read the same switch a query reads.
+    // Advertising the derived budget while the queries see no cache made a disabled application
+    // answer a load with COMPLETE and still report an unusable cache of 512 MiB.
+    assertThat(ExecutorIndexCache.Config.advertisedBudget("false", null, "4g", null)).isZero();
+    assertThat(ExecutorIndexCache.Config.advertisedBudget("false", "2g", "4g", null)).isZero();
+  }
+
+  @Test
+  void anUnsetSwitchAdvertisesNothing() {
+    // The cache is off by default on both sides (Config.from reads a missing switch as false), and
+    // an executor that fell back to "on" is the same disagreement in the switch's other state.
+    assertThat(ExecutorIndexCache.Config.advertisedBudget(null, null, "4g", null)).isZero();
+    assertThat(ExecutorIndexCache.Config.advertisedBudget(" ", null, "4g", null)).isZero();
+  }
+
+  @Test
+  void theSwitchIsReadTheWayAQueryReadsIt() {
+    // Same spelling rules as a query: case does not matter, and an empty value is not a yes.
+    assertThat(ExecutorIndexCache.Config.advertisedBudget("TRUE", null, "1g", null))
+        .isEqualTo((long) (1 * GB * 0.25));
+    assertThat(ExecutorIndexCache.Config.advertisedBudget("yes", null, "1g", null)).isZero();
   }
 
   @Test

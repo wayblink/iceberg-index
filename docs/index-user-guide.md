@@ -399,7 +399,7 @@ CALL local.system.cleanup_index_files(table => 'db.docs');
 
 | 配置 | 默认 | 说明 |
 |---|---|---|
-| `spark.iceberg.index.cache.enabled` | `false` | 总开关 |
+| `spark.iceberg.index.cache.enabled` | `false` | 总开关；关掉时 executor 不广告预算，`load_index` 以 `CACHE_DISABLED` 失败 |
 | `spark.iceberg.index.cache.bytes` | 自动（按工作集推导，下限 512MB） | 每 executor 预算 |
 | `spark.iceberg.index.cache.heap-fraction` | `0.25` | 自动预算的堆占比上限 |
 | `spark.iceberg.index.cache.mode` | `auto` | `PIN_ALL` / `PIN_HOT` / `STREAM` |
@@ -433,7 +433,7 @@ CALL local.system.offload_index(table => 'db.docs', index => '<uuid>');
 |---|---|---|
 | `spark.iceberg.index.vector.over-sample` | 不设 | 候选放宽倍数；近似结构不设则不改写 |
 | `spark.iceberg.index.vector.name` | 不设 | 同列多索引时选哪个 |
-| `spark.iceberg.index.cache.enabled` | `false` | 缓存开关 |
+| `spark.iceberg.index.cache.enabled` | `false` | 缓存开关；关掉时 `load_index` 报 `CACHE_DISABLED` |
 | `spark.iceberg.index.cache.bytes` | 自动 | 每 executor 预算 |
 | `spark.iceberg.index.cache.heap-fraction` | `0.25` | 自动预算的堆占比 |
 | `spark.iceberg.index.cache.mode` | `auto` | 缓存档位 |

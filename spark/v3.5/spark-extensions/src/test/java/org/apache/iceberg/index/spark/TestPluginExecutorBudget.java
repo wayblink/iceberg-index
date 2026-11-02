@@ -92,7 +92,7 @@ class TestPluginExecutorBudget {
     SparkSession spark = start(null);
     ExecutorIndexCache cache = ExecutorIndexCache.get();
     try {
-      long advertised = ExecutorIndexCache.Config.advertisedBudget(null, "7g", null);
+      long advertised = ExecutorIndexCache.Config.advertisedBudget("true", null, "7g", null);
       ExecutorIndexCache.Config query = ExecutorIndexCache.Config.from(spark, 600 * MB);
       cache.file("larger-than-advertised", query, "test", () -> charged(600 * MB));
       assertThat(cache.stats().bytes()).isLessThanOrEqualTo(advertised);
@@ -163,7 +163,7 @@ class TestPluginExecutorBudget {
     try {
       ExecutorIndexCache.Config query = ExecutorIndexCache.Config.from(spark, 0);
       assertThat(query.maxBytes())
-          .isEqualTo(ExecutorIndexCache.Config.advertisedBudget(" ", "7g", null));
+          .isEqualTo(ExecutorIndexCache.Config.advertisedBudget("true", " ", "7g", null));
     } finally {
       cache.clear();
       spark.stop();
@@ -175,7 +175,7 @@ class TestPluginExecutorBudget {
     SparkSession spark = start(null);
     ExecutorIndexCache cache = ExecutorIndexCache.get();
     try {
-      long budget = ExecutorIndexCache.Config.advertisedBudget(null, "7g", null);
+      long budget = ExecutorIndexCache.Config.advertisedBudget("true", null, "7g", null);
       cache.file("lazy", ExecutorIndexCache.Config.from(spark, MB), "test", () -> charged(MB));
       ExecutorIndexCacheWorker observer =
           new ExecutorIndexCacheWorker(
@@ -193,7 +193,75 @@ class TestPluginExecutorBudget {
     }
   }
 
+  @Test
+  void aCacheThatIsOffRefusesTheLoadItsQueriesCannotUse() {
+    // The switch is read by both sides or by neither: a run that leaves the cache off must not
+    // advertise a budget, must not answer a load with COMPLETE, and must not fill an executor with
+    // files its own queries will never look at.
+    SparkSession spark = start(null, "false");
+    String table = "local.db.plugin_disabled_vectors";
+    ExecutorIndexCache cache = ExecutorIndexCache.get();
+    try {
+      spark.sql("CREATE NAMESPACE IF NOT EXISTS local.db");
+      spark.sql("CREATE TABLE " + table + " (id bigint, embedding array<double>) USING iceberg");
+      spark.sql("INSERT INTO " + table + " VALUES (1, array(1.0d, 0.0d)), (2, array(0.0d, 1.0d))");
+      String index =
+          spark
+              .sql(
+                  "CALL local.system.build_vector_index(table=>'db.plugin_disabled_vectors',"
+                      + " column=>'embedding', dimension=>2, structure=>'FLAT', metric=>'EUCLIDEAN')")
+              .head()
+              .getString(0);
+
+      assertThat(awaitReports(spark))
+          .as("every executor reports the budget a query would see, which is none")
+          .isNotEmpty()
+          .allSatisfy(report -> assertThat(report.budgetBytes()).isZero());
+
+      List<Row> load =
+          spark
+              .sql("CALL local.system.load_index(table=>'" + table + "', index=>'" + index + "')")
+              .collectAsList();
+
+      assertThat(load.get(0).getString(0))
+          .as("a cache that is off cannot answer a load")
+          .isEqualTo("FAILED");
+      List<Row> files = load.subList(1, load.size());
+      assertThat(files).as("a load with nothing planned still names the files").isNotEmpty();
+      files.forEach(row -> assertThat(row.getString(10)).isEqualTo("CACHE_DISABLED"));
+      assertThat(cache.stats().entries()).isZero();
+    } finally {
+      try {
+        spark.sql("DROP TABLE IF EXISTS " + table + " PURGE");
+      } finally {
+        cache.clear();
+        spark.stop();
+      }
+    }
+  }
+
+  /** Waits for a report from the executors, which is what a plan is placed from. */
+  private static List<IndexCacheControl.Status> awaitReports(SparkSession spark) {
+    List<IndexCacheControl.Status> reports = IndexCacheControl.status(spark);
+    for (int attempt = 0; attempt < 300 && reports.isEmpty(); attempt += 1) {
+      try {
+        Thread.sleep(200L);
+      } catch (InterruptedException e) {
+        Thread.currentThread().interrupt();
+        break;
+      }
+
+      reports = IndexCacheControl.status(spark);
+    }
+
+    return reports;
+  }
+
   private SparkSession start(String configured) {
+    return start(configured, "true");
+  }
+
+  private SparkSession start(String configured, String enabled) {
     ExecutorIndexCache.get().clear();
     SparkSession.Builder builder =
         SparkSession.builder()
@@ -209,8 +277,11 @@ class TestPluginExecutorBudget {
                 "org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions")
             .config("spark.sql.catalog.local", "org.apache.iceberg.spark.SparkCatalog")
             .config("spark.sql.catalog.local.type", "hadoop")
-            .config("spark.sql.catalog.local.warehouse", warehouse.toUri().toString())
-            .config(ExecutorIndexCache.Config.ENABLED, "true");
+            .config("spark.sql.catalog.local.warehouse", warehouse.toUri().toString());
+    if (enabled != null) {
+      builder.config(ExecutorIndexCache.Config.ENABLED, enabled);
+    }
+
     if (configured != null) {
       builder.config(ExecutorIndexCache.Config.BYTES, configured);
     }

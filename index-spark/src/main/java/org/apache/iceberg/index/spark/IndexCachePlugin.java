@@ -154,10 +154,13 @@ public class IndexCachePlugin implements SparkPlugin {
      * the application configures none.
      *
      * <p>The executor is where a load is refused, so this number is what turns a configured cache
-     * into a usable one: advertising nothing while a query derives a budget refused every load.
+     * into a usable one: advertising nothing while a query derives a budget refused every load. The
+     * converse is just as wrong: advertising a budget while the queries run with the cache off
+     * answered a load with COMPLETE and filled an executor nothing would read.
      */
     private static long advertisedBudget(org.apache.spark.SparkConf conf) {
       return ExecutorIndexCache.Config.advertisedBudget(
+          conf.get(ExecutorIndexCache.Config.ENABLED, null),
           conf.get(ExecutorIndexCache.Config.BYTES, null),
           conf.get(ExecutorIndexCache.Config.EXECUTOR_MEMORY, null),
           conf.get(ExecutorIndexCache.Config.HEAP_FRACTION, null));
