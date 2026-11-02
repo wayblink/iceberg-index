@@ -30,13 +30,11 @@ import org.apache.iceberg.FileFormat;
 import org.apache.iceberg.PartitionSpec;
 import org.apache.iceberg.Table;
 import org.apache.iceberg.data.Record;
-import org.apache.iceberg.data.parquet.GenericParquetWriter;
 import org.apache.iceberg.deletes.PositionDelete;
 import org.apache.iceberg.deletes.PositionDeleteWriter;
+import org.apache.iceberg.encryption.EncryptedFiles;
+import org.apache.iceberg.formats.FormatModelRegistry;
 import org.apache.iceberg.index.vector.VectorIndexTypes;
-import org.apache.iceberg.io.DeleteSchemaUtil;
-import org.apache.iceberg.io.FileAppender;
-import org.apache.iceberg.parquet.Parquet;
 import org.apache.iceberg.spark.Spark3Util;
 import org.apache.spark.sql.Row;
 import org.apache.spark.sql.SparkSession;
@@ -260,16 +258,12 @@ class TestVectorCoverageModes {
 
     assertThat(target).as("the table has a data file to delete a row from").isNotNull();
     String location = table.location() + "/data/probe-pos-" + position + ".parquet";
-    FileAppender<org.apache.iceberg.StructLike> appender =
-        (FileAppender<org.apache.iceberg.StructLike>)
-            (FileAppender<?>)
-                Parquet.write(table.io().newOutputFile(location))
-                    .schema(DeleteSchemaUtil.pathPosSchema())
-                    .createWriterFunc(GenericParquetWriter::buildWriter)
-                    .build();
     PositionDeleteWriter<Record> writer =
-        new PositionDeleteWriter<>(
-            appender, FileFormat.PARQUET, location, PartitionSpec.unpartitioned(), null, null);
+        FormatModelRegistry.<Record>positionDeleteWriteBuilder(
+                FileFormat.PARQUET,
+                EncryptedFiles.plainAsEncryptedOutput(table.io().newOutputFile(location)))
+            .spec(PartitionSpec.unpartitioned())
+            .build();
     try (PositionDeleteWriter<Record> open = writer) {
       open.write(PositionDelete.<Record>create().set(target.location().toString(), position));
     }
