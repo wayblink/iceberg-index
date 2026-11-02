@@ -454,7 +454,30 @@ final class IndexCacheMemory {
     }
   }
 
-  /** Whether one memory record describes the same model, reader and runtime as another. */
+  /**
+   * Whether a record describes the same model and reader as this runtime, ignoring which JVM wrote
+   * the estimate. A record from another runtime is still loadable: the resolver re-estimates it
+   * here, so refusing it outright would make an index built by one JVM unreadable by another.
+   */
+  static boolean compatibleModel(IndexFileMemory memory, IndexAdapter adapter) {
+    if (memory == null || !supportedLayout() || memory.modelVersion() != 2) {
+      return false;
+    }
+
+    try {
+      IndexFileMemory descriptor = descriptor(adapter, contextKey(adapter));
+      return descriptor != null
+          && descriptor.modelVersion() == memory.modelVersion()
+          && descriptor.readerId().equals(memory.readerId());
+    } catch (RuntimeException e) {
+      return false;
+    }
+  }
+
+  /**
+   * Whether one memory record describes the same model, reader and runtime as another. A copy that
+   * is already resident is reused only under the profile it was prepared with.
+   */
   private static boolean compatible(IndexFileMemory memory, IndexFileMemory descriptor) {
     return memory != null
         && descriptor != null
@@ -480,7 +503,11 @@ final class IndexCacheMemory {
    * file is laid out, and a driver plans for executors whose parallelism it does not share.
    */
   static boolean compatibleRuntime(String runtime) {
-    return runtime != null && layoutIdentity(runtime).equals(layoutIdentity(runtimeIdentity()));
+    return compatibleRuntime(runtime, runtimeIdentity());
+  }
+
+  private static boolean compatibleRuntime(String left, String right) {
+    return left != null && right != null && layoutIdentity(left).equals(layoutIdentity(right));
   }
 
   /** The part of a runtime identity that decides memory layout. */

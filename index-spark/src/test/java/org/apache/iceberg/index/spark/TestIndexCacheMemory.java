@@ -779,4 +779,36 @@ class TestIndexCacheMemory {
       }
     }
   }
+
+  @Test
+  void aRecordWrittenUnderAnotherProcessorCountIsReestimatedRatherThanRefused() {
+    VectorIndexAdapter adapter =
+        new VectorIndexAdapter(
+            VectorIndexDefinition.builder()
+                .fieldId(1)
+                .dimension(2)
+                .metric(Metric.EUCLIDEAN)
+                .structure(VectorStructure.FLAT)
+                .build());
+    IndexFileMemory current = IndexCacheMemory.currentDescriptor(adapter);
+    assertThat(current).isNotNull();
+
+    // A JVM with another processor count writes the same layout and a different processor number.
+    // That number decides which prepared state may be shared, not whether the record describes the
+    // file, so it must not read as a foreign runtime.
+    IndexFileMemory otherProcessors =
+        current.toBuilder()
+            .runtimeProfile(current.runtimeProfile().replaceAll("processors=\\d+", "processors=1"))
+            .build();
+
+    assertThat(IndexCacheMemory.compatibleModel(otherProcessors, adapter)).isTrue();
+    assertThat(IndexCacheMemory.compatible(otherProcessors, adapter))
+        .as("a resident copy is still reused only under the profile it was prepared with")
+        .isFalse();
+    assertThat(
+            IndexCacheMemory.compatibleModel(
+                current.toBuilder().readerId("another-reader").build(), adapter))
+        .as("a record written by another reader cannot be re-estimated")
+        .isFalse();
+  }
 }

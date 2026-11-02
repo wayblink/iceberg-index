@@ -30,19 +30,27 @@ final class IndexCacheReadContext implements ExecutorIndexCacheWorker.Loader {
   @Override
   public void validate(IndexCacheProtocol.Command command) {
     IndexAdapter adapter = adapter(command);
+    // A record written by another runtime is not a refusal: the loader re-estimates it here, and
+    // only the model and the reader decide whether that can be done at all.
     Preconditions.checkArgument(
-        IndexCacheMemory.compatible(command.file().memory(), adapter),
-        "Index memory model, reader or runtime profile is incompatible: %s",
+        IndexCacheMemory.compatibleModel(command.file().memory(), adapter),
+        "Index memory model or reader is incompatible: %s",
         command.file().location());
   }
 
   @Override
   public void validate(IndexCacheProtocol.Command command, ExecutorIndexCache.CachedFile file) {
-    validate(command);
+    IndexAdapter adapter = adapter(command);
+    // Reusing a copy that is already resident is different from loading one: it must have been
+    // prepared under the profile the command states, not merely one the loader could re-estimate.
+    Preconditions.checkArgument(
+        IndexCacheMemory.compatible(command.file().memory(), adapter),
+        "Index memory model, reader or runtime profile is incompatible: %s",
+        command.file().location());
     Preconditions.checkArgument(
         file.hasKnownContext(), "Index prepared memory is unknown: %s", command.file().location());
     Preconditions.checkArgument(
-        file.matchesContext(adapter(command)),
+        file.matchesContext(adapter),
         "Cached index memory model, reader or runtime profile is incompatible: %s",
         command.file().location());
   }
