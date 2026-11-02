@@ -1624,9 +1624,14 @@ names the column, the structure of the index and the setting to configure. Setti
 integer lets the index answer, with its candidates widened and then re-scored exactly against the
 rows; a value that is not a positive integer is an error rather than a silent 1. An exact index
 (`FLAT` over unquantized vectors) needs no such setting, because it enumerates every candidate.
-This paragraph describes the `ORDER BY` rewrite: `CALL system.vector_search` and the vector table
-functions keep the index's own score and order and do not re-score or scan uncovered files.
-`EXPLAIN` shows whether the rewrite happened, by the presence of the vector source:
+This paragraph describes the `ORDER BY` rewrite. `CALL system.vector_search` answers the same
+question and names the scope through `coverage`: `table` (the default) answers for the whole table,
+scanning the files the index does not cover and re-scoring every answer to the distance the query
+asks for — the same rows the rewrite returns; `indexed` stays inside the covered files; and
+`index_hits` is the diagnostic view that reports the index's own hits in the index's own order, with
+its estimate as the score and a null `row` for a row the table no longer has. The vector table
+functions have no parameter for this and always answer `table`. `EXPLAIN` shows whether the rewrite
+happened, by the presence of the vector source:
 
 ```sql
 EXPLAIN SELECT id FROM local.db.docs

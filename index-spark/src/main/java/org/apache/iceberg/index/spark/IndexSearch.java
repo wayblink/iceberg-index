@@ -62,13 +62,12 @@ public final class IndexSearch {
   public static final String POSITION_COLUMN = "pos";
 
   /**
-   * Column of the score of a hit, as the index ordered it.
+   * Column of the score of a hit.
    *
-   * <p>This is the index's own score: for a structured or quantized index it is an estimate of the
-   * distance, the same quantity in the same direction but not the exact value, and it orders the
-   * candidates the index was willing to consider rather than the table. A query written as {@code
-   * ORDER BY vec_distance(...)} is the one that returns exact distances, because the sort re-scores
-   * the rows it keeps; a caller comparing scores across queries should use that form.
+   * <p>What it holds is the request's contract: a coverage mode answers with the distance the query
+   * asks for, which is the number {@code ORDER BY vec_distance(...)} sorts by, while the diagnostic
+   * {@code index_hits} view reports the index's own estimate in the index's own order. A caller
+   * that compares scores across queries wants a coverage mode.
    */
   public static final String SCORE_COLUMN = "score";
 

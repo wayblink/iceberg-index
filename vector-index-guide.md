@@ -100,15 +100,17 @@ CALL local.system.build_vector_index(
 
 同列多索引（对比不同参数）在探测里是常规用法：第二次构建传 `name`，查询时用 `index => '…'` 指定，或在会话里设 `spark.iceberg.index.vector.name`。
 
-## 4. 查询：三条入口
+## 4. 查询：三条入口与三个覆盖模式
 
 | 入口 | 形态 | 扫描? | 精确重排 | 索引落后时 |
 |---|---|---|---|---|
 | 自动改写 | `SELECT … ORDER BY vec_distance(col, q) LIMIT k` | 只读命中的行；未覆盖文件做残差扫描 | 有：候选放宽后按真实距离重排 | 索引答能答的部分 + 扫未覆盖文件，结果完整 |
-| 过程 | `CALL … vector_search(…)` | 不扫表 | 无：直接返回 kernel 的分数与顺序 | 只从索引快照取候选；已删除的行仍占一行但 `row` 为 NULL，也不补候选 |
-| 表函数 | `SELECT … FROM vector_index_search(…)` | 同过程 | 无 | 同过程 |
+| 过程（默认 `coverage => 'table'`） | `CALL … vector_search(…)` | 不扫全表：索引命中 + 未覆盖文件补扫 | 有：按真实距离重排，`score` 就是 `vec_distance` 的值 | 结果完整；被删的行丢掉，由下一个候选补上 |
+| 过程（`coverage => 'indexed'`） | 同上，多一个参数 | 不扫表 | 有 | 只答索引覆盖到的活行，可能少于 k |
+| 过程（`coverage => 'index_hits'`） | 同上，多一个参数 | 不扫表 | 无：kernel 的分数与顺序 | 诊断用：已删的行仍占一行，但 `row` 为 NULL |
+| 表函数 | `SELECT … FROM vector_index_search(…)` | 同默认档 | 有 | 表函数没有参数位，固定 `table` |
 
-这三条的差别是实测出来的，不是措辞上的：同一张 `IVF·RaBitQ 4bit` 的表上，`vector_search` / 表函数 给出的 top-1 可能与真实最近邻不同（kernel 没放宽候选、也没重排），而改写路径在 `over-sample=10` 时能给出与全表扫描一致的第一名。要"结果正确优先"就用改写写法，要"拿到 kernel 自己的排序/分数"或"批量取行引用"就用过程。
+默认档与改写路径给的是**同一个答案**（同一批活行、同一个距离），差别只在形状：改写返回行，过程/表函数返回「数据文件 + 位置 + 距离 + row」。要看 kernel 自己的排序与估算分数、或要看索引里那些已经失效的命中，用 `coverage => 'index_hits'`——那是诊断视图，不是查询结果。要批量拿行引用时默认档同样可用，它的每一行都带 `data_file` 与 `pos`。
 
 ### 4.1 自动改写（推荐日常使用）
 
@@ -297,7 +299,7 @@ CALL local.system.cleanup_index_files(table => 'db.docs');
 | 查询很慢、`index_cache_status` 显示 `coverage` 低 | 缓存没开或预算不足 | 开 `cache.enabled`，别把 `cache.bytes` 设得比工作集小 |
 | `index_cache_status()` 返回 0 行 | 缓存没开，或配置用 `--conf` 传但版本较旧 | 用会话 `SET` 或新版镜像 |
 | `SET spark.iceberg...` 报 `INVALID_SET_SYNTAX` | 配置名里有 `.` 和 `-` | 用反引号：``SET `spark.iceberg.index.vector.over-sample`=10`` |
-| 过程/表函数的 top-1 与改写结果不同 | 过程不做候选放宽也不做精确重排 | 要精确第一名用改写写法；过程看的是 kernel 排序 |
+| 过程/表函数的 top-1 与改写结果不同 | 默认档与改写应当一致；先确认是不是用了 `coverage => 'index_hits'`（那是 kernel 排序） | 查询结果用默认档；`index_hits` 只用于诊断 |
 
 ## 11. 速查
 

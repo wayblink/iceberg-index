@@ -25,7 +25,19 @@ import java.nio.file.Path;
 import java.util.Comparator;
 import java.util.List;
 import java.util.stream.Collectors;
+import org.apache.iceberg.DataFile;
+import org.apache.iceberg.FileFormat;
+import org.apache.iceberg.PartitionSpec;
+import org.apache.iceberg.Table;
+import org.apache.iceberg.data.Record;
+import org.apache.iceberg.data.parquet.GenericParquetWriter;
+import org.apache.iceberg.deletes.PositionDelete;
+import org.apache.iceberg.deletes.PositionDeleteWriter;
 import org.apache.iceberg.index.vector.VectorIndexTypes;
+import org.apache.iceberg.io.DeleteSchemaUtil;
+import org.apache.iceberg.io.FileAppender;
+import org.apache.iceberg.parquet.Parquet;
+import org.apache.iceberg.spark.Spark3Util;
 import org.apache.spark.sql.Row;
 import org.apache.spark.sql.SparkSession;
 import org.junit.jupiter.api.AfterAll;
@@ -182,6 +194,99 @@ class TestVectorCoverageModes {
     // and the file that holds id 2 is rewritten away, so the index holds a hit nothing resolves
     spark.sql("DELETE FROM " + full + " WHERE id = 2");
     return name;
+  }
+
+  /**
+   * A row the table deleted without touching its file: only resolving the position can drop it.
+   *
+   * <p>Every file a hit names is still in the snapshot, so the file-level check lets this hit
+   * through and the answer depends on the position being gone. That is the gate the coverage modes
+   * rely on when a table deletes rows and keeps its files, which is what merge-on-read does.
+   */
+  @Test
+  void aPositionDeleteInsideACoveredFileIsNotAnAnswer() throws Exception {
+    String name = "position_delete";
+    String full = "local.db.t_" + name;
+    spark.sql("CREATE NAMESPACE IF NOT EXISTS local.db");
+    spark.sql(
+        "CREATE TABLE "
+            + full
+            + " "
+            + COLUMNS
+            + " TBLPROPERTIES ('format-version' = '2', 'write.delete.mode' = 'merge-on-read')");
+    spark.sql("INSERT INTO " + full + " VALUES (1, array(0.0d, 0.0d)), (3, array(1.0d, 1.0d))");
+    spark.sql(
+        "CALL local.system.build_vector_index(table => 'db.t_"
+            + name
+            + "', column => 'embedding', dimension => 2, metric => 'euclidean', "
+            + "structure => 'flat')");
+
+    // the delete is a position delete of its own, so the data file the index saw stays in place
+    String deletedFrom = addPositionDelete(full, 0L).location().toString();
+    assertThat(dataFileLocations(full))
+        .as("a position delete leaves the data file where the index saw it")
+        .hasSize(2)
+        .contains(deletedFrom);
+
+    List<Long> live = liveIds(name);
+    List<Row> indexed = search(name, QUERY, 2, "indexed");
+    assertThat(indexed.stream().map(row -> row.isNullAt(3)))
+        .as("a short answer is fewer rows, never a row reported as missing")
+        .doesNotContain(true);
+    assertThat(idsOfHits(indexed))
+        .as("the deleted position is not an answer, and every live row still is")
+        .containsExactlyElementsOf(nearestOf(name, live));
+    assertThat(scoresOfHits(indexed)).containsExactlyElementsOf(distanceOf(name, live));
+
+    List<Row> hits = search(name, QUERY, 4, "index_hits");
+    assertThat(hits.stream().filter(row -> row.isNullAt(3)).count())
+        .as("the index still holds the position, and the diagnostic view says so")
+        .isPositive();
+  }
+
+  /**
+   * Adds a position delete for one row, the way a job writes one.
+   *
+   * <p>The SQL path is not used here because this baseline's Spark DELETE rewrites the data file,
+   * which would replace the file under test instead of deleting a row inside it.
+   */
+  private DataFile addPositionDelete(String tableName, long position) throws Exception {
+    Table table = Spark3Util.loadIcebergTable(spark, tableName);
+    DataFile target;
+    try (org.apache.iceberg.io.CloseableIterable<org.apache.iceberg.FileScanTask> tasks =
+        table.newScan().planFiles()) {
+      target = tasks.iterator().next().file();
+    }
+
+    assertThat(target).as("the table has a data file to delete a row from").isNotNull();
+    String location = table.location() + "/data/probe-pos-" + position + ".parquet";
+    FileAppender<org.apache.iceberg.StructLike> appender =
+        (FileAppender<org.apache.iceberg.StructLike>)
+            (FileAppender<?>)
+                Parquet.write(table.io().newOutputFile(location))
+                    .schema(DeleteSchemaUtil.pathPosSchema())
+                    .createWriterFunc(GenericParquetWriter::buildWriter)
+                    .build();
+    PositionDeleteWriter<Record> writer =
+        new PositionDeleteWriter<>(
+            appender, FileFormat.PARQUET, location, PartitionSpec.unpartitioned(), null, null);
+    try (PositionDeleteWriter<Record> open = writer) {
+      open.write(PositionDelete.<Record>create().set(target.location().toString(), position));
+    }
+
+    table.newRowDelta().addDeletes(writer.toDeleteFile()).commit();
+    return target;
+  }
+
+  /** The locations of the table's current data files. */
+  private List<String> dataFileLocations(String tableName) throws Exception {
+    Table table = Spark3Util.loadIcebergTable(spark, tableName);
+    try (org.apache.iceberg.io.CloseableIterable<org.apache.iceberg.FileScanTask> tasks =
+        table.newScan().planFiles()) {
+      return java.util.stream.StreamSupport.stream(tasks.spliterator(), false)
+          .map(task -> task.file().location().toString())
+          .collect(Collectors.toList());
+    }
   }
 
   private List<Long> nearestIdsByScan(String table, int k) {

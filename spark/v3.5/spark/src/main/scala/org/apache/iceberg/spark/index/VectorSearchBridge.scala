@@ -316,7 +316,9 @@ private[spark] object VectorSearchBridge {
           .withConsistency(Consistency.AT_OR_BEFORE))
 
       // a hit of a file the snapshot no longer has is not a candidate at all: the row it names is
-      // gone, and scoring it would let a rewritten-away file occupy a place in the answer
+      // gone, and scoring it would let a rewritten-away file occupy a place in the answer. The
+      // fetch-back below drops these too — a scan task is only planned for a file the snapshot has —
+      // so this is what keeps them out before the work of resolving them, not the only guard
       val fresh = outcome
         .hits()
         .asScala
