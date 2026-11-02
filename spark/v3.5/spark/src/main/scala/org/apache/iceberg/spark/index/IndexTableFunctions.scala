@@ -27,6 +27,8 @@ import org.apache.iceberg.index.vector.VectorIndexDefinition.Metric
 import org.apache.iceberg.index.vector.VectorIndexTypes
 import org.apache.iceberg.relocated.com.google.common.base.Preconditions
 import org.apache.iceberg.spark.Spark3Util
+import org.apache.spark.sql.catalyst.expressions.IsNotNull
+import org.apache.spark.sql.catalyst.plans.logical.Filter
 import org.apache.spark.sql.SparkSession
 import org.apache.spark.sql.SparkSessionExtensions
 import org.apache.spark.sql.catalyst.FunctionIdentifier
@@ -260,10 +262,17 @@ object IndexTableFunctions {
         s"$tableName already has a column named $DISTANCE_COLUMN, so the distance cannot be added")
     }
 
-    val distance =
-      VectorDistanceExpression(named.getOrElse(Metric.COSINE), vector, query, explicitMetric = true)
+    val distance = VectorDistanceExpression(
+      named.getOrElse(Metric.COSINE),
+      vector,
+      query,
+      explicitMetric = true)
+    // a row without a vector has no distance, so it has no place in a distance ordering: plain
+    // Spark would sort it first under ASC and spend one of the k rows on it, which is neither what
+    // the index branch answers nor what the guide promises
+    val candidates = Filter(IsNotNull(vector), relation)
     val ordered =
-      Sort(Seq(SortOrder(distance, Ascending, NullsFirst, Seq.empty)), global = true, relation)
+      Sort(Seq(SortOrder(distance, Ascending, NullsFirst, Seq.empty)), global = true, candidates)
     val limited = GlobalLimit(Literal(k), ordered)
     Project(selected :+ Alias(distance, DISTANCE_COLUMN)(), limited)
   }

@@ -165,6 +165,27 @@ class TestVectorSearchTableFunction {
   }
 
   @Test
+  public void aRowWithoutAVectorIsNotAnswered() {
+    String table = tableWithIndex("vs_null_vector", "hnsw");
+    spark.sql(String.format("INSERT INTO local.%s VALUES (9, 'null', NULL)", table));
+
+    List<Row> hits =
+        spark
+            .sql(
+                String.format(
+                    "SELECT id, _distance FROM vector_search("
+                        + "table => 'local.%s', query_vector => array(0.9d, 0.1d), "
+                        + "vector_column => 'embedding', k => 5, distance_type => 'euclidean')",
+                    table))
+            .collectAsList();
+
+    // the row has no distance, so it is not one of the k nearest: answering with it would spend a
+    // place on a row nothing can compare
+    assertThat(hits).extracting(row -> row.getLong(0)).doesNotContain(9L);
+    assertThat(hits).allSatisfy(row -> assertThat(row.isNullAt(1)).isFalse());
+  }
+
+  @Test
   public void refusesWhatItCannotAnswer() {
     String table = tableWithIndex("vs_refusals", "hnsw");
 
