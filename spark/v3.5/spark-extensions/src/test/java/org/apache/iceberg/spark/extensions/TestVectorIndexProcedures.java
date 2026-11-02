@@ -20,6 +20,7 @@ package org.apache.iceberg.spark.extensions;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.assertj.core.api.Assertions.within;
 
 import java.util.List;
 import org.apache.iceberg.ParameterizedTestExtension;
@@ -98,12 +99,25 @@ public class TestVectorIndexProcedures extends ExtensionsTestBase {
     assertThat(searchOutput).hasSize(2);
     assertThat(searchOutput.get(0)[0]).isInstanceOf(String.class);
     assertThat(searchOutput.get(0)[1]).isInstanceOf(Number.class);
-    double firstScore = ((Number) searchOutput.get(0)[2]).doubleValue();
-    double secondScore = ((Number) searchOutput.get(1)[2]).doubleValue();
+    double firstDistance = ((Number) searchOutput.get(0)[2]).doubleValue();
+    double secondDistance = ((Number) searchOutput.get(1)[2]).doubleValue();
     // the score of the default coverage mode is the distance the query asks for, so the nearer row
     // has the smaller one; this used to be the index's own (similarity) score
-    assertThat(firstScore).isLessThan(secondScore);
+    assertThat(firstDistance).isLessThan(secondDistance);
     assertThat(searchOutput.get(0)[3].toString()).contains("\"id\":1");
+
+    // and it is the very number the query itself computes: the same two rows, ordered by
+    // vec_distance, carry the distances the procedure reported
+    List<Object[]> byDistance =
+        sql(
+            "SELECT vec_distance(embedding, array(0.95d, 0.05d)) AS distance FROM %s "
+                + "ORDER BY distance ASC LIMIT 2",
+            tableName);
+    assertThat(byDistance).hasSize(2);
+    assertThat(((Number) byDistance.get(0)[0]).doubleValue())
+        .isCloseTo(firstDistance, within(1e-12));
+    assertThat(((Number) byDistance.get(1)[0]).doubleValue())
+        .isCloseTo(secondDistance, within(1e-12));
 
     // k = 0 returns no rows
     assertThat(
