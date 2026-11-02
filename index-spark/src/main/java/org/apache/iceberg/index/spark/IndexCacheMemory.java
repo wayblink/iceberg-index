@@ -519,25 +519,37 @@ final class IndexCacheMemory {
   static String readerKey(IndexAdapter adapter) {
     try {
       ContextKey context = contextKey(adapter);
-      IndexFileMemory descriptor = descriptor(adapter, context);
-      String identity = context.definition() + "/" + context.vm() + "/" + context.processors();
-      if (descriptor != null) {
-        identity +=
-            "/"
-                + descriptor.modelVersion()
-                + "/"
-                + descriptor.readerId()
-                + "/"
-                + descriptor.runtimeProfile();
-      }
-      return HexFormat.of()
-          .formatHex(
-              MessageDigest.getInstance("SHA-256")
-                  .digest(identity.getBytes(StandardCharsets.UTF_8)));
+      return readerIdentity(context.definition(), context.vm(), descriptor(adapter, context));
     } catch (RuntimeException | NoSuchAlgorithmException e) {
       // Unidentifiable legacy readers cannot share a prepared state across adapter instances.
       return "unknown-" + Integer.toHexString(System.identityHashCode(adapter));
     }
+  }
+
+  /**
+   * What a prepared reader depends on: the definition, the VM, and how the file was measured.
+   *
+   * <p>The measuring host's processor count is left out for the same reason it does not decide
+   * compatibility. The driver builds this key when it plans a load and every executor builds it
+   * again for its own cache, so a key that followed the count would name one reader two ways and
+   * the copy the driver planned would not be the copy a query looks up.
+   */
+  static String readerIdentity(String definition, String vm, IndexFileMemory descriptor)
+      throws NoSuchAlgorithmException {
+    String identity = definition + "/" + vm;
+    if (descriptor != null) {
+      identity +=
+          "/"
+              + descriptor.modelVersion()
+              + "/"
+              + descriptor.readerId()
+              + "/"
+              + layoutIdentity(descriptor.runtimeProfile());
+    }
+
+    return HexFormat.of()
+        .formatHex(
+            MessageDigest.getInstance("SHA-256").digest(identity.getBytes(StandardCharsets.UTF_8)));
   }
 
   private static ContextKey contextKey(IndexAdapter adapter) {

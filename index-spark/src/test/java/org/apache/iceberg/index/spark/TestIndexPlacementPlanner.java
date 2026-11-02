@@ -111,6 +111,24 @@ class TestIndexPlacementPlanner {
   }
 
   @Test
+  void aNodeWhoseNumbersThisJvmCannotModelIsNotReportedAsFull() {
+    // Another JVM family is a different matter from another processor count: the shape cannot be
+    // projected here at all, so its free space is unknown rather than small.
+    IndexCacheProtocol.NodeReport foreign =
+        IndexCacheProtocol.NodeReport.builder()
+            .session("session")
+            .executorId("a")
+            .incarnation("a-1")
+            .budgetBytes(rawBudget(512))
+            .metadataShape(
+                ExecutorIndexCache.Shape.empty()
+                    .withRuntime("vm=Another VM;version=0;processors=8"))
+            .build();
+    assertThat(planner.plan(target(file("new", 2)), List.of(foreign)).rejected())
+        .containsEntry("new", "RUNTIME_MISMATCH");
+  }
+
+  @Test
   void releasesAreIncludedInUsedRatherThanCountedTwice() {
     IndexCacheProtocol.NodeReport held =
         IndexCacheProtocol.NodeReport.builder()

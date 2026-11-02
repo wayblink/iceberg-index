@@ -624,6 +624,43 @@ class TestIndexCacheMemory {
   }
 
   @Test
+  void aReaderKeyIsTheSameWhicheverHostMeasuredTheFile() throws Exception {
+    // The driver builds this key when it plans a load and every executor builds it again for its
+    // own cache, so a key that followed the measuring host's core count would name one reader two
+    // ways and the planned copy would not be the copy a query looks up.
+    assertThat(
+            IndexCacheMemory.readerIdentity("def", "hotspot/17", measured("profile;processors=8")))
+        .isEqualTo(
+            IndexCacheMemory.readerIdentity(
+                "def", "hotspot/17", measured("profile;processors=172")));
+  }
+
+  @Test
+  void aReaderKeyStillSeparatesAnotherVmOrReader() throws Exception {
+    String base = IndexCacheMemory.readerIdentity("def", "hotspot/17", measured("profile"));
+    assertThat(IndexCacheMemory.readerIdentity("def", "hotspot/21", measured("profile")))
+        .isNotEqualTo(base);
+    assertThat(
+            IndexCacheMemory.readerIdentity(
+                "def", "hotspot/17", measured("other-reader", "profile")))
+        .isNotEqualTo(base);
+  }
+
+  private static IndexFileMemory measured(String runtimeProfile) {
+    return measured("vector/ivf/2", runtimeProfile);
+  }
+
+  private static IndexFileMemory measured(String readerId, String runtimeProfile) {
+    return IndexFileMemory.builder()
+        .modelVersion(2)
+        .readerId(readerId)
+        .runtimeProfile(runtimeProfile)
+        .payloadBytes(8L)
+        .preparedBytes(64L)
+        .build();
+  }
+
+  @Test
   void unknownMemoryCannotBecomeFreeCapacity() {
     assertThatThrownBy(() -> IndexCacheMemory.residentBytes(null))
         .isInstanceOf(IllegalArgumentException.class)

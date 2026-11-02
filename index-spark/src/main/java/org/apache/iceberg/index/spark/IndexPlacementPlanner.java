@@ -140,11 +140,20 @@ final class IndexPlacementPlanner {
     }
 
     boolean known = false;
+    boolean projectable = false;
     for (WorkingNode node : nodes) {
       if (node.shape == null || !node.shape.charge().known()) {
         continue;
       }
+
       known = true;
+      if (!node.shape.compatibleRuntime()) {
+        // A node whose numbers come from a JVM this one cannot model has unknown free space here,
+        // and calling it full sends the operator looking for capacity that was never the problem.
+        continue;
+      }
+
+      projectable = true;
       try {
         ExecutorIndexCache.ChargeSnapshot empty =
             ExecutorIndexCache.Shape.empty()
@@ -157,6 +166,10 @@ final class IndexPlacementPlanner {
         return "SIZE_UNKNOWN";
       }
     }
+    if (known && !projectable) {
+      return "RUNTIME_MISMATCH";
+    }
+
     return known ? "FILE_TOO_LARGE" : "SIZE_UNKNOWN";
   }
 
