@@ -472,6 +472,23 @@ final class IndexCacheMemory {
         + Runtime.getRuntime().availableProcessors();
   }
 
+  /**
+   * Whether a shape stated under {@code runtime} can be projected here.
+   *
+   * <p>Only the JVM family decides that. The processor count is not part of it: it decides which
+   * prepared state may be shared between callers (see the adapter context key), not how an index
+   * file is laid out, and a driver plans for executors whose parallelism it does not share.
+   */
+  static boolean compatibleRuntime(String runtime) {
+    return runtime != null && layoutIdentity(runtime).equals(layoutIdentity(runtimeIdentity()));
+  }
+
+  /** The part of a runtime identity that decides memory layout. */
+  private static String layoutIdentity(String runtime) {
+    int processors = runtime.indexOf(";processors=");
+    return processors < 0 ? runtime : runtime.substring(0, processors);
+  }
+
   static String readerKey(IndexAdapter adapter) {
     try {
       ContextKey context = contextKey(adapter);

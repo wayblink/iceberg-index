@@ -320,6 +320,27 @@ class TestIndexPlacementPlanner {
         .build();
   }
 
+  @Test
+  void aShapeFromAnExecutorWithAnotherProcessorCountIsStillPlaced() {
+    // The driver plans for executors it does not share a processor count with. That difference is a
+    // prepared-state concern, not a reason to call a 2 MiB file too large for an empty 8 GiB node.
+    String foreignRuntime =
+        IndexCacheMemory.runtimeIdentity().replaceAll(";processors=\\d+", ";processors=1");
+    IndexCacheProtocol.NodeReport report =
+        IndexCacheProtocol.NodeReport.builder()
+            .session("session")
+            .executorId("executor-1")
+            .incarnation("executor-1-1")
+            .budgetBytes(rawBudget(8))
+            .metadataShape(ExecutorIndexCache.Shape.empty().withRuntime(foreignRuntime))
+            .build();
+
+    IndexCacheProtocol.Plan plan = planner.plan(target(file("new", 2)), List.of(report));
+
+    assertThat(plan.placements()).containsEntry("new", "executor-1");
+    assertThat(plan.rejected()).isEmpty();
+  }
+
   private static ExecutorIndexCache.Shape shape(long units) {
     return units == 0
         ? ExecutorIndexCache.Shape.empty()

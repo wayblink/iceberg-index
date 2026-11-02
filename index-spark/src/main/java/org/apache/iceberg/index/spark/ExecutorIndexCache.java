@@ -1143,9 +1143,24 @@ final class ExecutorIndexCache {
       this.pendingLoads = Set.copyOf(pendingLoads);
     }
 
+    /**
+     * The same shape as a runtime other than this JVM states it, for tests of foreign executors.
+     */
+    Shape withRuntime(String newRuntime) {
+      Shape shape = new Shape(state, charge, pendingLoads);
+      return new Shape(shape.state, shape.charge, newRuntime, shape.pendingLoads);
+    }
+
+    private Shape(State state, ChargeSnapshot charge, String runtime, Set<String> pendingLoads) {
+      this.state = state;
+      this.charge = charge;
+      this.runtime = runtime;
+      this.pendingLoads = pendingLoads;
+    }
+
     boolean compatibleRuntime() {
       return charge.known()
-          && runtime.equals(IndexCacheMemory.runtimeIdentity())
+          && IndexCacheMemory.compatibleRuntime(runtime)
           && IndexCacheMemory.supportedLayout();
     }
 
