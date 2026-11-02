@@ -29,6 +29,7 @@ import java.util.Locale;
 import java.util.stream.Collectors;
 import org.apache.iceberg.index.vector.VectorIndexTypes;
 import org.apache.iceberg.relocated.com.google.common.collect.Lists;
+import org.apache.spark.sql.AnalysisException;
 import org.apache.spark.sql.Row;
 import org.apache.spark.sql.RowFactory;
 import org.apache.spark.sql.SparkSession;
@@ -131,6 +132,27 @@ class TestRewriteVectorSearch {
                 table,
                 "SELECT id FROM local.%s ORDER BY vec_distance(embedding, array(0.9d, 0.1d)) LIMIT 2"))
         .contains("VectorSearchSource");
+  }
+
+  @Test
+  public void refusesAMetricItCannotCompute() {
+    String table = tableWithIndex("docs_bad_metric", "hnsw");
+
+    // a metric it does not know is a mistake in the query, so it is an analysis error naming the
+    // metric and the ones it does know, not an internal failure of the engine
+    assertThatThrownBy(
+            () ->
+                spark
+                    .sql(
+                        String.format(
+                            "SELECT id FROM local.%s "
+                                + "ORDER BY vec_distance(embedding, array(0.9d, 0.1d), 'manhattan') "
+                                + "LIMIT 2",
+                            table))
+                    .collectAsList())
+        .isInstanceOf(AnalysisException.class)
+        .hasMessageContaining("Unknown metric for vec_distance: manhattan")
+        .hasMessageContaining("cosine, dot_product or euclidean");
   }
 
   @Test

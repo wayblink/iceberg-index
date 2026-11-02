@@ -25,6 +25,7 @@ import static org.assertj.core.api.Assertions.within;
 import java.nio.file.Path;
 import java.util.List;
 import org.apache.iceberg.index.vector.VectorIndexTypes;
+import org.apache.spark.sql.AnalysisException;
 import org.apache.spark.sql.Row;
 import org.apache.spark.sql.SparkSession;
 import org.junit.jupiter.api.AfterAll;
@@ -223,6 +224,7 @@ class TestVectorSearchTableFunction {
                                 + "k => 1, index_name => 'x')",
                             table))
                     .collectAsList())
+        .isInstanceOf(AnalysisException.class)
         .hasMessageContaining("index_name");
 
     assertThatThrownBy(
@@ -235,7 +237,8 @@ class TestVectorSearchTableFunction {
                                 + "k => 1)",
                             table))
                     .collectAsList())
-        .hasMessageContaining("missing");
+        .isInstanceOf(AnalysisException.class)
+        .hasMessageContaining("Column missing does not exist");
 
     assertThatThrownBy(
             () ->
@@ -247,7 +250,8 @@ class TestVectorSearchTableFunction {
                                 + "k => 1, distance_type => 'manhattan')",
                             table))
                     .collectAsList())
-        .hasMessageContaining("manhattan");
+        .isInstanceOf(AnalysisException.class)
+        .hasMessageContaining("Unknown distance_type manhattan");
   }
 
   @Test

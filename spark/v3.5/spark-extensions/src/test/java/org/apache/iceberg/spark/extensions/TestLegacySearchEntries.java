@@ -26,6 +26,7 @@ import java.util.List;
 import org.apache.iceberg.ParameterizedTestExtension;
 import org.apache.iceberg.index.text.TextIndexTypes;
 import org.apache.iceberg.index.vector.VectorIndexTypes;
+import org.apache.spark.sql.AnalysisException;
 import org.apache.spark.sql.Dataset;
 import org.apache.spark.sql.Row;
 import org.junit.jupiter.api.AfterEach;
@@ -189,13 +190,17 @@ public class TestLegacySearchEntries extends ExtensionsTestBase {
     textIndex(text);
 
     // an option the index cannot answer must fail rather than be dropped: a caller who wrote it
-    // would otherwise believe it was applied. How the failure is wrapped is a separate matter
-    // (#2893), so only the words are pinned here.
+    // would otherwise believe it was applied. It is an analysis error and not an internal one: a
+    // caller has to be able to tell a mistake of theirs from a failure of the engine
     assertThatThrownBy(
             () -> run("SELECT id FROM %s WHERE match(body, 'error', 'operator=AND')", text))
+        .isInstanceOf(AnalysisException.class)
+        .hasMessageContaining("match takes a column and a query, got 3 arguments")
         .hasMessageContaining("options are not supported");
 
     assertThatThrownBy(() -> run("SELECT text_score(body, 'error', 'operator=AND') FROM %s", text))
+        .isInstanceOf(AnalysisException.class)
+        .hasMessageContaining("text_score takes a column and a query, got 3 arguments")
         .hasMessageContaining("options are not supported");
 
     // two arguments are the whole call, in the shape the rewrite answers

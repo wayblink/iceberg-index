@@ -27,6 +27,7 @@ import org.apache.iceberg.index.vector.VectorIndexDefinition.Metric
 import org.apache.iceberg.index.vector.VectorIndexTypes
 import org.apache.iceberg.relocated.com.google.common.base.Preconditions
 import org.apache.iceberg.spark.Spark3Util
+import org.apache.spark.sql.catalyst.analysis.IndexErrors
 import org.apache.spark.sql.catalyst.expressions.IsNotNull
 import org.apache.spark.sql.catalyst.plans.logical.Filter
 import org.apache.spark.sql.SparkSession
@@ -131,8 +132,7 @@ object IndexTableFunctions {
    * <p>The metric is always named to the distance, so a query never changes meaning because of the
    * index that happens to answer it; when no index matches the metric, the scan answers instead.
    */
-  private def analysisError(message: String): Nothing =
-    throw new IllegalArgumentException(message)
+  private def analysisError(message: String): Nothing = throw IndexErrors.analysis(message)
 
   /**
    * The rows a text index ranks for a query, as the table's own columns plus the score.

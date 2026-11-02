@@ -25,6 +25,7 @@ import static org.assertj.core.api.Assertions.within;
 import java.nio.file.Path;
 import java.util.List;
 import org.apache.iceberg.index.text.TextIndexTypes;
+import org.apache.spark.sql.AnalysisException;
 import org.apache.spark.sql.Row;
 import org.apache.spark.sql.SparkSession;
 import org.junit.jupiter.api.AfterAll;
@@ -231,6 +232,7 @@ class TestTextSearchTableFunction {
                             "SELECT id FROM local.%s WHERE match(body, 'error', 'operator=AND')",
                             table))
                     .collectAsList())
+        .isInstanceOf(AnalysisException.class)
         .hasMessageContaining("options are not supported");
   }
 

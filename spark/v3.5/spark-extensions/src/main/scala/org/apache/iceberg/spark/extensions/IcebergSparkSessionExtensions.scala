@@ -23,6 +23,7 @@ import org.apache.spark.sql.AnalysisException
 import org.apache.spark.sql.SparkSessionExtensions
 import org.apache.spark.sql.catalyst.FunctionIdentifier
 import org.apache.spark.sql.catalyst.analysis.CheckViews
+import org.apache.spark.sql.catalyst.analysis.IndexErrors
 import org.apache.spark.sql.catalyst.analysis.ProcedureArgumentCoercion
 import org.apache.spark.sql.catalyst.analysis.ResolveIndexStatements
 import org.apache.spark.sql.catalyst.analysis.ResolveProcedures
@@ -49,16 +50,13 @@ class IcebergSparkSessionExtensions extends (SparkSessionExtensions => Unit) {
    */
   private def metricOf(args: Seq[Expression]): Metric = {
     if (args.size < 2) {
-      throw new AnalysisException(
-        "vec_distance needs a vector and a query vector",
-        Map.empty[String, String])
+      throw IndexErrors.analysis("vec_distance needs a vector and a query vector")
     }
 
     if (args.size > 3) {
-      throw new AnalysisException(
+      throw IndexErrors.analysis(
         s"vec_distance takes a vector, a query vector and an optional metric, got ${args.size} " +
-          "arguments",
-        Map.empty[String, String])
+          "arguments")
     }
 
     if (args.size == 2) {
@@ -69,9 +67,8 @@ class IcebergSparkSessionExtensions extends (SparkSessionExtensions => Unit) {
               .Literal(value: org.apache.spark.unsafe.types.UTF8String, _) =>
           value.toString
         case _ =>
-          throw new AnalysisException(
-            "The metric of vec_distance must be a constant: cosine, dot_product or euclidean",
-            Map.empty[String, String])
+          throw IndexErrors.analysis(
+            "The metric of vec_distance must be a constant: cosine, dot_product or euclidean")
       }
 
       name.trim.toLowerCase(java.util.Locale.ROOT) match {
@@ -79,9 +76,8 @@ class IcebergSparkSessionExtensions extends (SparkSessionExtensions => Unit) {
         case "dot" | "dot_product" | "inner_product" | "ip" => Metric.DOT_PRODUCT
         case "euclidean" | "l2" => Metric.EUCLIDEAN
         case other =>
-          throw new AnalysisException(
-            s"Unknown metric for vec_distance: $other, expected cosine, dot_product or euclidean",
-            Map.empty[String, String])
+          throw IndexErrors.analysis(
+            s"Unknown metric for vec_distance: $other, expected cosine, dot_product or euclidean")
       }
     }
   }
@@ -95,10 +91,9 @@ class IcebergSparkSessionExtensions extends (SparkSessionExtensions => Unit) {
    */
   private def textArguments(name: String, args: Seq[Expression]): (Expression, Expression) = {
     if (args.size != 2) {
-      throw new AnalysisException(
+      throw IndexErrors.analysis(
         s"$name takes a column and a query, got ${args.size} arguments: options are not supported " +
-          "by the text index yet",
-        Map.empty[String, String])
+          "by the text index yet")
     }
 
     (args(0), args(1))
