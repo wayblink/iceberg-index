@@ -27,15 +27,17 @@ under the License.
 
 **Tech Stack:** Java17、现有JUnit5/AssertJ、Spark3.5/Scala2.12、现有FileIO/Puffin；不新增依赖。
 
-**Spec:** `docs/2026-10-27-ivf-payload-in-place-design.md` §3/7/8，用户2026-10-28确认C/D边界修订。
+**Spec:** `docs/2026-10-27-ivf-payload-in-place-design.md` §3/7/8，用户2026-10-28确认C/D边界修订。用户进一步确认共享元数据和内部消息调整；剩余E以`docs/2026-10-28-cache-owned-metadata-and-internal-protocol.md`为细化实施合同。已有Task3/4的逐file常数或求和不能作为完整E交付，按补充设计E1–E4迁移；索引resident归零与总预算内的control费用必须分开。
 
 ## Global Constraints
 
+- 用户最新顺序优先：先完成#2773全部开发，只跑必要小TDD/编译/格式/轻量代码复核；全core、跨模块完整回归、资源及10M100M性能、新镜像集群SQL验收全部移交后置#2778。开发就绪不等于最终验收，不因耗时大测试推迟下一开发卡。
+
 - 独立`card/2780`，工作树`/Users/jyxc-dz-0101035/workspace/iceberg-wt/2780`，基底`ede87bcd8ff2bfc8f1d3d67d20ac97038104865d`。只add具体文件，不自动merge/push main。
-- C当前IVF的P为独立对象图S，不人为长期保留已解码的U；D才持U+M，届时必须完整记U及数组头。HNSW图/映射、FLAT entries/字节分别按实际引用计算。（现状：D已随本分支落地，IVF/FLAT 的P已包含原地保留的payload快照U与数组头，`IvfKernel.preparedBytes` 以 `PreparedStructureSize.bytes(payload.length)` 记账；C阶段的独立S描述只用于理解历史口径。）
+- C当前IVF的P为独立对象图S，不人为长期保留已解码的U；D才持U+M，届时必须完整记U及数组头。HNSW图/映射、FLAT entries/字节分别按实际引用计算。
 - 保持payload编码/manifest格式，不重建旧索引、不强制重写旧manifest。保留IndexBlob/IndexEntry公开复制合同。
 - 不新增public接口、配置或依赖，不改默认值，不重写BM25统计、图算法或调度策略。现有默认prepare方法内部实现可修改，签名不变。
-- model=2的P包含自有数组，不含已释放外部输入/query scratch。C/U长度仅诊断；固定JVM布局的结构估计不是精确retained heap实测。
+- model=2的P包含自有数组，不含已释放外部输入/query scratch。C/U长度仅诊断；固定JVM布局的结构估计不是精确retained heap实测。当前vector实现只对检测通过的HotSpot17/64bit/压缩引用及class pointers/8字节对齐/compact strings给known估计；HNSW还限定已确认的hnswlib1.1.0与Eclipse容器表示，不支持时null/0表示unknown。
 - 数组按身份去重，slice保留完整backing必须完整计费；未知不能填0，managed不得把未知当可装下。
 - plain的≥30%适用范围尚未调整，本计划不改收益门槛；E使用同基底配对，不把B14f7到当前main的无关差异归因C。
 
@@ -113,7 +115,7 @@ under the License.
 ./gradlew -DsparkVersions=3.5 -DscalaVersion=2.12 :iceberg-core:test --tests org.apache.iceberg.index.TestIndexBuildResult
 ./gradlew -DsparkVersions=3.5 -DscalaVersion=2.12 :iceberg-core:test --tests 'org.apache.iceberg.index.*'
 ./gradlew -DsparkVersions=3.5 -DscalaVersion=2.12 :iceberg-index-vector:test :iceberg-index-spark:test :iceberg-index-text:test
-./gradlew -DsparkVersions=3.5 -DscalaVersion=2.12 spotlessCheck revApiCheck
+./gradlew -DsparkVersions=3.5 -DscalaVersion=2.12 spotlessCheck :iceberg-core:revapi :iceberg-api:revapi
 ```
 
 Expected：测试实际执行且XML 0 failures/errors；编译失败不算行为RED，缺测/跳过明确记录。初始新树89+271+6=366测试通过仅作前置基线，不代表本计划完成。

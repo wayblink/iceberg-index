@@ -28,19 +28,25 @@ import java.util.List;
 import org.apache.iceberg.Files;
 import org.apache.iceberg.index.IndexAdapter;
 import org.apache.iceberg.index.IndexBlob;
+import org.apache.iceberg.index.IndexBuildResult;
 import org.apache.iceberg.index.IndexDefinition;
 import org.apache.iceberg.index.IndexEntry;
 import org.apache.iceberg.index.IndexFile;
+import org.apache.iceberg.index.IndexFileMemory;
 import org.apache.iceberg.index.IndexSearchResult;
 import org.apache.iceberg.index.PuffinIndexFileContainer;
 import org.apache.iceberg.io.FileIO;
 import org.apache.iceberg.io.InputFile;
 import org.apache.iceberg.io.OutputFile;
+import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
 
 class TestDistributedIndexSearchSizing {
+  // The owner a query plans with is the table location; a working set is only known under one.
+  private static final String OWNER = "file:/warehouse";
+
   @TempDir private Path temp;
 
   @ParameterizedTest
@@ -57,11 +63,165 @@ class TestDistributedIndexSearchSizing {
             .entryCount(0)
             .build();
     IndexAdapter adapter = new SizedAdapter(preparedBytes);
-    byte[] payload = java.nio.file.Files.readAllBytes(temp.resolve("index.puffin"));
-    long residentBytes =
-        ExecutorIndexCache.loaded(payload, adapter.prepare(ByteBuffer.wrap(payload))).bytes();
-    assertThat(DistributedIndexSearch.workingSetBytes(new LocalIO(), List.of(file), adapter))
-        .isEqualTo(residentBytes);
+    long expected = admittedBytes(file, adapter);
+    assertThat(DistributedIndexSearch.workingSetBytes(new LocalIO(), List.of(file), adapter, OWNER))
+        .isEqualTo(expected);
+  }
+
+  @Test
+  void genericPositiveEstimateIsUnknownOnUnsupportedWrapperLayout(@TempDir Path temp)
+      throws Exception {
+    Process child =
+        new ProcessBuilder(
+                System.getProperty("java.home") + "/bin/java",
+                "-XX:-UseCompressedOops",
+                "-cp",
+                System.getProperty("java.class.path"),
+                WrapperLayoutProbe.class.getName(),
+                temp.toString())
+            .redirectErrorStream(true)
+            .start();
+    try {
+      assertThat(child.waitFor(30, java.util.concurrent.TimeUnit.SECONDS)).isTrue();
+      String output =
+          new String(
+              child.getInputStream().readAllBytes(), java.nio.charset.StandardCharsets.UTF_8);
+      assertThat(child.exitValue()).as(output).isZero();
+    } finally {
+      child.destroyForcibly();
+    }
+  }
+
+  public static class WrapperLayoutProbe {
+    public static void main(String[] args) throws Exception {
+      Path location = Path.of(args[0], "unsupported.puffin");
+      SizedAdapter adapter = new SizedAdapter(70);
+      new PuffinIndexFileContainer()
+          .write(
+              Files.localOutput(location.toString()),
+              List.of(IndexBlob.of("test-sizing", new byte[10])));
+      if (adapter.encodeEntriesWithMemory(List.of()).memory().preparedBytes() <= 0) {
+        throw new AssertionError("Probe requires a generic positive P");
+      }
+      if (IndexCacheMemory.resolve(new LocalIO(), file(location.toString()), adapter) != null) {
+        throw new AssertionError("Unsupported wrapper layout was declared known");
+      }
+      if (IndexCacheMemory.compatible(
+          adapter.encodeEntriesWithMemory(List.of()).memory(), adapter)) {
+        throw new AssertionError("Unsupported wrapper layout passed managed compatibility");
+      }
+      ExecutorIndexCache.CachedFile loaded =
+          DistributedIndexSearch.loadFile(new LocalIO(), location.toString(), adapter);
+      if (loaded.hasKnownContext()) {
+        throw new AssertionError("Unsupported wrapper layout retained a known context receipt");
+      }
+      if (loaded.bytes() <= 0
+          || loaded.searching(searcher -> searcher.search(ByteBuffer.allocate(0), 1)) == null) {
+        throw new AssertionError("Legacy query fallback must stay usable");
+      }
+    }
+  }
+
+  @Test
+  void cacheIdentityIncludesReaderDefinition() {
+    assertThat(DistributedIndexSearch.adapterKey(new SizedAdapter(70)))
+        .isNotEqualTo(DistributedIndexSearch.adapterKey(new SizedAdapter(170)));
+  }
+
+  @Test
+  void changingDefinitionAtTheSameLocationInvalidatesEstimate() throws IOException {
+    IndexFile file = writeFile("definition.puffin");
+    SizedAdapter smaller = new SizedAdapter(70);
+    SizedAdapter larger = new SizedAdapter(170);
+    long first =
+        DistributedIndexSearch.workingSetBytes(new LocalIO(), List.of(file), smaller, OWNER);
+    long second =
+        DistributedIndexSearch.workingSetBytes(new LocalIO(), List.of(file), larger, OWNER);
+    // Each reader is priced by the estimate it publishes, not by the file's blob length.
+    assertThat(first).isEqualTo(admittedBytes(file, smaller)).isPositive();
+    assertThat(second).isEqualTo(admittedBytes(file, larger)).isGreaterThan(first);
+  }
+
+  @Test
+  void failedEstimationIsUnknownAndCanBeRetried() throws IOException {
+    Path path = temp.resolve("retry.puffin");
+    java.nio.file.Files.write(path, new byte[10]);
+    IndexFile file = file(path.toString());
+    SizedAdapter adapter = new SizedAdapter(70);
+    assertThat(DistributedIndexSearch.workingSetBytes(new LocalIO(), List.of(file), adapter, OWNER))
+        .isEqualTo(-1);
+    java.nio.file.Files.delete(path);
+    new PuffinIndexFileContainer()
+        .write(
+            Files.localOutput(path.toString()), List.of(IndexBlob.of("test-sizing", new byte[10])));
+    assertThat(DistributedIndexSearch.workingSetBytes(new LocalIO(), List.of(file), adapter, OWNER))
+        .isEqualTo(admittedBytes(file, adapter))
+        .isPositive();
+  }
+
+  @Test
+  void unknownFileInWorkingSetIsNotFreeCapacity() throws IOException {
+    IndexFile valid = writeFile("valid.puffin");
+    Path bad = temp.resolve("bad.puffin");
+    java.nio.file.Files.write(bad, new byte[10]);
+    assertThat(
+            DistributedIndexSearch.workingSetBytes(
+                new LocalIO(), List.of(valid, file(bad.toString())), new SizedAdapter(70), OWNER))
+        .isEqualTo(-1);
+  }
+
+  /**
+   * The capacity the executor charges for one file of this reader: the admission it computes from
+   * the same memory descriptor, measured rather than derived from the estimate formula.
+   */
+  private static long admittedBytes(IndexFile file, IndexAdapter adapter) {
+    IndexFileMemory memory = IndexCacheMemory.resolveMemory(new LocalIO(), file, adapter);
+    if (memory == null) {
+      return -1;
+    }
+
+    IndexCacheProtocol.File prospect =
+        IndexCacheProtocol.File.builder()
+            .location(file.location())
+            .owner(OWNER)
+            .cacheKey(
+                DistributedIndexSearch.cacheKey(
+                    OWNER, DistributedIndexSearch.adapterKey(adapter), file.location()))
+            .memory(memory)
+            .estimatedBytes(IndexCacheMemory.residentBytes(memory))
+            .build();
+    return ExecutorIndexCache.Shape.empty()
+        .projectAdmission(null, 0, List.of(prospect))
+        .charge()
+        .residentBytes();
+  }
+
+  private IndexFile writeFile(String name) throws IOException {
+    String location = temp.resolve(name).toString();
+    new PuffinIndexFileContainer()
+        .write(Files.localOutput(location), List.of(IndexBlob.of("test-sizing", new byte[10])));
+    return file(location);
+  }
+
+  private static IndexFile file(String location) {
+    return IndexFile.builder()
+        .location(location)
+        .kind(IndexFile.Kind.ENTRY_BEARING)
+        .blobType("test-sizing")
+        .entryCount(0)
+        .build();
+  }
+
+  private record SizedDefinition(long bytes) implements IndexDefinition {
+    @Override
+    public String type() {
+      return "test-sizing";
+    }
+
+    @Override
+    public int fieldId() {
+      return 1;
+    }
   }
 
   private static class LocalIO implements FileIO {
@@ -105,7 +265,20 @@ class TestDistributedIndexSearchSizing {
 
     @Override
     public IndexDefinition definition() {
-      throw new UnsupportedOperationException();
+      return new SizedDefinition(bytes);
+    }
+
+    @Override
+    public IndexBuildResult encodeEntriesWithMemory(List<IndexEntry> entries) {
+      return IndexBuildResult.of(
+          ByteBuffer.wrap(new byte[10]),
+          IndexFileMemory.builder()
+              .payloadBytes(10)
+              .preparedBytes(bytes)
+              .modelVersion(2)
+              .readerId("test-sizing/1")
+              .runtimeProfile("fixture")
+              .build());
     }
 
     @Override

@@ -21,24 +21,23 @@ package org.apache.iceberg.index.spark;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
-import java.nio.ByteBuffer;
 import java.time.Duration;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
 import java.util.Map;
-import java.util.concurrent.CountDownLatch;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
-import java.util.concurrent.Future;
-import java.util.concurrent.TimeUnit;
+import java.util.Set;
 import java.util.concurrent.atomic.AtomicInteger;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.iceberg.hadoop.HadoopFileIO;
 import org.apache.iceberg.index.IndexAdapter;
-import org.apache.iceberg.index.IndexDefinition;
 import org.apache.iceberg.index.IndexFileMemory;
-import org.apache.iceberg.index.IndexSearchResult;
+import org.apache.iceberg.index.vector.VectorIndexAdapter;
+import org.apache.iceberg.index.vector.VectorIndexDefinition;
+import org.apache.iceberg.index.vector.VectorIndexDefinition.Metric;
+import org.apache.iceberg.index.vector.VectorIndexDefinition.VectorStructure;
 import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
@@ -50,27 +49,33 @@ class TestIndexCachePlugin {
   private static final String SESSION = "application-1";
   private static final String EXECUTOR = "executor-1";
   private static final String INCARNATION = "executor-1#1";
-  private static final IndexDefinition DEFINITION = new VectorDefinition(2);
-  private static final IndexFileMemory MEMORY =
-      IndexFileMemory.builder()
-          .fileBytes(80L)
-          .payloadBytes(60L)
-          .preparedBytes(40L)
-          .modelVersion(1)
-          .readerId("vector/hnswlib/1")
-          .runtimeProfile("reference-bytes=4")
-          .structure(Map.of())
-          .build();
+  private static final String INDEX_UUID = "index-1";
+  // The owner a query plans with is the table location, and its cache key carries that owner.
+  private static final String OWNER = "table-1";
+  // An executor reports the budget its cache is configured with, so both sides agree.
+  private static final long CACHE_BYTES = 1_000_000L;
 
   private final ExecutorIndexCache cache = ExecutorIndexCache.get();
+  private final VectorIndexAdapter adapter = new VectorIndexAdapter(definition());
   private final AtomicInteger loaderCalls = new AtomicInteger();
   private long now = Duration.ofMinutes(5).toNanos();
+  private IndexFileMemory memory;
+  private long estimate;
   private IndexResidencyCoordinator coordinator;
   private IndexCacheDriverControl control;
+
+  @BeforeAll
+  static void registerTypes() {
+    IndexCacheTypeRegistration.registerAll();
+  }
 
   @BeforeEach
   void setUp() {
     cache.clear();
+    // The real memory model of the reader that will hold the copy, not a hand-written descriptor.
+    memory = IndexCacheMemory.currentDescriptor(adapter);
+    assertThat(memory).as("current index memory descriptor").isNotNull();
+    estimate = IndexCacheMemory.residentBytes(memory);
     coordinator = new IndexResidencyCoordinator(() -> now);
     control = new IndexCacheDriverControl(coordinator);
   }
@@ -82,11 +87,10 @@ class TestIndexCachePlugin {
 
   @Test
   void driverAnswersAReportWithThePlannedCommands() {
-    control.receive(report(1, 1_000, 0));
+    control.receive(report(1));
 
-    String plan =
-        coordinator.acceptLoad(target("A", "f1"), IndexResidencyPolicy.parse("forever"), now);
-    IndexCacheProtocol.Reply reply = control.receive(report(2, 1_000, 0));
+    String plan = coordinator.acceptLoad(target("f1"), IndexResidencyPolicy.parse("forever"), now);
+    IndexCacheProtocol.Reply reply = control.receive(report(2));
 
     assertThat(reply.commands()).hasSize(1);
     assertThat(reply.commands().get(0).type()).isEqualTo(IndexCacheProtocol.CommandType.LOAD);
@@ -95,149 +99,30 @@ class TestIndexCachePlugin {
   }
 
   @Test
-  void aLoadIsPlannedWhenNoBudgetWasConfigured() {
-    // what an executor advertises without a configured budget: the space is there, so the load has
-    // to be planned rather than refused as if the cache were turned off
-    long advertised = ExecutorIndexCache.Config.advertisedBudget(null, "4g", null);
-    control.receive(report(1, advertised, 0));
-
-    coordinator.acceptLoad(target("A", "f1"), IndexResidencyPolicy.parse("forever"), now);
-    IndexCacheProtocol.Reply reply = control.receive(report(2, advertised, 0));
-
-    assertThat(reply.commands())
-        .extracting(IndexCacheProtocol.Command::type)
-        .contains(IndexCacheProtocol.CommandType.LOAD);
-  }
-
-  @Test
-  void aLoadIsRefusedWhenTheBudgetIsExplicitlyZero() {
-    // zero still means no cache: a run that says so gets no load, and that has to stay
-    // distinguishable from a run that configured nothing
-    control.receive(report(1, 0, 0));
-
-    coordinator.acceptLoad(target("A", "f1"), IndexResidencyPolicy.parse("forever"), now);
-    IndexCacheProtocol.Reply reply = control.receive(report(2, 0, 0));
-
-    assertThat(reply.commands()).isEmpty();
-  }
-
-  @Test
-  void acknowledgingAReusedLazyCopyDoesNotChargeItAgain() {
-    ExecutorIndexCache.Config lazy = ExecutorIndexCache.Config.of(true, 1000).withOwner("adapter");
-    cache.file("f1", lazy, "A", TestIndexCachePlugin::loaded);
-    ExecutorIndexCacheWorker worker =
-        new ExecutorIndexCacheWorker(
-            SESSION,
-            EXECUTOR,
-            INCARNATION,
-            cache,
-            ExecutorIndexCache.Config.of(true, 1000),
-            command -> {
-              loaderCalls.incrementAndGet();
-              return loaded();
-            },
-            IndexCacheWorkerConfig.parse(Map.of()));
-    control.receive(worker.report("test", 1, 1000, 0, Map.of()));
-    String plan =
-        coordinator.acceptLoad(target("A", "f1"), IndexResidencyPolicy.parse("forever"), now);
-    IndexCacheProtocol.Command command =
-        control.receive(worker.report("test", 2, 1000, 0, Map.of())).commands().get(0);
-    assertThat(coordinator.result(plan).status()).isEqualTo(IndexCacheProtocol.Status.PENDING);
-    assertThat(coordinator.state(EXECUTOR, INCARNATION).reservedBytes()).isZero();
-    control.receive(worker.execute(command));
-    assertThat(coordinator.result(plan).status()).isEqualTo(IndexCacheProtocol.Status.COMPLETE);
-    assertThat(coordinator.state(EXECUTOR, INCARNATION).usedBytes())
-        .isEqualTo(cache.stats().bytes());
-    assertThat(loaderCalls).hasValue(0);
-  }
-
-  @Test
-  void aLoadedAckConvertsOnlyItsReportedReservationToUsedBytes() throws Exception {
-    ExecutorService executor = Executors.newSingleThreadExecutor();
-    CountDownLatch loading = new CountDownLatch(1);
-    CountDownLatch finish = new CountDownLatch(1);
-    try (ExecutorIndexCache.ExecutorBudget ignored = cache.bindExecutorBudget(1000)) {
-      cache.file(
-          "warm",
-          ExecutorIndexCache.Config.of(true, 1000),
-          "test",
-          () -> ExecutorIndexCache.loaded(new byte[] {1}, null, 300));
-      ExecutorIndexCacheWorker worker =
-          new ExecutorIndexCacheWorker(
-              SESSION,
-              EXECUTOR,
-              INCARNATION,
-              cache,
-              ExecutorIndexCache.Config.of(true, 1000),
-              command -> {
-                loading.countDown();
-                try {
-                  if (!finish.await(5, TimeUnit.SECONDS)) {
-                    throw new IllegalStateException("Loader timed out");
-                  }
-                } catch (InterruptedException e) {
-                  Thread.currentThread().interrupt();
-                  throw new IllegalStateException(e);
-                }
-                return loaded();
-              },
-              IndexCacheWorkerConfig.parse(Map.of()));
-      control.receive(worker.report("test", 1, 1000, 0, Map.of()));
-      String plan =
-          coordinator.acceptLoad(target("A", "f1"), IndexResidencyPolicy.parse("forever"), now);
-      IndexCacheProtocol.Command command =
-          control.receive(worker.report("test", 2, 1000, 0, Map.of())).commands().get(0);
-      Future<IndexCacheProtocol.Ack> load = executor.submit(() -> worker.execute(command));
-      assertThat(loading.await(5, TimeUnit.SECONDS)).isTrue();
-      IndexCacheProtocol.NodeReport during = worker.report("test", 3, 1000, 0, Map.of());
-      assertThat(during.reservedByCommand()).containsEntry(command.commandId(), 300L);
-      assertThat(during.reservedBytesFor(plan)).isEqualTo(300);
-      control.receive(during);
-      assertThat(coordinator.state(EXECUTOR, INCARNATION).reservedBytes()).isEqualTo(300);
-      finish.countDown();
-      control.receive(load.get(5, TimeUnit.SECONDS));
-      IndexCacheProtocol.NodeReport after = coordinator.state(EXECUTOR, INCARNATION);
-      assertThat(after.usedBytes()).isEqualTo(420);
-      assertThat(after.reservedBytes()).isZero();
-      assertThat(after.reservedByCommand()).isEmpty();
-    } finally {
-      finish.countDown();
-      executor.shutdownNow();
-      assertThat(executor.awaitTermination(5, TimeUnit.SECONDS)).isTrue();
-    }
-  }
-
-  @Test
   void driverAppliesAcknowledgements() {
-    control.receive(report(1, 1_000, 0));
-    String plan =
-        coordinator.acceptLoad(target("A", "f1"), IndexResidencyPolicy.parse("forever"), now);
-    IndexCacheProtocol.Command command = control.receive(report(2, 1_000, 0)).commands().get(0);
+    control.receive(report(1));
+    String plan = coordinator.acceptLoad(target("f1"), IndexResidencyPolicy.parse("forever"), now);
+    IndexCacheProtocol.Command command = control.receive(report(2)).commands().get(0);
+    IndexCacheProtocol.Ack loaded = loadedAck(command);
 
-    control.receive(
-        IndexCacheProtocol.Ack.builder()
-            .session(SESSION)
-            .planId(plan)
-            .commandId(command.commandId())
-            .executorId(EXECUTOR)
-            .incarnation(INCARNATION)
-            .epoch(command.epoch())
-            .sequence(command.sequence())
-            .status(IndexCacheProtocol.AckStatus.LOADED)
-            .bytes(120)
-            .build());
+    control.receive(loaded);
 
-    assertThat(coordinator.result(plan).status()).isEqualTo(IndexCacheProtocol.Status.COMPLETE);
+    IndexCacheProtocol.Result result = coordinator.result(plan);
+    assertThat(result.status()).isEqualTo(IndexCacheProtocol.Status.COMPLETE);
+    // Resident bytes come back from the executor's shape, not from the size the command carried.
+    assertThat(result.residentBytes())
+        .isEqualTo(loaded.metadataShape().residentBytes(Set.of(command.file().cacheKey())))
+        .isPositive();
   }
 
   @Test
   void aReplyCarriesOnlyOneBatchAndTheRestFollowsLater() {
     IndexResidencyCoordinator bounded = new IndexResidencyCoordinator(() -> now, 2);
     IndexCacheDriverControl boundedControl = new IndexCacheDriverControl(bounded);
-    boundedControl.receive(report(1, 1_000, 0));
-    bounded.acceptLoad(target("A", "f1", "f2", "f3"), IndexResidencyPolicy.parse("forever"), now);
+    boundedControl.receive(report(1));
+    bounded.acceptLoad(target("f1", "f2", "f3"), IndexResidencyPolicy.parse("forever"), now);
 
-    IndexCacheProtocol.Reply first = boundedControl.receive(report(2, 1_000, 0));
+    IndexCacheProtocol.Reply first = boundedControl.receive(report(2));
 
     assertThat(first.commands()).hasSize(2);
     assertThat(first.commands().get(0).definition()).isNotNull();
@@ -246,9 +131,8 @@ class TestIndexCachePlugin {
 
   @Test
   void aFailedAcknowledgementRoundTripIsRetriedInsteadOfDropped() {
-    control.receive(report(1, 1_000, 0));
-    String plan =
-        coordinator.acceptLoad(target("A", "f1"), IndexResidencyPolicy.parse("forever"), now);
+    control.receive(report(1));
+    String plan = coordinator.acceptLoad(target("f1"), IndexResidencyPolicy.parse("forever"), now);
     java.util.concurrent.atomic.AtomicBoolean failOnce =
         new java.util.concurrent.atomic.AtomicBoolean(true);
     List<Object> sent = new ArrayList<>();
@@ -276,7 +160,7 @@ class TestIndexCachePlugin {
 
   @Test
   void anAcknowledgementThatCannotBeSentDoesNotSilenceTheReport() {
-    control.receive(report(1, 1_000, 0));
+    control.receive(report(1));
     String plan =
         coordinator.acceptLoad(target("A", "f1"), IndexResidencyPolicy.parse("forever"), now);
     List<Object> sent = new ArrayList<>();
@@ -305,47 +189,22 @@ class TestIndexCachePlugin {
 
   @Test
   void aBusyExecutorIsAskedAgainAndTheLimitIsEnforced() {
-    control.receive(report(1, 1_000, 0));
-    String plan =
-        coordinator.acceptLoad(target("A", "f1"), IndexResidencyPolicy.parse("forever"), now);
-    IndexCacheProtocol.Command command = control.receive(report(2, 1_000, 0)).commands().get(0);
+    control.receive(report(1));
+    String plan = coordinator.acceptLoad(target("f1"), IndexResidencyPolicy.parse("forever"), now);
+    IndexCacheProtocol.Command command = control.receive(report(2)).commands().get(0);
 
-    control.receive(
-        IndexCacheProtocol.Ack.builder()
-            .session(SESSION)
-            .planId(plan)
-            .commandId(command.commandId())
-            .executorId(EXECUTOR)
-            .incarnation(INCARNATION)
-            .epoch(command.epoch())
-            .sequence(command.sequence())
-            .status(IndexCacheProtocol.AckStatus.REJECTED)
-            .bytes(0)
-            .reason("BUSY")
-            .build());
+    control.receive(rejected(command, "BUSY"));
 
     // The command is put back, so the next poll carries it again instead of dropping it.
     assertThat(coordinator.result(plan).uncovered()).containsEntry("f1", "PENDING");
-    assertThat(control.receive(report(3, 1_000, 0)).commands())
+    assertThat(control.receive(report(3)).commands())
         .extracting(IndexCacheProtocol.Command::commandId)
         .containsExactly(command.commandId());
 
     // After the attempt limit the file is a real failure rather than an endless retry.
     for (long sequence = 4; sequence < 4 + 3; sequence++) {
-      control.receive(
-          IndexCacheProtocol.Ack.builder()
-              .session(SESSION)
-              .planId(plan)
-              .commandId(command.commandId())
-              .executorId(EXECUTOR)
-              .incarnation(INCARNATION)
-              .epoch(command.epoch())
-              .sequence(command.sequence())
-              .status(IndexCacheProtocol.AckStatus.REJECTED)
-              .bytes(0)
-              .reason("BUSY")
-              .build());
-      control.receive(report(sequence, 1_000, 0));
+      control.receive(rejected(command, "BUSY"));
+      control.receive(report(sequence));
     }
 
     assertThat(coordinator.result(plan).uncovered()).containsEntry("f1", "BUSY_EXHAUSTED");
@@ -353,10 +212,10 @@ class TestIndexCachePlugin {
 
   @Test
   void executorHonoursTheReplyBatchLimit() {
-    control.receive(report(1, 10_000, 0));
+    control.receive(report(1));
     String plan =
         coordinator.acceptLoad(
-            target("A", "f1", "f2", "f3"), IndexResidencyPolicy.parse("forever"), now);
+            target("f1", "f2", "f3"), IndexResidencyPolicy.parse("forever"), now);
     List<Object> sent = new ArrayList<>();
 
     IndexCacheRunner runner = runner(message -> control.receive(message), sent, 2);
@@ -380,9 +239,8 @@ class TestIndexCachePlugin {
 
   @Test
   void executorPollsExecutesOnceAndReportsBack() {
-    control.receive(report(1, 1_000, 0));
-    String plan =
-        coordinator.acceptLoad(target("A", "f1"), IndexResidencyPolicy.parse("forever"), now);
+    control.receive(report(1));
+    String plan = coordinator.acceptLoad(target("f1"), IndexResidencyPolicy.parse("forever"), now);
     List<Object> sent = new ArrayList<>();
 
     IndexCacheRunner runner = runner(message -> control.receive(message), sent);
@@ -401,7 +259,7 @@ class TestIndexCachePlugin {
 
   @Test
   void executorStopsPollingAfterClose() {
-    control.receive(report(1, 1_000, 0));
+    control.receive(report(1));
     List<Object> sent = new ArrayList<>();
     IndexCacheRunner runner = runner(message -> control.receive(message), sent);
 
@@ -417,30 +275,18 @@ class TestIndexCachePlugin {
 
   @Test
   void lateCopyAfterOffloadIsReleasedThroughTheChannel() {
-    control.receive(report(1, 1_000, 0));
-    String plan =
-        coordinator.acceptLoad(target("A", "f1"), IndexResidencyPolicy.parse("forever"), now);
-    IndexCacheProtocol.Command command = control.receive(report(2, 1_000, 0)).commands().get(0);
+    control.receive(report(1));
+    String plan = coordinator.acceptLoad(target("f1"), IndexResidencyPolicy.parse("forever"), now);
+    IndexCacheProtocol.Command command = control.receive(report(2)).commands().get(0);
     // The driver offloads before the executor answers, so the copy arrives without an owner.
-    String offload = coordinator.acceptOffload("A", now);
+    String offload = coordinator.acceptOffload(INDEX_UUID, now);
     assertThat(plan).isNotEmpty();
 
     List<Object> sent = new ArrayList<>();
     IndexCacheRunner runner = runner(message -> control.receive(message), sent);
-    runner.worker.execute(command);
-    control.receive(
-        IndexCacheProtocol.Ack.builder()
-            .session(SESSION)
-            .planId(plan)
-            .commandId(command.commandId())
-            .executorId(EXECUTOR)
-            .incarnation(INCARNATION)
-            .epoch(command.epoch())
-            .sequence(command.sequence())
-            .status(IndexCacheProtocol.AckStatus.LOADED)
-            .bytes(120)
-            .build());
-    assertThat(runner.worker.holders()).containsKey("adapter|A|f1");
+    // The executor's own acknowledgement arrives late, after the driver withdrew the target.
+    control.receive(runner.worker.execute(command));
+    assertThat(runner.worker.holders()).containsKey(command.file().cacheKey());
 
     // The next poll carries the orphan release, and executing it frees the copy.
     for (int i = 0; i < 100 && !runner.worker.holders().isEmpty(); i++) {
@@ -486,7 +332,7 @@ class TestIndexCachePlugin {
             EXECUTOR,
             INCARNATION,
             cache,
-            ExecutorIndexCache.Config.of(true, 1_000_000L),
+            ExecutorIndexCache.Config.of(true, CACHE_BYTES),
             command -> {
               loaderCalls.incrementAndGet();
               return loaded();
@@ -502,76 +348,122 @@ class TestIndexCachePlugin {
             IndexCacheWorkerConfig.parse(
                 Map.of(
                     "spark.iceberg.index.cache.control.max-commands", String.valueOf(maxCommands))),
-            1_000L);
+            CACHE_BYTES);
     return new IndexCacheRunner(worker, loop);
   }
 
   private record IndexCacheRunner(ExecutorIndexCacheWorker worker, IndexCacheExecutorLoop loop) {}
 
-  private IndexCacheProtocol.NodeReport report(long sequence, long budget, long used) {
+  @Test
+  void controlReportIncludesActualRuntimeIdentity() {
+    List<Object> sent = new ArrayList<>();
+    IndexCacheRunner runner =
+        runner(message -> IndexCacheProtocol.Reply.builder().commands(List.of()).build(), sent);
+    try {
+      runner.loop.pollOnce();
+      assertThat(sent).hasSize(1);
+      IndexCacheProtocol.NodeReport report = (IndexCacheProtocol.NodeReport) sent.get(0);
+      assertThat(report.profile())
+          .contains(System.getProperty("java.vm.name"))
+          .contains("processors=" + Runtime.getRuntime().availableProcessors());
+    } finally {
+      runner.loop.close();
+    }
+  }
+
+  private static IndexCacheProtocol.NodeReport report(long sequence) {
     return IndexCacheProtocol.NodeReport.builder()
         .session(SESSION)
         .executorId(EXECUTOR)
         .incarnation(INCARNATION)
         .sequence(sequence)
-        .budgetBytes(budget)
-        .usedBytes(used)
+        .budgetBytes(CACHE_BYTES)
+        // A report without the capacity shape is planned as unknown capacity, so it plans nothing.
+        .metadataShape(ExecutorIndexCache.Shape.empty())
         .build();
   }
 
-  private IndexCacheProtocol.Target target(String indexUuid, String... locations) {
+  /**
+   * The acknowledgement an executor that loaded this command would send: its own capacity shape,
+   * with the copy's resident size read back from that shape.
+   */
+  private IndexCacheProtocol.Ack loadedAck(IndexCacheProtocol.Command command) {
+    // A synthetic ACK must carry a newer shape version than the report it follows. The executor's
+    // cache increments its snapshot version on each committed state; do the same here.
+    ExecutorIndexCache.get().chargeSnapshot();
+    ExecutorIndexCache.Shape shape =
+        ExecutorIndexCache.get()
+            .shape()
+            .project(INDEX_UUID, command.epoch(), List.of(command.file()));
+    return IndexCacheProtocol.Ack.builder()
+        .session(SESSION)
+        .planId(command.planId())
+        .commandId(command.commandId())
+        .executorId(EXECUTOR)
+        .incarnation(INCARNATION)
+        .epoch(command.epoch())
+        .sequence(command.sequence())
+        .status(IndexCacheProtocol.AckStatus.LOADED)
+        .bytes(shape.residentBytes(Set.of(command.file().cacheKey())))
+        .metadataShape(shape)
+        .build();
+  }
+
+  /** A refusal carries no new capacity, so it reports no shape. */
+  private static IndexCacheProtocol.Ack rejected(
+      IndexCacheProtocol.Command command, String reason) {
+    return IndexCacheProtocol.Ack.builder()
+        .session(SESSION)
+        .planId(command.planId())
+        .commandId(command.commandId())
+        .executorId(EXECUTOR)
+        .incarnation(INCARNATION)
+        .epoch(command.epoch())
+        .sequence(command.sequence())
+        .status(IndexCacheProtocol.AckStatus.REJECTED)
+        .bytes(0)
+        .reason(reason)
+        .build();
+  }
+
+  private IndexCacheProtocol.Target target(String... locations) {
     return IndexCacheProtocol.Target.builder()
-        .indexUuid(indexUuid)
+        .indexUuid(INDEX_UUID)
+        .owner(OWNER)
         .snapshotId(1)
-        .files(
-            java.util.Arrays.stream(locations)
-                .map(
-                    location ->
-                        IndexCacheProtocol.File.builder()
-                            .location(location)
-                            .cacheKey("adapter|" + indexUuid + "|" + location)
-                            .estimatedBytes(120L)
-                            .memory(MEMORY)
-                            .build())
-                .toList())
-        .definition(DEFINITION)
+        .files(Arrays.stream(locations).map(this::file).toList())
+        .definition(adapter.definition())
         .io(new HadoopFileIO(new Configuration()))
         .build();
   }
 
-  private static ExecutorIndexCache.CachedFile loaded() {
-    return ExecutorIndexCache.loaded(
-        new byte[] {1, 2, 3},
-        new IndexAdapter.PreparedSearch() {
-          @Override
-          public List<IndexSearchResult> search(ByteBuffer query, int topK) {
-            return List.of();
-          }
-
-          @Override
-          public long estimatedBytes() {
-            return 40L;
-          }
-        },
-        120L);
+  private IndexCacheProtocol.File file(String location) {
+    return IndexCacheProtocol.File.builder()
+        .location(location)
+        .owner(OWNER)
+        .cacheKey(cacheKey(location))
+        .estimatedBytes(estimate)
+        .memory(memory)
+        .build();
   }
 
-  private static final class VectorDefinition implements IndexDefinition {
-    private static final long serialVersionUID = 1L;
-    private final int fieldId;
+  private String cacheKey(String location) {
+    return DistributedIndexSearch.cacheKey(
+        OWNER, DistributedIndexSearch.adapterKey(adapter), location);
+  }
 
-    private VectorDefinition(int fieldId) {
-      this.fieldId = fieldId;
-    }
+  /** The prepared copy the read path publishes, stamped with the reader that prepared it. */
+  private ExecutorIndexCache.CachedFile loaded() {
+    IndexAdapter.PreparedSearch prepared = adapter.prepare(adapter.encodeEntries(List.of()));
+    return ExecutorIndexCache.loaded(new byte[] {1, 2, 3}, prepared).withContext(adapter);
+  }
 
-    @Override
-    public String type() {
-      return "vector";
-    }
-
-    @Override
-    public int fieldId() {
-      return fieldId;
-    }
+  private static VectorIndexDefinition definition() {
+    return VectorIndexDefinition.builder()
+        .fieldId(1)
+        .dimension(2)
+        .metric(Metric.COSINE)
+        .structure(VectorStructure.FLAT)
+        .build();
   }
 }

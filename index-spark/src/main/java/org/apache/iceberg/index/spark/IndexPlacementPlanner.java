@@ -40,7 +40,7 @@ final class IndexPlacementPlanner {
       Preconditions.checkArgument(
           identities.add(report.executorId()), "Duplicate executor: %s", report.executorId());
       if (report.budgetBytes() > 0) {
-        nodes.add(new WorkingNode(report));
+        nodes.add(new WorkingNode(report, target.indexUuid()));
       }
     }
 
@@ -55,7 +55,10 @@ final class IndexPlacementPlanner {
     Map<String, String> rejected = new LinkedHashMap<>();
     Map<String, WorkingNode> chosen = new LinkedHashMap<>();
     for (IndexCacheProtocol.File file : files) {
-      if (file.estimatedBytes() == null) {
+      if (file.estimatedBytes() == null
+          || file.owner() == null
+          || file.owner().isBlank()
+          || file.memory() == null) {
         rejected.put(file.location(), "SIZE_UNKNOWN");
         continue;
       }
@@ -136,42 +139,77 @@ final class IndexPlacementPlanner {
       return "NO_EXECUTORS";
     }
 
+    boolean known = false;
     for (WorkingNode node : nodes) {
-      if (file.estimatedBytes() <= node.report.budgetBytes()) {
-        return "INSUFFICIENT_CAPACITY";
+      if (node.shape == null || !node.shape.charge().known()) {
+        continue;
+      }
+      known = true;
+      try {
+        ExecutorIndexCache.ChargeSnapshot empty =
+            ExecutorIndexCache.Shape.empty()
+                .projectAdmission(node.indexUuid, Long.MAX_VALUE, List.of(file))
+                .charge();
+        if (empty.usedBytes() <= node.report.budgetBytes()) {
+          return "INSUFFICIENT_CAPACITY";
+        }
+      } catch (RuntimeException e) {
+        return "SIZE_UNKNOWN";
       }
     }
-
-    return "FILE_TOO_LARGE";
+    return known ? "FILE_TOO_LARGE" : "SIZE_UNKNOWN";
   }
 
   private static final class WorkingNode {
     private final IndexCacheProtocol.NodeReport report;
-    private long occupied;
+    private final String indexUuid;
+    private ExecutorIndexCache.Shape shape;
 
-    private WorkingNode(IndexCacheProtocol.NodeReport report) {
+    private WorkingNode(IndexCacheProtocol.NodeReport report, String indexUuid) {
       this.report = report;
-      this.occupied = Math.addExact(report.usedBytes(), report.reservedBytes());
+      this.indexUuid = indexUuid;
+      this.shape = report.metadataShape();
     }
 
     private boolean holds(IndexCacheProtocol.File file) {
-      return report.holders().containsKey(file.cacheKey());
+      return report.holders().containsKey(file.cacheKey())
+          && (shape == null || shape.owns(indexUuid, file.cacheKey()));
     }
 
     private boolean fits(IndexCacheProtocol.File file) {
-      return occupied <= report.budgetBytes() && extra(file) <= report.budgetBytes() - occupied;
-    }
-
-    private long extra(IndexCacheProtocol.File file) {
-      return holds(file) ? 0 : file.estimatedBytes();
+      if (shape == null || !shape.charge().known()) {
+        return false;
+      }
+      try {
+        return after(file) <= report.budgetBytes();
+      } catch (RuntimeException e) {
+        return false;
+      }
     }
 
     private long after(IndexCacheProtocol.File file) {
-      return Math.addExact(occupied, extra(file));
+      if (holds(file)) {
+        return Math.addExact(report.usedBytes(), report.reservedBytes());
+      }
+      ExecutorIndexCache.ChargeSnapshot current = shape.charge();
+      ExecutorIndexCache.ChargeSnapshot projected =
+          shape.projectAdmission(indexUuid, Long.MAX_VALUE, List.of(file)).charge();
+      long incremental =
+          Math.subtractExact(
+              Math.addExact(projected.usedBytes(), projected.reservedBytes()),
+              Math.addExact(current.usedBytes(), current.reservedBytes()));
+      // Reservations made while planning an earlier file live in the shape; count whichever
+      // occupancy is larger so migration cannot spend room already promised to another file.
+      long baseUsed = Math.max(report.usedBytes(), current.usedBytes());
+      long baseReserved = Math.max(report.reservedBytes(), current.reservedBytes());
+      return Math.addExact(Math.addExact(baseUsed, baseReserved), incremental);
     }
 
     private void reserve(IndexCacheProtocol.File file) {
-      this.occupied = after(file);
+      if (shape == null) {
+        shape = ExecutorIndexCache.Shape.empty();
+      }
+      this.shape = shape.projectAdmission(indexUuid, Long.MAX_VALUE, List.of(file));
     }
   }
 }

@@ -20,6 +20,7 @@ package org.apache.iceberg.index.spark;
 
 import java.io.Serializable;
 import java.nio.ByteBuffer;
+import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.Iterator;
 import java.util.List;
@@ -31,13 +32,13 @@ import org.apache.iceberg.Table;
 import org.apache.iceberg.index.IndexAdapter;
 import org.apache.iceberg.index.IndexBlob;
 import org.apache.iceberg.index.IndexFile;
+import org.apache.iceberg.index.IndexFileMemory;
 import org.apache.iceberg.index.IndexMetadata;
 import org.apache.iceberg.index.IndexQuery;
 import org.apache.iceberg.index.IndexReader;
 import org.apache.iceberg.index.IndexSearchResult;
 import org.apache.iceberg.index.IndexTypes;
 import org.apache.iceberg.index.PuffinIndexFileContainer;
-import org.apache.iceberg.inmemory.InMemoryInputFile;
 import org.apache.iceberg.io.FileIO;
 import org.apache.iceberg.io.IOUtil;
 import org.apache.iceberg.io.InputFile;
@@ -155,7 +156,7 @@ public final class DistributedIndexSearch {
     // properties of its catalog rather than with whatever the session happens to be configured with
     Broadcast<FileIO> ioRef = context.broadcast(table.io());
     // whether an executor remembers index files between queries, and how much it may keep
-    long workingSet = workingSetBytes(table.io(), files, adapter);
+    long workingSet = workingSetBytes(table.io(), files, adapter, table.location());
     Broadcast<ExecutorIndexCache.Config> cacheRef =
         context.broadcast(ExecutorIndexCache.Config.from(spark, workingSet, table.location()));
     String cacheKey = adapterKey(adapter);
@@ -302,7 +303,7 @@ public final class DistributedIndexSearch {
     }
     Broadcast<List<byte[]>> queriesRef = context.broadcast(queryPayloads);
     Broadcast<FileIO> ioRef = context.broadcast(table.io());
-    long workingSet = workingSetBytes(table.io(), files, adapter);
+    long workingSet = workingSetBytes(table.io(), files, adapter, table.location());
     Broadcast<ExecutorIndexCache.Config> cacheRef =
         context.broadcast(ExecutorIndexCache.Config.from(spark, workingSet, table.location()));
     String cacheKey = adapterKey(adapter);
@@ -559,30 +560,101 @@ public final class DistributedIndexSearch {
   }
 
   /**
-   * The bytes the query's index files hold once their payloads are prepared.
-   *
-   * <p>What a budget has to cover is the memory a query needs, not the size of the files on disk: a
-   * decoded entry list, a set of centroids and a graph with a connection list per node all cost
-   * more than the bytes they were read from, and by a different factor each. Charging the budget
-   * against the file size is what left a derived budget covering two thirds of the files it was
-   * supposed to hold, and one factor standing in for all three structures would be the same guess
-   * with a different number.
-   *
-   * <p>So the size is measured rather than multiplied: each payload is read and prepared once, and
-   * what it reports is remembered. An index file never changes once written, so the cost is a
-   * header read per file the first time and nothing after that.
+   * The retained-state estimate is only known under the table that owns the cache keys, so the
+   * owner-less form is always unknown (-1). Use {@link #workingSetBytes(FileIO, List, IndexAdapter,
+   * String)} with the table location.
    */
   static long workingSetBytes(FileIO io, List<IndexFile> files, IndexAdapter adapter) {
-    long total = 0;
-    for (IndexFile file : files) {
-      total += preparedBytesOf(io, file.location(), adapter);
-    }
-
-    return total;
+    return -1;
   }
 
-  private static final Map<String, Long> KNOWN_PREPARED_BYTES =
-      new java.util.concurrent.ConcurrentHashMap<>();
+  /**
+   * The prepared-state bytes of one index file under this reader and runtime, or -1 when unknown.
+   *
+   * <p>A manifest record matching the current model, reader and runtime is trusted without a read;
+   * otherwise the file is read and prepared once to re-estimate it. The value is the retained
+   * prepared state P, not the container or encoded payload lengths, which are diagnostic only.
+   */
+  static long preparedBytesOf(FileIO io, IndexFile file, IndexAdapter adapter) {
+    IndexFileMemory memory = IndexCacheMemory.resolveMemory(io, file, adapter);
+    return memory == null ? -1 : memory.preparedBytes();
+  }
+
+  static long workingSetBytes(
+      FileIO io, List<IndexFile> files, IndexAdapter adapter, String owner) {
+    if (owner == null || owner.isBlank() || IndexCacheMemory.currentDescriptor(adapter) == null) {
+      return -1;
+    }
+    List<IndexCacheProtocol.File> planned = new ArrayList<>();
+    for (IndexFile file : files) {
+      IndexFileMemory memory = IndexCacheMemory.resolveMemory(io, file, adapter);
+      if (memory == null) {
+        return -1;
+      }
+      planned.add(
+          IndexCacheProtocol.File.builder()
+              .location(file.location())
+              .cacheKey(cacheKey(owner, adapterKey(adapter), file.location()))
+              .owner(owner)
+              .memory(memory)
+              .estimatedBytes(IndexCacheMemory.residentBytes(memory))
+              .build());
+    }
+    try {
+      return ExecutorIndexCache.Shape.empty().project(null, 0, planned).charge().usedBytes();
+    } catch (RuntimeException e) {
+      return -1;
+    }
+  }
+
+  static final class LoadedFile {
+    private final ExecutorIndexCache.CachedFile file;
+    private final long fileBytes;
+    private final long payloadBytes;
+    private final long preparedBytes;
+
+    LoadedFile(
+        ExecutorIndexCache.CachedFile file, long fileBytes, long payloadBytes, long preparedBytes) {
+      this.file = file;
+      this.fileBytes = fileBytes;
+      this.payloadBytes = payloadBytes;
+      this.preparedBytes = preparedBytes;
+    }
+
+    ExecutorIndexCache.CachedFile file() {
+      return file;
+    }
+
+    long fileBytes() {
+      return fileBytes;
+    }
+
+    long payloadBytes() {
+      return payloadBytes;
+    }
+
+    long preparedBytes() {
+      return preparedBytes;
+    }
+  }
+
+  private static final class PreparedFile {
+    private final IndexAdapter.PreparedSearch searcher;
+    private final long payloadBytes;
+
+    private PreparedFile(IndexAdapter.PreparedSearch searcher, long payloadBytes) {
+      this.searcher = searcher;
+      this.payloadBytes = payloadBytes;
+    }
+
+    IndexAdapter.PreparedSearch searcher() {
+      return searcher;
+    }
+
+    long payloadBytes() {
+      return payloadBytes;
+    }
+  }
 
   private static final Set<String> WARNED_ESTIMATE_REASONS = ConcurrentHashMap.newKeySet();
 
@@ -605,8 +677,20 @@ public final class DistributedIndexSearch {
   }
 
   static ExecutorIndexCache.CachedFile loadFile(FileIO io, String location, IndexAdapter adapter) {
-    byte[] content = readPayload(io, location);
-    return ExecutorIndexCache.loaded(content, prepareFile(content, adapter));
+    return loadFileState(io, location, adapter).file();
+  }
+
+  static LoadedFile loadFileState(FileIO io, String location, IndexAdapter adapter) {
+    InputFile input = io.newInputFile(location);
+    long length = input.getLength();
+    if (length > IndexPayloadLimits.MAX_PAYLOAD_BYTES) {
+      throw new IllegalArgumentException(IndexPayloadLimits.tooLargeToRead(length, location));
+    }
+    PreparedFile prepared = prepareFile(input, adapter);
+    ExecutorIndexCache.CachedFile file =
+        ExecutorIndexCache.loaded(prepared.payloadBytes(), prepared.searcher())
+            .withContext(adapter);
+    return new LoadedFile(file, length, prepared.payloadBytes(), file.preparedBytes());
   }
 
   /**
@@ -623,56 +707,6 @@ public final class DistributedIndexSearch {
       // a length is a hint for sizing, never a reason to fail a read that will report the error
       return 0L;
     }
-  }
-
-  private static long preparedBytesOf(FileIO io, String location, IndexAdapter adapter) {
-    Long known = KNOWN_PREPARED_BYTES.get(location);
-    if (known != null) {
-      return known;
-    }
-
-    long bytes;
-    try {
-      // Use the same retained-state charge as executor admission, including the payload buffer.
-      bytes = loadFile(io, location, adapter).bytes();
-    } catch (RuntimeException e) {
-      // a size only sizes a budget: an index file this build cannot read is reported elsewhere, and
-      // failing the query here would turn an unreadable index into an unanswerable query
-      warnEstimateFallback("the prepared size of an index file could not be measured", e);
-      return sizeOf(io, location);
-    }
-
-    if (KNOWN_PREPARED_BYTES.size() < 100_000) {
-      KNOWN_PREPARED_BYTES.put(location, bytes);
-    }
-
-    return bytes;
-  }
-
-  private static final Map<String, Long> KNOWN_SIZES =
-      new java.util.concurrent.ConcurrentHashMap<>();
-
-  private static long sizeOf(FileIO io, String location) {
-    Long known = KNOWN_SIZES.get(location);
-    if (known != null) {
-      return known;
-    }
-
-    long size;
-    try {
-      size = io.newInputFile(location).getLength();
-    } catch (RuntimeException e) {
-      // a size is only used to size a budget, so an unreadable one leaves the budget to its
-      // defaults rather than failing the query
-      warnEstimateFallback("the length of an index file could not be read", e);
-      return 0L;
-    }
-
-    if (KNOWN_SIZES.size() < 100_000) {
-      KNOWN_SIZES.put(location, size);
-    }
-
-    return size;
   }
 
   /** Reads the payload of one index file, which an executor reads whole. */
@@ -693,7 +727,7 @@ public final class DistributedIndexSearch {
   }
 
   /** Prepares one index file, which an executor has read whole, for any number of searches. */
-  private static IndexAdapter.PreparedSearch prepareFile(byte[] content, IndexAdapter adapter) {
+  private static PreparedFile prepareFile(InputFile input, IndexAdapter adapter) {
     // every type the adapter can still read, not just the one it writes: an index built before a
     // rename is still on tables, and a reader that only knew the current name would skip it
     java.util.Set<String> blobTypes =
@@ -703,7 +737,7 @@ public final class DistributedIndexSearch {
 
     List<IndexBlob> blobs;
     try {
-      blobs = new PuffinIndexFileContainer().read(new InMemoryInputFile(content));
+      blobs = new PuffinIndexFileContainer().read(input);
     } catch (java.io.IOException e) {
       throw new java.io.UncheckedIOException("Failed to read an index file", e);
     }
@@ -714,10 +748,13 @@ public final class DistributedIndexSearch {
       }
 
       ByteBuffer payload = ByteBuffer.wrap(blob.payload());
+      long payloadBytes = payload.remaining();
       try {
-        return adapter.writesAuxiliaryFiles()
-            ? adapter.prepareAuxiliary(payload)
-            : adapter.prepare(payload);
+        IndexAdapter.PreparedSearch searcher =
+            adapter.writesAuxiliaryFiles()
+                ? adapter.prepareAuxiliary(payload)
+                : adapter.prepare(payload);
+        return new PreparedFile(searcher, payloadBytes);
       } catch (ClassCastException | IllegalArgumentException e) {
         // a payload an index was written with can stop being readable when the entries it holds
         // change shape; that is a rebuild, and the message has to say so rather than look like a
@@ -750,6 +787,8 @@ public final class DistributedIndexSearch {
   static String adapterKey(IndexAdapter adapter) {
     return adapter.getClass().getName()
         + "|"
-        + (adapter.writesAuxiliaryFiles() ? adapter.auxiliaryBlobType() : adapter.entryBlobType());
+        + (adapter.writesAuxiliaryFiles() ? adapter.auxiliaryBlobType() : adapter.entryBlobType())
+        + ":"
+        + IndexCacheMemory.readerKey(adapter);
   }
 }

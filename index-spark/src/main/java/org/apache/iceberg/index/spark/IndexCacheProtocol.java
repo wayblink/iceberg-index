@@ -62,6 +62,7 @@ final class IndexCacheProtocol {
     private static final long serialVersionUID = 1L;
     private final String location;
     private final String cacheKey;
+    private final String owner;
     private final String kind;
     private final String blobType;
     // ByteBuffer is not serializable; the payload travels as a byte array and is wrapped on read.
@@ -89,6 +90,7 @@ final class IndexCacheProtocol {
 
       this.location = builder.location;
       this.cacheKey = builder.cacheKey;
+      this.owner = builder.owner;
       this.kind = builder.kind;
       this.blobType = builder.blobType;
       this.payload = builder.payload == null ? null : copyOfRemaining(builder.payload);
@@ -106,6 +108,10 @@ final class IndexCacheProtocol {
 
     String cacheKey() {
       return cacheKey;
+    }
+
+    String owner() {
+      return owner;
     }
 
     String kind() {
@@ -132,6 +138,7 @@ final class IndexCacheProtocol {
     static final class Builder {
       private String location;
       private String cacheKey;
+      private String owner;
       private String kind;
       private String blobType;
       private ByteBuffer payload;
@@ -145,6 +152,11 @@ final class IndexCacheProtocol {
 
       Builder cacheKey(String value) {
         this.cacheKey = value;
+        return this;
+      }
+
+      Builder owner(String value) {
+        this.owner = value;
         return this;
       }
 
@@ -227,6 +239,7 @@ final class IndexCacheProtocol {
     private final List<File> files;
     private final IndexDefinition definition;
     private final FileIO io;
+    private final String owner;
 
     private Target(Builder builder) {
       Preconditions.checkArgument(
@@ -247,6 +260,7 @@ final class IndexCacheProtocol {
       this.files = List.copyOf(builder.files);
       this.definition = builder.definition;
       this.io = builder.io;
+      this.owner = builder.owner;
     }
 
     static Builder builder() {
@@ -270,6 +284,10 @@ final class IndexCacheProtocol {
       return files;
     }
 
+    String owner() {
+      return owner;
+    }
+
     /** Read context; a target without it can be planned but never executed. */
     boolean hasReadContext() {
       return definition != null && io != null;
@@ -287,6 +305,7 @@ final class IndexCacheProtocol {
       private String indexUuid;
       private long snapshotId;
       private List<File> files = List.of();
+      private String owner;
       private IndexDefinition definition;
       private FileIO io;
 
@@ -297,6 +316,11 @@ final class IndexCacheProtocol {
 
       Builder snapshotId(long value) {
         this.snapshotId = value;
+        return this;
+      }
+
+      Builder owner(String value) {
+        this.owner = value;
         return this;
       }
 
@@ -336,8 +360,24 @@ final class IndexCacheProtocol {
     private final Map<String, Long> reservedByCommand;
     private final String profile;
     private final Map<String, Long> accessAgeNanos;
+    private final ExecutorIndexCache.Shape metadataShape;
 
     private NodeReport(Builder builder) {
+      if (builder.metadataShape != null) {
+        Map<String, Long> shapeHolders = builder.metadataShape.holders();
+        if (!shapeHolders.isEmpty() || builder.holders.isEmpty()) {
+          builder.holders = shapeHolders;
+        }
+        ExecutorIndexCache.ChargeSnapshot charge = builder.metadataShape.charge();
+        if (charge.known()
+            && (charge.usedBytes() != 0 || charge.reservedBytes() != 0 || builder.usedBytes == 0)) {
+          // A known shape is the authority on what this executor retains. An unknown one says
+          // nothing, so the byte counts the report carries stand rather than becoming zero.
+          builder.usedBytes = charge.usedBytes();
+          builder.reservedBytes = charge.reservedBytes();
+          builder.releasingBytes = charge.releasingBytes();
+        }
+      }
       Preconditions.checkArgument(
           builder.session != null && !builder.session.isEmpty(), "Application session is missing");
       Preconditions.checkArgument(
@@ -377,6 +417,7 @@ final class IndexCacheProtocol {
       this.reservedByCommand = immutableMap(builder.reservedByCommand);
       this.profile = builder.profile;
       this.accessAgeNanos = immutableMap(builder.accessAgeNanos);
+      this.metadataShape = builder.metadataShape;
     }
 
     static Builder builder() {
@@ -441,6 +482,10 @@ final class IndexCacheProtocol {
       return accessAgeNanos;
     }
 
+    ExecutorIndexCache.Shape metadataShape() {
+      return metadataShape;
+    }
+
     /** Orders reports of the same executor so older reports cannot overwrite newer state. */
     long accessSequence() {
       return sequence;
@@ -464,6 +509,7 @@ final class IndexCacheProtocol {
           .reservedByPlan(reservedByPlan)
           .reservedByCommand(reservedByCommand())
           .profile(profile)
+          .metadataShape(metadataShape)
           .accessAgeNanos(accessAgeNanos);
     }
 
@@ -481,6 +527,7 @@ final class IndexCacheProtocol {
       private Map<String, Long> reservedByCommand = Map.of();
       private String profile;
       private Map<String, Long> accessAgeNanos = Map.of();
+      private ExecutorIndexCache.Shape metadataShape;
 
       Builder session(String value) {
         this.session = value;
@@ -544,6 +591,13 @@ final class IndexCacheProtocol {
 
       Builder accessAgeNanos(Map<String, Long> value) {
         this.accessAgeNanos = value;
+        return this;
+      }
+
+      Builder metadataShape(ExecutorIndexCache.Shape value) {
+        // The report constructor reconciles the shape with the byte counts the report carries, so
+        // this only records the shape: a copy must not lose the numbers it was given.
+        this.metadataShape = value;
         return this;
       }
 
@@ -763,6 +817,7 @@ final class IndexCacheProtocol {
     private final AckStatus status;
     private final long bytes;
     private final String reason;
+    private final ExecutorIndexCache.Shape metadataShape;
 
     private Ack(Builder builder) {
       Preconditions.checkArgument(builder.session != null, "ACK session is missing");
@@ -785,6 +840,7 @@ final class IndexCacheProtocol {
       this.status = builder.status;
       this.bytes = builder.bytes;
       this.reason = builder.reason;
+      this.metadataShape = builder.metadataShape;
     }
 
     static Builder builder() {
@@ -827,6 +883,25 @@ final class IndexCacheProtocol {
       return bytes;
     }
 
+    ExecutorIndexCache.Shape metadataShape() {
+      return metadataShape;
+    }
+
+    Builder copy() {
+      return builder()
+          .session(session)
+          .planId(planId)
+          .commandId(commandId)
+          .executorId(executorId)
+          .incarnation(incarnation)
+          .epoch(epoch)
+          .sequence(sequence)
+          .status(status)
+          .bytes(bytes)
+          .reason(reason)
+          .metadataShape(metadataShape);
+    }
+
     String reason() {
       return reason;
     }
@@ -842,6 +917,7 @@ final class IndexCacheProtocol {
       private AckStatus status;
       private long bytes;
       private String reason;
+      private ExecutorIndexCache.Shape metadataShape;
 
       Builder session(String value) {
         this.session = value;
@@ -890,6 +966,11 @@ final class IndexCacheProtocol {
 
       Builder reason(String value) {
         this.reason = value;
+        return this;
+      }
+
+      Builder metadataShape(ExecutorIndexCache.Shape value) {
+        this.metadataShape = value;
         return this;
       }
 

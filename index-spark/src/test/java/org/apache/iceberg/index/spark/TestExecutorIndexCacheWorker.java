@@ -26,13 +26,18 @@ import java.lang.reflect.Modifier;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
-import org.apache.iceberg.index.IndexAdapter;
 import org.apache.iceberg.index.IndexDefinition;
 import org.apache.iceberg.index.IndexFileMemory;
+import org.apache.iceberg.index.vector.VectorIndexAdapter;
+import org.apache.iceberg.index.vector.VectorIndexDefinition;
+import org.apache.iceberg.index.vector.VectorIndexDefinition.Metric;
+import org.apache.iceberg.index.vector.VectorIndexDefinition.VectorStructure;
 import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
@@ -40,25 +45,35 @@ class TestExecutorIndexCacheWorker {
   private static final String SESSION = "application-1";
   private static final String EXECUTOR = "executor-1";
   private static final String INCARNATION = "executor-1#1";
-  private static final IndexDefinition DEFINITION = new VectorDefinition(3);
-  private static final IndexFileMemory MEMORY =
-      IndexFileMemory.builder()
-          .fileBytes(80L)
-          .payloadBytes(80L)
-          .preparedBytes(40L)
-          .modelVersion(1)
-          .readerId("vector/hnswlib/1")
-          .runtimeProfile("reference-bytes=4")
-          .structure(Map.of("entries", 10L))
-          .build();
 
   private final ExecutorIndexCache cache = ExecutorIndexCache.get();
   private final AtomicInteger loaderCalls = new AtomicInteger();
   private final List<String> loadedLocations = new ArrayList<>();
+  private final VectorIndexAdapter adapter =
+      new VectorIndexAdapter(
+          VectorIndexDefinition.builder()
+              .fieldId(1)
+              .dimension(2)
+              .metric(Metric.EUCLIDEAN)
+              .structure(VectorStructure.FLAT)
+              .build());
+  private IndexDefinition definition;
+  private IndexFileMemory memory;
+  private long fileBytes;
   private ExecutorIndexCacheWorker worker;
+
+  @BeforeAll
+  static void registerTypes() {
+    IndexCacheTypeRegistration.registerAll();
+  }
 
   @BeforeEach
   void setUp() {
+    definition = adapter.definition();
+    // The descriptor the current runtime really resolves, so the fixture carries the same
+    // model/reader/profile a committed copy does instead of a hand-written guess.
+    memory = IndexCacheMemory.currentDescriptor(adapter);
+    fileBytes = IndexCacheMemory.residentBytes(memory);
     cache.clear();
     worker = newWorker(countingLoader());
   }
@@ -96,7 +111,7 @@ class TestExecutorIndexCacheWorker {
             .type(IndexCacheProtocol.CommandType.LOAD)
             .mode("adapter")
             .file(file("A", "f1"))
-            .definition(DEFINITION)
+            .definition(definition)
             .io(
                 new org.apache.iceberg.hadoop.HadoopFileIO(
                     new org.apache.hadoop.conf.Configuration()))
@@ -123,7 +138,7 @@ class TestExecutorIndexCacheWorker {
             .type(IndexCacheProtocol.CommandType.LOAD)
             .mode("adapter")
             .file(file("A", "f1"))
-            .definition(DEFINITION)
+            .definition(definition)
             .io(
                 new org.apache.iceberg.hadoop.HadoopFileIO(
                     new org.apache.hadoop.conf.Configuration()))
@@ -179,7 +194,7 @@ class TestExecutorIndexCacheWorker {
     assertThat(loading.await(30, TimeUnit.SECONDS)).isTrue();
 
     // The control channel must answer reports while a large prepare is still running.
-    IndexCacheProtocol.NodeReport report = worker.report("profile", 3, 1_000L, 0L, Map.of());
+    IndexCacheProtocol.NodeReport report = worker.report("profile", 3, 1_000L, 0L, 0L, Map.of());
     assertThat(report.sequence()).isEqualTo(3);
     assertThat(report.budgetBytes()).isEqualTo(1_000L);
 
@@ -201,18 +216,43 @@ class TestExecutorIndexCacheWorker {
   }
 
   @Test
-  void acknowledgementCarriesStatusOnly() {
-    IndexCacheProtocol.Ack ack = worker.execute(load("A", "f1", 1));
+  void acknowledgementCarriesStatusOnly() throws Exception {
+    // A large payload: the acknowledgement reports the committed charge, so its own encoding must
+    // not grow with the bytes the executor prepared. It also must not carry the read context.
+    byte[] payload = new byte[64 * 1024];
+    IndexCacheProtocol.Ack ack = worker.execute(load("A", "f1", 1, payload));
 
+    assertThat(ack.status()).isEqualTo(IndexCacheProtocol.AckStatus.LOADED);
+    assertThat(ack.metadataShape()).isNotNull();
+    assertThat(ack.metadataShape().charge().residentBytes()).isPositive();
+    assertThat(serializedSize(ack))
+        .as("the ACK must not ship the prepared payload")
+        .isLessThan(payload.length / 4);
+
+    Set<Class<?>> allowed =
+        Set.of(IndexCacheProtocol.AckStatus.class, ExecutorIndexCache.Shape.class, String.class);
     for (Field field : ack.getClass().getDeclaredFields()) {
       if (Modifier.isStatic(field.getModifiers())) {
         continue;
       }
 
       Class<?> type = field.getType();
-      assertThat(type.isPrimitive() || type == String.class || type.isEnum())
+      assertThat(type.isPrimitive() || allowed.contains(type))
           .as("ACK field %s must not carry payloads or read context", field.getName())
           .isTrue();
+    }
+
+    // The shape is a metadata projection: no index definition or FileIO (the read context) and no
+    // payload buffer may appear in it.
+    for (Field field : ack.metadataShape().getClass().getDeclaredFields()) {
+      Class<?> type = field.getType();
+      assertThat(
+              type == IndexDefinition.class
+                  || type == org.apache.iceberg.io.FileIO.class
+                  || type == byte[].class
+                  || type == java.nio.ByteBuffer.class)
+          .as("ACK shape field %s must not carry payloads or read context", field.getName())
+          .isFalse();
     }
   }
 
@@ -232,7 +272,7 @@ class TestExecutorIndexCacheWorker {
             .type(IndexCacheProtocol.CommandType.LOAD)
             .mode("adapter")
             .file(unknown)
-            .definition(DEFINITION)
+            .definition(definition)
             .io(
                 new org.apache.iceberg.hadoop.HadoopFileIO(
                     new org.apache.hadoop.conf.Configuration()))
@@ -250,12 +290,15 @@ class TestExecutorIndexCacheWorker {
     worker.execute(load("A", "f1", 1));
 
     IndexCacheProtocol.NodeReport report =
-        worker.report("profile", 7, 500L, 0L, Map.of("A", 5_000L));
+        worker.report("profile", 7, 500L, 0L, 0L, Map.of("A", 5_000L));
 
     assertThat(report.session()).isEqualTo(SESSION);
     assertThat(report.executorId()).isEqualTo(EXECUTOR);
     assertThat(report.incarnation()).isEqualTo(INCARNATION);
-    assertThat(report.holders()).containsEntry("adapter|A|f1", 120L);
+    // The holder carries the real resident charge of one file, receipts and containers included,
+    // not the file's own estimate alone.
+    assertThat(report.holders())
+        .containsEntry("adapter|A|f1", cache.chargeSnapshot().residentBytes());
     assertThat(report.accessAgeNanos()).containsEntry("A", 5_000L);
   }
 
@@ -431,7 +474,7 @@ class TestExecutorIndexCacheWorker {
             EXECUTOR,
             INCARNATION,
             cache,
-            // Only 100 bytes of budget: the 120-byte file cannot be admitted right now.
+            // Only 100 bytes of budget: this prepared-state charge cannot be admitted now.
             ExecutorIndexCache.Config.of(true, 100L),
             countingLoader(),
             IndexCacheWorkerConfig.parse(Map.of()));
@@ -445,14 +488,20 @@ class TestExecutorIndexCacheWorker {
   @Test
   void aRetryableRefusalIsNotMemoized() {
     worker.close();
-    // The cache only has room for one file of this size.
+    // The cache only has room for one file: the budget is just below the two-file projection,
+    // including their control state, not only their payload or prepared bytes.
+    ExecutorIndexCache.ChargeSnapshot both =
+        ExecutorIndexCache.Shape.empty()
+            .projectAdmission("A", 1, List.of(file("A", "f1"), file("A", "f2")))
+            .charge();
+    long oneFile = both.usedBytes() - 1;
     worker =
         new ExecutorIndexCacheWorker(
             SESSION,
             EXECUTOR,
             INCARNATION,
             cache,
-            ExecutorIndexCache.Config.of(true, 130L),
+            ExecutorIndexCache.Config.of(true, oneFile),
             countingLoader(),
             IndexCacheWorkerConfig.parse(Map.of()));
 
@@ -484,7 +533,14 @@ class TestExecutorIndexCacheWorker {
     cache.releaseCopy("A", "adapter|A|f1");
 
     assertThat(worker.holders()).doesNotContainKey("adapter|A|f1");
-    assertThat(worker.report("p", 1, 1_000L, 0L, Map.of()).usedBytes()).isZero();
+    // Control state may remain after the copy is gone; the resident charge is what must reach zero.
+    assertThat(
+            worker
+                .report("p", 1, 1_000L, 0L, 0L, Map.of())
+                .metadataShape()
+                .charge()
+                .residentBytes())
+        .isZero();
   }
 
   @Test
@@ -580,6 +636,11 @@ class TestExecutorIndexCacheWorker {
   }
 
   private IndexCacheProtocol.Command load(String indexUuid, String location, long epoch) {
+    return load(indexUuid, location, epoch, new byte[] {1, 2, 3});
+  }
+
+  private IndexCacheProtocol.Command load(
+      String indexUuid, String location, long epoch, byte[] payload) {
     return IndexCacheProtocol.Command.builder()
         .session(SESSION)
         .executorId(EXECUTOR)
@@ -590,8 +651,8 @@ class TestExecutorIndexCacheWorker {
         .commandId("plan-" + epoch + "#" + location + "-LOAD")
         .type(IndexCacheProtocol.CommandType.LOAD)
         .mode("adapter")
-        .file(file(indexUuid, location))
-        .definition(DEFINITION)
+        .file(file(indexUuid, location, payload))
+        .definition(definition)
         .io(new org.apache.iceberg.hadoop.HadoopFileIO(new org.apache.hadoop.conf.Configuration()))
         .build();
   }
@@ -615,31 +676,35 @@ class TestExecutorIndexCacheWorker {
         .build();
   }
 
-  private static IndexCacheProtocol.File file(String indexUuid, String location) {
+  private IndexCacheProtocol.File file(String indexUuid, String location) {
+    return file(indexUuid, location, new byte[] {1, 2, 3});
+  }
+
+  private IndexCacheProtocol.File file(String indexUuid, String location, byte[] payload) {
     return IndexCacheProtocol.File.builder()
         .location(location)
         .cacheKey("adapter|" + indexUuid + "|" + location)
-        .estimatedBytes(120L)
-        .memory(MEMORY)
+        .owner("A")
+        .estimatedBytes(fileBytes)
+        .memory(memory)
+        .payload(java.nio.ByteBuffer.wrap(payload))
         .build();
   }
 
-  private static ExecutorIndexCache.CachedFile loaded(IndexCacheProtocol.Command command) {
-    return ExecutorIndexCache.loaded(
-        new byte[] {1, 2, 3},
-        new IndexAdapter.PreparedSearch() {
-          @Override
-          public List<org.apache.iceberg.index.IndexSearchResult> search(
-              java.nio.ByteBuffer query, int topK) {
-            return List.of();
-          }
+  private static long serializedSize(Object value) throws java.io.IOException {
+    java.io.ByteArrayOutputStream bytes = new java.io.ByteArrayOutputStream();
+    try (java.io.ObjectOutputStream out = new java.io.ObjectOutputStream(bytes)) {
+      out.writeObject(value);
+    }
 
-          @Override
-          public long estimatedBytes() {
-            return 40L;
-          }
-        },
-        120L);
+    return bytes.size();
+  }
+
+  private ExecutorIndexCache.CachedFile loaded(IndexCacheProtocol.Command command) {
+    // A committed copy carries the reader-profile receipt the cache validates; without it the
+    // shape is explicitly unknown and cannot plan the next admission.
+    return ExecutorIndexCache.loaded(0, adapter.prepare(adapter.encodeEntries(List.of())))
+        .withContext(adapter);
   }
 
   private ExecutorIndexCacheWorker.Loader countingLoader() {
@@ -648,24 +713,5 @@ class TestExecutorIndexCacheWorker {
       loadedLocations.add(command.file().location());
       return loaded(command);
     };
-  }
-
-  private static final class VectorDefinition implements IndexDefinition {
-    private static final long serialVersionUID = 1L;
-    private final int fieldId;
-
-    private VectorDefinition(int fieldId) {
-      this.fieldId = fieldId;
-    }
-
-    @Override
-    public String type() {
-      return "vector";
-    }
-
-    @Override
-    public int fieldId() {
-      return fieldId;
-    }
   }
 }

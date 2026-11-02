@@ -33,6 +33,14 @@ import org.junit.jupiter.api.Test;
 
 class TestExecutorBudgetBinding {
   private static final long MB = 1024L * 1024L;
+
+  /**
+   * Bookkeeping a published copy is charged above the size a policy fixture states: the entry
+   * wrapper, its owner text and the map node that holds it. It is a few hundred bytes, so a bound
+   * keeps these fixtures from pinning an exact layout while still proving the stated charge.
+   */
+  private static final long CONTROL_BYTES = 4096L;
+
   private final ExecutorIndexCache cache = ExecutorIndexCache.get();
 
   @BeforeEach
@@ -51,7 +59,7 @@ class TestExecutorBudgetBinding {
               cache.installManaged(
                   "managed", 1, "managed-key", largerQuery, () -> charged(450 * MB)))
           .isNull();
-      assertThat(cache.stats().bytes()).isEqualTo(100 * MB);
+      assertThat(cache.stats().bytes()).isBetween(100 * MB, 100 * MB + CONTROL_BYTES);
       assertThat(cache.memoryUsage().reservedBytes()).isZero();
     }
   }
@@ -88,14 +96,16 @@ class TestExecutorBudgetBinding {
               command -> charged(MB),
               IndexCacheWorkerConfig.parse(Map.of()));
       IndexCacheProtocol.NodeReport report = observer.report("test", 1, 512 * MB, 0, Map.of());
-      assertThat(report.usedBytes()).isEqualTo(100 * MB);
-      assertThat(report.reservedBytes()).isEqualTo(400 * MB);
-      assertThat(report.holders()).containsEntry("|test|resident", 100 * MB);
+      assertThat(report.usedBytes()).isBetween(100 * MB, 100 * MB + CONTROL_BYTES);
+      assertThat(report.reservedBytes()).isBetween(400 * MB, 400 * MB + CONTROL_BYTES);
+      assertThat(report.holders()).containsKey("|test|resident");
+      assertThat(report.holders().get("|test|resident"))
+          .isBetween(100 * MB, 100 * MB + CONTROL_BYTES);
       assertThat(report.usedBytes() + report.reservedBytes())
           .isLessThanOrEqualTo(report.budgetBytes());
       finish.countDown();
       load.get(5, TimeUnit.SECONDS);
-      assertThat(cache.memoryUsage().usedBytes()).isEqualTo(500 * MB);
+      assertThat(cache.memoryUsage().usedBytes()).isBetween(500 * MB, 500 * MB + CONTROL_BYTES);
       assertThat(cache.memoryUsage().reservedBytes()).isZero();
     } finally {
       finish.countDown();
@@ -140,7 +150,7 @@ class TestExecutorBudgetBinding {
       finish.countDown();
       lazy.get(5, TimeUnit.SECONDS);
       assertThat(managed.get(5, TimeUnit.SECONDS)).isNull();
-      assertThat(cache.memoryUsage().usedBytes()).isEqualTo(300 * MB);
+      assertThat(cache.memoryUsage().usedBytes()).isBetween(300 * MB, 300 * MB + CONTROL_BYTES);
       assertThat(cache.memoryUsage().reservedBytes()).isZero();
     } finally {
       finish.countDown();
@@ -236,7 +246,7 @@ class TestExecutorBudgetBinding {
         ExecutorIndexCache.Config.of(true, 1024 * MB),
         "test",
         () -> charged(600 * MB));
-    assertThat(cache.stats().bytes()).isEqualTo(600 * MB);
+    assertThat(cache.stats().bytes()).isBetween(600 * MB, 600 * MB + CONTROL_BYTES);
   }
 
   private static void await(CountDownLatch latch) {
