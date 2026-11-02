@@ -31,6 +31,7 @@ import org.apache.iceberg.index.IndexReader;
 import org.apache.iceberg.index.vector.VectorIndexAdapter;
 import org.apache.iceberg.index.vector.VectorIndexDefinition;
 import org.apache.iceberg.index.vector.VectorIndexTypes;
+import org.apache.iceberg.relocated.com.google.common.collect.Lists;
 import org.apache.iceberg.spark.Spark3Util;
 import org.apache.spark.sql.SparkSession;
 import org.junit.jupiter.api.AfterAll;
@@ -120,14 +121,43 @@ class TestIndexCacheWorkingSetCharge {
       charged += DistributedIndexSearch.loadFile(table.io(), file.location(), adapter).bytes();
     }
 
-    long budget = DistributedIndexSearch.workingSetBytes(table.io(), files, adapter);
+    // the budget a query derives is only defined for an owner: owned cache metadata is what the
+    // projection charges, so without one the size is reported as unknown rather than guessed
+    assertThat(DistributedIndexSearch.workingSetBytes(table.io(), files, adapter))
+        .as("an unowned working set is unknown")
+        .isEqualTo(-1);
 
-    assertThat(budget)
-        .as("the budget is derived from the same charge admission uses")
-        .isEqualTo(charged);
+    long budget =
+        DistributedIndexSearch.workingSetBytes(table.io(), files, adapter, table.location());
+    // a prepared structure costs more than the bytes it was read from, so the budget has to exceed
+    // both the container on disk and the payload the reader admitted
     assertThat(budget)
         .as("a prepared structure costs more than the bytes it was read from: disk=%s", onDisk)
         .isGreaterThan(onDisk);
+    assertThat(budget)
+        .as("the budget covers at least the bytes admission read: charged=%s", charged)
+        .isGreaterThanOrEqualTo(charged);
+
+    // and it is the charge admission arrives at, not a separate estimate
+    List<IndexCacheProtocol.File> planned = Lists.newArrayList();
+    for (IndexFile file : files) {
+      planned.add(
+          IndexCacheProtocol.File.builder()
+              .location(file.location())
+              .owner(table.location())
+              .cacheKey(
+                  DistributedIndexSearch.cacheKey(
+                      table.location(),
+                      DistributedIndexSearch.adapterKey(adapter),
+                      file.location()))
+              .memory(file.memory())
+              .estimatedBytes(IndexCacheMemory.residentBytes(file.memory()))
+              .build());
+    }
+
+    assertThat(budget)
+        .as("the budget is derived from the same charge admission uses")
+        .isEqualTo(ExecutorIndexCache.Shape.empty().project(null, 0, planned).charge().usedBytes());
   }
 
   private static byte[] read(Table table, String location) {
