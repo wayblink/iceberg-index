@@ -121,6 +121,19 @@ class TestTypedSearchEquivalence {
   }
 
   @Test
+  public void aRowWithoutAVectorIsInNeitherAnswer() {
+    String table = table("typed_null_vector", true);
+    spark.sql(String.format("INSERT INTO local.db.%s VALUES (9, 'null', NULL)", table));
+
+    List<Row> typed = vectorSearch(table, "array(0.9d, 0.1d)", 5);
+    List<Row> ordered = vectorOrderBy(table, "array(0.9d, 0.1d)", 5);
+
+    assertThat(ids(typed)).isEqualTo(ids(ordered));
+    // a row with no vector has no distance, so it is not one of the nearest rows either way
+    assertThat(ids(typed)).doesNotContain(9L);
+  }
+
+  @Test
   public void aDeletedRowIsInNeitherAnswer() throws Exception {
     String table = table("typed_deletes", true);
     Table icebergTable = Spark3Util.loadIcebergTable(spark, "local.db." + table);
