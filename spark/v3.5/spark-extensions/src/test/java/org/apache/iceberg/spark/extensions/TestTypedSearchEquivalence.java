@@ -31,11 +31,11 @@ import org.apache.iceberg.Schema;
 import org.apache.iceberg.Table;
 import org.apache.iceberg.data.GenericRecord;
 import org.apache.iceberg.data.Record;
-import org.apache.iceberg.data.parquet.GenericParquetWriter;
 import org.apache.iceberg.deletes.EqualityDeleteWriter;
+import org.apache.iceberg.encryption.EncryptedFiles;
+import org.apache.iceberg.encryption.EncryptedOutputFile;
+import org.apache.iceberg.formats.FormatModelRegistry;
 import org.apache.iceberg.index.vector.VectorIndexTypes;
-import org.apache.iceberg.io.FileAppender;
-import org.apache.iceberg.parquet.Parquet;
 import org.apache.iceberg.spark.Spark3Util;
 import org.apache.spark.sql.Row;
 import org.apache.spark.sql.SparkSession;
@@ -269,22 +269,17 @@ class TestTypedSearchEquivalence {
   /** Writes one equality delete row into a delete file in the table's own format. */
   private static DeleteFile writeEqualityDelete(Table table, long id) throws Exception {
     Schema keySchema = table.schema().select("id");
-    String location = table.location() + "/data/equality-delete-" + id + ".parquet";
-    FileAppender<Record> appender =
-        Parquet.write(table.io().newOutputFile(location))
-            .schema(keySchema)
-            .createWriterFunc(GenericParquetWriter::buildWriter)
-            .build();
+    EncryptedOutputFile out =
+        EncryptedFiles.plainAsEncryptedOutput(
+            table
+                .io()
+                .newOutputFile(table.location() + "/data/equality-delete-" + id + ".parquet"));
     EqualityDeleteWriter<Record> writer =
-        new EqualityDeleteWriter<>(
-            appender,
-            FileFormat.PARQUET,
-            location,
-            PartitionSpec.unpartitioned(),
-            null,
-            null,
-            null,
-            keySchema.columns().get(0).fieldId());
+        FormatModelRegistry.equalityDeleteWriteBuilder(FileFormat.PARQUET, Record.class, out)
+            .schema(keySchema)
+            .spec(PartitionSpec.unpartitioned())
+            .equalityFieldIds(keySchema.columns().get(0).fieldId())
+            .build();
     try (writer) {
       writer.write(GenericRecord.create(keySchema).copy("id", id));
     }
