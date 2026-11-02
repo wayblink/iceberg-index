@@ -20,18 +20,23 @@ package org.apache.iceberg.spark.index
 
 import java.lang.{Long => JLong}
 import java.util.{List => JList}
-
-import scala.collection.JavaConverters._
-import scala.collection.mutable
-
-import org.apache.iceberg.index.{IndexQuery, IndexSearchResult}
+import org.apache.iceberg.index.IndexQuery
 import org.apache.iceberg.index.IndexQuery.Consistency
-import org.apache.iceberg.index.spark.{DistributedIndexSearch, IndexEntries, IndexSearch}
-import org.apache.iceberg.index.vector.{VectorDistance, VectorIndexAdapter}
-import org.apache.spark.sql.{Row, RowFactory, SparkSession}
+import org.apache.iceberg.index.IndexSearchResult
+import org.apache.iceberg.index.spark.DistributedIndexSearch
+import org.apache.iceberg.index.spark.IndexEntries
+import org.apache.iceberg.index.spark.IndexSearch
+import org.apache.iceberg.index.vector.VectorDistance
+import org.apache.iceberg.index.vector.VectorIndexAdapter
+import org.apache.spark.sql.Row
+import org.apache.spark.sql.RowFactory
+import org.apache.spark.sql.SparkSession
 import org.apache.spark.sql.catalyst.plans.logical.LeafNode
 import org.apache.spark.sql.catalyst.plans.logical.Statistics
-import org.apache.spark.sql.types.{StructField, StructType}
+import org.apache.spark.sql.types.StructField
+import org.apache.spark.sql.types.StructType
+import scala.collection.JavaConverters._
+import scala.collection.mutable
 
 /**
  * The shared entry point for a vector search whose result keeps the index's own hits: {@code CALL
@@ -49,6 +54,9 @@ import org.apache.spark.sql.types.{StructField, StructType}
  */
 private[spark] object VectorSearchBridge {
 
+  /** The least a row can cost, for a column whose type declares no size of its own. */
+  private[spark] val BytesPerRowFloor = 8L
+
   /** A request whose contract is the index's own hits, planned but not searched. */
   def plan(
       spark: SparkSession,
@@ -57,7 +65,6 @@ private[spark] object VectorSearchBridge {
       indexArgument: String,
       queries: JList[Array[Float]],
       k: Int,
-      tableSnapshotId: JLong,
       batch: Boolean,
       coverage: String): VectorBindingResult = {
     val contract = VectorResultContract.forCoverage(coverage)
@@ -66,7 +73,9 @@ private[spark] object VectorSearchBridge {
       column,
       queries,
       k,
-      tableSnapshotId,
+      // the request is planned against the table's current snapshot; a caller that has already
+      // frozen one hands it to the search, not to the plan
+      null,
       contract.name,
       indexArgument,
       batch)
@@ -527,7 +536,7 @@ private[spark] case class VectorSearchHitsRequest(
   override def computeStats: Statistics = {
     val perQuery = math.max(0, topK).toLong
     val rows = if (batch) perQuery * queries.size else perQuery
-    val bytesPerRow = output.foldLeft(8L) { (bytes, attribute) =>
+    val bytesPerRow = output.foldLeft(VectorSearchBridge.BytesPerRowFloor) { (bytes, attribute) =>
       bytes + attribute.dataType.defaultSize
     }
     Statistics(sizeInBytes = bytesPerRow * rows, rowCount = Some(rows))

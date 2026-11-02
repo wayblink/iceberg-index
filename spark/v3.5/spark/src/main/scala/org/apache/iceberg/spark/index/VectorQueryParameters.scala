@@ -20,7 +20,6 @@ package org.apache.iceberg.spark.index
 
 import java.lang.{Long => JLong}
 import java.util.{Map => JMap}
-
 private[spark] case class VectorParameter(
     value: String,
     origin: String,

@@ -19,24 +19,28 @@
 package org.apache.iceberg.spark.index
 
 import java.lang.{Long => JLong}
-
-import scala.collection.mutable
-
 import org.apache.iceberg.index.vector.VectorIndexDefinition.Metric
 import org.apache.spark.sql.SparkSession
 import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.expressions.Alias
-import org.apache.spark.sql.catalyst.expressions.AttributeReference
 import org.apache.spark.sql.catalyst.expressions.Ascending
-import org.apache.spark.sql.catalyst.expressions.ExprId
+import org.apache.spark.sql.catalyst.expressions.AttributeReference
 import org.apache.spark.sql.catalyst.expressions.Expression
+import org.apache.spark.sql.catalyst.expressions.ExprId
 import org.apache.spark.sql.catalyst.expressions.GenericInternalRow
 import org.apache.spark.sql.catalyst.expressions.IsNotNull
-import org.apache.spark.sql.catalyst.plans.logical.{Filter, GlobalLimit, LocalLimit, LogicalPlan, Project, Sort, SubqueryAlias}
+import org.apache.spark.sql.catalyst.plans.logical.Filter
+import org.apache.spark.sql.catalyst.plans.logical.GlobalLimit
+import org.apache.spark.sql.catalyst.plans.logical.LocalLimit
+import org.apache.spark.sql.catalyst.plans.logical.LogicalPlan
+import org.apache.spark.sql.catalyst.plans.logical.Project
+import org.apache.spark.sql.catalyst.plans.logical.Sort
+import org.apache.spark.sql.catalyst.plans.logical.SubqueryAlias
 import org.apache.spark.sql.catalyst.rules.Rule
 import org.apache.spark.sql.execution.datasources.v2.DataSourceV2Relation
 import org.slf4j.Logger
 import org.slf4j.LoggerFactory
+import scala.collection.mutable
 
 /**
  * Replaces the source of {@code ORDER BY vec_distance(column, query) LIMIT k} with a vector search
@@ -61,6 +65,9 @@ import org.slf4j.LoggerFactory
 case class RewriteVectorSearch(spark: SparkSession) extends Rule[LogicalPlan] {
 
   private val logger: Logger = LoggerFactory.getLogger(getClass)
+
+  /** How much of the rewritten plan a log line shows. */
+  private val PlanPreviewLength = 100
 
   override def apply(plan: LogicalPlan): LogicalPlan = {
     plan.transformDown {
@@ -192,7 +199,7 @@ case class RewriteVectorSearch(spark: SparkSession) extends Rule[LogicalPlan] {
                   JLong.valueOf(resolved.parameters.overSample),
                   resolved.parameters.overSampleOrigin,
                   Integer.valueOf(resolved.inputs.uncoveredDataFiles.size)): _*)
-              logger.info("rewrote a vector query into {}", source.simpleString(100))
+              logger.info("rewrote a vector query into {}", source.simpleString(PlanPreviewLength))
               Some(lowered)
             }
           case NoApplicableVectorIndex =>

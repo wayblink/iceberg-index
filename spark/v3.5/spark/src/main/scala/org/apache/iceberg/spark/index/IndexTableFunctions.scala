@@ -18,38 +18,38 @@
  */
 package org.apache.iceberg.spark.index
 
-import org.apache.iceberg.index.text.TextIndexTypes
-import org.apache.iceberg.index.vector.VectorIndexTypes
-import org.apache.iceberg.spark.Spark3Util
+import java.util.Locale
 import org.apache.iceberg.index.spark.IndexSearch
+import org.apache.iceberg.index.spark.VectorIndexes
 import org.apache.iceberg.index.spark.VectorIndexSearch
-import org.apache.spark.sql.catalyst.FunctionIdentifier
-import org.apache.spark.sql.catalyst.expressions.Expression
-import org.apache.spark.sql.catalyst.util.ArrayData
-import org.apache.spark.sql.types.DoubleType
-import scala.collection.JavaConverters._
+import org.apache.iceberg.index.text.TextIndexTypes
+import org.apache.iceberg.index.vector.VectorIndexDefinition.Metric
+import org.apache.iceberg.index.vector.VectorIndexTypes
+import org.apache.iceberg.relocated.com.google.common.base.Preconditions
+import org.apache.iceberg.spark.Spark3Util
 import org.apache.spark.sql.SparkSession
 import org.apache.spark.sql.SparkSessionExtensions
-import org.apache.spark.sql.catalyst.expressions.ExpressionInfo
-import org.apache.spark.sql.catalyst.plans.logical.LogicalPlan
-import org.apache.iceberg.index.spark.VectorIndexes
-import org.apache.iceberg.index.vector.VectorIndexDefinition.Metric
+import org.apache.spark.sql.catalyst.FunctionIdentifier
 import org.apache.spark.sql.catalyst.expressions.Alias
-import org.apache.spark.sql.catalyst.expressions.Attribute
 import org.apache.spark.sql.catalyst.expressions.Ascending
+import org.apache.spark.sql.catalyst.expressions.Attribute
 import org.apache.spark.sql.catalyst.expressions.Descending
+import org.apache.spark.sql.catalyst.expressions.Expression
+import org.apache.spark.sql.catalyst.expressions.ExpressionInfo
 import org.apache.spark.sql.catalyst.expressions.Literal
 import org.apache.spark.sql.catalyst.expressions.NamedArgumentExpression
 import org.apache.spark.sql.catalyst.expressions.NullsFirst
 import org.apache.spark.sql.catalyst.expressions.SortOrder
 import org.apache.spark.sql.catalyst.plans.logical.GlobalLimit
+import org.apache.spark.sql.catalyst.plans.logical.LogicalPlan
 import org.apache.spark.sql.catalyst.plans.logical.Project
 import org.apache.spark.sql.catalyst.plans.logical.Sort
-import org.apache.spark.sql.execution.datasources.v2.DataSourceV2Relation
-import org.apache.iceberg.relocated.com.google.common.base.Preconditions
+import org.apache.spark.sql.catalyst.util.ArrayData
 import org.apache.spark.sql.connector.catalog.TableCatalog
+import org.apache.spark.sql.execution.datasources.v2.DataSourceV2Relation
+import org.apache.spark.sql.types.DoubleType
 import org.apache.spark.sql.util.CaseInsensitiveStringMap
-import java.util.Locale
+import scala.collection.JavaConverters._
 
 /**
  * Registers the index table-valued functions: functions that take a table, a column and a query and
@@ -70,6 +70,12 @@ object IndexTableFunctions {
   private val VECTOR_INDEX_SEARCH = "vector_index_search"
   private val VECTOR_INDEX_SEARCH_BATCH = "vector_index_search_batch"
   private val TEXT_INDEX_SEARCH = "text_index_search"
+
+  /** The rows a search returns when the caller names no limit. */
+  private val DefaultLimit = 10
+
+  /** The arguments every index table function takes: a table, a column, what to look for, and k. */
+  private val SearchArgumentCount = 4
 
   def register(extensions: SparkSessionExtensions): Unit = {
     extensions.injectTableFunction(
@@ -154,7 +160,7 @@ object IndexTableFunctions {
       .int("limit")
       .orElse(arguments.int("k"))
       .orElse(arguments.int("num_results"))
-      .getOrElse(10)
+      .getOrElse(DefaultLimit)
     val columns = arguments.strings("columns")
 
     Preconditions.checkArgument(
@@ -214,7 +220,7 @@ object IndexTableFunctions {
       .int("k")
       .orElse(arguments.int("num_results"))
       .orElse(arguments.int("limit"))
-      .getOrElse(10)
+      .getOrElse(DefaultLimit)
     val column = arguments.string(VECTOR_COLUMN)
     // the function states its metric, and cosine when the caller names none. Leaving it unnamed to
     // follow the index would need the projected distance to be re-bound to the index metric, which
@@ -377,7 +383,7 @@ object IndexTableFunctions {
   }
 
   private def vectorIndexSearch(args: Seq[Expression]): LogicalPlan = {
-    checkArity(args, 4, VECTOR_INDEX_SEARCH, "(table, column, query, k)")
+    checkArity(args, SearchArgumentCount, VECTOR_INDEX_SEARCH, "(table, column, query, k)")
     val spark = SparkSession.active
     VectorIndexTypes.register()
     val tableName = stringArg(args, 0)
@@ -395,7 +401,7 @@ object IndexTableFunctions {
   }
 
   private def vectorIndexSearchBatch(args: Seq[Expression]): LogicalPlan = {
-    checkArity(args, 4, VECTOR_INDEX_SEARCH_BATCH, "(table, column, queries, k)")
+    checkArity(args, SearchArgumentCount, VECTOR_INDEX_SEARCH_BATCH, "(table, column, queries, k)")
     val spark = SparkSession.active
     VectorIndexTypes.register()
     val tableName = stringArg(args, 0)
@@ -410,7 +416,7 @@ object IndexTableFunctions {
   }
 
   private def textIndexSearch(args: Seq[Expression]): LogicalPlan = {
-    checkArity(args, 4, TEXT_INDEX_SEARCH, "(table, column, query, k)")
+    checkArity(args, SearchArgumentCount, TEXT_INDEX_SEARCH, "(table, column, query, k)")
     val spark = SparkSession.active
     TextIndexTypes.register()
     val tableName = stringArg(args, 0)

@@ -18,8 +18,8 @@
  */
 package org.apache.iceberg.spark.index
 
-import org.apache.iceberg.index.text.TextIndexDefinition
 import org.apache.iceberg.index.text.TextIndexAdapter.CorpusStatistics
+import org.apache.iceberg.index.text.TextIndexDefinition
 import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.expressions.Predicate
 import org.apache.spark.sql.catalyst.expressions.codegen.CodegenFallback

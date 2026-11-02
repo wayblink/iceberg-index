@@ -18,20 +18,27 @@
  */
 package org.apache.iceberg.spark.index
 
-import java.io.{IOException, UncheckedIOException}
+import java.io.IOException
+import java.io.UncheckedIOException
 import java.lang.{Long => JLong}
 import java.util.{List => JList}
-
+import org.apache.iceberg.SerializableTable
+import org.apache.iceberg.Snapshot
+import org.apache.iceberg.Table
+import org.apache.iceberg.index.IndexFile
+import org.apache.iceberg.index.IndexManifest
+import org.apache.iceberg.index.IndexManifestList
+import org.apache.iceberg.index.IndexMetadata
+import org.apache.iceberg.index.IndexSnapshot
+import org.apache.iceberg.index.spark.IndexEntries
+import org.apache.iceberg.index.spark.VectorIndexes
+import org.apache.iceberg.index.vector.VectorIndexAdapter
+import org.apache.iceberg.index.vector.VectorIndexDefinition
+import org.apache.iceberg.spark.Spark3Util
+import org.apache.iceberg.spark.SparkSchemaUtil
+import org.apache.spark.sql.SparkSession
 import scala.collection.JavaConverters._
 import scala.collection.mutable
-
-import org.apache.iceberg.{SerializableTable, Snapshot, Table}
-import org.apache.iceberg.index.{IndexFile, IndexManifest, IndexManifestList, IndexMetadata, IndexSnapshot}
-import org.apache.iceberg.index.spark.{IndexEntries, VectorIndexes}
-import org.apache.iceberg.index.vector.{VectorIndexAdapter, VectorIndexDefinition}
-import org.apache.iceberg.spark.{Spark3Util, SparkSchemaUtil}
-import org.apache.spark.sql.SparkSession
-
 private[spark] object BindVectorSearch {
   def bind(spark: SparkSession, request: VectorSearchRequest): VectorBindingResult = {
     val input = request.input

@@ -21,8 +21,8 @@ package org.apache.iceberg.spark.index
 import org.apache.iceberg.index.vector.VectorDistance
 import org.apache.iceberg.index.vector.VectorIndexDefinition.Metric
 import org.apache.spark.sql.catalyst.InternalRow
-import org.apache.spark.sql.catalyst.expressions.codegen.CodegenFallback
 import org.apache.spark.sql.catalyst.expressions.Expression
+import org.apache.spark.sql.catalyst.expressions.codegen.CodegenFallback
 import org.apache.spark.sql.catalyst.util.ArrayData
 import org.apache.spark.sql.types.ArrayType
 import org.apache.spark.sql.types.DoubleType

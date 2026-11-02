@@ -19,7 +19,6 @@
 package org.apache.iceberg.spark.index
 
 import java.lang.{Long => JLong}
-
 private[spark] case class VectorCandidateBudget(
     requested: Long,
     initial: Int,

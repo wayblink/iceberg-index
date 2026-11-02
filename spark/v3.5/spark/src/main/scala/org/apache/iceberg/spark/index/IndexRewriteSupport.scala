@@ -18,23 +18,22 @@
  */
 package org.apache.iceberg.spark.index
 
-import scala.collection.JavaConverters._
-
 import org.apache.iceberg.index.IndexSearchResult
 import org.apache.iceberg.index.spark.IndexEntries
 import org.apache.iceberg.spark.SparkSchemaUtil
 import org.apache.iceberg.spark.source.SparkTable
+import org.apache.spark.sql.Row
+import org.apache.spark.sql.SparkSession
 import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.expressions.Expression
 import org.apache.spark.sql.catalyst.expressions.GenericInternalRow
-import org.apache.spark.sql.execution.datasources.v2.DataSourceV2Relation
 import org.apache.spark.sql.catalyst.plans.logical.LogicalPlan
 import org.apache.spark.sql.catalyst.util.ArrayData
-import org.apache.spark.sql.Row
-import org.apache.spark.sql.SparkSession
+import org.apache.spark.sql.execution.datasources.v2.DataSourceV2Relation
 import org.apache.spark.sql.types.DataType
 import org.apache.spark.sql.types.Decimal
 import org.apache.spark.sql.types.StructType
+import scala.collection.JavaConverters._
 
 /**
  * What the index rewrite rules have in common: finding the scan a query reads, resolving the rows a

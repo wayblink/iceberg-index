@@ -19,14 +19,13 @@
 package org.apache.iceberg.spark.index
 
 import java.util.{List => JList}
-
-import scala.collection.JavaConverters._
-
 import org.apache.iceberg.Table
 import org.apache.iceberg.index.spark.VectorIndexes
 import org.apache.iceberg.spark.Spark3Util
-import org.apache.spark.sql.{Row, SparkSession}
+import org.apache.spark.sql.Row
+import org.apache.spark.sql.SparkSession
 import org.apache.spark.sql.catalyst.plans.logical.LogicalPlan
+import scala.collection.JavaConverters._
 
 /**
  * The Java-facing entry point for the index-hit search, so {@code CALL vector_search} runs the same
@@ -54,7 +53,6 @@ private[spark] object VectorSearchCalls {
       indexArgument,
       queries,
       k,
-      null,
       batch,
       coverage) match {
       case BoundVectorSearch(context) => VectorSearchHitsPlan(context, batch)

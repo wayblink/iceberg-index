@@ -18,20 +18,21 @@
  */
 package org.apache.iceberg.spark.index
 
-import scala.collection.JavaConverters._
-
 import org.apache.iceberg.index.IndexQuery
 import org.apache.iceberg.index.IndexQuery.Consistency
 import org.apache.iceberg.index.IndexReader
 import org.apache.iceberg.index.IndexSearchResult
-import org.apache.iceberg.index.spark.{IndexEntries, VectorIndexes}
+import org.apache.iceberg.index.spark.IndexEntries
+import org.apache.iceberg.index.spark.VectorIndexes
 import org.apache.iceberg.index.text.TextIndexAdapter
 import org.apache.iceberg.index.text.TextIndexAdapter.CorpusStatistics
 import org.apache.iceberg.index.text.TextIndexDefinition
+import org.apache.spark.sql.Row
+import org.apache.spark.sql.SparkSession
+import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.expressions.Alias
 import org.apache.spark.sql.catalyst.expressions.AttributeReference
 import org.apache.spark.sql.catalyst.expressions.Descending
-import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.expressions.Expression
 import org.apache.spark.sql.catalyst.expressions.GenericInternalRow
 import org.apache.spark.sql.catalyst.expressions.SortOrder
@@ -41,10 +42,9 @@ import org.apache.spark.sql.catalyst.plans.logical.LocalRelation
 import org.apache.spark.sql.catalyst.plans.logical.LogicalPlan
 import org.apache.spark.sql.catalyst.plans.logical.Sort
 import org.apache.spark.sql.catalyst.rules.Rule
-import org.apache.spark.sql.Row
-import org.apache.spark.sql.SparkSession
 import org.slf4j.Logger
 import org.slf4j.LoggerFactory
+import scala.collection.JavaConverters._
 
 /**
  * Rewrites a text search written the ordinary way into a text index lookup, in two forms:
@@ -247,7 +247,8 @@ case class RewriteTextSearch(spark: SparkSession) extends Rule[LogicalPlan] {
 
     if (hits.size > MaxMatchRows) {
       logger.warn(
-        "Text search of column {} of table {} matches {} rows, which is more than the {} a rewrite reads back, scanning",
+        "Text search of column {} of table {} matches {} rows, which is more than the {} a rewrite"
+          + " reads back, scanning",
         Array(
           column,
           table.name(),

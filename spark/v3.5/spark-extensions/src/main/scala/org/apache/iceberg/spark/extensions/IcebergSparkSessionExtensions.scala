@@ -18,12 +18,10 @@
  */
 package org.apache.iceberg.spark.extensions
 
-import org.apache.spark.sql.SparkSessionExtensions
-import org.apache.spark.sql.catalyst.FunctionIdentifier
 import org.apache.iceberg.index.vector.VectorIndexDefinition.Metric
 import org.apache.spark.sql.AnalysisException
-import org.apache.spark.sql.catalyst.expressions.Expression
-import org.apache.spark.sql.catalyst.expressions.ExpressionInfo
+import org.apache.spark.sql.SparkSessionExtensions
+import org.apache.spark.sql.catalyst.FunctionIdentifier
 import org.apache.spark.sql.catalyst.analysis.CheckViews
 import org.apache.spark.sql.catalyst.analysis.ProcedureArgumentCoercion
 import org.apache.spark.sql.catalyst.analysis.ResolveIndexStatements
@@ -31,11 +29,12 @@ import org.apache.spark.sql.catalyst.analysis.ResolveProcedures
 import org.apache.spark.sql.catalyst.analysis.ResolveViews
 import org.apache.spark.sql.catalyst.analysis.RewriteMergeIntoTableForRowLineage
 import org.apache.spark.sql.catalyst.analysis.RewriteUpdateTableForRowLineage
+import org.apache.spark.sql.catalyst.expressions.Expression
+import org.apache.spark.sql.catalyst.expressions.ExpressionInfo
 import org.apache.spark.sql.catalyst.optimizer.RemoveRowLineageOutputFromOriginalTable
 import org.apache.spark.sql.catalyst.optimizer.ReplaceStaticInvoke
 import org.apache.spark.sql.catalyst.parser.extensions.IcebergSparkSqlExtensionsParser
 import org.apache.spark.sql.execution.datasources.v2.ExtendedDataSourceV2Strategy
-
 class IcebergSparkSessionExtensions extends (SparkSessionExtensions => Unit) {
 
   private val VEC_DISTANCE = "vec_distance"

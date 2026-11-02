@@ -19,21 +19,23 @@
 package org.apache.iceberg.spark.index
 
 import java.lang.{Long => JLong}
-
-import scala.collection.JavaConverters._
-import scala.collection.mutable
-
-import org.apache.iceberg.index.{IndexQuery, IndexSearchResult}
+import org.apache.iceberg.index.IndexQuery
 import org.apache.iceberg.index.IndexQuery.Consistency
-import org.apache.iceberg.index.spark.{DistributedIndexSearch, IndexEntries}
+import org.apache.iceberg.index.IndexSearchResult
+import org.apache.iceberg.index.spark.DistributedIndexSearch
+import org.apache.iceberg.index.spark.IndexEntries
 import org.apache.iceberg.index.vector.VectorIndexAdapter
 import org.apache.spark.rdd.RDD
-import org.apache.spark.sql.{Row, SparkSession}
+import org.apache.spark.sql.Row
+import org.apache.spark.sql.SparkSession
 import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.expressions.Attribute
-import org.apache.spark.sql.types.{StructField, StructType}
+import org.apache.spark.sql.types.StructField
+import org.apache.spark.sql.types.StructType
 import org.slf4j.Logger
 import org.slf4j.LoggerFactory
+import scala.collection.JavaConverters._
+import scala.collection.mutable
 
 /**
  * How a lowered vector source produces rows.

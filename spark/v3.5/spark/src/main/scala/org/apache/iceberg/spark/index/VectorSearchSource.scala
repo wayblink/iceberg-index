@@ -18,15 +18,16 @@
  */
 package org.apache.iceberg.spark.index
 
-import scala.collection.JavaConverters._
-import scala.collection.mutable
-
 import org.apache.iceberg.index.vector.VectorIndexDefinition
 import org.apache.spark.sql.catalyst.expressions.Attribute
 import org.apache.spark.sql.catalyst.plans.logical.LeafNode
 import org.apache.spark.sql.catalyst.plans.logical.Statistics
-
+import scala.collection.JavaConverters._
+import scala.collection.mutable
 private[spark] object VectorSearchSource {
+
+  /** The least a row can cost, for a column whose type declares no size of its own. */
+  private[spark] val BytesPerRowFloor = 8
 
   /**
    * Whether searching this index compares every vector there is, whatever candidate budget it is
@@ -133,8 +134,9 @@ private[spark] case class VectorSearchSource(context: VectorSearchContext)(
       val file = task.file()
       if (seen.add(file.location().toString)) total + file.recordCount() else total
     }
-    val bytesPerRow = output.foldLeft(BigInt(8)) { (bytes, attribute) =>
-      bytes + attribute.dataType.defaultSize
+    val bytesPerRow = output.foldLeft(BigInt(VectorSearchSource.BytesPerRowFloor)) {
+      (bytes, attribute) =>
+        bytes + attribute.dataType.defaultSize
     }
     Statistics(sizeInBytes = bytesPerRow * rows, rowCount = Some(rows))
   }

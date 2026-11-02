@@ -20,17 +20,20 @@ package org.apache.iceberg.spark.index
 
 import java.lang.{Long => JLong}
 import java.util.{List => JList}
-
-import scala.collection.JavaConverters._
-
-import org.apache.iceberg.{FileScanTask, Snapshot, Table}
-import org.apache.iceberg.index.{IndexFile, IndexMetadata, IndexSnapshot}
+import org.apache.iceberg.FileScanTask
+import org.apache.iceberg.Snapshot
+import org.apache.iceberg.Table
+import org.apache.iceberg.index.IndexFile
+import org.apache.iceberg.index.IndexMetadata
+import org.apache.iceberg.index.IndexSnapshot
 import org.apache.iceberg.index.spark.IndexSearch
 import org.apache.iceberg.index.vector.VectorIndexDefinition
 import org.apache.iceberg.spark.SparkSchemaUtil
-import org.apache.spark.sql.catalyst.expressions.{Attribute, AttributeReference}
+import org.apache.spark.sql.catalyst.expressions.Attribute
+import org.apache.spark.sql.catalyst.expressions.AttributeReference
 import org.apache.spark.sql.catalyst.plans.logical.LeafNode
 import org.apache.spark.sql.types.StructType
+import scala.collection.JavaConverters._
 
 /**
  * What a vector request promises about the rows it returns.

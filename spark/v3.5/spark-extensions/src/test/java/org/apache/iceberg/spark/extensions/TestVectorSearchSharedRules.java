@@ -395,7 +395,6 @@ class TestVectorSearchSharedRules {
             null,
             List.of(new float[] {1.0F, 0.0F}),
             2,
-            null,
             "INDEX_HITS".equals(contract),
             "INDEX_HITS".equals(contract) ? "index_hits" : "table");
     assertThat(result).isInstanceOf(BoundVectorSearch.class);
