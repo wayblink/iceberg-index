@@ -100,7 +100,9 @@ public class TestVectorIndexProcedures extends ExtensionsTestBase {
     assertThat(searchOutput.get(0)[1]).isInstanceOf(Number.class);
     double firstScore = ((Number) searchOutput.get(0)[2]).doubleValue();
     double secondScore = ((Number) searchOutput.get(1)[2]).doubleValue();
-    assertThat(firstScore).isGreaterThan(secondScore);
+    // the score of the default coverage mode is the distance the query asks for, so the nearer row
+    // has the smaller one; this used to be the index's own (similarity) score
+    assertThat(firstScore).isLessThan(secondScore);
     assertThat(searchOutput.get(0)[3].toString()).contains("\"id\":1");
 
     // k = 0 returns no rows
