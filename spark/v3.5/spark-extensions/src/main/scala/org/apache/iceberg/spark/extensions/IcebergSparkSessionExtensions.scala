@@ -66,7 +66,8 @@ class IcebergSparkSessionExtensions extends (SparkSessionExtensions => Unit) {
       Metric.COSINE
     } else {
       val name = args(2) match {
-        case org.apache.spark.sql.catalyst.expressions.Literal(value: org.apache.spark.unsafe.types.UTF8String, _) =>
+        case org.apache.spark.sql.catalyst.expressions
+              .Literal(value: org.apache.spark.unsafe.types.UTF8String, _) =>
           value.toString
         case _ =>
           throw new AnalysisException(
@@ -85,7 +86,6 @@ class IcebergSparkSessionExtensions extends (SparkSessionExtensions => Unit) {
       }
     }
   }
-
 
   /**
    * The column and the query of a text function, refusing a call with anything else.
@@ -128,11 +128,8 @@ class IcebergSparkSessionExtensions extends (SparkSessionExtensions => Unit) {
           VEC_DISTANCE,
           "vec_distance(vector, query[, metric]): distance to a query vector"),
         (args: Seq[Expression]) =>
-          org.apache.iceberg.spark.index.VectorDistanceExpression(
-            metricOf(args),
-            args.head,
-            args(1),
-            args.size > 2))
+          org.apache.iceberg.spark.index
+            .VectorDistanceExpression(metricOf(args), args.head, args(1), args.size > 2))
     }
     extensions.injectOptimizerRule { spark =>
       org.apache.iceberg.spark.index.RewriteVectorSearch(spark)

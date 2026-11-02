@@ -410,9 +410,9 @@ class CheckIndexesProcedure extends BaseProcedure {
   /**
    * How many data files of the current snapshot the index does not cover.
    *
-   * <p>Coverage is a file-level property the manifest states, so this reads the manifest rather than
-   * the table data. It is null when there is no snapshot: nothing is known about coverage then, and
-   * a zero would read as "fully covered".
+   * <p>Coverage is a file-level property the manifest states, so this reads the manifest rather
+   * than the table data. It is null when there is no snapshot: nothing is known about coverage
+   * then, and a zero would read as "fully covered".
    */
   /**
    * The line a fully readable index gets: nothing, or what to do about the files it does not cover.

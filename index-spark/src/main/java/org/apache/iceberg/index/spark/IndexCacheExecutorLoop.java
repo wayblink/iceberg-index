@@ -167,7 +167,8 @@ final class IndexCacheExecutorLoop implements AutoCloseable {
     } catch (InterruptedException e) {
       throw e;
     } catch (Exception e) {
-      LOG.debug("Index cache acknowledgement {} did not reach the driver; retrying", ack.commandId(), e);
+      LOG.debug(
+          "Index cache acknowledgement {} did not reach the driver; retrying", ack.commandId(), e);
       return false;
     }
   }

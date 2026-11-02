@@ -151,7 +151,7 @@ case class RewriteVectorSearch(spark: SparkSession) extends Rule[LogicalPlan] {
             } else if (resolved == null) {
               None
             } else if (context.rawParameters.overSample == null
-                && !VectorSearchSource.enumeratesEveryCandidate(definition)) {
+              && !VectorSearchSource.enumeratesEveryCandidate(definition)) {
               // the kernel ranks candidates by an estimate, so answering a top-k question with k of
               // them returns whatever the estimate preferred rather than the nearest rows: without
               // a budget the caller chose, the scan answers instead of answering wrongly

@@ -16,7 +16,6 @@
  * specific language governing permissions and limitations
  * under the License.
  */
-
 package org.apache.spark.sql.catalyst.analysis
 
 import org.apache.iceberg.Table
@@ -45,7 +44,9 @@ import scala.jdk.CollectionConverters._
  * in the table here. Keeping the lookup in analysis means an unknown or ambiguous name fails while
  * the query is analyzed rather than part way through a job.
  */
-case class ResolveIndexStatements(spark: SparkSession) extends Rule[LogicalPlan] with LookupCatalog {
+case class ResolveIndexStatements(spark: SparkSession)
+    extends Rule[LogicalPlan]
+    with LookupCatalog {
 
   protected lazy val catalogManager: CatalogManager = spark.sessionState.catalogManager
 
@@ -77,13 +78,15 @@ case class ResolveIndexStatements(spark: SparkSession) extends Rule[LogicalPlan]
             metadata,
             name)
         case other =>
-          throw new AnalysisException(
-            s"Index $name cannot be dropped: unsupported type $other")
+          throw new AnalysisException(s"Index $name cannot be dropped: unsupported type $other")
       }
   }
 
   /** The table and the one index it holds under that name or UUID, failing on none or several. */
-  private def resolve(catalogName: String, ident: Identifier, name: String): (Table, IndexMetadata) = {
+  private def resolve(
+      catalogName: String,
+      ident: Identifier,
+      name: String): (Table, IndexMetadata) = {
     val icebergTable = Spark3Util.loadIcebergTable(spark, tableName(catalogName, ident))
     val matches = VectorIndexes
       .indexesOf(icebergTable)

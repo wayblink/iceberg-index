@@ -48,6 +48,7 @@ private[spark] object VectorResultContract {
   case object TableLiveTopK extends VectorResultContract {
     override val name: String = "TABLE_LIVE_TOPK"
   }
+
   /**
    * The nearest live rows of the whole table, answered as hits.
    *

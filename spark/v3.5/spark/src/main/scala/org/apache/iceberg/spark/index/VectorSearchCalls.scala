@@ -48,7 +48,15 @@ private[spark] object VectorSearchCalls {
       batch: Boolean,
       coverage: String): VectorSearchHitsPlan = {
     VectorSearchBridge.plan(
-      spark, table, column, indexArgument, queries, k, null, batch, coverage) match {
+      spark,
+      table,
+      column,
+      indexArgument,
+      queries,
+      k,
+      null,
+      batch,
+      coverage) match {
       case BoundVectorSearch(context) => VectorSearchHitsPlan(context, batch)
       case NoApplicableVectorIndex =>
         throw new IllegalArgumentException(

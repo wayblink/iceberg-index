@@ -92,9 +92,7 @@ class IcebergSqlExtensionsAstBuilder(delegate: ParserInterface)
     val parts = toSeq(ctx.multipartIdentifier.parts).map(part => unquote(part.getText))
     val (catalog, table) = catalogAndTable(parts)
 
-    CallStatement(
-      Seq(catalog, "system", "list_indexes"),
-      Seq(PositionalArgument(Literal(table))))
+    CallStatement(Seq(catalog, "system", "list_indexes"), Seq(PositionalArgument(Literal(table))))
   }
 
   /**
@@ -127,7 +125,8 @@ class IcebergSqlExtensionsAstBuilder(delegate: ParserInterface)
           s"Unsupported index method: $other, supported methods are vector and fts")
     }
 
-    val options = Option(ctx.indexOptions).map(nodes => toSeq(nodes.indexOption)).getOrElse(Seq.empty)
+    val options =
+      Option(ctx.indexOptions).map(nodes => toSeq(nodes.indexOption)).getOrElse(Seq.empty)
     val seen = scala.collection.mutable.LinkedHashSet.empty[String]
     val optionArgs = options.map { option =>
       val key = unquote(option.key.getText).toLowerCase(Locale.ROOT)
@@ -146,10 +145,11 @@ class IcebergSqlExtensionsAstBuilder(delegate: ParserInterface)
     CallStatement(Seq(catalog, "system", procedure), args)
   }
 
-  override def visitRefreshIndex(ctx: RefreshIndexContext): RefreshIndexStatement = withOrigin(ctx) {
-    val parts = toSeq(ctx.multipartIdentifier.parts).map(part => unquote(part.getText))
-    RefreshIndexStatement(parts, unquote(ctx.indexName.getText))
-  }
+  override def visitRefreshIndex(ctx: RefreshIndexContext): RefreshIndexStatement =
+    withOrigin(ctx) {
+      val parts = toSeq(ctx.multipartIdentifier.parts).map(part => unquote(part.getText))
+      RefreshIndexStatement(parts, unquote(ctx.indexName.getText))
+    }
 
   override def visitDropIndex(ctx: DropIndexContext): DropIndexStatement = withOrigin(ctx) {
     val parts = toSeq(ctx.multipartIdentifier.parts).map(part => unquote(part.getText))
@@ -164,7 +164,6 @@ class IcebergSqlExtensionsAstBuilder(delegate: ParserInterface)
       (SparkSession.active.sessionState.catalogManager.currentCatalog.name(), parts.mkString("."))
     }
   }
-
 
   /** Backticks quote a name; the catalog and the table do not contain them. */
   private def unquote(part: String): String = {

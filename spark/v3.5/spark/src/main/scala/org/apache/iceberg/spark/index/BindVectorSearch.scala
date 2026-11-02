@@ -87,9 +87,7 @@ private[spark] object BindVectorSearch {
     // no value for it, which is a row without a vector rather than a query that cannot be answered
     val schema = frozen.schema()
     val field = schema.findField(input.column)
-    require(
-      field != null,
-      s"Cannot find vector column ${input.column} in table ${frozen.name()}")
+    require(field != null, s"Cannot find vector column ${input.column} in table ${frozen.name()}")
     require(
       definition.fieldId() == field.fieldId(),
       s"Vector index ${metadata.indexUuid()} does not match column ${input.column}")

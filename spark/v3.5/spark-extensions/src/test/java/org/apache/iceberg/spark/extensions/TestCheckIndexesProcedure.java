@@ -54,11 +54,14 @@ public class TestCheckIndexesProcedure extends ExtensionsTestBase {
     sql("INSERT INTO %s VALUES (2, array(0.0, 1.0))", tableName);
     Object[] gap = check(tableName).get(0);
     assertThat(gap[11]).as("the appended file is not covered").isEqualTo(1L);
-    assertThat((String) gap[12]).as("the report says what closes the gap")
+    assertThat((String) gap[12])
+        .as("the report says what closes the gap")
         .contains("1 data files")
         .contains("refresh_vector_index");
 
-    sql("CALL %s.system.refresh_vector_index(table => '%s', column => 'embedding')", catalogName, tableName);
+    sql(
+        "CALL %s.system.refresh_vector_index(table => '%s', column => 'embedding')",
+        catalogName, tableName);
     Object[] healed = check(tableName).get(0);
     assertThat(healed[11]).as("a refresh appends the file and closes the gap").isEqualTo(0L);
     assertThat(healed[12]).as("nothing left to suggest").isNull();
@@ -137,7 +140,9 @@ public class TestCheckIndexesProcedure extends ExtensionsTestBase {
         .allSatisfy(
             row -> {
               assertThat((Boolean) row[8]).as("readable: %s", row[4]).isTrue();
-              assertThat(row[11]).as("a fully covered index reports no gap: %s", row[4]).isEqualTo(0L);
+              assertThat(row[11])
+                  .as("a fully covered index reports no gap: %s", row[4])
+                  .isEqualTo(0L);
               assertThat(row[12]).as("no suggestion for a readable index: %s", row[4]).isNull();
             });
   }

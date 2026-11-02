@@ -51,7 +51,6 @@ import org.apache.spark.sql.connector.catalog.TableCatalog
 import org.apache.spark.sql.util.CaseInsensitiveStringMap
 import java.util.Locale
 
-
 /**
  * Registers the index table-valued functions: functions that take a table, a column and a query and
  * return the matched rows as a table, so they can be used in a FROM clause and composed with the
@@ -112,7 +111,6 @@ object IndexTableFunctions {
         textIndexSearch))
   }
 
-
   /**
    * The nearest rows of a table, as the table's own columns plus the distance that chose them.
    *
@@ -128,7 +126,6 @@ object IndexTableFunctions {
   private def analysisError(message: String): Nothing =
     throw new IllegalArgumentException(message)
 
-
   /**
    * The rows a text index ranks for a query, as the table's own columns plus the score.
    *
@@ -141,10 +138,8 @@ object IndexTableFunctions {
     val spark = SparkSession.active
     TextIndexTypes.register()
 
-    val arguments = new TableFunctionArguments(
-      TEXT_SEARCH,
-      args,
-      Seq("table", "query", "search_columns", "k"))
+    val arguments =
+      new TableFunctionArguments(TEXT_SEARCH, args, Seq("table", "query", "search_columns", "k"))
     arguments.requireOnly(
       required = Seq("table", "search_columns"),
       optional = Seq("query", "query_string", "limit", "k", "num_results", "columns"))
@@ -181,10 +176,8 @@ object IndexTableFunctions {
     def columnOf(name: String): Attribute = {
       relation.output
         .find(attribute => attribute.name.equalsIgnoreCase(name))
-        .getOrElse(
-          analysisError(
-            s"Column $name does not exist in $tableName; the table has " +
-              relation.output.map(_.name).mkString(", ")))
+        .getOrElse(analysisError(s"Column $name does not exist in $tableName; the table has " +
+          relation.output.map(_.name).mkString(", ")))
     }
 
     val vector = columnOf(searched.head)
@@ -197,7 +190,8 @@ object IndexTableFunctions {
     // expression, binds its statistics from the index of that column, and the projection above then
     // reads the score it produced
     val score = TextScoreExpression(null, null, vector, Literal(query))
-    val ordered = Sort(Seq(SortOrder(score, Descending, NullsFirst, Seq.empty)), global = true, relation)
+    val ordered =
+      Sort(Seq(SortOrder(score, Descending, NullsFirst, Seq.empty)), global = true, relation)
     val limited = GlobalLimit(Literal(k), ordered)
     Project(selected :+ Alias(score, SCORE_COLUMN)(), limited)
   }
@@ -212,13 +206,7 @@ object IndexTableFunctions {
       Seq("table", "query_vector", "k", VECTOR_COLUMN))
     arguments.requireOnly(
       required = Seq("table", "query_vector"),
-      optional = Seq(
-        "k",
-        "num_results",
-        "limit",
-        VECTOR_COLUMN,
-        "distance_type",
-        "columns"))
+      optional = Seq("k", "num_results", "limit", VECTOR_COLUMN, "distance_type", "columns"))
 
     val tableName = arguments.string("table")
     val query = arguments.expression("query_vector")
@@ -235,7 +223,10 @@ object IndexTableFunctions {
     val named = arguments.metric("distance_type")
     val columns = arguments.strings("columns")
 
-    Preconditions.checkArgument(k > 0, "vector_search needs a positive number of results, got %s", k)
+    Preconditions.checkArgument(
+      k > 0,
+      "vector_search needs a positive number of results, got %s",
+      k)
 
     val catalogAndIdent = Spark3Util.catalogAndIdentifier(spark, tableName)
     val catalog = catalogAndIdent.catalog()
@@ -250,10 +241,8 @@ object IndexTableFunctions {
     def columnOf(name: String): Attribute = {
       relation.output
         .find(attribute => attribute.name.equalsIgnoreCase(name))
-        .getOrElse(
-          analysisError(
-            s"Column $name does not exist in $tableName; the table has " +
-              relation.output.map(_.name).mkString(", ")))
+        .getOrElse(analysisError(s"Column $name does not exist in $tableName; the table has " +
+          relation.output.map(_.name).mkString(", ")))
     }
 
     val vector = columnOf(column)
@@ -265,12 +254,10 @@ object IndexTableFunctions {
         s"$tableName already has a column named $DISTANCE_COLUMN, so the distance cannot be added")
     }
 
-    val distance = VectorDistanceExpression(
-      named.getOrElse(Metric.COSINE),
-      vector,
-      query,
-      explicitMetric = true)
-    val ordered = Sort(Seq(SortOrder(distance, Ascending, NullsFirst, Seq.empty)), global = true, relation)
+    val distance =
+      VectorDistanceExpression(named.getOrElse(Metric.COSINE), vector, query, explicitMetric = true)
+    val ordered =
+      Sort(Seq(SortOrder(distance, Ascending, NullsFirst, Seq.empty)), global = true, relation)
     val limited = GlobalLimit(Literal(k), ordered)
     Project(selected :+ Alias(distance, DISTANCE_COLUMN)(), limited)
   }
@@ -311,8 +298,7 @@ object IndexTableFunctions {
     def requireOnly(required: Seq[String], optional: Seq[String]): Unit = {
       val known = required ++ optional
       named.keys.find(key => !known.contains(key)).foreach { unknown =>
-        analysisError(
-          s"$name does not have an argument $unknown; it takes ${known.mkString(", ")}")
+        analysisError(s"$name does not have an argument $unknown; it takes ${known.mkString(", ")}")
       }
 
       required.find(key => !named.contains(key)).foreach { missing =>

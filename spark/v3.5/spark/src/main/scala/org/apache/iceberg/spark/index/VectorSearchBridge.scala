@@ -217,42 +217,40 @@ private[spark] object VectorSearchBridge {
     }
 
     val answered = mutable.ListBuffer.empty[Row]
-    request.queries.zipWithIndex.foreach {
-      case (queryVector, queryId) =>
-        val query = queryVector.toArray
-        val indexed = indexCandidates(spark, context, query)
-        val scanned =
-          if (request.contract == VectorResultContract.IndexCovered) {
-            Seq.empty
-          } else {
-            uncoveredCandidates(spark, context, query)
-          }
-
-        val best = (indexed ++ scanned).sortBy(candidate => candidate._3).take(request.topK)
-        // the selected rows are read once more, as JSON: it is at most k rows per query, and it
-        // keeps the row's own schema deciding its shape
-        val json = rowsJsonOf(spark, context, best.map(candidate => (candidate._1, candidate._2)))
-        best.foreach {
-          case (dataFile, position, distance, _) =>
-            val rowJson =
-              Option(json.get(dataFile))
-                .flatMap(byPosition => Option(byPosition.get(JLong.valueOf(position))))
-                .orNull
-            answered += (if (request.batch) {
-                           RowFactory.create(
-                             Integer.valueOf(queryId),
-                             dataFile,
-                             JLong.valueOf(position),
-                             java.lang.Double.valueOf(distance),
-                             rowJson)
-                         } else {
-                           RowFactory.create(
-                             dataFile,
-                             JLong.valueOf(position),
-                             java.lang.Double.valueOf(distance),
-                             rowJson)
-                         })
+    request.queries.zipWithIndex.foreach { case (queryVector, queryId) =>
+      val query = queryVector.toArray
+      val indexed = indexCandidates(spark, context, query)
+      val scanned =
+        if (request.contract == VectorResultContract.IndexCovered) {
+          Seq.empty
+        } else {
+          uncoveredCandidates(spark, context, query)
         }
+
+      val best = (indexed ++ scanned).sortBy(candidate => candidate._3).take(request.topK)
+      // the selected rows are read once more, as JSON: it is at most k rows per query, and it
+      // keeps the row's own schema deciding its shape
+      val json = rowsJsonOf(spark, context, best.map(candidate => (candidate._1, candidate._2)))
+      best.foreach { case (dataFile, position, distance, _) =>
+        val rowJson =
+          Option(json.get(dataFile))
+            .flatMap(byPosition => Option(byPosition.get(JLong.valueOf(position))))
+            .orNull
+        answered += (if (request.batch) {
+                       RowFactory.create(
+                         Integer.valueOf(queryId),
+                         dataFile,
+                         JLong.valueOf(position),
+                         java.lang.Double.valueOf(distance),
+                         rowJson)
+                     } else {
+                       RowFactory.create(
+                         dataFile,
+                         JLong.valueOf(position),
+                         java.lang.Double.valueOf(distance),
+                         rowJson)
+                     })
+      }
     }
 
     spark.createDataFrame(answered.asJava, schema).collectAsList()
@@ -302,9 +300,8 @@ private[spark] object VectorSearchBridge {
       if (fresh.nonEmpty) {
         val byFile = fresh
           .groupBy(hit => hit.dataFile())
-          .map {
-            case (dataFile, hits) =>
-              dataFile -> hits.map(hit => JLong.valueOf(hit.rowPosition())).toSet.asJava
+          .map { case (dataFile, hits) =>
+            dataFile -> hits.map(hit => JLong.valueOf(hit.rowPosition())).toSet.asJava
           }
           .asJava
         val rowsByFile = IndexEntries.rowsAt(
@@ -329,7 +326,11 @@ private[spark] object VectorSearchBridge {
         done = true
       } else {
         val next =
-          VectorCandidateBudget.nextOrNull(budget.initial, found.size, request.topK, budget.entryUpperBound)
+          VectorCandidateBudget.nextOrNull(
+            budget.initial,
+            found.size,
+            request.topK,
+            budget.entryUpperBound)
         if (next == null) {
           done = true
         } else {
@@ -338,9 +339,8 @@ private[spark] object VectorSearchBridge {
       }
     }
 
-    found.map {
-      case ((dataFile, position), row) =>
-        (dataFile, position, distanceOf(metric, row, vectorIndex, query), row)
+    found.map { case ((dataFile, position), row) =>
+      (dataFile, position, distanceOf(metric, row, vectorIndex, query), row)
     }.toSeq
   }
 
@@ -379,23 +379,23 @@ private[spark] object VectorSearchBridge {
     val broadcast = spark.sparkContext.broadcast(query)
     rows.rdd
       .filter(entry => vectorIndex < 0 || !entry._2._2.isNullAt(vectorIndex))
-      .map {
-        entry =>
-          val row = entry._2._2
-          (row, entry._1, entry._2._1, distanceOf(metric, row, vectorIndex, broadcast.value))
+      .map { entry =>
+        val row = entry._2._2
+        (row, entry._1, entry._2._1, distanceOf(metric, row, vectorIndex, broadcast.value))
       }
       // a row without a vector is not a candidate, and neither branch may answer with one: the two
       // have to answer the same question
       .takeOrdered(request.topK)(
         Ordering.by[(Row, String, java.lang.Long, Double), Double](scored => scored._4))
-      .map {
-        scored => (scored._2, scored._3.longValue(), scored._4, scored._1)
+      .map { scored =>
+        (scored._2, scored._3.longValue(), scored._4, scored._1)
       }
       .toSeq
   }
 
   /** The schema a request answers with, which is what its output attributes declare. */
-  private def structOf(output: Seq[org.apache.spark.sql.catalyst.expressions.Attribute]): StructType = {
+  private def structOf(
+      output: Seq[org.apache.spark.sql.catalyst.expressions.Attribute]): StructType = {
     new StructType(
       output
         .map(attribute => StructField(attribute.name, attribute.dataType, attribute.nullable))
@@ -439,9 +439,8 @@ private[spark] object VectorSearchBridge {
 
     val positions = selected
       .groupBy(selected => selected._1)
-      .map {
-        case (dataFile, rows) =>
-          dataFile -> rows.map(row => JLong.valueOf(row._2)).toSet.asJava
+      .map { case (dataFile, rows) =>
+        dataFile -> rows.map(row => JLong.valueOf(row._2)).toSet.asJava
       }
       .asJava
 
