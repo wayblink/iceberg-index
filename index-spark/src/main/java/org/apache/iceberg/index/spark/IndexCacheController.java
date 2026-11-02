@@ -43,18 +43,20 @@ final class IndexCacheController {
   static final long DEFAULT_WAIT_NANOS = java.time.Duration.ofSeconds(60).toNanos();
 
   /**
-   * Waits until every file of the plan is terminal or the wait can no longer end well.
+   * Waits until the plan is settled or the wait can no longer end well, then reports its state.
    *
-   * <p>The wait ends on the deadline, and also when no executor is recent enough to answer it. In
-   * both cases the plan is ended rather than merely abandoned: an executor that never answered
-   * holds the space the plan promised, and the driver would count it as taken by the next load.
-   * Only a plan that covered every file is left as it is.
+   * <p>A plan that has loaded some files but not all of them is still working, so it is waited on
+   * rather than ended: ending it would fence the files an executor is still loading and release the
+   * copies it already installed, which leaves the next attempt with nothing to reuse. The wait ends
+   * on the deadline and when no executor is recent enough to answer, because in both cases nothing
+   * can still arrive. A plan that did not cover every file is ended there rather than merely
+   * abandoned, so an executor that never answered does not keep holding the space it promised.
    */
   static IndexCacheProtocol.Result await(
       IndexCacheDriverControl control, String planId, long deadlineNanos) {
     IndexCacheProtocol.Result result = control.result(planId);
-    while (!terminal(result.status()) && control.hasLiveExecutors(control.nowNanos())) {
-      if (control.nowNanos() >= deadlineNanos) {
+    while (!settled(result.status())) {
+      if (control.nowNanos() >= deadlineNanos || !control.hasLiveExecutors(control.nowNanos())) {
         break;
       }
 
@@ -78,9 +80,13 @@ final class IndexCacheController {
     return control.expire(planId, control.nowNanos());
   }
 
-  private static boolean terminal(IndexCacheProtocol.Status status) {
+  /**
+   * Statuses no further acknowledgement can change: a plan that loaded some files is reported as
+   * {@link IndexCacheProtocol.Status#PARTIAL} while the rest are still in flight, so it is not one
+   * of them.
+   */
+  private static boolean settled(IndexCacheProtocol.Status status) {
     return status == IndexCacheProtocol.Status.COMPLETE
-        || status == IndexCacheProtocol.Status.PARTIAL
         || status == IndexCacheProtocol.Status.FAILED
         || status == IndexCacheProtocol.Status.CANCELLED
         || status == IndexCacheProtocol.Status.OFFLOADED;

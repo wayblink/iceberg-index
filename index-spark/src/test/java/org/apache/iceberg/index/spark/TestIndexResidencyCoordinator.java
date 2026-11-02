@@ -1175,6 +1175,52 @@ class TestIndexResidencyCoordinator {
   }
 
   @Test
+  void awaitingAPartlyLoadedPlanWaitsForItsRemainingFiles() throws Exception {
+    String indexUuid = "multi-await";
+    coordinator.report(node("a", "a-1", 1, budget(40)));
+    Object[] files = new Object[24];
+    for (int i = 0; i < 12; i += 1) {
+      files[2 * i] = "f" + i;
+      files[2 * i + 1] = 1;
+    }
+
+    String plan =
+        coordinator.acceptLoad(
+            target(indexUuid, files), IndexResidencyPolicy.parse("forever"), clock.now());
+    IndexCacheDriverControl control = new IndexCacheDriverControl(coordinator);
+    List<IndexCacheProtocol.Command> commands = coordinator.commands("a", "a-1");
+    assertThat(commands).hasSize(12);
+
+    // A cluster confirms one file first and the rest only after the executor prepared them: that is
+    // work in progress, so the caller must keep waiting instead of ending the plan.
+    Thread acknowledger =
+        new Thread(
+            () -> {
+              coordinator.ack(
+                  ack(plan, "a", "a-1", commands.get(0), IndexCacheProtocol.AckStatus.LOADED));
+              try {
+                Thread.sleep(300L);
+              } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                return;
+              }
+
+              for (IndexCacheProtocol.Command command : commands.subList(1, commands.size())) {
+                coordinator.ack(
+                    ack(plan, "a", "a-1", command, IndexCacheProtocol.AckStatus.LOADED));
+              }
+            });
+    acknowledger.start();
+
+    IndexCacheProtocol.Result result =
+        IndexCacheController.await(control, plan, clock.now() + Duration.ofSeconds(10).toNanos());
+    acknowledger.join(10_000L);
+
+    assertThat(result.uncovered()).as("every file of the plan: %s", result).isEmpty();
+    assertThat(result.status()).isEqualTo(IndexCacheProtocol.Status.COMPLETE);
+  }
+
+  @Test
   void aLoadOfManyFilesConfirmsEveryOneOfThem() {
     String indexUuid = "multi";
     coordinator.report(node("a", "a-1", 1, budget(40)));
