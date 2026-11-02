@@ -88,6 +88,54 @@ class TestPluginExecutorBudget {
   }
 
   @Test
+  void aLoadOfManyIndexFilesCompletes() {
+    SparkSession spark = start(null);
+    String table = "local.db.plugin_many_files";
+    ExecutorIndexCache cache = ExecutorIndexCache.get();
+    try {
+      spark.sql("CREATE NAMESPACE IF NOT EXISTS local.db");
+      spark.sql("CREATE TABLE " + table + " (id bigint, embedding array<double>) USING iceberg");
+      // one data file per insert, and one index file per data file, so the load plans many files
+      for (int i = 0; i < 12; i += 1) {
+        spark.sql(
+            "INSERT INTO "
+                + table
+                + " VALUES ("
+                + i
+                + ", array("
+                + i
+                + ".0d, "
+                + (12 - i)
+                + ".0d))");
+      }
+      String index =
+          spark
+              .sql(
+                  "CALL local.system.build_vector_index(table=>'db.plugin_many_files', "
+                      + "column=>'embedding', dimension=>2, structure=>'FLAT', metric=>'EUCLIDEAN', "
+                      + "max_entries_per_index_file=>1)")
+              .head()
+              .getString(0);
+      String status =
+          spark
+              .sql(
+                  "CALL local.system.load_index(table=>'local.db.plugin_many_files', index=>'"
+                      + index
+                      + "')")
+              .head()
+              .getString(0);
+      assertThat(status).as("a load of every index file completes").isEqualTo("COMPLETE");
+    } finally {
+      try {
+        spark.sql("DROP TABLE IF EXISTS " + table + " PURGE");
+      } finally {
+        cache.clear();
+        spark.stop();
+      }
+    }
+  }
+
+  @Test
   void lazyQueryCannotExceedTheAdvertisedAutomaticBudget() {
     SparkSession spark = start(null);
     ExecutorIndexCache cache = ExecutorIndexCache.get();

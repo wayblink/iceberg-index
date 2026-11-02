@@ -1174,6 +1174,30 @@ class TestIndexResidencyCoordinator {
     }
   }
 
+  @Test
+  void aLoadOfManyFilesConfirmsEveryOneOfThem() {
+    String indexUuid = "multi";
+    coordinator.report(node("a", "a-1", 1, budget(40)));
+    Object[] files = new Object[24];
+    for (int i = 0; i < 12; i += 1) {
+      files[2 * i] = "f" + i;
+      files[2 * i + 1] = 1;
+    }
+
+    String plan =
+        coordinator.acceptLoad(
+            target(indexUuid, files), IndexResidencyPolicy.parse("forever"), clock.now());
+    List<IndexCacheProtocol.Command> commands = coordinator.commands("a", "a-1");
+    assertThat(commands).hasSize(12);
+    for (IndexCacheProtocol.Command command : commands) {
+      coordinator.ack(ack(plan, "a", "a-1", command, IndexCacheProtocol.AckStatus.LOADED));
+    }
+
+    IndexCacheProtocol.Result result = coordinator.result(plan);
+    assertThat(result.uncovered()).as("every file the plan loaded: %s", result).isEmpty();
+    assertThat(result.residentBytes()).isPositive();
+  }
+
   private void ackFile(String planId, String location, IndexCacheProtocol.AckStatus status) {
     coordinator.ack(ack(planId, "a", "a-1", loadCommand(planId, location), status));
   }

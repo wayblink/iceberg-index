@@ -119,6 +119,38 @@ class TestIndexCachePlugin {
   }
 
   @Test
+  void aLoadOfManyFilesCompletesThroughTheControlChannel() {
+    control.receive(report(1));
+    String[] locations = new String[12];
+    for (int i = 0; i < locations.length; i += 1) {
+      locations[i] = "many-" + i;
+    }
+
+    String plan =
+        coordinator.acceptLoad(target(locations), IndexResidencyPolicy.parse("forever"), now);
+
+    List<Object> sent = new ArrayList<>();
+    IndexCacheRunner runner =
+        runner(
+            message -> {
+              sent.add(message);
+              return control.receive(message);
+            },
+            sent,
+            64);
+    for (int i = 0;
+        i < 400 && coordinator.result(plan).status() != IndexCacheProtocol.Status.COMPLETE;
+        i++) {
+      runner.loop.pollOnce();
+      sleepQuietly(10);
+    }
+
+    IndexCacheProtocol.Result result = coordinator.result(plan);
+    assertThat(result.uncovered()).as("every file the load placed: %s", result).isEmpty();
+    assertThat(result.status()).isEqualTo(IndexCacheProtocol.Status.COMPLETE);
+  }
+
+  @Test
   void aReplyCarriesOnlyOneBatchAndTheRestFollowsLater() {
     IndexResidencyCoordinator bounded = new IndexResidencyCoordinator(() -> now, 2);
     IndexCacheDriverControl boundedControl = new IndexCacheDriverControl(bounded);
