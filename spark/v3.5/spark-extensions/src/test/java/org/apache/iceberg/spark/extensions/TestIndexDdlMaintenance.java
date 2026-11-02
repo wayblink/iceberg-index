@@ -24,6 +24,7 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import java.util.List;
 import org.apache.iceberg.ParameterizedTestExtension;
 import org.apache.iceberg.index.vector.VectorIndexTypes;
+import org.apache.spark.sql.AnalysisException;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.TestTemplate;
@@ -42,6 +43,9 @@ public class TestIndexDdlMaintenance extends ExtensionsTestBase {
     sql("DROP TABLE IF EXISTS %s", qualified("ddl_refresh_" + catalogName));
     sql("DROP TABLE IF EXISTS %s", qualified("ddl_drop_" + catalogName));
     sql("DROP TABLE IF EXISTS %s", qualified("ddl_ambiguous_" + catalogName));
+    sql("DROP TABLE IF EXISTS %s", qualified("ddl_uuid_" + catalogName));
+    sql("DROP TABLE IF EXISTS %s", qualified("ddl_uuid_gone_" + catalogName));
+    sql("DROP TABLE IF EXISTS %s", qualified("ddl_quoted_" + catalogName));
   }
 
   @TestTemplate
@@ -73,6 +77,59 @@ public class TestIndexDdlMaintenance extends ExtensionsTestBase {
     List<Object[]> remaining =
         sql("CALL %s.system.list_indexes(table => '%s')", catalogName, table);
     assertThat(remaining).isEmpty();
+  }
+
+  @TestTemplate
+  public void testAnIndexIsAddressedByItsUUIDAsWellAsByItsName() {
+    String table = qualified("ddl_uuid_" + catalogName);
+    createIndexedTable(table, "by_uuid");
+    String uuid = indexUuid(table, "by_uuid");
+
+    sql("INSERT INTO %s VALUES (7, array(0.5, 0.5)), (8, array(-0.5, -0.5))", table);
+    sql("ALTER TABLE %s REFRESH INDEX `%s`", table, uuid);
+
+    // the UUID names the same index the name does, and a refresh through it covered the new files
+    List<Object[]> refreshed = sql("SHOW INDEXES FROM %s", table);
+    assertThat(refreshed).hasSize(1);
+    assertThat(((Number) refreshed.get(0)[6]).longValue()).isEqualTo(8L);
+
+    sql("ALTER TABLE %s DROP INDEX `%s`", table, uuid);
+    assertThat(sql("SHOW INDEXES FROM %s", table)).isEmpty();
+  }
+
+  @TestTemplate
+  public void testTheUUIDOfADroppedTableAddressesNothing() {
+    String table = qualified("ddl_uuid_gone_" + catalogName);
+    createIndexedTable(table, "gone");
+    String dropped = indexUuid(table, "gone");
+
+    // the same name, a different table: the UUID belongs to the one that is gone
+    sql("DROP TABLE %s", table);
+    createIndexedTable(table, "gone");
+    assertThat(indexUuid(table, "gone")).isNotEqualTo(dropped);
+
+    assertThatThrownBy(() -> sql("ALTER TABLE %s DROP INDEX `%s`", table, dropped))
+        .isInstanceOf(AnalysisException.class)
+        .hasMessageContaining("Index " + dropped + " does not exist");
+  }
+
+  @TestTemplate
+  public void testAQuotedTableNameAddressesTheSameIndex() {
+    String name = "ddl_quoted_" + catalogName;
+    String table = qualified(name);
+    createIndexedTable(table, "quoted");
+    String quoted = String.format("`%s`.`default`.`%s`", catalogName, name);
+
+    sql("INSERT INTO %s VALUES (7, array(0.5, 0.5))", table);
+    sql("ALTER TABLE %s REFRESH INDEX quoted", quoted);
+
+    List<Object[]> refreshed = sql("SHOW INDEXES FROM %s", table);
+    assertThat(refreshed).hasSize(1);
+    assertThat(((Number) refreshed.get(0)[6]).longValue()).isEqualTo(7L);
+
+    // backticks quote the parts of the name, they are not part of it
+    sql("ALTER TABLE %s DROP INDEX quoted", quoted);
+    assertThat(sql("SHOW INDEXES FROM %s", table)).isEmpty();
   }
 
   @TestTemplate
@@ -108,6 +165,16 @@ public class TestIndexDdlMaintenance extends ExtensionsTestBase {
     assertThatThrownBy(() -> sql("ALTER TABLE %s REFRESH INDEX body", table))
         .isInstanceOf(org.apache.spark.sql.AnalysisException.class)
         .hasMessageContaining("unnamed index on body");
+  }
+
+  private String indexUuid(String table, String indexName) {
+    List<Object[]> shown = sql("SHOW INDEXES FROM %s", table);
+    assertThat(shown).anySatisfy(row -> assertThat(row[8]).isEqualTo(indexName));
+    return (String)
+        shown.stream()
+            .filter(row -> indexName.equals(row[8]))
+            .findFirst()
+            .orElseThrow(() -> new AssertionError("no index " + indexName + " in " + table))[0];
   }
 
   private String qualified(String name) {

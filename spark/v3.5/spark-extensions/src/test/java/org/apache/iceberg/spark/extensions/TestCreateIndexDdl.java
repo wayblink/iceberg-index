@@ -41,6 +41,8 @@ public class TestCreateIndexDdl extends ExtensionsTestBase {
   public void removeTables() {
     sql("DROP TABLE IF EXISTS %s", qualified("create_index_" + catalogName));
     sql("DROP TABLE IF EXISTS %s", qualified("create_index_text_" + catalogName));
+    sql("DROP TABLE IF EXISTS %s", qualified("create_index_missing_" + catalogName));
+    sql("DROP TABLE IF EXISTS %s", qualified("create_index_nested_" + catalogName));
   }
 
   @TestTemplate
@@ -127,6 +129,36 @@ public class TestCreateIndexDdl extends ExtensionsTestBase {
                     table))
         .isInstanceOf(org.apache.spark.sql.AnalysisException.class)
         .hasMessageContaining("Duplicate index option: dimension");
+  }
+
+  @TestTemplate
+  public void testCreateIndexNamesTheColumnItCannotFind() {
+    String table = qualified("create_index_missing_" + catalogName);
+    createVectorTable(table);
+
+    assertThatThrownBy(
+            () ->
+                sql(
+                    "ALTER TABLE %s CREATE INDEX i USING vector (missing_col) "
+                        + "WITH (dimension = 2)",
+                    table))
+        .isInstanceOf(IllegalArgumentException.class)
+        .hasMessageContaining("Column missing_col does not exist");
+  }
+
+  @TestTemplate
+  public void testAnIndexColumnIsATopLevelColumn() {
+    String table = qualified("create_index_nested_" + catalogName);
+    sql("CREATE TABLE %s (id bigint, a struct<b: array<double>>) USING iceberg", table);
+    sql("INSERT INTO %s SELECT 1, named_struct('b', array(1.0d, 0.0d))", table);
+
+    // an index is built on a column, and a dotted path is not one: the refusal names the path
+    // rather than building an index on something else
+    assertThatThrownBy(
+            () ->
+                sql("ALTER TABLE %s CREATE INDEX i USING vector (a.b) WITH (dimension = 2)", table))
+        .isInstanceOf(IllegalArgumentException.class)
+        .hasMessageContaining("a.b does not exist");
   }
 
   @TestTemplate
