@@ -376,17 +376,25 @@ private[spark] object VectorSearchBridge {
     }
 
     val metric = inputs.definition.metric()
+    val dimension = query.length
     val broadcast = spark.sparkContext.broadcast(query)
     rows.rdd
-      .filter(entry => vectorIndex < 0 || !entry._2._2.isNullAt(vectorIndex))
+      .filter { entry =>
+        val row = entry._2._2
+        vectorIndex >= 0 && !row.isNullAt(vectorIndex) &&
+        row.getList[AnyRef](vectorIndex).size() == dimension
+      }
       .map { entry =>
         val row = entry._2._2
         (row, entry._1, entry._2._1, distanceOf(metric, row, vectorIndex, broadcast.value))
       }
-      // a row without a vector is not a candidate, and neither branch may answer with one: the two
-      // have to answer the same question
-      .takeOrdered(request.topK)(
-        Ordering.by[(Row, String, java.lang.Long, Double), Double](scored => scored._4))
+      // a row without a vector is not a candidate, and neither is one whose vector does not have
+      // the dimension the query has: it cannot be compared with the query, so scoring it would fail
+      // the whole search instead of leaving it out. The index branch cannot return one either,
+      // because every entry it holds was built for one dimension, so both branches answer the same
+      // question
+      .takeOrdered(request.topK)(Ordering.by[(Row, String, java.lang.Long, Double), Double](
+        scored => scored._4))
       .map { scored =>
         (scored._2, scored._3.longValue(), scored._4, scored._1)
       }
