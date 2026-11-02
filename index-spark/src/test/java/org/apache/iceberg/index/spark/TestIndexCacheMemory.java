@@ -840,7 +840,15 @@ class TestIndexCacheMemory {
 
     assertThat(IndexCacheMemory.compatibleModel(otherProcessors, adapter)).isTrue();
     assertThat(IndexCacheMemory.compatible(otherProcessors, adapter))
-        .as("a resident copy is still reused only under the profile it was prepared with")
+        .as("the same layout is described by the same numbers whichever host measured them")
+        .isTrue();
+    assertThat(
+            IndexCacheMemory.compatible(
+                current.toBuilder()
+                    .runtimeProfile(current.runtimeProfile().replace("alignment=8", "alignment=16"))
+                    .build(),
+                adapter))
+        .as("another layout is not a record this runtime can reuse")
         .isFalse();
     assertThat(
             IndexCacheMemory.compatibleModel(

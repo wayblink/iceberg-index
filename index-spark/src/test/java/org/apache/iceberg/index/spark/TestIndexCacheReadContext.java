@@ -170,7 +170,8 @@ class TestIndexCacheReadContext {
         reads.set(0);
         IndexFileMemory memory = adapter.encodeEntriesWithMemory(List.of()).memory();
         if (mismatch) {
-          memory = memory.toBuilder().runtimeProfile("processors=different-executor").build();
+          memory =
+              memory.toBuilder().runtimeProfile(memory.runtimeProfile() + ";alignment=16").build();
         }
         IndexCacheProtocol.Command command =
             IndexCacheProtocol.Command.builder()
@@ -305,14 +306,11 @@ class TestIndexCacheReadContext {
           IndexFileMemory memory = built.memory();
           assertThat(memory).isNotNull();
           if (mismatch) {
+            // A layout the model does not describe, not another processor count: the driver and an
+            // executor rarely agree on cores, and the numbers transfer between them.
             memory =
                 memory.toBuilder()
-                    .runtimeProfile(
-                        memory
-                            .runtimeProfile()
-                            .replace(
-                                "processors=" + Runtime.getRuntime().availableProcessors(),
-                                "processors=999999"))
+                    .runtimeProfile(memory.runtimeProfile().replace("alignment=8", "alignment=16"))
                     .build();
           }
           IndexCacheProtocol.Command command =

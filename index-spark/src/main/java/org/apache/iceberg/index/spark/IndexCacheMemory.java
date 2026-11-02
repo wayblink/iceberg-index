@@ -443,6 +443,13 @@ final class IndexCacheMemory {
     return JvmLayout.supportedOrWarn("Index cache capacity accounting");
   }
 
+  /**
+   * Whether a record's numbers describe this runtime's layout, ignoring which host measured them.
+   *
+   * <p>Used where a copy is reused rather than re-estimated. The processor count is left out for
+   * the same reason it does not decide compatibility: two hosts of one cluster rarely agree on
+   * cores, and the resident copy's own context is checked separately against this adapter.
+   */
   static boolean compatible(IndexFileMemory memory, IndexAdapter adapter) {
     if (!supportedLayout() || memory == null || memory.modelVersion() != 2) {
       return false;
@@ -452,6 +459,23 @@ final class IndexCacheMemory {
     } catch (RuntimeException e) {
       return false;
     }
+  }
+
+  /**
+   * Whether a record's numbers describe the same model, reader and layout as another.
+   *
+   * <p>The recorded profile names the host that measured the file, and that name includes its
+   * processor count. The count decides which prepared state may be shared between callers, not how
+   * the file is laid out, so a record measured on a 172-core driver describes a file an executor
+   * with 160 cores can reuse as it is.
+   */
+  private static boolean compatible(IndexFileMemory memory, IndexFileMemory descriptor) {
+    return memory != null
+        && descriptor != null
+        && memory.modelVersion() == descriptor.modelVersion()
+        && memory.readerId().equals(descriptor.readerId())
+        && layoutIdentity(memory.runtimeProfile())
+            .equals(layoutIdentity(descriptor.runtimeProfile()));
   }
 
   /**
@@ -478,14 +502,6 @@ final class IndexCacheMemory {
    * Whether one memory record describes the same model, reader and runtime as another. A copy that
    * is already resident is reused only under the profile it was prepared with.
    */
-  private static boolean compatible(IndexFileMemory memory, IndexFileMemory descriptor) {
-    return memory != null
-        && descriptor != null
-        && memory.modelVersion() == descriptor.modelVersion()
-        && memory.readerId().equals(descriptor.readerId())
-        && memory.runtimeProfile().equals(descriptor.runtimeProfile());
-  }
-
   static String runtimeIdentity() {
     return "vm="
         + System.getProperty("java.vm.name")
