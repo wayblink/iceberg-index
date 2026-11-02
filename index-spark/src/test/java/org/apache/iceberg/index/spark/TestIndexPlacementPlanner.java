@@ -91,8 +91,23 @@ class TestIndexPlacementPlanner {
 
   @Test
   void doesNotSpendAnotherLoadReservationOrPendingRelease() {
+    // An executor that states no shape is unknown capacity, not free space: the planner refuses to
+    // place rather than assuming the reservations it states leave room. The reservation and pending
+    // release the report carries are what the coordinator subtracts from a known shape.
     assertThat(planner.plan(target(file("new", 2)), List.of(node("a", 8, 8))).rejected())
         .containsEntry("new", "INSUFFICIENT_CAPACITY");
+    IndexCacheProtocol.NodeReport bare =
+        IndexCacheProtocol.NodeReport.builder()
+            .session("session")
+            .executorId("a")
+            .incarnation("a-1")
+            .budgetBytes(rawBudget(8))
+            .usedBytes(units(4))
+            .reservedBytes(units(4))
+            .metadataShape(ExecutorIndexCache.Shape.empty().unknownCharge())
+            .build();
+    assertThat(planner.plan(target(file("new", 2)), List.of(bare)).rejected())
+        .containsEntry("new", "SIZE_UNKNOWN");
   }
 
   @Test

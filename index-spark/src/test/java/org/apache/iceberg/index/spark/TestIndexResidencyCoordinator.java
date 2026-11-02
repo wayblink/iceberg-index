@@ -102,6 +102,23 @@ class TestIndexResidencyCoordinator {
   }
 
   @Test
+  void aNodeThatStoppedReportingIsNotAPlacementTarget() {
+    coordinator.report(node("a", "a-1", 1, 512, 0));
+    assertThat(coordinator.commands("a", "a-1")).isEmpty();
+
+    // the node has gone quiet. It was the emptiest node when it last spoke, so without the
+    // staleness bound it is the one the planner picks, and the plan then waits out its whole
+    // deadline for an answer that cannot come.
+    clock.reset(BASE + IndexResidencyCoordinator.STALE_AFTER_NANOS + 1);
+    coordinator.acceptLoad(
+        target("A", "f1", 300), IndexResidencyPolicy.parse("forever"), clock.now());
+
+    assertThat(coordinator.commands("a", "a-1"))
+        .as("commands sent to a node nobody has heard from")
+        .isEmpty();
+  }
+
+  @Test
   void aReportedPlanReservationIsNotAddedToItsDriverPromiseAgain() {
     coordinator.report(node("a", "a-1", 1, 1000, 0));
     String first =

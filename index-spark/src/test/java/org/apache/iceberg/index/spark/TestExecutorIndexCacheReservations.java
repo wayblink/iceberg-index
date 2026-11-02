@@ -531,20 +531,10 @@ class TestExecutorIndexCacheReservations {
           askTwice(
               "a-new", withMode(config, ExecutorIndexCache.Mode.PIN_HOT, 0).withOwner("A"), 40);
         };
-    Measured target =
-        measure(
-            config -> {
-              askTwice(
-                  "b", withMode(config, ExecutorIndexCache.Mode.PIN_HOT, 0).withOwner("B"), 60);
-              askTwice(
-                  "a-new", withMode(config, ExecutorIndexCache.Mode.PIN_HOT, 0).withOwner("A"), 40);
-            },
-            "B|adapter|b",
-            "A|adapter|a-new");
-    // Enough room for the retained pair, but not for all three: the new entry has to make
-    // admission reclaim the one its table no longer needs.
-    long all = atRest(fixture).usedBytes();
-    long capacity = Math.subtractExact(all, 24L);
+    // Enough room for the retained pair and not for all three: the new entry has to make admission
+    // reclaim the one its table no longer needs, and which entry that is is what this asserts.
+    long capacity = measure(fixture, "B|adapter|b", "A|adapter|a-new").capacity();
+    long allThree = atRest(fixture).usedBytes();
     ExecutorIndexCache.Config a =
         withMode(ExecutorIndexCache.Config.of(true, capacity), ExecutorIndexCache.Mode.PIN_HOT, 0)
             .withOwner("A");
@@ -552,8 +542,14 @@ class TestExecutorIndexCacheReservations {
     askTwice("a-old", a, 40);
     askTwice("b", b, 60);
     askTwice("a-new", a, 40);
-    assertThat(cache.stats().bytes()).isLessThan(all);
-    assertThat(cache.stats().bytes()).isLessThanOrEqualTo(capacity);
+    assertThat(cache.residentKeys())
+        .as("fair eviction keeps the other table's entry and the kept entry of the same table")
+        .contains("B|adapter|b", "A|adapter|a-new")
+        .doesNotContain("A|adapter|a-old");
+    // The charge of the same entry set depends on the path that produced it (map capacity and the
+    // ownership bookkeeping both keep their history), so the number asserted here is what has to
+    // hold at this capacity, not the charge another history would report.
+    assertThat(cache.stats().bytes()).isLessThan(allThree).isLessThanOrEqualTo(capacity);
   }
 
   @Test

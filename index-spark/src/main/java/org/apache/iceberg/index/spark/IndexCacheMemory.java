@@ -18,12 +18,10 @@
  */
 package org.apache.iceberg.index.spark;
 
-import com.sun.management.HotSpotDiagnosticMXBean;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.ObjectOutputStream;
 import java.io.UncheckedIOException;
-import java.lang.management.ManagementFactory;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
@@ -41,6 +39,7 @@ import org.apache.iceberg.index.spark.IndexCacheMetadata.Components;
 import org.apache.iceberg.index.spark.IndexCacheMetadata.MetadataState;
 import org.apache.iceberg.index.spark.IndexCacheMetadata.Mutation;
 import org.apache.iceberg.index.spark.IndexCacheMetadata.Texts;
+import org.apache.iceberg.index.vector.JvmLayout;
 import org.apache.iceberg.io.FileIO;
 import org.apache.iceberg.relocated.com.google.common.base.Preconditions;
 import org.slf4j.Logger;
@@ -433,20 +432,15 @@ final class IndexCacheMemory {
     }
   }
 
+  /**
+   * Whether this JVM's object layout is the one the cache's charge model describes.
+   *
+   * <p>The probe lives with the structural estimates it shares those facts with, so the two modules
+   * cannot disagree about which JVMs are supported, and it is decided once per JVM rather than read
+   * from an MXBean on every estimate.
+   */
   static boolean supportedLayout() {
-    try {
-      HotSpotDiagnosticMXBean bean =
-          ManagementFactory.getPlatformMXBean(HotSpotDiagnosticMXBean.class);
-      return bean != null
-          && "17".equals(System.getProperty("java.specification.version"))
-          && "64".equals(System.getProperty("sun.arch.data.model"))
-          && "true".equals(bean.getVMOption("UseCompressedOops").getValue())
-          && "true".equals(bean.getVMOption("UseCompressedClassPointers").getValue())
-          && "8".equals(bean.getVMOption("ObjectAlignmentInBytes").getValue())
-          && "true".equals(bean.getVMOption("CompactStrings").getValue());
-    } catch (RuntimeException | LinkageError e) {
-      return false;
-    }
+    return JvmLayout.supportedOrWarn("Index cache capacity accounting");
   }
 
   static boolean compatible(IndexFileMemory memory, IndexAdapter adapter) {

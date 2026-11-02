@@ -18,8 +18,6 @@
  */
 package org.apache.iceberg.index.vector;
 
-import com.sun.management.HotSpotDiagnosticMXBean;
-import java.lang.management.ManagementFactory;
 import java.nio.ByteBuffer;
 import java.util.Map;
 import org.apache.iceberg.index.IndexBuildResult;

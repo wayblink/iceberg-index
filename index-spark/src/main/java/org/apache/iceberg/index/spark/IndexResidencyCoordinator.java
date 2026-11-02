@@ -1919,22 +1919,6 @@ final class IndexResidencyCoordinator {
         continue;
       }
 
-      // This plan is accounted for by the placements being planned. Other commands and every
-      // ordinary-query reservation must remain unavailable.
-      long others =
-          Math.addExact(
-              node.effectiveReservedBytesExcept(planId), node.excessReservationsFor(planId));
-
-      // Occupancy includes retained copies plus every other plan's unresolved promise; the
-      // planner adds this plan's own placements to that baseline.
-      reports.add(
-          node.report
-              .copy()
-              .usedBytes(Math.addExact(node.report.usedBytes(), others))
-              .reservedBytes(0)
-              .reservedByPlan(Map.of())
-              .reservedByCommand(Map.of())
-              .build());
       reports.add(node.report.copy().metadataShape(node.projected(planId)).build());
     }
 

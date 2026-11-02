@@ -25,7 +25,6 @@ import java.util.Comparator;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
-import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
 import org.apache.iceberg.Table;
@@ -590,6 +589,27 @@ public final class DistributedIndexSearch {
    * otherwise the file is read and prepared once to re-estimate it. The value is the retained
    * prepared state P, not the container or encoded payload lengths, which are diagnostic only.
    */
+  /**
+   * Reports an unknown working set with its reason, once per reason.
+   *
+   * <p>An unknown working set is not a query failure: the cache falls back to its smallest budget,
+   * which keeps it from claiming the query fits. What it does mean is that repeated queries will
+   * not be served from the cache, and that is worth one line rather than a debug message per query.
+   */
+  private static long unknownWorkingSet(String reason) {
+    if (WORKING_SET_REASONS.add(reason)) {
+      LOG.warn(
+          "The index cache working set is unknown because {}; a derived budget cannot size this"
+              + " query and the cache keeps only its minimum. Raise the reporting if this table is"
+              + " meant to be served from the cache.",
+          reason);
+    }
+
+    return -1;
+  }
+
+  private static final java.util.Set<String> WORKING_SET_REASONS = ConcurrentHashMap.newKeySet();
+
   static long preparedBytesOf(FileIO io, IndexFile file, IndexAdapter adapter) {
     IndexFileMemory memory = IndexCacheMemory.resolveMemory(io, file, adapter);
     return memory == null ? -1 : memory.preparedBytes();
@@ -597,14 +617,20 @@ public final class DistributedIndexSearch {
 
   static long workingSetBytes(
       FileIO io, List<IndexFile> files, IndexAdapter adapter, String owner) {
-    if (owner == null || owner.isBlank() || IndexCacheMemory.currentDescriptor(adapter) == null) {
-      return -1;
+    if (owner == null || owner.isBlank()) {
+      return unknownWorkingSet("the table has no location to own the entries");
     }
+
+    if (IndexCacheMemory.currentDescriptor(adapter) == null) {
+      return unknownWorkingSet(
+          "reader " + adapter.getClass().getName() + " has no retained-state descriptor");
+    }
+
     List<IndexCacheProtocol.File> planned = new ArrayList<>();
     for (IndexFile file : files) {
       IndexFileMemory memory = IndexCacheMemory.resolveMemory(io, file, adapter);
       if (memory == null) {
-        return -1;
+        return unknownWorkingSet("the retained size of one of the files is unknown");
       }
       planned.add(
           IndexCacheProtocol.File.builder()
@@ -668,26 +694,6 @@ public final class DistributedIndexSearch {
 
     long payloadBytes() {
       return payloadBytes;
-    }
-  }
-
-  private static final Set<String> WARNED_ESTIMATE_REASONS = ConcurrentHashMap.newKeySet();
-
-  /**
-   * Reports an estimate that fell back to the container length, once per reason.
-   *
-   * <p>A derived budget is sized from these estimates, so a silent fallback is a query that looks
-   * measured and is not. It is not a query failure: the container length is a lower bound of what
-   * the prepared structure costs, so the budget stays usable.
-   */
-  private static void warnEstimateFallback(String reason, RuntimeException cause) {
-    if (WARNED_ESTIMATE_REASONS.add(reason)) {
-      LOG.warn(
-          "{}; the index cache budget falls back to the index file's container length, so a"
-              + " derived budget may under-cover this query. Raise the reporting if this table is"
-              + " meant to be served from the cache.",
-          reason,
-          cause);
     }
   }
 
