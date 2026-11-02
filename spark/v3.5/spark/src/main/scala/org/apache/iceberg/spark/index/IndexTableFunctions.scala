@@ -224,10 +224,9 @@ object IndexTableFunctions {
       .orElse(arguments.int("limit"))
       .getOrElse(DefaultLimit)
     val column = arguments.string(VECTOR_COLUMN)
-    // the function states its metric, and cosine when the caller names none. Leaving it unnamed to
-    // follow the index would need the projected distance to be re-bound to the index metric, which
-    // the rewrite only does for the ordering, not for a projection above the limit; until that is
-    // fixed, a stated metric is the only way to keep the ordering and the returned distance equal.
+    // a metric the caller names is the question, and one it does not name is whatever the index was
+    // built with: the distance is projected below the limit, where the rewrite binds its metric, so
+    // the ordering and the returned distance stay the same measurement either way
     val named = arguments.metric("distance_type")
     val columns = arguments.strings("columns")
 
@@ -266,15 +265,21 @@ object IndexTableFunctions {
       named.getOrElse(Metric.COSINE),
       vector,
       query,
-      explicitMetric = true)
+      explicitMetric = named.isDefined)
     // a row without a vector has no distance, so it has no place in a distance ordering: plain
     // Spark would sort it first under ASC and spend one of the k rows on it, which is neither what
     // the index branch answers nor what the guide promises
     val candidates = Filter(IsNotNull(vector), relation)
+    // the distance is projected below the limit, not above it, so the projection is inside the part
+    // of the plan the rewrite binds the index's metric in: a sort over the name the projection gives
+    // means the same thing as a sort that computes it, and both follow the index
+    val computed = Project(selected :+ Alias(distance, DISTANCE_COLUMN)(), candidates)
     val ordered =
-      Sort(Seq(SortOrder(distance, Ascending, NullsFirst, Seq.empty)), global = true, candidates)
-    val limited = GlobalLimit(Literal(k), ordered)
-    Project(selected :+ Alias(distance, DISTANCE_COLUMN)(), limited)
+      Sort(
+        Seq(SortOrder(computed.output.last, Ascending, NullsFirst, Seq.empty)),
+        global = true,
+        computed)
+    GlobalLimit(Literal(k), ordered)
   }
 
   /** The named and positional arguments of a table function, refusing what it does not know. */

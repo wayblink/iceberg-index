@@ -131,6 +131,30 @@ class TestVectorSearchTableFunction {
   }
 
   @Test
+  public void followsTheMetricOfTheIndexWhenTheCallerNamesNone() {
+    // the index is euclidean, so a call that names no metric is the same question and the index
+    // answers it: the distance is the euclidean one, not the cosine the caller did not ask for
+    String table = tableWithMetric("vs_default_metric", "EUCLIDEAN");
+
+    String query =
+        String.format(
+            "SELECT id, _distance FROM vector_search("
+                + "table => 'local.%s', query_vector => array(0.9d, 0.1d), "
+                + "vector_column => 'embedding', k => 1)",
+            table);
+
+    assertThat(planOf(query)).contains("VectorSearchSource");
+    Row row = spark.sql(query).head();
+    assertThat(row.getLong(0)).isEqualTo(1L);
+    assertThat(row.getDouble(1)).isCloseTo(Math.sqrt(0.02d), within(1e-6d));
+
+    // naming a metric the index was not built with is still a different question, answered by a
+    // scan
+    assertThat(planOf(query.replace("k => 1", "k => 1, distance_type => 'cosine'")))
+        .doesNotContain("VectorSearchSource");
+  }
+
+  @Test
   public void answersWithAScanWhenTheIndexUsesAnotherMetric() {
     // the index is cosine; asking for euclidean is a different question, so the rows come from a
     // scan and the distance is the euclidean one, not a re-labelled cosine

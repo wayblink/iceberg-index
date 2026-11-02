@@ -209,7 +209,7 @@ SELECT id, title, _distance FROM vector_search(
   k => 3);
 ```
 
-`vector_search` 表函数的 `distance_type` 可以显式指定 `cosine` / `dot_product` / `euclidean`（也接受 `cos`、`l2` 等别名）；它与索引的 metric 不一致时，改写会退让并做全表扫描，但**答案仍是你要的那个 metric 的精确值**。
+`vector_search` 表函数的 `distance_type` 可以显式指定 `cosine` / `dot_product` / `euclidean`（也接受 `cos`、`l2` 等别名）；**不写它就跟随索引的 metric**（索引是 euclidean，返回的就是 euclidean 距离）；写了但与索引不一致时，改写会退让并做全表扫描，但**答案仍是你要的那个 metric 的精确值**。
 
 #### 改写发生的条件（全部满足）
 

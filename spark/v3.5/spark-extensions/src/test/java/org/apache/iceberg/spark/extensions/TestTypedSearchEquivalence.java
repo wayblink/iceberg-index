@@ -239,8 +239,7 @@ class TestTypedSearchEquivalence {
         .sql(
             String.format(
                 "SELECT id, body, _distance FROM vector_search(table => 'local.db.%s', "
-                    + "query_vector => %s, vector_column => 'embedding', k => %d, "
-                    + "distance_type => 'euclidean')",
+                    + "query_vector => %s, vector_column => 'embedding', k => %d)",
                 table, query, k))
         .collectAsList();
   }
