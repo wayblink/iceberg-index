@@ -245,7 +245,7 @@ SET `spark.iceberg.index.vector.over-sample`=10;
 CALL local.system.refresh_vector_index(table => 'db.docs', column => 'embedding', index => 'ivf_1bit');
 ```
 
-只重建受影响的索引文件。输出与构建一致；如果当前快照已被覆盖（没有新文件可补），返回 `index_files = 0, entries = 0`。
+只重建受影响的索引文件：新数据文件会补上段，内容变过的数据文件（出现了删除文件，或被重写换名）会把它所属的组整体重建，没被新快照触及的索引文件原样保留。输出与构建一致；只有当前快照与父索引快照相比什么都没变时才不产新快照，返回 `index_files = 0, entries = 0`。
 
 ```sql
 CALL local.system.drop_vector_index(table => 'db.docs', column => 'embedding', index => 'ivf_1bit');
@@ -490,7 +490,7 @@ CALL local.system.offload_index(table => 'db.docs', index => '<uuid>');
 
 **9.9 大索引的跨节点放置。** 装不进单节点缓存的规模（如 100M HNSW），目前只能"装得下多少装多少"，没有分片放置与均衡调度。
 
-**9.10 构建部分失败仍报成功，是设计而不是缺陷。** `state = SUCCEEDED` 说的是“这次构建跑完并发布了”，不是“每个数据文件都被索引”。默认语义下，某些索引文件构建失败时任务不抛异常、已成功的那部分照常发布，失败组的数据文件由查询时的残差扫描兜住——**结果仍然正确，只是那些文件每次都要扫**。判断完整性看 `index_build_status` 的 `files_failed`，以及 `check_indexes` 的 `uncovered_data_files`（未覆盖数据文件数）与 `suggestion`（会给 `refresh_vector_index` 的补齐语句；刷新只追加段，成本低）。构建日志里也会有一条 WARN 报出失败文件数。
+**9.10 构建部分失败仍报成功，是设计而不是缺陷。** `state = SUCCEEDED` 说的是“这次构建跑完并发布了”，不是“每个数据文件都被索引”。默认语义下，某些索引文件构建失败时任务不抛异常、已成功的那部分照常发布，失败组的数据文件由查询时的残差扫描兜住——**结果仍然正确，只是那些文件每次都要扫**。判断完整性看 `index_build_status` 的 `files_failed`，以及 `check_indexes` 的 `uncovered_data_files`（未覆盖数据文件数）与 `suggestion`（会给 `refresh_vector_index` 的补齐语句；漏掉的文件从没被覆盖过，刷新只是补段，成本低）。构建日志里也会有一条 WARN 报出失败文件数。注意“刷新很便宜”只对**补段**成立：如果表里出现了删除或被重写的数据文件，刷新会重建它所在的组，成本按组算，不是按新增文件算。
 
 ---
 

@@ -1180,9 +1180,12 @@ less parallelism during the build and a larger file to load per task.
 ### `refresh_vector_index`
 
 Refreshes an existing vector index against the table's current snapshot. Index files of unchanged
-data files are carried over; files of removed or rewritten data files are dropped and new data files
-are indexed. When the current snapshot is already covered, no new index snapshot is created and
-zero files and entries are reported.
+data files are carried over. New data files are indexed, and a data file whose contents changed —
+a delete file appeared for it, or a rewrite replaced it — is re-indexed together with every data
+file that shares its index file, because an index file covers whole data files. When the snapshot
+differs from the one the index was built at but nothing has to be built, the new index snapshot is
+still published with the stale index files dropped; when nothing changed at all, no new index
+snapshot is created and zero files and entries are reported.
 
 | Argument Name | Required? | Type   | Description                        |
 |---------------|-----------|--------|------------------------------------|
@@ -1394,7 +1397,9 @@ CALL catalog_name.system.build_text_index(
 ### `refresh_text_index`
 
 Refreshes a BM25 text index from the current table snapshot, rewriting only the index files of
-data files that were added or changed.
+data files that were added or changed. A delete file that appeared for a data file counts as a
+change: the postings of that file are rebuilt, and so are the document statistics the index scores
+with, because a deleted document must stop influencing them.
 
 | Argument Name | Required? | Type   | Description        |
 |---------------|-----------|--------|--------------------|

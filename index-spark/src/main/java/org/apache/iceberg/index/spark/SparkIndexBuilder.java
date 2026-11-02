@@ -64,8 +64,8 @@ import org.slf4j.LoggerFactory;
  *
  * <p>Entries are read by {@link IndexEntries}, shuffled by data file so that all rows of a data
  * file land in one partition, and written as one index file per data file per partition. That keeps
- * source-file coverage precise: a refresh only has to drop the index files of data files that were
- * removed or rewritten.
+ * source-file coverage precise: a refresh only has to rebuild the index files of data files whose
+ * contents changed.
  *
  * <p>Like the core builder, this only writes files and returns updated metadata; publishing it
  * through the {@code IndexCatalog} is a separate step.
@@ -152,9 +152,11 @@ public final class SparkIndexBuilder {
   /**
    * Refreshes an index incrementally against a newer source table snapshot.
    *
-   * <p>Index files of data files that are still present are carried over unchanged (parent-index
-   * snapshot lineage); index files of removed or rewritten data files are dropped, and new data
-   * files are indexed. If nothing changed, the metadata is returned unchanged.
+   * <p>Index files of data files that are still present and unchanged are carried over
+   * (parent-index snapshot lineage). New data files are indexed, and so is every data file whose
+   * contents changed since the index was built: a delete file appeared for it, or a rewrite
+   * replaced it. An index file covers whole data files, so a change to one of them rebuilds every
+   * data file it covers. If nothing changed, the metadata is returned unchanged.
    *
    * @param spark the Spark session
    * @param table the Iceberg table to index
@@ -202,45 +204,55 @@ public final class SparkIndexBuilder {
       return currentMetadata;
     }
 
-    // a refresh appends: it builds segments for the data files the parent does not cover and
-    // leaves every existing segment where it is. A data file whose entries changed, or one that a
-    // rewrite replaced, is not re-indexed here: that rewrites segments, costs as much as a rebuild,
-    // and belongs to an explicit rebuild or a merge of the index.
-    Set<String> staleFiles = Sets.union(removedFiles, deleteChangedFiles);
-    if (!staleFiles.isEmpty()) {
-      LOG.warn(
-          "Index {} of table {} does not cover {} data files whose contents changed since it was "
-              + "built. They are left as they are: a refresh appends, it does not rewrite "
-              + "segments. Rebuild the index to cover them.",
+    // A data file whose contents changed is re-indexed here, together with every data file that
+    // shares an index file with it: an index file covers whole data files and cannot be rewritten
+    // in part. Leaving them out would keep answering with rows the table no longer holds, and a
+    // text
+    // index would keep scoring with a document frequency that counts those rows. Merging segments
+    // and redistributing them stay the job of an index merge; the delete itself is not.
+    List<IndexFile> parentFiles = indexFiles(fileIO, previous);
+    Set<String> changedFiles =
+        IndexGrouping.expandToGroups(parentFiles, Sets.union(removedFiles, deleteChangedFiles));
+    if (!changedFiles.isEmpty()) {
+      LOG.info(
+          "Index {} of table {} re-indexes {} data files whose contents changed since it was "
+              + "built",
           currentMetadata.indexUuid(),
           table.name(),
-          staleFiles.size());
+          Sets.intersection(changedFiles, currentFiles).size());
     }
 
-    if (newFiles.isEmpty()) {
-      return currentMetadata;
+    List<IndexFile> carried = Lists.newArrayList();
+    for (IndexFile indexFile : parentFiles) {
+      if (Sets.intersection(Sets.newHashSet(indexFile.coveredDataFiles()), changedFiles)
+          .isEmpty()) {
+        carried.add(indexFile);
+      }
     }
 
-    List<IndexFile> carried = Lists.newArrayList(indexFiles(fileIO, previous));
-    Set<String> rebuildFiles = newFiles;
+    // a removed data file has nothing to rebuild, but the index files that covered it are gone,
+    // which is why the snapshot below is still published
+    Set<String> rebuildFiles = Sets.intersection(Sets.union(newFiles, changedFiles), currentFiles);
 
     IndexSnapshotWriter writer = new IndexSnapshotWriter(fileIO);
     List<IndexFile> indexFiles;
     String manifestList;
     try {
       List<IndexFile> newIndexFiles =
-          buildIndexFiles(
-              spark,
-              table,
-              indexLocation,
-              currentMetadata.indexUuid(),
-              snapshotId,
-              sourceTableSnapshotId,
-              vectorColumn,
-              adapter,
-              rebuildFiles,
-              currentMetadata.maxEntriesPerIndexFile(),
-              writer);
+          rebuildFiles.isEmpty()
+              ? Lists.newArrayList()
+              : buildIndexFiles(
+                  spark,
+                  table,
+                  indexLocation,
+                  currentMetadata.indexUuid(),
+                  snapshotId,
+                  sourceTableSnapshotId,
+                  vectorColumn,
+                  adapter,
+                  rebuildFiles,
+                  currentMetadata.maxEntriesPerIndexFile(),
+                  writer);
       indexFiles = Lists.newArrayList(carried);
       indexFiles.addAll(newIndexFiles);
       manifestList = writer.writeManifestList(indexLocation, snapshotId, indexFiles);
@@ -319,7 +331,7 @@ public final class SparkIndexBuilder {
         // guaranteed to look; the status report keeps the count, and check_indexes reports the gap.
         LOG.warn(
             "Index build for table {} finished with {} data files not indexed; the index covers the "
-                + "rest and queries scan the uncovered files until a refresh appends them",
+                + "rest and queries scan the uncovered files until a refresh covers them",
             table.name(),
             failedFiles);
       }

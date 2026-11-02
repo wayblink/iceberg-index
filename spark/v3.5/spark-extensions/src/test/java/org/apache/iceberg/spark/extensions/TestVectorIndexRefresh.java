@@ -20,10 +20,24 @@ package org.apache.iceberg.spark.extensions;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
+import java.io.IOException;
+import java.io.UncheckedIOException;
 import java.nio.file.Path;
 import java.util.Arrays;
+import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Set;
+import org.apache.iceberg.Table;
+import org.apache.iceberg.index.IndexFile;
+import org.apache.iceberg.index.IndexManifest;
+import org.apache.iceberg.index.IndexManifestList;
+import org.apache.iceberg.index.IndexMetadata;
+import org.apache.iceberg.index.IndexReader;
+import org.apache.iceberg.index.IndexSnapshot;
+import org.apache.iceberg.index.spark.IndexEntries;
+import org.apache.iceberg.index.spark.VectorIndexes;
 import org.apache.iceberg.index.vector.VectorIndexTypes;
+import org.apache.iceberg.spark.Spark3Util;
 import org.apache.spark.sql.Row;
 import org.apache.spark.sql.SparkSession;
 import org.junit.jupiter.api.AfterAll;
@@ -32,14 +46,16 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
 /**
- * Tests that a refresh appends segments and nothing else.
+ * Tests what a refresh does to an existing index snapshot.
  *
- * <p>A refresh builds the data files the parent does not cover and carries every existing segment
- * unchanged. A data file whose entries changed — a delete file appeared for it, or a rewrite
- * replaced it — is deliberately not re-indexed: that rewrites segments, and it is the job of an
- * explicit rebuild or of merging the index, not of a refresh.
+ * <p>A refresh carries every segment whose data files are still present and unchanged, builds
+ * segments for the data files the parent does not cover, and rebuilds the segments of data files
+ * whose contents changed — a delete file appeared for one, or a rewrite replaced it. Re-indexing
+ * those is what keeps a query from answering with rows the table no longer holds; carrying the rest
+ * unchanged is what keeps a refresh cheap. Merging segments and redistributing them are not part of
+ * it.
  */
-class TestVectorIndexRefreshAppends {
+class TestVectorIndexRefresh {
 
   private static final String COLUMNS = "(id bigint, embedding array<double>) USING iceberg";
 
@@ -110,9 +126,15 @@ class TestVectorIndexRefreshAppends {
   }
 
   @Test
-  public void doesNotRewriteSegmentsWhenACoveredFileGainsDeletes() {
+  public void rebuildsTheGroupWhoseDataFileGainedDeletes() throws Exception {
     String table = "db.refresh_deletes";
-    spark.sql(String.format("CREATE TABLE local.%s %s", table, COLUMNS));
+    // merge-on-read keeps the data file a delete touches, so this is the case a rewrite does not
+    // produce: the file is still in the snapshot and its entries changed
+    spark.sql(
+        String.format(
+            "CREATE TABLE local.%s %s TBLPROPERTIES "
+                + "('format-version' = '2', 'write.delete.mode' = 'merge-on-read')",
+            table, COLUMNS));
     spark.sql(
         String.format(
             "INSERT INTO local.%s VALUES (1, array(1.0d, 0.0d)), (2, array(0.0d, 1.0d))", table));
@@ -126,14 +148,26 @@ class TestVectorIndexRefreshAppends {
     spark.sql(String.format("DELETE FROM local.%s WHERE id = 2", table));
 
     List<Object[]> refreshed = refresh(table);
-    assertThat(((Number) refreshed.get(0)[2]).longValue()).isZero();
-    assertThat(((Number) refreshed.get(0)[3]).longValue()).isZero();
+    // the group that covers the changed data file is rebuilt, and only that group: the new
+    // segment holds the rows the table still has, so the entry count drops and the file
+    // count stays where it was
+    assertThat(((Number) refreshed.get(0)[2]).longValue()).isEqualTo(filesBefore);
+    assertThat(((Number) refreshed.get(0)[3]).longValue()).isEqualTo(entriesBefore - 1L);
 
     List<Object[]> after = listIndexes(table);
-    assertThat(((Number) after.get(0)[6]).longValue()).isEqualTo(entriesBefore);
+    assertThat(((Number) after.get(0)[6]).longValue()).isEqualTo(entriesBefore - 1L);
     assertThat(((Number) after.get(0)[5]).longValue()).isEqualTo(filesBefore);
 
-    // the deleted row is gone anyway: visibility is read from the table, not from the index
+    // the rebuilt segment does not answer with the deleted row any more, and the snapshot binds
+    Table icebergTable = Spark3Util.loadIcebergTable(spark, "local." + table);
+    long snapshot = icebergTable.currentSnapshot().snapshotId();
+    assertThat(
+            new IndexReader(
+                    VectorIndexes.findIndex(icebergTable, "embedding", "vector", null),
+                    icebergTable)
+                .uncoveredDataFiles(snapshot, IndexEntries.dataFiles(icebergTable, snapshot)))
+        .isEmpty();
+
     List<Row> hits =
         spark
             .sql(
@@ -143,6 +177,45 @@ class TestVectorIndexRefreshAppends {
                     table))
             .collectAsList();
     assertThat(hits).extracting(row -> row.getLong(0)).doesNotContain(2L);
+  }
+
+  @Test
+  public void carriesUnchangedSegmentsThroughAnAppend() throws Exception {
+    String table = "db.refresh_carry";
+    spark.sql(String.format("CREATE TABLE local.%s %s", table, COLUMNS));
+    spark.sql(String.format("INSERT INTO local.%s VALUES (1, array(1.0d, 0.0d))", table));
+    buildIndex(table);
+
+    Table icebergTable = Spark3Util.loadIcebergTable(spark, "local." + table);
+    Set<String> before = indexFileLocations(icebergTable);
+
+    spark.sql(String.format("INSERT INTO local.%s VALUES (2, array(0.0d, 1.0d))", table));
+    refresh(table);
+
+    Set<String> after = indexFileLocations(Spark3Util.loadIcebergTable(spark, "local." + table));
+    // an append must not rewrite anything: every index file the parent had is still the file the
+    // refreshed snapshot points at
+    assertThat(after).containsAll(before);
+  }
+
+  private static Set<String> indexFileLocations(Table table) {
+    IndexMetadata metadata = VectorIndexes.findIndex(table, "embedding", "vector", null);
+    IndexSnapshot snapshot = metadata.latestSnapshot();
+    Set<String> locations = new LinkedHashSet<>();
+    try {
+      IndexManifestList manifestList =
+          IndexManifestList.read(table.io().newInputFile(snapshot.indexManifestList()));
+      for (IndexManifestList.ManifestRef manifestRef : manifestList.manifests()) {
+        for (IndexFile indexFile :
+            IndexManifest.read(table.io().newInputFile(manifestRef.location())).indexFiles()) {
+          locations.add(indexFile.location());
+        }
+      }
+    } catch (IOException e) {
+      throw new UncheckedIOException(e);
+    }
+
+    return locations;
   }
 
   private static void buildIndex(String table) {

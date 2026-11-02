@@ -129,7 +129,7 @@ ALTER TABLE hms.db.docs CREATE INDEX docs_ivf_1bit USING vector (embedding)
   WITH (dimension = 128, metric = 'euclidean', structure = 'IVF',
         options = map('nprobe', '32', 'rabitq-bits', '1'));
 ALTER TABLE hms.db.docs CREATE INDEX USING fts (body);   -- 文本索引暂时没有名字
-ALTER TABLE hms.db.docs REFRESH INDEX docs_ivf_1bit;      -- 补段：只追未覆盖文件
+ALTER TABLE hms.db.docs REFRESH INDEX docs_ivf_1bit;      -- 补段 + 重建内容变过的组
 ALTER TABLE hms.db.docs DROP INDEX docs_ivf_1bit;
 ```
 
@@ -143,7 +143,7 @@ ALTER TABLE hms.db.docs DROP INDEX docs_ivf_1bit;
 | `check_indexes(table=>...)` | 体检：是否需要重建 | 定期跑；返回可粘贴的 `refresh_vector_index(...)` 建议 |
 | `index_build_status(...)` | 构建进度 | 大表构建期间；状态落文件，随时可查 |
 | `index_cache_status()` | 各执行器缓存占用/覆盖 | 排查"为什么某次查询慢" |
-| `refresh_vector_index(...)` | 增量/重建 | 数据变更后；索引落后不阻塞查询，但覆盖率下降会变慢 |
+| `refresh_vector_index(...)` | 补段 + 重建内容变过的组 | 数据变更后；索引落后不阻塞查询，但覆盖率下降会变慢 |
 | `load_index` / `offload_index` | 手动驻留/卸载 | 见 §5.3；**当前仍在完善**（§7） |
 | `cleanup_index_files(...)` | 清理孤儿文件 | 构建失败或重建后的收尾 |
 | `drop_vector_index(...)` | 删索引 | 下线/换参数 |
@@ -453,7 +453,7 @@ docker push hub.i.basemind.com/spark/sparkann-e2e:<tag>
 
 这些不是"以后再说"，而是会影响运维决策的现状：
 
-0. **构建“成功”不等于“全覆盖”**（2026-10-30）。`state=SUCCEEDED` 只表示本次构建跑完并发布；某个索引文件写失败时 `files_failed` 非 0，`check_indexes` 的 `uncovered_data_files` 报漏掉的数据文件数并给出 `refresh_vector_index` 建议（补段，便宜）。查询结果不受影响，只是这些文件每次被扫描。运维应把 `files_failed>0` 或 `uncovered_data_files>0` 当告警，而不是成功。
+0. **构建“成功”不等于“全覆盖”**（2026-10-30）。`state=SUCCEEDED` 只表示本次构建跑完并发布；某个索引文件写失败时 `files_failed` 非 0，`check_indexes` 的 `uncovered_data_files` 报漏掉的数据文件数并给出 `refresh_vector_index` 建议（漏掉的文件没被覆盖过，刷新只需补段，便宜）。查询结果不受影响，只是这些文件每次被扫描。运维应把 `files_failed>0` 或 `uncovered_data_files>0` 当告警，而不是成功。注意这与“删改过的文件”不是一回事：后者在刷新时会重建它所在的组，见 §2.3 的 `refresh_*_index` 说明。
 
 1. **镜像与构建器版本必须对齐**（#2756）。当前没有自动门禁，只靠发布清单里的 smoke。**建议在 CI 增加断言**：镜像内 `IndexManifest` 可读版本集合 ⊇ 构建器 `FORMAT_VERSION`。
 2. **驻留管理未收口**（#2391，7/9）。`load_index`/`offload_index` 的语义已定（按 index 粒度、固定保护期、索引级 LRU），实现仍在推进；生产先别依赖手工驻留。
