@@ -427,17 +427,21 @@ public final class DistributedIndexSearch {
     return perQuery;
   }
 
-  /** Keeps the best {@code limit} hits of a query and drops the rest. */
+  /**
+   * Keeps the best {@code limit} hits of a query and drops the rest.
+   *
+   * <p>The result is ordered even when nothing is dropped: a list shorter than the limit arrives in
+   * whatever order the merge produced, and two hits with the same score would then reach the caller
+   * in an order that depends on how the tasks were scheduled. The order of a merge is a function of
+   * the scores and of the data file and position that break ties, so a query has one answer.
+   */
   private static List<Tuple3<String, Long, Double>> bounded(
       List<Tuple3<String, Long, Double>> hits,
       Comparator<Tuple3<String, Long, Double>> order,
       int limit) {
-    if (hits.size() <= limit) {
-      return hits;
-    }
     List<Tuple3<String, Long, Double>> sorted = Lists.newArrayList(hits);
     sorted.sort(order);
-    return Lists.newArrayList(sorted.subList(0, limit));
+    return Lists.newArrayList(sorted.subList(0, Math.min(limit, sorted.size())));
   }
 
   /**

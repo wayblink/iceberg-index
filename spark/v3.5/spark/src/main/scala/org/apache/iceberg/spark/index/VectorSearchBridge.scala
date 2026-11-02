@@ -57,6 +57,23 @@ private[spark] object VectorSearchBridge {
   /** The least a row can cost, for a column whose type declares no size of its own. */
   private[spark] val BytesPerRowFloor = 8L
 
+  /**
+   * Nearest first, and by where the row is when two distances are equal.
+   *
+   * <p>A distance alone leaves two hits in whatever order they arrived in, which is the order the
+   * tasks happened to produce: a cached query and an uncached one then answer the same question
+   * differently, and so do two runs of the same query. The data file and the row position make the
+   * order a function of the question rather than of the scheduling.
+   */
+  private val NearestFirst: Ordering[(String, Long, Double, Row)] =
+    Ordering.by[(String, Long, Double, Row), (Double, String, Long)](candidate =>
+      (candidate._3, candidate._1, candidate._2))
+
+  /** The same order for a candidate on its way back from the cluster, before it is a hit. */
+  private val NearestScannedFirst: Ordering[(Row, String, java.lang.Long, Double)] =
+    Ordering.by[(Row, String, java.lang.Long, Double), (Double, String, Long)](scored =>
+      (scored._4, scored._2, scored._3.longValue()))
+
   /** A request whose contract is the index's own hits, planned but not searched. */
   def plan(
       spark: SparkSession,
@@ -236,7 +253,7 @@ private[spark] object VectorSearchBridge {
           uncoveredCandidates(spark, context, query)
         }
 
-      val best = (indexed ++ scanned).sortBy(candidate => candidate._3).take(request.topK)
+      val best = (indexed ++ scanned).sorted(NearestFirst).take(request.topK)
       // the selected rows are read once more, as JSON: it is at most k rows per query, and it
       // keeps the row's own schema deciding its shape
       val json = rowsJsonOf(spark, context, best.map(candidate => (candidate._1, candidate._2)))
@@ -402,8 +419,7 @@ private[spark] object VectorSearchBridge {
       // the whole search instead of leaving it out. The index branch cannot return one either,
       // because every entry it holds was built for one dimension, so both branches answer the same
       // question
-      .takeOrdered(request.topK)(Ordering.by[(Row, String, java.lang.Long, Double), Double](
-        scored => scored._4))
+      .takeOrdered(request.topK)(NearestScannedFirst)
       .map { scored =>
         (scored._2, scored._3.longValue(), scored._4, scored._1)
       }

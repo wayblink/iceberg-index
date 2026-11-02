@@ -50,6 +50,7 @@ public class TestVectorIndexSearchBatch extends ExtensionsTestBase {
     sql("DROP TABLE IF EXISTS %s", tableName("vectors_batch_from_table_" + catalogName));
     sql("DROP TABLE IF EXISTS %s", tableName("vectors_batch_queries_" + catalogName));
     sql("DROP TABLE IF EXISTS %s", tableName("vectors_batch_empty_" + catalogName));
+    sql("DROP TABLE IF EXISTS %s", tableName("vectors_batch_order_" + catalogName));
   }
 
   @TestTemplate
@@ -90,6 +91,69 @@ public class TestVectorIndexSearchBatch extends ExtensionsTestBase {
       }
     } finally {
       spark.conf().unset(CACHE_ENABLED);
+    }
+  }
+
+  @TestTemplate
+  public void equalDistancesAreOrderedByTheirPositionNotByTheCache() {
+    String tableName = tableName("vectors_batch_order_" + catalogName);
+    sql("CREATE TABLE %s (id bigint, embedding array<double>) USING iceberg", tableName);
+    // four rows, each in a file of its own, all exactly one unit from the query: the answer orders
+    // them by where they are, not by the order the tasks happened to produce
+    sql("INSERT INTO %s VALUES (1, array(1.0d, 0.0d))", tableName);
+    sql("INSERT INTO %s VALUES (2, array(-1.0d, 0.0d))", tableName);
+    sql("INSERT INTO %s VALUES (3, array(0.0d, 1.0d))", tableName);
+    sql("INSERT INTO %s VALUES (4, array(0.0d, -1.0d))", tableName);
+    sql(
+        "CALL %s.system.build_vector_index("
+            + "table => '%s', column => 'embedding', dimension => 2, metric => 'euclidean')",
+        catalogName, tableName);
+
+    String search =
+        "CALL %s.system.vector_search_batch(table => '%s', column => 'embedding', "
+            + "queries => array('0.0,0.0'), k => 4)";
+
+    List<Object[]> uncached = sql(search, catalogName, tableName);
+    assertThat(uncached).hasSize(4);
+    assertOrderedByPosition(uncached);
+
+    spark.conf().set(CACHE_ENABLED, "true");
+    try {
+      List<Object[]> cold = sql(search, catalogName, tableName);
+      List<Object[]> warm = sql(search, catalogName, tableName);
+      assertOrderedByPosition(cold);
+      assertOrderedByPosition(warm);
+      for (List<Object[]> cached : java.util.Arrays.asList(cold, warm)) {
+        assertThat(cached).hasSameSizeAs(uncached);
+        for (int i = 0; i < uncached.size(); i++) {
+          assertThat(rowValues(cached.get(i))).isEqualTo(rowValues(uncached.get(i)));
+        }
+      }
+    } finally {
+      spark.conf().unset(CACHE_ENABLED);
+    }
+  }
+
+  /** Two hits at the same distance come back ordered by data file and then by row position. */
+  private static void assertOrderedByPosition(List<Object[]> rows) {
+    for (int i = 1; i < rows.size(); i += 1) {
+      Object[] previous = rows.get(i - 1);
+      Object[] current = rows.get(i);
+      double previousDistance = ((Number) previous[3]).doubleValue();
+      double currentDistance = ((Number) current[3]).doubleValue();
+      if (previousDistance == currentDistance) {
+        int byFile = ((String) previous[1]).compareTo((String) current[1]);
+        assertThat(byFile <= 0)
+            .as("row %s ties with %s and has to come first by data file", i - 1, i)
+            .isTrue();
+        if (byFile == 0) {
+          assertThat(((Number) previous[2]).longValue())
+              .as(
+                  "row %s ties with %s in the same file and has to come first by position",
+                  i - 1, i)
+              .isLessThan(((Number) current[2]).longValue());
+        }
+      }
     }
   }
 
