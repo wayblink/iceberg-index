@@ -256,6 +256,7 @@ final class IndexCacheLocations {
   }
 
   private static final class View {
+    private final Report source;
     private final String executorId;
     private final String host;
     private final long epoch;
@@ -269,6 +270,7 @@ final class IndexCacheLocations {
     private long lastSeenMillis;
 
     private View(Report report) {
+      this.source = report;
       this.executorId = report.executorId();
       this.host = report.host();
       this.epoch = report.epoch();
@@ -324,7 +326,15 @@ final class IndexCacheLocations {
     };
   }
 
-  /** The newest snapshot wins; a report from an older JVM replaces the view outright. */
+  /**
+   * The newest snapshot wins; a report from an older JVM replaces the view outright.
+   *
+   * <p>A report need not carry the charge projection, and most do not: a task reports what it
+   * cached and what the cache cost, which is what a coverage number is computed from, while the
+   * projection travels once per query because it is a map over every cached file. A report without
+   * one therefore keeps the projection the view already has, so a later, more complete key set does
+   * not throw away the shape that gives its bytes.
+   */
   void merge(Report report) {
     if (report == null || report.executorId() == null) {
       return;
@@ -332,20 +342,50 @@ final class IndexCacheLocations {
 
     synchronized (lock) {
       View current = views.get(report.executorId());
-      boolean newerCharge =
-          report.metadataShape() != null
-              && (current == null
-                  || current.metadataShape == null
-                  || report.metadataShape().charge().version()
-                      > current.metadataShape.charge().version());
-      if (current == null
-          || report.epoch() != current.epoch
-          || (report.metadataShape() != null
-              ? newerCharge
-              : report.seq() > current.seq && current.metadataShape == null)) {
+      if (current == null || report.epoch() != current.epoch) {
         views.put(report.executorId(), new View(report));
+        return;
       }
+
+      // the key set and the counters are ordered by the executor's own report sequence: the newest
+      // report saw the most files, and an older one that arrives after it is old news
+      Report newest = report.seq() > current.seq ? report : current.source;
+      // the projection is ordered on its own, because most reports do not carry one: a task sends
+      // keys and counters, one task per query sends the map, and the map's charge version says
+      // which snapshot of the accounting is the newer one. Keeping the two orderings apart is what
+      // stops an older key set from overwriting a newer one just because its report had the map
+      ExecutorIndexCache.Shape shape =
+          report.metadataShape() != null
+                  && (current.metadataShape == null
+                      || report.metadataShape().charge().version()
+                          > current.metadataShape.charge().version())
+              ? report.metadataShape()
+              : current.metadataShape;
+      views.put(report.executorId(), new View(withShape(newest, shape)));
     }
+  }
+
+  /** The same report, carrying the given projection, which may be null. */
+  private static Report withShape(Report report, ExecutorIndexCache.Shape shape) {
+    Report copy =
+        new Report(
+            report.executorId(),
+            report.host(),
+            report.epoch(),
+            report.seq(),
+            report.keys(),
+            report.hits(),
+            report.misses(),
+            report.loads(),
+            report.evictions(),
+            report.bytes(),
+            report.entries(),
+            report.reportedAtMillis());
+    if (shape != null) {
+      copy.withMetadata(shape);
+    }
+
+    return copy;
   }
 
   void mergeAll(Collection<Report> reports) {

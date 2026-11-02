@@ -48,17 +48,20 @@ class TestExecutorIndexCache {
   }
 
   @Test
-  void eachReportDescribesWhatTheExecutorHoldsThen() {
-    // Every task of a query reports, because the last one is the only point at which the cache the
-    // query filled is described. Reporting once per query would describe its first task instead,
-    // and `index_cache_status` would show a cache that never filled.
-    assertThat(cache.report("1", "host").entries()).isZero();
-    cache.file(
-        "s3://bucket/index.puffin",
-        config(1024 * 1024),
-        "adapter",
-        () -> load(new AtomicInteger(), 100));
-    assertThat(cache.report("1", "host").entries()).isEqualTo(1L);
+  void everyTaskOfAQueryReportsAndOneOfThemCarriesTheChargeProjection() {
+    // A query runs one task per index file and each task adds a file, so each task's report is a
+    // more complete picture than the one before it and the driver keeps the newest. The projection
+    // is a map over every cached file, so it travels once per query rather than once per task.
+    IndexCacheLocations.Report first = cache.reportForTask("query-1", "1", "host");
+    IndexCacheLocations.Report second = cache.reportForTask("query-1", "1", "host");
+    IndexCacheLocations.Report other = cache.reportForTask("query-2", "1", "host");
+
+    assertThat(first).isNotNull();
+    assertThat(first.metadataShape()).as("the first task of a query carries the shape").isNotNull();
+    assertThat(second).isNotNull();
+    assertThat(second.metadataShape()).as("a later task does not").isNull();
+    assertThat(second.seq()).as("and it is ordered after the first").isGreaterThan(first.seq());
+    assertThat(other.metadataShape()).as("a new query carries one again").isNotNull();
   }
 
   @Test

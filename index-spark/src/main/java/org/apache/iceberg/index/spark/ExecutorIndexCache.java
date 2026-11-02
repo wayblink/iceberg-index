@@ -30,6 +30,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.concurrent.locks.ReentrantLock;
 import java.util.function.Consumer;
 import org.apache.iceberg.index.IndexAdapter;
@@ -666,6 +667,10 @@ final class ExecutorIndexCache {
   // the control overhead the last charge projection stated, so an acknowledgement does not build a
   // projection of the whole cache just to read one number
   private long chargedControlBytes;
+
+  /** The query whose report already carried this executor's metadata shape, if any. */
+  private final AtomicReference<String> shapedQuery = new AtomicReference<>();
+
   // Registered waiters keep the same monitor alive until every caller has left.
   private OwnedMap<String, LoadMonitor> loading = new OwnedMap<>();
 
@@ -2440,6 +2445,28 @@ final class ExecutorIndexCache {
     }
   }
 
+  /**
+   * The report a task sends for its query.
+   *
+   * <p>Every task reports, because the picture a report carries is what the driver shows as the
+   * query's coverage: one task of a query reads and caches one index file, so a report taken by an
+   * early task describes a cache that is only partly filled, and a coverage computed from it is
+   * wrong in the direction that matters — it says less is cached than really is. The counters and
+   * the cached keys travel with every report; they are eight bytes per cached file, not a copy of
+   * the payload. The driver keeps the newest report, which is the most complete one.
+   *
+   * <p>The charge projection does not travel with every report: it is a map over the cached files,
+   * and sending it once per task would make a query over a thousand files push a thousand copies of
+   * it. One report per query carries it, and the driver keeps it while it merges later reports that
+   * only have keys and counters.
+   *
+   * @return the report for this task
+   */
+  IndexCacheLocations.Report reportForTask(String queryId, String executorId, String host) {
+    boolean withShape = queryId == null || !queryId.equals(shapedQuery.getAndSet(queryId));
+    return report(executorId, host, withShape);
+  }
+
   /** The sequence of the current charge state, which orders answers against later reports. */
   long chargeVersion() {
     synchronized (mapLock) {
@@ -2463,9 +2490,14 @@ final class ExecutorIndexCache {
 
   /** The report this executor sends back at the end of a task. */
   IndexCacheLocations.Report report(String executorId, String host) {
+    return report(executorId, host, true);
+  }
+
+  private IndexCacheLocations.Report report(String executorId, String host, boolean withShape) {
     synchronized (mapLock) {
       Stats stats = stats();
-      return new IndexCacheLocations.Report(
+      IndexCacheLocations.Report report =
+          new IndexCacheLocations.Report(
               executorId,
               host,
               EPOCH,
@@ -2477,8 +2509,8 @@ final class ExecutorIndexCache {
               stats.evictions(),
               stats.bytes(),
               stats.entries(),
-              System.currentTimeMillis())
-          .withMetadata(shape());
+              System.currentTimeMillis());
+      return withShape ? report.withMetadata(shape()) : report;
     }
   }
 

@@ -55,6 +55,21 @@ class TestIndexCacheLocations {
   }
 
   @Test
+  void anOlderReportWithAChargeProjectionDoesNotUndoANewerKeySet() {
+    // A task reports keys and counters, and one task per query reports the charge projection, so a
+    // report that carries the projection can arrive after one that does not. Its key set is older:
+    // it is what a coverage number is computed from, so it must not win over the newer one.
+    IndexCacheLocations table = new IndexCacheLocations();
+    table.merge(report("1", 7, 10, FILES[0], FILES[1]));
+    table.merge(report("1", 7, 9, FILES[0]).withMetadata(ExecutorIndexCache.Shape.empty()));
+
+    assertThat(table.coveredCount(Arrays.asList(FILES)))
+        .as("the newer key set survives")
+        .isEqualTo(2);
+    assertThat(table.summary(Arrays.asList(FILES)).coverage()).isEqualTo(1.0);
+  }
+
+  @Test
   void aRestartedExecutorReplacesItsViewEntirely() {
     IndexCacheLocations table = new IndexCacheLocations();
     table.merge(report("1", 7, 10, FILES[0], FILES[1]));
