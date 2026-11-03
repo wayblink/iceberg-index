@@ -71,7 +71,7 @@ C按当前表示的实际引用处理所有权：IVF目前把快照解码成独�
 
 新缓存 resident 以 P 为主，再加确实被缓存额外保留且不属于 P 的状态 E。共享数组按身份只计一次；slice 若保留大 backing array，计完整数组。核心独占路径 E 中没有 C。`IndexCacheMemory` 的新模型转换不再无条件加 `fileBytes`；build、runtime、manifest→placement 使用同一估算函数，不能一边报 U+M、一边仍加 C。
 
-model=1、未知模型、缺失 memory、reader/runtimeProfile 不匹配的旧估算不能直接用于精确容量决策：由统一 resolver 加载并按当前模型重估，或返回显式 unknown，不能返回0、不能继续声称严格预算已获保证。保留既有 legacy fallback 的明确“不准确估算”标识；managed 规划不得把 unknown 当已知可容纳。新估算可按不可变文件身份、reader、model、runtime 缓存；升级使旧缓存失效。无需重建或重写旧 payload，也不强制更新旧 manifest。跨 kernel 的 model 标记与公式一起升级，不能统一换版本号却保留不一致语义。
+model=1、未知模型、缺失 memory、reader 不匹配、或 runtimeProfile 的**布局**部分不匹配（JVM 家族与版本、对象头/引用宽度/对齐、紧凑字符串、representation 等）的旧估算不能直接用于精确容量决策：由统一 resolver 加载并按当前模型重估，或返回显式 unknown，不能返回0、不能继续声称严格预算已获保证。**仅并行度（可用核数）不同不构成不匹配**：它是 prepared state 的共享与估算缓存分桶维度（`ContextKey.processors`），不是内存布局维度；同布局的记录可以直接使用，驻留副本也可复用，否则一台机器建的索引会被另一台机器判为不可读。这条判定由 `IndexCacheMemory.compatibleRuntime`（`layoutIdentity` 剥掉核数后再比）、`compatibleModel`（冷装载只要求 model 与 reader，其余交给 resolver 重估）与 `readerIdentity`（prepared state 的键用布局身份）共同实现。保留既有 legacy fallback 的明确“不准确估算”标识；managed 规划不得把 unknown 当已知可容纳。新估算可按不可变文件身份、reader、model、runtime 缓存；升级使旧缓存失效。无需重建或重写旧 payload，也不强制更新旧 manifest。跨 kernel 的 model 标记与公式一起升级，不能统一换版本号却保留不一致语义。
 
 验收同时核对可达数组与收费模型；仅 build 数字等于 prepare 数字不足以证明没有双方共同漏账。
 
