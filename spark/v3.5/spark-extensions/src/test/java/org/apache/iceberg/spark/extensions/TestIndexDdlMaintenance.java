@@ -56,6 +56,7 @@ public class TestIndexDdlMaintenance extends ExtensionsTestBase {
     List<Object[]> before = sql("CALL %s.system.list_indexes(table => '%s')", catalogName, table);
     long entriesBefore = ((Number) before.get(0)[6]).longValue();
     long snapshotBefore = ((Number) before.get(0)[3]).longValue();
+    long indexSnapshotBefore = ((Number) before.get(0)[9]).longValue();
 
     sql("INSERT INTO %s VALUES (7, array(0.5, 0.5)), (8, array(-0.5, -0.5))", table);
     sql("ALTER TABLE %s REFRESH INDEX emb_flat", table);
@@ -65,6 +66,8 @@ public class TestIndexDdlMaintenance extends ExtensionsTestBase {
     assertThat(((Number) after.get(0)[6]).longValue()).isEqualTo(entriesBefore + 2);
     assertThat(((Number) after.get(0)[3]).longValue()).isNotEqualTo(snapshotBefore);
     assertThat(after.get(0)[8]).isEqualTo("emb_flat");
+    // a refresh publishes a new index snapshot, which is what a run has to pin before it measures
+    assertThat(((Number) after.get(0)[9]).longValue()).isNotEqualTo(indexSnapshotBefore);
   }
 
   @TestTemplate

@@ -368,10 +368,12 @@ SHOW INDEXES FROM local.db.docs;   -- 只有 FROM，没有 IN
 
 | 想知道 | 命令 | 关键列 |
 |---|---|---|
-| 这张表有哪些索引、参数是什么、建到哪个快照 | `CALL … list_indexes(table => 'db.t')` / `SHOW INDEXES FROM …` | `index_uuid, column, index_type, source_snapshot_id, status, index_files, entries, definition, index_name` |
+| 这张表有哪些索引、参数是什么、覆盖哪份数据、是哪一版 | `CALL … list_indexes(table => 'db.t')` / `SHOW INDEXES FROM …` | `index_uuid, column, index_type, source_snapshot_id, status, index_files, entries, definition, index_name, index_snapshot_id` |
 | 索引还能不能被这个版本读、落后多少、漏了多少文件 | `CALL … check_indexes(table => 'db.t')` | `readable, writer, writer_version, reader_version, stale, uncovered_data_files, suggestion` |
 | 构建到哪一步、上次为什么失败 | `CALL … index_build_status(table => 'db.t')` | `state, started_at, updated_at, age_ms, stale, files_built, files_total, files_failed, rows, error` |
 | 集群缓存装了什么、命中率如何 | `CALL … index_cache_status()` | `executor_id, host, epoch, mode, entries, bytes, hits, misses, loads, evictions, coverage, working_set_bytes, reported_at, age_ms, stale` |
+
+`source_snapshot_id` 是这份索引覆盖的**表**快照，`index_snapshot_id` 是这个索引**自己**那一版的快照 id：`REFRESH INDEX` 会在同一个 `index_uuid`、同一个名字下发布新的 index snapshot，所以只有 `index_snapshot_id` 能说清「测的是哪一版索引」（验收套件在跑之前就把它冻住，刷新过的索引会被拒绝，而不是被当成准备好的那份）。
 
 `list_indexes` 的 `status` 只有 `PUBLISHED` 或 `NULL`（没有快照时），**不会显示构建进度**——那要看 `index_build_status`。`definition` 是 JSON 字符串，取 `metric` 之类的字段要 `get_json_object`。
 

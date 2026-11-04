@@ -438,7 +438,18 @@ class TestVectorIndexGuide {
             "index_files",
             "entries",
             "definition",
-            "index_name");
+            "index_name",
+            "index_snapshot_id");
+
+    // The index snapshot is the build, the source snapshot is the data it covers: both are
+    // reported, and neither can stand in for the other.
+    Row listed =
+        spark.sql("CALL local.system.list_indexes(table => 'db.status')").collectAsList().get(0);
+    Long indexSnapshot = listed.getAs("index_snapshot_id");
+    Long sourceSnapshot = listed.getAs("source_snapshot_id");
+    assertThat(indexSnapshot).isNotNull();
+    assertThat(indexSnapshot.longValue()).isPositive();
+    assertThat(sourceSnapshot).isNotNull();
 
     assertThat(spark.sql("CALL local.system.check_indexes(table => 'db.status')").columns())
         .containsExactly(

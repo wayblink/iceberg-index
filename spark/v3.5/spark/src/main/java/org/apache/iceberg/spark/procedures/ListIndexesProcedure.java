@@ -58,7 +58,11 @@ class ListIndexesProcedure extends BaseProcedure {
             new StructField("index_files", DataTypes.LongType, false, Metadata.empty()),
             new StructField("entries", DataTypes.LongType, false, Metadata.empty()),
             new StructField("definition", DataTypes.StringType, true, Metadata.empty()),
-            new StructField("index_name", DataTypes.StringType, true, Metadata.empty())
+            new StructField("index_name", DataTypes.StringType, true, Metadata.empty()),
+            // Which build of the index this is. The acceptance suite pins it before a run, so an
+            // index refreshed after preparation is refused instead of measured as the one it
+            // prepared: source_snapshot_id says which data it covers, not which build it is.
+            new StructField("index_snapshot_id", DataTypes.LongType, true, Metadata.empty())
           });
 
   public static ProcedureBuilder builder() {
@@ -112,7 +116,8 @@ class ListIndexesProcedure extends BaseProcedure {
                     counts[0],
                     counts[1],
                     UTF8String.fromString(IndexMetadataParser.toJson(metadata.definition())),
-                    metadata.name() == null ? null : UTF8String.fromString(metadata.name())));
+                    metadata.name() == null ? null : UTF8String.fromString(metadata.name()),
+                    snapshot == null ? null : snapshot.snapshotId()));
           }
 
           return rows.toArray(new InternalRow[0]);
