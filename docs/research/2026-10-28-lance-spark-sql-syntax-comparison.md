@@ -17,6 +17,9 @@
   under the License.
 -->
 
+> **口径说明（2026-11-04）**：本文是外部调研/对比记录，用来判断要不要借鉴某项能力，**不构成产品语法口径**。产品面向用户的文档里不再把语法的来源写进口径（见 #2945）。
+
+
 # Lance-Spark SQL 用法与 Iceberg 索引语法对比
 
 继续阅读：[向 Lance-Spark 对齐 SQL 的可行性、工作量与收益](2026-10-28-lance-spark-sql-alignment-feasibility.md)。这是研究建议，尚未批准实施或新增接口参数。

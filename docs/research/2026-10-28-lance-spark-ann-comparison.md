@@ -17,6 +17,9 @@
   under the License.
 -->
 
+> **口径说明（2026-11-04）**：本文是外部调研/对比记录，用来判断要不要借鉴某项能力，**不构成产品语法口径**。产品面向用户的文档里不再把语法的来源写进口径（见 #2945）。
+
+
 # Iceberg 与 Lance-Spark 索引体系：能力、执行、维护与部署对比
 
 配套研究：[Lance 索引内核复用可行性](2026-10-28-lance-index-kernel-reuse.md)、[Lance-Spark SQL 用法与我方语法对比](2026-10-28-lance-spark-sql-syntax-comparison.md)。

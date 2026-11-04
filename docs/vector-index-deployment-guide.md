@@ -30,7 +30,7 @@
 有两种写法，语义相同、由同一套过程执行：
 
 **（1）`CALL` 过程**（原有写法，参数最全，仍在支持）
-**（2）`ALTER TABLE … CREATE INDEX`**（与 Lance-Spark 对齐的 DDL，见 2.1.1）
+**（2）`ALTER TABLE … CREATE INDEX`**（DDL 写法，见 2.1.1）
 
 > 注意：**索引只能建在 Iceberg catalog 的表上，并且语句里的表名要带 catalog 前缀**（例如 `hms.db.docs`）。如果把 Iceberg 表建在会话目录（`spark_catalog`，即 Hive 会话目录）里，建表会成功，但之后的任何读取都会报 `iceberg is not a valid Spark SQL Data Source`——这不是索引层的问题，是 1.9.1 的 `IcebergSource` 只实现了 V2 provider，而 Hive 表读走 V1 路径。两种解法：始终用 Iceberg catalog 限定名，或把 `spark.sql.catalog.spark_catalog` 配成 `org.apache.iceberg.spark.SparkSessionCatalog`。（实测。）
 
@@ -62,7 +62,7 @@ CALL prod.system.build_vector_index(
 
 **埋点提示**：`rabitq-bits` 与 `nprobe` 写在索引定义里，同一个列上可以并存多个不同参数的索引（用 `name` 区分），这是做 A/B 对比的正确方式，也是 benchmark 的做法。
 
-### 2.1.1 索引 DDL（与 Lance-Spark 对齐）
+### 2.1.1 索引 DDL
 
 ```
 SHOW INDEXES FROM hms.db.docs;
@@ -83,7 +83,7 @@ ALTER TABLE hms.db.docs DROP INDEX docs_ivf_1bit;
 - `CREATE INDEX` 的 `WITH` 键就是 `CALL` 过程的参数名，值按 SQL 表达式解析（支持 `map(...)`）；未知键、缺 `dimension`、重复键、非法 method 都在**分析期**报错。
 - **文本索引还没有名字**：`CREATE INDEX USING fts` 不能带名字，带名字会明确报错并提示改用 `CALL build_text_index`；`REFRESH/DROP INDEX` 也按名寻址不到它。
 - **`REFRESH` 是“补段”**：只为当前快照中未被子段覆盖的数据文件建新段，已有段原样保留。已覆盖文件的内容发生变化（被 rewrite 替换、或有了删除文件）时**不会再重建**，只打 WARN 并提示重建——这是与旧实现的语义差异，旧作业若依赖“刷新会顺带修正旧组”需要改成显式重建。
-- `DROP INDEX` 沿用既有默认 `purge=true`（连索引文件一起删），与 Lance-Spark 只摘登记不同。
+- `DROP INDEX` 沿用既有默认 `purge=true`（连索引文件一起删），不会只摘掉登记。
 - 未实现、不要承诺：`OPTIMIZE INDEX`、短语/多列/混合检索。
 
 ### 2.2 查询
@@ -120,7 +120,7 @@ SET spark.iceberg.index.vector.over-sample = 100;
 
 **注意度量**：`vec_distance` 默认算余弦，只有在被改写命中时才特化成索引的 metric。所以"手写一个不走索引的对照查询"时，`vec_distance(...) + 0.0d` 这种写法其实是余弦排序——若索引是 EUCLIDEAN，两者排序不同，会出现"精确索引也差一行"的假象。做对照必须自己写 L2 表达式。
 
-### 2.1.1 索引 DDL（与 Lance-Spark 对齐，2026-10-30 起）
+### 2.1.1 索引 DDL（2026-10-30 起）
 
 ```
 SHOW INDEXES FROM hms.db.docs;
