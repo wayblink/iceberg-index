@@ -88,6 +88,36 @@ class TestFormatModelRegistry {
         .hasMessageContaining("Cannot register class");
   }
 
+  /**
+   * A format that provides no model for a content type is a common mistake - writing deletes in a
+   * format that only carries data files - and the refusal has to say which format and what it does
+   * provide, or the caller has to guess.
+   */
+  @Test
+  void aMissingModelNamesTheFormatAndWhatItProvides() {
+    FormatModelRegistry.register(new DummyParquetFormatModel(Object.class, Object.class));
+
+    assertThatThrownBy(
+            () ->
+                FormatModelRegistry.equalityDeleteWriteBuilder(
+                    FileFormat.LANCE, Object.class, null))
+        .isInstanceOf(IllegalArgumentException.class)
+        .hasMessageContaining("LANCE")
+        .hasMessageContaining("no types")
+        .hasMessageContaining("format that provides one");
+  }
+
+  @Test
+  void aMissingTypeNamesTheTypesThatFormatDoesProvide() {
+    FormatModelRegistry.register(new DummyParquetFormatModel(Object.class, Object.class));
+
+    assertThatThrownBy(
+            () -> FormatModelRegistry.readBuilder(FileFormat.PARQUET, String.class, null))
+        .isInstanceOf(IllegalArgumentException.class)
+        .hasMessageContaining("PARQUET")
+        .hasMessageContaining(Object.class.getName());
+  }
+
   @Test
   void registerToleratesMissingClass() {
     assertThatNoException().isThrownBy(() -> register("org.apache.iceberg.formats.DoesNotExist"));

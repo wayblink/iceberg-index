@@ -18,6 +18,7 @@
  */
 package org.apache.iceberg.formats;
 
+import java.util.Collections;
 import java.util.List;
 import java.util.Map;
 import org.apache.iceberg.DataFile;
@@ -33,6 +34,7 @@ import org.apache.iceberg.io.InputFile;
 import org.apache.iceberg.relocated.com.google.common.annotations.VisibleForTesting;
 import org.apache.iceberg.relocated.com.google.common.base.Preconditions;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableList;
+import org.apache.iceberg.relocated.com.google.common.collect.Lists;
 import org.apache.iceberg.relocated.com.google.common.collect.Maps;
 import org.apache.iceberg.util.Pair;
 import org.slf4j.Logger;
@@ -196,8 +198,37 @@ public final class FormatModelRegistry {
   private static <D, S> FormatModel<D, S> modelFor(FileFormat format, Class<? extends D> type) {
     FormatModel<D, S> model = (FormatModel<D, S>) MODELS.get(Pair.of(format, type));
     Preconditions.checkArgument(
-        model != null, "Format model is not registered for format %s and type %s", format, type);
+        model != null,
+        "Format model is not registered for format %s and type %s; %s is registered for %s. "
+            + "Register a model for this type, or write this content in a format that provides one",
+        format,
+        type.getName(),
+        format,
+        typesFor(format));
     return model;
+  }
+
+  /**
+   * The types one format provides a model for, so a refusal can say what that format does carry.
+   *
+   * <p>Asking for an equality delete in a format that only writes data files is a mistake worth
+   * naming precisely: the caller either needs another format for that content or a model this build
+   * does not have.
+   */
+  private static String typesFor(FileFormat format) {
+    List<String> types = Lists.newArrayList();
+    for (Pair<FileFormat, Class<?>> key : MODELS.keySet()) {
+      if (key.first() == format) {
+        types.add(key.second().getName());
+      }
+    }
+
+    if (types.isEmpty()) {
+      return "no types";
+    }
+
+    Collections.sort(types);
+    return String.join(", ", types);
   }
 
   private static void registerSupportedFormats() {
