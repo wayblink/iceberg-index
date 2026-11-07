@@ -129,31 +129,31 @@ class TestDistributedIndexSearchSizing {
   }
 
   @Test
-  void changingDefinitionAtTheSameLocationInvalidatesEstimate() throws IOException {
+  void aFileWithoutRecordIsPricedByItsLengthForEveryReader() throws IOException {
     IndexFile file = writeFile("definition.puffin");
-    SizedAdapter smaller = new SizedAdapter(70);
-    SizedAdapter larger = new SizedAdapter(170);
-    long first =
-        DistributedIndexSearch.workingSetBytes(new LocalIO(), List.of(file), smaller, OWNER);
-    long second =
-        DistributedIndexSearch.workingSetBytes(new LocalIO(), List.of(file), larger, OWNER);
-    // Each reader is priced by the estimate it publishes, not by the file's blob length.
-    assertThat(first).isEqualTo(admittedBytes(file, smaller)).isPositive();
-    assertThat(second).isEqualTo(admittedBytes(file, larger)).isGreaterThan(first);
+    long length = java.nio.file.Files.size(Path.of(file.location()));
+    // A record is the only thing that can state a reader-specific prepared size; without one the
+    // bound comes from the container, so it cannot differ between readers of the same file.
+    for (SizedAdapter adapter : List.of(new SizedAdapter(70), new SizedAdapter(170))) {
+      assertThat(IndexCacheMemory.resolveMemory(new LocalIO(), file, adapter).preparedBytes())
+          .isEqualTo(IndexCacheMemory.residentBytes(length, 0L))
+          .isPositive();
+      assertThat(
+              DistributedIndexSearch.workingSetBytes(new LocalIO(), List.of(file), adapter, OWNER))
+          .isEqualTo(admittedBytes(file, adapter));
+    }
   }
 
   @Test
-  void failedEstimationIsUnknownAndCanBeRetried() throws IOException {
+  void aFileWithNoRecordIsBoundedAndAnUnknownLengthIsNotFree() throws IOException {
     Path path = temp.resolve("retry.puffin");
-    java.nio.file.Files.write(path, new byte[10]);
     IndexFile file = file(path.toString());
     SizedAdapter adapter = new SizedAdapter(70);
+    // Nothing exists at the location, so the length is unknown and the size cannot be bounded.
     assertThat(DistributedIndexSearch.workingSetBytes(new LocalIO(), List.of(file), adapter, OWNER))
         .isEqualTo(-1);
-    java.nio.file.Files.delete(path);
-    new PuffinIndexFileContainer()
-        .write(
-            Files.localOutput(path.toString()), List.of(IndexBlob.of("test-sizing", new byte[10])));
+    // Writing the file makes it boundable without reading it: only its length is consulted.
+    java.nio.file.Files.write(path, new byte[10]);
     assertThat(DistributedIndexSearch.workingSetBytes(new LocalIO(), List.of(file), adapter, OWNER))
         .isEqualTo(admittedBytes(file, adapter))
         .isPositive();
@@ -163,7 +163,6 @@ class TestDistributedIndexSearchSizing {
   void unknownFileInWorkingSetIsNotFreeCapacity() throws IOException {
     IndexFile valid = writeFile("valid.puffin");
     Path bad = temp.resolve("bad.puffin");
-    java.nio.file.Files.write(bad, new byte[10]);
     assertThat(
             DistributedIndexSearch.workingSetBytes(
                 new LocalIO(), List.of(valid, file(bad.toString())), new SizedAdapter(70), OWNER))

@@ -24,6 +24,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 import org.apache.iceberg.DataFiles;
 import org.apache.iceberg.PartitionSpec;
 import org.apache.iceberg.Schema;
+import org.apache.iceberg.SortOrder;
 import org.apache.iceberg.TestTables;
 import org.apache.iceberg.index.IndexBuildRequest;
 import org.apache.iceberg.index.IndexBuilder;
@@ -33,6 +34,10 @@ import org.apache.iceberg.index.vector.VectorIndexAdapter;
 import org.apache.iceberg.index.vector.VectorIndexDefinition;
 import org.apache.iceberg.index.vector.VectorIndexTypes;
 import org.apache.iceberg.index.vector.VectorKernels;
+import org.apache.iceberg.io.FileIO;
+import org.apache.iceberg.io.InputFile;
+import org.apache.iceberg.io.OutputFile;
+import org.apache.iceberg.io.SeekableInputStream;
 import org.apache.iceberg.types.Types;
 
 /** Builds a real table, a real index, and the files a control command has to plan. */
@@ -53,9 +58,21 @@ final class TestIndexFixtures {
   record BuiltIndex(TestTables.TestTable table, IndexMetadata metadata) {}
 
   static BuiltIndex build(File tempDir, String indexUuid, String... dataFiles) {
+    return build(tempDir, new TestTables.LocalFileIO(), indexUuid, dataFiles);
+  }
+
+  /** Builds the index through the given file IO, so a test can watch what the plan reads. */
+  static BuiltIndex build(File tempDir, FileIO io, String indexUuid, String... dataFiles) {
+    String tableName = "t" + SEQUENCE.incrementAndGet();
     TestTables.TestTable table =
         TestTables.create(
-            tempDir, "t" + SEQUENCE.incrementAndGet(), SCHEMA, PartitionSpec.unpartitioned(), 2);
+            tempDir,
+            tableName,
+            SCHEMA,
+            PartitionSpec.unpartitioned(),
+            SortOrder.unsorted(),
+            2,
+            new TestTables.TestTableOperations(tableName, tempDir, io));
     for (String dataFile : dataFiles) {
       table
           .newAppend()
@@ -136,5 +153,76 @@ final class TestIndexFixtures {
         new VectorIndexAdapter((VectorIndexDefinition) metadata.definition());
     String adapterKey = DistributedIndexSearch.adapterKey(adapter);
     return metadata.tableLocation() + "|" + adapterKey + "|" + fileLocation;
+  }
+
+  /**
+   * Counts what a planning pass does to index payloads, the files the builder writes under {@code
+   * data/}. Listing an index reads its manifests through the same file IO, so a test counting every
+   * stream would count listing too; a payload is what must not be read.
+   */
+  static final class CountingIO implements FileIO {
+    private final FileIO delegate = new TestTables.LocalFileIO();
+    private final AtomicInteger payloadStreams = new AtomicInteger();
+    private final AtomicInteger payloadLengths = new AtomicInteger();
+
+    int payloadStreams() {
+      return payloadStreams.get();
+    }
+
+    int payloadLengths() {
+      return payloadLengths.get();
+    }
+
+    void reset() {
+      payloadStreams.set(0);
+      payloadLengths.set(0);
+    }
+
+    @Override
+    public InputFile newInputFile(String path) {
+      InputFile file = delegate.newInputFile(path);
+      boolean payload = isPayload(path);
+      return new InputFile() {
+        @Override
+        public long getLength() {
+          if (payload) {
+            payloadLengths.incrementAndGet();
+          }
+          return file.getLength();
+        }
+
+        @Override
+        public SeekableInputStream newStream() {
+          if (payload) {
+            payloadStreams.incrementAndGet();
+          }
+          return file.newStream();
+        }
+
+        @Override
+        public String location() {
+          return file.location();
+        }
+
+        @Override
+        public boolean exists() {
+          return file.exists();
+        }
+      };
+    }
+
+    @Override
+    public OutputFile newOutputFile(String path) {
+      return delegate.newOutputFile(path);
+    }
+
+    @Override
+    public void deleteFile(String path) {
+      delegate.deleteFile(path);
+    }
+
+    private static boolean isPayload(String path) {
+      return path.contains("/data/index-file-");
+    }
   }
 }

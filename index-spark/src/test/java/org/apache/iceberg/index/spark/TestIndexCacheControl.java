@@ -590,18 +590,12 @@ class TestIndexCacheControl {
 
   @ParameterizedTest
   @ValueSource(ints = {1, 2, 99})
-  void targetReestimatesIncompatibleManifestMemory(int model) throws IOException {
+  void targetBoundsIncompatibleManifestMemoryWithoutReadingTheFile(int model) throws IOException {
+    TestIndexFixtures.CountingIO io = new TestIndexFixtures.CountingIO();
     TestIndexFixtures.BuiltIndex built =
-        TestIndexFixtures.build(tempDir, "stale-memory", "data.parquet");
-    String listLocation = built.metadata().snapshots().get(0).indexManifestList();
-    String manifestLocation =
-        IndexManifestList.read(built.table().io().newInputFile(listLocation))
-            .manifests()
-            .get(0)
-            .location();
+        TestIndexFixtures.build(tempDir, io, "stale-memory", "data.parquet");
     List<IndexFile> rewritten = new ArrayList<>();
-    for (IndexFile file :
-        IndexManifest.read(built.table().io().newInputFile(manifestLocation)).indexFiles()) {
+    for (IndexFile file : publishedIndexFiles(built)) {
       rewritten.add(
           IndexFile.builder()
               .location(file.location())
@@ -618,22 +612,45 @@ class TestIndexCacheControl {
                       .build())
               .build());
     }
+    String manifestLocation = manifestLocationOf(built);
     built.table().io().deleteFile(manifestLocation);
     IndexManifest.write(built.table().io().newOutputFile(manifestLocation), rewritten);
+    io.reset();
 
     VectorIndexAdapter adapter =
         new VectorIndexAdapter((VectorIndexDefinition) built.metadata().definition());
-    DistributedIndexSearch.LoadedFile loaded =
-        DistributedIndexSearch.loadFileState(
-            built.table().io(), rewritten.get(0).location(), adapter);
+    IndexFileMemory descriptor = IndexCacheMemory.currentDescriptor(adapter);
+    assertThat(descriptor).isNotNull();
+
     IndexCacheProtocol.File planned =
         IndexCacheController.target(built.table(), built.metadata()).files().get(0);
-    assertThat(planned.estimatedBytes()).isEqualTo(loaded.file().bytes());
-    assertThat(planned.memory()).isNotNull();
+
+    // The record states the container size, so the bound costs no read and no stat.
+    assertThat(rewritten.get(0).memory().fileBytes()).isNotNull();
+    assertThat(planned.memory().preparedBytes())
+        .isEqualTo(IndexCacheMemory.residentBytes(rewritten.get(0).memory().fileBytes(), 0L))
+        .isNotEqualTo(rewritten.get(0).memory().preparedBytes());
+    assertThat(planned.estimatedBytes())
+        .isEqualTo(IndexCacheMemory.residentBytes(planned.memory()));
     assertThat(planned.memory().modelVersion()).isEqualTo(2);
-    assertThat(planned.memory().preparedBytes()).isEqualTo(loaded.preparedBytes());
     assertThat(planned.memory().readerId()).isNotEqualTo("old-reader");
     assertThat(planned.memory().runtimeProfile()).isNotEqualTo("old-runtime");
+    assertThat(io.payloadStreams()).as("an incompatible record is not re-measured").isZero();
+    assertThat(io.payloadLengths()).isZero();
+  }
+
+  private static String manifestLocationOf(TestIndexFixtures.BuiltIndex built) throws IOException {
+    String listLocation = built.metadata().snapshots().get(0).indexManifestList();
+    return IndexManifestList.read(built.table().io().newInputFile(listLocation))
+        .manifests()
+        .get(0)
+        .location();
+  }
+
+  private static List<IndexFile> publishedIndexFiles(TestIndexFixtures.BuiltIndex built)
+      throws IOException {
+    return IndexManifest.read(built.table().io().newInputFile(manifestLocationOf(built)))
+        .indexFiles();
   }
 
   private static List<String> indexFiles(TestIndexFixtures.BuiltIndex built) {

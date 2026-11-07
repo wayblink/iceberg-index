@@ -46,14 +46,13 @@ final class IndexCacheController {
    * Waits until the plan is settled or the wait can no longer end well, then reports its state.
    *
    * <p>The window measures a stall, not the whole load, and it starts when the plan is accepted:
-   * resolving the target (listing a large index and estimating the memory of every file in it)
-   * happens on the driver before the plan exists, and charging that time to the window leaves the
-   * plan fenced the moment it is accepted. Every confirmation restarts the window, so a large index
-   * whose files arrive minutes apart is still waited on while it is moving; a plan that stops
-   * moving is what the window ends. It also ends when no executor is recent enough to answer,
-   * because then nothing can still arrive. A plan that did not cover every file is ended there
-   * rather than merely abandoned, so an executor that never answered does not keep holding the
-   * space it promised.
+   * resolving the target (listing a large index and pricing each of its files) happens on the
+   * driver before the plan exists, and charging that time to the window leaves the plan fenced the
+   * moment it is accepted. Every confirmation restarts the window, so a large index whose files
+   * arrive minutes apart is still waited on while it is moving; a plan that stops moving is what
+   * the window ends. It also ends when no executor is recent enough to answer, because then nothing
+   * can still arrive. A plan that did not cover every file is ended there rather than merely
+   * abandoned, so an executor that never answered does not keep holding the space it promised.
    */
   static IndexCacheProtocol.Result await(
       IndexCacheDriverControl control, String planId, long waitNanos) {
@@ -172,8 +171,9 @@ final class IndexCacheController {
     IndexAdapter adapter =
         IndexTypes.fromType(metadata.indexType()).createAdapter(metadata.definition());
     List<IndexCacheProtocol.File> planned = new ArrayList<>(files.size());
+    IndexCacheMemory.Estimates estimates = new IndexCacheMemory.Estimates();
     for (IndexFile file : files) {
-      IndexFileMemory memory = IndexCacheMemory.resolveMemory(table.io(), file, adapter);
+      IndexFileMemory memory = estimates.resolve(table.io(), file, adapter);
       planned.add(
           IndexCacheProtocol.File.builder()
               .location(file.location())
@@ -185,6 +185,7 @@ final class IndexCacheController {
               .memory(memory)
               .build());
     }
+    estimates.log("load plan");
 
     return IndexCacheProtocol.Target.builder()
         .indexUuid(metadata.indexUuid())

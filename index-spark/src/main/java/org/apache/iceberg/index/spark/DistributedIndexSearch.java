@@ -585,13 +585,6 @@ public final class DistributedIndexSearch {
   }
 
   /**
-   * The prepared-state bytes of one index file under this reader and runtime, or -1 when unknown.
-   *
-   * <p>A manifest record matching the current model, reader and runtime is trusted without a read;
-   * otherwise the file is read and prepared once to re-estimate it. The value is the retained
-   * prepared state P, not the container or encoded payload lengths, which are diagnostic only.
-   */
-  /**
    * Reports an unknown working set with its reason, once per reason.
    *
    * <p>An unknown working set is not a query failure: the cache falls back to its smallest budget,
@@ -612,6 +605,15 @@ public final class DistributedIndexSearch {
 
   private static final java.util.Set<String> WORKING_SET_REASONS = ConcurrentHashMap.newKeySet();
 
+  /**
+   * The retained-state estimate of one index file under this reader and runtime, or -1 when
+   * unknown.
+   *
+   * <p>A manifest record matching the current model, reader and runtime is trusted as it is;
+   * otherwise the legacy rule bounds the estimate from the length of the file, which costs a stat
+   * rather than a read of its payload. The value is the retained prepared state P, not the
+   * container or encoded payload lengths, which are diagnostic only.
+   */
   static long preparedBytesOf(FileIO io, IndexFile file, IndexAdapter adapter) {
     IndexFileMemory memory = IndexCacheMemory.resolveMemory(io, file, adapter);
     return memory == null ? -1 : memory.preparedBytes();
@@ -628,25 +630,29 @@ public final class DistributedIndexSearch {
           "reader " + adapter.getClass().getName() + " has no retained-state descriptor");
     }
 
-    List<IndexCacheProtocol.File> planned = new ArrayList<>();
-    for (IndexFile file : files) {
-      IndexFileMemory memory = IndexCacheMemory.resolveMemory(io, file, adapter);
-      if (memory == null) {
-        return unknownWorkingSet("the retained size of one of the files is unknown");
-      }
-      planned.add(
-          IndexCacheProtocol.File.builder()
-              .location(file.location())
-              .cacheKey(cacheKey(owner, adapterKey(adapter), file.location()))
-              .owner(owner)
-              .memory(memory)
-              .estimatedBytes(IndexCacheMemory.residentBytes(memory))
-              .build());
-    }
+    IndexCacheMemory.Estimates estimates = new IndexCacheMemory.Estimates();
     try {
+      List<IndexCacheProtocol.File> planned = new ArrayList<>();
+      for (IndexFile file : files) {
+        IndexFileMemory memory = estimates.resolve(io, file, adapter);
+        if (memory == null) {
+          return unknownWorkingSet("the retained size of one of the files is unknown");
+        }
+        planned.add(
+            IndexCacheProtocol.File.builder()
+                .location(file.location())
+                .cacheKey(cacheKey(owner, adapterKey(adapter), file.location()))
+                .owner(owner)
+                .memory(memory)
+                .estimatedBytes(IndexCacheMemory.residentBytes(memory))
+                .build());
+      }
+
       return ExecutorIndexCache.Shape.empty().project(null, 0, planned).charge().usedBytes();
     } catch (RuntimeException e) {
       return -1;
+    } finally {
+      estimates.log("query working set");
     }
   }
 

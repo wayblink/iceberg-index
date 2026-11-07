@@ -49,8 +49,9 @@ import org.junit.jupiter.params.provider.ValueSource;
 /**
  * The per-file prepared estimate resolves through the unified memory resolver: a manifest record
  * that already matches the current model, reader and runtime is trusted without a read, and an old,
- * missing or mismatched record is re-estimated by reading and preparing the complete file, never
- * silently priced at zero.
+ * missing or mismatched record is bounded from the file's length by the legacy inexact rule. What
+ * no case may do is read the payload, because a driver prices every file of an index before it
+ * plans anything and reading them there is what once spent five minutes of the caller's wait.
  */
 class TestDistributedIndexSearchPreparedBytes {
 
@@ -73,93 +74,113 @@ class TestDistributedIndexSearchPreparedBytes {
   }
 
   @Test
-  void missingManifestRecordIsReestimatedByReading() throws IOException {
+  void missingManifestRecordIsBoundedFromTheLengthWithoutReading() throws IOException {
     String location = writePayload("missing.puffin", "zstd");
     IndexFile file = file(location, null);
     TrustAdapter adapter = new TrustAdapter(123, READER, PROFILE);
     CountingFileIO io = new CountingFileIO();
 
-    long fileLength = Files.localInput(location).getLength();
-    assertThat(DistributedIndexSearch.preparedBytesOf(io, file, adapter)).isEqualTo(123);
-    assertThat(io.inputFiles()).isEqualTo(1);
-    assertThat(io.bytesRead())
-        .as("the re-estimate reads the complete file and its trailer")
-        .isGreaterThanOrEqualTo(fileLength);
-    assertThat(adapter.prepareCount()).isEqualTo(1);
+    assertThat(DistributedIndexSearch.preparedBytesOf(io, file, adapter))
+        .as("the legacy rule bounds the retained state from the container bytes")
+        .isEqualTo(IndexCacheMemory.residentBytes(Files.localInput(location).getLength(), 0L))
+        .isPositive();
+    assertThat(io.bytesRead()).as("a length is not a payload read").isZero();
+    assertThat(adapter.prepareCount()).as("planning does not prepare the file").isZero();
   }
 
   @Test
-  void oldMemoryModelIsReestimatedNotTrusted() throws IOException {
+  void recordedLengthIsUsedWithoutTouchingTheFileSystem() throws IOException {
+    String location = writePayload("recorded-length.puffin", "zstd");
+    IndexFile file =
+        file(location, memory(999, "test-trust/2", PROFILE).toBuilder().fileBytes(4096L).build());
+    TrustAdapter adapter = new TrustAdapter(123, READER, PROFILE);
+    CountingFileIO io = new CountingFileIO();
+
+    assertThat(DistributedIndexSearch.preparedBytesOf(io, file, adapter))
+        .isEqualTo(IndexCacheMemory.residentBytes(4096L, 0L));
+    assertThat(io.inputFiles()).as("the record states the length already").isZero();
+    assertThat(io.bytesRead()).isZero();
+    assertThat(adapter.prepareCount()).isZero();
+  }
+
+  @Test
+  void oldMemoryModelIsBoundedNotTrusted() throws IOException {
     String location = writePayload("old-model.puffin", "zstd");
     IndexFileMemory declared = memory(999, READER, PROFILE).toBuilder().modelVersion(1).build();
     IndexFile file = file(location, declared);
     TrustAdapter adapter = new TrustAdapter(123, READER, PROFILE);
     CountingFileIO io = new CountingFileIO();
 
-    assertThat(DistributedIndexSearch.preparedBytesOf(io, file, adapter)).isEqualTo(123);
-    assertThat(io.inputFiles()).isEqualTo(1);
-    assertThat(adapter.prepareCount()).isEqualTo(1);
+    assertThat(DistributedIndexSearch.preparedBytesOf(io, file, adapter))
+        .isNotEqualTo(999)
+        .isEqualTo(IndexCacheMemory.residentBytes(Files.localInput(location).getLength(), 0L));
+    assertThat(io.bytesRead()).isZero();
+    assertThat(adapter.prepareCount()).isZero();
   }
 
   @Test
-  void mismatchedReaderIsReestimated() throws IOException {
+  void mismatchedReaderIsBoundedNotTrusted() throws IOException {
     String location = writePayload("reader.puffin", "zstd");
     IndexFile file = file(location, memory(999, "test-trust/2", PROFILE));
     TrustAdapter adapter = new TrustAdapter(123, READER, PROFILE);
     CountingFileIO io = new CountingFileIO();
 
-    assertThat(DistributedIndexSearch.preparedBytesOf(io, file, adapter)).isEqualTo(123);
-    assertThat(io.inputFiles()).isEqualTo(1);
-    assertThat(adapter.prepareCount()).isEqualTo(1);
+    assertThat(DistributedIndexSearch.preparedBytesOf(io, file, adapter))
+        .isNotEqualTo(999)
+        .isEqualTo(IndexCacheMemory.residentBytes(Files.localInput(location).getLength(), 0L));
+    assertThat(io.bytesRead()).isZero();
+    assertThat(adapter.prepareCount()).isZero();
   }
 
   @Test
-  void mismatchedRuntimeIsReestimated() throws IOException {
+  void mismatchedRuntimeIsBoundedNotTrusted() throws IOException {
     String location = writePayload("runtime.puffin", "zstd");
     IndexFile file = file(location, memory(999, READER, "other-profile"));
     TrustAdapter adapter = new TrustAdapter(123, READER, PROFILE);
     CountingFileIO io = new CountingFileIO();
 
-    assertThat(DistributedIndexSearch.preparedBytesOf(io, file, adapter)).isEqualTo(123);
-    assertThat(io.inputFiles()).isEqualTo(1);
-    assertThat(adapter.prepareCount()).isEqualTo(1);
+    assertThat(DistributedIndexSearch.preparedBytesOf(io, file, adapter))
+        .isNotEqualTo(999)
+        .isEqualTo(IndexCacheMemory.residentBytes(Files.localInput(location).getLength(), 0L));
+    assertThat(io.bytesRead()).isZero();
+    assertThat(adapter.prepareCount()).isZero();
   }
 
   @Test
-  void unreadableFileIsUnknownNotZero() throws IOException {
-    String location = temp.resolve("garbage.puffin").toString();
-    java.nio.file.Files.write(java.nio.file.Path.of(location), new byte[10]);
-    IndexFile file = file(location, null);
+  void missingFileIsUnknownNotZero() {
+    IndexFile file = file(temp.resolve("absent.puffin").toString(), null);
     TrustAdapter adapter = new TrustAdapter(123, READER, PROFILE);
+    CountingFileIO io = new CountingFileIO();
 
-    assertThat(DistributedIndexSearch.preparedBytesOf(new CountingFileIO(), file, adapter))
-        .isEqualTo(-1);
+    assertThat(DistributedIndexSearch.preparedBytesOf(io, file, adapter)).isEqualTo(-1);
+    assertThat(io.bytesRead()).isZero();
   }
 
   @Test
-  void reestimationFailureIsRetryable() throws IOException {
+  void lengthFailureIsRetryable() throws IOException {
     String location = temp.resolve("retry.puffin").toString();
-    java.nio.file.Files.write(java.nio.file.Path.of(location), new byte[10]);
     IndexFile file = file(location, null);
     TrustAdapter adapter = new TrustAdapter(123, READER, PROFILE);
 
     assertThat(DistributedIndexSearch.preparedBytesOf(new CountingFileIO(), file, adapter))
         .isEqualTo(-1);
-    java.nio.file.Files.delete(java.nio.file.Path.of(location));
-    writePayload(location, "zstd");
+    writePayloadAt(location, "zstd");
     assertThat(DistributedIndexSearch.preparedBytesOf(new CountingFileIO(), file, adapter))
-        .isEqualTo(123);
+        .isEqualTo(IndexCacheMemory.residentBytes(Files.localInput(location).getLength(), 0L))
+        .isPositive();
   }
 
   @ParameterizedTest
   @ValueSource(strings = {"none", "zstd"})
-  void bothCodecsAreReadableForReestimation(String codec) throws IOException {
+  void aBoundIsDerivedFromTheLengthOfEitherCodec(String codec) throws IOException {
     String location = writePayload("codec-" + codec + ".puffin", codec);
     IndexFile file = file(location, null);
     TrustAdapter adapter = new TrustAdapter(123, READER, PROFILE);
+    CountingFileIO io = new CountingFileIO();
 
-    assertThat(DistributedIndexSearch.preparedBytesOf(new CountingFileIO(), file, adapter))
-        .isEqualTo(123);
+    assertThat(DistributedIndexSearch.preparedBytesOf(io, file, adapter))
+        .isEqualTo(IndexCacheMemory.residentBytes(Files.localInput(location).getLength(), 0L));
+    assertThat(io.bytesRead()).as("a bound never needs the payload").isZero();
   }
 
   @Test
@@ -182,7 +203,7 @@ class TestDistributedIndexSearchPreparedBytes {
   }
 
   @Test
-  void manifestWithoutMemoryIsReestimated() throws IOException {
+  void manifestWithoutMemoryIsBoundedFromTheLength() throws IOException {
     String location = writePayload("legacy.puffin", "zstd");
     String manifestLocation = temp.resolve("legacy.imn").toString();
     IndexManifest.write(Files.localOutput(manifestLocation), List.of(file(location, null)));
@@ -192,20 +213,24 @@ class TestDistributedIndexSearchPreparedBytes {
     TrustAdapter adapter = new TrustAdapter(123, READER, PROFILE);
     CountingFileIO io = new CountingFileIO();
     assertThat(DistributedIndexSearch.preparedBytesOf(io, published.get(0), adapter))
-        .isEqualTo(123);
-    assertThat(io.inputFiles()).isEqualTo(1);
-    assertThat(adapter.prepareCount()).isEqualTo(1);
+        .isEqualTo(IndexCacheMemory.residentBytes(Files.localInput(location).getLength(), 0L));
+    assertThat(io.bytesRead()).isZero();
+    assertThat(adapter.prepareCount()).isZero();
   }
 
   private String writePayload(String name, String codec) throws IOException {
     String location = temp.resolve(name).toString();
+    writePayloadAt(location, codec);
+    return location;
+  }
+
+  private static void writePayloadAt(String location, String codec) throws IOException {
     String property = PuffinIndexFileContainer.INDEX_BLOB_COMPRESSION_PROPERTY;
     String previous = System.getProperty(property);
     try {
       System.setProperty(property, codec);
       new PuffinIndexFileContainer()
           .write(Files.localOutput(location), List.of(IndexBlob.of("test-trust", new byte[10])));
-      return location;
     } finally {
       if (previous == null) {
         System.clearProperty(property);

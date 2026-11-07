@@ -30,6 +30,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.TimeUnit;
 import org.apache.iceberg.index.IndexAdapter;
 import org.apache.iceberg.index.IndexBuildResult;
 import org.apache.iceberg.index.IndexFile;
@@ -54,6 +55,8 @@ final class IndexCacheMemory {
   private static final int MAX_ESTIMATES = 100_000;
   private static final Logger LOG = LoggerFactory.getLogger(IndexCacheMemory.class);
   private static final Map<ContextKey, IndexFileMemory> DESCRIPTORS = new ConcurrentHashMap<>();
+  // Bounds derived from a file's length, so that a second planning pass in this JVM does not ask
+  // for the length of every file again. A load and the first query of the same index both plan.
   private static final Map<EstimateKey, IndexFileMemory> ESTIMATES = new ConcurrentHashMap<>();
 
   private static final class ContextKey {
@@ -322,27 +325,106 @@ final class IndexCacheMemory {
   /**
    * Resolves the retained-memory estimate of one file under this reader and runtime.
    *
-   * <p>A manifest record whose model, reader and runtime already match this runtime is trusted
-   * without reading the file. An old, missing or mismatched record is re-estimated by reading and
-   * preparing the complete file, and a failure leaves the estimate explicitly unknown rather than
-   * silently free.
+   * <p>A manifest record whose model, reader and runtime already match this runtime is trusted as
+   * it is. An old, missing or mismatched record is bounded from the length of the file by the
+   * legacy inexact rule instead, never by reading it: a load and a query both price every file of
+   * an index on the driver before they do anything, and reading payloads there spends the caller's
+   * wait on work an executor repeats. A record already states the container size, so only a file
+   * without one is measured at all, and only for its length. A file whose length cannot be read
+   * stays explicitly unknown rather than free.
    */
   static IndexFileMemory resolveMemory(FileIO io, IndexFile file, IndexAdapter adapter) {
-    if (!supportedLayout()) {
-      return null;
+    return resolveFile(io, file, adapter).memory();
+  }
+
+  /**
+   * The estimates of one planning pass, and how each of them was obtained.
+   *
+   * <p>A pass prices every file of an index before it plans anything, so how many of those files
+   * were priced from a record rather than bounded from a rule is what says whether planning was
+   * free. One line per pass keeps that visible without a knob to tune.
+   */
+  static final class Estimates {
+    private final long startNanos = System.nanoTime();
+    private long recorded;
+    private long estimated;
+    private long unknown;
+
+    IndexFileMemory resolve(FileIO io, IndexFile file, IndexAdapter adapter) {
+      Resolution resolution = resolveFile(io, file, adapter);
+      if (resolution.memory() == null) {
+        unknown += 1;
+      } else if (resolution.recorded()) {
+        recorded += 1;
+      } else {
+        estimated += 1;
+      }
+
+      return resolution.memory();
     }
+
+    void log(String pass) {
+      LOG.info(
+          "Index residency {}: files={} exact={} estimated={} unknown={} took_ms={}",
+          pass,
+          recorded + estimated + unknown,
+          recorded,
+          estimated,
+          unknown,
+          TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startNanos));
+    }
+  }
+
+  /** An estimate of one file, and whether a record or a rule produced it. */
+  private static final class Resolution {
+    private static final Resolution UNKNOWN = new Resolution(null, false);
+
+    private final IndexFileMemory memory;
+    private final boolean recorded;
+
+    private Resolution(IndexFileMemory memory, boolean recorded) {
+      this.memory = memory;
+      this.recorded = recorded;
+    }
+
+    static Resolution unknown() {
+      return UNKNOWN;
+    }
+
+    static Resolution recorded(IndexFileMemory memory) {
+      return new Resolution(memory, true);
+    }
+
+    static Resolution estimated(IndexFileMemory memory) {
+      return new Resolution(memory, false);
+    }
+
+    IndexFileMemory memory() {
+      return memory;
+    }
+
+    boolean recorded() {
+      return recorded;
+    }
+  }
+
+  private static Resolution resolveFile(FileIO io, IndexFile file, IndexAdapter adapter) {
+    if (!supportedLayout()) {
+      return Resolution.unknown();
+    }
+
     try {
       ContextKey context = contextKey(adapter);
       IndexFileMemory descriptor = descriptor(adapter, context);
       if (descriptor == null || descriptor.modelVersion() != 2 || descriptor.preparedBytes() <= 0) {
-        return null;
+        return Resolution.unknown();
       }
 
       // A matching manifest record already describes this exact representation, so it is trusted
-      // without a read. Old, missing or mismatched records fall through to the re-estimate below.
+      // without touching the file at all.
       IndexFileMemory declared = file.memory();
       if (declared != null && declared.preparedBytes() > 0 && compatible(declared, descriptor)) {
-        return declared;
+        return Resolution.recorded(declared);
       }
 
       EstimateKey key =
@@ -352,40 +434,43 @@ final class IndexCacheMemory {
               file.kind(),
               file.blobType(),
               file.entryCount(),
-              file.memory(),
+              declared,
               descriptor.modelVersion(),
               descriptor.readerId(),
               descriptor.runtimeProfile());
       IndexFileMemory known = ESTIMATES.get(key);
       if (known != null) {
-        return known;
+        return Resolution.estimated(known);
       }
 
-      // A record that does not match this reader or runtime is re-estimated by reading and
-      // preparing the complete file; the full validation stays intact here and on the executor.
-      DistributedIndexSearch.LoadedFile loaded =
-          DistributedIndexSearch.loadFileState(io, file.location(), adapter);
-      if (loaded.preparedBytes() <= 0) {
-        return null;
+      // The record describes another reader or runtime, so its numbers are not this cache's. What
+      // survives is the container size, and a length is a stat rather than a read of the payload.
+      Long recordedLength = declared == null ? null : declared.fileBytes();
+      long length =
+          recordedLength != null ? recordedLength : io.newInputFile(file.location()).getLength();
+      if (length <= 0) {
+        return Resolution.unknown();
       }
 
+      // The bound is the pre-existing inexact fallback the executor charges a searcher that cannot
+      // report its retained memory, expressed here as this runtime's prepared-state estimate so
+      // that every consumer of a memory record charges it the same way.
       IndexFileMemory memory =
           IndexFileMemory.builder()
-              .fileBytes(loaded.fileBytes())
-              .payloadBytes(loaded.payloadBytes())
-              .preparedBytes(loaded.preparedBytes())
+              .fileBytes(length)
+              .payloadBytes(0)
+              .preparedBytes(residentBytes(length, 0L))
               .modelVersion(descriptor.modelVersion())
               .readerId(descriptor.readerId())
               .runtimeProfile(descriptor.runtimeProfile())
               .build();
-      residentBytes(memory);
       if (ESTIMATES.size() < MAX_ESTIMATES) {
         ESTIMATES.putIfAbsent(key, memory);
       }
-      return memory;
+      return Resolution.estimated(memory);
     } catch (RuntimeException e) {
       LOG.debug("Index capacity is unknown for {} under the current reader", file.location(), e);
-      return null;
+      return Resolution.unknown();
     }
   }
 
@@ -480,8 +565,8 @@ final class IndexCacheMemory {
 
   /**
    * Whether a record describes the same model and reader as this runtime, ignoring which JVM wrote
-   * the estimate. A record from another runtime is still loadable: the resolver re-estimates it
-   * here, so refusing it outright would make an index built by one JVM unreadable by another.
+   * the estimate. A record from another runtime is still loadable: an executor measures the file it
+   * prepares, so refusing it outright would make an index built by one JVM unreadable by another.
    */
   static boolean compatibleModel(IndexFileMemory memory, IndexAdapter adapter) {
     if (memory == null || !supportedLayout() || memory.modelVersion() != 2) {
