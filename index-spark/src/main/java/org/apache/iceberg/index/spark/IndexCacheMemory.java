@@ -326,12 +326,14 @@ final class IndexCacheMemory {
    * Resolves the retained-memory estimate of one file under this reader and runtime.
    *
    * <p>A manifest record whose model, reader and runtime already match this runtime is trusted as
-   * it is. An old, missing or mismatched record is bounded from the length of the file by the
-   * legacy inexact rule instead, never by reading it: a load and a query both price every file of
-   * an index on the driver before they do anything, and reading payloads there spends the caller's
-   * wait on work an executor repeats. A record already states the container size, so only a file
-   * without one is measured at all, and only for its length. A file whose length cannot be read
-   * stays explicitly unknown rather than free.
+   * it is. A record of the same model and reader that only states another runtime keeps its own
+   * measurement, because that measurement describes this file and the layout statement around it is
+   * within a few percent. Any other record is bounded from the length of the file by the legacy
+   * inexact rule instead, never by reading it: a load and a query both price every file of an index
+   * on the driver before they do anything, and reading payloads there spends the caller's wait on
+   * work an executor repeats. A record already states the container size, so only a file without
+   * one is measured at all, and only for its length. A file whose length cannot be read stays
+   * explicitly unknown rather than free.
    */
   static IndexFileMemory resolveMemory(FileIO io, IndexFile file, IndexAdapter adapter) {
     return resolveFile(io, file, adapter).memory();
@@ -443,8 +445,27 @@ final class IndexCacheMemory {
         return Resolution.estimated(known);
       }
 
-      // The record describes another reader or runtime, so its numbers are not this cache's. What
-      // survives is the container size, and a length is a stat rather than a read of the payload.
+      // The record describes another reader or runtime, so its numbers are not this cache's. A
+      // record of the same model and reader is still the measurement of this file: the runtime
+      // profile only states the constants of the layout that measured it, which differ by a few
+      // percent at most, while the length bound is twice the file. Keeping the measurement is
+      // therefore the closer estimate, and it is charged under the layout of the reader that will
+      // load the file.
+      if (declared != null && declared.preparedBytes() > 0 && compatibleModel(declared, adapter)) {
+        IndexFileMemory measured =
+            declared.toBuilder()
+                .modelVersion(descriptor.modelVersion())
+                .readerId(descriptor.readerId())
+                .runtimeProfile(descriptor.runtimeProfile())
+                .build();
+        if (ESTIMATES.size() < MAX_ESTIMATES) {
+          ESTIMATES.putIfAbsent(key, measured);
+        }
+        return Resolution.estimated(measured);
+      }
+
+      // What survives a record of another reader or model is the container size, and a length is a
+      // stat rather than a read of the payload.
       Long recordedLength = declared == null ? null : declared.fileBytes();
       long length =
           recordedLength != null ? recordedLength : io.newInputFile(file.location()).getLength();

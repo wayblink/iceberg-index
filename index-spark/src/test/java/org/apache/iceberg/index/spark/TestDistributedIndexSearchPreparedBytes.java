@@ -48,10 +48,11 @@ import org.junit.jupiter.params.provider.ValueSource;
 
 /**
  * The per-file prepared estimate resolves through the unified memory resolver: a manifest record
- * that already matches the current model, reader and runtime is trusted without a read, and an old,
- * missing or mismatched record is bounded from the file's length by the legacy inexact rule. What
- * no case may do is read the payload, because a driver prices every file of an index before it
- * plans anything and reading them there is what once spent five minutes of the caller's wait.
+ * that already matches the current model, reader and runtime is trusted without a read, a record
+ * that only states another runtime of the same model and reader keeps its own measurement, and any
+ * other record is bounded from the file's length by the legacy inexact rule. What no case may do is
+ * read the payload, because a driver prices every file of an index before it plans anything and
+ * reading them there is what once spent five minutes of the caller's wait.
  */
 class TestDistributedIndexSearchPreparedBytes {
 
@@ -133,15 +134,17 @@ class TestDistributedIndexSearchPreparedBytes {
   }
 
   @Test
-  void mismatchedRuntimeIsBoundedNotTrusted() throws IOException {
+  void mismatchedRuntimeKeepsTheRecordedEstimate() throws IOException {
     String location = writePayload("runtime.puffin", "zstd");
     IndexFile file = file(location, memory(999, READER, "other-profile"));
     TrustAdapter adapter = new TrustAdapter(123, READER, PROFILE);
     CountingFileIO io = new CountingFileIO();
 
     assertThat(DistributedIndexSearch.preparedBytesOf(io, file, adapter))
-        .isNotEqualTo(999)
-        .isEqualTo(IndexCacheMemory.residentBytes(Files.localInput(location).getLength(), 0L));
+        .as("another runtime of the same model and reader still measured this file")
+        .isEqualTo(999)
+        .isNotEqualTo(IndexCacheMemory.residentBytes(Files.localInput(location).getLength(), 0L));
+    assertThat(io.inputFiles()).as("a measurement needs neither a length nor a payload").isZero();
     assertThat(io.bytesRead()).isZero();
     assertThat(adapter.prepareCount()).isZero();
   }

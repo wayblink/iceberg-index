@@ -25,6 +25,7 @@ import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 import java.util.function.UnaryOperator;
 import org.apache.iceberg.Files;
 import org.apache.iceberg.index.IndexFile;
@@ -43,6 +44,9 @@ import org.junit.jupiter.api.io.TempDir;
  * loudly when a payload is read again, unlike a duration, which depends on the machine.
  */
 class TestIndexPlanningWithoutPayloadReads {
+  /** A runtime identity that describes another layout of the same model and reader. */
+  private static final String OTHER_RUNTIME = "hotspot-17-64;alignment=16;processors=4";
+
   @TempDir private File tempDir;
 
   @Test
@@ -179,6 +183,56 @@ class TestIndexPlanningWithoutPayloadReads {
             DistributedIndexSearch.workingSetBytes(
                 io, published, adapter(built), built.table().location()))
         .isEqualTo(-1);
+  }
+
+  @Test
+  void aRecordFromAnotherRuntimeKeepsItsMeasuredEstimate() {
+    TestIndexFixtures.CountingIO io = new TestIndexFixtures.CountingIO();
+    TestIndexFixtures.BuiltIndex built =
+        TestIndexFixtures.build(tempDir, io, "idx-other-runtime", "data.parquet");
+    long fileBytes = 24_529_754L;
+    long measured = 30_130_688L;
+    rewriteMemory(
+        built,
+        recorded ->
+            recorded.toBuilder()
+                .fileBytes(fileBytes)
+                .preparedBytes(measured)
+                // The record was measured on another layout of the same model and reader, and it
+                // carries no structural counts to recompute from: the figure it states is the only
+                // measurement there is.
+                .runtimeProfile(OTHER_RUNTIME)
+                .structure(Map.of())
+                .build());
+    List<IndexFile> published = publishedFiles(built);
+    io.reset();
+
+    IndexFileMemory descriptor = IndexCacheMemory.currentDescriptor(adapter(built));
+    assertThat(descriptor).isNotNull();
+
+    IndexCacheProtocol.Target target = IndexCacheController.target(built.table(), built.metadata());
+
+    assertThat(target.files()).isNotEmpty();
+    for (IndexCacheProtocol.File planned : target.files()) {
+      IndexFileMemory recorded = fileAt(published, planned.location()).memory();
+      assertThat(recorded.fileBytes()).isEqualTo(fileBytes);
+      assertThat(planned.memory()).isNotNull();
+      assertThat(planned.memory().preparedBytes())
+          .as("a measured estimate survives a layout statement that differs by a few percent")
+          .isEqualTo(measured);
+      assertThat(planned.memory().preparedBytes())
+          .as("the inexact fallback charges twice the file, which overstates it")
+          .isNotEqualTo(IndexCacheMemory.residentBytes(fileBytes, 0L));
+      // The figure is charged under the layout of the reader that will load the file.
+      assertThat(planned.memory().modelVersion()).isEqualTo(descriptor.modelVersion());
+      assertThat(planned.memory().readerId()).isEqualTo(descriptor.readerId());
+      assertThat(planned.memory().runtimeProfile()).isEqualTo(descriptor.runtimeProfile());
+      assertThat(planned.estimatedBytes())
+          .isEqualTo(IndexCacheMemory.residentBytes(planned.memory()));
+    }
+
+    assertThat(io.payloadStreams()).as("planning must not read an index payload").isZero();
+    assertThat(io.payloadLengths()).as("the record states the length already").isZero();
   }
 
   private static VectorIndexAdapter adapter(TestIndexFixtures.BuiltIndex built) {
