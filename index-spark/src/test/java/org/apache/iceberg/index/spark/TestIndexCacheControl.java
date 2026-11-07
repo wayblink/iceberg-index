@@ -241,11 +241,10 @@ class TestIndexCacheControl {
 
   @Test
   void aSlowTargetDoesNotSpendTheWaitWindowBeforeThePlanIsAccepted() {
-    // Listing an index and resolving the memory of each of its files happens on the driver before
-    // the plan exists: a 6.3 GB index of 256 files takes minutes there. The window is for waiting
-    // on
-    // acknowledgements, so it has to start when the plan is accepted. Charging it from the call's
-    // own start fences a plan the moment it is accepted, and every file then reads as TIMED_OUT.
+    // Resolving the target (listing its files and estimating the memory of each) runs on the
+    // driver before the plan exists, and takes minutes for an index of 6.3 GB in 256 files. The
+    // window is for waiting on acknowledgements, so it starts when the plan is accepted: charging
+    // it from the call's own start fences the plan the moment it is accepted.
     TestIndexFixtures.BuiltIndex built =
         TestIndexFixtures.build(tempDir, "idx-late", "data-1.parquet", "data-2.parquet");
     MutableClock clock = new MutableClock(BASE);
@@ -253,8 +252,7 @@ class TestIndexCacheControl {
     IndexCacheDriverControl control = new IndexCacheDriverControl(coordinator);
     control.receive(node());
 
-    // The plan is accepted now; the call itself began five minutes ago, which is what planning
-    // cost.
+    // The plan is accepted now, but the call began five minutes ago: that is what planning cost.
     long entry = BASE - Duration.ofMinutes(5).toNanos();
     Thread executor = slowExecutor(control, coordinator, 100L);
 
@@ -263,32 +261,6 @@ class TestIndexCacheControl {
 
     executor.interrupt();
     assertThat(result.targetFiles()).hasSize(indexFiles(built).size());
-    assertThat(result.status()).isEqualTo(IndexCacheProtocol.Status.COMPLETE);
-    assertThat(result.uncovered()).isEmpty();
-  }
-
-  @Test
-  void aPlanWhoseConfirmationsAreApartByMoreThanTheWindowIsNotFencedWhileTheyKeepComing() {
-    // One index file of the 100M dataset is 24.5 MB, so the gap between two confirmations can
-    // outlast the window even though the plan is progressing. Ending that plan throws away the
-    // copies the executors already installed and reports them as TIMED_OUT.
-    TestIndexFixtures.BuiltIndex built =
-        TestIndexFixtures.build(tempDir, "idx-apart", "data-1.parquet", "data-2.parquet");
-    IndexResidencyCoordinator coordinator = new IndexResidencyCoordinator(System::nanoTime);
-    IndexCacheDriverControl control = new IndexCacheDriverControl(coordinator);
-    control.receive(node());
-    Thread executor = slowExecutor(control, coordinator, 800L);
-
-    IndexCacheProtocol.Result result =
-        IndexCacheController.load(
-            control,
-            built.table(),
-            built.metadata(),
-            "30m",
-            coordinator.nowNanos(),
-            Duration.ofSeconds(1).toNanos());
-
-    executor.interrupt();
     assertThat(result.status()).isEqualTo(IndexCacheProtocol.Status.COMPLETE);
     assertThat(result.uncovered()).isEmpty();
   }

@@ -1221,6 +1221,53 @@ class TestIndexResidencyCoordinator {
   }
 
   @Test
+  void aPlanWhoseConfirmationsAreApartByMoreThanTheWindowIsStillWaitedOn() throws Exception {
+    // One confirmation can take longer than the whole window on its own: a single index file of the
+    // 100M dataset is 24.5 MB. While confirmations keep arriving the plan is moving, so what the
+    // window measures is the stall and not the load; ending it here throws away the copies the
+    // executors already installed and reports the rest as TIMED_OUT.
+    IndexResidencyCoordinator ticked = new IndexResidencyCoordinator(System::nanoTime);
+    ticked.report(node("a", "a-1", 1, budget(40)));
+    Object[] files = new Object[10];
+    for (int i = 0; i < 5; i += 1) {
+      files[2 * i] = "f" + i;
+      files[2 * i + 1] = 1;
+    }
+
+    String plan =
+        ticked.acceptLoad(
+            target("apart", files), IndexResidencyPolicy.parse("forever"), System.nanoTime());
+    IndexCacheDriverControl control = new IndexCacheDriverControl(ticked);
+    List<IndexCacheProtocol.Command> commands = ticked.commands("a", "a-1");
+    assertThat(commands).hasSize(5);
+
+    // Every gap is inside the window and the whole load is well past it, so only a wait that
+    // restarts on progress can see this plan through.
+    Thread acknowledger =
+        new Thread(
+            () -> {
+              for (IndexCacheProtocol.Command command : commands) {
+                try {
+                  Thread.sleep(350L);
+                } catch (InterruptedException e) {
+                  Thread.currentThread().interrupt();
+                  return;
+                }
+
+                ticked.ack(ack(plan, "a", "a-1", command, IndexCacheProtocol.AckStatus.LOADED));
+              }
+            });
+    acknowledger.start();
+
+    IndexCacheProtocol.Result result =
+        IndexCacheController.await(control, plan, Duration.ofMillis(800).toNanos());
+    acknowledger.join(30_000L);
+
+    assertThat(result.status()).isEqualTo(IndexCacheProtocol.Status.COMPLETE);
+    assertThat(result.uncovered()).isEmpty();
+  }
+
+  @Test
   void aLoadOfManyFilesConfirmsEveryOneOfThem() {
     String indexUuid = "multi";
     coordinator.report(node("a", "a-1", 1, budget(40)));
