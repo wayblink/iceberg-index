@@ -39,24 +39,30 @@ import org.apache.iceberg.relocated.com.google.common.base.Preconditions;
 final class IndexCacheController {
   private IndexCacheController() {}
 
-  /** How long a control call waits for its files to reach a terminal state. */
+  /** How long a control call waits without progress for its files to reach a terminal state. */
   static final long DEFAULT_WAIT_NANOS = java.time.Duration.ofSeconds(60).toNanos();
 
   /**
    * Waits until the plan is settled or the wait can no longer end well, then reports its state.
    *
-   * <p>A plan that has loaded some files but not all of them is still working, so it is waited on
-   * rather than ended: ending it would fence the files an executor is still loading and release the
-   * copies it already installed, which leaves the next attempt with nothing to reuse. The wait ends
-   * on the deadline and when no executor is recent enough to answer, because in both cases nothing
-   * can still arrive. A plan that did not cover every file is ended there rather than merely
-   * abandoned, so an executor that never answered does not keep holding the space it promised.
+   * <p>The window measures a stall, not the whole load, and it starts when the plan is accepted:
+   * resolving the target (listing a large index and estimating the memory of every file in it)
+   * happens on the driver before the plan exists, and charging that time to the window leaves the
+   * plan fenced the moment it is accepted. Every confirmation restarts the window, so a large index
+   * whose files arrive minutes apart is still waited on while it is moving; a plan that stops
+   * moving is what the window ends. It also ends when no executor is recent enough to answer,
+   * because then nothing can still arrive. A plan that did not cover every file is ended there
+   * rather than merely abandoned, so an executor that never answered does not keep holding the
+   * space it promised.
    */
   static IndexCacheProtocol.Result await(
-      IndexCacheDriverControl control, String planId, long deadlineNanos) {
+      IndexCacheDriverControl control, String planId, long waitNanos) {
     IndexCacheProtocol.Result result = control.result(planId);
+    long waiting = result.uncovered().size();
+    long deadlineNanos = control.nowNanos() + waitNanos;
     while (!settled(result.status())) {
-      if (control.nowNanos() >= deadlineNanos || !control.hasLiveExecutors(control.nowNanos())) {
+      long now = control.nowNanos();
+      if (now >= deadlineNanos || !control.hasLiveExecutors(now)) {
         break;
       }
 
@@ -69,6 +75,12 @@ final class IndexCacheController {
       }
 
       result = control.result(planId);
+      long stillWaiting = result.uncovered().size();
+      if (stillWaiting < waiting) {
+        // A file reached a terminal state, so the plan is moving: the window is about the stall.
+        waiting = stillWaiting;
+        deadlineNanos = control.nowNanos() + waitNanos;
+      }
     }
 
     if (result.status() == IndexCacheProtocol.Status.COMPLETE) {
@@ -98,7 +110,7 @@ final class IndexCacheController {
       IndexMetadata metadata,
       String retainFor,
       long nowNanos) {
-    return load(control, table, metadata, retainFor, nowNanos, nowNanos + DEFAULT_WAIT_NANOS);
+    return load(control, table, metadata, retainFor, nowNanos, DEFAULT_WAIT_NANOS);
   }
 
   static IndexCacheProtocol.Result load(
@@ -107,11 +119,11 @@ final class IndexCacheController {
       IndexMetadata metadata,
       String retainFor,
       long nowNanos,
-      long deadlineNanos) {
+      long waitNanos) {
     IndexCacheProtocol.Target target = target(table, metadata);
     IndexResidencyPolicy policy = IndexResidencyPolicy.parse(retainFor);
     String planId = control.acceptLoad(target, policy, nowNanos);
-    return await(control, planId, deadlineNanos);
+    return await(control, planId, waitNanos);
   }
 
   static IndexCacheProtocol.Result offload(
@@ -125,7 +137,7 @@ final class IndexCacheController {
 
     // No location check here: releasing an index only needs its identity, and a moved table must
     // still be able to offload what it loaded.
-    return offload(control, table, metadata, nowNanos, nowNanos + DEFAULT_WAIT_NANOS);
+    return offload(control, table, metadata, nowNanos, DEFAULT_WAIT_NANOS);
   }
 
   static IndexCacheProtocol.Result offload(
@@ -133,9 +145,9 @@ final class IndexCacheController {
       Table table,
       IndexMetadata metadata,
       long nowNanos,
-      long deadlineNanos) {
+      long waitNanos) {
     String planId = control.acceptOffload(metadata.indexUuid(), nowNanos);
-    return await(control, planId, deadlineNanos);
+    return await(control, planId, waitNanos);
   }
 
   /** The plan target for the index snapshot covering the table's current snapshot. */

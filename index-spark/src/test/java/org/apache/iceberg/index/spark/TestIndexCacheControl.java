@@ -25,6 +25,7 @@ import java.io.File;
 import java.io.IOException;
 import java.time.Duration;
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -85,13 +86,13 @@ class TestIndexCacheControl {
     control.receive(node());
 
     IndexCacheProtocol.Result first =
-        IndexCacheController.load(control, built.table(), built.metadata(), "30m", BASE, BASE);
+        IndexCacheController.load(control, built.table(), built.metadata(), "30m", BASE, 0L);
     IndexCacheProtocol.Result repeated =
-        IndexCacheController.load(control, built.table(), built.metadata(), null, BASE, BASE);
+        IndexCacheController.load(control, built.table(), built.metadata(), null, BASE, 0L);
     assertThat(repeated.protection().deadlineNanos()).isEqualTo(first.protection().deadlineNanos());
 
     IndexCacheProtocol.Result zero =
-        IndexCacheController.load(control, built.table(), built.metadata(), "0", BASE, BASE);
+        IndexCacheController.load(control, built.table(), built.metadata(), "0", BASE, 0L);
     assertThat(zero.protection().permanent()).isFalse();
     assertThat(zero.protection().deadlineNanos()).isZero();
   }
@@ -105,7 +106,7 @@ class TestIndexCacheControl {
     control.receive(node());
 
     IndexCacheProtocol.Result result =
-        IndexCacheController.load(control, built.table(), built.metadata(), "forever", BASE, BASE);
+        IndexCacheController.load(control, built.table(), built.metadata(), "forever", BASE, 0L);
 
     assertThat(result.protection().permanent()).isTrue();
     assertThat(result.protection().text()).isEqualTo("forever");
@@ -118,12 +119,12 @@ class TestIndexCacheControl {
     IndexResidencyCoordinator coordinator = new IndexResidencyCoordinator(() -> BASE);
     IndexCacheDriverControl control = new IndexCacheDriverControl(coordinator);
     control.receive(node());
-    IndexCacheController.load(control, built.table(), built.metadata(), "forever", BASE, BASE);
+    IndexCacheController.load(control, built.table(), built.metadata(), "forever", BASE, 0L);
 
     IndexCacheProtocol.Result first =
-        IndexCacheController.offload(control, built.table(), built.metadata(), BASE, BASE);
+        IndexCacheController.offload(control, built.table(), built.metadata(), BASE, 0L);
     IndexCacheProtocol.Result second =
-        IndexCacheController.offload(control, built.table(), built.metadata(), BASE, BASE);
+        IndexCacheController.offload(control, built.table(), built.metadata(), BASE, 0L);
 
     assertThat(first.status()).isEqualTo(IndexCacheProtocol.Status.OFFLOADED);
     assertThat(second.status()).isEqualTo(IndexCacheProtocol.Status.OFFLOADED);
@@ -139,7 +140,7 @@ class TestIndexCacheControl {
     IndexCacheDriverControl control = new IndexCacheDriverControl(coordinator);
     control.receive(node());
     IndexCacheProtocol.Result protocol =
-        IndexCacheController.load(control, built.table(), built.metadata(), "30m", BASE, BASE);
+        IndexCacheController.load(control, built.table(), built.metadata(), "30m", BASE, 0L);
 
     IndexCacheControl.Result result = IndexCacheControl.Result.from(control, protocol);
 
@@ -160,7 +161,7 @@ class TestIndexCacheControl {
     IndexResidencyCoordinator coordinator = new IndexResidencyCoordinator(() -> BASE);
     IndexCacheDriverControl control = new IndexCacheDriverControl(coordinator);
     control.receive(node());
-    IndexCacheController.load(control, built.table(), built.metadata(), "0", BASE, BASE);
+    IndexCacheController.load(control, built.table(), built.metadata(), "0", BASE, 0L);
 
     assertThat(coordinator.protectedIndexes()).containsKey("idx-1");
   }
@@ -172,7 +173,7 @@ class TestIndexCacheControl {
     IndexResidencyCoordinator coordinator = new IndexResidencyCoordinator(() -> BASE);
     IndexCacheDriverControl control = new IndexCacheDriverControl(coordinator);
     control.receive(node());
-    IndexCacheController.load(control, built.table(), built.metadata(), "30m", BASE, BASE);
+    IndexCacheController.load(control, built.table(), built.metadata(), "30m", BASE, 0L);
 
     List<IndexCacheControl.Status> status = IndexCacheControl.statusOf(control, BASE);
 
@@ -239,6 +240,60 @@ class TestIndexCacheControl {
   }
 
   @Test
+  void aSlowTargetDoesNotSpendTheWaitWindowBeforeThePlanIsAccepted() {
+    // Listing an index and resolving the memory of each of its files happens on the driver before
+    // the plan exists: a 6.3 GB index of 256 files takes minutes there. The window is for waiting
+    // on
+    // acknowledgements, so it has to start when the plan is accepted. Charging it from the call's
+    // own start fences a plan the moment it is accepted, and every file then reads as TIMED_OUT.
+    TestIndexFixtures.BuiltIndex built =
+        TestIndexFixtures.build(tempDir, "idx-late", "data-1.parquet", "data-2.parquet");
+    MutableClock clock = new MutableClock(BASE);
+    IndexResidencyCoordinator coordinator = new IndexResidencyCoordinator(clock);
+    IndexCacheDriverControl control = new IndexCacheDriverControl(coordinator);
+    control.receive(node());
+
+    // The plan is accepted now; the call itself began five minutes ago, which is what planning
+    // cost.
+    long entry = BASE - Duration.ofMinutes(5).toNanos();
+    Thread executor = slowExecutor(control, coordinator, 100L);
+
+    IndexCacheProtocol.Result result =
+        IndexCacheController.load(control, built.table(), built.metadata(), "30m", entry);
+
+    executor.interrupt();
+    assertThat(result.targetFiles()).hasSize(indexFiles(built).size());
+    assertThat(result.status()).isEqualTo(IndexCacheProtocol.Status.COMPLETE);
+    assertThat(result.uncovered()).isEmpty();
+  }
+
+  @Test
+  void aPlanWhoseConfirmationsAreApartByMoreThanTheWindowIsNotFencedWhileTheyKeepComing() {
+    // One index file of the 100M dataset is 24.5 MB, so the gap between two confirmations can
+    // outlast the window even though the plan is progressing. Ending that plan throws away the
+    // copies the executors already installed and reports them as TIMED_OUT.
+    TestIndexFixtures.BuiltIndex built =
+        TestIndexFixtures.build(tempDir, "idx-apart", "data-1.parquet", "data-2.parquet");
+    IndexResidencyCoordinator coordinator = new IndexResidencyCoordinator(System::nanoTime);
+    IndexCacheDriverControl control = new IndexCacheDriverControl(coordinator);
+    control.receive(node());
+    Thread executor = slowExecutor(control, coordinator, 800L);
+
+    IndexCacheProtocol.Result result =
+        IndexCacheController.load(
+            control,
+            built.table(),
+            built.metadata(),
+            "30m",
+            coordinator.nowNanos(),
+            Duration.ofSeconds(1).toNanos());
+
+    executor.interrupt();
+    assertThat(result.status()).isEqualTo(IndexCacheProtocol.Status.COMPLETE);
+    assertThat(result.uncovered()).isEmpty();
+  }
+
+  @Test
   void aPlanThatPassesItsDeadlineIsFencedInsteadOfStayingPending() {
     TestIndexFixtures.BuiltIndex built =
         TestIndexFixtures.build(tempDir, "idx-deadline", "data-1.parquet", "data-2.parquet");
@@ -256,8 +311,7 @@ class TestIndexCacheControl {
     assertThat(coordinator.state("executor-1", "executor-1#1").reservedByCommand()).isNotEmpty();
 
     clock.advance(Duration.ofMinutes(1).toNanos());
-    IndexCacheProtocol.Result result =
-        IndexCacheController.await(control, planId, clock.nowNanos());
+    IndexCacheProtocol.Result result = IndexCacheController.await(control, planId, 0L);
 
     // A deadline that ends the wait must also end the plan: the executor never answered, so the
     // files are not resident and their reservations may not outlive the caller's patience.
@@ -286,8 +340,7 @@ class TestIndexCacheControl {
 
     clock.advance(IndexResidencyCoordinator.STALE_AFTER_NANOS + Duration.ofSeconds(1).toNanos());
     assertThat(control.hasLiveExecutors(clock.nowNanos())).isFalse();
-    IndexCacheProtocol.Result result =
-        IndexCacheController.await(control, planId, clock.nowNanos());
+    IndexCacheProtocol.Result result = IndexCacheController.await(control, planId, 0L);
 
     assertThat(result.status()).isEqualTo(IndexCacheProtocol.Status.FAILED);
     assertThat(result.uncovered().values()).containsOnly("TIMED_OUT");
@@ -303,7 +356,7 @@ class TestIndexCacheControl {
         new IndexCacheDriverControl(new IndexResidencyCoordinator(() -> BASE));
     control.receive(node());
     IndexCacheProtocol.Result protocol =
-        IndexCacheController.load(control, built.table(), built.metadata(), "30m", BASE, BASE);
+        IndexCacheController.load(control, built.table(), built.metadata(), "30m", BASE, 0L);
 
     IndexCacheControl.Result result = IndexCacheControl.Result.from(control, protocol);
 
@@ -322,8 +375,7 @@ class TestIndexCacheControl {
 
     assertThatThrownBy(
             () ->
-                IndexCacheController.load(
-                    control, other.table(), built.metadata(), "0", BASE, BASE))
+                IndexCacheController.load(control, other.table(), built.metadata(), "0", BASE, 0L))
         .isInstanceOf(IllegalArgumentException.class)
         .hasMessageContaining("belongs to table");
   }
@@ -346,7 +398,7 @@ class TestIndexCacheControl {
         new IndexCacheDriverControl(new IndexResidencyCoordinator(() -> BASE));
     control.receive(node());
     IndexCacheProtocol.Result load =
-        IndexCacheController.load(control, built.table(), built.metadata(), "forever", BASE, BASE);
+        IndexCacheController.load(control, built.table(), built.metadata(), "forever", BASE, 0L);
 
     String searchKey =
         DistributedIndexSearch.cacheKey(
@@ -383,7 +435,7 @@ class TestIndexCacheControl {
             command.file().estimatedBytes()));
 
     IndexCacheProtocol.Result offload =
-        IndexCacheController.offload(control, built.table(), built.metadata(), BASE, BASE);
+        IndexCacheController.offload(control, built.table(), built.metadata(), BASE, 0L);
     IndexCacheControl.Result rows = IndexCacheControl.Result.from(control, offload);
 
     assertThat(rows.status()).isEqualTo("RELEASING");
@@ -415,7 +467,7 @@ class TestIndexCacheControl {
             .build());
 
     IndexCacheProtocol.Result offload =
-        IndexCacheController.offload(control, built.table(), built.metadata(), BASE, BASE);
+        IndexCacheController.offload(control, built.table(), built.metadata(), BASE, 0L);
 
     // A copy was acknowledged, so the release has to be confirmed before this is done.
     assertThat(offload.status()).isEqualTo(IndexCacheProtocol.Status.RELEASING);
@@ -451,7 +503,7 @@ class TestIndexCacheControl {
     IndexCacheDriverControl control =
         new IndexCacheDriverControl(new IndexResidencyCoordinator(() -> BASE));
     control.receive(node());
-    IndexCacheController.load(control, built.table(), built.metadata(), "forever", BASE, BASE);
+    IndexCacheController.load(control, built.table(), built.metadata(), "forever", BASE, 0L);
     control.recordAccess("idx-1", BASE + 5_000_000L);
 
     List<IndexCacheControl.IndexStatus> rows =
@@ -470,7 +522,7 @@ class TestIndexCacheControl {
     IndexCacheDriverControl control =
         new IndexCacheDriverControl(new IndexResidencyCoordinator(() -> BASE));
     control.receive(node());
-    IndexCacheController.load(control, built.table(), built.metadata(), "forever", BASE, BASE);
+    IndexCacheController.load(control, built.table(), built.metadata(), "forever", BASE, 0L);
 
     List<IndexCacheControl.IndexStatus> rows = IndexCacheControl.indexStatusOf(control, BASE);
 
@@ -686,6 +738,45 @@ class TestIndexCacheControl {
           .controlBytes(withdrawn.charge().controlBytes());
     }
     return ack.build();
+  }
+
+  /** Answers pending load commands one at a time, spaced out, the way a slow executor does. */
+  private static Thread slowExecutor(
+      IndexCacheDriverControl control, IndexResidencyCoordinator coordinator, long gapMillis) {
+    Thread thread =
+        new Thread(
+            () -> {
+              Set<String> answered = new HashSet<>();
+              try {
+                while (!Thread.currentThread().isInterrupted()) {
+                  List<IndexCacheProtocol.Command> pending = new ArrayList<>();
+                  for (IndexCacheProtocol.Command command :
+                      coordinator.commands("executor-1", "executor-1#1")) {
+                    if (command.type() == IndexCacheProtocol.CommandType.LOAD
+                        && answered.add(command.commandId())) {
+                      pending.add(command);
+                    }
+                  }
+
+                  for (IndexCacheProtocol.Command command : pending) {
+                    Thread.sleep(gapMillis);
+                    control.receive(
+                        ack(
+                            command.planId(),
+                            command,
+                            IndexCacheProtocol.AckStatus.LOADED,
+                            command.file().estimatedBytes()));
+                  }
+
+                  Thread.sleep(10L);
+                }
+              } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+              }
+            });
+    thread.setDaemon(true);
+    thread.start();
+    return thread;
   }
 
   /** A clock the test moves by hand, so a deadline passes without waiting for it. */

@@ -1213,7 +1213,7 @@ class TestIndexResidencyCoordinator {
     acknowledger.start();
 
     IndexCacheProtocol.Result result =
-        IndexCacheController.await(control, plan, clock.now() + Duration.ofSeconds(10).toNanos());
+        IndexCacheController.await(control, plan, Duration.ofSeconds(10).toNanos());
     acknowledger.join(10_000L);
 
     assertThat(result.uncovered()).as("every file of the plan: %s", result).isEmpty();

@@ -34,7 +34,13 @@ import org.apache.spark.sql.SparkSession;
 public final class IndexCacheControl {
   private IndexCacheControl() {}
 
-  /** Requests one planning round for this index; a repeated call replaces the previous target. */
+  /**
+   * Requests one planning round for this index; a repeated call replaces the previous target.
+   *
+   * <p>The call waits for the plan to settle and gives up after a minute without a confirmation: a
+   * large index whose files keep arriving is waited on, a plan whose executors stopped answering is
+   * not.
+   */
   public static Result load(
       SparkSession spark, Table table, IndexMetadata metadata, String retainFor) {
     IndexCacheDriverControl control = controlOf(spark);
