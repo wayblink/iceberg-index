@@ -280,6 +280,63 @@ class TestRewriteVectorSearch {
   }
 
   @Test
+  public void aCandidateBudgetIsNotRequiredWhenScoresAreExactAndTheSetIsFixed() {
+    // An IVF index over unquantized vectors scores exactly: the vectors are kept and the score is
+    // the one a full scan would give, so the approximation is only which partitions nprobe visits.
+    // A wider candidate budget therefore cannot change the answer - the k nearest of the visited
+    // set are the k nearest of it whether it is asked for k rows or 10k - and demanding a budget
+    // would refuse the index for a reason that does not exist.
+    String table = table("docs_ivf_none");
+    spark.sql(
+        String.format(
+            "CALL local.system.build_vector_index("
+                + "table => '%s', column => 'embedding', dimension => 2, "
+                + "structure => 'IVF', quantizer => 'NONE', "
+                + "options => map('nlist', '4', 'nprobe', '4'))",
+            table));
+
+    try {
+      spark.conf().unset("spark.iceberg.index.vector.over-sample");
+      assertThat(planOf(table, nearestNeighbour(table, 2)))
+          .as("an exact-scoring index answers without the caller setting a budget")
+          .contains("VectorSearchSource");
+
+      // and the answer is the one a scan gives, which is what makes the budget irrelevant here
+      assertThat(search(table, 2)).containsExactlyElementsOf(fullScan(table, 2));
+
+      // the same answer with a budget, because the budget cannot change which rows are nearest
+      spark.conf().set("spark.iceberg.index.vector.over-sample", "10");
+      assertThat(search(table, 2)).containsExactlyElementsOf(fullScan(table, 2));
+    } finally {
+      spark.conf().unset("spark.iceberg.index.vector.over-sample");
+    }
+  }
+
+  @Test
+  public void aQuantizedIndexIsNotUsedWithoutACandidateBudget() {
+    // A quantized code ranks candidates by an estimate, so asking it for k rows returns the k the
+    // estimate preferred rather than the k nearest; without a budget the scan answers instead, and
+    // the warning names the setting that would let the index answer.
+    String table = table("docs_rab_quiet");
+    spark.sql(
+        String.format(
+            "CALL local.system.build_vector_index("
+                + "table => '%s', column => 'embedding', dimension => 2, "
+                + "structure => 'IVF', quantizer => 'RABITQ', "
+                + "options => map('nlist', '4', 'nprobe', '4', 'rabitq-bits', '3'))",
+            table));
+
+    try {
+      spark.conf().unset("spark.iceberg.index.vector.over-sample");
+      assertThat(planOf(table, nearestNeighbour(table, 2)))
+          .as("no budget, so the scan answers rather than the estimate")
+          .doesNotContain("VectorSearchSource");
+    } finally {
+      spark.conf().unset("spark.iceberg.index.vector.over-sample");
+    }
+  }
+
+  @Test
   public void overSamplingKeepsTheNearestCandidatesRatherThanTheFarthest() {
     // an approximate index is asked for more candidates than the query wants, and the re-scoring
     // that follows has to keep the nearest of them: keeping the farthest answers with rows that are

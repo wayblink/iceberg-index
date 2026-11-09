@@ -158,10 +158,12 @@ case class RewriteVectorSearch(spark: SparkSession) extends Rule[LogicalPlan] {
             } else if (resolved == null) {
               None
             } else if (context.rawParameters.overSample == null
-              && !VectorSearchSource.enumeratesEveryCandidate(definition)) {
-              // the kernel ranks candidates by an estimate, so answering a top-k question with k of
+              && VectorSearchSource.budgetChangesTheAnswer(definition)) {
+              // the index orders candidates by an estimate, so answering a top-k question with k of
               // them returns whatever the estimate preferred rather than the nearest rows: without
-              // a budget the caller chose, the scan answers instead of answering wrongly
+              // a budget the caller chose, the scan answers instead of answering wrongly. An index
+              // that scores exactly does not need the budget - asking it for 10k rows would return
+              // the same 10k, so it is not asked to stand aside
               logger.warn(
                 "Not using the vector index of column {} (field {}, {}/{}) for a top-{} query: " +
                   "that kernel ranks candidates by an estimate, so asking it for {} of them would " +
