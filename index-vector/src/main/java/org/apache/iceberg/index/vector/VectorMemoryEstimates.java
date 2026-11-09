@@ -76,6 +76,18 @@ final class VectorMemoryEstimates {
     return supportedLayout() ? bytes : 0;
   }
 
+  /** Reads one recorded structural count, or -1 when the record does not state it. */
+  static long count(Map<String, Long> structure, String key) {
+    Long value = structure.get(key);
+    return value == null ? -1L : value;
+  }
+
+  /** Reads one recorded count that a formula uses as a count of items, or -1 when it cannot be. */
+  static int intCount(Map<String, Long> structure, String key) {
+    long value = count(structure, key);
+    return value < 0 || value > Integer.MAX_VALUE ? -1 : (int) value;
+  }
+
   static long dictionaryBytes(Iterable<String> dataFiles) {
     long bytes = 0;
     for (String dataFile : dataFiles) {

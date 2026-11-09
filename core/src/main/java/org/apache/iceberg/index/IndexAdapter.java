@@ -21,6 +21,7 @@ package org.apache.iceberg.index;
 import java.nio.ByteBuffer;
 import java.util.Comparator;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import javax.annotation.Nullable;
 import org.apache.iceberg.relocated.com.google.common.base.Preconditions;
@@ -154,6 +155,21 @@ public interface IndexAdapter {
     default long estimatedBytes() {
       return 0L;
     }
+  }
+
+  /**
+   * How many bytes a searcher prepared from a payload of this shape retains, or null when this
+   * index type cannot tell.
+   *
+   * <p>The keys of {@code structure} are defined by the implementation: it is the code that
+   * recorded them alongside the estimate of a built file, and it is the only code that knows what
+   * they count. Implementations must not read the payload they price, and the number they return is
+   * the one {@link PreparedSearch#estimatedBytes()} reports, without the wrapper a cache adds
+   * around a searcher it keeps. Null means the caller has to price the payload another way.
+   */
+  @Nullable
+  default Long retainedBytes(long payloadBytes, Map<String, Long> structure) {
+    return null;
   }
 
   /**

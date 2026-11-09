@@ -326,7 +326,8 @@ final class IndexCacheMemory {
    * Resolves the retained-memory estimate of one file under this reader and runtime.
    *
    * <p>A manifest record whose model, reader and runtime already match this runtime is trusted as
-   * it is. A record of the same model and reader that only states another runtime keeps its own
+   * it is. A record whose structure this adapter can price is recomputed with the current formula,
+   * and a record of the same model and reader that only states another runtime keeps its own
    * measurement, because that measurement describes this file and the layout statement around it is
    * within a few percent. Any other record is bounded from the length of the file by the legacy
    * inexact rule instead, never by reading it: a load and a query both price every file of an index
@@ -422,7 +423,7 @@ final class IndexCacheMemory {
         return Resolution.unknown();
       }
 
-      // A matching manifest record already describes this exact representation, so it is trusted
+      // 1. A matching manifest record already describes this exact representation, so it is trusted
       // without touching the file at all.
       IndexFileMemory declared = file.memory();
       if (declared != null && declared.preparedBytes() > 0 && compatible(declared, descriptor)) {
@@ -445,27 +446,30 @@ final class IndexCacheMemory {
         return Resolution.estimated(known);
       }
 
-      // The record describes another reader or runtime, so its numbers are not this cache's. A
-      // record of the same model and reader is still the measurement of this file: the runtime
-      // profile only states the constants of the layout that measured it, which differ by a few
-      // percent at most, while the length bound is twice the file. Keeping the measurement is
-      // therefore the closer estimate, and it is charged under the layout of the reader that will
-      // load the file.
-      if (declared != null && declared.preparedBytes() > 0 && compatibleModel(declared, adapter)) {
-        IndexFileMemory measured =
-            declared.toBuilder()
-                .modelVersion(descriptor.modelVersion())
-                .readerId(descriptor.readerId())
-                .runtimeProfile(descriptor.runtimeProfile())
-                .build();
-        if (ESTIMATES.size() < MAX_ESTIMATES) {
-          ESTIMATES.putIfAbsent(key, measured);
+      // The record describes another representation, so its numbers are not this cache's. What
+      // follows is priced without reading the payload: a load and a query both price every file of
+      // an index on the driver before they do anything, and reading payloads there spends the
+      // caller's wait on work an executor repeats.
+      //
+      // 2. A record states the structure the estimate was derived from, so an adapter that knows
+      //    what those counts measure recomputes this runtime's figure with the current formula:
+      //    exact, and still exact after the model or the formula changes.
+      // 3. A record of the same model and reader that only states another runtime keeps its own
+      //    measurement, because that measurement was taken of this file and the layout statement
+      //    differs by a few percent, while the length bound is twice the file.
+      if (declared != null) {
+        IndexFileMemory repriced = repriced(declared, descriptor, adapter);
+        if (repriced != null) {
+          if (ESTIMATES.size() < MAX_ESTIMATES) {
+            ESTIMATES.putIfAbsent(key, repriced);
+          }
+          return Resolution.estimated(repriced);
         }
-        return Resolution.estimated(measured);
       }
 
-      // What survives a record of another reader or model is the container size, and a length is a
-      // stat rather than a read of the payload.
+      // 4. What survives otherwise is the container size: a record already states it, so only a
+      //    file without one is measured at all, and a length is a stat rather than a payload read.
+      // 5. A file whose length cannot be read stays explicitly unknown rather than free.
       Long recordedLength = declared == null ? null : declared.fileBytes();
       long length =
           recordedLength != null ? recordedLength : io.newInputFile(file.location()).getLength();
@@ -493,6 +497,48 @@ final class IndexCacheMemory {
       LOG.debug("Index capacity is unknown for {} under the current reader", file.location(), e);
       return Resolution.unknown();
     }
+  }
+
+  /**
+   * What this runtime's prepared state of a recorded file costs, according to the record itself.
+   *
+   * <p>A record states the structural counts the estimate was derived from, so an adapter that
+   * knows what those counts measure recomputes this runtime's figure with the current formula:
+   * exact, free of file access, and still exact after the model or the formula changes. Otherwise a
+   * record of the same model and reader keeps its own measurement, which was taken of this file. A
+   * record of another model or reader describes another prepared form, so nothing is returned for
+   * it. Either answer is charged under the layout of the reader that will load the file.
+   */
+  private static IndexFileMemory repriced(
+      IndexFileMemory declared, IndexFileMemory descriptor, IndexAdapter adapter) {
+    if (declared.payloadBytes() > 0 && !declared.structure().isEmpty()) {
+      Long recomputed;
+      try {
+        recomputed = adapter.retainedBytes(declared.payloadBytes(), declared.structure());
+      } catch (RuntimeException e) {
+        // An adapter that cannot price its own structure is one that cannot tell, and that costs a
+        // recomputation rather than the record it was reading.
+        LOG.debug("Index structure is unpriced by {}", adapter.getClass().getName(), e);
+        recomputed = null;
+      }
+
+      if (recomputed != null && recomputed > 0) {
+        return under(declared, descriptor).preparedBytes(recomputed).build();
+      }
+    }
+
+    return declared.preparedBytes() > 0 && compatibleModel(declared, adapter)
+        ? under(declared, descriptor).build()
+        : null;
+  }
+
+  /** A record of this file, stated under the layout of the reader that will load it. */
+  private static IndexFileMemory.Builder under(
+      IndexFileMemory declared, IndexFileMemory descriptor) {
+    return declared.toBuilder()
+        .modelVersion(descriptor.modelVersion())
+        .readerId(descriptor.readerId())
+        .runtimeProfile(descriptor.runtimeProfile());
   }
 
   /** Uses the existing codec SPI rather than adding a public memory-model descriptor interface. */

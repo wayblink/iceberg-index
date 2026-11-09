@@ -21,6 +21,7 @@ package org.apache.iceberg.index.vector;
 import java.nio.ByteBuffer;
 import java.util.Comparator;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import org.apache.iceberg.index.IndexAdapter;
 import org.apache.iceberg.index.IndexBuildResult;
@@ -188,6 +189,21 @@ public final class VectorIndexAdapter implements IndexAdapter, java.io.Serializa
   @Override
   public List<IndexSearchResult> searchAuxiliary(ByteBuffer payload, ByteBuffer query, int topK) {
     return kernel.search(payload, query, topK);
+  }
+
+  /**
+   * Prices a payload from the structural counts a build recorded, when this kernel's prepared form
+   * follows from them. A kernel whose prepared form those counts do not describe, such as a graph,
+   * answers unknown and the caller prices the payload another way.
+   */
+  @Override
+  public Long retainedBytes(long payloadBytes, Map<String, Long> structure) {
+    if (payloadBytes <= 0 || structure.isEmpty() || !(kernel instanceof RetainedBytes sizes)) {
+      return null;
+    }
+
+    long bytes = sizes.retainedBytes(payloadBytes, structure);
+    return bytes > 0 ? bytes : null;
   }
 
   @Override

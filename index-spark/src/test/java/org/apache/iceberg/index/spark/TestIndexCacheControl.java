@@ -27,6 +27,7 @@ import java.time.Duration;
 import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.atomic.AtomicInteger;
 import org.apache.iceberg.index.IndexFile;
@@ -605,6 +606,9 @@ class TestIndexCacheControl {
               .coveredDataFiles(file.coveredDataFiles())
               .memory(
                   file.memory().toBuilder()
+                      // A record that states no structure is one this runtime cannot price, which
+                      // is also what every record written before the counts were recorded states.
+                      .structure(Map.of())
                       .preparedBytes(1)
                       .modelVersion(model)
                       .readerId("old-reader")
@@ -625,7 +629,7 @@ class TestIndexCacheControl {
     IndexCacheProtocol.File planned =
         IndexCacheController.target(built.table(), built.metadata()).files().get(0);
 
-    // The record states the container size, so the bound costs no read and no stat.
+    // The record still states the container size, so the bound needs no read and no stat.
     assertThat(rewritten.get(0).memory().fileBytes()).isNotNull();
     assertThat(planned.memory().preparedBytes())
         .isEqualTo(IndexCacheMemory.residentBytes(rewritten.get(0).memory().fileBytes(), 0L))
@@ -636,6 +640,66 @@ class TestIndexCacheControl {
     assertThat(planned.memory().readerId()).isNotEqualTo("old-reader");
     assertThat(planned.memory().runtimeProfile()).isNotEqualTo("old-runtime");
     assertThat(io.payloadStreams()).as("an incompatible record is not re-measured").isZero();
+    assertThat(io.payloadLengths()).isZero();
+  }
+
+  @ParameterizedTest
+  @ValueSource(ints = {1, 2, 99})
+  void targetRecomputesIncompatibleManifestMemoryFromItsStructure(int model) throws IOException {
+    TestIndexFixtures.CountingIO io = new TestIndexFixtures.CountingIO();
+    TestIndexFixtures.BuiltIndex built =
+        TestIndexFixtures.build(tempDir, io, "recomputable-memory", "data.parquet");
+    List<IndexFile> published = publishedIndexFiles(built);
+    // What the build measured for this payload, and the counts it derived that measurement from.
+    long measured = published.get(0).memory().preparedBytes();
+    assertThat(published.get(0).memory().structure()).isNotEmpty();
+
+    List<IndexFile> rewritten = new ArrayList<>();
+    for (IndexFile file : published) {
+      rewritten.add(
+          IndexFile.builder()
+              .location(file.location())
+              .kind(file.kind())
+              .blobType(file.blobType())
+              .entryCount(file.entryCount())
+              .coveredDataFiles(file.coveredDataFiles())
+              .memory(
+                  file.memory().toBuilder()
+                      // The counts and the payload length survive the rewrite, so this runtime can
+                      // price the same payload again; only the reader that stated it is foreign.
+                      .preparedBytes(1)
+                      .modelVersion(model)
+                      .readerId("old-reader")
+                      .runtimeProfile("old-runtime")
+                      .build())
+              .build());
+    }
+    String manifestLocation = manifestLocationOf(built);
+    built.table().io().deleteFile(manifestLocation);
+    IndexManifest.write(built.table().io().newOutputFile(manifestLocation), rewritten);
+    io.reset();
+
+    VectorIndexAdapter adapter =
+        new VectorIndexAdapter((VectorIndexDefinition) built.metadata().definition());
+    IndexFileMemory descriptor = IndexCacheMemory.currentDescriptor(adapter);
+    assertThat(descriptor).isNotNull();
+
+    IndexCacheProtocol.File planned =
+        IndexCacheController.target(built.table(), built.metadata()).files().get(0);
+    assertThat(planned.location()).isEqualTo(rewritten.get(0).location());
+    // The recorded structure prices this payload exactly: the current formula over the same counts
+    // reproduces what the build measured, so the file is charged its real residency rather than
+    // twice its container size.
+    assertThat(planned.memory().preparedBytes())
+        .as("the counts the record states reproduce the measured residency")
+        .isEqualTo(measured)
+        .isNotEqualTo(IndexCacheMemory.residentBytes(rewritten.get(0).memory().fileBytes(), 0L));
+    assertThat(planned.estimatedBytes())
+        .isEqualTo(IndexCacheMemory.residentBytes(planned.memory()));
+    assertThat(planned.memory().modelVersion()).isEqualTo(2);
+    assertThat(planned.memory().readerId()).isNotEqualTo("old-reader");
+    assertThat(planned.memory().runtimeProfile()).isNotEqualTo("old-runtime");
+    assertThat(io.payloadStreams()).as("a recomputation reads no payload").isZero();
     assertThat(io.payloadLengths()).isZero();
   }
 

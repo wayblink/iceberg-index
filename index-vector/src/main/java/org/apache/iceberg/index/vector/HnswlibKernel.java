@@ -52,6 +52,12 @@ import org.apache.iceberg.relocated.com.google.common.collect.Lists;
  * <p>The graph ranks candidates by its own distance, so a hit is re-scored against the vector it
  * holds and the re-scored results are ordered before they are truncated. That is what lets an
  * approximate search report the score the exact scan would have given.
+ *
+ * <p>A prepared graph is measured, never derived from the counts a build records. Those counts say
+ * how many nodes the graph holds and how many neighbours a node may keep, but the retained size of
+ * a graph also depends on how many layers each node occupies and on how much neighbour capacity
+ * every layer list was allocated, which only the loaded graph states. The kernel therefore does not
+ * price a payload from a record.
  */
 public final class HnswlibKernel implements VectorKernel {
 

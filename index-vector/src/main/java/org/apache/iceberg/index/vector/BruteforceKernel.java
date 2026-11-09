@@ -48,7 +48,7 @@ import org.apache.iceberg.relocated.com.google.common.collect.Lists;
  * result object per entry and a sort over all of them. The payload keeps its entry-bearing form and
  * stays readable by the version that wrote it.
  */
-public final class BruteforceKernel implements VectorKernel {
+public final class BruteforceKernel implements VectorKernel, RetainedBytes {
 
   private static final long serialVersionUID = 1L;
 
@@ -219,13 +219,33 @@ public final class BruteforceKernel implements VectorKernel {
    * files they point at, and the small objects that read them. An entry is read where it lies, so
    * it costs the bytes the payload already holds rather than an object of its own.
    */
-  private static long preparedBytes(int payloadLength, List<String> dataFiles) {
-    return PreparedStructureSize.bytes(payloadLength)
-        + PreparedStructureSize.references(dataFiles.size())
-        + VectorMemoryEstimates.dictionaryBytes(dataFiles)
+  private static long preparedBytes(long payloadLength, int dataFileCount, long dictionaryBytes) {
+    return PreparedStructureSize.bytes(Math.toIntExact(payloadLength))
+        + PreparedStructureSize.references(dataFileCount)
+        + dictionaryBytes
         + PreparedStructureSize.object(LOADED_FIELDS)
         + PreparedStructureSize.object(SEARCHER_FIELDS)
         + PreparedStructureSize.object(SCORING_FIELDS);
+  }
+
+  private static long preparedBytes(int payloadLength, List<String> dataFiles) {
+    return preparedBytes(
+        payloadLength, dataFiles.size(), VectorMemoryEstimates.dictionaryBytes(dataFiles));
+  }
+
+  /**
+   * Prices a payload from the data file count and dictionary size a build recorded, which is
+   * everything this prepared form holds besides the snapshot itself.
+   */
+  @Override
+  public long retainedBytes(long payloadBytes, Map<String, Long> structure) {
+    int dataFileCount = VectorMemoryEstimates.intCount(structure, "data-file-count");
+    long dictionaryBytes = VectorMemoryEstimates.count(structure, "data-file-string-bytes");
+    if (dataFileCount < 0 || dictionaryBytes < 0) {
+      return 0L;
+    }
+
+    return preparedBytes(payloadBytes, dataFileCount, dictionaryBytes);
   }
 
   private static long preparedBytes(Loaded loaded) {

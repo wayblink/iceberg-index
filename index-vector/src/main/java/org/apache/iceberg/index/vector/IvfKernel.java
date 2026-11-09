@@ -52,7 +52,7 @@ import org.apache.iceberg.relocated.com.google.common.collect.Lists;
  * same file therefore reproduces the same partitions, which a test that compares recall can rely
  * on.
  */
-public final class IvfKernel implements VectorKernel {
+public final class IvfKernel implements VectorKernel, RetainedBytes {
 
   private static final long serialVersionUID = 1L;
 
@@ -319,7 +319,7 @@ public final class IvfKernel implements VectorKernel {
         PreparedStructureSize.object(LOADED_FIELDS)
             + PreparedStructureSize.object(SEARCHER_FIELDS)
             + PreparedStructureSize.object(SCORING_FIELDS)
-            + PreparedStructureSize.bytes((int) payloadBytes)
+            + PreparedStructureSize.bytes(Math.toIntExact(payloadBytes))
             + PreparedStructureSize.ints(listCount)
             + PreparedStructureSize.ints(listCount)
             + PreparedStructureSize.references(listCount)
@@ -335,6 +335,37 @@ public final class IvfKernel implements VectorKernel {
     }
 
     return bytes;
+  }
+
+  /**
+   * Prices a payload from the counts a build recorded: the payload itself, one offset and one count
+   * per list, one centroid per list, the data file dictionary, and a quantizer per list when the
+   * lists are stored as codes.
+   */
+  @Override
+  public long retainedBytes(long payloadBytes, Map<String, Long> structure) {
+    int listCount = VectorMemoryEstimates.intCount(structure, "list-count");
+    int dataFileCount = VectorMemoryEstimates.intCount(structure, "data-file-count");
+    int dimension = VectorMemoryEstimates.intCount(structure, "dimension");
+    long dictionaryBytes = VectorMemoryEstimates.count(structure, "data-file-string-bytes");
+    long quantizerBytes =
+        isQuantized() ? VectorMemoryEstimates.count(structure, "quantizer-bytes") : 0L;
+    if (listCount < 0
+        || dataFileCount < 0
+        || dimension < 0
+        || dictionaryBytes < 0
+        || quantizerBytes < 0) {
+      return 0L;
+    }
+
+    return preparedBytes(
+        payloadBytes,
+        listCount,
+        dataFileCount,
+        dictionaryBytes,
+        dimension,
+        isQuantized(),
+        quantizerBytes);
   }
 
   private static long preparedBytes(Loaded loaded) {

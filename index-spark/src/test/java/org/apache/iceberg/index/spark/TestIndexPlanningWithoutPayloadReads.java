@@ -100,7 +100,7 @@ class TestIndexPlanningWithoutPayloadReads {
   }
 
   @Test
-  void anIncompatibleRecordIsBoundedWithoutReadingAndCarriesTheCurrentReader() {
+  void anIncompatibleRecordIsRecomputedWithoutReadingAndCarriesTheCurrentReader() {
     TestIndexFixtures.CountingIO io = new TestIndexFixtures.CountingIO();
     TestIndexFixtures.BuiltIndex built =
         TestIndexFixtures.build(tempDir, io, "idx-incompatible", "data.parquet");
@@ -126,9 +126,12 @@ class TestIndexPlanningWithoutPayloadReads {
       assertThat(recorded).isNotNull();
       assertThat(recorded.fileBytes()).isNotNull();
       assertThat(planned.memory()).isNotNull();
-      // The record still states the container size, so the bound needs no file system call.
+      // The rewrite leaves the payload length and the structure in place, so this runtime
+      // recomputes the residency of the same payload instead of bounding the container size.
+      assertThat(planned.memory().preparedBytes()).isEqualTo(recorded.preparedBytes());
       assertThat(planned.memory().preparedBytes())
-          .isEqualTo(IndexCacheMemory.residentBytes(recorded.fileBytes(), 0L));
+          .as("a recomputed estimate is not the container bound")
+          .isNotEqualTo(IndexCacheMemory.residentBytes(recorded.fileBytes(), 0L));
       // The bound describes this runtime's resident state, so it carries the descriptor of the
       // reader that will load the file rather than the one that wrote the record.
       assertThat(planned.memory().modelVersion()).isEqualTo(descriptor.modelVersion());
@@ -224,6 +227,49 @@ class TestIndexPlanningWithoutPayloadReads {
           .as("the inexact fallback charges twice the file, which overstates it")
           .isNotEqualTo(IndexCacheMemory.residentBytes(fileBytes, 0L));
       // The figure is charged under the layout of the reader that will load the file.
+      assertThat(planned.memory().modelVersion()).isEqualTo(descriptor.modelVersion());
+      assertThat(planned.memory().readerId()).isEqualTo(descriptor.readerId());
+      assertThat(planned.memory().runtimeProfile()).isEqualTo(descriptor.runtimeProfile());
+      assertThat(planned.estimatedBytes())
+          .isEqualTo(IndexCacheMemory.residentBytes(planned.memory()));
+    }
+
+    assertThat(io.payloadStreams()).as("planning must not read an index payload").isZero();
+    assertThat(io.payloadLengths()).as("the record states the length already").isZero();
+  }
+
+  @Test
+  void aRecordOfAnotherModelIsRecomputedFromItsStructure() {
+    TestIndexFixtures.CountingIO io = new TestIndexFixtures.CountingIO();
+    TestIndexFixtures.BuiltIndex built =
+        TestIndexFixtures.build(tempDir, io, "idx-recompute", "data.parquet", "data-2.parquet");
+    // What a model 2 build wrote: the counts it derived the estimate from, and the estimate.
+    List<IndexFile> published = publishedFiles(built);
+    assertThat(published).allSatisfy(file -> assertThat(file.memory().structure()).isNotEmpty());
+
+    rewriteMemory(built, recorded -> recorded.toBuilder().modelVersion(1).build());
+    io.reset();
+
+    IndexFileMemory descriptor = IndexCacheMemory.currentDescriptor(adapter(built));
+    assertThat(descriptor).isNotNull();
+
+    IndexCacheProtocol.Target target = IndexCacheController.target(built.table(), built.metadata());
+
+    assertThat(target.files()).isNotEmpty();
+    for (IndexCacheProtocol.File planned : target.files()) {
+      IndexFileMemory recorded = fileAt(published, planned.location()).memory();
+      assertThat(recorded.modelVersion()).isEqualTo(2);
+      assertThat(planned.memory()).isNotNull();
+      assertThat(planned.memory().preparedBytes())
+          .as("the current formula over the recorded counts recomputes the recorded bytes")
+          .isEqualTo(recorded.preparedBytes());
+      assertThat(planned.memory().preparedBytes())
+          .as("a recomputed estimate is not the legacy bound on the container")
+          .isNotEqualTo(IndexCacheMemory.residentBytes(recorded.fileBytes(), 0L));
+      // The payload is charged as the record measured it; only the model that priced it changed.
+      assertThat(planned.memory().payloadBytes()).isEqualTo(recorded.payloadBytes());
+      assertThat(planned.memory().fileBytes()).isEqualTo(recorded.fileBytes());
+      assertThat(planned.memory().structure()).isEqualTo(recorded.structure());
       assertThat(planned.memory().modelVersion()).isEqualTo(descriptor.modelVersion());
       assertThat(planned.memory().readerId()).isEqualTo(descriptor.readerId());
       assertThat(planned.memory().runtimeProfile()).isEqualTo(descriptor.runtimeProfile());

@@ -24,6 +24,7 @@ import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.util.Comparator;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import org.apache.iceberg.Files;
@@ -49,10 +50,11 @@ import org.junit.jupiter.params.provider.ValueSource;
 /**
  * The per-file prepared estimate resolves through the unified memory resolver: a manifest record
  * that already matches the current model, reader and runtime is trusted without a read, a record
- * that only states another runtime of the same model and reader keeps its own measurement, and any
- * other record is bounded from the file's length by the legacy inexact rule. What no case may do is
- * read the payload, because a driver prices every file of an index before it plans anything and
- * reading them there is what once spent five minutes of the caller's wait.
+ * whose structure the adapter can price is recomputed with the current formula, a record that only
+ * states another runtime of the same model and reader keeps its own measurement, and any other
+ * record is bounded from the file's length by the legacy inexact rule. What no case may do is read
+ * the payload, because a driver prices every file of an index before it plans anything and reading
+ * them there is what once spent five minutes of the caller's wait.
  */
 class TestDistributedIndexSearchPreparedBytes {
 
@@ -147,6 +149,66 @@ class TestDistributedIndexSearchPreparedBytes {
     assertThat(io.inputFiles()).as("a measurement needs neither a length nor a payload").isZero();
     assertThat(io.bytesRead()).isZero();
     assertThat(adapter.prepareCount()).isZero();
+  }
+
+  @Test
+  void aRecomputedEstimateIsPreferredToTheMeasurementOfAnotherRuntime() throws IOException {
+    String location = writePayload("recomputed.puffin", "zstd");
+    IndexFile file =
+        file(
+            location,
+            memory(999, READER, "other-profile").toBuilder()
+                .structure(Map.of("entries", 10L))
+                .build());
+    RecomputingAdapter adapter = new RecomputingAdapter(123, READER, PROFILE, 2048L);
+    CountingFileIO io = new CountingFileIO();
+
+    assertThat(DistributedIndexSearch.preparedBytesOf(io, file, adapter))
+        .as("the current formula describes this runtime; the measurement describes another one")
+        .isEqualTo(2048)
+        .isNotEqualTo(999)
+        .isNotEqualTo(IndexCacheMemory.residentBytes(10L, 0L));
+    assertThat(io.inputFiles()).as("a recomputation needs neither a length nor a payload").isZero();
+    assertThat(io.bytesRead()).isZero();
+    assertThat(adapter.prepareCount()).isZero();
+  }
+
+  @Test
+  void aStructureTheAdapterCannotPriceFallsBackToTheLength() throws IOException {
+    String location = writePayload("unpriceable.puffin", "zstd");
+    // The record states a structure, but this adapter's pricing of it is null, which is what an
+    // adapter that predates the method reports.
+    IndexFile file =
+        file(
+            location,
+            memory(999, "test-trust/2", PROFILE).toBuilder()
+                .structure(Map.of("entries", 10L))
+                .build());
+    TrustAdapter adapter = new TrustAdapter(123, READER, PROFILE);
+    CountingFileIO io = new CountingFileIO();
+
+    assertThat(DistributedIndexSearch.preparedBytesOf(io, file, adapter))
+        .as("an unknown pricing degrades to the length rule rather than failing")
+        .isEqualTo(IndexCacheMemory.residentBytes(Files.localInput(location).getLength(), 0L))
+        .isNotEqualTo(999);
+    assertThat(io.bytesRead()).isZero();
+  }
+
+  @Test
+  void aStructureTheAdapterCannotPriceKeepsTheMeasurement() throws IOException {
+    String location = writePayload("unpriceable-same-reader.puffin", "zstd");
+    IndexFile file =
+        file(
+            location,
+            memory(999, READER, "other-profile").toBuilder()
+                .structure(Map.of("entries", 10L))
+                .build());
+    TrustAdapter adapter = new TrustAdapter(123, READER, PROFILE);
+    CountingFileIO io = new CountingFileIO();
+
+    assertThat(DistributedIndexSearch.preparedBytesOf(io, file, adapter)).isEqualTo(999);
+    assertThat(io.inputFiles()).isZero();
+    assertThat(io.bytesRead()).isZero();
   }
 
   @Test
@@ -372,7 +434,7 @@ class TestDistributedIndexSearchPreparedBytes {
     }
   }
 
-  private static final class TrustAdapter implements IndexAdapter {
+  private static class TrustAdapter implements IndexAdapter {
     private final long preparedBytes;
     private final String readerId;
     private final String runtimeProfile;
@@ -438,6 +500,22 @@ class TestDistributedIndexSearchPreparedBytes {
     @Override
     public Comparator<IndexSearchResult> resultComparator() {
       throw new UnsupportedOperationException();
+    }
+  }
+
+  /** An adapter that prices a record from its structural counts, as a vector kernel does. */
+  private static final class RecomputingAdapter extends TrustAdapter {
+    private final long recomputed;
+
+    private RecomputingAdapter(
+        long preparedBytes, String readerId, String runtimeProfile, long recomputed) {
+      super(preparedBytes, readerId, runtimeProfile);
+      this.recomputed = recomputed;
+    }
+
+    @Override
+    public Long retainedBytes(long payloadBytes, Map<String, Long> structure) {
+      return structure.containsKey("entries") ? recomputed : null;
     }
   }
 }
