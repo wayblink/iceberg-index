@@ -217,21 +217,31 @@ SELECT id, title, _distance FROM vector_search(
 2. 表只有 identity 分区；
 3. 形态是"单表 + 唯一一个升序距离排序 + 可折叠的正数 `LIMIT`"，中间只有投影、子查询别名、以及向量列上的 `IS NOT NULL`；
 4. 显式 `metric`（如果写了第三参数）与索引的 metric 一致，否则只 WARN 并退扫描；
-5. 索引要么不需要候选预算（`FLAT` 且无量化，或 `IVF` 且无量化——后者打分是精确的，见 4.4），要么显式配置了 `over-sample`——估计打分与图结构没有候选倍数时不做近似（4.4）。
+5. 索引存在、覆盖当前快照，就参与改写——**是否设置 `over-sample` 不影响走不走索引**，只影响候选宽度（4.4）。
 
 反过来，`DESC`、多个排序键、`OFFSET`、join、聚合、窗口、任何非 `IS NOT NULL` 的过滤（包括 `WHERE year = 2020`）、非 identity 分区、`LIMIT` 不是字面量——都会让规则退让，退回全表扫描。
 
 一个容易忽略的细节：改写后排序键会被绑定成**索引的 metric**。所以不带第三参数的 `ORDER BY vec_distance(col, q)` 是按索引的 metric 计算的，与"没有索引时全扫描默认 COSINE"可能不是同一个量。
 
-### 4.4 估计打分与图结构要显式调 over-sample
+### 4.4 候选宽度：默认值从哪里来，什么时候要自己调
 
-这里要分清两件事。**候选集是否完整**决定计划里标 `exact` 还是 `approximate`：`IVF` 只访问 `nprobe` 个分区，所以它的答案始终是表的一个样本，标 `approximate`。**是否需要候选预算**是另一个问题——向它多要一些候选，会不会换回另外一批 k 行？
+**索引总是被使用**（前提是它存在、覆盖当前快照、形态匹配）。`over-sample` 不是"允许近似"的开关，它是**候选宽度**：向索引多要一些候选，交给上面的精确重排去挑。因此它决定的是召回与延迟的折中，不是走不走索引。
 
-- `FLAT` 无量化：枚举全部条目，不需要预算。
-- `IVF` 无量化：向量本体被保留，打分就是全表扫描会给的那个分数，只是少看了几个分区。被访问分区内的 k 个最近，与你把它要回来 k 行还是 10k 行无关，所以**不需要预算**，直接走索引（计划仍标 `approximate`，因为分区没看全）。
-- `IVF` 带量化（`RABITQ`）与 `HNSW`：候选由估算距离或图遍历决定，只给 k 个候选时回来的就是估计器最喜欢的那 k 个，候选集里可能没有真正的最近邻。**没配置倍数时改写规则不改写**：查询退回扫描 + 排序，精确但慢，日志里有一条 WARNING 说明原因。`HNSW` 的广度是它自己的 `ef`，请求更多候选可能真的加宽搜索，所以同样需要倍数。
+计划里标 `exact` 还是 `approximate` 由另一件事决定——**候选集是否完整**：只有 `FLAT` 且无量化才枚举全部条目（`exact`）；`IVF` 只访问 `nprobe` 个分区，`HNSW` 只走图的一部分，两者都是表的一个样本（`approximate`）。近似与否是索引形态的属性，不是参数设置的属性。
 
-要让估计打分或图结构参与：
+不配置倍数时，宽度由索引形态决定，计划里会写明数值与来源（`overSample=10 [STRUCTURE_DEFAULT, documented-experience-values]`）：
+
+| 形态 | 默认倍数 | 为什么 |
+|---|---|---|
+| `FLAT` 无量化 | 1 | 枚举全部条目，宽度改变不了答案 |
+| `IVF` 无量化 | 1 | 打分是精确的（向量本体保留），被访问分区内的 k 个最近与宽度无关 |
+| `IVF·1bit` | 50 | 一位量化下估计最粗，候选要宽才包得住真实近邻 |
+| `IVF·2bit` | 25 | 介于两者之间 |
+| `IVF·3bit` | 10 | 三位量化下估计已较细 |
+| `IVF·4bit` 及以上 | 5 | 估计接近精确 |
+| `HNSW` | 3 | 图的广度由它自己的 `ef` 决定，倍数用来把候选再放宽一点 |
+
+这些数字是本项目在这些表上公布的**经验区间**（1bit 需要 50–100、3bit 约 10、图 1–3）的插值，**是默认值不是保证**；按表校准过的倍数还在做（见 #3004-B2）。要自己定宽度：
 
 ```sql
 SET `spark.iceberg.index.vector.over-sample`=10;
@@ -239,7 +249,7 @@ SET `spark.iceberg.index.vector.over-sample`=10;
 
 配置名里有点和短横，`SET` 必须用反引号包起来，否则解析器报语法错误。
 
-经验值（只对需要预算的形态成立）：`IVF·3bit` 约 10 倍、`IVF·1bit` 约 50–100 倍才能把真实 top-10 包进候选集；`HNSW` 一般 1–3 倍。放宽不是免费的，倍数直接乘在回表行数上。无量化 `IVF` 设不设这个倍数，答案都一样。
+放宽不是免费的，倍数直接乘在回表行数上。无量化 `IVF` 与 `FLAT` 设不设这个倍数，答案都一样（只是多读一些行回来重排）。
 
 这个参数只存在于 conf 里，没有对应的 `CALL` 参数；表函数也只能通过它影响。
 
@@ -439,7 +449,7 @@ CALL local.system.offload_index(table => 'db.docs', index => '<uuid>');
 
 | 键 | 默认 | 作用 |
 |---|---|---|
-| `spark.iceberg.index.vector.over-sample` | 不设 | 候选放宽倍数；估计打分与图结构不设则不改写（无量化 `IVF` 不需要） |
+| `spark.iceberg.index.vector.over-sample` | 按形态推导 | 候选放宽倍数；不设时由结构决定，计划里写明数值与来源 |
 | `spark.iceberg.index.vector.name` | 不设 | 同列多索引时选哪个 |
 | `spark.iceberg.index.cache.enabled` | `false` | 缓存开关；关掉时 `load_index` 报 `CACHE_DISABLED` |
 | `spark.iceberg.index.cache.bytes` | 自动 | 每 executor 预算 |
@@ -513,8 +523,8 @@ CALL local.system.offload_index(table => 'db.docs', index => '<uuid>');
 | `ABANDONED` | driver 在构建中退出 | 重新构建，再 `cleanup_index_files` |
 | `No vector index exists` | 列上没有向量索引 | `build_vector_index` |
 | `does not match index dimension` | 查询向量长度与索引维度不符 | 对齐长度 |
-| 查询没走索引（`EXPLAIN` 里没有 `VectorSearchSource`） | 形态/分区/metric 不满足、估计打分或图结构没设 `over-sample`，或没加载扩展 | 按 4.3 逐条排查；需要预算的结构按 4.4 设倍数 |
-| 召回明显偏低 | 带量化结构下 over-sample 太小，或 `nprobe` 太小 | 倍数设到 10（1bit 需要 50–100）；无量化 `IVF` 调大 `nprobe` |
+| 查询没走索引（`EXPLAIN` 里没有 `VectorSearchSource`） | 形态/分区/metric 不满足，或没加载扩展 | 按 4.3 逐条排查 |
+| 召回明显偏低 | `nprobe` 太小，或带量化时倍数太小 | 先调 `nprobe`（无量化 `IVF` 只有这一个旋钮）；带量化再调倍数，1bit 可到 50–100 |
 | 查询慢、`coverage` 低 | 缓存没开或预算不足 | 开 `cache.enabled` |
 | `SET` 报 `INVALID_SET_SYNTAX` | 键名有 `.` 和 `-` | 用反引号包键名 |
 | `text_score needs a text index … none was found`（但索引存在） | 索引落后，或 `match` 与别的谓词并列，或零命中 | 先 `refresh_text_index`；把 `match` 单独用（5.4） |
