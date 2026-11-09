@@ -140,6 +140,15 @@ class TestVectorSearchSharedRules {
       assertThat(planText).contains("result=approximate");
       assertThat(planText).contains("overSample=50 [STRUCTURE_DEFAULT");
 
+      // the procedure really answers, rather than resolving a width for a search it never runs
+      assertThat(
+              spark
+                  .sql(
+                      "CALL local.system.vector_search(table => 'db.shared_rabitq', "
+                          + "column => 'embedding', query => array(1.0d, 0.0d), k => 2)")
+                  .collectAsList())
+          .hasSize(2);
+
       // a caller who states a width still wins, on both entry points
       spark.conf().set(OVER_SAMPLE, "7");
       assertThat(plan(table, "TABLE_LIVE_TOPK").parameters().overSample()).isEqualTo(7L);

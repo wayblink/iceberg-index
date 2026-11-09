@@ -337,6 +337,9 @@ class TestRewriteVectorSearch {
           .as("the width and where it came from are part of the plan")
           .contains("overSample=10 [STRUCTURE_DEFAULT");
       assertThat(plan).contains("result=approximate");
+      // the budget the width produced: two hits at three bits, ten candidates each, before the
+      // entry bound shrinks what a file can actually offer
+      assertThat(plan).contains("requestedCandidates=20");
 
       // and the answer is the exact ordering over the rows the estimate offered, which is what the
       // re-scoring above the source produces

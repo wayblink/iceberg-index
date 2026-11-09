@@ -211,16 +211,21 @@ class TestVectorIndexGuide {
         "CALL local.system.build_vector_index("
             + "table => 'db.ivf_idx', column => 'embedding', dimension => 2, structure => 'IVF', "
             + "quantizer => 'RABITQ')");
+    // §4.4 · the manual's own statement: the multiplier sets how wide the net is, not whether the
+    // index is used. An unset multiplier is a width derived from the structure, and the plan says
+    // which width and where it came from.
     assertThat(planOf("db.ivf_idx"))
-        .as("an approximate kernel asked for k candidates cannot find the true top-k")
-        .doesNotContain("VectorSearchSource");
+        .as("an approximate index answers, and says so")
+        .contains("VectorSearchSource")
+        .contains("result=approximate")
+        .contains("[STRUCTURE_DEFAULT, documented-experience-values]");
 
-    // §4.1 · the manual's own statement: the multiplier is what lets an approximate index answer
     try {
       spark.sql("SET `spark.iceberg.index.vector.over-sample`=10");
       assertThat(planOf("db.ivf_idx"))
-          .as("an approximate index is used once the candidates are widened")
-          .contains("VectorSearchSource");
+          .as("a stated multiplier replaces the derived one")
+          .contains("VectorSearchSource")
+          .contains("overSample=10 [SESSION_CONF");
     } finally {
       spark.conf().unset("spark.iceberg.index.vector.over-sample");
     }
