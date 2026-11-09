@@ -104,7 +104,9 @@ public class TestLegacySearchEntries extends ExtensionsTestBase {
             "index_files",
             "entries",
             "definition",
-            "index_name");
+            "index_name",
+            // 3c764cc2d added the snapshot a listing row describes; this assertion was left behind
+            "index_snapshot_id");
 
     assertThat(
             callColumns(
