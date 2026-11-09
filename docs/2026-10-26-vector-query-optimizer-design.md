@@ -75,7 +75,7 @@ TVF不调用这个执行型bridge。`IndexTableFunctions`的两个向量builder�
 
 ## 4. 参数必须携带来源，而不是只有一个数值
 
-推荐内部不可变表示 `ParameterValue(value, origin)`；未设置时保留缺席状态，不提前塞默认值。来源至少区分 `CALL_ARGUMENT`、`USER_CONF`、`SESSION_CONF`、`SUBMIT_CONF`、`INDEX_DEFINITION`、`AUTO`、`COMPAT_DEFAULT`。不使用公开配置接口或 Java Optional。
+推荐内部不可变表示 `ParameterValue(value, origin)`；未设置时保留缺席状态，不提前塞默认值。来源至少区分 `CALL_ARGUMENT`、`USER_CONF`、`SESSION_CONF`、`SUBMIT_CONF`、`INDEX_DEFINITION`、`AUTO`、`STRUCTURE_DEFAULT`。不使用公开配置接口或 Java Optional。
 
 优先级：当前入口显式参数 > 当前 session 显式设置 > submit 配置 > 适用于该参数的索引定义显式值 > 自动决策/兼容默认值。下层显式值被上层显式值取代是用户配置优先级，不是优化覆盖；决策记录应保留被遮蔽来源。
 
@@ -124,7 +124,11 @@ CALL 保留索引最新快照搜索与当前表回表的合同，但把两个快
 
 ## 7. 未设置参数怎么决定：先守住证据边界
 
-首期可直接交付的策略：未设置 over-sample 时使用现有兼容基线1，来源标为 `COMPAT_DEFAULT(no-calibrated-policy)`。这不是声称1最优，也不是新的召回保证。框架、计划解释和预算推导先可用，自动调参不能靠随手写的10/50/100兑现。
+**2026-11-09 修订**：本节原写“未设置 over-sample 时使用兼容基线 1”，此后 2026-11-02 的重写规则把“未设置”变成了**不改写、退回扫描**（`6f1910eea`），与本节的口径不一致；两次都不成立的理由是同一个：把“用户没设一个调优旋钮”当成了“不许用索引”，而近似与否是索引形态的属性，不是参数设置的属性。
+
+现在的策略：**索引总是被使用**，未设置倍数时宽度由结构推导，来源标 `STRUCTURE_DEFAULT`，理由字段写明取自公布的经验区间（`documented-experience-values`）。推导表与依据见用户指南 §4.4 与 `VectorQueryParameters.defaultOverSample`：`FLAT` 与无量化 `IVF` 为 1（宽度改变不了答案），量化 `IVF` 按位数 50/25/10/5，`HNSW` 为 3。计划里同时给出宽度、来源与 `result=exact|approximate`，改写不再因为参数缺席而放弃。
+
+这不是声称这些数最优，也不是新的召回保证；它们是本项目公布区间（1bit 50–100、3bit≈10、图 1–3）的插值，按表校准仍待完成（产品仓 #3004-B2）。自动调参不能靠随手写的 10/50/100 兑现，这条判断不变。
 
 有校准数据后的策略应是独立 `ChooseUnsetParameters` 实现：对于同一索引/数据范围和查询分布，测不同倍数的召回与延迟，在不低于已批准质量基线的可行集合里选代价较小者。没有匹配证据则回到兼容基线，不跨数据集套单价。
 
@@ -206,7 +210,7 @@ requestedCandidates=1000, initialCandidates=1000
 contract=TABLE_LIVE_TOPK, driverMaterialization=true
 ```
 
-未设置则显示 `overSample=1 [COMPAT_DEFAULT, no-calibrated-policy]`。不在日志/explain 输出查询向量或完整业务行。
+未设置则显示推导出的宽度与其来源，例如 `overSample=50 [STRUCTURE_DEFAULT, documented-experience-values]`；显式设置显示 `overSample=10 [SESSION_CONF]`。不在日志/explain 输出查询向量或完整业务行。
 
 阶段A已落地为 `VectorSearchSource` 的计划文本：`contract`、`column`、`k`、`metric`、`overSample=<值> [<来源>]`（用户显式设置时带 `locked`）、`requestedCandidates`、`initialCandidates`、`index`、`tableSnapshot`、`indexSnapshot`、`uncoveredFiles`、`driverMaterialization=true`。
 

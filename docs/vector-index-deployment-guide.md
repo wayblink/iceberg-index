@@ -114,7 +114,7 @@ SET spark.iceberg.index.vector.over-sample = 100;
 
 `over-sample` 的含义是"向索引要 k×over 个候选，再取前 k"。对 `ORDER BY` 的自动改写，取前 k 之前会**精确重排**，所以放大倍数提高的是**召回**；对 `CALL vector_search` / 两个向量 TVF，结果合同是"索引自己的原始分数、按索引顺序取前 k、删掉的行以 `row = null` 保留"，**不精确重排、不扫未覆盖文件**，因此放大倍数只扩大候选范围、不会让结果变成"精确 Top-K"（近似 kernel 扩大范围后候选集本身可能变，但不保证与旧 `C=k` 逐条一致）。
 
-它是唯一在查询时能调的召回/延迟旋钮：一次设成 100 是安全的默认（实测 10M/100M 的 1bit 都要 100 倍候选才追平精确召回）。未设置时用兼容基线 1，并在计划里标成 `COMPAT_DEFAULT(no-calibrated-policy)`——那不是"已-calibrated 的最优值"。显式设置（包括显式写 1）一律保留；空串、非整数、0、负数会报错而不是被静默改成 1。
+它是唯一在查询时能调的召回/延迟旋钮：一次设成 100 是安全的（实测 10M/100M 的 1bit 都要 100 倍候选才追平精确召回）。未设置时宽度由索引形态推导（量化 IVF 按位数 50/25/10/5、图 3、无量化结构 1），计划里标成 `overSample=<值> [STRUCTURE_DEFAULT, documented-experience-values]`——那是公布经验区间的插值，不是"已-calibrated 的最优值"。索引不会因为没设置这个旋钮就不被使用。显式设置（包括显式写 1）一律保留；空串、非整数、0、负数会报错而不是被静默改成 1。
 
 **近似 kernel 要拿到与精确扫描一致的结果，必须放大 over-sample。** 集群验收实测：200k 行、16 维、IVF+RaBitQ 4bit、`nprobe=1024`、`nlist=256` 时，`over-sample` 为默认值 1 的 Top-10 与 L2 真值**不同**（召回不满）；把 `spark.iceberg.index.vector.over-sample` 设成 4000 后，Top-10 与 L2 真值逐行一致。也就是说"索引结果 = 精确结果"不是默认行为，而是候选预算足够的产物。
 

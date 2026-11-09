@@ -99,6 +99,57 @@ class TestVectorSearchSharedRules {
   }
 
   @Test
+  void aQuantizedIndexDecidesTheSameWidthForBothEntryPoints() throws Exception {
+    // The two entry points used to disagree: the procedure fell back to a compatibility constant of
+    // one while the rewrite refused the index altogether. They now share one decision, so a table
+    // whose index stores one bit per dimension must report the same width, from the same source,
+    // whether the caller wrote a procedure call or an ordered query - and neither may answer by
+    // scanning.
+    spark.sql("CREATE NAMESPACE IF NOT EXISTS local.db");
+    spark.sql("CREATE TABLE local.db.shared_rabitq " + COLUMNS);
+    spark.sql(
+        "INSERT INTO local.db.shared_rabitq VALUES (1, array(1.0d, 0.0d)), (2, array(0.0d, 1.0d))");
+    spark.sql(
+        "CALL local.system.build_vector_index(table => 'db.shared_rabitq', column => 'embedding', "
+            + "dimension => 2, metric => 'euclidean', structure => 'IVF', quantizer => 'RABITQ', "
+            + "options => map('nlist', '2', 'nprobe', '2'))");
+    Table table = Spark3Util.loadIcebergTable(spark, "local.db.shared_rabitq");
+
+    try {
+      spark.conf().unset(OVER_SAMPLE);
+      VectorSearchContext sql = plan(table, "TABLE_LIVE_TOPK");
+      VectorSearchContext call = plan(table, "INDEX_HITS");
+      assertThat(sql.parameters().overSample())
+          .as("one bit per dimension: the published range is fifty to a hundred")
+          .isEqualTo(50L);
+      assertThat(call.parameters().overSample()).isEqualTo(50L);
+      assertThat(sql.parameters().overSampleOrigin()).isEqualTo("STRUCTURE_DEFAULT");
+      assertThat(call.parameters().overSampleOrigin()).isEqualTo("STRUCTURE_DEFAULT");
+
+      // and the rewrite actually uses the index, rather than deciding the width for a plan it then
+      // abandons
+      String planText =
+          spark
+              .sql(
+                  "SELECT id FROM local.db.shared_rabitq "
+                      + "ORDER BY vec_distance(embedding, array(1.0d, 0.0d)) LIMIT 1")
+              .queryExecution()
+              .optimizedPlan()
+              .toString();
+      assertThat(planText).contains("VectorSearchSource");
+      assertThat(planText).contains("result=approximate");
+      assertThat(planText).contains("overSample=50 [STRUCTURE_DEFAULT");
+
+      // a caller who states a width still wins, on both entry points
+      spark.conf().set(OVER_SAMPLE, "7");
+      assertThat(plan(table, "TABLE_LIVE_TOPK").parameters().overSample()).isEqualTo(7L);
+      assertThat(plan(table, "INDEX_HITS").parameters().overSample()).isEqualTo(7L);
+    } finally {
+      spark.conf().unset(OVER_SAMPLE);
+    }
+  }
+
+  @Test
   void aValueThatCannotBeAMultiplierIsReportedByEveryEntryPoint() throws Exception {
     Table table = tableWithIndex("shared_invalid");
     try {
