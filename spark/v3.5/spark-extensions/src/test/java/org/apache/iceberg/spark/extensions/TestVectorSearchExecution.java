@@ -190,7 +190,8 @@ class TestVectorSearchExecution {
     assertThat(text).contains("contract=TABLE_LIVE_TOPK");
     assertThat(text).contains("driverMaterialization=true");
     // the number the query ran with, and where it came from, are part of the plan
-    assertThat(text).contains("overSample=1 [COMPAT_DEFAULT, no-calibrated-policy]");
+    // a flat index stores every vector, so the width cannot matter and the default is one
+    assertThat(text).contains("overSample=1 [STRUCTURE_DEFAULT, documented-experience-values]");
     assertThat(text).contains("metric=EUCLIDEAN");
     // the request and the budget it was shrunk to are both visible
     assertThat(text).contains("requestedCandidates=");

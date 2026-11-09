@@ -37,44 +37,13 @@ private[spark] object VectorSearchSource {
    * itself, so any subset of candidates it is asked for still contains the nearest rows in order.
    * Every other structure, a graph, a clustered list or a quantized code, orders candidates by an
    * estimate, so the rows it lists are a sample: a larger budget widens the sample, it does not make
-   * the set complete. Saying which of the two an index is keeps one answer for both the plan and the
-   * rule that decides whether to rewrite a query into a search at all.
+   * the set complete. This is what the plan labels an answer with, exact or approximate. It is not
+   * what decides whether a query is rewritten: an index is used either way, and the width it searches
+   * with is a parameter rather than a precondition.
    */
   def enumeratesEveryCandidate(definition: VectorIndexDefinition): Boolean =
     definition.structure() == VectorIndexDefinition.VectorStructure.FLAT &&
       definition.quantizer() == VectorIndexDefinition.VectorQuantizer.NONE
-
-  /**
-   * Whether asking for more than k candidates could change which k rows come back.
-   *
-   * <p>Two questions have been conflated, and they are not the same one. Whether the candidate set
-   * is the whole table ({@link #enumeratesEveryCandidate}) decides how an EXPLAIN labels the answer:
-   * an IVF index visits only the partitions nprobe names, so its answer is a sample of the table
-   * however exact each score is.
-   *
-   * <p>Whether a candidate budget is <em>needed</em> is a different question: would asking for more
-   * rows than k return a different set of k? Over unquantized vectors it would not. The kernel keeps
-   * the vectors and scores each one exactly, so the k nearest of the visited partitions are the k
-   * nearest of them whether it hands back k rows or ten thousand - the re-scoring above keeps the
-   * same rows, and a budget buys nothing. Over a quantized code the order is an estimate, so k rows
-   * is whatever the estimate preferred, and a wider budget is exactly what gives the re-scoring a
-   * real choice. A graph is its own case again: its breadth is ef, and asking for more can widen the
-   * search itself.
-   *
-   * <p>So the rule that decides whether to rewrite asks this, not whether the set is complete. A
-   * flat index over unquantized vectors answers both ways; an IVF index over unquantized vectors is
-   * approximate but needs no budget.
-   */
-  def budgetChangesTheAnswer(definition: VectorIndexDefinition): Boolean =
-    definition.structure() match {
-      case VectorIndexDefinition.VectorStructure.FLAT =>
-        // a flat index that stored a quantized code would score by an estimate; the build refuses
-        // that combination, and this keeps the rule honest if it ever stops doing so
-        !enumeratesEveryCandidate(definition)
-      case VectorIndexDefinition.VectorStructure.IVF =>
-        definition.quantizer() != VectorIndexDefinition.VectorQuantizer.NONE
-      case _ => true
-    }
 }
 
 /**

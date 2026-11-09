@@ -22,6 +22,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 import java.util.Map;
+import org.apache.iceberg.index.vector.VectorIndexDefinition;
 import org.junit.jupiter.api.Test;
 
 class TestVectorCandidateBudget {
@@ -30,7 +31,13 @@ class TestVectorCandidateBudget {
     ResolvedVectorParameters parameters =
         VectorQueryParameters.decide(
             VectorQueryParameters.capture(
-                Map.of("spark.iceberg.index.vector.over-sample", "100"), Map.of(), null));
+                Map.of("spark.iceberg.index.vector.over-sample", "100"), Map.of(), null),
+            VectorIndexDefinition.builder()
+                .fieldId(1)
+                .dimension(2)
+                .metric(VectorIndexDefinition.Metric.EUCLIDEAN)
+                .structure(VectorIndexDefinition.VectorStructure.FLAT)
+                .build());
     VectorCandidateBudget budget = VectorCandidateBudget.derive(10, parameters.overSample(), 20L);
     assertThat(budget.requested()).isEqualTo(1000L);
     assertThat(budget.initial()).isEqualTo(20);

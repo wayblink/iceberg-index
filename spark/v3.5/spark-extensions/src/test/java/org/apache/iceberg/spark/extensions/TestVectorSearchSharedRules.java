@@ -80,9 +80,11 @@ class TestVectorSearchSharedRules {
     try {
       VectorSearchContext sql = plan(table, "TABLE_LIVE_TOPK");
       VectorSearchContext call = plan(table, "INDEX_HITS");
+      // neither entry point scans because a multiple was left unset: both decide the same width
       assertThat(sql.parameters().overSample()).isEqualTo(1L);
       assertThat(call.parameters().overSample()).isEqualTo(1L);
-      assertThat(call.parameters().overSampleOrigin()).isEqualTo("COMPAT_DEFAULT");
+      assertThat(call.parameters().overSampleOrigin()).isEqualTo("STRUCTURE_DEFAULT");
+      assertThat(sql.parameters().overSampleOrigin()).isEqualTo("STRUCTURE_DEFAULT");
 
       spark.conf().set(OVER_SAMPLE, "7");
       VectorSearchContext sqlSet = plan(table, "TABLE_LIVE_TOPK");

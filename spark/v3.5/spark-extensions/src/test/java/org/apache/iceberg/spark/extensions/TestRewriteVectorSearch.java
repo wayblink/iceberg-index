@@ -313,11 +313,12 @@ class TestRewriteVectorSearch {
   }
 
   @Test
-  public void aQuantizedIndexIsNotUsedWithoutACandidateBudget() {
-    // A quantized code ranks candidates by an estimate, so asking it for k rows returns the k the
-    // estimate preferred rather than the k nearest; without a budget the scan answers instead, and
-    // the warning names the setting that would let the index answer.
-    String table = table("docs_rab_quiet");
+  public void aQuantizedIndexIsUsedWithTheWidthItsStructureCallsFor() {
+    // The index is used whether or not the caller configured a multiple: a query is not answered by
+    // a scan because a knob was left alone. What the multiple does is decide how many candidates the
+    // estimate hands to the exact re-scoring, and the default width comes from the structure - three
+    // bits per dimension needs about ten, not one.
+    String table = table("docs_rab_default");
     spark.sql(
         String.format(
             "CALL local.system.build_vector_index("
@@ -328,9 +329,18 @@ class TestRewriteVectorSearch {
 
     try {
       spark.conf().unset("spark.iceberg.index.vector.over-sample");
-      assertThat(planOf(table, nearestNeighbour(table, 2)))
-          .as("no budget, so the scan answers rather than the estimate")
-          .doesNotContain("VectorSearchSource");
+      String plan = planOf(table, nearestNeighbour(table, 2));
+      assertThat(plan)
+          .as("an unset multiple is a default width, not a reason to scan")
+          .contains("VectorSearchSource");
+      assertThat(plan)
+          .as("the width and where it came from are part of the plan")
+          .contains("overSample=10 [STRUCTURE_DEFAULT");
+      assertThat(plan).contains("result=approximate");
+
+      // and the answer is the exact ordering over the rows the estimate offered, which is what the
+      // re-scoring above the source produces
+      assertThat(search(table, 2)).hasSize(2);
     } finally {
       spark.conf().unset("spark.iceberg.index.vector.over-sample");
     }

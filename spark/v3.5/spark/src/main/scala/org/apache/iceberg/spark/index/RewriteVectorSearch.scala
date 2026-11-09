@@ -157,29 +157,6 @@ case class RewriteVectorSearch(spark: SparkSession) extends Rule[LogicalPlan] {
               None
             } else if (resolved == null) {
               None
-            } else if (context.rawParameters.overSample == null
-              && VectorSearchSource.budgetChangesTheAnswer(definition)) {
-              // the index orders candidates by an estimate, so answering a top-k question with k of
-              // them returns whatever the estimate preferred rather than the nearest rows: without
-              // a budget the caller chose, the scan answers instead of answering wrongly. An index
-              // that scores exactly does not need the budget - asking it for 10k rows would return
-              // the same 10k, so it is not asked to stand aside
-              logger.warn(
-                "Not using the vector index of column {} (field {}, {}/{}) for a top-{} query: " +
-                  "that kernel ranks candidates by an estimate, so asking it for {} of them would " +
-                  "leave true nearest rows out of the answer. {} is not set, so the query is " +
-                  "answered by a scan. To have this index answer instead, set it explicitly, for " +
-                  "example SET `{}`=10 (about 10 for IVF 3bit, 50 to 100 for 1bit).",
-                Array[Object](
-                  column,
-                  Integer.valueOf(definition.fieldId()),
-                  definition.structure().name(),
-                  definition.quantizer().name(),
-                  Integer.valueOf(k),
-                  Integer.valueOf(k),
-                  VectorQueryParameters.OverSampleConf,
-                  VectorQueryParameters.OverSampleConf): _*)
-              None
             } else {
               val source = VectorSearchSource(resolved)(scan.output)
               // the distance in the sort is bound to the metric of the index that answers it: the
@@ -216,7 +193,9 @@ case class RewriteVectorSearch(spark: SparkSession) extends Rule[LogicalPlan] {
 
   /** Applies the shared parameter decision and derives the candidate budget, or null if invalid. */
   private def bindDecisions(context: VectorSearchContext, k: Int): VectorSearchContext = {
-    val parameters = VectorQueryParameters.decide(context.rawParameters)
+    val parameters = VectorQueryParameters.decide(
+      context.rawParameters,
+      context.inputs.definition)
     val budget =
       VectorCandidateBudget.derive(k, parameters.overSample, context.inputs.entryUpperBound)
     context.copy(parameters = parameters, budget = budget)

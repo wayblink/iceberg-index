@@ -106,7 +106,9 @@ private[spark] object VectorSearchBridge {
               parameters = null,
               budget = VectorCandidateBudget(0L, 0, context.inputs.entryUpperBound)))
         }
-        val parameters = VectorQueryParameters.decide(context.rawParameters)
+        val parameters = VectorQueryParameters.decide(
+          context.rawParameters,
+          context.inputs.definition)
         BoundVectorSearch(
           context.copy(
             parameters = parameters,

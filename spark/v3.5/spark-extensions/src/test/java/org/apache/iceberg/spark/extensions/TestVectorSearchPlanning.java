@@ -256,27 +256,30 @@ class TestVectorSearchPlanning {
 
   /**
    * An approximate kernel ranks candidates by an estimate, so asking it for k rows asks for k
-   * estimates and not for the k nearest rows: with no over-sample configured the rewrite stands
-   * aside and the scan answers, instead of answering from an index that cannot answer.
+   * estimates and not for the k nearest rows. The index is used anyway: whether a query is answered
+   * approximately is a property of the index the caller built, not of whether they also set a
+   * multiple. What the multiple decides is how many candidates the estimate hands to the exact
+   * re-scoring, and when it is unset that width comes from the structure - a one-bit code needs a
+   * wide net, which the plan states along with where the number came from.
    */
   @Test
-  void anApproximateIndexIsLeftToTheScanWithoutAnExplicitOverSample() {
+  void anApproximateIndexIsUsedWithoutAnExplicitOverSample() {
     createApproximateTable("planning_approx_default");
 
     assertThat(plan(nearestOf("planning_approx_default")))
-        .as("one candidate per hit cannot contain the true top-k, so the index is not asked")
-        .doesNotContain("VectorSearchSource")
-        .doesNotContain("result=approximate")
-        .contains("RelationV2[");
+        .as("the index answers, and the plan says it did so approximately")
+        .contains("VectorSearchSource")
+        .contains("result=approximate")
+        .as("and the width it used is stated with its source")
+        .contains("overSample=50 [STRUCTURE_DEFAULT, documented-experience-values]");
 
     try {
-      // an explicitly configured multiplier is the caller accepting the approximation, and the
-      // rewrite resumes with the widening it asks for
+      // a caller who knows what they want still decides: the configured value replaces the default
       spark.conf().set(OVER_SAMPLE, "10");
       assertThat(plan(nearestOf("planning_approx_default")))
           .contains("VectorSearchSource")
           .contains("result=approximate")
-          .contains("overSample=10");
+          .contains("overSample=10 [SESSION_CONF");
     } finally {
       spark.conf().unset(OVER_SAMPLE);
     }
