@@ -26,6 +26,11 @@ import java.nio.ByteBuffer;
 import java.util.Arrays;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.Consumer;
 import org.apache.iceberg.index.IndexAdapter.PreparedSearch;
 import org.apache.iceberg.index.IndexBuildResult;
 import org.apache.iceberg.index.IndexEntry;
@@ -129,11 +134,15 @@ public final class IvfKernel implements VectorKernel, RetainedBytes {
     int count = materialized.size();
 
     List<String> dataFiles = VectorPayloads.dataFilesOf(materialized);
-    float[][] vectors = decodeAll(materialized);
+    // How many threads this build may use. One keeps every loop on the path it always took, so a
+    // build that does not ask for threads produces the bytes it always did.
+    int threads = Math.max(1, Math.min(parallelism, Math.max(1, count)));
+
+    float[][] vectors = decodeAll(materialized, threads);
 
     int listCount = options.nlistFor(count);
-    float[][] centroids = listCount == 0 ? new float[0][] : train(vectors, listCount);
-    int[][] assignments = assign(vectors, centroids);
+    float[][] centroids = listCount == 0 ? new float[0][] : train(vectors, listCount, threads);
+    int[][] assignments = assign(vectors, centroids, threads);
     long quantizerBytes = 0;
     ByteArrayOutputStream payload = new ByteArrayOutputStream();
     try (DataOutputStream out = new DataOutputStream(payload)) {
@@ -213,9 +222,22 @@ public final class IvfKernel implements VectorKernel, RetainedBytes {
   }
 
   /** The vectors of the entries, checked against what this index can store. */
-  private float[][] decodeAll(List<IndexEntry> entries) {
+  private float[][] decodeAll(List<IndexEntry> entries, int threads) {
     float[][] vectors = new float[entries.size()][];
-    for (int i = 0; i < entries.size(); i++) {
+    runInParallel(
+        threads,
+        entries.size(),
+        start -> {
+          for (int i = start[0]; i < start[1]; i++) {
+            decodeInto(entries, vectors, i);
+          }
+        });
+    return vectors;
+  }
+
+  /** Decodes one entry, and refuses a vector the metric cannot use. */
+  private void decodeInto(List<IndexEntry> entries, float[][] vectors, int i) {
+    {
       vectors[i] = VectorPayloads.decodeVector(entries.get(i).payload(), dimension, "Entry");
       if (scoring.metric() == VectorIndexDefinition.Metric.COSINE) {
         // a vector with no direction cannot be assigned to a partition: every centroid is equally
@@ -227,7 +249,6 @@ public final class IvfKernel implements VectorKernel, RetainedBytes {
             entries.get(i).rowPosition());
       }
     }
-    return vectors;
   }
 
   /**
@@ -822,7 +843,7 @@ public final class IvfKernel implements VectorKernel, RetainedBytes {
    * <p>The sample is every k-th vector, which spreads it over the file without a random draw, so
    * the same file trains the same centroids every time it is built.
    */
-  private float[][] train(float[][] vectors, int listCount) {
+  private float[][] train(float[][] vectors, int listCount, int threads) {
     int sampleCount = IvfOptions.samplesFor(vectors.length, listCount);
     int stride = Math.max(1, vectors.length / sampleCount);
     float[][] sample = new float[sampleCount][];
@@ -837,7 +858,7 @@ public final class IvfKernel implements VectorKernel, RetainedBytes {
     }
 
     for (int iteration = 0; iteration < MAX_ITERATIONS; iteration++) {
-      int[] assignment = nearestCentroid(sample, centroids);
+      int[] assignment = nearestCentroid(sample, centroids, threads);
       float[][] sums = new float[listCount][dimension];
       int[] sizes = new int[listCount];
       for (int i = 0; i < sample.length; i++) {
@@ -878,12 +899,12 @@ public final class IvfKernel implements VectorKernel, RetainedBytes {
    * <p>A dropped list is a centroid no vector is closest to; keeping it would only add a partition
    * that a search might visit and find empty.
    */
-  private int[][] assign(float[][] vectors, float[][] centroids) {
+  private int[][] assign(float[][] vectors, float[][] centroids, int threads) {
     if (centroids.length == 0) {
       return new int[0][];
     }
 
-    int[] assignment = nearestCentroid(vectors, centroids);
+    int[] assignment = nearestCentroid(vectors, centroids, threads);
     int[][] members = new int[centroids.length][];
     int[] sizes = new int[centroids.length];
     for (int list : assignment) {
@@ -904,21 +925,86 @@ public final class IvfKernel implements VectorKernel, RetainedBytes {
   }
 
   /** The index of the centroid each vector is closest to. */
-  private int[] nearestCentroid(float[][] vectors, float[][] centroids) {
+  /**
+   * Puts every vector under its nearest centroid.
+   *
+   * <p>Each row is decided on its own, so the rows are split into contiguous ranges and every range
+   * writes only its own slots: the assignment is the one a single thread would have produced, in
+   * the same order and to the same list.
+   */
+  private int[] nearestCentroid(float[][] vectors, float[][] centroids, int threads) {
     int[] assignment = new int[vectors.length];
-    for (int i = 0; i < vectors.length; i++) {
-      int best = 0;
-      double bestScore = scoring.score(vectors[i], centroids[0]);
-      for (int list = 1; list < centroids.length; list++) {
-        double score = scoring.score(vectors[i], centroids[list]);
-        if (scoring.compareScores(score, bestScore) < 0) {
-          best = list;
-          bestScore = score;
-        }
-      }
-      assignment[i] = best;
-    }
+    runInParallel(
+        threads,
+        vectors.length,
+        range -> {
+          for (int i = range[0]; i < range[1]; i++) {
+            assignment[i] = nearestCentroidOf(vectors[i], centroids);
+          }
+        });
     return assignment;
+  }
+
+  /** The nearest centroid of one vector, breaking ties towards the earlier list. */
+  private int nearestCentroidOf(float[] vector, float[][] centroids) {
+    int best = 0;
+    double bestScore = scoring.score(vector, centroids[0]);
+    for (int list = 1; list < centroids.length; list++) {
+      double score = scoring.score(vector, centroids[list]);
+      if (scoring.compareScores(score, bestScore) < 0) {
+        best = list;
+        bestScore = score;
+      }
+    }
+
+    return best;
+  }
+
+  /**
+   * Calls {@code body} once per range, on at most {@code threads} threads.
+   *
+   * <p>Ranges are contiguous and disjoint, so a body that writes only its own slots produces the
+   * same arrays as the serial loop it replaces. One thread, or nothing to split, keeps the calls on
+   * the calling thread rather than paying for a pool that would hand back the work immediately.
+   */
+  private static void runInParallel(int threads, int count, Consumer<int[]> body) {
+    if (threads <= 1 || count <= 1) {
+      body.accept(new int[] {0, count});
+      return;
+    }
+
+    int parts = Math.min(threads, count);
+    ExecutorService pool = Executors.newFixedThreadPool(parts);
+    AtomicReference<RuntimeException> failure = new AtomicReference<>();
+    CountDownLatch finished = new CountDownLatch(parts);
+    try {
+      for (int part = 0; part < parts; part++) {
+        int start = (int) ((long) part * count / parts);
+        int end = (int) ((long) (part + 1) * count / parts);
+        int[] range = new int[] {start, end};
+        pool.execute(
+            () -> {
+              try {
+                body.accept(range);
+              } catch (RuntimeException e) {
+                failure.compareAndSet(null, e);
+              } finally {
+                finished.countDown();
+              }
+            });
+      }
+
+      finished.await();
+    } catch (InterruptedException e) {
+      Thread.currentThread().interrupt();
+      throw new RuntimeException("Interrupted while building the IVF index", e);
+    } finally {
+      pool.shutdownNow();
+    }
+
+    if (failure.get() != null) {
+      throw failure.get();
+    }
   }
 
   private static double norm(float[] vector) {
