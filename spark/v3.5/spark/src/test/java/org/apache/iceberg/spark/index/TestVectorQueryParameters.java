@@ -59,6 +59,59 @@ class TestVectorQueryParameters {
   }
 
   @Test
+  void theFilterLinkDefaultsToTheRule() {
+    ResolvedVectorParameters chosen =
+        VectorQueryParameters.decide(VectorQueryParameters.capture(Map.of(), Map.of(), null), FLAT);
+
+    assertThat(chosen.filterMode())
+        .as("leaving the knob alone asks for the rule, not for a link")
+        .isEqualTo(VectorQueryParameters.FilterModeAuto());
+    assertThat(chosen.filterModeOrigin()).isEqualTo("DEFAULT");
+  }
+
+  @Test
+  void theFilterLinkHoldsTheValueTheQueryNamed() {
+    for (String mode :
+        new String[] {
+          VectorQueryParameters.FilterModeAuto(),
+          VectorQueryParameters.FilterModePre(),
+          VectorQueryParameters.FilterModePost()
+        }) {
+      ResolvedVectorParameters chosen =
+          VectorQueryParameters.decide(
+              VectorQueryParameters.capture(
+                  Map.of(VectorQueryParameters.FilterModeConf(), mode), Map.of(), null),
+              FLAT);
+
+      assertThat(chosen.filterMode()).isEqualTo(mode);
+      assertThat(chosen.filterModeOrigin()).isEqualTo("SESSION_CONF");
+    }
+  }
+
+  @Test
+  void theFilterLinkIsReadWithoutRegardToCase() {
+    ResolvedVectorParameters chosen =
+        VectorQueryParameters.decide(
+            VectorQueryParameters.capture(
+                Map.of(VectorQueryParameters.FilterModeConf(), " POST "), Map.of(), null),
+            FLAT);
+
+    assertThat(chosen.filterMode()).isEqualTo(VectorQueryParameters.FilterModePost());
+  }
+
+  @Test
+  void aFilterLinkThatDoesNotExistIsRefused() {
+    RawVectorParameters raw =
+        VectorQueryParameters.capture(
+            Map.of(VectorQueryParameters.FilterModeConf(), "sometimes"), Map.of(), null);
+
+    assertThatThrownBy(() -> VectorQueryParameters.decide(raw, FLAT))
+        .as("an unknown link is refused rather than answered some other way")
+        .isInstanceOf(IllegalArgumentException.class)
+        .hasMessageContaining(VectorQueryParameters.FilterModeConf());
+  }
+
+  @Test
   void explicitDefaultIsLocked() {
     RawVectorParameters raw =
         VectorQueryParameters.capture(Map.of(OVER_SAMPLE, "1"), Map.of(), null);
@@ -103,7 +156,8 @@ class TestVectorQueryParameters {
   void copiedSubmitOriginIsAmbiguous() {
     ResolvedVectorParameters chosen =
         VectorQueryParameters.decide(
-            VectorQueryParameters.capture(Map.of(OVER_SAMPLE, "1"), Map.of(OVER_SAMPLE, "1"), null), FLAT);
+            VectorQueryParameters.capture(Map.of(OVER_SAMPLE, "1"), Map.of(OVER_SAMPLE, "1"), null),
+            FLAT);
     assertThat(chosen.overSample()).isEqualTo(1L);
     assertThat(chosen.overSampleOrigin()).isEqualTo("USER_CONF(session-or-submit)");
     assertThat(chosen.overSampleLocked()).isTrue();
@@ -127,7 +181,9 @@ class TestVectorQueryParameters {
   void sessionIndexWinsSubmit() {
     VectorParameter selected =
         VectorQueryParameters.decide(
-            VectorQueryParameters.capture(Map.of(INDEX_NAME, "session-index"), Map.of(INDEX_NAME, "submit-index"), null), FLAT)
+                VectorQueryParameters.capture(
+                    Map.of(INDEX_NAME, "session-index"), Map.of(INDEX_NAME, "submit-index"), null),
+                FLAT)
             .indexName();
     assertThat(selected.value()).isEqualTo("session-index");
     assertThat(selected.origin()).isEqualTo("SESSION_CONF");
@@ -166,7 +222,8 @@ class TestVectorQueryParameters {
   void repeatDecisionDoesNotChangeLockedValues() {
     RawVectorParameters raw =
         VectorQueryParameters.capture(Map.of(OVER_SAMPLE, "100"), Map.of(), null);
-    assertThat(VectorQueryParameters.decide(raw, FLAT)).isEqualTo(VectorQueryParameters.decide(raw, FLAT));
+    assertThat(VectorQueryParameters.decide(raw, FLAT))
+        .isEqualTo(VectorQueryParameters.decide(raw, FLAT));
     assertThat(raw.overSample().value()).isEqualTo("100");
   }
 

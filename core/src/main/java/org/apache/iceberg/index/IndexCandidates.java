@@ -166,8 +166,14 @@ public final class IndexCandidates implements Serializable {
       }
 
       // a table twice the size of the set keeps probing short: the load factor stays at or below
-      // one half, so a miss rarely walks more than a couple of slots
-      int capacity = Integer.highestOneBit(Math.max(4, distinct * 2 - 1)) << 1;
+      // one half, so a miss rarely walks more than a couple of slots. The wanted size is computed
+      // as
+      // a long, because twice a large set does not fit in an int, and a table sized from an
+      // overflowed number would be too small to hold the set it was built for.
+      long wanted = Math.max(4L, (long) distinct * 2L - 1L);
+      Preconditions.checkArgument(
+          wanted <= (1L << 30), "Too many candidate positions to hold: %s", distinct);
+      int capacity = Integer.highestOneBit((int) wanted) << 1;
       long[] table = new long[capacity];
       Arrays.fill(table, FREE);
       int mask = capacity - 1;

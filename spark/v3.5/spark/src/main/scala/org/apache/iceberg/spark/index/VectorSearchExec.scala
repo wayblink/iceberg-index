@@ -137,32 +137,23 @@ private[spark] object VectorSearchExec {
       return null
     }
 
-    val candidates = IndexCandidates.of(positions.get)
-    val entries = context.inputs.entryUpperBound
-    val density =
-      if (entries == null || entries.longValue() <= 0L) {
-        1.0
-      } else {
-        candidates.count().toDouble / entries.longValue().toDouble
-      }
-
-    if (mode == VectorQueryParameters.FilterModeAuto && density > MaxCandidateDensity) {
+    val candidates =
+      VectorFilterLink.decide(
+        mode,
+        positions.get,
+        context.inputs.entryUpperBound,
+        MaxCandidateRows,
+        MaxCandidateDensity)
+    if (candidates == null) {
+      logger.info("vector search filter kept too many rows to narrow the search, mode={}", mode)
+    } else {
       logger.info(
-        "vector search filter kept {} of {} index entries, density={} over {} so the filter is "
-          + "applied after the search",
+        "vector search filter kept {} of {} index entries, mode={}",
         JLong.valueOf(candidates.count()),
-        entries,
-        java.lang.Double.valueOf(density),
-        java.lang.Double.valueOf(MaxCandidateDensity))
-      return null
+        context.inputs.entryUpperBound,
+        mode)
     }
 
-    logger.info(
-      "vector search filter kept {} of {} index entries, density={} mode={}",
-      JLong.valueOf(candidates.count()),
-      entries,
-      java.lang.Double.valueOf(density),
-      mode)
     candidates
   }
 
@@ -433,18 +424,6 @@ private[spark] object VectorSearchExec {
     }
   }
 
-  /**
-   * The schema the fetched rows are read with.
-   *
-   * <p>An evaluator binds a reference to the position of its field, so the filter is bound against
-   * the projection of the columns it names; the fetch-back reads the projected columns of the query,
-   * and the filter's own columns are read alongside them only when the filter is applied after the
-   * search, which is the case that builds this.
-   */
-  private def filterSchema(context: VectorSearchContext): org.apache.iceberg.Schema = {
-    context.inputs.table.schema().select(context.filterColumns.asJava)
-  }
-
   private def positionsOf(
       hits: Seq[IndexSearchResult]): java.util.Map[String, java.util.Set[JLong]] = {
     hits
@@ -487,6 +466,64 @@ private[spark] object VectorSearchExec {
       .filterNot(field => base.fieldNames.contains(field.name))
       .foreach(field => widenedSchema = widenedSchema.add(field))
     widenedSchema
+  }
+}
+
+/**
+ * Which side of the search a filter runs on, and whether it can run there at all.
+ *
+ * <p>The decision is separated from the operator because it is the part with an answer that is easy
+ * to get wrong and cheap to check: the rule picks the cheaper link, a caller that named one gets it,
+ * and a caller that named one it cannot have is told rather than answered another way.
+ */
+private[spark] object VectorFilterLink {
+
+  /**
+   * The candidates the pre-filter link would score, or null when the filter has to run after it.
+   *
+   * @param mode the link the query asked for
+   * @param positions the rows the filter kept, per data file, or null when there were too many to hold
+   * @param entries how many entries the index holds, or null when that is unknown
+   * @param cap the most rows a candidate set may hold
+   * @param densityLimit the densest a candidate set may be for the rule to choose the pre-filter link
+   */
+  def decide(
+      mode: String,
+      positions: java.util.Map[String, Array[Long]],
+      entries: JLong,
+      cap: Int,
+      densityLimit: Double): IndexCandidates = {
+    if (mode == VectorQueryParameters.FilterModePost) {
+      // the filter runs after the search, so there is nothing to narrow the search with
+      return null
+    }
+
+    if (positions == null) {
+      if (mode == VectorQueryParameters.FilterModePre) {
+        throw new IllegalArgumentException(
+          s"${VectorQueryParameters.FilterModeConf}=pre cannot read this query's filtered rows: "
+            + s"the filter keeps more than $cap rows, which cannot be held on the driver")
+      }
+
+      return null
+    }
+
+    val candidates = IndexCandidates.of(positions)
+    if (mode != VectorQueryParameters.FilterModeAuto) {
+      return candidates
+    }
+
+    val density =
+      if (entries == null || entries.longValue() <= 0L) {
+        1.0
+      } else {
+        candidates.count().toDouble / entries.longValue().toDouble
+      }
+    if (density > densityLimit) {
+      null
+    } else {
+      candidates
+    }
   }
 }
 

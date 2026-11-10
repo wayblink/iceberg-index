@@ -20,7 +20,6 @@ package org.apache.iceberg.index.spark;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
-import java.util.List;
 import org.apache.iceberg.Schema;
 import org.apache.iceberg.expressions.Expressions;
 import org.apache.iceberg.types.Types;
@@ -87,15 +86,5 @@ class TestIndexRowFilter {
 
   private static Row row(int id, long price, String category) {
     return RowFactory.create(Integer.valueOf(id), Long.valueOf(price), category);
-  }
-
-  /** The columns a filter names, which have to be read for it to be evaluated. */
-  @Test
-  void keepsTheFieldsItCanCompare() {
-    List<Types.NestedField> fields = SCHEMA.columns();
-
-    assertThat(IndexRowFilter.isComparable(fields.get(0))).isTrue();
-    assertThat(IndexRowFilter.isComparable(fields.get(1))).isTrue();
-    assertThat(IndexRowFilter.isComparable(fields.get(2))).isTrue();
   }
 }

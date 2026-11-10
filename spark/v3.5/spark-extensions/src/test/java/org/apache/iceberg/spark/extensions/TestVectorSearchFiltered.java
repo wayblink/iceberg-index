@@ -220,6 +220,26 @@ class TestVectorSearchFiltered {
     }
   }
 
+  @Test
+  void filtersOnADateColumn() throws Exception {
+    tableWithIndex("filtered_date");
+
+    List<Row> rows =
+        spark
+            .sql(
+                "SELECT id, day FROM local.db.filtered_date "
+                    + "WHERE day > DATE '2021-01-01' ORDER BY vec_distance(embedding, array("
+                    + query()
+                    + "), 'euclidean') LIMIT 5")
+            .collectAsList();
+
+    assertThat(rows)
+        .as("a filter on a date column is judged the way the column means, not the way it is boxed")
+        .hasSize(5);
+    assertThat(rows)
+        .allSatisfy(row -> assertThat(row.getDate(1).toString()).isEqualTo("2024-06-01"));
+  }
+
   private static String query() {
     StringBuilder builder = new StringBuilder();
     for (int d = 0; d < DIMENSION; d++) {
@@ -239,7 +259,7 @@ class TestVectorSearchFiltered {
     spark.sql(
         "CREATE TABLE local.db."
             + name
-            + " (id bigint, price bigint, embedding array<double> NOT NULL) USING iceberg");
+            + " (id bigint, price bigint, day date, embedding array<double> NOT NULL) USING iceberg");
 
     StringBuilder values = new StringBuilder();
     for (int row = 0; row < ROWS; row++) {
@@ -253,7 +273,9 @@ class TestVectorSearchFiltered {
           .append(", ")
           // every third row is cheap, so a price filter keeps a third of the table
           .append(row % 3 == 0 ? row : 100 + row)
-          .append(", array(");
+          .append(", DATE '")
+          .append(row % 3 == 0 ? "2020-01-01" : "2024-06-01")
+          .append("', array(");
       for (int d = 0; d < DIMENSION; d++) {
         if (d > 0) {
           values.append(", ");
