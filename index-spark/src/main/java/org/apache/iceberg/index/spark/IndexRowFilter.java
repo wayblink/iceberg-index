@@ -37,7 +37,9 @@ import org.apache.spark.sql.Row;
  * of the read. A colum whose value the evaluator cannot compare, which this project's types leave
  * to a separate decision, is rejected when the filter is built rather than halfway through a query.
  */
-final class IndexRowFilter {
+final class IndexRowFilter implements java.io.Serializable {
+  private static final long serialVersionUID = 1L;
+
   private final Evaluator evaluator;
 
   IndexRowFilter(Schema schema, Expression filter) {

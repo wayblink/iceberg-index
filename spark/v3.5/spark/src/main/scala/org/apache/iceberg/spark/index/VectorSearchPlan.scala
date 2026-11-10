@@ -191,8 +191,13 @@ private[spark] case class VectorSearchContext(
     inputs: ResolvedExecutionInputs,
     rawParameters: RawVectorParameters,
     parameters: ResolvedVectorParameters = null,
-    budget: VectorCandidateBudget = null) {
+    budget: VectorCandidateBudget = null,
+    filter: org.apache.iceberg.expressions.Expression = null,
+    filterColumns: Seq[String] = Seq.empty) {
   def queryVectors: JList[Array[Float]] = request.input.queries.map(_.toArray).asJava
+
+  /** Whether a scalar filter narrows the rows this search may answer with. */
+  def hasFilter: Boolean = filter != null
 }
 
 private[spark] sealed trait VectorBindingResult {

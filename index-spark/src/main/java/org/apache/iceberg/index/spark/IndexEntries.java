@@ -255,7 +255,10 @@ public final class IndexEntries {
     SerializableConfiguration conf =
         new SerializableConfiguration(spark.sessionState().newHadoopConf());
     StructType readSchema = sparkSchema(table, filterColumns);
-    IndexRowFilter rowFilter = new IndexRowFilter(schema == null ? tableSchema : schema, filter);
+    // the evaluator binds a reference to the position of its field, so it has to see the schema the
+    // rows are actually read with: the projection of the filter's columns, not the whole table
+    Schema readAs = sparkSchemaOf(table, filterColumns, schema);
+    IndexRowFilter rowFilter = new IndexRowFilter(readAs, filter);
 
     JavaRDD<Row> kept = null;
     for (FileScanTask task : taskList) {
@@ -286,6 +289,13 @@ public final class IndexEntries {
     byFile.forEach(
         (file, rows) -> positions.put(file, rows.stream().mapToLong(Long::longValue).toArray()));
     return positions;
+  }
+
+  /**
+   * The schema the filter's columns are read with, which is what a bound reference indexes into.
+   */
+  private static Schema sparkSchemaOf(Table table, List<String> columns, Schema schema) {
+    return (schema == null ? table.schema() : schema).select(columns.toArray(new String[0]));
   }
 
   /** The delete files of the tasks being read, read once. */

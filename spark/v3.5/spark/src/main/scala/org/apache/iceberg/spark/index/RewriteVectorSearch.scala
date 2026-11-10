@@ -19,6 +19,8 @@
 package org.apache.iceberg.spark.index
 
 import java.lang.{Long => JLong}
+import org.apache.iceberg.Table
+import org.apache.iceberg.expressions.Expressions
 import org.apache.iceberg.index.vector.VectorIndexDefinition.Metric
 import org.apache.spark.sql.SparkSession
 import org.apache.spark.sql.catalyst.InternalRow
@@ -38,6 +40,7 @@ import org.apache.spark.sql.catalyst.plans.logical.Sort
 import org.apache.spark.sql.catalyst.plans.logical.SubqueryAlias
 import org.apache.spark.sql.catalyst.rules.Rule
 import org.apache.spark.sql.execution.datasources.v2.DataSourceV2Relation
+import org.apache.spark.sql.execution.datasources.SparkExpressionConverter
 import org.slf4j.Logger
 import org.slf4j.LoggerFactory
 import scala.collection.mutable
@@ -99,11 +102,8 @@ case class RewriteVectorSearch(spark: SparkSession) extends Rule[LogicalPlan] {
       case attribute: AttributeReference => attribute.name
       case _ => return None
     }
-    // the filters are judged once the column is known: a guard is one on the vector column, and a
-    // filter on anything else is a reason to leave the query to Spark
-    if (!chain.guards(column)) {
-      return None
-    }
+    // a guard on the vector column is one both branches can apply themselves, so only the filters
+    // on other columns are carried into the search
     val k = IndexRewriteSupport.foldableInt(rows).getOrElse(return None)
     if (k <= 0) {
       return None
@@ -111,6 +111,10 @@ case class RewriteVectorSearch(spark: SparkSession) extends Rule[LogicalPlan] {
 
     val scan = chain.scan
     val sparkTable = IndexRewriteSupport.icebergTable(scan).getOrElse(return None)
+    val carried = filterOf(chain, column, sparkTable.table())
+    if (carried.columns == null) {
+      return None
+    }
     if (sparkTable.table().schema().findField(column) == null) {
       return None
     }
@@ -145,6 +149,12 @@ case class RewriteVectorSearch(spark: SparkSession) extends Rule[LogicalPlan] {
           case BoundVectorSearch(context) =>
             val bindMillis = (System.nanoTime() - bindStart) / 1000000L
             val resolved = bindDecisions(context, k)
+            val filtered =
+              if (resolved == null || carried.expression == null) {
+                resolved
+              } else {
+                resolved.copy(filter = carried.expression, filterColumns = carried.columns)
+              }
             val definition = context.inputs.definition
             val indexMetric = definition.metric()
             if (resolved != null && distance.explicitMetric && indexMetric != distance.metric) {
@@ -158,11 +168,11 @@ case class RewriteVectorSearch(spark: SparkSession) extends Rule[LogicalPlan] {
             } else if (resolved == null) {
               None
             } else {
-              val source = VectorSearchSource(resolved)(scan.output)
+              val source = VectorSearchSource(filtered)(scan.output)
               // the distance in the sort is bound to the metric of the index that answers it: the
               // re-scoring has to measure what the query asked for, and the function alone only
               // knows the default metric
-              val metric = resolved.inputs.definition.metric()
+              val metric = filtered.inputs.definition.metric()
               val lowered = bindMetric(limit, distance, metric).transformDown {
                 case relation: DataSourceV2Relation if relation eq scan => source
                 // the ordering holds a copy of the distance made during analysis, so it is matched by
@@ -172,12 +182,15 @@ case class RewriteVectorSearch(spark: SparkSession) extends Rule[LogicalPlan] {
                     node.order.map(order => order.copy(child = distance.copy(metric = metric))))
               }
               logger.info(
-                "vector search plan: bind={}ms overSample={}[{}] uncoveredFiles={}",
+                "vector search plan: bind={}ms overSample={}[{}] uncoveredFiles={} filter={} "
+                  + "filterColumns={}",
                 Array[Object](
                   JLong.valueOf(bindMillis),
-                  JLong.valueOf(resolved.parameters.overSample),
-                  resolved.parameters.overSampleOrigin,
-                  Integer.valueOf(resolved.inputs.uncoveredDataFiles.size)): _*)
+                  JLong.valueOf(filtered.parameters.overSample),
+                  filtered.parameters.overSampleOrigin,
+                  Integer.valueOf(filtered.inputs.uncoveredDataFiles.size),
+                  Option(filtered.filter).map(_.toString).getOrElse("none"),
+                  filtered.filterColumns.mkString(",")): _*)
               logger.info("rewrote a vector query into {}", source.simpleString(PlanPreviewLength))
               Some(lowered)
             }
@@ -193,9 +206,7 @@ case class RewriteVectorSearch(spark: SparkSession) extends Rule[LogicalPlan] {
 
   /** Applies the shared parameter decision and derives the candidate budget, or null if invalid. */
   private def bindDecisions(context: VectorSearchContext, k: Int): VectorSearchContext = {
-    val parameters = VectorQueryParameters.decide(
-      context.rawParameters,
-      context.inputs.definition)
+    val parameters = VectorQueryParameters.decide(context.rawParameters, context.inputs.definition)
     val budget =
       VectorCandidateBudget.derive(k, parameters.overSample, context.inputs.entryUpperBound)
     context.copy(parameters = parameters, budget = budget)
@@ -332,6 +343,45 @@ case class RewriteVectorSearch(spark: SparkSession) extends Rule[LogicalPlan] {
     }
     Some(EligibleChain(scans.get, computed.toMap, filters.toList))
   }
+
+  /**
+   * The filter a query carries on columns other than the vector one, as one expression, or null.
+   *
+   * <p>A filter the scan context cannot evaluate, or one naming a column the table does not have,
+   * leaves the query to Spark: the index would have to drop rows it cannot judge, and dropping a row
+   * it cannot judge is the same as answering a different question.
+   */
+  private def filterOf(chain: EligibleChain, column: String, table: Table): VectorFilter = {
+    val conditions =
+      chain.filters.map(_.condition).filterNot(condition => isVectorGuard(condition, column))
+    if (conditions.isEmpty) {
+      return VectorFilter(null, Seq.empty)
+    }
+
+    val converted = conditions.map { condition =>
+      try {
+        SparkExpressionConverter.convertToIcebergExpression(condition)
+      } catch {
+        case _: IllegalArgumentException => return VectorFilter(null, null)
+      }
+    }
+
+    val columns = chain.filters
+      .flatMap(_.condition.references.toSeq)
+      .map(_.name)
+      .distinct
+      .filterNot(_ == column)
+    if (columns.exists(name => table.schema().findField(name) == null)) {
+      return VectorFilter(null, null)
+    }
+
+    VectorFilter(converted.reduceLeft(Expressions.and), columns)
+  }
+
+  /** The filter a rewritten query applies itself, and the columns it names. */
+  private case class VectorFilter(
+      expression: org.apache.iceberg.expressions.Expression,
+      columns: Seq[String])
 
   /** Whether a filter is a non-null guard on the vector column, which both branches can apply. */
   private def isVectorGuard(condition: Expression, column: String): Boolean = {

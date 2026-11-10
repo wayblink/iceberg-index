@@ -23,6 +23,7 @@ import org.apache.iceberg.index.IndexQuery
 import org.apache.iceberg.index.IndexQuery.Consistency
 import org.apache.iceberg.index.IndexSearchResult
 import org.apache.iceberg.index.spark.DistributedIndexSearch
+import org.apache.iceberg.index.IndexCandidates
 import org.apache.iceberg.index.spark.IndexEntries
 import org.apache.iceberg.index.vector.VectorIndexAdapter
 import org.apache.spark.rdd.RDD
@@ -59,18 +60,102 @@ private[spark] object VectorSearchExec {
   /** The rounds a delete-aware search may take before it returns what it has. */
   private val MaxRounds = 10
 
+  /**
+   * The most rows a candidate set may hold.
+   *
+   * <p>The set is built on the driver and broadcast, so its size is a driver memory decision rather
+   * than a table property: a hundred million rows filtered down to a quarter of themselves is two
+   * hundred million positions, which is over a gigabyte. Past this the search is not narrowed and the
+   * scan branch answers the query, which is the answer it would have given without an index.
+   */
+  private val MaxCandidateRows = 2000000
+
+  /**
+   * The densest a candidate set may be and still be worth using.
+   *
+   * <p>Reading the filter's columns to build the set is a second pass over them. When the filter
+   * keeps more than a quarter of the rows, the search would score most of them anyway and the pass
+   * buys nothing, so the query is left to the scan branch instead.
+   */
+  private val MaxCandidateDensity = 0.25
+
+  /**
+   * The rows this query may answer with, or null when the index cannot be narrowed to them.
+   *
+   * <p>A query without a filter is not narrowed: every row is a candidate, and the search already
+   * answers that question. A filter that keeps too many rows, or one whose columns cannot be read
+   * here, also produces null, and the caller answers the query from a scan.
+   */
+  private def candidatesFor(spark: SparkSession, context: VectorSearchContext): IndexCandidates = {
+    if (!context.hasFilter) {
+      return null
+    }
+
+    val positions =
+      try {
+        IndexEntries.matchingPositions(
+          spark,
+          context.inputs.table,
+          context.inputs.scanTasks,
+          context.inputs.table.schema(),
+          context.filter,
+          context.filterColumns.toList.asJava,
+          MaxCandidateRows)
+      } catch {
+        case error: RuntimeException =>
+          logger.warn("Could not read the filtered rows, answering from a scan", error)
+          null
+      }
+
+    if (positions == null) {
+      logger.info(
+        "vector search filter kept more than {} rows, answering from a scan",
+        Integer.valueOf(MaxCandidateRows))
+      return null
+    }
+
+    val candidates = IndexCandidates.of(positions)
+    val entries = context.inputs.entryUpperBound
+    val density =
+      if (entries == null || entries.longValue() <= 0L) {
+        1.0
+      } else {
+        candidates.count().toDouble / entries.longValue().toDouble
+      }
+    logger.info(
+      "vector search filter kept {} of {} index entries, density={} limit={}",
+      JLong.valueOf(candidates.count()),
+      entries,
+      java.lang.Double.valueOf(density),
+      java.lang.Double.valueOf(MaxCandidateDensity))
+    if (density > MaxCandidateDensity) {
+      return null
+    }
+
+    candidates
+  }
+
   def rows(
       spark: SparkSession,
       source: VectorSearchSource): (RDD[InternalRow], VectorSearchStats) = {
     val context = source.context
     val names = source.output.map(_.name)
     val readSchema = schemaOf(source.output)
+    val candidates = candidatesFor(spark, context)
     val candidateStart = System.nanoTime()
-    val found = candidateRows(spark, context, names, readSchema)
+    val found = candidateRows(spark, context, names, readSchema, candidates)
     val candidateNanos = System.nanoTime() - candidateStart
     val indexBranch = rowsToRdd(spark, found.rows, readSchema)
     val residualStart = System.nanoTime()
-    val residual = residualRows(spark, context, names, readSchema)
+    // a filtered query whose candidates could not be narrowed is answered by the scan branch: the
+    // index has nothing to add once every row of the table may be in the answer
+    val residual =
+      residualRows(
+        spark,
+        context,
+        names,
+        readSchema,
+        wholeTable = context.hasFilter && candidates == null)
     val residualNanos = System.nanoTime() - residualStart
     val residualFiles = if (residual == null) 0 else context.inputs.uncoveredDataFiles.size
     // the parameters are decided before a source is ever built, but the candidate loop treats them
@@ -131,12 +216,18 @@ private[spark] object VectorSearchExec {
       spark: SparkSession,
       context: VectorSearchContext,
       names: Seq[String],
-      readSchema: StructType): Candidates = {
+      readSchema: StructType,
+      candidates: IndexCandidates): Candidates = {
     val inputs = context.inputs
     val k = context.request.input.topK
     val queries = context.request.input.queries
     if (k <= 0 || queries.isEmpty || context.parameters == null) {
       return Candidates(Nil, 0L, 0L, 0, 0, 0, 0, "empty_request")
+    }
+    if (context.hasFilter && candidates == null) {
+      // the filter could not narrow the search, so what the index would return is the unfiltered
+      // answer and the scan branch answers the query instead
+      return Candidates(Nil, 0L, 0L, 0, 0, 0, 0, "filter_not_narrowed")
     }
     val opening = if (context.budget == null) {
       VectorCandidateBudget.derive(k, context.parameters.overSample, inputs.entryUpperBound)
@@ -166,7 +257,8 @@ private[spark] object VectorSearchExec {
           inputs.table,
           IndexQuery
             .of(inputs.indexSnapshot.sourceTableSnapshotId(), payload, budget.initial)
-            .withConsistency(Consistency.AT_OR_BEFORE))
+            .withConsistency(Consistency.AT_OR_BEFORE),
+          candidates)
         // hits of data files the frozen snapshot no longer has cannot be resolved: a compaction or
         // rewrite after the build leaves entries pointing at files the snapshot replaced. They are
         // dropped instead of failing the query, and counted once so the loss is visible
@@ -244,8 +336,10 @@ private[spark] object VectorSearchExec {
       spark: SparkSession,
       context: VectorSearchContext,
       names: Seq[String],
-      readSchema: StructType): RDD[InternalRow] = {
-    val uncovered = context.inputs.uncoveredDataFiles
+      readSchema: StructType,
+      wholeTable: Boolean): RDD[InternalRow] = {
+    val uncovered =
+      if (wholeTable) context.inputs.dataFiles else context.inputs.uncoveredDataFiles
     if (uncovered.isEmpty || context.request.input.contract == VectorResultContract.IndexHits) {
       return null
     }
