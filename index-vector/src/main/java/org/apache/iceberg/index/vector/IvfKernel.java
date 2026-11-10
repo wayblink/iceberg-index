@@ -33,6 +33,7 @@ import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Consumer;
 import org.apache.iceberg.index.IndexAdapter.PreparedSearch;
 import org.apache.iceberg.index.IndexBuildResult;
+import org.apache.iceberg.index.IndexCandidates;
 import org.apache.iceberg.index.IndexEntry;
 import org.apache.iceberg.index.IndexSearchResult;
 import org.apache.iceberg.relocated.com.google.common.base.Preconditions;
@@ -718,26 +719,122 @@ public final class IvfKernel implements VectorKernel, RetainedBytes {
       VectorTopK top = new VectorTopK(topK, candidates, scoring, index -> loaded.dataFiles[index]);
       VectorPayloadReader reader = new VectorPayloadReader(loaded.payload);
       if (loaded.listQuantizers == null) {
-        scorePlainLists(queryVector, lists, reader, top);
+        scorePlainLists(queryVector, lists, reader, top, null, null);
       } else {
-        scoreQuantizedLists(queryVector, lists, reader, top);
+        scoreQuantizedLists(queryVector, lists, reader, top, null, null);
       }
 
       return top.results();
     }
 
+    @Override
+    public boolean joinsCandidateSet() {
+      return true;
+    }
+
+    @Override
+    public List<IndexSearchResult> search(ByteBuffer query, int topK, IndexCandidates candidates) {
+      Preconditions.checkArgument(topK >= 0, "Top-k must be non-negative: %s", topK);
+      Preconditions.checkArgument(candidates != null, "Candidate set is null");
+      if (topK == 0
+          || loaded.entryCount == 0
+          || loaded.centroids.length == 0
+          || candidates.isEmpty()) {
+        return ImmutableList.of();
+      }
+
+      float[] queryVector =
+          VectorPayloads.decodeVector(VectorPayloads.toBytes(query), dimension, "Query");
+      IndexCandidates.LongSet[] admitted = admittedRows(candidates);
+      if (admitted == null) {
+        return ImmutableList.of();
+      }
+
+      VectorTopK top =
+          new VectorTopK(topK, candidates.count(), scoring, index -> loaded.dataFiles[index]);
+      VectorPayloadReader reader = new VectorPayloadReader(loaded.payload);
+      // a filter spreads the rows worth scoring over the whole index in proportion to itself, not
+      // in proportion to the query, so the lists nearest the query can hold fewer of them than the
+      // window asks for. The search then widens to the next lists instead of returning short, and
+      // stops widening once it has visited every list there is.
+      boolean[] scored = new boolean[loaded.centroids.length];
+      int probed = Math.max(1, Math.min(nprobe, loaded.centroids.length));
+      while (true) {
+        int[] lists = nearestCentroids(queryVector, loaded.centroids, probed, scoring);
+        if (loaded.listQuantizers == null) {
+          scorePlainLists(queryVector, lists, reader, top, admitted, scored);
+        } else {
+          scoreQuantizedLists(queryVector, lists, reader, top, admitted, scored);
+        }
+
+        if (top.size() >= topK || probed == loaded.centroids.length) {
+          return top.results();
+        }
+
+        probed = (int) Math.min(loaded.centroids.length, (long) probed * 2);
+      }
+    }
+
+    /**
+     * Turns the candidate set into one lookup per data file index, so that scoring a record costs
+     * an array read rather than a hash of the file its name identifies.
+     *
+     * @return the lookups, or null when the set names no file this searcher holds
+     */
+    private IndexCandidates.LongSet[] admittedRows(IndexCandidates candidates) {
+      IndexCandidates.LongSet[] admitted = new IndexCandidates.LongSet[loaded.dataFiles.length];
+      boolean any = false;
+      for (int index = 0; index < admitted.length; index++) {
+        admitted[index] = candidates.forFile(loaded.dataFiles[index]);
+        any |= admitted[index] != null;
+      }
+
+      return any ? admitted : null;
+    }
+
+    /** Whether a record may be scored, which is always true when no filter was given. */
+    private static boolean admits(
+        IndexCandidates.LongSet[] admitted, int dataFileIndex, long rowPosition) {
+      if (admitted == null) {
+        return true;
+      }
+
+      IndexCandidates.LongSet set = admitted[dataFileIndex];
+      return set != null && set.contains(rowPosition);
+    }
+
     /**
      * Scores the records of unquantized lists, reading each vector into one search-private array.
+     *
+     * <p>A record a candidate set turns down is skipped before its vector is read: reading it is
+     * the cost the filter is there to avoid.
      */
     private void scorePlainLists(
-        float[] queryVector, int[] lists, VectorPayloadReader reader, VectorTopK top) {
+        float[] queryVector,
+        int[] lists,
+        VectorPayloadReader reader,
+        VectorTopK top,
+        IndexCandidates.LongSet[] admitted,
+        boolean[] scored) {
       float[] vector = new float[dimension];
       for (int list : lists) {
+        if (scored != null) {
+          if (scored[list]) {
+            continue;
+          }
+
+          scored[list] = true;
+        }
+
         int count = loaded.listCounts[list];
         long offset = loaded.listStarts[list];
         for (int record = 0; record < count; record++, offset += stride) {
           int dataFileIndex = reader.intAt(offset);
           long rowPosition = reader.longAt(offset + Integer.BYTES);
+          if (!admits(admitted, dataFileIndex, rowPosition)) {
+            continue;
+          }
+
           long vectorBase = offset + Integer.BYTES + Long.BYTES;
           for (int d = 0; d < dimension; d++) {
             vector[d] = reader.floatAt(vectorBase + (long) Float.BYTES * d);
@@ -756,9 +853,22 @@ public final class IvfKernel implements VectorKernel, RetainedBytes {
      * at the same precision as when the code was a decoded array.
      */
     private void scoreQuantizedLists(
-        float[] queryVector, int[] lists, VectorPayloadReader reader, VectorTopK top) {
+        float[] queryVector,
+        int[] lists,
+        VectorPayloadReader reader,
+        VectorTopK top,
+        IndexCandidates.LongSet[] admitted,
+        boolean[] scored) {
       float[] factors = new float[RaBitQQuantizer.FACTORS];
       for (int list : lists) {
+        if (scored != null) {
+          if (scored[list]) {
+            continue;
+          }
+
+          scored[list] = true;
+        }
+
         RaBitQQuantizer listQuantizer = loaded.listQuantizers[list];
         float[] center = loaded.listCenters[list];
         float[] rotatedQuery = listQuantizer.rotateQuery(queryVector);
@@ -780,6 +890,10 @@ public final class IvfKernel implements VectorKernel, RetainedBytes {
         for (int record = 0; record < count; record++, offset += stride) {
           int dataFileIndex = reader.intAt(offset);
           long rowPosition = reader.longAt(offset + Integer.BYTES);
+          if (!admits(admitted, dataFileIndex, rowPosition)) {
+            continue;
+          }
+
           long codeBase = offset + Integer.BYTES + Long.BYTES;
           long factorsBase = codeBase + codeBytes;
           for (int f = 0; f < factors.length; f++) {

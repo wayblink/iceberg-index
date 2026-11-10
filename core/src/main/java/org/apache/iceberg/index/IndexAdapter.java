@@ -25,6 +25,7 @@ import java.util.Map;
 import java.util.Set;
 import javax.annotation.Nullable;
 import org.apache.iceberg.relocated.com.google.common.base.Preconditions;
+import org.apache.iceberg.relocated.com.google.common.collect.ImmutableList;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableSet;
 import org.apache.iceberg.relocated.com.google.common.collect.Lists;
 
@@ -144,6 +145,39 @@ public interface IndexAdapter {
   /** A loaded index payload that can be searched more than once. */
   interface PreparedSearch {
     List<IndexSearchResult> search(ByteBuffer query, int topK);
+
+    /**
+     * Searches the rows the candidate set admits, and only those.
+     *
+     * <p>A searcher that reports {@link #joinsCandidateSet()} fills the window from the candidate
+     * rows itself, so it returns {@code topK} rows whenever the candidates hold that many. Any
+     * other searcher answers the unfiltered question and then keeps what the set admits, which can
+     * be fewer rows than were asked for and is not the same question: a caller that needs a full
+     * window over a filtered population has to fall back to filtering after the search instead.
+     *
+     * @param query the encoded query
+     * @param topK the number of rows asked for
+     * @param candidates the rows a scalar filter admitted
+     */
+    default List<IndexSearchResult> search(ByteBuffer query, int topK, IndexCandidates candidates) {
+      Preconditions.checkArgument(candidates != null, "Candidate set is null");
+      if (candidates.isEmpty()) {
+        return ImmutableList.of();
+      }
+
+      return candidates.retain(search(query, topK));
+    }
+
+    /**
+     * Whether this searcher skips the rows a candidate set excludes while it searches, instead of
+     * searching first and dropping hits afterwards.
+     *
+     * <p>False means {@link #search(ByteBuffer, int, IndexCandidates)} cannot be relied on for a
+     * full window: it decides which rows to score without knowing the filter.
+     */
+    default boolean joinsCandidateSet() {
+      return false;
+    }
 
     /**
      * How much memory this searcher holds, for a caller that keeps it around between queries.
