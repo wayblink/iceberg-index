@@ -59,7 +59,10 @@ private[spark] object BindVectorSearch {
         s"Cannot read vector table snapshot ${input.tableSnapshotId}")
       return NoApplicableVectorIndex
     }
-    val keys = Set(VectorQueryParameters.OverSampleConf, VectorQueryParameters.IndexNameConf)
+    val keys = Set(
+      VectorQueryParameters.OverSampleConf,
+      VectorQueryParameters.IndexNameConf,
+      VectorQueryParameters.FilterModeConf)
     val session = spark.conf.getAll.filter { case (key, _) => keys.contains(key) }.asJava
     val submit = spark.sparkContext.getConf.getAll.toMap.filter { case (key, _) =>
       keys.contains(key)

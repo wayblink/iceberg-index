@@ -24,6 +24,7 @@ import org.apache.iceberg.index.IndexQuery.Consistency
 import org.apache.iceberg.index.IndexSearchResult
 import org.apache.iceberg.index.spark.DistributedIndexSearch
 import org.apache.iceberg.index.IndexCandidates
+import org.apache.iceberg.index.spark.IndexRowFilter
 import org.apache.iceberg.index.spark.IndexEntries
 import org.apache.iceberg.index.vector.VectorIndexAdapter
 import org.apache.spark.rdd.RDD
@@ -65,56 +66,78 @@ private[spark] object VectorSearchExec {
    *
    * <p>The set is built on the driver and broadcast, so its size is a driver memory decision rather
    * than a table property: a hundred million rows filtered down to a quarter of themselves is two
-   * hundred million positions, which is over a gigabyte. Past this the search is not narrowed and the
-   * scan branch answers the query, which is the answer it would have given without an index.
+   * hundred million positions, which is over a gigabyte. A query that asked for the pre-filter link
+   * and cannot have it fails rather than being answered another way: the caller asked for a link, and
+   * quietly answering from a scan would hide that the link it asked for was never used.
    */
   private val MaxCandidateRows = 2000000
 
   /**
-   * The densest a candidate set may be and still be worth using.
+   * The densest a candidate set may be and still be worth building.
    *
    * <p>Reading the filter's columns to build the set is a second pass over them. When the filter
    * keeps more than a quarter of the rows, the search would score most of them anyway and the pass
-   * buys nothing, so the query is left to the scan branch instead.
+   * buys nothing, so the rule that picks a link picks the other one. A query that named the link
+   * itself keeps it at any density.
    */
   private val MaxCandidateDensity = 0.25
 
   /**
-   * The rows this query may answer with, or null when the index cannot be narrowed to them.
+   * The rows this query may answer with, or null when the filter is applied after the search.
    *
-   * <p>A query without a filter is not narrowed: every row is a candidate, and the search already
-   * answers that question. A filter that keeps too many rows, or one whose columns cannot be read
-   * here, also produces null, and the caller answers the query from a scan.
+   * <p>A query without a filter is not narrowed: every row is a candidate and the search already
+   * answers that question. Otherwise the mode decides: the pre-filter link reads the filter's rows
+   * and the search skips the rest, the post-filter link scores first and judges the rows it fetched,
+   * and the default rule picks whichever is cheaper for this filter.
    */
   private def candidatesFor(spark: SparkSession, context: VectorSearchContext): IndexCandidates = {
     if (!context.hasFilter) {
       return null
     }
 
+    val mode = context.parameters.filterMode
+    if (mode == VectorQueryParameters.FilterModePost) {
+      logger.info("vector search filter applied after the search, mode={}", mode)
+      return null
+    }
+
     val positions =
       try {
-        IndexEntries.matchingPositions(
-          spark,
-          context.inputs.table,
-          context.inputs.scanTasks,
-          context.inputs.table.schema(),
-          context.filter,
-          context.filterColumns.toList.asJava,
-          MaxCandidateRows)
+        Some(
+          IndexEntries.matchingPositions(
+            spark,
+            context.inputs.table,
+            context.inputs.scanTasks,
+            context.inputs.table.schema(),
+            context.filter,
+            context.filterColumns.toList.asJava,
+            MaxCandidateRows))
       } catch {
         case error: RuntimeException =>
-          logger.warn("Could not read the filtered rows, answering from a scan", error)
-          null
+          if (mode == VectorQueryParameters.FilterModePre) {
+            throw error
+          }
+
+          logger.warn(
+            "Could not read the filtered rows, applying the filter after the search",
+            error)
+          None
       }
 
-    if (positions == null) {
+    if (positions.isEmpty || positions.get == null) {
+      if (mode == VectorQueryParameters.FilterModePre) {
+        throw new IllegalArgumentException(
+          s"${VectorQueryParameters.FilterModeConf}=pre cannot read this query's filtered rows: the filter keeps more than "
+            + s"$MaxCandidateRows rows, which cannot be held on the driver")
+      }
+
       logger.info(
-        "vector search filter kept more than {} rows, answering from a scan",
+        "vector search filter kept more than {} rows, applying the filter after the search",
         Integer.valueOf(MaxCandidateRows))
       return null
     }
 
-    val candidates = IndexCandidates.of(positions)
+    val candidates = IndexCandidates.of(positions.get)
     val entries = context.inputs.entryUpperBound
     val density =
       if (entries == null || entries.longValue() <= 0L) {
@@ -122,16 +145,24 @@ private[spark] object VectorSearchExec {
       } else {
         candidates.count().toDouble / entries.longValue().toDouble
       }
-    logger.info(
-      "vector search filter kept {} of {} index entries, density={} limit={}",
-      JLong.valueOf(candidates.count()),
-      entries,
-      java.lang.Double.valueOf(density),
-      java.lang.Double.valueOf(MaxCandidateDensity))
-    if (density > MaxCandidateDensity) {
+
+    if (mode == VectorQueryParameters.FilterModeAuto && density > MaxCandidateDensity) {
+      logger.info(
+        "vector search filter kept {} of {} index entries, density={} over {} so the filter is "
+          + "applied after the search",
+        JLong.valueOf(candidates.count()),
+        entries,
+        java.lang.Double.valueOf(density),
+        java.lang.Double.valueOf(MaxCandidateDensity))
       return null
     }
 
+    logger.info(
+      "vector search filter kept {} of {} index entries, density={} mode={}",
+      JLong.valueOf(candidates.count()),
+      entries,
+      java.lang.Double.valueOf(density),
+      mode)
     candidates
   }
 
@@ -149,13 +180,7 @@ private[spark] object VectorSearchExec {
     val residualStart = System.nanoTime()
     // a filtered query whose candidates could not be narrowed is answered by the scan branch: the
     // index has nothing to add once every row of the table may be in the answer
-    val residual =
-      residualRows(
-        spark,
-        context,
-        names,
-        readSchema,
-        wholeTable = context.hasFilter && candidates == null)
+    val residual = residualRows(spark, context, names, readSchema)
     val residualNanos = System.nanoTime() - residualStart
     val residualFiles = if (residual == null) 0 else context.inputs.uncoveredDataFiles.size
     // the parameters are decided before a source is ever built, but the candidate loop treats them
@@ -169,8 +194,9 @@ private[spark] object VectorSearchExec {
       }
     logger.info(
       "vector search contract={} k={} overSample={} candidates={} lastRequest={} live={} "
-        + "unresolved={} outsideSnapshot={} rounds={} rowsAtFiles={} residualFiles={} reason={} "
-        + "driverMaterialization=true candidatesMs={} residualMs={}",
+        + "unresolved={} filteredOut={} outsideSnapshot={} rounds={} rowsAtFiles={} "
+        + "residualFiles={} reason={} filterMode={} driverMaterialization=true candidatesMs={} "
+        + "residualMs={}",
       Array[Object](
         context.request.input.contract.name,
         Integer.valueOf(context.request.input.topK),
@@ -179,11 +205,13 @@ private[spark] object VectorSearchExec {
         JLong.valueOf(found.requested),
         Integer.valueOf(found.rows.size),
         Integer.valueOf(found.unresolved),
+        Integer.valueOf(found.rejected),
         Integer.valueOf(found.outsideSnapshot),
         Integer.valueOf(found.rounds),
         Integer.valueOf(found.rowsAtFiles),
         Integer.valueOf(residualFiles),
         found.reason,
+        if (context.parameters == null) "unset" else context.parameters.filterMode,
         JLong.valueOf(candidateNanos / 1000000L),
         JLong.valueOf(residualNanos / 1000000L)): _*)
     val rows =
@@ -193,6 +221,7 @@ private[spark] object VectorSearchExec {
       found.requested,
       found.rows.size,
       found.unresolved,
+      found.rejected,
       found.outsideSnapshot,
       found.rounds,
       found.rowsAtFiles,
@@ -206,6 +235,7 @@ private[spark] object VectorSearchExec {
       initial: Long,
       requested: Long,
       unresolved: Int,
+      rejected: Int,
       outsideSnapshot: Int,
       rounds: Int,
       rowsAtFiles: Int,
@@ -222,12 +252,7 @@ private[spark] object VectorSearchExec {
     val k = context.request.input.topK
     val queries = context.request.input.queries
     if (k <= 0 || queries.isEmpty || context.parameters == null) {
-      return Candidates(Nil, 0L, 0L, 0, 0, 0, 0, "empty_request")
-    }
-    if (context.hasFilter && candidates == null) {
-      // the filter could not narrow the search, so what the index would return is the unfiltered
-      // answer and the scan branch answers the query instead
-      return Candidates(Nil, 0L, 0L, 0, 0, 0, 0, "filter_not_narrowed")
+      return Candidates(Nil, 0L, 0L, 0, 0, 0, 0, 0, "empty_request")
     }
     val opening = if (context.budget == null) {
       VectorCandidateBudget.derive(k, context.parameters.overSample, inputs.entryUpperBound)
@@ -236,12 +261,32 @@ private[spark] object VectorSearchExec {
     }
 
     val adapter = new VectorIndexAdapter(inputs.definition)
+    // the filter applied after the search judges the rows this loop fetched, which is what lets it
+    // keep fetching until the window is full of rows that pass instead of rows that merely exist.
+    // The evaluator binds a reference to the position of its field, so it is bound against the order
+    // the rows come back in, which is the query's projection plus whatever the filter needed and the
+    // projection did not already have.
+    val postFilter = context.hasFilter && candidates == null
+    val missing = if (postFilter) {
+      context.filterColumns.filterNot(names.contains)
+    } else {
+      Seq.empty[String]
+    }
+    val readColumns = names ++ missing
+    val fetchSchema = widenedSchema(readSchema, missing, context.inputs.table.schema())
+    val rowFilter =
+      if (postFilter) {
+        new IndexRowFilter(context.inputs.table.schema().select(readColumns.asJava), context.filter)
+      } else {
+        null
+      }
     val found = mutable.LinkedHashMap.empty[(String, Long), Row]
     // a position is counted once, whether it resolved to a live row or not: a wider round returns
     // the earlier candidates again, and an unresolved one would otherwise be counted on every round
     val seen = mutable.Set.empty[(String, Long)]
     var budget = opening
     var unresolved = 0
+    var rejected = 0
     var outsideSnapshot = 0
     val readFiles = mutable.Set.empty[String]
     var round = 0
@@ -280,8 +325,8 @@ private[spark] object VectorSearchExec {
             spark,
             inputs.table,
             positions,
-            names.toList.asJava,
-            readSchema,
+            readColumns.toList.asJava,
+            fetchSchema,
             inputs.scanTasks)
           readFiles ++= rowsByFile.keySet().asScala
           fresh.foreach { hit =>
@@ -292,8 +337,12 @@ private[spark] object VectorSearchExec {
               // a deleted, no longer visible or otherwise unresolved hit: the index still ranks it,
               // but the frozen table snapshot has no live row at that position any more
               unresolved += 1
+            } else if (rowFilter != null && !rowFilter.matches(row)) {
+              // the filter is applied after the search, so a row it turns down is not part of the
+              // answer: counting it would stop the loop with a window the query cannot fill
+              rejected += 1
             } else {
-              found.put((hit.dataFile(), hit.rowPosition()), row)
+              found.put((hit.dataFile(), hit.rowPosition()), narrow(row, names.size))
             }
           }
         }
@@ -310,8 +359,15 @@ private[spark] object VectorSearchExec {
         }
       }
       if (!done) {
+        // a row the filter turned down used up a candidate slot without filling the window, so the
+        // next request has to make room for both: the rows still missing and the ones already seen
+        // and rejected. Asking only for the difference would crawl forward and stop short.
         val next =
-          VectorCandidateBudget.nextOrNull(budget.initial, found.size, k, budget.entryUpperBound)
+          VectorCandidateBudget.nextOrNull(
+            budget.initial,
+            found.size,
+            k + rejected,
+            budget.entryUpperBound)
         if (next == null) {
           done = true
           reason = "budget_not_representable"
@@ -325,6 +381,7 @@ private[spark] object VectorSearchExec {
       opening.initial,
       budget.initial,
       unresolved,
+      rejected,
       outsideSnapshot,
       round,
       readFiles.size,
@@ -336,10 +393,8 @@ private[spark] object VectorSearchExec {
       spark: SparkSession,
       context: VectorSearchContext,
       names: Seq[String],
-      readSchema: StructType,
-      wholeTable: Boolean): RDD[InternalRow] = {
-    val uncovered =
-      if (wholeTable) context.inputs.dataFiles else context.inputs.uncoveredDataFiles
+      readSchema: StructType): RDD[InternalRow] = {
+    val uncovered = context.inputs.uncoveredDataFiles
     if (uncovered.isEmpty || context.request.input.contract == VectorResultContract.IndexHits) {
       return null
     }
@@ -360,6 +415,34 @@ private[spark] object VectorSearchExec {
       // whether its file happens to be covered
       .filter(row => vectorIndex < 0 || !row.isNullAt(vectorIndex))
       .map(row => row.copy())
+  }
+
+  /** A fetched row without the columns that were read only to judge it. */
+  private def narrow(row: Row, keep: Int): Row = {
+    if (row.size == keep) {
+      row
+    } else {
+      val values = new Array[Object](keep)
+      var index = 0
+      while (index < keep) {
+        values(index) = row.get(index).asInstanceOf[Object]
+        index += 1
+      }
+
+      org.apache.spark.sql.RowFactory.create(values: _*)
+    }
+  }
+
+  /**
+   * The schema the fetched rows are read with.
+   *
+   * <p>An evaluator binds a reference to the position of its field, so the filter is bound against
+   * the projection of the columns it names; the fetch-back reads the projected columns of the query,
+   * and the filter's own columns are read alongside them only when the filter is applied after the
+   * search, which is the case that builds this.
+   */
+  private def filterSchema(context: VectorSearchContext): org.apache.iceberg.Schema = {
+    context.inputs.table.schema().select(context.filterColumns.asJava)
   }
 
   private def positionsOf(
@@ -387,6 +470,24 @@ private[spark] object VectorSearchExec {
     StructType(output.map { attribute =>
       StructField(attribute.name, attribute.dataType, attribute.nullable, attribute.metadata)
     }.toArray)
+
+  /** The schema the fetched rows are read with: the projection, then what judging a row needs. */
+  private def widenedSchema(
+      base: StructType,
+      extra: Seq[String],
+      tableSchema: org.apache.iceberg.Schema): StructType = {
+    if (extra.isEmpty) {
+      return base
+    }
+
+    val widened =
+      org.apache.iceberg.spark.SparkSchemaUtil.convert(tableSchema.select(extra.asJava))
+    var widenedSchema = base
+    widened.fields
+      .filterNot(field => base.fieldNames.contains(field.name))
+      .foreach(field => widenedSchema = widenedSchema.add(field))
+    widenedSchema
+  }
 }
 
 /**
@@ -399,6 +500,7 @@ private[spark] case class VectorSearchStats(
     lastRequest: Long,
     liveCandidates: Int,
     deletedOrInvisibleHits: Int,
+    filteredOutHits: Int,
     hitsOutsideSnapshot: Int,
     rounds: Int,
     rowsAtFiles: Int,

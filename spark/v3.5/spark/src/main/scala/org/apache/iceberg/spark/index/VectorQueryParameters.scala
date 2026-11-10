@@ -34,7 +34,8 @@ private[spark] case class VectorParameter(
 
 private[spark] case class RawVectorParameters(
     overSample: VectorParameter,
-    indexName: VectorParameter)
+    indexName: VectorParameter,
+    filterMode: VectorParameter)
 
 private[spark] case class ResolvedVectorParameters(
     overSample: Long,
@@ -42,11 +43,34 @@ private[spark] case class ResolvedVectorParameters(
     overSampleLocked: Boolean,
     overSampleShadowedOrigin: String,
     overSampleReason: String,
-    indexName: VectorParameter)
+    indexName: VectorParameter,
+    filterMode: String = VectorQueryParameters.DefaultFilterMode,
+    filterModeOrigin: String = "DEFAULT")
 
 private[spark] object VectorQueryParameters {
   val OverSampleConf = "spark.iceberg.index.vector.over-sample"
   val IndexNameConf = "spark.iceberg.index.vector.name"
+
+  /**
+   * How a query's filter is applied: before the search, after it, or by the rule that decides which
+   * one is cheaper.
+   *
+   * <p>The link an operator is not told about is the one that cannot surprise it, so this is the
+   * query's own decision rather than a property of the table. There is no third behaviour behind it:
+   * a mode that cannot be honoured fails the query instead of answering it another way.
+   */
+  val FilterModeConf = "spark.iceberg.index.vector.filter-mode"
+
+  /** Apply the filter before the search when that is cheaper, and after it otherwise. */
+  val FilterModeAuto = "auto"
+
+  /** Read the filter's rows first and let the search skip the rest. */
+  val FilterModePre = "pre"
+
+  /** Search first and keep the rows the filter admits, asking for more while the window is short. */
+  val FilterModePost = "post"
+
+  val DefaultFilterMode = FilterModeAuto
 
   def capture(
       session: JMap[String, String],
@@ -56,6 +80,7 @@ private[spark] object VectorQueryParameters {
     require(submit != null, "Submit configuration cannot be null")
     val overSample = configured(session, submit, OverSampleConf)
     val configuredIndex = configured(session, submit, IndexNameConf)
+    val filterMode = configured(session, submit, FilterModeConf)
     val index = if (indexArgument == null) {
       configuredIndex
     } else {
@@ -68,7 +93,7 @@ private[spark] object VectorQueryParameters {
       }
       VectorParameter(indexArgument, "CALL_ARGUMENT", true, shadowed)
     }
-    RawVectorParameters(overSample, index)
+    RawVectorParameters(overSample, index, filterMode)
   }
 
   def decide(
@@ -85,6 +110,7 @@ private[spark] object VectorQueryParameters {
         s"Invalid $IndexNameConf: '${raw.indexName.value}'")
       raw.indexName.copy(value = raw.indexName.value.trim)
     }
+    val mode = filterModeOf(raw.filterMode)
     if (parameter == null) {
       ResolvedVectorParameters(
         defaultOverSample(definition),
@@ -92,7 +118,9 @@ private[spark] object VectorQueryParameters {
         false,
         null,
         "documented-experience-values",
-        index)
+        index,
+        mode._1,
+        mode._2)
     } else {
       val message = s"Invalid $OverSampleConf: '${parameter.value}'; expected a positive integer"
       require(parameter.value != null, message)
@@ -109,8 +137,31 @@ private[spark] object VectorQueryParameters {
         parameter.locked,
         parameter.shadowedOrigin,
         null,
-        index)
+        index,
+        mode._1,
+        mode._2)
     }
+  }
+
+  /**
+   * The link a query asked for, or the rule that picks one.
+   *
+   * <p>An unrecognised value fails the query: answering it some other way would be answering a
+   * question the caller did not ask, and a filter that is applied on the wrong side of the search
+   * returns the wrong rows rather than fewer of the right ones.
+   */
+  private def filterModeOf(parameter: VectorParameter): (String, String) = {
+    if (parameter == null) {
+      return (DefaultFilterMode, "DEFAULT")
+    }
+
+    val value =
+      if (parameter.value == null) null else parameter.value.trim.toLowerCase(java.util.Locale.ROOT)
+    val valid = Set(FilterModeAuto, FilterModePre, FilterModePost)
+    require(
+      valid.contains(value),
+      s"Invalid $FilterModeConf: '${parameter.value}'; expected one of auto, pre, post")
+    (value, parameter.origin)
   }
 
   /**

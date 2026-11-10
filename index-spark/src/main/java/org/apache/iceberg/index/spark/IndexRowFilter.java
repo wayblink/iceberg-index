@@ -37,19 +37,19 @@ import org.apache.spark.sql.Row;
  * of the read. A colum whose value the evaluator cannot compare, which this project's types leave
  * to a separate decision, is rejected when the filter is built rather than halfway through a query.
  */
-final class IndexRowFilter implements java.io.Serializable {
+public final class IndexRowFilter implements java.io.Serializable {
   private static final long serialVersionUID = 1L;
 
   private final Evaluator evaluator;
 
-  IndexRowFilter(Schema schema, Expression filter) {
+  public IndexRowFilter(Schema schema, Expression filter) {
     Preconditions.checkArgument(schema != null, "Schema is null");
     Preconditions.checkArgument(filter != null, "Filter is null");
     this.evaluator = new Evaluator(schema.asStruct(), filter);
   }
 
   /** Whether the row is part of the answer the unfiltered table would have given. */
-  boolean matches(Row row) {
+  public boolean matches(Row row) {
     return row != null && evaluator.eval(new RowStruct(row));
   }
 
@@ -107,7 +107,7 @@ final class IndexRowFilter implements java.io.Serializable {
   }
 
   /** The type of each field a filter may name, for the check that it can be evaluated at all. */
-  static boolean isComparable(Types.NestedField field) {
+  public static boolean isComparable(Types.NestedField field) {
     switch (field.type().typeId()) {
       case BOOLEAN:
       case INTEGER:

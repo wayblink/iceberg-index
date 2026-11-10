@@ -19,6 +19,7 @@
 package org.apache.iceberg.spark.extensions;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 import java.nio.file.Path;
 import java.util.List;
@@ -130,32 +131,93 @@ class TestVectorSearchFiltered {
   }
 
   @Test
-  void keepsADenseFilterCorrectByFallingBackToTheScan() throws Exception {
+  void fillsTheWindowForADenseFilterByFilteringAfterTheSearch() throws Exception {
     tableWithIndex("filtered_dense");
 
-    // a filter that keeps nearly every row is not worth narrowing the search for: the answer still
-    // has to be the five rows a scan would give
-    List<Row> fromIndex =
+    // every row passes, so the pre-filter link would buy nothing and the rule picks the other one:
+    // the window still has to be full, which is what filtering after the search has to deliver
+    List<Row> rows =
         spark
             .sql(
-                "SELECT id FROM local.db.filtered_dense "
+                "SELECT id, price FROM local.db.filtered_dense "
                     + "WHERE price >= 0 ORDER BY vec_distance(embedding, array("
                     + query()
                     + "), 'euclidean') LIMIT 5")
             .collectAsList();
-    List<Row> fromScan =
-        spark
-            .sql(
-                "SELECT id FROM local.db.filtered_dense WHERE price >= 0 "
-                    + "ORDER BY vec_distance(embedding, array("
-                    + query()
-                    + "), 'euclidean') LIMIT 5")
-            .collectAsList();
 
-    assertThat(fromIndex)
-        .as("a filter too dense to narrow is answered by the same rows, not fewer")
-        .hasSameSizeAs(fromScan)
-        .isNotEmpty();
+    assertThat(rows).as("a dense filter is still answered with a full window").hasSize(5);
+    assertThat(rows).allSatisfy(row -> assertThat(row.getLong(1)).isGreaterThanOrEqualTo(0L));
+  }
+
+  @Test
+  void appliesTheFilterBeforeTheSearchWhenAsked() throws Exception {
+    tableWithIndex("filtered_mode_pre");
+
+    List<Row> rows =
+        withConf(
+            "pre",
+            () ->
+                spark
+                    .sql(
+                        "SELECT id, price FROM local.db.filtered_mode_pre "
+                            + "WHERE price < 40 ORDER BY vec_distance(embedding, array("
+                            + query()
+                            + "), 'euclidean') LIMIT 5")
+                    .collectAsList());
+
+    assertThat(rows).hasSize(5);
+    assertThat(rows).allSatisfy(row -> assertThat(row.getLong(1)).isLessThan(40L));
+  }
+
+  @Test
+  void appliesTheFilterAfterTheSearchWhenAsked() throws Exception {
+    tableWithIndex("filtered_mode_post");
+
+    List<Row> rows =
+        withConf(
+            "post",
+            () ->
+                spark
+                    .sql(
+                        "SELECT id, price FROM local.db.filtered_mode_post "
+                            + "WHERE price < 40 ORDER BY vec_distance(embedding, array("
+                            + query()
+                            + "), 'euclidean') LIMIT 5")
+                    .collectAsList());
+
+    assertThat(rows)
+        .as("the post-filter link widens the search until the window is full of rows that pass")
+        .hasSize(5);
+    assertThat(rows).allSatisfy(row -> assertThat(row.getLong(1)).isLessThan(40L));
+  }
+
+  @Test
+  void rejectsAFilterModeItDoesNotKnow() throws Exception {
+    tableWithIndex("filtered_mode_bad");
+
+    assertThatThrownBy(
+            () ->
+                withConf(
+                    "sometimes",
+                    () ->
+                        spark
+                            .sql(
+                                "SELECT id FROM local.db.filtered_mode_bad "
+                                    + "WHERE price < 40 ORDER BY vec_distance(embedding, array("
+                                    + query()
+                                    + "), 'euclidean') LIMIT 5")
+                            .collectAsList()))
+        .as("an unknown mode is refused rather than answered some other way")
+        .hasMessageContaining("filter-mode");
+  }
+
+  private static <T> T withConf(String mode, java.util.function.Supplier<T> body) {
+    spark.conf().set("spark.iceberg.index.vector.filter-mode", mode);
+    try {
+      return body.get();
+    } finally {
+      spark.conf().unset("spark.iceberg.index.vector.filter-mode");
+    }
   }
 
   private static String query() {
