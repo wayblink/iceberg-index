@@ -84,6 +84,28 @@ class TestIndexRowFilter {
         .isTrue();
   }
 
+  @Test
+  void travelsToAnExecutor() throws Exception {
+    // the candidate read that builds the filtered rows runs the judgement inside a Spark closure,
+    // so
+    // a filter that cannot be shipped fails the job rather than the assertion
+    IndexRowFilter filter = new IndexRowFilter(SCHEMA, Expressions.equal("category", "books"));
+
+    java.io.ByteArrayOutputStream bytes = new java.io.ByteArrayOutputStream();
+    try (java.io.ObjectOutputStream out = new java.io.ObjectOutputStream(bytes)) {
+      out.writeObject(filter);
+    }
+
+    IndexRowFilter restored;
+    try (java.io.ObjectInputStream in =
+        new java.io.ObjectInputStream(new java.io.ByteArrayInputStream(bytes.toByteArray()))) {
+      restored = (IndexRowFilter) in.readObject();
+    }
+
+    assertThat(restored.matches(row(1, 10L, "books"))).isTrue();
+    assertThat(restored.matches(row(1, 10L, "toys"))).isFalse();
+  }
+
   private static Row row(int id, long price, String category) {
     return RowFactory.create(Integer.valueOf(id), Long.valueOf(price), category);
   }

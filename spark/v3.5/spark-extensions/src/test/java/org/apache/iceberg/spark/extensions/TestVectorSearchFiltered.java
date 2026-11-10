@@ -44,6 +44,7 @@ import org.junit.jupiter.api.io.TempDir;
 class TestVectorSearchFiltered {
   private static final int DIMENSION = 4;
   private static final int ROWS = 200;
+  private static final int KEPT = 150;
 
   private static SparkSession spark;
 
@@ -238,6 +239,96 @@ class TestVectorSearchFiltered {
         .hasSize(5);
     assertThat(rows)
         .allSatisfy(row -> assertThat(row.getDate(1).toString()).isEqualTo("2024-06-01"));
+  }
+
+  @Test
+  void neverReturnsADeletedRowWhenTheFilterRunsBeforeTheSearch() throws Exception {
+    tableWithIndex("filtered_deleted_pre");
+    deleteLastQuarter("filtered_deleted_pre");
+
+    List<Row> rows =
+        withConf(
+            "pre",
+            () ->
+                spark
+                    .sql(
+                        "SELECT id, price FROM local.db.filtered_deleted_pre "
+                            + "WHERE price < 40 ORDER BY vec_distance(embedding, array("
+                            + query()
+                            + "), 'euclidean') LIMIT 5")
+                    .collectAsList());
+
+    assertThat(rows).isNotEmpty();
+    assertThat(rows)
+        .as("a row whose file still has it, but whose live set does not, is not an answer")
+        .allSatisfy(row -> assertThat(row.getLong(0)).isLessThan(KEPT));
+  }
+
+  @Test
+  void neverReturnsADeletedRowWhenTheFilterRunsAfterTheSearch() throws Exception {
+    tableWithIndex("filtered_deleted_post");
+    deleteLastQuarter("filtered_deleted_post");
+
+    List<Row> rows =
+        withConf(
+            "post",
+            () ->
+                spark
+                    .sql(
+                        "SELECT id, price FROM local.db.filtered_deleted_post "
+                            + "WHERE price < 40 ORDER BY vec_distance(embedding, array("
+                            + query()
+                            + "), 'euclidean') LIMIT 5")
+                    .collectAsList());
+
+    assertThat(rows)
+        .as("the search may still rank a deleted row, and dropping it must not shorten the window")
+        .hasSize(5);
+    assertThat(rows).allSatisfy(row -> assertThat(row.getLong(0)).isLessThan(KEPT));
+  }
+
+  @Test
+  void returnsWhatItFoundWhenTheFilterAdmitsFewerRowsThanAsked() throws Exception {
+    tableWithIndex("filtered_short");
+
+    for (String mode : new String[] {"pre", "post"}) {
+      List<Row> rows =
+          withConf(
+              mode,
+              () ->
+                  spark
+                      .sql(
+                          "SELECT id, price FROM local.db.filtered_short WHERE price = 6 "
+                              + "ORDER BY vec_distance(embedding, array("
+                              + query()
+                              + "), 'euclidean') LIMIT 5")
+                      .collectAsList());
+
+      assertThat(rows)
+          .as("%s: one row passes, so one row is the answer, not a padded window", mode)
+          .hasSize(1);
+      assertThat(rows.get(0).getLong(1)).isEqualTo(6L);
+    }
+  }
+
+  private static void deleteLastQuarter(String name) {
+    // a merge-on-read delete leaves position deletes behind, so the data file still holds the rows
+    // the index points at and the live set does not
+    spark.sql(
+        "ALTER TABLE local.db."
+            + name
+            + " SET TBLPROPERTIES ('write.delete.mode'='merge-on-read')");
+    spark.sql("DELETE FROM local.db." + name + " WHERE id >= " + KEPT);
+    // the test only means something if the rows are still in their data files: a copy-on-write
+    // delete would remove them physically and the index would have nothing stale to point at
+    long positionDeletes =
+        spark
+            .sql("SELECT count(*) FROM local.db." + name + ".files WHERE content = 1")
+            .head()
+            .getLong(0);
+    assertThat(positionDeletes)
+        .as("the table has to carry a position delete for this test to be testing one")
+        .isGreaterThan(0L);
   }
 
   private static String query() {

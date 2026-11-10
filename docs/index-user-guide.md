@@ -215,11 +215,13 @@ SELECT id, title, _distance FROM vector_search(
 
 1. 列上有向量索引；同列多个时必须用 `spark.iceberg.index.vector.name` 指定，否则不动手；
 2. 表只有 identity 分区；
-3. 形态是"单表 + 唯一一个升序距离排序 + 可折叠的正数 `LIMIT`"，中间只有投影、子查询别名、以及向量列上的 `IS NOT NULL`；
+3. 形态是"单表 + 唯一一个升序距离排序 + 可折叠的正数 `LIMIT`"，中间只有投影、子查询别名，以及能被转换成索引侧表达式的过滤条件（向量列上的 `IS NOT NULL` 是其中最简单的一种）；
 4. 显式 `metric`（如果写了第三参数）与索引的 metric 一致，否则只 WARN 并退扫描；
 5. 索引存在、覆盖当前快照，就参与改写——**是否设置 `over-sample` 不影响走不走索引**，只影响候选宽度（4.4）。
 
-反过来，`DESC`、多个排序键、`OFFSET`、join、聚合、窗口、任何非 `IS NOT NULL` 的过滤（包括 `WHERE year = 2020`）、非 identity 分区、`LIMIT` 不是字面量——都会让规则退让，退回全表扫描。
+反过来，`DESC`、多个排序键、`OFFSET`、join、聚合、窗口、无法转换成索引侧表达式的过滤（子查询、UDF、跨表列）、非 identity 分区、`LIMIT` 不是字面量——都会让规则退让，退回全表扫描。
+
+标量过滤（`WHERE year = 2020`、`WHERE price < 100`）**不再导致退让**：它会被带进检索，落在索引前面还是后面由 `filter-mode` 决定（4.6）。这也意味着**带过滤的查询结果是近似的**（与不带过滤时同为索引本身的近似程度），而不再是全表扫描的精确值；过滤后符合条件的行不足 k 时，返回找到的那些行而不是补齐。
 
 一个容易忽略的细节：改写后排序键会被绑定成**索引的 metric**。所以不带第三参数的 `ORDER BY vec_distance(col, q)` 是按索引的 metric 计算的，与"没有索引时全扫描默认 COSINE"可能不是同一个量。
 
@@ -273,6 +275,20 @@ CALL local.system.drop_vector_index(table => 'db.docs', column => 'embedding', i
 注意 `ALTER TABLE … DROP INDEX <name>` **没有 `purge` 参数**，它落到默认值 `true`，即直接删文件。
 
 ---
+
+### 4.6 过滤落在检索的哪一侧：`filter-mode`
+
+带标量过滤的向量查询有三种走法，由 `spark.iceberg.index.vector.filter-mode` 指定：
+
+| 值 | 行为 | 什么时候用 |
+|---|---|---|
+| `auto`（默认） | 过滤后行数少（≤ 索引条目数的 1/4）就先读过滤列、再让检索跳过其余行；否则先检索、再在回表时筛 | 一般来说不用管 |
+| `pre` | 先按过滤条件算出候选行集合，检索只给这些行打分 | 过滤选择性好、过滤列窄 |
+| `post` | 不读过滤列；先检索，再对取回的行判定，不够 k 就继续扩样 | 过滤列很宽（大字符串 `LIKE`）、读它的列比多取几次候选更贵 |
+
+两条链路都不改变"过滤条件必须被满足"，区别只在成本与候选宽度。`post` 会让检索多取一些候选来补偿被过滤掉的行，所以它的耗时对选择性更敏感；`pre` 则要先付一次过滤列的扫描。
+
+**显式指定就一定会被遵守，不会静默换成另一种方式**：`pre` 需要把候选行集合放在 driver 上，如果过滤后行数超过上限（200 万行），查询会直接失败的，而不是悄悄改用别的链路。原因很简单——你指定链路就是为了确认它真的被用上了。
 
 ## 5. 全文索引
 
@@ -451,6 +467,7 @@ CALL local.system.offload_index(table => 'db.docs', index => '<uuid>');
 |---|---|---|
 | `spark.iceberg.index.vector.over-sample` | 按形态推导 | 候选放宽倍数；不设时由结构决定，计划里写明数值与来源 |
 | `spark.iceberg.index.vector.name` | 不设 | 同列多索引时选哪个 |
+| `spark.iceberg.index.vector.filter-mode` | `auto` | 标量过滤落在检索前还是后：`auto` / `pre` / `post`；显式指定时不会被静默替换 |
 | `spark.iceberg.index.cache.enabled` | `false` | 缓存开关；关掉时 `load_index` 报 `CACHE_DISABLED` |
 | `spark.iceberg.index.cache.bytes` | 自动 | 每 executor 预算 |
 | `spark.iceberg.index.cache.heap-fraction` | `0.25` | 自动预算的堆占比 |
