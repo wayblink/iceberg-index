@@ -29,7 +29,9 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
 import org.apache.iceberg.Table;
 import org.apache.iceberg.index.IndexAdapter;
+import org.apache.iceberg.index.IndexAdapter.PreparedSearch;
 import org.apache.iceberg.index.IndexBlob;
+import org.apache.iceberg.index.IndexCandidates;
 import org.apache.iceberg.index.IndexFile;
 import org.apache.iceberg.index.IndexFileMemory;
 import org.apache.iceberg.index.IndexMetadata;
@@ -124,6 +126,35 @@ public final class DistributedIndexSearch {
    */
   public static SearchOutcome search(
       SparkSession spark, IndexMetadata metadata, Table table, IndexQuery query) {
+    return search(spark, metadata, table, query, null);
+  }
+
+  /**
+   * Searches the index for the rows a scalar filter admitted, and only those.
+   *
+   * <p>Without a candidate set a filtered query cannot be answered from the index: the search picks
+   * the rows nearest the query out of everything the index holds, and the rows the filter would
+   * have kept may be anywhere in that order. Handing the admitted rows to the search lets the
+   * kernel decide what to score with the filter in hand, which is what makes a filtered query a
+   * question an index can answer at all.
+   *
+   * <p>A kernel that cannot take the set while it searches is asked the unfiltered question and
+   * filtered afterwards, which returns fewer rows than asked for when the filter is selective. That
+   * is a smaller answer to the same question, never a wrong one.
+   *
+   * @param spark the Spark session
+   * @param metadata the index to search
+   * @param table the table the index belongs to, used to resolve the snapshot and its file IO
+   * @param query the query to answer
+   * @param candidates the rows a scalar filter admitted, or null when the query has no filter
+   * @return the hits of the whole index, best first, and whether the index holds more of them
+   */
+  public static SearchOutcome search(
+      SparkSession spark,
+      IndexMetadata metadata,
+      Table table,
+      IndexQuery query,
+      IndexCandidates candidates) {
     // A search is what makes an index hot, so this is where the LRU learns about it.
     IndexCacheControl.recordAccess(spark, metadata.indexUuid());
     IndexAdapter adapter =
@@ -151,6 +182,9 @@ public final class DistributedIndexSearch {
     Broadcast<IndexAdapter> adapterRef = context.broadcast(adapter);
     // a ByteBuffer is not serializable, so the payload travels as bytes
     Broadcast<byte[]> queryRef = context.broadcast(toBytes(query.payload().duplicate()));
+    // the admitted rows travel once for the whole search rather than with each task's closure
+    Broadcast<IndexCandidates> candidatesRef =
+        candidates == null ? null : context.broadcast(candidates);
     // the file IO travels whole, so an executor reads a payload the way the table is read, with the
     // properties of its catalog rather than with whatever the session happens to be configured with
     Broadcast<FileIO> ioRef = context.broadcast(table.io());
@@ -186,6 +220,8 @@ public final class DistributedIndexSearch {
                     locations1 -> {
                       IndexAdapter fileAdapter = adapterRef.getValue();
                       ByteBuffer fileQuery = ByteBuffer.wrap(queryRef.getValue());
+                      IndexCandidates fileCandidates =
+                          candidatesRef == null ? null : candidatesRef.getValue();
                       FileIO fileIO = ioRef.getValue();
                       ExecutorIndexCache.Config cacheConfig = cacheRef.getValue();
                       List<Tuple3<String, Long, Double>> fileHits = Lists.newArrayList();
@@ -211,7 +247,12 @@ public final class DistributedIndexSearch {
                         try {
                           for (IndexSearchResult hit :
                               file.searching(
-                                  prepared -> prepared.search(fileQuery.duplicate(), localTopK))) {
+                                  prepared ->
+                                      searchFile(
+                                          prepared,
+                                          fileQuery.duplicate(),
+                                          localTopK,
+                                          fileCandidates))) {
                             fileHits.add(
                                 new Tuple3<>(hit.dataFile(), hit.rowPosition(), hit.score()));
                           }
@@ -244,6 +285,21 @@ public final class DistributedIndexSearch {
     }
 
     return new SearchOutcome(ImmutableList.copyOf(hits), moreHits);
+  }
+
+  /**
+   * Searches one index file for the rows the candidate set admits.
+   *
+   * <p>A kernel that filters while it searches fills the window from the admitted rows, so the file
+   * still contributes as many hits as it has. Any other kernel answers the unfiltered question and
+   * the hits outside the set are dropped, which is the best that can be done without asking it a
+   * question it cannot answer.
+   */
+  static List<IndexSearchResult> searchFile(
+      PreparedSearch prepared, ByteBuffer query, int topK, IndexCandidates candidates) {
+    return candidates == null
+        ? prepared.search(query, topK)
+        : prepared.search(query, topK, candidates);
   }
 
   /**
