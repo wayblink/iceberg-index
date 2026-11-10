@@ -215,6 +215,79 @@ public final class IndexEntries {
     return rows;
   }
 
+  /**
+   * The live rows a filter keeps, as the positions the index would name them by.
+   *
+   * <p>An index search that knows which rows may be in the answer can skip the rest while it
+   * scores, which is what makes a filtered query cheaper than an unfiltered one instead of more
+   * expensive. The rows are read as the table is read, so delete files are applied and a removed
+   * row is not a candidate.
+   *
+   * <p>The set is held in memory on the driver and then broadcast, so it is only worth building
+   * when it is small: the read stops once it has seen more rows than the caller will hold, and says
+   * so by returning null rather than by truncating. A caller that gets null has to answer the query
+   * another way.
+   *
+   * @param spark the Spark session
+   * @param table the Iceberg table to read
+   * @param tasks the scan tasks whose rows are candidates, already narrowed by file level pruning
+   * @param schema the schema to read the rows with, or null to infer it from the files
+   * @param filter the filter the rows have to pass
+   * @param filterColumns the columns the filter names, which have to be read for it to be evaluated
+   * @param cap the most rows the caller is willing to hold
+   * @return the kept positions per data file, or null when the filter keeps more than {@code cap}
+   */
+  public static Map<String, long[]> matchingPositions(
+      SparkSession spark,
+      Table table,
+      java.util.Collection<FileScanTask> tasks,
+      Schema schema,
+      org.apache.iceberg.expressions.Expression filter,
+      List<String> filterColumns,
+      int cap) {
+    List<FileScanTask> taskList = Lists.newArrayList(tasks);
+    if (taskList.isEmpty()) {
+      return java.util.Collections.emptyMap();
+    }
+
+    Schema tableSchema = table.schema();
+    SnapshotDeletes deletes = SnapshotDeletes.read(spark, table, taskList, tableSchema);
+    SerializableConfiguration conf =
+        new SerializableConfiguration(spark.sessionState().newHadoopConf());
+    StructType readSchema = sparkSchema(table, filterColumns);
+    IndexRowFilter rowFilter = new IndexRowFilter(schema == null ? tableSchema : schema, filter);
+
+    JavaRDD<Row> kept = null;
+    for (FileScanTask task : taskList) {
+      String dataFile = task.file().location().toString();
+      JavaRDD<Row> fileRows =
+          liveRowsOf(spark, tableSchema, task, filterColumns, null, readSchema, deletes, conf)
+              .filter(entry -> rowFilter.matches(entry._2()))
+              .mapToPair(
+                  (PairFunction<Tuple2<Long, Row>, String, Long>)
+                      entry -> new Tuple2<>(dataFile, entry._1()))
+              .map(entry -> (Row) RowFactory.create(entry._1(), entry._2()));
+      kept = kept == null ? fileRows : kept.union(fileRows);
+    }
+
+    // taking one more than the cap is what tells the two cases apart without counting the whole set
+    // and then reading it again
+    List<Row> bounded = kept.take(cap + 1);
+    if (bounded.size() > cap) {
+      return null;
+    }
+
+    Map<String, List<Long>> byFile = Maps.newLinkedHashMap();
+    for (Row row : bounded) {
+      byFile.computeIfAbsent(row.getString(0), key -> Lists.newArrayList()).add(row.getLong(1));
+    }
+
+    Map<String, long[]> positions = Maps.newLinkedHashMap();
+    byFile.forEach(
+        (file, rows) -> positions.put(file, rows.stream().mapToLong(Long::longValue).toArray()));
+    return positions;
+  }
+
   /** The delete files of the tasks being read, read once. */
   private static SnapshotDeletes deletesFor(
       SparkSession spark, List<FileScanTask> tasks, Table table) {
