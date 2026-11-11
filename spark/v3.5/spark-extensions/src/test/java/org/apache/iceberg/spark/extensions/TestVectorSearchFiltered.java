@@ -334,6 +334,27 @@ class TestVectorSearchFiltered {
         .isGreaterThan(0L);
   }
 
+  @Test
+  void answersAFilteredQueryInOneJob() throws Exception {
+    tableWithIndex("filtered_one_job");
+
+    int jobs =
+        SparkJobCounter.jobsDuring(
+            spark,
+            () ->
+                spark
+                    .sql(
+                        "SELECT id, price FROM local.db.filtered_one_job "
+                            + "WHERE price < 40 ORDER BY vec_distance(embedding, array("
+                            + query()
+                            + "), 'euclidean') LIMIT 5")
+                    .collectAsList());
+
+    assertThat(jobs)
+        .as("the rows a search found are read by the tasks that found them, not by a second job")
+        .isEqualTo(1);
+  }
+
   private static String query() {
     StringBuilder builder = new StringBuilder();
     for (int d = 0; d < DIMENSION; d++) {
