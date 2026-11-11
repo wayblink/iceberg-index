@@ -831,6 +831,110 @@ public final class IndexEntries {
     }
   }
 
+  /**
+   * The live rows at the given positions of one data file, as this task reads them.
+   *
+   * <p>A search names the rows it found by file and position, and this reads those rows where the
+   * search happened: the format model opens the file once and reads only the positions asked for,
+   * for every format a table can be written in, and the snapshot's deletes are applied before a row
+   * is returned. Reading them here rather than collecting the positions and fetching the rows in
+   * another job is what keeps the fetch-back from costing a job of its own.
+   *
+   * @param io the table's file IO, so the file is read the way the table is read
+   * @param task the scan task of the file, of the snapshot being answered
+   * @param deletes the delete files of that snapshot
+   * @param positions the positions to read, in ascending order
+   * @param projection the columns to return, in this order
+   * @param expected the schema to read the file with, or null to infer it from the file
+   * @return the live rows, in ascending position order, each paired with its position
+   */
+  static List<Tuple2<Row, Long>> liveRowsAt(
+      FileIO io,
+      FileScanTask task,
+      SnapshotDeletes deletes,
+      List<Long> positions,
+      Schema projection,
+      org.apache.spark.sql.types.StructType expected) {
+    if (positions.isEmpty()) {
+      return Lists.newArrayList();
+    }
+
+    String dataFile = task.file().location().toString();
+    long[] deleted = deletes.deletedPositions(dataFile);
+    List<EqualityKeySet> keySets = deletes.keySets();
+    List<String> keyColumns = deletes.keyColumns();
+
+    List<Long> wanted = Lists.newArrayListWithCapacity(positions.size());
+    for (long position : positions) {
+      if (java.util.Arrays.binarySearch(deleted, position) < 0) {
+        wanted.add(position);
+      }
+    }
+
+    if (wanted.isEmpty()) {
+      return Lists.newArrayList();
+    }
+
+    // the equality keys have to be read to judge a row, and a key the query did not ask for still
+    // has to be read for that judgement to be possible
+    List<String> readColumns = Lists.newArrayList();
+    for (Types.NestedField field : projection.columns()) {
+      readColumns.add(field.name());
+    }
+    for (String key : keyColumns) {
+      if (!readColumns.contains(key)) {
+        readColumns.add(key);
+      }
+    }
+
+    Schema readSchema = projection.select(readColumns.toArray(new String[0]));
+    java.util.Iterator<Tuple2<Row, Long>> read;
+    try {
+      read = readFileWithFormat(dataFile, task.file().format(), readSchema, expected, wanted, null);
+    } catch (java.io.IOException e) {
+      throw new java.io.UncheckedIOException("Failed to read " + dataFile, e);
+    }
+
+    List<Tuple2<Row, Long>> rows = Lists.newArrayListWithCapacity(wanted.size());
+    while (read.hasNext()) {
+      Tuple2<Row, Long> entry = read.next();
+      if (!survivesEqualityDeletes(entry._1(), keySets)) {
+        continue;
+      }
+
+      rows.add(new Tuple2<>(projectTo(entry._1(), readColumns, projection), entry._2()));
+    }
+
+    return rows;
+  }
+
+  /** Whether a row survives the equality deletes of the snapshot. */
+  private static boolean survivesEqualityDeletes(Row row, List<EqualityKeySet> keySets) {
+    // a snapshot can hold equality deletes keyed on different columns, and each removes its own
+    // rows, so the row is held against every key set rather than against one key
+    for (EqualityKeySet keySet : keySets) {
+      if (keySet.keys().contains(equalityKey(row, keySet.fields()))) {
+        return false;
+      }
+    }
+
+    return true;
+  }
+
+  /** The row narrowed to the columns the query asked for, when the read carried more than that. */
+  private static Row projectTo(Row row, List<String> readColumns, Schema projection) {
+    if (readColumns.size() == projection.columns().size()) {
+      return row;
+    }
+
+    Object[] values = new Object[projection.columns().size()];
+    for (int i = 0; i < values.length; i++) {
+      values[i] = row.get(readColumns.indexOf(projection.columns().get(i).name()));
+    }
+
+    return RowFactory.create(values);
+  }
+
   /** Reads every row of one data file with the format model for its format, in file order. */
   private static Iterator<Tuple2<Row, Long>> readFileWithFormat(
       String location,
