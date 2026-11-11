@@ -59,13 +59,13 @@ class TestVectorQueryParameters {
   }
 
   @Test
-  void theFilterLinkDefaultsToTheRule() {
+  void theFilterLinkDefaultsToTheOneThatKeepsEveryRow() {
     ResolvedVectorParameters chosen =
         VectorQueryParameters.decide(VectorQueryParameters.capture(Map.of(), Map.of(), null), FLAT);
 
     assertThat(chosen.filterMode())
-        .as("leaving the knob alone asks for the rule, not for a link")
-        .isEqualTo(VectorQueryParameters.FilterModeAuto());
+        .as("leaving the knob alone asks for the link that loses no rows")
+        .isEqualTo(VectorQueryParameters.FilterModePre());
     assertThat(chosen.filterModeOrigin()).isEqualTo("DEFAULT");
   }
 
@@ -73,9 +73,7 @@ class TestVectorQueryParameters {
   void theFilterLinkHoldsTheValueTheQueryNamed() {
     for (String mode :
         new String[] {
-          VectorQueryParameters.FilterModeAuto(),
-          VectorQueryParameters.FilterModePre(),
-          VectorQueryParameters.FilterModePost()
+          VectorQueryParameters.FilterModePre(), VectorQueryParameters.FilterModePost()
         }) {
       ResolvedVectorParameters chosen =
           VectorQueryParameters.decide(
@@ -101,14 +99,16 @@ class TestVectorQueryParameters {
 
   @Test
   void aFilterLinkThatDoesNotExistIsRefused() {
-    RawVectorParameters raw =
-        VectorQueryParameters.capture(
-            Map.of(VectorQueryParameters.FilterModeConf(), "sometimes"), Map.of(), null);
+    for (String unknown : new String[] {"sometimes", "auto"}) {
+      RawVectorParameters raw =
+          VectorQueryParameters.capture(
+              Map.of(VectorQueryParameters.FilterModeConf(), unknown), Map.of(), null);
 
-    assertThatThrownBy(() -> VectorQueryParameters.decide(raw, FLAT))
-        .as("an unknown link is refused rather than answered some other way")
-        .isInstanceOf(IllegalArgumentException.class)
-        .hasMessageContaining(VectorQueryParameters.FilterModeConf());
+      assertThatThrownBy(() -> VectorQueryParameters.decide(raw, FLAT))
+          .as("%s is refused rather than answered some other way", unknown)
+          .isInstanceOf(IllegalArgumentException.class)
+          .hasMessageContaining(VectorQueryParameters.FilterModeConf());
+    }
   }
 
   @Test

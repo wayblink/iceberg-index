@@ -73,22 +73,12 @@ private[spark] object VectorSearchExec {
   private val MaxCandidateRows = 2000000
 
   /**
-   * The densest a candidate set may be and still be worth building.
-   *
-   * <p>Reading the filter's columns to build the set is a second pass over them. When the filter
-   * keeps more than a quarter of the rows, the search would score most of them anyway and the pass
-   * buys nothing, so the rule that picks a link picks the other one. A query that named the link
-   * itself keeps it at any density.
-   */
-  private val MaxCandidateDensity = 0.25
-
-  /**
    * The rows this query may answer with, or null when the filter is applied after the search.
    *
    * <p>A query without a filter is not narrowed: every row is a candidate and the search already
-   * answers that question. Otherwise the mode decides: the pre-filter link reads the filter's rows
-   * and the search skips the rest, the post-filter link scores first and judges the rows it fetched,
-   * and the default rule picks whichever is cheaper for this filter.
+   * answers that question. A query that asked for the filter to run after the search gets null. Any
+   * other query reads its filter's rows, and a query that asked for this link and cannot have it is
+   * told so rather than answered another way.
    */
   private def candidatesFor(spark: SparkSession, context: VectorSearchContext): IndexCandidates = {
     if (!context.hasFilter) {
@@ -103,57 +93,33 @@ private[spark] object VectorSearchExec {
 
     val positions =
       try {
-        Some(
-          IndexEntries.matchingPositions(
-            spark,
-            context.inputs.table,
-            context.inputs.scanTasks,
-            context.inputs.table.schema(),
-            context.filter,
-            context.filterColumns.toList.asJava,
-            MaxCandidateRows))
+        IndexEntries.matchingPositions(
+          spark,
+          context.inputs.table,
+          context.inputs.scanTasks,
+          context.inputs.table.schema(),
+          context.filter,
+          context.filterColumns.toList.asJava,
+          MaxCandidateRows)
       } catch {
         case error: RuntimeException =>
-          if (mode == VectorQueryParameters.FilterModePre) {
-            throw error
-          }
-
-          logger.warn(
-            "Could not read the filtered rows, applying the filter after the search",
+          throw new IllegalArgumentException(
+            s"${VectorQueryParameters.FilterModeConf}=$mode cannot read this query's filtered rows",
             error)
-          None
       }
 
-    if (positions.isEmpty || positions.get == null) {
-      if (mode == VectorQueryParameters.FilterModePre) {
-        throw new IllegalArgumentException(
-          s"${VectorQueryParameters.FilterModeConf}=pre cannot read this query's filtered rows: the filter keeps more than "
-            + s"$MaxCandidateRows rows, which cannot be held on the driver")
-      }
-
-      logger.info(
-        "vector search filter kept more than {} rows, applying the filter after the search",
-        Integer.valueOf(MaxCandidateRows))
-      return null
+    if (positions == null) {
+      throw new IllegalArgumentException(
+        s"${VectorQueryParameters.FilterModeConf}=$mode cannot read this query's filtered rows: the "
+          + s"filter keeps more than $MaxCandidateRows rows, which cannot be held on the driver")
     }
 
-    val candidates =
-      VectorFilterLink.decide(
-        mode,
-        positions.get,
-        context.inputs.entryUpperBound,
-        MaxCandidateRows,
-        MaxCandidateDensity)
-    if (candidates == null) {
-      logger.info("vector search filter kept too many rows to narrow the search, mode={}", mode)
-    } else {
-      logger.info(
-        "vector search filter kept {} of {} index entries, mode={}",
-        JLong.valueOf(candidates.count()),
-        context.inputs.entryUpperBound,
-        mode)
-    }
-
+    val candidates = IndexCandidates.of(positions)
+    logger.info(
+      "vector search filter kept {} of {} index entries, mode={}",
+      JLong.valueOf(candidates.count()),
+      context.inputs.entryUpperBound,
+      mode)
     candidates
   }
 
@@ -466,64 +432,6 @@ private[spark] object VectorSearchExec {
       .filterNot(field => base.fieldNames.contains(field.name))
       .foreach(field => widenedSchema = widenedSchema.add(field))
     widenedSchema
-  }
-}
-
-/**
- * Which side of the search a filter runs on, and whether it can run there at all.
- *
- * <p>The decision is separated from the operator because it is the part with an answer that is easy
- * to get wrong and cheap to check: the rule picks the cheaper link, a caller that named one gets it,
- * and a caller that named one it cannot have is told rather than answered another way.
- */
-private[spark] object VectorFilterLink {
-
-  /**
-   * The candidates the pre-filter link would score, or null when the filter has to run after it.
-   *
-   * @param mode the link the query asked for
-   * @param positions the rows the filter kept, per data file, or null when there were too many to hold
-   * @param entries how many entries the index holds, or null when that is unknown
-   * @param cap the most rows a candidate set may hold
-   * @param densityLimit the densest a candidate set may be for the rule to choose the pre-filter link
-   */
-  def decide(
-      mode: String,
-      positions: java.util.Map[String, Array[Long]],
-      entries: JLong,
-      cap: Int,
-      densityLimit: Double): IndexCandidates = {
-    if (mode == VectorQueryParameters.FilterModePost) {
-      // the filter runs after the search, so there is nothing to narrow the search with
-      return null
-    }
-
-    if (positions == null) {
-      if (mode == VectorQueryParameters.FilterModePre) {
-        throw new IllegalArgumentException(
-          s"${VectorQueryParameters.FilterModeConf}=pre cannot read this query's filtered rows: "
-            + s"the filter keeps more than $cap rows, which cannot be held on the driver")
-      }
-
-      return null
-    }
-
-    val candidates = IndexCandidates.of(positions)
-    if (mode != VectorQueryParameters.FilterModeAuto) {
-      return candidates
-    }
-
-    val density =
-      if (entries == null || entries.longValue() <= 0L) {
-        1.0
-      } else {
-        candidates.count().toDouble / entries.longValue().toDouble
-      }
-    if (density > densityLimit) {
-      null
-    } else {
-      candidates
-    }
   }
 }
 

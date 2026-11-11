@@ -135,16 +135,19 @@ class TestVectorSearchFiltered {
   void fillsTheWindowForADenseFilterByFilteringAfterTheSearch() throws Exception {
     tableWithIndex("filtered_dense");
 
-    // every row passes, so the pre-filter link would buy nothing and the rule picks the other one:
-    // the window still has to be full, which is what filtering after the search has to deliver
+    // every row passes, so the filter narrows nothing: the window still has to be full, which is
+    // what filtering after the search has to deliver however few rows it has to drop
     List<Row> rows =
-        spark
-            .sql(
-                "SELECT id, price FROM local.db.filtered_dense "
-                    + "WHERE price >= 0 ORDER BY vec_distance(embedding, array("
-                    + query()
-                    + "), 'euclidean') LIMIT 5")
-            .collectAsList();
+        withConf(
+            "post",
+            () ->
+                spark
+                    .sql(
+                        "SELECT id, price FROM local.db.filtered_dense "
+                            + "WHERE price >= 0 ORDER BY vec_distance(embedding, array("
+                            + query()
+                            + "), 'euclidean') LIMIT 5")
+                    .collectAsList());
 
     assertThat(rows).as("a dense filter is still answered with a full window").hasSize(5);
     assertThat(rows).allSatisfy(row -> assertThat(row.getLong(1)).isGreaterThanOrEqualTo(0L));

@@ -53,16 +53,13 @@ private[spark] object VectorQueryParameters {
 
   /**
    * How a query's filter is applied: before the search, after it, or by the rule that decides which
-   * one is cheaper.
    *
    * <p>The link an operator is not told about is the one that cannot surprise it, so this is the
-   * query's own decision rather than a property of the table. There is no third behaviour behind it:
-   * a mode that cannot be honoured fails the query instead of answering it another way.
+   * query's own decision rather than a property of the table, and it is a choice between two links
+   * rather than a rule that picks one: a query that was not asked how to filter is answered the way
+   * it always was, not the way a threshold guessed.
    */
   val FilterModeConf = "spark.iceberg.index.vector.filter-mode"
-
-  /** Apply the filter before the search when that is cheaper, and after it otherwise. */
-  val FilterModeAuto = "auto"
 
   /** Read the filter's rows first and let the search skip the rest. */
   val FilterModePre = "pre"
@@ -70,7 +67,14 @@ private[spark] object VectorQueryParameters {
   /** Search first and keep the rows the filter admits, asking for more while the window is short. */
   val FilterModePost = "post"
 
-  val DefaultFilterMode = FilterModeAuto
+  /**
+   * The link a query gets when it names none.
+   *
+   * <p>This one loses no rows: it narrows where the search looks rather than trimming what the
+   * search found, so a filtered answer never comes back shorter than the rows that pass. The other
+   * link is for a filter whose columns are expensive to read, and the query has to ask for it.
+   */
+  val DefaultFilterMode = FilterModePre
 
   def capture(
       session: JMap[String, String],
@@ -157,10 +161,10 @@ private[spark] object VectorQueryParameters {
 
     val value =
       if (parameter.value == null) null else parameter.value.trim.toLowerCase(java.util.Locale.ROOT)
-    val valid = Set(FilterModeAuto, FilterModePre, FilterModePost)
+    val valid = Set(FilterModePre, FilterModePost)
     require(
       valid.contains(value),
-      s"Invalid $FilterModeConf: '${parameter.value}'; expected one of auto, pre, post")
+      s"Invalid $FilterModeConf: '${parameter.value}'; expected one of pre, post")
     (value, parameter.origin)
   }
 
