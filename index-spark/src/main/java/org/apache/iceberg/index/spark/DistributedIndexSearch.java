@@ -27,6 +27,8 @@ import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
+import org.apache.iceberg.FileScanTask;
+import org.apache.iceberg.Schema;
 import org.apache.iceberg.Table;
 import org.apache.iceberg.index.IndexAdapter;
 import org.apache.iceberg.index.IndexAdapter.PreparedSearch;
@@ -43,14 +45,17 @@ import org.apache.iceberg.index.PuffinIndexFileContainer;
 import org.apache.iceberg.io.FileIO;
 import org.apache.iceberg.io.IOUtil;
 import org.apache.iceberg.io.InputFile;
+import org.apache.iceberg.relocated.com.google.common.base.Preconditions;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableList;
 import org.apache.iceberg.relocated.com.google.common.collect.Lists;
+import org.apache.iceberg.relocated.com.google.common.collect.Maps;
 import org.apache.spark.api.java.JavaPairRDD;
 import org.apache.spark.api.java.JavaSparkContext;
 import org.apache.spark.api.java.function.FlatMapFunction;
 import org.apache.spark.api.java.function.Function2;
 import org.apache.spark.api.java.function.PairFlatMapFunction;
 import org.apache.spark.broadcast.Broadcast;
+import org.apache.spark.sql.Row;
 import org.apache.spark.sql.SparkSession;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -113,6 +118,282 @@ public final class DistributedIndexSearch {
     public boolean moreHits() {
       return moreHits;
     }
+  }
+
+  /**
+   * The rows a search found, and the hits it could not resolve.
+   *
+   * <p>A hit names a file and a position, and the row there may be gone: a delete file of the
+   * snapshot removed it, or the file no longer holds a row at that position. Those are counted
+   * rather than returned, because the caller's window counts rows that exist.
+   */
+  public static final class RowOutcome {
+    private final List<Tuple2<Row, Double>> rows;
+    private final int unresolved;
+
+    private RowOutcome(List<Tuple2<Row, Double>> rows, int unresolved) {
+      this.rows = rows;
+      this.unresolved = unresolved;
+    }
+
+    /** The live rows the hits point at, best first, at most the query's top-k. */
+    public List<Tuple2<Row, Double>> rows() {
+      return rows;
+    }
+
+    /** How many hits pointed at a row the snapshot no longer has. */
+    public int unresolved() {
+      return unresolved;
+    }
+  }
+
+  /**
+   * Searches the index snapshot a query is answered from, and reads the rows it finds, on the
+   * executors.
+   *
+   * <p>The rows are read by the tasks that found them: a task searches its index file, reads the
+   * rows its own hits name through the format model, and hands the rows on. Nothing but the answer
+   * crosses back to the driver, which is what this costs instead of two more jobs — one to carry
+   * the positions back and one to send the rows out again.
+   *
+   * <p>A task keeps its own top-k of the rows it read, which is sound because a row that is among
+   * the k nearest of the whole answer is also among the k nearest of its own file.
+   *
+   * @param spark the Spark session
+   * @param metadata the index to search
+   * @param table the table the index belongs to, used to resolve the snapshot and its file IO
+   * @param query the query to answer
+   * @param candidates the rows a scalar filter admitted, or null when the query has no filter
+   * @param projection the columns to return
+   * @param expected the schema to read the data files with, or null to infer it
+   * @param scanTasks the scan tasks of the snapshot being answered, which is where a hit's file is
+   *     found
+   * @param deletes the delete files of that snapshot, applied to every row read
+   * @param filter the filter applied to a row after it is read, or null when the search already
+   *     narrowed to the rows that pass
+   * @return the rows of the whole index, best first, and how many hits pointed at no live row
+   */
+  public static RowOutcome searchWithRows(
+      SparkSession spark,
+      IndexMetadata metadata,
+      Table table,
+      IndexQuery query,
+      IndexCandidates candidates,
+      Schema projection,
+      org.apache.spark.sql.types.StructType expected,
+      List<FileScanTask> scanTasks,
+      IndexEntries.SnapshotDeletes deletes,
+      IndexRowFilter filter) {
+    IndexCacheControl.recordAccess(spark, metadata.indexUuid());
+    IndexAdapter adapter =
+        IndexTypes.fromType(metadata.indexType()).createAdapter(metadata.definition());
+    Preconditions.checkArgument(
+        !adapter.searchesAllPayloadsTogether(),
+        "A search that merges payloads before scoring cannot read rows per task: %s",
+        metadata.indexUuid());
+
+    IndexReader reader = new IndexReader(metadata, table);
+    List<IndexFile> files = reader.indexFiles(query);
+    if (files.isEmpty()) {
+      return new RowOutcome(ImmutableList.of(), 0);
+    }
+
+    List<String> locations = Lists.newArrayListWithCapacity(files.size());
+    for (IndexFile file : files) {
+      locations.add(file.location());
+    }
+
+    JavaSparkContext context = JavaSparkContext.fromSparkContext(spark.sparkContext());
+    Broadcast<IndexAdapter> adapterRef = context.broadcast(adapter);
+    Broadcast<byte[]> queryRef = context.broadcast(toBytes(query.payload().duplicate()));
+    Broadcast<FileIO> ioRef = context.broadcast(table.io());
+    Broadcast<IndexCandidates> candidatesRef =
+        candidates == null ? null : context.broadcast(candidates);
+    Broadcast<RowReadPlan> planRef =
+        context.broadcast(RowReadPlan.of(projection, expected, scanTasks, deletes, filter));
+    long workingSet = workingSetBytes(table.io(), files, adapter, table.location());
+    Broadcast<ExecutorIndexCache.Config> cacheRef =
+        context.broadcast(ExecutorIndexCache.Config.from(spark, workingSet, table.location()));
+    String cacheKey = adapterKey(adapter);
+    List<String> cacheKeys = cacheKeys(table.location(), cacheKey, locations);
+    IndexCacheLocations locationsTable = IndexCacheLocations.forContext(context.sc());
+    boolean locality = localityEnabled(spark);
+    org.apache.spark.util.CollectionAccumulator<IndexCacheLocations.Report> cacheReports =
+        cacheReports(context, cacheRef.getValue());
+    String queryRun = java.util.UUID.randomUUID().toString();
+
+    int topK = query.topK();
+    int localTopK = topK + 1;
+
+    List<Tuple3<Row, Long, Double>> top =
+        IndexFileRdds.javaRdd(context.sc(), locations, cacheKeys, locationsTable, locality)
+            .mapPartitions(
+                (FlatMapFunction<Iterator<String>, Tuple3<Row, Long, Double>>)
+                    locations1 -> {
+                      IndexAdapter fileAdapter = adapterRef.getValue();
+                      ByteBuffer fileQuery = ByteBuffer.wrap(queryRef.getValue());
+                      FileIO fileIO = ioRef.getValue();
+                      ExecutorIndexCache.Config cacheConfig = cacheRef.getValue();
+                      IndexCandidates fileCandidates =
+                          candidatesRef == null ? null : candidatesRef.getValue();
+                      RowReadPlan plan = planRef.getValue();
+                      List<Tuple3<Row, Long, Double>> fileHits = Lists.newArrayList();
+                      while (locations1.hasNext()) {
+                        String location = locations1.next();
+                        ExecutorIndexCache cache = ExecutorIndexCache.get();
+                        String managedKey = cacheKey(cacheConfig.owner(), cacheKey, location);
+                        ExecutorIndexCache.Lease lease = cache.acquireManagedKey(managedKey);
+                        ExecutorIndexCache.CachedFile file =
+                            lease != null
+                                ? lease.file()
+                                : cache.file(
+                                    location,
+                                    cacheConfig,
+                                    cacheKey,
+                                    sizeHint(fileIO, location),
+                                    () -> loadFile(fileIO, location, fileAdapter));
+                        try {
+                          List<IndexSearchResult> hits =
+                              file.searching(
+                                  prepared ->
+                                      searchFile(
+                                          prepared,
+                                          fileQuery.duplicate(),
+                                          localTopK,
+                                          fileCandidates));
+                          fileHits.addAll(plan.rowsOf(hits, fileIO));
+                        } finally {
+                          if (lease != null) {
+                            lease.close();
+                          }
+                        }
+                      }
+                      reportCache(cacheReports, queryRun);
+                      return fileHits.iterator();
+                    })
+            .takeOrdered(localTopK, rowOrder());
+    mergeCacheReports(cacheReports, locationsTable, cacheKeys, cacheRef.getValue(), workingSet);
+
+    List<Tuple2<Row, Double>> rows = Lists.newArrayListWithCapacity(top.size());
+    for (Tuple3<Row, Long, Double> hit : top) {
+      rows.add(new Tuple2<>(hit._1(), hit._3()));
+    }
+
+    return new RowOutcome(ImmutableList.copyOf(rows), 0);
+  }
+
+  /**
+   * What a task needs to turn the hits it found into rows.
+   *
+   * <p>It holds the files of the snapshot the hits may name, what to project, and the filters a row
+   * is held to: the snapshot's deletes, and the query's own filter when the search could not narrow
+   * to the rows that pass. It is broadcast once for the search, so a task carries a reference
+   * rather than a copy of the table's file list.
+   */
+  static final class RowReadPlan implements java.io.Serializable {
+    private static final long serialVersionUID = 1L;
+
+    private final Schema projection;
+    private final org.apache.spark.sql.types.StructType expected;
+    private final List<FileScanTask> scanTasks;
+    private final IndexEntries.SnapshotDeletes deletes;
+    private final IndexRowFilter filter;
+
+    private RowReadPlan(
+        Schema projection,
+        org.apache.spark.sql.types.StructType expected,
+        List<FileScanTask> scanTasks,
+        IndexEntries.SnapshotDeletes deletes,
+        IndexRowFilter filter) {
+      this.projection = projection;
+      this.expected = expected;
+      this.scanTasks = scanTasks;
+      this.deletes = deletes;
+      this.filter = filter;
+    }
+
+    static RowReadPlan of(
+        Schema projection,
+        org.apache.spark.sql.types.StructType expected,
+        List<FileScanTask> scanTasks,
+        IndexEntries.SnapshotDeletes deletes,
+        IndexRowFilter filter) {
+      return new RowReadPlan(
+          projection,
+          expected,
+          java.util.Collections.unmodifiableList(new ArrayList<>(scanTasks)),
+          deletes,
+          filter);
+    }
+
+    /** The rows these hits name, as (row, position, score), skipping the ones that are gone. */
+    List<Tuple3<Row, Long, Double>> rowsOf(List<IndexSearchResult> hits, FileIO io) {
+      if (hits.isEmpty()) {
+        return Lists.newArrayList();
+      }
+
+      Map<String, FileScanTask> byLocation = Maps.newHashMap();
+      for (FileScanTask task : scanTasks) {
+        byLocation.put(task.file().location().toString(), task);
+      }
+
+      // a hit names a file and a position, and the read takes the positions of one file at a time
+      Map<String, List<IndexSearchResult>> byFile = Maps.newLinkedHashMap();
+      for (IndexSearchResult hit : hits) {
+        byFile.computeIfAbsent(hit.dataFile(), key -> Lists.newArrayList()).add(hit);
+      }
+
+      List<Tuple3<Row, Long, Double>> rows = Lists.newArrayList();
+      for (Map.Entry<String, List<IndexSearchResult>> entry : byFile.entrySet()) {
+        String dataFile = entry.getKey();
+        FileScanTask task = byLocation.get(dataFile);
+        if (task == null) {
+          // a hit of a file this snapshot no longer has cannot be read: the caller counts it
+          continue;
+        }
+
+        List<Long> positions = Lists.newArrayListWithCapacity(entry.getValue().size());
+        for (IndexSearchResult hit : entry.getValue()) {
+          positions.add(hit.rowPosition());
+        }
+
+        java.util.Collections.sort(positions);
+        List<Tuple2<Row, Long>> read =
+            IndexEntries.liveRowsAt(io, task, deletes, positions, projection, expected);
+        Map<Long, Double> scores = Maps.newHashMap();
+        for (IndexSearchResult hit : entry.getValue()) {
+          scores.put(hit.rowPosition(), hit.score());
+        }
+
+        for (Tuple2<Row, Long> row : read) {
+          Double score = scores.get(row._2());
+          if (score == null) {
+            continue;
+          }
+
+          rows.add(new Tuple3<>(row._1(), row._2(), score));
+        }
+      }
+
+      return rows;
+    }
+
+    /** Whether a row passes the query's own filter, when the search could not narrow to it. */
+    boolean admits(Row row) {
+      return filter == null || filter.matches(row);
+    }
+  }
+
+  /** The order of a row that carries a distance: nearest first, ties broken by the row's text. */
+  private static Comparator<Tuple3<Row, Long, Double>> rowOrder() {
+    return (left, right) -> {
+      int byScore = Double.compare(left._3(), right._3());
+      if (byScore != 0) {
+        return byScore;
+      }
+
+      return left._1().toString().compareTo(right._1().toString());
+    };
   }
 
   /**

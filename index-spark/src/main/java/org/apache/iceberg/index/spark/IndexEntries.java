@@ -1293,7 +1293,7 @@ public final class IndexEntries {
     }
   }
 
-  private static final class SnapshotDeletes {
+  static final class SnapshotDeletes {
 
     private static final long[] NO_POSITIONS = new long[0];
 
