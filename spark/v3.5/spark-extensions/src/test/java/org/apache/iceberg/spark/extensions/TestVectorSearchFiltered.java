@@ -338,21 +338,50 @@ class TestVectorSearchFiltered {
   void answersAFilteredQueryInOneJob() throws Exception {
     tableWithIndex("filtered_one_job");
 
-    int jobs =
-        SparkJobCounter.jobsDuring(
-            spark,
-            () ->
-                spark
-                    .sql(
-                        "SELECT id, price FROM local.db.filtered_one_job "
-                            + "WHERE price < 40 ORDER BY vec_distance(embedding, array("
-                            + query()
-                            + "), 'euclidean') LIMIT 5")
-                    .collectAsList());
-
-    assertThat(jobs)
-        .as("the rows a search found are read by the tasks that found them, not by a second job")
+    // measured before the fuse: three jobs without a filter, five with the filter read first. The
+    // three are the search, the fetch-back and the re-parallelisation of what the fetch-back
+    // collected; the two more are the driver-side read of the filter's rows.
+    assertThat(jobsFor("filtered_one_job", ""))
+        .as("an unfiltered search reads the rows it found in the tasks that found them")
         .isEqualTo(1);
+    assertThat(jobsFor("filtered_one_job", " WHERE price < 40"))
+        .as("the filter's rows are read where the search happens, not by two more jobs")
+        .isEqualTo(1);
+    assertThat(jobsFor("filtered_one_job", " WHERE price < 40", "post"))
+        .as("filtering after the search costs no extra job either")
+        .isEqualTo(1);
+  }
+
+  private static int jobsFor(String name, String where) {
+    return jobsFor(name, where, null);
+  }
+
+  private static int jobsFor(String name, String where, String mode) {
+    if (mode == null) {
+      spark.conf().unset("spark.iceberg.index.vector.filter-mode");
+    } else {
+      spark.conf().set("spark.iceberg.index.vector.filter-mode", mode);
+    }
+
+    try {
+      String select = "post".equals(mode) ? "id, price" : "id";
+      return SparkJobCounter.jobsDuring(
+          spark,
+          () ->
+              spark
+                  .sql(
+                      "SELECT "
+                          + select
+                          + " FROM local.db."
+                          + name
+                          + where
+                          + " ORDER BY vec_distance(embedding, array("
+                          + query()
+                          + "), 'euclidean') LIMIT 5")
+                  .collectAsList());
+    } finally {
+      spark.conf().unset("spark.iceberg.index.vector.filter-mode");
+    }
   }
 
   private static String query() {
