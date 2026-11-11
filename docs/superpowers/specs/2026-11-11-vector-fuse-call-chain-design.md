@@ -170,8 +170,35 @@ lance-spark 把融合做在**原生扫描器**里：`ScanOptions.Builder().neare
 
 差别在于：Lance 的 reader 接受**查询向量**，Iceberg 的 Parquet 读取接受**谓词**，没有"按距离排序返回"的能力。所以要达到同等效果，只能由我们自己把"检索结果 → 位置 → 按位置读行"这三步放在同一个 task 里做；`FormatModelRegistry` 的 `positions(...)` 提供了按位置读的部分，缺的只是把它搬进 task。
 
-## 7. 待评审确认的点
+## 7. 融合器的职责与非职责（评审已确认）
 
-1. 分步顺序是否认可（先 `post`/无过滤转绿，再 `pre`，再分组细化）。
-2. `rowsToDd`/`rowsAt` 的移除只针对 `VectorSearchExec` 路径、其余三条入口不动，是否符合预期。
-3. 第 5 步"分组细化"是否本轮必须做，还是先按"一索引文件一分区"跑通再单独优化。
+融合器是一个 **executor 侧的工具类**，由 `DistributedIndexSearch` 的任务体调用。它把今天散在 driver 侧的四段收进一个任务：`candidatesFor` 的候选、`candidateRows` 的检索、`rowsAt` 的回表、`rowsToDd` 的重新并行化。
+
+### 7.1 它做的事（全部在任务内、全部是 local 操作）
+
+1. 加载索引 payload，或从 `ExecutorIndexCache` 取驻留的那份（驻留与驱逐行为不变）；
+2. 用查询向量算出本分区的候选 `(dataFile, rowPosition, score)`；
+3. 按位置读行：`FormatModelRegistry.readBuilder(format, ...)` + `builder.positions(wanted)`，Parquet 与 Lance 共用同一条路径；
+4. 应用 `SnapshotDeletes`（位置删除 + 等值删除）；
+5. **前过滤**：候选由过滤条件给出时，不在候选内的行不打分；
+6. **后过滤**：取回的行就地判定，被拒的不占窗口，任务内扩大预算重探；
+7. 维护本地 top-k，输出 `(Row, score)` 迭代器；
+8. 本地 top-k 不足时如实标记（对应 `VectorSearchStats.indexUnderfilled`）。
+
+### 7.2 它不做的事（实施时不得越界）
+
+1. **不是 Spark 的数据源 reader。** 不实现 `PartitionReader` / `ScanBuilder`，不改 `VectorSearchSource`、不动扫描计划。lance-spark 能做 `ScanOptions.nearest` 是因为它的 reader 属于数据源自身；向量检索在我们这里是一个算子的执行体，改造成 V2 数据源会牵动全表扫描语义，风险远大于收益。
+2. **不接管全局排序。** 只产出本地 top-k，全局顺序由上层 `Sort` 用**精确重算**的距离决定。融合器内部的分数只用于挑本地候选。
+3. **前过滤不做"先扫一遍过滤列"。** 如果每个任务都先扫自己那份的过滤列来造候选，等于把今天一次全局预扫变成 N 份分区扫描——总 IO 相同但每任务都要等扫完才开始检索，串行化更差。正确形态是：**候选由索引给，过滤在行上判定**，向量列与过滤列在同一次按位置读里取。`pre` 与 `post` 在任务内的差别因此只剩"判定在打分前还是取行后"，不再有额外的一趟扫描——`pre` 的 2 个额外 job 也随之消失。
+4. **不改删除与快照语义。** 沿用 `SnapshotDeletes`；第一版不把 delete position 集合下沉广播。
+5. **不碰其余三条入口。** `IndexSearch`（TVF/procedure）、`RewriteTextSearch`（全文）、`IndexRewriteSupport.rowsAt` 保持原实现。
+
+### 7.3 与 lance-spark 的对齐边界
+
+调度层面改完后与它平起平坐：1 个 job、无 driver 物化。**IO 层面不会一样**：它的索引内建于格式、扫描期就能决定打开哪些页；我们的是外部索引算候选、再按位置读，`positions` 能跳过行组，但一个页内只要有一行命中仍要整页解。要追平 IO 需要把候选下推成页级过滤（自定义 reader，需新增 `iceberg-data` 依赖），只有在 benchmark 证明 IO 是瓶颈后才做。
+
+## 8. 待评审确认的点
+
+1. ~~分步顺序是否认可~~：已确认。
+2. ~~`rowsAt`/`rowsToDd` 的移除范围~~：已确认为只针对 `VectorSearchExec` 路径。
+3. 待定：第 5 步"分组细化"本轮必须做，还是先按"一索引文件一分区"跑通再单独优化。
