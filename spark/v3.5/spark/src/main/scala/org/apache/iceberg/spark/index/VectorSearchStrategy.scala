@@ -88,25 +88,27 @@ private[spark] case class VectorSearchSourceExec(
     extends LeafExecNode {
 
   /**
-   * What the driver barrier moved, so a query can be explained and measured without its rows.
+   * What the search crossed, so a query can be explained and measured without its rows.
    *
    * <p>A hit without a live row is a candidate the index still ranks but the frozen table snapshot
-   * no longer returns: the row was deleted or is otherwise not visible. Underfill here is the index
-   * branch's own shortfall after its last allowed round, not the whole answer's: a residual scan can
-   * still complete a partly covered query. The reason is logged, because a Spark metric carries a
-   * number and not a sentence.
+   * no longer returns: the row was deleted or is otherwise not visible. Underfill here is an index
+   * file's own shortfall after its last allowed round, not the whole answer's: a residual scan can
+   * still complete a partly covered query.
+   *
+   * <p>Everything but the files the scan branch was planned over is counted by the tasks that read
+   * the rows, because the rows never reach the driver for it to count them.
    */
   override lazy val metrics: Map[String, SQLMetric] =
     Map(
       "numCandidates" -> SQLMetrics.createMetric(
         spark.sparkContext,
-        "initial candidates the query asked for"),
+        "candidates asked for, summed over the index files"),
       "numCandidateRequests" -> SQLMetrics.createMetric(
         spark.sparkContext,
-        "candidates asked for in the last round"),
+        "candidates asked for in the last round, summed over the index files"),
       "numCandidateRounds" -> SQLMetrics.createMetric(
         spark.sparkContext,
-        "rounds the delete-aware search took"),
+        "rounds the delete-aware search took, summed over the index files"),
       "numLiveCandidates" -> SQLMetrics.createMetric(
         spark.sparkContext,
         "candidate hits that resolved to a live row"),
@@ -118,27 +120,19 @@ private[spark] case class VectorSearchSourceExec(
         "candidate hits whose data file the frozen snapshot no longer has"),
       "numRowsAtFiles" -> SQLMetrics.createMetric(
         spark.sparkContext,
-        "distinct data files read to resolve candidates"),
+        "data files read to resolve candidates, summed over the index files"),
       "numResidualFiles" -> SQLMetrics.createMetric(
         spark.sparkContext,
         "uncovered files the residual branch was planned over"),
       "numIndexUnderfilled" -> SQLMetrics.createMetric(
         spark.sparkContext,
-        "index branches that ended with fewer than k live candidates"),
+        "index files that ended with fewer than k live rows"),
       "numOutputRows" -> SQLMetrics.createMetric(spark.sparkContext, "rows produced"))
 
   override protected def doExecute(): RDD[InternalRow] = {
-    val (rows, stats) = VectorSearchExec.rows(spark, source)
-    val updates = Map(
-      "numCandidates" -> stats.initialCandidates,
-      "numCandidateRequests" -> stats.lastRequest,
-      "numCandidateRounds" -> stats.rounds.toLong,
-      "numLiveCandidates" -> stats.liveCandidates.toLong,
-      "numDeletedOrInvisibleHits" -> stats.deletedOrInvisibleHits.toLong,
-      "numHitsOutsideSnapshot" -> stats.hitsOutsideSnapshot.toLong,
-      "numRowsAtFiles" -> stats.rowsAtFiles.toLong,
-      "numResidualFiles" -> stats.residualFiles.toLong,
-      "numIndexUnderfilled" -> (if (stats.indexUnderfilled) 1L else 0L))
+    val (rows, stats) = VectorSearchExec.rows(spark, source, metrics)
+    // what the driver knows before the tasks run is set here; everything else they add themselves
+    val updates = Map("numResidualFiles" -> stats.residualFiles.toLong)
     updates.foreach { case (name, value) => metrics(name).set(value) }
     val executionId = spark.sparkContext.getLocalProperty("spark.sql.execution.id")
     if (executionId != null) {

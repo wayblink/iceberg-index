@@ -28,8 +28,8 @@ import org.apache.spark.sql.SparkSession;
  *
  * <p>A vector query is planned once and answered by one pass over the index files, so the work a
  * query costs is the work one job does. Anything that runs a second job to collect what the first
- * one found is spending a scheduling round and a driver barrier on something a task could have done,
- * and that is what this counts.
+ * one found is spending a scheduling round and a driver barrier on something a task could have
+ * done, and that is what this counts.
  */
 final class SparkJobCounter {
 

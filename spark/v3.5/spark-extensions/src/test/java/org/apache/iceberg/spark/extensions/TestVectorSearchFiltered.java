@@ -23,15 +23,20 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 import java.nio.file.Path;
 import java.util.List;
+import java.util.stream.Collectors;
 import org.apache.iceberg.Table;
 import org.apache.iceberg.index.vector.VectorIndexTypes;
 import org.apache.iceberg.spark.Spark3Util;
+import org.apache.spark.sql.Dataset;
 import org.apache.spark.sql.Row;
 import org.apache.spark.sql.SparkSession;
+import org.apache.spark.sql.execution.SparkPlan;
+import org.apache.spark.sql.execution.metric.SQLMetric;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
+import scala.jdk.javaapi.CollectionConverters;
 
 /**
  * A vector query that also filters on another column is answered from the index, over the filtered
@@ -213,6 +218,84 @@ class TestVectorSearchFiltered {
                             .collectAsList()))
         .as("an unknown mode is refused rather than answered some other way")
         .hasMessageContaining("filter-mode");
+  }
+
+  @Test
+  void runsTheFilterWhereTheTaskSearches() throws Exception {
+    // one row of two hundred passes this filter and it is the farthest from the query, so the two
+    // links pay for it differently: reading the filter first scores that one row and answers in a
+    // single request, while judging after the search rejects window after window until the search
+    // has nothing left to offer. Both are answering the same question - the link decides what a
+    // window that keeps being rejected costs, which is why pre can fill one and post may not.
+    tableWithIndex("filtered_local");
+
+    assertThat(idsFor("filtered_local", "pre", " WHERE price = 299"))
+        .as("the filter runs before the search, so the admitted row is what gets scored")
+        .containsExactly(199L);
+    assertThat(roundsFor("filtered_local", "pre", " WHERE price = 299"))
+        .as("a search restricted to the admitted rows asks its file once")
+        .isEqualTo(1L);
+    assertThat(roundsFor("filtered_local", "post", " WHERE price = 299"))
+        .as("a search that scores everything first pays a round for every window it rejects")
+        .isGreaterThan(1L);
+  }
+
+  private static long roundsFor(String name, String mode, String where) {
+    return withConf(
+        mode,
+        () -> {
+          Dataset<Row> frame =
+              spark.sql(
+                  "SELECT id FROM local.db."
+                      + name
+                      + where
+                      + " ORDER BY vec_distance(embedding, array("
+                      + query()
+                      + "), 'euclidean') LIMIT 5");
+          // the rounds are added by the tasks as they run, so the query has to have run before the
+          // metric means anything
+          frame.collectAsList();
+          return metric(sourceExec(frame), "numCandidateRounds");
+        });
+  }
+
+  private static List<Long> idsFor(String name, String mode, String where) {
+    return withConf(
+        mode,
+        () ->
+            spark
+                .sql(
+                    "SELECT id FROM local.db."
+                        + name
+                        + where
+                        + " ORDER BY vec_distance(embedding, array("
+                        + query()
+                        + "), 'euclidean') LIMIT 5")
+                .collectAsList()
+                .stream()
+                .map(row -> row.getLong(0))
+                .collect(Collectors.toList()));
+  }
+
+  /** The lowered source in the executed plan, or a failure naming the plan that was built. */
+  private static SparkPlan sourceExec(Dataset<Row> frame) {
+    SparkPlan executed = frame.queryExecution().executedPlan();
+    for (SparkPlan leaf : CollectionConverters.asJava(executed.collectLeaves())) {
+      if (leaf.nodeName().contains("VectorSearch")) {
+        return leaf;
+      }
+    }
+
+    throw new AssertionError("No VectorSearch in the plan:\n" + executed);
+  }
+
+  private static long metric(SparkPlan plan, String name) {
+    SQLMetric metric = CollectionConverters.asJava(plan.metrics()).get(name);
+    if (metric == null) {
+      throw new AssertionError("No " + name + " in the plan's metrics");
+    }
+
+    return metric.value();
   }
 
   private static <T> T withConf(String mode, java.util.function.Supplier<T> body) {

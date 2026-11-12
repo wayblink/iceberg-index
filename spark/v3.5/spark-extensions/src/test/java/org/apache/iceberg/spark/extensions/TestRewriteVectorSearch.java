@@ -315,9 +315,9 @@ class TestRewriteVectorSearch {
   @Test
   public void aQuantizedIndexIsUsedWithTheWidthItsStructureCallsFor() {
     // The index is used whether or not the caller configured a multiple: a query is not answered by
-    // a scan because a knob was left alone. What the multiple does is decide how many candidates the
-    // estimate hands to the exact re-scoring, and the default width comes from the structure - three
-    // bits per dimension needs about ten, not one.
+    // a scan because a knob was left alone. What the multiple does is decide how many candidates
+    // the estimate hands to the exact re-scoring, and the default width comes from the structure:
+    // three bits per dimension needs about ten, not one.
     String table = table("docs_rab_default");
     spark.sql(
         String.format(

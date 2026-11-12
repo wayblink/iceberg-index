@@ -248,7 +248,7 @@ class TestVectorSearchExecution {
   }
 
   @Test
-  void aDeletedHitIsFilledFromAWiderRound() throws Exception {
+  void aDeletedHitIsFilledWithoutAWiderRound() throws Exception {
     String table = tableWithIndex("exec_deleted");
     // the closest row is deleted after the index was built, leaving a hole in the first candidates
     spark.sql(String.format("DELETE FROM local.db.%s WHERE id = 1", table));
@@ -257,8 +257,9 @@ class TestVectorSearchExecution {
     List<Row> rows = frame.collectAsList();
 
     assertThat(rows).hasSize(3);
+    assertThat(rows).extracting(row -> row.getLong(0)).doesNotContain(1L);
     SparkPlan source = sourceExec(frame);
-    // one deleted row is one unresolved hit, even though a wider round returns it again
+    // one deleted row is one unresolved hit, and it is counted once rather than on every round
     assertThat(metric(source, "numDeletedOrInvisibleHits")).isEqualTo(1L);
     // the rounds resolve against the same covered files, so each is counted once and not per round
     Table iceberg = Spark3Util.loadIcebergTable(spark, "local.db." + table);
@@ -268,11 +269,60 @@ class TestVectorSearchExecution {
         coveredFiles += 1;
       }
     }
-    assertThat(metric(source, "numCandidateRounds")).isGreaterThanOrEqualTo(2L);
     assertThat(metric(source, "numRowsAtFiles")).isEqualTo(coveredFiles);
-    assertThat(metric(source, "numCandidateRounds")).isGreaterThanOrEqualTo(2L);
+    // the window is asked for with one candidate to spare, so this table fills it in one round: a
+    // deleted hit is a hole the spare candidate covers, not a reason to search wider
+    assertThat(metric(source, "numCandidateRounds")).isEqualTo(1L);
     assertThat(metric(source, "numLiveCandidates")).isEqualTo(3L);
     assertThat(metric(source, "numIndexUnderfilled")).isZero();
+  }
+
+  @Test
+  void aWindowShortOfLiveRowsWidensInsideTheTask() {
+    String table = "exec_widened";
+    spark.sql("CREATE NAMESPACE IF NOT EXISTS local.db");
+    spark.sql(
+        String.format(
+            "CREATE TABLE local.db.%s %s TBLPROPERTIES ('write.delete.mode' = 'merge-on-read')",
+            table, COLUMNS));
+    // eight rows, and the four candidates a three-row window asks for are not all live: the task
+    // that read them has no second job to fall back on, so it asks its own index file for more
+    spark.sql(
+        String.format(
+            "INSERT INTO local.db.%s VALUES (1, array(1.0d, 0.0d)), (2, array(0.9d, 0.0d)), "
+                + "(3, array(0.8d, 0.0d)), (4, array(0.7d, 0.0d)), (5, array(0.6d, 0.0d)), "
+                + "(6, array(0.5d, 0.0d)), (7, array(0.4d, 0.0d)), (8, array(0.3d, 0.0d))",
+            table));
+    spark.sql(
+        String.format(
+            "CALL local.system.build_vector_index(table => 'db.%s', column => 'embedding', "
+                + "dimension => 2, structure => 'flat')",
+            table));
+    spark.sql(String.format("DELETE FROM local.db.%s WHERE id IN (1, 2, 3)", table));
+
+    String parameter = "spark.iceberg.index.vector.over-sample";
+    scala.Option<String> previous = spark.conf().getOption(parameter);
+    // the tightest window the caller can ask for, so the deleted rows are not covered by the spare
+    // candidates a wider budget would have asked for anyway
+    spark.conf().set(parameter, "1");
+    try {
+      Dataset<Row> frame = spark.sql(nearest(table, 3));
+      List<Row> rows = frame.collectAsList();
+
+      assertThat(rows).hasSize(3);
+      assertThat(rows).extracting(row -> row.getLong(0)).containsExactly(4L, 5L, 6L);
+      SparkPlan source = sourceExec(frame);
+      assertThat(metric(source, "numDeletedOrInvisibleHits")).isGreaterThanOrEqualTo(3L);
+      assertThat(metric(source, "numCandidateRounds")).isGreaterThanOrEqualTo(2L);
+      assertThat(metric(source, "numLiveCandidates")).isEqualTo(3L);
+      assertThat(metric(source, "numIndexUnderfilled")).isZero();
+    } finally {
+      if (previous.isDefined()) {
+        spark.conf().set(parameter, previous.get());
+      } else {
+        spark.conf().unset(parameter);
+      }
+    }
   }
 
   @Test
