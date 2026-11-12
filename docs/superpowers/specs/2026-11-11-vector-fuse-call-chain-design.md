@@ -239,14 +239,15 @@ lance-spark 把融合做在**原生扫描器**里：`ScanOptions.Builder().neare
 - 本项验证合计 721 个用例（`index-spark` 393 + spark-extensions 328）。
 - 未做：性能测量（按 #5447 的裁决留到功能完成后单独跑）。
 
-### 8.4 `step-1.9-index` 为什么还没有合入
+### 8.4 移到 `step-1.9-index` 时改了什么
 
-那条分支是**更窄的产品线**：`core` 里没有 `formats` SPI（没有 `FormatModelRegistry`）、`parquet` 里没有 `ParquetFormatModel`、也**没有 `lance` 模块**。所以融合的两个提交不能直接 cherry-pick：
+那条分支是更窄的产品线：`core` 没有 `formats` SPI（没有 `FormatModelRegistry`）、`parquet` 没有 `ParquetFormatModel`、也没有 `lance` 模块。所以这次不是 cherry-pick，而是按同一设计重新落了一遍，差别只有三处：
 
-- `IndexEntries.liveRowsAt` 用的是 `FormatModelRegistry.readBuilder(...)`；1.9 那边是自己写的 `readRecords(format, input, projection)`（`Parquet.read(...)`）。
-- `e849e76abf` / `fe8956bdb2`（Lance 端到端用例）在 1.9 上没有对应模块。
+1. **读行入口**：1.9 用自己的 `readRecords(format, input, projection, positions)` → `Parquet.read(input).project(...).positions(...)`（没有 format model registry 那一层）；`readFileWithFormat` 的编号/重贴位置逻辑与 `main` 相同。
+2. **`openDeletes`** 仍走 `readRecords`（这条线上删除文件只有 parquet 一种，没有"按表格式读删除文件"那一层）。
+3. **Lance 的端到端用例不存在**（没有 `lance` 模块），`TestLanceVectorSearch` 的两条用例只存在于 `main`；1.9 上靠 `TestVectorSearchFiltered` 的 `pre`/`post` 用例覆盖同一组语义。
 
-可以移植的部分：`parquet` 模块的 `positions()` 支持（`Parquet.java` + `ParquetReader.java`，自包含，只依赖 parquet-mr），以及把 1.9 的 `readRecords` 改成 `.positions(wanted)` 后接同样的 `liveRowsAt`。这需要一次真正的移植，不是 cherry-pick。
+移植后跑过：`Parquet` 位置读用例 + `index-spark` 全量 + 向量/全文/索引 TVF 相关 spark 用例，合计 **708 个全绿**。移植过程中那条"把 `pre` 与 `post` 区分开"的用例先红过一次，正好抓出两处被合并解掉的代码——候选集没有传给 kernel、行在过滤判定前就被裁到投影宽度。这两处修好后重跑全绿。
 
 ## 9. 待评审确认的点
 
