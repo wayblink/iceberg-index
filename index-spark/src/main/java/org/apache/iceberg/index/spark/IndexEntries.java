@@ -215,89 +215,6 @@ public final class IndexEntries {
     return rows;
   }
 
-  /**
-   * The live rows a filter keeps, as the positions the index would name them by.
-   *
-   * <p>An index search that knows which rows may be in the answer can skip the rest while it
-   * scores, which is what makes a filtered query cheaper than an unfiltered one instead of more
-   * expensive. The rows are read as the table is read, so delete files are applied and a removed
-   * row is not a candidate.
-   *
-   * <p>The set is held in memory on the driver and then broadcast, so it is only worth building
-   * when it is small: the read stops once it has seen more rows than the caller will hold, and says
-   * so by returning null rather than by truncating. A caller that gets null has to answer the query
-   * another way.
-   *
-   * @param spark the Spark session
-   * @param table the Iceberg table to read
-   * @param tasks the scan tasks whose rows are candidates, already narrowed by file level pruning
-   * @param schema the schema to read the rows with, or null to infer it from the files
-   * @param filter the filter the rows have to pass
-   * @param filterColumns the columns the filter names, which have to be read for it to be evaluated
-   * @param cap the most rows the caller is willing to hold
-   * @return the kept positions per data file, or null when the filter keeps more than {@code cap}
-   */
-  public static Map<String, long[]> matchingPositions(
-      SparkSession spark,
-      Table table,
-      java.util.Collection<FileScanTask> tasks,
-      Schema schema,
-      org.apache.iceberg.expressions.Expression filter,
-      List<String> filterColumns,
-      int cap) {
-    List<FileScanTask> taskList = Lists.newArrayList(tasks);
-    if (taskList.isEmpty()) {
-      return java.util.Collections.emptyMap();
-    }
-
-    Schema tableSchema = table.schema();
-    SnapshotDeletes deletes = SnapshotDeletes.read(spark, table, taskList, tableSchema);
-    SerializableConfiguration conf =
-        new SerializableConfiguration(spark.sessionState().newHadoopConf());
-    StructType readSchema = sparkSchema(table, filterColumns);
-    // the evaluator binds a reference to the position of its field, so it has to see the schema the
-    // rows are actually read with: the projection of the filter's columns, not the whole table
-    Schema readAs = sparkSchemaOf(table, filterColumns, schema);
-    IndexRowFilter rowFilter = new IndexRowFilter(readAs, filter);
-
-    JavaRDD<Row> kept = null;
-    for (FileScanTask task : taskList) {
-      String dataFile = task.file().location().toString();
-      JavaRDD<Row> fileRows =
-          liveRowsOf(spark, tableSchema, task, filterColumns, null, readSchema, deletes, conf)
-              .filter(entry -> rowFilter.matches(entry._2()))
-              .mapToPair(
-                  (PairFunction<Tuple2<Long, Row>, String, Long>)
-                      entry -> new Tuple2<>(dataFile, entry._1()))
-              .map(entry -> (Row) RowFactory.create(entry._1(), entry._2()));
-      kept = kept == null ? fileRows : kept.union(fileRows);
-    }
-
-    // taking one more than the cap is what tells the two cases apart without counting the whole set
-    // and then reading it again
-    List<Row> bounded = kept.take(cap + 1);
-    if (bounded.size() > cap) {
-      return null;
-    }
-
-    Map<String, List<Long>> byFile = Maps.newLinkedHashMap();
-    for (Row row : bounded) {
-      byFile.computeIfAbsent(row.getString(0), key -> Lists.newArrayList()).add(row.getLong(1));
-    }
-
-    Map<String, long[]> positions = Maps.newLinkedHashMap();
-    byFile.forEach(
-        (file, rows) -> positions.put(file, rows.stream().mapToLong(Long::longValue).toArray()));
-    return positions;
-  }
-
-  /**
-   * The schema the filter's columns are read with, which is what a bound reference indexes into.
-   */
-  private static Schema sparkSchemaOf(Table table, List<String> columns, Schema schema) {
-    return (schema == null ? table.schema() : schema).select(columns.toArray(new String[0]));
-  }
-
   /** The delete files of the tasks being read, read once. */
   private static SnapshotDeletes deletesFor(
       SparkSession spark, List<FileScanTask> tasks, Table table) {
@@ -846,6 +763,8 @@ public final class IndexEntries {
    * @param positions the positions to read, in ascending order
    * @param projection the columns to return, in this order
    * @param expected the schema to read the file with, or null to infer it from the file
+   * @param conf the Hadoop configuration to read the file with, which is the session's own and is
+   *     deserialized once per task rather than per file
    * @return the live rows, in ascending position order, each paired with its position
    */
   static List<Tuple2<Row, Long>> liveRowsAt(
@@ -854,7 +773,8 @@ public final class IndexEntries {
       SnapshotDeletes deletes,
       List<Long> positions,
       Schema projection,
-      org.apache.spark.sql.types.StructType expected) {
+      org.apache.spark.sql.types.StructType expected,
+      SerializableConfiguration conf) {
     if (positions.isEmpty()) {
       return Lists.newArrayList();
     }
@@ -890,7 +810,7 @@ public final class IndexEntries {
     Schema readSchema = projection.select(readColumns.toArray(new String[0]));
     java.util.Iterator<Tuple2<Row, Long>> read;
     try {
-      read = readFileWithFormat(dataFile, task.file().format(), readSchema, expected, wanted, null);
+      read = readFileWithFormat(dataFile, task.file().format(), readSchema, expected, wanted, conf);
     } catch (java.io.IOException e) {
       throw new java.io.UncheckedIOException("Failed to read " + dataFile, e);
     }
@@ -898,6 +818,12 @@ public final class IndexEntries {
     List<Tuple2<Row, Long>> rows = Lists.newArrayListWithCapacity(wanted.size());
     while (read.hasNext()) {
       Tuple2<Row, Long> entry = read.next();
+      // a format that ignored the positions read the whole file, so the rows it returned are
+      // numbered but not narrowed: only the ones that were asked for are part of the answer
+      if (java.util.Collections.binarySearch(wanted, entry._2()) < 0) {
+        continue;
+      }
+
       if (!survivesEqualityDeletes(entry._1(), keySets)) {
         continue;
       }
@@ -906,6 +832,85 @@ public final class IndexEntries {
     }
 
     return rows;
+  }
+
+  /**
+   * The live rows of one data file that a filter admits, as the positions a search names them by.
+   *
+   * <p>A task that restricts its search to the admitted rows has to know them, and reading them
+   * here is what makes that a local decision: it opens the file the task covers and reads the
+   * columns the filter names, so the price of the filter is the columns it needs rather than the
+   * whole row, and every task pays it in parallel with the others rather than in one pass over the
+   * table. The snapshot's deletes are applied as the rows stream past, so a row a delete file
+   * removed never becomes a candidate.
+   *
+   * @param io the table's file IO, so the file is read the way the table is read
+   * @param task the scan task of the file, of the snapshot being answered
+   * @param deletes the delete files of that snapshot
+   * @param filter the filter a row has to pass, bound to the columns of {@code filterColumns}
+   * @param tableSchema the table's schema, which the columns are selected from
+   * @param filterColumns the columns the filter names
+   * @param expected the schema to read the file with, or null to infer it from the file
+   * @param conf the Hadoop configuration to read the file with
+   * @return the admitted positions, in ascending order
+   */
+  static long[] positionsMatching(
+      FileIO io,
+      FileScanTask task,
+      SnapshotDeletes deletes,
+      IndexRowFilter filter,
+      Schema tableSchema,
+      List<String> filterColumns,
+      org.apache.spark.sql.types.StructType expected,
+      SerializableConfiguration conf) {
+    String dataFile = task.file().location().toString();
+    long[] deleted = deletes.deletedPositions(dataFile);
+    List<EqualityKeySet> keySets = deletes.keySets();
+
+    // the equality keys have to be read to judge a row, and a key the filter does not name still
+    // has to be read for that judgement to be possible
+    List<String> readColumns = Lists.newArrayList(filterColumns);
+    for (String key : deletes.keyColumns()) {
+      if (!readColumns.contains(key)) {
+        readColumns.add(key);
+      }
+    }
+
+    Schema readSchema = tableSchema.select(readColumns.toArray(new String[0]));
+    Schema filterSchema = tableSchema.select(filterColumns.toArray(new String[0]));
+    java.util.Iterator<Tuple2<Row, Long>> read;
+    try {
+      // no positions: every row of the file is read in file order, which is what makes the filter
+      // see the rows it has to judge rather than the rows a search happened to find
+      read = readFileWithFormat(dataFile, task.file().format(), readSchema, expected, null, conf);
+    } catch (java.io.IOException e) {
+      throw new java.io.UncheckedIOException("Failed to read " + dataFile, e);
+    }
+
+    long[] admitted = new long[64];
+    int count = 0;
+    while (read.hasNext()) {
+      Tuple2<Row, Long> entry = read.next();
+      if (java.util.Arrays.binarySearch(deleted, entry._2()) >= 0) {
+        continue;
+      }
+
+      if (!survivesEqualityDeletes(entry._1(), keySets)) {
+        continue;
+      }
+
+      if (!filter.matches(projectTo(entry._1(), readColumns, filterSchema))) {
+        continue;
+      }
+
+      if (count == admitted.length) {
+        admitted = java.util.Arrays.copyOf(admitted, admitted.length * 2);
+      }
+
+      admitted[count++] = entry._2();
+    }
+
+    return java.util.Arrays.copyOf(admitted, count);
   }
 
   /** Whether a row survives the equality deletes of the snapshot. */
@@ -972,9 +977,10 @@ public final class IndexEntries {
           Types.NestedField field = projection.columns().get(i);
           values[i] = toSparkValue(field.type(), record.getField(field.name()));
         }
-        // a format that honoured the positions returned exactly those rows, in ascending order
-        long position = wanted == null ? nextPosition : wanted.get((int) nextPosition);
-        rows.add(new Tuple2<>(new GenericRowWithSchema(values, sparkSchema), position));
+        // the row is numbered as it streams past, which is its position in the file. A format that
+        // honoured the positions returned exactly the rows asked for, and those are relabelled
+        // below; until the read ends there is no way to tell the two cases apart
+        rows.add(new Tuple2<>(new GenericRowWithSchema(values, sparkSchema), nextPosition));
         nextPosition++;
       }
     }
@@ -996,15 +1002,16 @@ public final class IndexEntries {
               + rows.size());
     }
 
-    if (wanted != null && rows.size() != wanted.size()) {
-      // the format ignored the positions and read the file, which is allowed: number the rows the
-      // way an unfiltered read would, so the caller's position filter still picks the hit rows
-      List<Tuple2<Row, Long>> numbered = Lists.newArrayListWithCapacity(rows.size());
+    if (wanted != null && rows.size() == wanted.size()) {
+      // the format honoured the positions: it returned exactly those rows, in ascending order, so
+      // the numbering they streamed with is the order asked for rather than the row's position
       for (int i = 0; i < rows.size(); i++) {
-        numbered.add(new Tuple2<>(rows.get(i)._1(), (long) i));
+        rows.set(i, new Tuple2<>(rows.get(i)._1(), wanted.get(i)));
       }
-      return numbered.iterator();
     }
+
+    // otherwise the format ignored the positions and read the file, which is allowed: the rows are
+    // numbered in file order, and the caller's position filter picks the ones it asked for
     return rows.iterator();
   }
 
@@ -1293,7 +1300,8 @@ public final class IndexEntries {
     }
   }
 
-  static final class SnapshotDeletes {
+  static final class SnapshotDeletes implements java.io.Serializable {
+    private static final long serialVersionUID = 1L;
 
     private static final long[] NO_POSITIONS = new long[0];
 
