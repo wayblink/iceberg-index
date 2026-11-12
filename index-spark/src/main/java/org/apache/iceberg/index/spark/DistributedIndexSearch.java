@@ -143,6 +143,7 @@ public final class DistributedIndexSearch {
     private final SQLMetric files;
     private final SQLMetric rounds;
     private final SQLMetric underfilled;
+    private final SQLMetric scanTasks;
 
     public RowCounters(
         SQLMetric requested,
@@ -152,7 +153,8 @@ public final class DistributedIndexSearch {
         SQLMetric outsideSnapshot,
         SQLMetric files,
         SQLMetric rounds,
-        SQLMetric underfilled) {
+        SQLMetric underfilled,
+        SQLMetric scanTasks) {
       this.requested = requested;
       this.lastRequest = lastRequest;
       this.live = live;
@@ -161,6 +163,7 @@ public final class DistributedIndexSearch {
       this.files = files;
       this.rounds = rounds;
       this.underfilled = underfilled;
+      this.scanTasks = scanTasks;
     }
 
     /** Adds what one index file's task found and what it cost. */
@@ -172,6 +175,7 @@ public final class DistributedIndexSearch {
         int outsideHits,
         int filesRead,
         int roundsRun,
+        int scanTasksShipped,
         boolean shortOfTopK) {
       add(requested, opening);
       add(lastRequest, last);
@@ -180,6 +184,7 @@ public final class DistributedIndexSearch {
       add(outsideSnapshot, outsideHits);
       add(files, filesRead);
       add(rounds, roundsRun);
+      add(scanTasks, scanTasksShipped);
       if (shortOfTopK) {
         add(underfilled, 1L);
       }
@@ -258,17 +263,28 @@ public final class DistributedIndexSearch {
       return context.emptyRDD();
     }
 
+    // a task is handed its own index file and the scan tasks of the files that file covers, so the
+    // table's file list does not travel with every task: what it needs is what it reads
+    Map<String, FileScanTask> tasksByLocation = Maps.newHashMap();
+    for (FileScanTask task : scanTasks) {
+      tasksByLocation.put(task.file().location().toString(), task);
+    }
+
     List<String> locations = Lists.newArrayListWithCapacity(files.size());
-    Map<String, Long> entriesByLocation = Maps.newHashMap();
-    Map<String, List<String>> coveredByLocation = Maps.newHashMap();
+    List<IndexFileTask> shipped = Lists.newArrayListWithCapacity(files.size());
     for (IndexFile file : files) {
+      List<FileScanTask> covered = Lists.newArrayList();
+      for (String dataFile : file.coveredDataFiles()) {
+        FileScanTask task = tasksByLocation.get(dataFile);
+        if (task != null) {
+          // a file the frozen snapshot no longer has has entries the index still names, and a hit
+          // of one is counted as outside the snapshot rather than read
+          covered.add(task);
+        }
+      }
+
       locations.add(file.location());
-      // what a task may widen up to: an index file holds no more rows than it says it does
-      entriesByLocation.put(file.location(), file.entryCount());
-      // the data files this index file has entries for, which is what a task reads when the query
-      // asks for the filter to run before the search: the restriction it applies is the rows of the
-      // files it covers, not the rows of the table
-      coveredByLocation.put(file.location(), file.coveredDataFiles());
+      shipped.add(new IndexFileTask(file.location(), file.entryCount(), covered));
     }
 
     JavaSparkContext sparkContext = context;
@@ -284,15 +300,13 @@ public final class DistributedIndexSearch {
     // with
     Broadcast<FileIO> ioRef = sparkContext.broadcast(table.io());
     Broadcast<byte[][]> payloadsRef = sparkContext.broadcast(payloads);
-    Broadcast<Map<String, Long>> entriesRef = sparkContext.broadcast(entriesByLocation);
-    Broadcast<Map<String, List<String>>> coveredRef = sparkContext.broadcast(coveredByLocation);
     Broadcast<RowReadPlan> planRef =
         sparkContext.broadcast(
             RowReadPlan.of(
                 projection,
                 expected,
-                scanTasks,
-                IndexEntries.SnapshotDeletes.read(spark, table, scanTasks, table.schema()),
+                IndexEntries.SnapshotDeletes.read(
+                    spark, table, coveredTasks(shipped), table.schema()),
                 new SerializableConfiguration(spark.sessionState().newHadoopConf()),
                 filter,
                 candidateFilter,
@@ -325,20 +339,19 @@ public final class DistributedIndexSearch {
     // or
     // a posting list of its own, so it is read whole and searched as a whole, and the number of
     // partitions is the number of index files rather than whatever a byte budget would make of them
-    return IndexFileRdds.javaRdd(sparkContext.sc(), locations, cacheKeys, locationsTable, locality)
+    return IndexFileRdds.tasks(sparkContext.sc(), shipped, cacheKeys, locationsTable, locality)
         .mapPartitions(
-            (FlatMapFunction<Iterator<String>, Row>)
-                indexLocations -> {
+            (FlatMapFunction<Iterator<IndexFileTask>, Row>)
+                indexFiles -> {
                   IndexAdapter fileAdapter = adapterRef.getValue();
                   byte[][] filePayloads = payloadsRef.getValue();
-                  Map<String, Long> fileEntries = entriesRef.getValue();
-                  Map<String, List<String>> fileCovered = coveredRef.getValue();
                   FileIO fileIO = ioRef.getValue();
                   ExecutorIndexCache.Config cacheConfig = cacheRef.getValue();
                   RowReadPlan plan = planRef.getValue();
                   List<Row> partitionRows = Lists.newArrayList();
-                  while (indexLocations.hasNext()) {
-                    String location = indexLocations.next();
+                  while (indexFiles.hasNext()) {
+                    IndexFileTask indexFile = indexFiles.next();
+                    String location = indexFile.location();
                     ExecutorIndexCache cache = ExecutorIndexCache.get();
                     String managedKey = cacheKey(cacheConfig.owner(), cacheKey, location);
                     // A file residency management owns is leased, so a release waits for this
@@ -355,12 +368,9 @@ public final class DistributedIndexSearch {
                                 sizeHint(fileIO, location),
                                 () -> loadFile(fileIO, location, fileAdapter));
                     try {
-                      Long entries = fileEntries.get(location);
                       // what this task may score at all, when the query asked for the filter to run
                       // before the search: the admitted rows of the files this index file covers
-                      IndexCandidates candidates =
-                          plan.candidatesOf(
-                              fileIO, fileCovered.getOrDefault(location, ImmutableList.of()));
+                      IndexCandidates candidates = plan.candidatesOf(fileIO, indexFile.tasks());
                       FileOutcome outcome =
                           rowsOfIndexFile(
                               file,
@@ -368,10 +378,11 @@ public final class DistributedIndexSearch {
                               filePayloads,
                               topK,
                               initial,
-                              entries == null ? Long.MAX_VALUE : entries.longValue(),
+                              indexFile.entryCount(),
                               higherScoreFirst,
                               candidates,
-                              plan);
+                              plan,
+                              indexFile.tasks());
                       if (tally != null) {
                         tally.report(
                             opening,
@@ -381,6 +392,7 @@ public final class DistributedIndexSearch {
                             outcome.outsideSnapshot,
                             outcome.filesRead,
                             outcome.rounds,
+                            indexFile.tasks().size(),
                             outcome.rows.size() < topK);
                       }
                       partitionRows.addAll(outcome.rows);
@@ -393,6 +405,16 @@ public final class DistributedIndexSearch {
                   reportCache(cacheReports, queryRun);
                   return partitionRows.iterator();
                 });
+  }
+
+  /** Every scan task a task may read, which is what the snapshot's deletes are read for. */
+  private static List<FileScanTask> coveredTasks(List<IndexFileTask> files) {
+    List<FileScanTask> tasks = Lists.newArrayList();
+    for (IndexFileTask file : files) {
+      tasks.addAll(file.tasks());
+    }
+
+    return tasks;
   }
 
   /** What one index file's task found, and what it cost to find it. */
@@ -438,7 +460,8 @@ public final class DistributedIndexSearch {
       long entries,
       boolean higherScoreFirst,
       IndexCandidates candidates,
-      RowReadPlan plan) {
+      RowReadPlan plan,
+      List<FileScanTask> ownTasks) {
     // a kernel that filters while it searches scores the admitted rows and nothing else, so the
     // window is filled from them; one that cannot do that answers the unfiltered question instead,
     // and the hits outside the set are dropped below rather than counted as rejected
@@ -467,7 +490,7 @@ public final class DistributedIndexSearch {
           more = true;
         }
 
-        RowsAtHits read = plan.rowsOf(hits, io);
+        RowsAtHits read = plan.rowsOf(hits, io, ownTasks);
         unresolved += read.unresolved;
         outside += read.outsideSnapshot;
         filesRead.addAll(read.dataFiles);
@@ -579,7 +602,6 @@ public final class DistributedIndexSearch {
 
     private final Schema projection;
     private final StructType expected;
-    private final List<FileScanTask> scanTasks;
     private final IndexEntries.SnapshotDeletes deletes;
     private final SerializableConfiguration conf;
     private final IndexRowFilter filter;
@@ -588,12 +610,9 @@ public final class DistributedIndexSearch {
     private final Schema tableSchema;
     private final int keep;
 
-    private transient Map<String, FileScanTask> tasksByLocation;
-
     private RowReadPlan(
         Schema projection,
         StructType expected,
-        List<FileScanTask> scanTasks,
         IndexEntries.SnapshotDeletes deletes,
         SerializableConfiguration conf,
         IndexRowFilter filter,
@@ -603,7 +622,6 @@ public final class DistributedIndexSearch {
         int keep) {
       this.projection = projection;
       this.expected = expected;
-      this.scanTasks = new ArrayList<>(scanTasks);
       this.deletes = deletes;
       this.conf = conf;
       this.filter = filter;
@@ -616,7 +634,6 @@ public final class DistributedIndexSearch {
     static RowReadPlan of(
         Schema projection,
         StructType expected,
-        List<FileScanTask> scanTasks,
         IndexEntries.SnapshotDeletes deletes,
         SerializableConfiguration conf,
         IndexRowFilter filter,
@@ -627,7 +644,6 @@ public final class DistributedIndexSearch {
       return new RowReadPlan(
           projection,
           expected,
-          scanTasks,
           deletes,
           conf,
           filter,
@@ -638,7 +654,7 @@ public final class DistributedIndexSearch {
     }
 
     /** The live rows the hits name, with the score the index gave each of them. */
-    RowsAtHits rowsOf(List<IndexSearchResult> hits, FileIO io) {
+    RowsAtHits rowsOf(List<IndexSearchResult> hits, FileIO io, List<FileScanTask> ownTasks) {
       if (hits.isEmpty()) {
         return new RowsAtHits(ImmutableList.of(), 0, 0, new java.util.HashSet<>());
       }
@@ -652,7 +668,7 @@ public final class DistributedIndexSearch {
       Set<String> files = new java.util.HashSet<>();
       int unresolved = 0;
       int outside = 0;
-      Map<String, FileScanTask> byLocation = tasksByLocation();
+      Map<String, FileScanTask> byLocation = tasksByLocation(ownTasks);
       for (Map.Entry<String, List<IndexSearchResult>> entry : byFile.entrySet()) {
         String dataFile = entry.getKey();
         FileScanTask task = byLocation.get(dataFile);
@@ -699,22 +715,15 @@ public final class DistributedIndexSearch {
      * keeps a small share of the table is what makes restricting the search worth it, and a task
      * knows its own share without asking the driver for the table's.
      */
-    IndexCandidates candidatesOf(FileIO io, List<String> dataFiles) {
-      if (candidateFilter == null || dataFiles.isEmpty()) {
+    IndexCandidates candidatesOf(FileIO io, List<FileScanTask> ownTasks) {
+      if (candidateFilter == null || ownTasks.isEmpty()) {
         return null;
       }
 
-      Map<String, FileScanTask> byLocation = tasksByLocation();
       Map<String, long[]> positions = Maps.newLinkedHashMap();
       long count = 0;
-      for (String dataFile : dataFiles) {
-        FileScanTask task = byLocation.get(dataFile);
-        if (task == null) {
-          // a file the frozen snapshot no longer has cannot contribute a row, and its entries are
-          // already counted as outside the snapshot when a hit names one
-          continue;
-        }
-
+      for (FileScanTask task : ownTasks) {
+        String dataFile = task.file().location().toString();
         long[] admitted =
             IndexEntries.positionsMatching(
                 io, task, deletes, candidateFilter, tableSchema, filterColumns, expected, conf);
@@ -750,17 +759,13 @@ public final class DistributedIndexSearch {
       return org.apache.spark.sql.RowFactory.create(values);
     }
 
-    private Map<String, FileScanTask> tasksByLocation() {
-      if (tasksByLocation == null) {
-        Map<String, FileScanTask> byLocation = Maps.newHashMap();
-        for (FileScanTask task : scanTasks) {
-          byLocation.put(task.file().location().toString(), task);
-        }
-
-        tasksByLocation = byLocation;
+    private static Map<String, FileScanTask> tasksByLocation(List<FileScanTask> tasks) {
+      Map<String, FileScanTask> byLocation = Maps.newHashMap();
+      for (FileScanTask task : tasks) {
+        byLocation.put(task.file().location().toString(), task);
       }
 
-      return tasksByLocation;
+      return byLocation;
     }
   }
 
