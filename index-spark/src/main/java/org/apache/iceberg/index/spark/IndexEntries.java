@@ -815,6 +815,14 @@ public final class IndexEntries {
       throw new java.io.UncheckedIOException("Failed to read " + dataFile, e);
     }
 
+    // the schema the caller made describes its projection; the read also carries the
+    // equality-delete
+    // keys, so the row a reader builds has to be described by what was actually read
+    StructType rowSchema =
+        expected != null && expected.size() == readSchema.columns().size()
+            ? expected
+            : toSparkSchema(readSchema);
+
     List<Tuple2<Row, Long>> rows = Lists.newArrayListWithCapacity(wanted.size());
     while (read.hasNext()) {
       Tuple2<Row, Long> entry = read.next();
@@ -882,7 +890,11 @@ public final class IndexEntries {
     try {
       // no positions: every row of the file is read in file order, which is what makes the filter
       // see the rows it has to judge rather than the rows a search happened to find
-      read = readFileWithFormat(dataFile, task.file().format(), readSchema, expected, null, conf);
+      StructType rowSchema =
+          expected != null && expected.size() == readSchema.columns().size()
+              ? expected
+              : toSparkSchema(readSchema);
+      read = readFileWithFormat(dataFile, task.file().format(), readSchema, rowSchema, null, conf);
     } catch (java.io.IOException e) {
       throw new java.io.UncheckedIOException("Failed to read " + dataFile, e);
     }

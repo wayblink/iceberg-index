@@ -21,6 +21,7 @@ package org.apache.iceberg.parquet;
 import java.io.IOException;
 import java.util.List;
 import java.util.function.Function;
+import java.util.stream.Collectors;
 import org.apache.iceberg.Schema;
 import org.apache.iceberg.exceptions.RuntimeIOException;
 import org.apache.iceberg.expressions.Expression;
@@ -137,6 +138,8 @@ public class ParquetReader<T> extends CloseableGroup implements CloseableIterabl
     // the rows this lookup asked for, ascending and distinct, or null to read the whole file
     private final List<Long> positions;
     private final long fileRowCount;
+    // how many of the requested positions this file holds: a position past the end names no row
+    private final int readablePositions;
 
     private int nextRowGroup = 0;
     private long nextRowGroupStart = 0;
@@ -155,15 +158,18 @@ public class ParquetReader<T> extends CloseableGroup implements CloseableIterabl
       this.model = conf.model();
       this.totalValues = conf.totalValues();
       this.reuseContainers = conf.reuseContainers();
-      this.positions = positions;
+      this.positions =
+          positions == null
+              ? null
+              : positions.stream().distinct().sorted().collect(Collectors.toList());
       this.fileRowCount = positions == null ? 0L : rowCount(reader);
+      this.readablePositions = positions == null ? 0 : readable(fileRowCount);
     }
 
     @Override
     public boolean hasNext() {
       if (positions != null) {
-        // a position the file does not hold names no row, so the answer is the ones it does hold
-        return positionsRead < readablePositions();
+        return positionsRead < readablePositions;
       }
 
       return valuesRead < totalValues;
@@ -223,11 +229,11 @@ public class ParquetReader<T> extends CloseableGroup implements CloseableIterabl
       model.setPageSource(pages);
     }
 
-    /** How many of the requested positions this file actually holds. */
-    private int readablePositions() {
+    /** How many of the requested positions a file of the given row count holds. */
+    private int readable(long rows) {
       int readable = 0;
       for (Long position : positions) {
-        if (position < fileRowCount) {
+        if (position < rows) {
           readable += 1;
         } else {
           break;
@@ -242,7 +248,7 @@ public class ParquetReader<T> extends CloseableGroup implements CloseableIterabl
      * and none of the others.
      */
     private void advanceToNextPosition() {
-      while (positionsRead < readablePositions()) {
+      while (positionsRead < readablePositions) {
         long wanted = positions.get(positionsRead);
         if (selectedPages.isEmpty()) {
           PageReadStore pages = readPagesHolding(wanted);
@@ -306,7 +312,7 @@ public class ParquetReader<T> extends CloseableGroup implements CloseableIterabl
           continue;
         }
 
-        long lastWanted = positions.get(readablePositions() - 1);
+        long lastWanted = positions.get(readablePositions - 1);
         if (start > lastWanted) {
           return null;
         }
@@ -314,6 +320,16 @@ public class ParquetReader<T> extends CloseableGroup implements CloseableIterabl
         try {
           if (block.getColumns().isEmpty()) {
             return null;
+          }
+
+          if (block.getColumns().get(0).getOffsetIndexReference() == null) {
+            // a file written without page indexes cannot say where a row sits, so the group is read
+            // whole and the rows are filtered as they stream past
+            selectedPages.clear();
+            selectedPages.add(new long[] {start, end});
+            nextRowPosition = start;
+            return reader.readFilteredRowGroup(
+                blockIndex, RowRanges.createSingle(block.getRowCount()));
           }
 
           OffsetIndex offsetIndex = reader.readOffsetIndex(block.getColumns().get(0));
