@@ -21,7 +21,7 @@
 
 日期：2026-11-11。关联：#3038（本设计的实施卡）、#3013（带过滤检索，已合入）、#3039（废弃 `auto`，已合入）。代码基线：`main @ 731ce9dccd`。
 
-状态：第 2、3、4 步已实施（2026-11-11，分支 `card/3038`）；第 5、6 步未做。实施结果与本文的偏差见 §8。
+状态：第 2–5 步已实施（2026-11-11，分支 `card/3038`）；第 6 步（Lance 端到端用例）未做。实施结果与本文的偏差见 §8。
 
 ## 1. 结论摘要
 
@@ -106,7 +106,7 @@ VectorSearchExec.rows (或新的 fused 入口)
    ├─(A') 候选集：pre 链路下移为"每个检索任务只为自己覆盖的数据文件算"（第 4 步）
    │
    ├─(B') DistributedIndexSearch.searchWithRows(...)        ← 新重载，一个 job
-   │      一个分区 = 一个索引文件（后续可细化到"索引文件 ↔ 其覆盖的数据文件"分组）
+   │      一个分区 = 一个索引文件 + 它覆盖的 scan task（`IndexFileTask`，见 §8.1-9）
    │      任务内顺序：
    │        1) ExecutorIndexCache 取/载索引 payload（不变，仍受驻留管理）
    │        2) prepared.search(query, localTopK, candidates)  → 本分区命中的 (dataFile, pos, score)
@@ -159,7 +159,7 @@ try (CloseableIterable<Record> records = builder.project(projection).build()) { 
 | 2 | `DistributedIndexSearch` 新增带行输出的重载；任务内 `searchFile` → `readFileWithFormat` → 本地 top-k | 已完成：三种形状各 1 个 job |
 | 3 | `VectorSearchExec` 在该路径上不再调用 `rowsAt` / `rowsToDd`；`MaxRounds` 下移 | 已完成：driver 持有命中行 = 0 |
 | 4 | `pre` 的候选计算下移（每个任务只为自己的覆盖文件算） | 已完成：`MaxCandidateRows` 与"超限即失败"分支消失，`pre` 断言转绿 |
-| 5 | 分组细化：按"索引文件 ↔ 覆盖的数据文件"分区并精确下发 scan task | 每分区 task 数与上送字节数可观测 |
+| 5 | 分组细化：按"索引文件 ↔ 覆盖的数据文件"分区并精确下发 scan task | 已完成：分区携带自己的 index file + entryCount + 覆盖 scan task，`numScanTasksShipped` 可观测 |
 | 6 | 验收：逐行一致（delete / residual / `pre`+`post`）、**补 Lance 格式端到端用例** | 与现实现结果集与顺序一致 |
 
 `auto` 已在 #3039 废弃，链路只有 `pre` 与 `post` 两种取值、默认 `pre`。
@@ -208,20 +208,22 @@ lance-spark 把融合做在**原生扫描器**里：`ScanOptions.Builder().neare
 5. **`readFileWithFormat` 的位置语义被修正。** 旧代码在流式读取时就把 `wanted.get(i)` 当作行位置，只有在"读完发现条数不等"时才回退成按序编号。Parquet 的格式模型**不实现** `positions(...)`（`ReadBuilder` 默认忽略，这里只有 Lance 实现），于是流式读到第 `wanted.size()+1` 行就越界。现在行一律按流过的序号编号，读完再判断"条数正好等于请求数"才重贴位置；调用方另外按请求集合过滤，两种情形都正确。
 6. **过滤列在判定之前不能被裁掉。** 取回的行是"投影 + 过滤需要的列"，判定通过后才裁回投影宽度；先裁再判会让过滤看到不含自己列的行走，`post` 会因此拒绝一切。
 7. **指标改成任务上报。** 行不再经过 driver，所以 `numCandidates` / `numCandidateRequests` / `numCandidateRounds` / `numLiveCandidates` / `numDeletedOrInvisibleHits` / `numHitsOutsideSnapshot` / `numRowsAtFiles` / `numIndexUnderfilled` 都是任务累加的计数（语义从"一条查询的数"变成"各索引文件之和"），driver 仍只设定 `numResidualFiles`。
-8. **`ExecutorIndexCache` 的局部性表不再被融合查询刷新。** `mergeCacheReports` 原本在 `search()` 的 `takeOrdered` 之后执行；融合路径没有任何 driver 侧 action，因此本查询无法在规划期消费自己的上报。**已知退化，未修**：局部性提示由其它入口（TVF / 全文）维持。
+8. **分组细化（第 5 步）：分区携带自己的数据。** 每分区是一个 `IndexFileTask`（索引文件位置 + `entryCount` + 该文件覆盖的 `FileScanTask` 列表），由 `IndexFileTaskRDD` 构造，局部性提示与原来同一套（`IndexFileRdds.preferred`）。于是任务只拿到自己会读的那些文件：表级 `scanTasks` 不再随每个任务走，也不再需要 `coveredByLocation` / `entriesByLocation` 两个 broadcast。附带收益：`SnapshotDeletes.read` 只读覆盖文件上的删除文件。可观测项是新指标 `numScanTasksShipped`（各 index task 收到的 scan task 数之和），用例断言它等于索引覆盖的当前文件数，且在"部分覆盖"的表上严格小于表的数据文件数。
+9. **`ExecutorIndexCache` 的局部性表不再被融合查询刷新。** `mergeCacheReports` 原本在 `search()` 的 `takeOrdered` 之后执行；融合路径没有任何 driver 侧 action，因此本查询无法在规划期消费自己的上报。**已知退化，未修**：局部性提示由其它入口（TVF / 全文）维持。
 
 ### 8.2 验证
 
 - `TestVectorSearchFiltered.answersAFilteredQueryInOneJob`：三种形状各 1 个 job（红 → 绿）。
 - `TestVectorSearchFiltered.runsTheFilterWhereTheTaskSearches`：同一句过滤下 `pre` 1 轮答出唯一放行行、`post` 多轮拒绝窗口——两个取值真的是两条局部策略。
 - `TestVectorSearchExecution.aWindowShortOfLiveRowsWidensInsideTheTask`：8 行表、删除最近 3 行、`over-sample=1`，任务内扩样一轮补齐窗口（`numCandidateRounds ≥ 2`、`numIndexUnderfilled = 0`）。
-- 向量/全文相关 spark-extensions 用例 305 个 + `index-spark` 393 个全绿（含 `rowsAt` / 删除 / 等值删除路径）。
-- 未做：第 5 步（按"索引文件 ↔ 覆盖数据文件"精确分组下发 scan task，现在仍是全表 `scanTasks` 随 broadcast 下发）、第 6 步的 Lance 端到端用例、以及性能测量（按 #5447 的裁决留到功能完成后单独跑）。
+- 向量/全文相关 spark-extensions 用例 305 个 + `index-spark` 393 个 + `spark-3.5` 索引用例 43 个全绿（含 `rowsAt` / 删除 / 等值删除路径）。
+- 第 5 步的可观测断言落在 `TestVectorSearchExecution`：`aFullyCoveredQueryReportsNoResidualBranch` 断言 `numScanTasksShipped == 覆盖文件数`；`aPartlyCoveredQueryReportsBothBranches` 断言它等于覆盖文件数且**严格小于**表的数据文件数（即不再把未覆盖文件也发给每个 index task）。
+- 未做：第 6 步的 Lance 端到端用例，以及性能测量（按 #5447 的裁决留到功能完成后单独跑）。
 
 ## 9. 待评审确认的点
 
 1. ~~分步顺序是否认可~~：已确认。
 2. ~~`rowsAt`/`rowsToDd` 的移除范围~~：已确认为只针对 `VectorSearchExec` 路径。
-3. 待定：第 5 步"分组细化"本轮必须做，还是先按"一索引文件一分区"跑通再单独优化。
-4. 待定：融合查询不再刷新 `ExecutorIndexCache` 的局部性表（§8.1-8），是否值得为它单独设计一条上报路径。
+3. ~~第 5 步的分组细化~~：已做（§8.1-9）。
+4. 待定：融合查询不再刷新 `ExecutorIndexCache` 的局部性表（§8.1-9），是否值得为它单独设计一条上报路径。
 5. 待定：`pre` 的候选集现在是按文件的 `long[]`，规模是该 task 覆盖文件的放行行数；10M/100M 规模下的 task 内存还没有实测（在 §8.2 的"未做"里）。
