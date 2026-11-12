@@ -21,7 +21,7 @@
 
 日期：2026-11-11。关联：#3038（本设计的实施卡）、#3013（带过滤检索，已合入）、#3039（废弃 `auto`，已合入）。代码基线：`main @ 731ce9dccd`。
 
-状态：第 2–5 步已实施（2026-11-11，分支 `card/3038`）；第 6 步（Lance 端到端用例）未做。实施结果与本文的偏差见 §8。
+状态：第 2–6 步已实施（2026-11-11，分支 `card/3038`）。实施结果与本文的偏差见 §8。
 
 ## 1. 结论摘要
 
@@ -160,7 +160,7 @@ try (CloseableIterable<Record> records = builder.project(projection).build()) { 
 | 3 | `VectorSearchExec` 在该路径上不再调用 `rowsAt` / `rowsToDd`；`MaxRounds` 下移 | 已完成：driver 持有命中行 = 0 |
 | 4 | `pre` 的候选计算下移（每个任务只为自己的覆盖文件算） | 已完成：`MaxCandidateRows` 与"超限即失败"分支消失，`pre` 断言转绿 |
 | 5 | 分组细化：按"索引文件 ↔ 覆盖的数据文件"分区并精确下发 scan task | 已完成：分区携带自己的 index file + entryCount + 覆盖 scan task，`numScanTasksShipped` 可观测 |
-| 6 | 验收：逐行一致（delete / residual / `pre`+`post`）、**补 Lance 格式端到端用例** | 与现实现结果集与顺序一致 |
+| 6 | 验收：逐行一致（delete / residual / `pre`+`post`）、**补 Lance 格式端到端用例** | 已完成：`TestLanceVectorSearch` 覆盖 ivf/flat × pre/post × 删除 |
 
 `auto` 已在 #3039 废弃，链路只有 `pre` 与 `post` 两种取值、默认 `pre`。
 
@@ -209,7 +209,8 @@ lance-spark 把融合做在**原生扫描器**里：`ScanOptions.Builder().neare
 6. **过滤列在判定之前不能被裁掉。** 取回的行是"投影 + 过滤需要的列"，判定通过后才裁回投影宽度；先裁再判会让过滤看到不含自己列的行走，`post` 会因此拒绝一切。
 7. **指标改成任务上报。** 行不再经过 driver，所以 `numCandidates` / `numCandidateRequests` / `numCandidateRounds` / `numLiveCandidates` / `numDeletedOrInvisibleHits` / `numHitsOutsideSnapshot` / `numRowsAtFiles` / `numIndexUnderfilled` 都是任务累加的计数（语义从"一条查询的数"变成"各索引文件之和"），driver 仍只设定 `numResidualFiles`。
 8. **分组细化（第 5 步）：分区携带自己的数据。** 每分区是一个 `IndexFileTask`（索引文件位置 + `entryCount` + 该文件覆盖的 `FileScanTask` 列表），由 `IndexFileTaskRDD` 构造，局部性提示与原来同一套（`IndexFileRdds.preferred`）。于是任务只拿到自己会读的那些文件：表级 `scanTasks` 不再随每个任务走，也不再需要 `coveredByLocation` / `entriesByLocation` 两个 broadcast。附带收益：`SnapshotDeletes.read` 只读覆盖文件上的删除文件。可观测项是新指标 `numScanTasksShipped`（各 index task 收到的 scan task 数之和），用例断言它等于索引覆盖的当前文件数，且在"部分覆盖"的表上严格小于表的数据文件数。
-9. **`ExecutorIndexCache` 的局部性表不再被融合查询刷新。** `mergeCacheReports` 原本在 `search()` 的 `takeOrdered` 之后执行；融合路径没有任何 driver 侧 action，因此本查询无法在规划期消费自己的上报。**已知退化，未修**：局部性提示由其它入口（TVF / 全文）维持。
+9. **不能边搜边过滤的 kernel 要靠放宽 `asked` 收敛。** `IndexAdapter.PreparedSearch` 的默认实现是"先打分再 `retain` 候选集"，只有 IVF 的第三重载真的在打分时跳过被排除的行（`joinsCandidateSet()`）。对前者，答案条数不能说明它是否还有没给的行：一个选择性很高的过滤会让答案一直很小，于是原来的 `more = hits.size() >= asked` 会在第一轮就判定"文件已经没货"，`pre` 直接返回空。现在对这类 kernel 改成"问遍该文件的 `entries`"为止（`more = asked < entries`），代价是这时的 `pre` 退化成 post 式扩样——Lance 的端到端用例（flat 结构 + 只放行 139/200 行的过滤）就是这个 bug 的现场。
+10. **`ExecutorIndexCache` 的局部性表不再被融合查询刷新。** `mergeCacheReports` 原本在 `search()` 的 `takeOrdered` 之后执行；融合路径没有任何 driver 侧 action，因此本查询无法在规划期消费自己的上报。**已知退化，未修**：局部性提示由其它入口（TVF / 全文）维持。
 
 ### 8.2 验证
 
@@ -218,12 +219,14 @@ lance-spark 把融合做在**原生扫描器**里：`ScanOptions.Builder().neare
 - `TestVectorSearchExecution.aWindowShortOfLiveRowsWidensInsideTheTask`：8 行表、删除最近 3 行、`over-sample=1`，任务内扩样一轮补齐窗口（`numCandidateRounds ≥ 2`、`numIndexUnderfilled = 0`）。
 - 向量/全文相关 spark-extensions 用例 305 个 + `index-spark` 393 个 + `spark-3.5` 索引用例 43 个全绿（含 `rowsAt` / 删除 / 等值删除路径）。
 - 第 5 步的可观测断言落在 `TestVectorSearchExecution`：`aFullyCoveredQueryReportsNoResidualBranch` 断言 `numScanTasksShipped == 覆盖文件数`；`aPartlyCoveredQueryReportsBothBranches` 断言它等于覆盖文件数且**严格小于**表的数据文件数（即不再把未覆盖文件也发给每个 index task）。
-- 未做：第 6 步的 Lance 端到端用例，以及性能测量（按 #5447 的裁决留到功能完成后单独跑）。
+- Lance 端到端（第 6 步）在 `TestLanceVectorSearch`：`aFilteredSearchAnswersFromLanceFilesOnEitherSideOfTheSearch` 覆盖 ivf/flat × `pre`/`post`（候选读、按位置回表都走 Lance 格式模型），`aFilteredSearchSkipsRowsDeletedInTheTablesOwnFormat` 覆盖 Lance 位置删除与过滤同时生效，两者都跟全表扫描逐行比对。
+- 本项验证合计 721 个用例（`index-spark` 393 + spark-extensions 328）。
+- 未做：性能测量（按 #5447 的裁决留到功能完成后单独跑）。
 
 ## 9. 待评审确认的点
 
 1. ~~分步顺序是否认可~~：已确认。
 2. ~~`rowsAt`/`rowsToDd` 的移除范围~~：已确认为只针对 `VectorSearchExec` 路径。
 3. ~~第 5 步的分组细化~~：已做（§8.1-9）。
-4. 待定：融合查询不再刷新 `ExecutorIndexCache` 的局部性表（§8.1-9），是否值得为它单独设计一条上报路径。
+4. 待定：融合查询不再刷新 `ExecutorIndexCache` 的局部性表（§8.1-10），是否值得为它单独设计一条上报路径。
 5. 待定：`pre` 的候选集现在是按文件的 `long[]`，规模是该 task 覆盖文件的放行行数；10M/100M 规模下的 task 内存还没有实测（在 §8.2 的"未做"里）。
