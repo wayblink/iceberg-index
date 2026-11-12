@@ -374,6 +374,14 @@ public class ParquetFormatModel<D, S, R>
     }
 
     @Override
+    public ReadBuilder<D, S> positions(java.util.Collection<Long> requested) {
+      // the reader lands on the pages that hold these rows and decodes nothing else, which is what
+      // makes resolving a handful of hits cost a handful of pages instead of a file
+      internal.positions(requested);
+      return this;
+    }
+
+    @Override
     public ReadBuilder<D, S> set(String key, String value) {
       internal.set(key, value);
       return this;

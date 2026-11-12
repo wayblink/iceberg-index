@@ -1260,6 +1260,7 @@ public class Parquet {
     private final Map<String, String> properties = Maps.newHashMap();
     private Long start = null;
     private Long length = null;
+    private java.util.List<Long> positions = null;
     private Schema schema = null;
     private Expression filter = null;
     private ReadSupport<?> readSupport = null;
@@ -1370,6 +1371,28 @@ public class Parquet {
 
     public ReadBuilder filterRecords(boolean newFilterRecords) {
       this.filterRecords = newFilterRecords;
+      return this;
+    }
+
+    /**
+     * Reads only the rows at the given positions of the file.
+     *
+     * <p>A lookup that already knows the rows it wants reads the pages that hold them instead of
+     * the whole file, which is what makes resolving a handful of hits cost a handful of pages. Rows
+     * are returned in ascending position order whatever order they were given in, and a position
+     * the file does not hold simply names no row.
+     *
+     * @param newPositions the file positions to read
+     * @return this for method chaining
+     */
+    public ReadBuilder positions(java.util.Collection<Long> newPositions) {
+      this.positions =
+          newPositions == null
+              ? null
+              : newPositions.stream()
+                  .distinct()
+                  .sorted()
+                  .collect(java.util.stream.Collectors.toList());
       return this;
     }
 
@@ -1588,7 +1611,15 @@ public class Parquet {
                   .apply();
 
           return new org.apache.iceberg.parquet.ParquetReader<>(
-              file, schema, options, readBuilder, mapping, filter, reuseContainers, caseSensitive);
+              file,
+              schema,
+              options,
+              readBuilder,
+              mapping,
+              filter,
+              reuseContainers,
+              caseSensitive,
+              positions);
         }
       }
 
