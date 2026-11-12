@@ -466,6 +466,14 @@ public final class DistributedIndexSearch {
     // window is filled from them; one that cannot do that answers the unfiltered question instead,
     // and the hits outside the set are dropped below rather than counted as rejected
     IndexCandidates admitted = candidates == null || candidates.isEmpty() ? null : candidates;
+    // a searcher that scores everything and then keeps what the set admits cannot say by its answer
+    // size that it has nothing left: a selective filter makes its answer small however much it
+    // still
+    // holds. What it can do is score more, so the widening goes on until the file's entries have
+    // all
+    // been asked for.
+    boolean filtersWhileSearching =
+        admitted == null || file.searching(prepared -> prepared.joinsCandidateSet());
     Map<String, FetchedRow> found = Maps.newLinkedHashMap();
     int limit = opening;
     int last = 0;
@@ -485,10 +493,9 @@ public final class DistributedIndexSearch {
             file.searching(
                 prepared -> searchFile(prepared, ByteBuffer.wrap(payload), asked, admitted));
         // a kernel that returned the whole window may hold more; one that returned less has nothing
-        // left to offer, which is what stops the widening
-        if (hits.size() >= asked) {
-          more = true;
-        }
+        // left to offer, which is what stops the widening. A kernel that keeps the set afterwards
+        // is asked for everything its file holds instead, because its answer size says nothing
+        more = filtersWhileSearching ? hits.size() >= asked : asked < entries;
 
         RowsAtHits read = plan.rowsOf(hits, io, ownTasks);
         unresolved += read.unresolved;

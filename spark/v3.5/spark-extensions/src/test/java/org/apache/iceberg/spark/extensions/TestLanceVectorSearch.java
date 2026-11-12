@@ -306,6 +306,146 @@ class TestLanceVectorSearch {
     assertThat(indexed).doesNotContain(0L);
   }
 
+  @Test
+  public void aFilteredSearchAnswersFromLanceFilesOnEitherSideOfTheSearch() {
+    // the filter keeps the far half of the table, so an unfiltered window cannot stand in for it.
+    // Both structures are covered because they carry the filter into the search differently: an IVF
+    // kernel skips the rows the set excludes while it scores, while a flat one scores everything
+    // and
+    // keeps what the set admits, which is a question its own answer size cannot answer.
+    for (String structure : new String[] {"ivf", null}) {
+      String table =
+          lanceTableWithPrices(
+              "lance_vectors_filtered_" + (structure == null ? "flat" : structure));
+      buildIndex(table, structure);
+
+      String where = " WHERE price < 40";
+      List<Long> scanned = ids(scannedQuery(table, where));
+      assertThat(scanned).as("the filter keeps the rows whose price is under 40").hasSize(3);
+
+      for (String mode : new String[] {"pre", "post"}) {
+        String arm = structure + "/" + mode;
+        List<Long> indexed = ids(indexedQuery(table, where, mode));
+        assertThat(indexed)
+            .as("%s: the index answers what a full scan answers, over Lance files", arm)
+            .isEqualTo(scanned);
+        assertThat(indexed)
+            .as("%s: every row of the answer passed the filter", arm)
+            .allSatisfy(id -> assertThat(100 - id).isLessThan(40));
+        assertThat(planOf(table, where, mode))
+            .as("%s: the query is answered from the index, not from a scan", arm)
+            .contains("VectorSearch");
+      }
+    }
+  }
+
+  @Test
+  public void aFilteredSearchSkipsRowsDeletedInTheTablesOwnFormat() {
+    String table = lanceTableWithPrices("lance_vectors_filtered_deleted");
+    // the nearest row the filter admits is removed, so the answer has to come from further out
+    spark.sql(String.format("DELETE FROM %s WHERE id = 61", table));
+    buildIndex(table);
+    assertThat(
+            spark
+                .sql(String.format("SELECT file_path FROM %s.all_files WHERE content != 0", table))
+                .collectAsList())
+        .as("the delete file is written in the table's own format")
+        .allSatisfy(row -> assertThat(row.getString(0)).endsWith(".lance"));
+
+    String where = " WHERE price < 40";
+    List<Long> scanned = ids(scannedQuery(table, where));
+    assertThat(scanned).doesNotContain(61L);
+
+    for (String mode : new String[] {"pre", "post"}) {
+      List<Long> indexed = ids(indexedQuery(table, where, mode));
+      assertThat(indexed)
+          .as("%s: a row deleted by a Lance position delete is not part of the answer", mode)
+          .doesNotContain(61L);
+      assertThat(indexed)
+          .as("%s: the index answers what a full scan answers", mode)
+          .isEqualTo(scanned);
+    }
+  }
+
+  /** A Lance table whose price keeps the far half of the rows, and whose vectors order by id. */
+  private static String lanceTableWithPrices(String name) {
+    String table = "local.db." + name;
+    spark.sql("CREATE NAMESPACE IF NOT EXISTS local.db");
+    spark.sql("DROP TABLE IF EXISTS " + table);
+    spark.sql(
+        "CREATE TABLE "
+            + table
+            + " (id bigint, price bigint, embedding array<double>) USING iceberg "
+            + "TBLPROPERTIES ('write.format.default' = 'lance', 'write.delete.mode' = 'merge-on-read')");
+    spark.sql(
+        String.format(
+            "INSERT INTO %s SELECT id, 100 - id, array(CAST(id AS double), CAST(100 - id AS double)) "
+                + "FROM range(0, 200)",
+            table));
+    return table;
+  }
+
+  private static void buildIndex(String table) {
+    buildIndex(table, null);
+  }
+
+  private static void buildIndex(String table, String structure) {
+    String choice = structure == null ? "" : ", structure => '" + structure + "'";
+    spark.sql(
+        String.format(
+            "CALL local.system.build_vector_index("
+                + "table => '%s', column => 'embedding', dimension => 2, metric => 'euclidean'%s)",
+            table, choice));
+  }
+
+  /** The query as the caller writes it: the index answers this one. */
+  private static List<Row> indexedQuery(String table, String where, String mode) {
+    String parameter = "spark.iceberg.index.vector.filter-mode";
+    spark.conf().set(parameter, mode);
+    try {
+      return spark
+          .sql(
+              String.format(
+                  "SELECT id FROM %s%s ORDER BY vec_distance(embedding, array(0.0d, 100.0d)) LIMIT 3",
+                  table, where))
+          .collectAsList();
+    } finally {
+      spark.conf().unset(parameter);
+    }
+  }
+
+  /** The same question with a zero added, which keeps the rewrite from answering it. */
+  private static List<Row> scannedQuery(String table, String where) {
+    return spark
+        .sql(
+            String.format(
+                "SELECT id FROM %s%s ORDER BY vec_distance(embedding, array(0.0d, 100.0d)) + 0.0d "
+                    + "LIMIT 3",
+                table, where))
+        .collectAsList();
+  }
+
+  private static String planOf(String table, String where, String mode) {
+    String parameter = "spark.iceberg.index.vector.filter-mode";
+    spark.conf().set(parameter, mode);
+    try {
+      return spark
+          .sql(
+              String.format(
+                  "SELECT id FROM %s%s ORDER BY vec_distance(embedding, array(0.0d, 100.0d)) LIMIT 3",
+                  table, where))
+          .queryExecution()
+          .executedPlan()
+          .toString();
+    } finally {
+      spark.conf().unset(parameter);
+    }
+  }
+
+  private static List<Long> ids(List<Row> rows) {
+    return rows.stream().map(row -> row.getLong(0)).collect(java.util.stream.Collectors.toList());
+  }
+
   /** Writes one equality delete row into a delete file in the table's own format. */
   private static DeleteFile writeEqualityDelete(Table table, long id) throws Exception {
     Schema keySchema = table.schema().select("id");
