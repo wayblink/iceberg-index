@@ -22,15 +22,20 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 import java.net.URI;
+import java.nio.ByteBuffer;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Set;
 import org.apache.iceberg.FileScanTask;
 import org.apache.iceberg.Table;
 import org.apache.iceberg.index.IndexFile;
 import org.apache.iceberg.index.IndexManifest;
 import org.apache.iceberg.index.IndexManifestList;
 import org.apache.iceberg.index.IndexMetadata;
+import org.apache.iceberg.index.IndexQuery;
+import org.apache.iceberg.index.IndexReader;
 import org.apache.iceberg.index.spark.VectorIndexes;
 import org.apache.iceberg.index.vector.VectorIndexTypes;
 import org.apache.iceberg.io.CloseableIterable;
@@ -218,7 +223,7 @@ class TestVectorSearchExecution {
   }
 
   @Test
-  void aFullyCoveredQueryReportsNoResidualBranch() {
+  void aFullyCoveredQueryReportsNoResidualBranch() throws Exception {
     String table = tableWithIndex("exec_covered");
     Dataset<Row> frame = spark.sql(nearest(table, 2));
     List<Row> rows = frame.collectAsList();
@@ -229,10 +234,12 @@ class TestVectorSearchExecution {
     assertThat(metric(source, "numLiveCandidates")).isGreaterThanOrEqualTo(2L);
     assertThat(metric(source, "numOutputRows")).isEqualTo(rows.size());
     assertThat(metric(source, "numIndexUnderfilled")).isZero();
+    // a task is handed the scan tasks of the files its own index file covers, not the table's
+    assertThat(metric(source, "numScanTasksShipped")).isEqualTo(coveredFileCount(table));
   }
 
   @Test
-  void aPartlyCoveredQueryReportsBothBranches() {
+  void aPartlyCoveredQueryReportsBothBranches() throws Exception {
     String table = tableWithIndex("exec_partly");
     // a row after the build leaves the index behind, so the uncovered file is scanned as well
     spark.sql(String.format("INSERT INTO local.db.%s VALUES (5, array(0.8d, 0.0d))", table));
@@ -245,6 +252,10 @@ class TestVectorSearchExecution {
     assertThat(metric(source, "numResidualFiles")).isEqualTo(1L);
     // the answer holds the candidate branch and the residual branch together
     assertThat(metric(source, "numOutputRows")).isGreaterThanOrEqualTo(rows.size());
+    // the covered files are what the index branch ships, so the file the index does not cover is
+    // read by the scan branch only and is not carried into every index task
+    assertThat(metric(source, "numScanTasksShipped")).isEqualTo(coveredFileCount(table));
+    assertThat(metric(source, "numScanTasksShipped")).isLessThan(dataFileCount(table));
   }
 
   @Test
@@ -604,6 +615,45 @@ class TestVectorSearchExecution {
       }
     }
     throw new AssertionError("No " + SOURCE + " in the plan:\n" + executed);
+  }
+
+  /** How many data files the table has, which is what a task used to be handed. */
+  private static long dataFileCount(String table) throws Exception {
+    Table iceberg = Spark3Util.loadIcebergTable(spark, "local.db." + table);
+    long count = 0L;
+    try (CloseableIterable<FileScanTask> tasks = iceberg.newScan().planFiles()) {
+      for (FileScanTask ignored : tasks) {
+        count += 1;
+      }
+    }
+
+    return count;
+  }
+
+  /**
+   * How many data files the table's vector index has entries for, which is what a task is handed.
+   */
+  private static long coveredFileCount(String table) throws Exception {
+    Table iceberg = Spark3Util.loadIcebergTable(spark, "local.db." + table);
+    IndexMetadata index = VectorIndexes.findIndex(iceberg, "embedding", "vector");
+    IndexQuery query =
+        IndexQuery.of(index.latestSnapshot().sourceTableSnapshotId(), ByteBuffer.allocate(0), 0);
+    Set<String> covered = new HashSet<>();
+    for (IndexFile file : new IndexReader(index, iceberg).indexFiles(query)) {
+      covered.addAll(file.coveredDataFiles());
+    }
+
+    // the snapshot's own files only: an entry of a file a rewrite replaced is not a scan task
+    try (CloseableIterable<FileScanTask> tasks = iceberg.newScan().planFiles()) {
+      Set<String> current = new HashSet<>();
+      for (FileScanTask task : tasks) {
+        current.add(task.file().location().toString());
+      }
+
+      covered.retainAll(current);
+    }
+
+    return covered.size();
   }
 
   private static long metric(SparkPlan plan, String name) {

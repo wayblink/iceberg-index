@@ -126,7 +126,8 @@ private[spark] object VectorSearchExec {
       metrics("numHitsOutsideSnapshot"),
       metrics("numRowsAtFiles"),
       metrics("numCandidateRounds"),
-      metrics("numIndexUnderfilled"))
+      metrics("numIndexUnderfilled"),
+      metrics("numScanTasksShipped"))
 
     val rows =
       DistributedIndexSearch.searchWithRows(

@@ -127,6 +127,9 @@ private[spark] case class VectorSearchSourceExec(
       "numIndexUnderfilled" -> SQLMetrics.createMetric(
         spark.sparkContext,
         "index files that ended with fewer than k live rows"),
+      "numScanTasksShipped" -> SQLMetrics.createMetric(
+        spark.sparkContext,
+        "scan tasks handed to the index tasks, which are the files each covers"),
       "numOutputRows" -> SQLMetrics.createMetric(spark.sparkContext, "rows produced"))
 
   override protected def doExecute(): RDD[InternalRow] = {
