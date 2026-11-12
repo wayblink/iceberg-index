@@ -808,13 +808,6 @@ public final class IndexEntries {
     }
 
     Schema readSchema = projection.select(readColumns.toArray(new String[0]));
-    java.util.Iterator<Tuple2<Row, Long>> read;
-    try {
-      read = readFileWithFormat(dataFile, task.file().format(), readSchema, expected, wanted, conf);
-    } catch (java.io.IOException e) {
-      throw new java.io.UncheckedIOException("Failed to read " + dataFile, e);
-    }
-
     // the schema the caller made describes its projection; the read also carries the
     // equality-delete
     // keys, so the row a reader builds has to be described by what was actually read
@@ -822,6 +815,13 @@ public final class IndexEntries {
         expected != null && expected.size() == readSchema.columns().size()
             ? expected
             : toSparkSchema(readSchema);
+    java.util.Iterator<Tuple2<Row, Long>> read;
+    try {
+      read =
+          readFileWithFormat(dataFile, task.file().format(), readSchema, rowSchema, wanted, conf);
+    } catch (java.io.IOException e) {
+      throw new java.io.UncheckedIOException("Failed to read " + dataFile, e);
+    }
 
     List<Tuple2<Row, Long>> rows = Lists.newArrayListWithCapacity(wanted.size());
     while (read.hasNext()) {
