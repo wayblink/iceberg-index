@@ -21,7 +21,7 @@
 
 日期：2026-11-11。关联：#3038（本设计的实施卡）、#3013（带过滤检索，已合入）、#3039（废弃 `auto`，已合入）。代码基线：`main @ 731ce9dccd`。
 
-状态：待评审。实施前请对照本文的"现状"一节确认代码未漂移。
+状态：第 2、3、4 步已实施（2026-11-11，分支 `card/3038`）；第 5、6 步未做。实施结果与本文的偏差见 §8。
 
 ## 1. 结论摘要
 
@@ -115,7 +115,7 @@ VectorSearchExec.rows (或新的 fused 入口)
    │           └─ FormatModelRegistry.readBuilder(format, Record.class, input)
    │                · Parquet → Iceberg parquet 格式模型
    │                · Lance    → Lance 集成注册的格式模型
-   │              builder.positions(wanted)  → 只读相关位置（页级跳过由格式模型实现）
+   │              builder.positions(wanted)  → 只有实现了该能力的格式才据此跳过（实测：Lance 实现，Parquet 不实现）
    │        4) 应用 SnapshotDeletes（位置删除 / 等值删除），剔除已删除行
    │        5) 任务内维护本地 top-k；不足 k 时**在任务内**扩大预算重探（MaxRounds 下移）
    │        6) 输出 (Row, score)
@@ -156,9 +156,9 @@ try (CloseableIterable<Record> records = builder.project(projection).build()) { 
 | 步 | 内容 | 完成标志 |
 |---|---|---|
 | 1 | 探针：`SparkJobCounter` + 三条断言（无过滤 / `post` / `pre` 各 1 个 job） | 已完成，**红**（`expected: 1 but was: 3`） |
-| 2 | `DistributedIndexSearch` 新增带行输出的重载；任务内 `searchFile` → `readFileWithFormat` → 本地 top-k | 无过滤与 `post` 两条断言转绿 |
-| 3 | `VectorSearchExec` 在该路径上不再调用 `rowsAt` / `rowsToDd`；`MaxRounds` 下移 | driver 持有命中行 = 0 |
-| 4 | `pre` 的候选计算下移（每个任务只为自己的数据文件算） | `pre` 断言转绿，`MaxCandidateRows` 上限与"超限即失败"分支消失 |
+| 2 | `DistributedIndexSearch` 新增带行输出的重载；任务内 `searchFile` → `readFileWithFormat` → 本地 top-k | 已完成：三种形状各 1 个 job |
+| 3 | `VectorSearchExec` 在该路径上不再调用 `rowsAt` / `rowsToDd`；`MaxRounds` 下移 | 已完成：driver 持有命中行 = 0 |
+| 4 | `pre` 的候选计算下移（每个任务只为自己的覆盖文件算） | 已完成：`MaxCandidateRows` 与"超限即失败"分支消失，`pre` 断言转绿 |
 | 5 | 分组细化：按"索引文件 ↔ 覆盖的数据文件"分区并精确下发 scan task | 每分区 task 数与上送字节数可观测 |
 | 6 | 验收：逐行一致（delete / residual / `pre`+`post`）、**补 Lance 格式端到端用例** | 与现实现结果集与顺序一致 |
 
@@ -180,10 +180,9 @@ lance-spark 把融合做在**原生扫描器**里：`ScanOptions.Builder().neare
 2. 用查询向量算出本分区的候选 `(dataFile, rowPosition, score)`；
 3. 按位置读行：`FormatModelRegistry.readBuilder(format, ...)` + `builder.positions(wanted)`，Parquet 与 Lance 共用同一条路径；
 4. 应用 `SnapshotDeletes`（位置删除 + 等值删除）；
-5. **前过滤**：候选由过滤条件给出时，不在候选内的行不打分；
+5. **前过滤**：task 先读自己覆盖的数据文件里过滤要的列，算出放行行位置，再让 kernel 只给这些行打分（见 §8.2）；
 6. **后过滤**：取回的行就地判定，被拒的不占窗口，任务内扩大预算重探；
-7. 维护本地 top-k，输出 `(Row, score)` 迭代器；
-8. 本地 top-k 不足时如实标记（对应 `VectorSearchStats.indexUnderfilled`）。
+7. 维护本地 top-k，输出行迭代器；**窗口不足时在任务内扩大预算重探**（旧 `MaxRounds` 下移），本索引文件扩到底仍不足则如实标记（旧 `VectorSearchStats.indexUnderfilled`，现在是任务上报的计数）。
 
 ### 7.2 它不做的事（实施时不得越界）
 
@@ -197,8 +196,32 @@ lance-spark 把融合做在**原生扫描器**里：`ScanOptions.Builder().neare
 
 调度层面改完后与它平起平坐：1 个 job、无 driver 物化。**IO 层面不会一样**：它的索引内建于格式、扫描期就能决定打开哪些页；我们的是外部索引算候选、再按位置读，`positions` 能跳过行组，但一个页内只要有一行命中仍要整页解。要追平 IO 需要把候选下推成页级过滤（自定义 reader，需新增 `iceberg-data` 依赖），只有在 benchmark 证明 IO 是瓶颈后才做。
 
-## 8. 待评审确认的点
+## 8. 实施记录（2026-11-11，`card/3038`）
+
+### 8.1 落地的形状与本文的偏差
+
+1. **`searchWithRows` 返回 RDD，不返回 driver 侧列表。** 初版把任务读到的行 `takeOrdered` 回 driver，那仍然要第二次 job 把行重新并行化（3 → 2 个 job）。现在每个任务直接输出自己那份 top-k 的行，`VectorSearchExec` 用 `spark.createDataFrame(JavaRDD, schema).queryExecution.toRdd` 转成内部行——这是 `mapPartitions` 级的类型转换，不起 job。实测三种形状（无过滤 / `pre` / `post`）从 3 / 5 / 3 个 job 降到 **1 / 1 / 1**。
+2. **`pre` 是 task 内的前过滤，不是"过滤在行上判定"。** 本文 §7.2 第 3 条曾主张"两个取值在任务内只剩判定时机之差"，那是错的，实现时也一度照此写了：把 `candidates` 一律传 null、只在取回的行上判定，等于把 `pre` 悄悄变成 `post`。现在 `pre` 恢复成本地预过滤——task 用 `IndexEntries.positionsMatching` 读自己覆盖的数据文件（只读过滤要的列，删除照常应用）得到 `IndexCandidates`，交给 `prepared.search(query, k, candidates)`，kernel 只给放行的行打分（`IvfKernel` 的第三重载会把探针扩到填满窗口为止）。`post` 仍是对取回的行判定 + task 内扩样。
+   两者的可观测差别有测试钉住（`TestVectorSearchFiltered.runsTheFilterWhereTheTaskSearches`）：200 行里只有 1 行通过一个选择性极高的过滤，`pre` **1 轮**就答出那一行，`post` 要一轮一轮拒绝窗口。
+3. **`pre` 的候选集不再有全局上限。** 它只活在读到它的 task 里，规模是该 task 覆盖文件的放行行数，因此 `MaxCandidateRows`（200 万）与"超限即失败"分支一并删除：那是 driver 内存的约束，不是 task 内存的约束。
+4. **分数方向是索引自己的决定。** 本地 top-k 必须按 `IndexAdapter.resultComparator()` 的方向取（HNSW 的分数是相似度，越大越好；IVF 的距离越小越好）。按"越小越好"写死会安静地返回最远的 k 行——实测就是这样错了三个用例。
+5. **`readFileWithFormat` 的位置语义被修正。** 旧代码在流式读取时就把 `wanted.get(i)` 当作行位置，只有在"读完发现条数不等"时才回退成按序编号。Parquet 的格式模型**不实现** `positions(...)`（`ReadBuilder` 默认忽略，这里只有 Lance 实现），于是流式读到第 `wanted.size()+1` 行就越界。现在行一律按流过的序号编号，读完再判断"条数正好等于请求数"才重贴位置；调用方另外按请求集合过滤，两种情形都正确。
+6. **过滤列在判定之前不能被裁掉。** 取回的行是"投影 + 过滤需要的列"，判定通过后才裁回投影宽度；先裁再判会让过滤看到不含自己列的行走，`post` 会因此拒绝一切。
+7. **指标改成任务上报。** 行不再经过 driver，所以 `numCandidates` / `numCandidateRequests` / `numCandidateRounds` / `numLiveCandidates` / `numDeletedOrInvisibleHits` / `numHitsOutsideSnapshot` / `numRowsAtFiles` / `numIndexUnderfilled` 都是任务累加的计数（语义从"一条查询的数"变成"各索引文件之和"），driver 仍只设定 `numResidualFiles`。
+8. **`ExecutorIndexCache` 的局部性表不再被融合查询刷新。** `mergeCacheReports` 原本在 `search()` 的 `takeOrdered` 之后执行；融合路径没有任何 driver 侧 action，因此本查询无法在规划期消费自己的上报。**已知退化，未修**：局部性提示由其它入口（TVF / 全文）维持。
+
+### 8.2 验证
+
+- `TestVectorSearchFiltered.answersAFilteredQueryInOneJob`：三种形状各 1 个 job（红 → 绿）。
+- `TestVectorSearchFiltered.runsTheFilterWhereTheTaskSearches`：同一句过滤下 `pre` 1 轮答出唯一放行行、`post` 多轮拒绝窗口——两个取值真的是两条局部策略。
+- `TestVectorSearchExecution.aWindowShortOfLiveRowsWidensInsideTheTask`：8 行表、删除最近 3 行、`over-sample=1`，任务内扩样一轮补齐窗口（`numCandidateRounds ≥ 2`、`numIndexUnderfilled = 0`）。
+- 向量/全文相关 spark-extensions 用例 305 个 + `index-spark` 393 个全绿（含 `rowsAt` / 删除 / 等值删除路径）。
+- 未做：第 5 步（按"索引文件 ↔ 覆盖数据文件"精确分组下发 scan task，现在仍是全表 `scanTasks` 随 broadcast 下发）、第 6 步的 Lance 端到端用例、以及性能测量（按 #5447 的裁决留到功能完成后单独跑）。
+
+## 9. 待评审确认的点
 
 1. ~~分步顺序是否认可~~：已确认。
 2. ~~`rowsAt`/`rowsToDd` 的移除范围~~：已确认为只针对 `VectorSearchExec` 路径。
 3. 待定：第 5 步"分组细化"本轮必须做，还是先按"一索引文件一分区"跑通再单独优化。
+4. 待定：融合查询不再刷新 `ExecutorIndexCache` 的局部性表（§8.1-8），是否值得为它单独设计一条上报路径。
+5. 待定：`pre` 的候选集现在是按文件的 `long[]`，规模是该 task 覆盖文件的放行行数；10M/100M 规模下的 task 内存还没有实测（在 §8.2 的"未做"里）。
