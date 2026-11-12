@@ -21,7 +21,7 @@
 
 日期：2026-11-11。关联：#3038（本设计的实施卡）、#3013（带过滤检索，已合入）、#3039（废弃 `auto`，已合入）。代码基线：`main @ 731ce9dccd`。
 
-状态：第 2–6 步已实施并合入 `main`（2026-11-12，`c35b11ca9e`）；Parquet 的 `positions()` 由 #3040 补齐。`step-1.9-index` 尚未合入，原因见 §8.4。
+状态：第 2–6 步已实施并合入 `main`（2026-11-12，`aa6e18876a`）；Parquet 的 `positions()` 由 #3040 补齐，并按同一设计移植到 `step-1.9-index`（§8.5）。
 
 ## 1. 结论摘要
 
@@ -106,7 +106,7 @@ VectorSearchExec.rows (或新的 fused 入口)
    ├─(A') 候选集：pre 链路下移为"每个检索任务只为自己覆盖的数据文件算"（第 4 步）
    │
    ├─(B') DistributedIndexSearch.searchWithRows(...)        ← 新重载，一个 job
-   │      一个分区 = 一个索引文件 + 它覆盖的 scan task（`IndexFileTask`，见 §8.1-9）
+   │      一个分区 = 一个索引文件 + 它覆盖的 scan task（`IndexFileTask`，见 §8.1-8）
    │      任务内顺序：
    │        1) ExecutorIndexCache 取/载索引 payload（不变，仍受驻留管理）
    │        2) prepared.search(query, localTopK, candidates)  → 本分区命中的 (dataFile, pos, score)
@@ -180,7 +180,7 @@ lance-spark 把融合做在**原生扫描器**里：`ScanOptions.Builder().neare
 2. 用查询向量算出本分区的候选 `(dataFile, rowPosition, score)`；
 3. 按位置读行：`FormatModelRegistry.readBuilder(format, ...)` + `builder.positions(wanted)`，Parquet 与 Lance 共用同一条路径；
 4. 应用 `SnapshotDeletes`（位置删除 + 等值删除）；
-5. **前过滤**：task 先读自己覆盖的数据文件里过滤要的列，算出放行行位置，再让 kernel 只给这些行打分（见 §8.2）；
+5. **前过滤**：task 先读自己覆盖的数据文件里过滤要的列，算出放行行位置，再让 kernel 只给这些行打分（见 §8.1-2）；
 6. **后过滤**：取回的行就地判定，被拒的不占窗口，任务内扩大预算重探；
 7. 维护本地 top-k，输出行迭代器；**窗口不足时在任务内扩大预算重探**（旧 `MaxRounds` 下移），本索引文件扩到底仍不足则如实标记（旧 `VectorSearchStats.indexUnderfilled`，现在是任务上报的计数）。
 
@@ -239,7 +239,25 @@ lance-spark 把融合做在**原生扫描器**里：`ScanOptions.Builder().neare
 - 本项验证合计 721 个用例（`index-spark` 393 + spark-extensions 328）。
 - 未做：性能测量（按 #5447 的裁决留到功能完成后单独跑）。
 
-### 8.4 移到 `step-1.9-index` 时改了什么
+### 8.4 Lance 与 Parquet 在同一套表上的对照
+
+同一批行（10,000,000）、同一索引定义（IVF/RABITQ/np150/3bit）、同一 harness、同一资源（4 executor × 7g），只换文件格式。两张表都跑**带页级 positions** 的镜像：
+
+| 臂 | Lance（`sift10m_base_v2_lance`，1.69 GB / 78 文件） | Parquet（`sift10m_base_v2`，0.98 GB / 78 文件） |
+|---|---|---|
+| 无过滤 | **1.57 / 1.07 / 1.72 s** | 3.56 / 4.89 s |
+| `pre` 40% | **1.32 s** | 3.35 s |
+| `post` 40% | **3.41 s** | 9.35 s |
+| `pre` 1% | **1.22 / 1.36 s** | 4.42 s |
+| `post` 1% | 27.04 s（单查询折量） | 34.95 s |
+
+**`positions()` 在两种格式上都确实生效**，有直接取证：打开 `-Diceberg.index.fetch-back.timings` 后，`price < 40` 的一次回表 Lance 每个文件只读 `rows=44..59`（正好是请求的位置数）、单文件 187 ms；而在补 `positions()` 之前的 Parquet 镜像是 `rows=128205`（整文件）、1790 ms。同一 JVM、同一套 jar，行为差异可复现。
+
+Lance 比 Parquet 快约 2.3–3.4× 的原因不是 `positions()` 实现得更聪明，而是 **读放大**：窄候选下两者都只读请求的行，但 Lance 的位置读走原生 range 扫描，Parquet 的页级读仍要解整页；候选变宽时差距缩小（`post` 1% 上 Lance 每次位置读 2437 ms 已接近整文件 2284 ms，只剩 1.3×）。
+
+**两条注意事项**（都在提交的日志里）：`post` 1% 的 Lance 数字是单查询折量（共享集群 17:00–19:00 频繁驱逐 executor，那一臂两次卡在最后 4 个任务上 20–50 分钟）；`sel3` 那次三个臂各只有 1 个样本，同窗口内噪声大。
+
+### 8.5 移到 `step-1.9-index` 时改了什么
 
 那条分支是更窄的产品线：`core` 没有 `formats` SPI（没有 `FormatModelRegistry`）、`parquet` 没有 `ParquetFormatModel`、也没有 `lance` 模块。所以这次不是 cherry-pick，而是按同一设计重新落了一遍，差别只有三处：
 
@@ -253,6 +271,6 @@ lance-spark 把融合做在**原生扫描器**里：`ScanOptions.Builder().neare
 
 1. ~~分步顺序是否认可~~：已确认。
 2. ~~`rowsAt`/`rowsToDd` 的移除范围~~：已确认为只针对 `VectorSearchExec` 路径。
-3. ~~第 5 步的分组细化~~：已做（§8.1-9）。
-4. 待定：融合查询不再刷新 `ExecutorIndexCache` 的局部性表（§8.1-10），是否值得为它单独设计一条上报路径。
+3. ~~第 5 步的分组细化~~：已做（§8.1-8）。
+4. 待定：融合查询不再刷新 `ExecutorIndexCache` 的局部性表（§8.1-9），是否值得为它单独设计一条上报路径。
 5. 待定：`pre` 的候选集现在是按文件的 `long[]`，规模是该 task 覆盖文件的放行行数；10M/100M 规模下的 task 内存还没有实测（在 §8.2 的"未做"里）。
