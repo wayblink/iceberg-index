@@ -21,7 +21,7 @@
 
 日期：2026-11-11。关联：#3038（本设计的实施卡）、#3013（带过滤检索，已合入）、#3039（废弃 `auto`，已合入）。代码基线：`main @ 731ce9dccd`。
 
-状态：第 2–6 步已实施（2026-11-11，分支 `card/3038`）。实施结果与本文的偏差见 §8。
+状态：第 2–6 步已实施并合入 `main`（2026-11-12，`c35b11ca9e`）；Parquet 的 `positions()` 由 #3040 补齐。`step-1.9-index` 尚未合入，原因见 §8.4。
 
 ## 1. 结论摘要
 
@@ -212,7 +212,23 @@ lance-spark 把融合做在**原生扫描器**里：`ScanOptions.Builder().neare
 9. **不能边搜边过滤的 kernel 要靠放宽 `asked` 收敛。** `IndexAdapter.PreparedSearch` 的默认实现是"先打分再 `retain` 候选集"，只有 IVF 的第三重载真的在打分时跳过被排除的行（`joinsCandidateSet()`）。对前者，答案条数不能说明它是否还有没给的行：一个选择性很高的过滤会让答案一直很小，于是原来的 `more = hits.size() >= asked` 会在第一轮就判定"文件已经没货"，`pre` 直接返回空。现在对这类 kernel 改成"问遍该文件的 `entries`"为止（`more = asked < entries`），代价是这时的 `pre` 退化成 post 式扩样——Lance 的端到端用例（flat 结构 + 只放行 139/200 行的过滤）就是这个 bug 的现场。
 10. **`ExecutorIndexCache` 的局部性表不再被融合查询刷新。** `mergeCacheReports` 原本在 `search()` 的 `takeOrdered` 之后执行；融合路径没有任何 driver 侧 action，因此本查询无法在规划期消费自己的上报。**已知退化，未修**：局部性提示由其它入口（TVF / 全文）维持。
 
-### 8.2 验证
+### 8.2 实测：融合前后的 10M 对照
+
+`hms.sparkann.sift10m_base_v2`（10M 行、`price = pk % 100`、78 文件），4 executor × 7g，同一 SQL，p50：
+
+| 形状 | before（`main@731ce9dccd`） | after 融合（无 positions） | after + positions |
+|---|---|---|---|
+| 无过滤 | 3.69 / 4.79 s | 6.04 / 7.72 s | **3.56 / 4.89 s** |
+| `pre` 1% | 5.59 s | 6.84 s | **4.42 s** |
+| `post` 1% | 未跑完 | 55.64 s | 34.95 s |
+| `pre` 40% | **失败**（`filter keeps more than 2000000 rows`） | 5.72 s | **3.35 s** |
+| `post` 40% | 未跑完 | 15.96 s | 9.35 s |
+
+两个结论：(1) 融合后**没有 positions 就是回归**（普通查询 1.5×），因为 task 内读行走格式模型读了整个文件而且是行式；(2) 补上页级 `positions()` 之后，普通查询回到基线、带过滤的两条链路都比被替换的实现更快，而 40% 那种稠密过滤在被替换的实现里**根本答不出来**。
+
+`post` 在 1% 上仍是 35 s：这是"先给全体打分再拒绝"这条链路对高选择性的固有代价（每一轮都要重新打分并读回被拒的行），不是回归——它比融合前同臂的 55.6 s 快 1.6×，且文档已声明 `pre` 才是高选择性的正确选择。
+
+### 8.3 验证
 
 - `TestVectorSearchFiltered.answersAFilteredQueryInOneJob`：三种形状各 1 个 job（红 → 绿）。
 - `TestVectorSearchFiltered.runsTheFilterWhereTheTaskSearches`：同一句过滤下 `pre` 1 轮答出唯一放行行、`post` 多轮拒绝窗口——两个取值真的是两条局部策略。
@@ -222,6 +238,15 @@ lance-spark 把融合做在**原生扫描器**里：`ScanOptions.Builder().neare
 - Lance 端到端（第 6 步）在 `TestLanceVectorSearch`：`aFilteredSearchAnswersFromLanceFilesOnEitherSideOfTheSearch` 覆盖 ivf/flat × `pre`/`post`（候选读、按位置回表都走 Lance 格式模型），`aFilteredSearchSkipsRowsDeletedInTheTablesOwnFormat` 覆盖 Lance 位置删除与过滤同时生效，两者都跟全表扫描逐行比对。
 - 本项验证合计 721 个用例（`index-spark` 393 + spark-extensions 328）。
 - 未做：性能测量（按 #5447 的裁决留到功能完成后单独跑）。
+
+### 8.4 `step-1.9-index` 为什么还没有合入
+
+那条分支是**更窄的产品线**：`core` 里没有 `formats` SPI（没有 `FormatModelRegistry`）、`parquet` 里没有 `ParquetFormatModel`、也**没有 `lance` 模块**。所以融合的两个提交不能直接 cherry-pick：
+
+- `IndexEntries.liveRowsAt` 用的是 `FormatModelRegistry.readBuilder(...)`；1.9 那边是自己写的 `readRecords(format, input, projection)`（`Parquet.read(...)`）。
+- `e849e76abf` / `fe8956bdb2`（Lance 端到端用例）在 1.9 上没有对应模块。
+
+可以移植的部分：`parquet` 模块的 `positions()` 支持（`Parquet.java` + `ParquetReader.java`，自包含，只依赖 parquet-mr），以及把 1.9 的 `readRecords` 改成 `.positions(wanted)` 后接同样的 `liveRowsAt`。这需要一次真正的移植，不是 cherry-pick。
 
 ## 9. 待评审确认的点
 
