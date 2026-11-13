@@ -212,11 +212,22 @@ exists but no Spark, Flink, MR, Arrow or index read path calls it, so the storag
 always empty. The consequence is asymmetric and surprising — the same table reads its parquet files
 with the catalog's `s3.*` settings and its Lance files with the process environment only.
 
-**Proposed fix (iceberg-lance side):** add a `setAll(Map)` default to `ReadBuilder` and have the
-engine readers (Spark `BaseBatchReader`/`BaseRowReader`, Flink `RowDataFileScanTaskReader`,
-MR `IcebergInputFormat`, `data` `GenericReader`, `index-spark` `IndexEntries`) pass the storage
-subset of `FileIO.properties()` (with `UnsupportedOperationException` handled — the `FileIO`
-default throws) and of the table properties.
+**Fix (partly done):** `ReadBuilder.setAll(Map)` already exists upstream and nothing called it.
+The engine readers now pass `FileIO.properties()` (with `UnsupportedOperationException` handled —
+the `FileIO` default throws) merged with the table properties, and the format model picks the keys it
+understands:
+
+- done: Spark 3.5 / 4.0 / 4.1 `BaseReader` (feeds `BaseBatchReader` and `BaseRowReader`), `data`
+  `GenericReader`, `index-spark` `IndexEntries` (data files, and delete files through
+  `FileIO.properties()`)
+- not done: Flink `RowDataFileScanTaskReader` — its constructor has no `FileIO`, so passing the
+  settings means changing the constructor and the callers above it; MR `IcebergInputFormat`;
+  `data` `BaseDeleteLoader` — it only holds `Function<DeleteFile, InputFile>` and the public
+  constructor cannot carry a configuration source without an API change
+
+Evidence: `TestLanceS3StorageOptions` writes and reads through MinIO with both the Iceberg spelling
+and `lance.storage.*`, and names an unreachable endpoint in the failure; `TestGenericReaderStorageProperties`
+registers a stub model and asserts the table properties reach the `ReadBuilder`.
 
 **Upstream gap:** `readBuilder(InputFile)` has no config parameter, so every format that owns its
 storage hits this. Worth raising with the File Format API owners rather than fixing per engine.

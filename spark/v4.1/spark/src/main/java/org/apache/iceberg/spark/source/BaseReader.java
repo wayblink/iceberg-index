@@ -49,6 +49,7 @@ import org.apache.iceberg.io.FileIO;
 import org.apache.iceberg.io.InputFile;
 import org.apache.iceberg.mapping.NameMapping;
 import org.apache.iceberg.mapping.NameMappingParser;
+import org.apache.iceberg.relocated.com.google.common.collect.Maps;
 import org.apache.iceberg.spark.SparkExecutorCache;
 import org.apache.iceberg.spark.SparkSchemaUtil;
 import org.apache.iceberg.spark.SparkUtil;
@@ -83,6 +84,8 @@ abstract class BaseReader<T, TaskT extends ScanTask> implements Closeable {
   private T current = null;
   private TaskT currentTask = null;
 
+  private final Map<String, String> storageProperties;
+
   BaseReader(
       Table table,
       FileIO fileIO,
@@ -102,6 +105,28 @@ abstract class BaseReader<T, TaskT extends ScanTask> implements Closeable {
         nameMappingString != null ? NameMappingParser.fromJson(nameMappingString) : null;
     this.counter = new DeleteCounter();
     this.cacheDeleteFilesOnExecutors = cacheDeleteFilesOnExecutors;
+    this.storageProperties = storageProperties(this.table, this.fileIO);
+  }
+
+  /**
+   * Storage settings for the formats that open files themselves, rather than through the {@link
+   * FileIO} that already holds them.
+   */
+  protected Map<String, String> storageProperties() {
+    return storageProperties;
+  }
+
+  private static Map<String, String> storageProperties(Table table, FileIO fileIO) {
+    Map<String, String> properties = Maps.newHashMap();
+    try {
+      properties.putAll(fileIO.properties());
+    } catch (UnsupportedOperationException e) {
+      // this FileIO does not expose its configuration; the table may still carry the settings
+    }
+
+    // the table is more specific than the catalog
+    properties.putAll(table.properties());
+    return properties;
   }
 
   protected abstract CloseableIterator<T> open(TaskT task);

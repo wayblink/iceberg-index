@@ -966,6 +966,9 @@ public final class IndexEntries {
     long tInput = System.nanoTime();
     ReadBuilder<Record, Void> builder =
         FormatModelRegistry.readBuilder(format, Record.class, input);
+    // a format that opens the file itself does not read through the Hadoop file system, so the
+    // storage settings this table is read with have to be handed to it
+    builder.setAll(storageProperties(taskConf(conf)));
     long tBuilder = System.nanoTime();
     boolean timings = Boolean.getBoolean("iceberg.index.fetch-back.timings");
 
@@ -1500,8 +1503,38 @@ public final class IndexEntries {
     InputFile inputFile = io.newInputFile(deleteFile.location());
     return FormatModelRegistry.readBuilder(deleteFile.format(), Record.class, inputFile)
         .project(projection)
+        .setAll(storageProperties(io))
         .reuseContainers()
         .build();
+  }
+
+  /**
+   * The file system settings a format that opens files itself needs, in the spelling the engine
+   * already carried them in.
+   */
+  private static Map<String, String> storageProperties(FileIO io) {
+    try {
+      return io.properties();
+    } catch (UnsupportedOperationException e) {
+      return ImmutableMap.of();
+    }
+  }
+
+  /** The same, for a path that only has the Hadoop configuration. */
+  private static Map<String, String> storageProperties(org.apache.hadoop.conf.Configuration conf) {
+    Map<String, String> properties = Maps.newHashMap();
+    for (Map.Entry<String, String> entry : conf) {
+      String key = entry.getKey();
+      if (key.startsWith("fs.s3a.")
+          || key.startsWith("fs.s3.")
+          || key.startsWith("fs.gs.")
+          || key.startsWith("fs.azure.")
+          || key.startsWith("s3.")) {
+        properties.put(key, entry.getValue());
+      }
+    }
+
+    return properties;
   }
 
   /** The table columns of one equality key set, in field id order; null where a column is gone. */

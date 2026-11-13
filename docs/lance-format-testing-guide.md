@@ -65,7 +65,9 @@ ALTER TABLE hms.sparkann.sift10m_lance SET TBLPROPERTIES (
 
 **凭据不要写进表属性**：表属性会进元数据和每一个快照的历史，等于把 AK/SK 永久留档。凭据走 catalog 配置、instance profile 或环境变量；表属性里只放 endpoint / region / path-style / 是否明文这几项。
 
-**两侧现状**：写侧已经按上表翻译（`TestLanceS3StorageOptions` 在 MinIO 上验证过，Iceberg 写法和 `lance.storage.*` 写法都能写能读，且把 endpoint 换成不存在的主机名时错误信息里会点名该主机，说明它真的被用了）。读侧还没有接上配置通道——`FormatModel.readBuilder(InputFile)` 不收配置，目前读 Lance 文件仍然只认环境变量；这一条记在 `lance/LANCE_SDK_GAPS.md` 第 10 节。
+**两侧现状**：读写都按上表翻译。写侧由 `ModelWriteBuilder.set` 把表属性送进来；读侧由 Spark 3.5/4.0/4.1 的批式与行式读取器、`data` 的 `GenericReader`、以及 `index-spark` 的检索回表把 `FileIO.properties()` 与表属性一起交给 `ReadBuilder`（表属性优先），Lance 再从收到的键里挑它认识的。
+
+证据分两层：`TestLanceS3StorageOptions` 在 MinIO 上验证了两套写法都能写能读，且把 endpoint 换成不存在的主机名时错误信息里会点名该主机，说明它真的被用了；`TestGenericReaderStorageProperties` 用一个记录配置的替身 format model 验证读取器确实把表属性交给了 `ReadBuilder`。还**没接**的入口是 Flink 的 `RowDataFileScanTaskReader`（它的构造函数里没有 `FileIO`，要改签名波及上层）、MR 的 `IcebergInputFormat`、以及 `data` 的 `BaseDeleteLoader`（只有 `Function<DeleteFile, InputFile>`，没有配置来源）——这些入口上的 Lance 文件目前仍然只认环境变量。
 
 ## 4. 还缺的（属 Lance Java SDK，不在本仓）
 

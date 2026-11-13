@@ -63,6 +63,7 @@ abstract class BaseRowReader<T extends ScanTask> extends BaseReader<InternalRow,
         FormatModelRegistry.readBuilder(format, InternalRow.class, file);
     return reader
         .project(projection)
+        .setAll(storageProperties())
         .idToConstant(idToConstant)
         .reuseContainers()
         .split(start, length)

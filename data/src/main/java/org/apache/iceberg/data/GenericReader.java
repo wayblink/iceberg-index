@@ -35,6 +35,7 @@ import org.apache.iceberg.io.CloseableIterator;
 import org.apache.iceberg.io.FileIO;
 import org.apache.iceberg.io.InputFile;
 import org.apache.iceberg.relocated.com.google.common.collect.Iterables;
+import org.apache.iceberg.relocated.com.google.common.collect.Maps;
 import org.apache.iceberg.util.PartitionUtil;
 
 class GenericReader implements Serializable {
@@ -43,6 +44,7 @@ class GenericReader implements Serializable {
   private final Schema projection;
   private final boolean caseSensitive;
   private final boolean reuseContainers;
+  private final Map<String, String> storageProperties;
 
   GenericReader(TableScan scan, boolean reuseContainers) {
     this.io = scan.table().io();
@@ -50,6 +52,24 @@ class GenericReader implements Serializable {
     this.projection = scan.schema();
     this.caseSensitive = scan.isCaseSensitive();
     this.reuseContainers = reuseContainers;
+    this.storageProperties = storageProperties(io, scan.table().properties());
+  }
+
+  /**
+   * Settings for the formats that open files themselves instead of going through the {@link FileIO}
+   * that already holds them.
+   */
+  private static Map<String, String> storageProperties(
+      FileIO io, Map<String, String> tableProperties) {
+    Map<String, String> properties = Maps.newHashMap();
+    try {
+      properties.putAll(io.properties());
+    } catch (UnsupportedOperationException e) {
+      // this FileIO does not expose its configuration; the table may still carry the settings
+    }
+
+    properties.putAll(tableProperties);
+    return properties;
   }
 
   CloseableIterator<Record> open(CloseableIterable<CombinedScanTask> tasks) {
@@ -97,6 +117,7 @@ class GenericReader implements Serializable {
 
     return builder
         .project(fileProjection)
+        .setAll(storageProperties)
         .idToConstant(partition)
         .split(task.start(), task.length())
         .caseSensitive(caseSensitive)

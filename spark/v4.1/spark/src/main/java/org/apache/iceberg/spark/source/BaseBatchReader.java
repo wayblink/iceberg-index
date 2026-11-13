@@ -82,6 +82,7 @@ abstract class BaseBatchReader<T extends ScanTask> extends BaseReader<ColumnarBa
     CloseableIterable<ColumnarBatch> iterable =
         readBuilder
             .project(deleteFilter.requiredSchema())
+            .setAll(storageProperties())
             .idToConstant(idToConstant)
             .split(start, length)
             .filter(residual)
