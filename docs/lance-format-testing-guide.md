@@ -37,7 +37,37 @@ Register a model for this type, or write this content in a format that provides 
 
 `position delete` 存进 Lance 本身是支持的，`TestLanceVectorSearch.searchAppliesPositionDeletesStoredInTheTablesOwnFormat` 就是按这个形状写的——它验证"被删行不会从索引结果里回来"。
 
-## 3. 还缺的（属 Lance Java SDK，不在本仓）
+## 3. 存储配置：非 AWS 的 S3 兼容存储
+
+Lance 的读写都自己开对象存储，它认的是 `object_store` 的**裸键**（`endpoint`、`access_key_id`、`secret_access_key`、`region`、`allow_http`、`virtual_hosted_style_request`）；Iceberg 和 Hadoop 用的是带前缀的键（`s3.endpoint`、`fs.s3a.access.key`）。把带前缀的键原样交给 Lance，它不会报错，而是**当一个没见过的键忽略掉**，然后回落到进程环境变量。所以只配表属性/catalog、不注入 `AWS_*` 时，读会静默走到公网 AWS 上（或者报 `Bucket ... not found`，看不出是配置没被接住）。
+
+现在写侧会把这些键翻译成 Lance 认的名字，三种写法等价，按需选一种：
+
+| 想配的 | Iceberg 写法 | Hadoop 写法 | Lance 逃逸口 |
+|---|---|---|---|
+| endpoint | `s3.endpoint` | `fs.s3a.endpoint` | `lance.storage.endpoint` |
+| access key | `s3.access-key-id` | `fs.s3a.access.key` | `lance.storage.access_key_id` |
+| secret key | `s3.secret-access-key` | `fs.s3a.secret.key` | `lance.storage.secret_access_key` |
+| session token | `s3.session-token` | `fs.s3a.session.token` | `lance.storage.session_token` |
+| region | `s3.region` | `fs.s3a.endpoint.region` | `lance.storage.region` |
+| 用 path-style 寻址 | `s3.path-style-access=true` | `fs.s3a.path.style.access=true` | `lance.storage.virtual_hosted_style_request=false` |
+| 走明文 http | — | `fs.s3a.connection.ssl.enabled=false` | `lance.storage.allow_http=true` |
+
+两条容易踩的：path-style 与 `allow_http` 在 Lance 那边是**反向开关**（`virtual_hosted_style_request`、`allow_http`），MinIO / 本厂 OSS 这类自建端点通常两个都要给，否则第一次 PUT 就报 `HTTP error: builder error`；`lance.storage.*` 是逃逸口，Lance 新增任何键都可以从这里透传，它最后应用，会覆盖同名的翻译结果。`s3.*` 里暂时没有对应项的键（比如 `s3.some-future-knob`）会被忽略并打一条 WARN，不会让已有的表读不出来。
+
+```sql
+ALTER TABLE hms.sparkann.sift10m_lance SET TBLPROPERTIES (
+  's3.endpoint' = 'http://oss.i.shaipower.com',
+  's3.region' = 'us-east-1',
+  's3.path-style-access' = 'true',
+  'fs.s3a.connection.ssl.enabled' = 'false');
+```
+
+**凭据不要写进表属性**：表属性会进元数据和每一个快照的历史，等于把 AK/SK 永久留档。凭据走 catalog 配置、instance profile 或环境变量；表属性里只放 endpoint / region / path-style / 是否明文这几项。
+
+**两侧现状**：写侧已经按上表翻译（`TestLanceS3StorageOptions` 在 MinIO 上验证过，Iceberg 写法和 `lance.storage.*` 写法都能写能读，且把 endpoint 换成不存在的主机名时错误信息里会点名该主机，说明它真的被用了）。读侧还没有接上配置通道——`FormatModel.readBuilder(InputFile)` 不收配置，目前读 Lance 文件仍然只认环境变量；这一条记在 `lance/LANCE_SDK_GAPS.md` 第 10 节。
+
+## 4. 还缺的（属 Lance Java SDK，不在本仓）
 
 这三条在 `lance/LANCE_SDK_GAPS.md` 里有完整讨论，只影响性能与裁剪，不影响正确性：
 
@@ -45,7 +75,7 @@ Register a model for this type, or write this content in a format that provides 
 - **filter 下推是 no-op**：`ReadBuilderWrapper.filter()` 接受表达式但不应用，过滤仍在 Iceberg 的残余求值里做，正确但慢。
 - **不可 split**：要真正在单个大文件内并行，需要 SDK 暴露 `getBytesWritten()` 并把字节偏移映射到行区间（Gap #3 的方案），成本高、收益不确定，建议先用第 1 节的文件数控制。
 
-## 4. 一次最小验证
+## 5. 一次最小验证
 
 ```sql
 CREATE TABLE hms.sparkann.lance_smoke (id bigint, embedding array<double>) USING iceberg

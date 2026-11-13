@@ -263,17 +263,8 @@ public class LanceFormatModel<D, S>
 
       String path = outputFile.encryptingOutputFile().location();
 
-      // Extract storage options from config (s3.*, gcs.*, azure.* prefixed properties)
-      Map<String, String> storageOptions = Maps.newHashMap();
-      for (Map.Entry<String, String> entry : config.entrySet()) {
-        String key = entry.getKey();
-        if (key.startsWith("s3.")
-            || key.startsWith("gcs.")
-            || key.startsWith("azure.")
-            || key.startsWith("lance.storage.")) {
-          storageOptions.put(key, entry.getValue());
-        }
-      }
+      // storage properties arrive in Iceberg/Hadoop spelling and Lance takes bare keys
+      Map<String, String> storageOptions = LanceStorageOptions.from(config);
 
       int batchSize = DEFAULT_BATCH_SIZE;
       if (config.containsKey("lance.batch-size")) {
@@ -406,17 +397,8 @@ public class LanceFormatModel<D, S>
     public CloseableIterable<D> build() {
       String path = inputFile.location();
 
-      // Extract storage options
-      Map<String, String> storageOptions = Maps.newHashMap();
-      for (Map.Entry<String, String> entry : config.entrySet()) {
-        String key = entry.getKey();
-        if (key.startsWith("s3.")
-            || key.startsWith("gcs.")
-            || key.startsWith("azure.")
-            || key.startsWith("lance.storage.")) {
-          storageOptions.put(key, entry.getValue());
-        }
-      }
+      // storage properties arrive in Iceberg/Hadoop spelling and Lance takes bare keys
+      Map<String, String> storageOptions = LanceStorageOptions.from(config);
 
       List<String> projectedColumns = null;
       org.apache.arrow.vector.types.pojo.Schema arrowSchema = null;

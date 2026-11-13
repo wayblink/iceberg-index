@@ -192,3 +192,38 @@ rows.
 The Spark writer throws `Unsupported type for Spark writer: LIST`; the generic converter has no
 list branch. Vector columns are arrays, so a Lance-backed vector table needs list support on the
 write and read paths (schema conversion, generic reader, Spark row reader, Spark columnar reader).
+
+## 10. Storage Configuration Has No Read-Side Channel (File Format API Gap)
+
+**Severity: blocking for any format that brings its own object store (Lance, and anything else
+that does not read through `FileIO`).**
+
+Lance opens the file itself, so it needs the S3 settings passed to `LanceFileReader.open` /
+`LanceFileWriter.open`. It takes bare `object_store` keys (`endpoint`, `access_key_id`,
+`secret_access_key`, `region`, `allow_http`, `virtual_hosted_style_request`) — a prefixed
+`lance.storage.endpoint` or `s3.endpoint` put into that map is ignored silently, and the reader
+falls back to the process environment.
+
+Write side works: `RegistryBasedFileWriterFactory` passes `table.properties()` through
+`ModelWriteBuilder.set`, and `LanceStorageOptions` translates them.
+
+Read side does not: `FormatModel.readBuilder(InputFile)` takes no configuration, `ReadBuilder.set`
+exists but no Spark, Flink, MR, Arrow or index read path calls it, so the storage options map is
+always empty. The consequence is asymmetric and surprising — the same table reads its parquet files
+with the catalog's `s3.*` settings and its Lance files with the process environment only.
+
+**Proposed fix (iceberg-lance side):** add a `setAll(Map)` default to `ReadBuilder` and have the
+engine readers (Spark `BaseBatchReader`/`BaseRowReader`, Flink `RowDataFileScanTaskReader`,
+MR `IcebergInputFormat`, `data` `GenericReader`, `index-spark` `IndexEntries`) pass the storage
+subset of `FileIO.properties()` (with `UnsupportedOperationException` handled — the `FileIO`
+default throws) and of the table properties.
+
+**Upstream gap:** `readBuilder(InputFile)` has no config parameter, so every format that owns its
+storage hits this. Worth raising with the File Format API owners rather than fixing per engine.
+
+**Cache of the accepted keys** (checked against `liblance_jni` in `lance-core-5.0.0-beta.6`):
+`access_key_id`, `secret_access_key`, `session_token`, `region`, `endpoint`, `allow_http`,
+`virtual_hosted_style_request`, `skip_signature`, `anonymous`, `client_max_retries`,
+`connect_timeout`, `proxy_url`, `allow_invalid_certificates`, and the Aliyun provider's
+`oss_endpoint` / `oss_access_key_id` / `oss_secret_access_key`. No `s3.*` key appears in the
+binary — that is why the prefixed pass-through was a no-op.
