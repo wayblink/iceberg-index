@@ -225,9 +225,16 @@ understands:
   `data` `BaseDeleteLoader` — it only holds `Function<DeleteFile, InputFile>` and the public
   constructor cannot carry a configuration source without an API change
 
+A second asymmetry is worth recording: the write side has no `FileIO` channel either.
+`RegistryBasedFileWriterFactory` only passes `table.properties()` through `ModelWriteBuilder.set`, so a
+table written to a non-AWS endpoint must carry endpoint / path-style / allow-http **as table
+properties** (credentials can still come from the environment or an instance profile).
+
 Evidence: `TestLanceS3StorageOptions` writes and reads through MinIO with both the Iceberg spelling
 and `lance.storage.*`, and names an unreachable endpoint in the failure; `TestGenericReaderStorageProperties`
-registers a stub model and asserts the table properties reach the `ReadBuilder`.
+registers a stub model and asserts the table properties reach the `ReadBuilder`;
+`TestLanceSparkS3StorageSmoke` writes a Lance table to MinIO through Spark, strips the storage
+properties from the table, and reads it back using only the catalog's `FileIO` properties.
 
 **Upstream gap:** `readBuilder(InputFile)` has no config parameter, so every format that owns its
 storage hits this. Worth raising with the File Format API owners rather than fixing per engine.

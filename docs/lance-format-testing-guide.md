@@ -53,7 +53,7 @@ Lance 的读写都自己开对象存储，它认的是 `object_store` 的**裸�
 | 用 path-style 寻址 | `s3.path-style-access=true` | `fs.s3a.path.style.access=true` | `lance.storage.virtual_hosted_style_request=false` |
 | 走明文 http | — | `fs.s3a.connection.ssl.enabled=false` | `lance.storage.allow_http=true` |
 
-两条容易踩的：path-style 与 `allow_http` 在 Lance 那边是**反向开关**（`virtual_hosted_style_request`、`allow_http`），MinIO / 本厂 OSS 这类自建端点通常两个都要给，否则第一次 PUT 就报 `HTTP error: builder error`；`lance.storage.*` 是逃逸口，Lance 新增任何键都可以从这里透传，它最后应用，会覆盖同名的翻译结果。`s3.*` 里暂时没有对应项的键（比如 `s3.some-future-knob`）会被忽略并打一条 WARN，不会让已有的表读不出来。
+三条容易踩的。一是 path-style 与 `allow_http` 在 Lance 那边是**反向开关**（`virtual_hosted_style_request`、`allow_http`），MinIO / 本厂 OSS 这类自建端点通常两个都要给，否则第一次 PUT 就报 `HTTP error: builder error`。二是 **region 有两个名字**：Iceberg 自己的 `S3FileIO` 认 `client.region`，Lance 认 `region`（由 `s3.region` 翻译而来），少给 `client.region` 会在建 writer 时就报 `Unable to load region from any of the providers`。三是 `lance.storage.*` 是逃逸口，Lance 新增任何键都可以从这里透传，它最后应用、会覆盖同名的翻译结果；`s3.*` 里暂时没有对应项的键（比如 `s3.some-future-knob`）会被忽略并打一条 WARN，不会让已有的表读不出来。
 
 ```sql
 ALTER TABLE hms.sparkann.sift10m_lance SET TBLPROPERTIES (
@@ -65,9 +65,9 @@ ALTER TABLE hms.sparkann.sift10m_lance SET TBLPROPERTIES (
 
 **凭据不要写进表属性**：表属性会进元数据和每一个快照的历史，等于把 AK/SK 永久留档。凭据走 catalog 配置、instance profile 或环境变量；表属性里只放 endpoint / region / path-style / 是否明文这几项。
 
-**两侧现状**：读写都按上表翻译。写侧由 `ModelWriteBuilder.set` 把表属性送进来；读侧由 Spark 3.5/4.0/4.1 的批式与行式读取器、`data` 的 `GenericReader`、以及 `index-spark` 的检索回表把 `FileIO.properties()` 与表属性一起交给 `ReadBuilder`（表属性优先），Lance 再从收到的键里挑它认识的。
+**来源不对称，这点要记住**：写侧由 `ModelWriteBuilder.set` 从**表属性**拿到配置，它没有 `FileIO` 通道，所以写一张非 AWS 上的 Lance 表时，endpoint / path-style / 是否明文都只能写在表属性里（凭据则可以留给 instance profile 或环境变量，免得进元数据与快照历史）。读侧两条来源都有：Spark 3.5/4.0/4.1 的批式与行式读取器、`data` 的 `GenericReader`、以及 `index-spark` 的检索回表把 `FileIO.properties()` 与表属性一起交给 `ReadBuilder`（表属性优先），Lance 再从收到的键里挑它认识的。
 
-证据分两层：`TestLanceS3StorageOptions` 在 MinIO 上验证了两套写法都能写能读，且把 endpoint 换成不存在的主机名时错误信息里会点名该主机，说明它真的被用了；`TestGenericReaderStorageProperties` 用一个记录配置的替身 format model 验证读取器确实把表属性交给了 `ReadBuilder`。还**没接**的入口是 Flink 的 `RowDataFileScanTaskReader`（它的构造函数里没有 `FileIO`，要改签名波及上层）、MR 的 `IcebergInputFormat`、以及 `data` 的 `BaseDeleteLoader`（只有 `Function<DeleteFile, InputFile>`，没有配置来源）——这些入口上的 Lance 文件目前仍然只认环境变量。
+证据分三层：`TestLanceS3StorageOptions` 在 MinIO 上验证了两套写法都能写能读，且把 endpoint 换成不存在的主机名时错误信息里会点名该主机，说明它真的被用了；`TestGenericReaderStorageProperties` 用一个记录配置的替身 format model 验证读取器确实把表属性交给了 `ReadBuilder`；`TestLanceSparkS3StorageSmoke` 走完整链路——在 Spark 里建一张数据文件落在 MinIO 的 Lance 表，写入后把表上的存储属性全部撤掉，再靠 catalog 的 `FileIO` 配置读回 `max(id)`，跑完自己删表删文件。三个测试在没有 MinIO 时跳过。还**没接**的入口是 Flink 的 `RowDataFileScanTaskReader`（它的构造函数里没有 `FileIO`，要改签名波及上层）、MR 的 `IcebergInputFormat`、以及 `data` 的 `BaseDeleteLoader`（只有 `Function<DeleteFile, InputFile>`，没有配置来源）——这些入口上的 Lance 文件目前仍然只认环境变量。
 
 ## 4. 还缺的（属 Lance Java SDK，不在本仓）
 
