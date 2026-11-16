@@ -18,8 +18,11 @@
  */
 package org.apache.iceberg.index.vector;
 
+import java.util.Map;
 import java.util.Random;
+import java.util.concurrent.ConcurrentHashMap;
 import org.apache.iceberg.relocated.com.google.common.base.Preconditions;
+import org.apache.iceberg.util.Pair;
 
 /**
  * One bit per dimension, plus three numbers per vector to make the estimate usable.
@@ -72,6 +75,17 @@ public final class RaBitQQuantizer implements java.io.Serializable {
 
   private static final int MAX_BITS = 8;
 
+  /**
+   * The signs in use, by seed and padded length.
+   *
+   * <p>Every list of one index file carries its own quantizer and they all share one seed, so the
+   * same array serves all of them rather than each holding a copy: at a padded length of 4096 a
+   * copy is 16 KiB, which a file with a few hundred lists pays a few hundred times over. The
+   * quantizers of one file are serialized together, so a round trip rebuilds one shared array
+   * rather than one per list, and the accounting counts it once for the same reason.
+   */
+  private static final Map<Pair<Long, Integer>, float[]> SIGNS = new ConcurrentHashMap<>();
+
   private final int dimension;
   private final int padded;
   private final long seed;
@@ -87,7 +101,11 @@ public final class RaBitQQuantizer implements java.io.Serializable {
     this.seed = seed;
     this.bits = bits;
     this.center = center.clone();
-    this.signs = signs(seed, padded);
+    this.signs = signsFor(seed, padded);
+  }
+
+  private static float[] signsFor(long seed, int length) {
+    return SIGNS.computeIfAbsent(Pair.of(seed, length), key -> signs(key.first(), key.second()));
   }
 
   /** The number of bits per dimension this quantizer was made with. */
@@ -263,13 +281,7 @@ public final class RaBitQQuantizer implements java.io.Serializable {
       double queryLengthSquared) {
     double norm = factors[0];
     double correction = factors[1];
-    // <x, P q'>, over the coordinates the code covers; a zero padded coordinate contributes
-    // nothing on either side
-    int levels = levels();
-    double projection = 0.0;
-    for (int i = 0; i < padded; i++) {
-      projection += decodeLevel(levelAt(payload, codeBase, i), levels) * rotatedQuery[i];
-    }
+    double projection = projection(payload, codeBase, rotatedQuery);
 
     double estimatedInner = norm == 0.0 || correction == 0.0 ? 0.0 : norm * projection / correction;
     double distanceSquared = norm * norm + queryLengthSquared - 2.0 * estimatedInner;
@@ -289,11 +301,7 @@ public final class RaBitQQuantizer implements java.io.Serializable {
       byte[] payload, long codeBase, float[] factors, float[] rotatedQuery, float[] query) {
     double norm = factors[0];
     double correction = factors[1];
-    int levels = levels();
-    double projection = 0.0;
-    for (int i = 0; i < padded; i++) {
-      projection += decodeLevel(levelAt(payload, codeBase, i), levels) * rotatedQuery[i];
-    }
+    double projection = projection(payload, codeBase, rotatedQuery);
 
     double centeredInner = norm == 0.0 || correction == 0.0 ? 0.0 : norm * projection / correction;
     // <o, q> = <c, c> + <c, q'> + <o', c> + <o', q'>, and the last term is the one estimated
@@ -401,25 +409,43 @@ public final class RaBitQQuantizer implements java.io.Serializable {
   }
 
   /**
-   * One quantization level, read from the code where it lies.
+   * The inner product of a code with a rotated query, over the coordinates the code covers.
    *
-   * <p>The first bit's address is checked against the code and the payload; a level that crosses a
-   * byte boundary reads one more, whose address is checked the same way. Bits within a byte are
-   * least-significant first, which is also the order {@link #setLevel} writes them in.
+   * <p>This is the inner loop of a search: one call per candidate, one iteration per coordinate.
+   * The code's extent is therefore checked once instead of twice per coordinate, and a coordinate's
+   * byte is reached with a running offset rather than through the generic address arithmetic.
+   *
+   * <p>Bits within a byte are least-significant first, which is the order {@link #setLevel} writes
+   * them in. The padded coordinates are not zero after the transform — it spreads them over the
+   * whole array — so they are read like any other; only their sum over the two vectors vanishes.
    */
-  private int levelAt(byte[] payload, long codeBase, int index) {
+  private double projection(byte[] payload, long codeBase, float[] rotatedQuery) {
     long codeBytes = codeBytes();
-    long localBit = (long) index * bits;
-    int shift = (int) (localBit & 7);
-    int first = IvfLayout.codeByteAddress(codeBase, index, bits, 0, codeBytes, payload.length);
-    int word = payload[first] & 0xFF;
-    if (shift + bits > Byte.SIZE) {
-      int second =
-          IvfLayout.codeByteAddress(codeBase, index, bits, bits - 1, codeBytes, payload.length);
-      word |= (payload[second] & 0xFF) << 8;
+    long end = codeBase + codeBytes;
+    Preconditions.checkArgument(
+        codeBase >= 0 && end >= codeBase && end <= payload.length,
+        "Code at payload byte %s with %s bytes is outside the %s-byte payload",
+        codeBase,
+        codeBytes,
+        payload.length);
+
+    int base = (int) codeBase;
+    int mask = levels() - 1;
+    int levels = levels();
+    double sum = 0.0;
+    for (int i = 0; i < padded; i++) {
+      long localBit = (long) i * bits;
+      int shift = (int) (localBit & 7);
+      int byteIndex = base + (int) (localBit >>> 3);
+      int word = payload[byteIndex] & 0xFF;
+      if (shift + bits > Byte.SIZE) {
+        word |= (payload[byteIndex + 1] & 0xFF) << 8;
+      }
+
+      sum += decodeLevel((word >>> shift) & mask, levels) * rotatedQuery[i];
     }
 
-    return (word >>> shift) & (levels() - 1);
+    return sum;
   }
 
   /** Estimates the retained center, padded signs and quantizer fields without copying arrays. */
