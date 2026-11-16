@@ -27,7 +27,9 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
+import org.apache.iceberg.index.spark.IndexCacheControl;
 import org.apache.iceberg.index.spark.IndexCachePlugin;
+import org.apache.iceberg.index.spark.IndexCacheStatus;
 import org.apache.iceberg.index.vector.VectorIndexTypes;
 import org.apache.spark.sql.Row;
 import org.apache.spark.sql.SparkSession;
@@ -69,11 +71,11 @@ public class TestIndexResidencyCluster {
             .config("spark.ui.enabled", "false")
             .config("spark.sql.shuffle.partitions", "2")
             .config("spark.default.parallelism", "2")
-            .config("spark.testing", "true")
             .config(
                 "spark.sql.extensions",
                 "org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions")
             .config("spark.plugins", IndexCachePlugin.class.getName())
+            .config("spark.iceberg.index.cache.enabled", "true")
             .config("spark.iceberg.index.cache.bytes", Long.toString(CACHE_BYTES))
             // local-cluster starts a JVM per executor and hands it this process's classpath, which
             // is where a Gradle test build keeps its classes; without it the plugin class is
@@ -93,7 +95,7 @@ public class TestIndexResidencyCluster {
             .getOrCreate();
 
     spark.sparkContext().setLogLevel("WARN");
-    spark.sql("CREATE DATABASE IF NOT EXISTS " + CATALOG + "." + DATABASE);
+    spark.sql("CREATE NAMESPACE IF NOT EXISTS " + CATALOG + "." + DATABASE);
   }
 
   @AfterAll
@@ -131,18 +133,9 @@ public class TestIndexResidencyCluster {
                 assertThat(row.getString(10)).as("gap of %s", row.getString(7)).isNull();
               });
 
-      // An ACK names the executor that stored the copy, and local-cluster gives each of them its
-      // own JVM; a thread pool in the driver could not produce two different hosts here.
-      List<String> executors = new ArrayList<>();
-      for (Row row : fileRows) {
-        String executor = row.getString(8);
-        if (!executors.contains(executor)) {
-          executors.add(executor);
-        }
-      }
-
-      assertThat(executors).isNotEmpty();
-      assertThat(executorHosts()).as("executors in the application").hasSize(2);
+      assertThat(IndexCacheControl.status(spark).stream().map(IndexCacheControl.Status::executorId))
+          .as("executor plugins in the application")
+          .hasSize(2);
 
       assertThat(searchIds(table)).containsExactlyElementsOf(uncached);
 
@@ -154,6 +147,93 @@ public class TestIndexResidencyCluster {
       // Offloading frees the copies without touching the files: the query still answers exactly the
       // same rows, reading them from storage again.
       assertThat(searchIds(table)).containsExactlyElementsOf(uncached);
+    } finally {
+      spark.sql("DROP TABLE IF EXISTS " + table);
+    }
+  }
+
+  @Test
+  void firstTextQueryAfterLoadHitsEveryResidentShard() {
+    String table = CATALOG + "." + DATABASE + ".documents";
+    try {
+      spark.sql(
+          "CREATE TABLE "
+              + table
+              + " (id bigint, body string) USING iceberg PARTITIONED BY (bucket(4, id))");
+      spark.sql(
+          "INSERT INTO " + table + " SELECT id, concat('iceberg document ', id) FROM range(64)");
+      String index =
+          spark
+              .sql(
+                  "CALL local.system.build_text_index(table => 'db.documents', column => 'body', "
+                      + "max_entries_per_index_file => 16L)")
+              .head()
+              .getString(0);
+      String query =
+          "CALL local.system.text_search(table => 'db.documents', column => 'body', "
+              + "query => 'iceberg', k => 10)";
+      List<Row> cold = spark.sql(query).collectAsList();
+      assertThat(cold).hasSize(10);
+      long hits = cacheHits();
+
+      List<Row> load = call("load_index", table, index, null);
+      assertThat(load.get(0).getString(0)).as("load result: %s", rows(load)).isEqualTo("COMPLETE");
+      assertThat(load.subList(1, load.size()).stream().map(row -> row.getString(8)).distinct())
+          .hasSize(2);
+
+      assertThat(spark.sql(query).collectAsList()).containsExactlyElementsOf(cold);
+      assertThat(cacheHits() - hits).isEqualTo(load.size() - 1L);
+
+      assertThat(call("offload_index", table, index, null).get(0).getString(0))
+          .isEqualTo("OFFLOADED");
+      assertThat(spark.sql(query).collectAsList()).containsExactlyElementsOf(cold);
+      assertThat(cacheHits() - hits).isEqualTo(load.size() - 1L);
+    } finally {
+      spark.sql("DROP TABLE IF EXISTS " + table);
+    }
+  }
+
+  private static long cacheHits() {
+    return IndexCacheStatus.snapshot(spark).stream()
+        .filter(row -> !"driver".equals(row.executorId()))
+        .mapToLong(IndexCacheStatus.Row::hits)
+        .sum();
+  }
+
+  @Test
+  void refreshReportsBothExecutorsBeforeAnyIndexQuery() {
+    String table = CATALOG + "." + DATABASE + ".documents_status";
+    try {
+      spark.sql(
+          "CREATE TABLE "
+              + table
+              + " (id bigint, body string) USING iceberg PARTITIONED BY (bucket(4, id))");
+      spark.sql(
+          "INSERT INTO " + table + " SELECT id, concat('iceberg document ', id) FROM range(64)");
+      String index =
+          spark
+              .sql(
+                  "CALL local.system.build_text_index(table => 'db.documents_status', "
+                      + "column => 'body', max_entries_per_index_file => 16L)")
+              .head()
+              .getString(0);
+      List<Row> load = call("load_index", table, index, null);
+      assertThat(load.get(0).getString(0)).as("load result: %s", rows(load)).isEqualTo("COMPLETE");
+      List<String> holders =
+          load.subList(1, load.size()).stream().map(row -> row.getString(8)).distinct().toList();
+      assertThat(holders).hasSize(2);
+
+      List<Row> status =
+          spark.sql("CALL local.system.index_cache_status(refresh => true)").collectAsList();
+      List<Row> executors =
+          status.stream().filter(row -> !"driver".equals(row.getString(0))).toList();
+      assertThat(executors)
+          .extracting(row -> row.getString(0))
+          .containsExactlyInAnyOrderElementsOf(holders);
+      assertThat(executors.stream().mapToLong(row -> row.getLong(4)).sum())
+          .isGreaterThanOrEqualTo(load.size() - 1L);
+      assertThat(call("offload_index", table, index, null).get(0).getString(0))
+          .isEqualTo("OFFLOADED");
     } finally {
       spark.sql("DROP TABLE IF EXISTS " + table);
     }
@@ -200,16 +280,6 @@ public class TestIndexResidencyCluster {
 
     File fallback = new File("/opt/spark");
     return new File(fallback, "bin/spark-submit").exists() ? fallback : null;
-  }
-
-  private static List<String> executorHosts() {
-    List<String> hosts = new ArrayList<>();
-    for (org.apache.spark.SparkExecutorInfo info :
-        spark.sparkContext().statusTracker().getExecutorInfos()) {
-      hosts.add(info.host());
-    }
-
-    return hosts;
   }
 
   private static void createVectors(String table) {

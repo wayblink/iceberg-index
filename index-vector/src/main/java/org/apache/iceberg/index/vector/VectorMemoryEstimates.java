@@ -22,6 +22,7 @@ import java.nio.ByteBuffer;
 import java.util.Map;
 import org.apache.iceberg.index.IndexBuildResult;
 import org.apache.iceberg.index.IndexFileMemory;
+import org.apache.iceberg.index.IndexMemoryLayout;
 
 final class VectorMemoryEstimates {
   private static final int MODEL_VERSION = 2;
@@ -56,16 +57,7 @@ final class VectorMemoryEstimates {
   }
 
   static String profile(int processors) {
-    if (!supportedLayout()) {
-      return null;
-    }
-
-    return "hotspot-17-64;object-header-allowance=16;array-header=16;reference-bytes="
-        + PreparedStructureSize.REFERENCE_BYTES
-        + ";alignment="
-        + PreparedStructureSize.ALIGNMENT
-        + ";compact-strings=true;representation=in-place;processors="
-        + processors;
+    return IndexMemoryLayout.profile(processors);
   }
 
   static boolean supportedLayout() {

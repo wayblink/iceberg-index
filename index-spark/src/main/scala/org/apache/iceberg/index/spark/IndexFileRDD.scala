@@ -31,8 +31,7 @@ import scala.reflect.ClassTag
  * A partition carries the file to read. What it prefers is the executor that has that file in its
  * cache, expressed as a TaskLocation.ExecutorCacheTaskLocation, which is the same hint Spark uses
  * for a cached block: the scheduler sends the task there when it can, and sends it anywhere when it
- * cannot. A hint is therefore never a requirement -- a task that lands elsewhere reads its file and
- * caches it there, which is what would happen without the table.
+ * cannot. A task that lands elsewhere reads its file from storage.
  */
 class IndexFileRDD(
     sc: SparkContext,
@@ -46,22 +45,17 @@ class IndexFileRDD(
     locations.size == cacheKeys.size,
     s"Each index file needs one cache key: ${locations.size} files, ${cacheKeys.size} keys")
 
+  @transient private lazy val confirmed =
+    IndexFileRdds.confirmedLocations(sparkContext, cacheKeys, locality)
+
   override protected def getPartitions: Array[Partition] =
     locations.indices.map(new IndexFileRdds.FilePartition(_): Partition).toArray
 
   override def compute(split: Partition, context: TaskContext): Iterator[String] =
     Iterator.single(locations(split.index))
 
-  /**
-   * The hosts that already hold this file.
-   *
-   * A hint names a host rather than an executor because the scheduler's executor-level location is
-   * not public API. On a cluster that runs one executor per node -- which is what the Kubernetes
-   * scheduler gives -- a host names the executor as well; where several executors share a host the
-   * hint can pick any of them, which still beats sending the task to a host that holds nothing.
-   */
   override def getPreferredLocations(split: Partition): Seq[String] =
-    IndexFileRdds.preferred(cacheKeys(split.index), table, locality)
+    IndexFileRdds.preferred(cacheKeys(split.index), table, locality, confirmed)
 
   /** The index file a partition reads, so results can be mapped back to it. */
   def locationAt(index: Int): String = locations(index)
@@ -86,8 +80,7 @@ class IndexFileTask(
 /**
  * One [[IndexFileTask]] per partition, each preferring the executors that already hold its file.
  *
- * The locality hint works the same way as in [[IndexFileRDD]]: it is a hint, so a task that lands
- * elsewhere reads its file and caches it there.
+ * The locality hint works the same way as in [[IndexFileRDD]].
  */
 class IndexFileTaskRDD(
     sc: SparkContext,
@@ -101,6 +94,9 @@ class IndexFileTaskRDD(
     files.size == cacheKeys.size,
     s"Each index file needs one cache key: ${files.size} files, ${cacheKeys.size} keys")
 
+  @transient private lazy val confirmed =
+    IndexFileRdds.confirmedLocations(sparkContext, cacheKeys, locality)
+
   override protected def getPartitions: Array[Partition] =
     files.indices.map(new IndexFileRdds.FilePartition(_): Partition).toArray
 
@@ -108,10 +104,18 @@ class IndexFileTaskRDD(
     Iterator.single(files(split.index))
 
   override def getPreferredLocations(split: Partition): Seq[String] =
-    IndexFileRdds.preferred(cacheKeys(split.index), table, locality)
+    IndexFileRdds.preferred(cacheKeys(split.index), table, locality, confirmed)
 }
 
 object IndexFileRdds {
+
+  /** One refresh probe per executor, preferring that executor's process. */
+  def statusProbes(sc: SparkContext, locations: java.util.Collection[String]): JavaRDD[String] = {
+    val probes =
+      if (locations.isEmpty) sc.parallelize(Seq(""), 1)
+      else sc.makeRDD(locations.asScala.map(location => (location, Seq(location))).toSeq)
+    new JavaRDD[String](probes)(ClassTag(classOf[String]))
+  }
 
   /**
    * A Java-typed view of the RDD.
@@ -140,20 +144,23 @@ object IndexFileRdds {
       new IndexFileTaskRDD(sc, files.asScala.toSeq, cacheKeys.asScala.toSeq, table, locality))(
       ClassTag(classOf[IndexFileTask]))
 
-  /**
-   * The hosts that already hold an index file.
-   *
-   * A hint names a host rather than an executor because the scheduler's executor-level location is
-   * not public API. On a cluster that runs one executor per node -- which is what the Kubernetes
-   * scheduler gives -- a host names the executor as well; where several executors share a host the
-   * hint can pick any of them, which still beats sending the task to a host that holds nothing.
-   */
+  private[spark] def confirmedLocations(
+      sc: SparkContext,
+      cacheKeys: Seq[String],
+      locality: Boolean): java.util.Map[String, java.util.List[String]] =
+    if (locality) IndexCacheLocations.confirmedLocations(sc, cacheKeys.asJava)
+    else java.util.Collections.emptyMap()
+
+  /** Prefer copies acknowledged by the residency plugin, then hosts reported by earlier tasks. */
   private[spark] def preferred(
       cacheKey: String,
       table: IndexCacheLocations,
-      locality: Boolean): Seq[String] = {
+      locality: Boolean,
+      confirmed: java.util.Map[String, java.util.List[String]]): Seq[String] = {
     if (!locality || table == null) {
       Seq.empty
+    } else if (confirmed.containsKey(cacheKey)) {
+      confirmed.get(cacheKey).asScala.toSeq
     } else {
       table
         .holders(cacheKey, 2)

@@ -280,15 +280,10 @@ final class ExecutorIndexCacheWorker implements AutoCloseable {
 
   private IndexCacheProtocol.Ack release(IndexCacheProtocol.Command command) {
     String cacheKey = command.file().cacheKey();
-    long appliedEpoch = cache.managedEpoch(command.indexUuid());
-    if (appliedEpoch > command.epoch()) {
-      // A newer load installed this copy; an older release must not delete it.
+    // Detach the claim and any pending admission under the same lock as the epoch check.
+    if (!cache.releaseCopy(command.indexUuid(), cacheKey, command.epoch())) {
       return reject(command, "STALE_EPOCH");
     }
-
-    // A release withdraws this index's claim at whatever epoch the executor currently holds, and
-    // also removes a pending admission so a load that is still preparing cannot publish afterwards.
-    cache.releaseCopy(command.indexUuid(), cacheKey);
 
     return ack(command, IndexCacheProtocol.AckStatus.RELEASED, 0, null);
   }

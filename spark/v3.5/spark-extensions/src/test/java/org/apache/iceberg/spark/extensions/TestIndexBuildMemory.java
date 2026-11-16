@@ -38,6 +38,8 @@ import org.apache.iceberg.index.IndexManifestList.ManifestRef;
 import org.apache.iceberg.index.IndexMetadata;
 import org.apache.iceberg.index.PuffinIndexFileContainer;
 import org.apache.iceberg.index.SidecarIndexCatalog;
+import org.apache.iceberg.index.text.TextIndexAdapter;
+import org.apache.iceberg.index.text.TextIndexDefinition;
 import org.apache.iceberg.index.vector.VectorIndexAdapter;
 import org.apache.iceberg.index.vector.VectorIndexDefinition;
 import org.apache.iceberg.io.CloseableIterable;
@@ -68,7 +70,7 @@ public class TestIndexBuildMemory extends ExtensionsTestBase {
   }
 
   @TestTemplate
-  void legacyTextBuildKeepsUnknownEstimate() throws Exception {
+  void textBuildPublishesMemory() throws Exception {
     String name = tableName("build_memory_text_" + catalogName);
     String indexUuid = null;
     try {
@@ -82,9 +84,21 @@ public class TestIndexBuildMemory extends ExtensionsTestBase {
       Table table = Spark3Util.loadIcebergTable(spark, name);
       IndexMetadata metadata =
           new SidecarIndexCatalog(table.io(), table).loadIndex(table.location(), indexUuid);
+      TextIndexAdapter adapter = new TextIndexAdapter((TextIndexDefinition) metadata.definition());
       List<IndexFile> files = indexFiles(table, metadata);
       assertThat(files).isNotEmpty();
-      assertThat(files).allSatisfy(file -> assertThat(file.memory()).isNull());
+      for (IndexFile file : files) {
+        IndexFileMemory memory = file.memory();
+        assertThat(memory).isNotNull();
+        assertThat(memory.readerId()).isEqualTo("text/bm25/1");
+        var input = table.io().newInputFile(file.location());
+        assertThat(memory.fileBytes()).isEqualTo(input.getLength());
+        IndexBlob blob = new PuffinIndexFileContainer().read(input).get(0);
+        assertThat(memory.payloadBytes()).isEqualTo(blob.payload().length);
+        assertThat(memory.preparedBytes())
+            .isEqualTo(adapter.prepareAuxiliary(ByteBuffer.wrap(blob.payload())).estimatedBytes());
+      }
+
       assertThat(files.stream().mapToLong(IndexFile::entryCount).sum()).isEqualTo(2);
     } finally {
       try {

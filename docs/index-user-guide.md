@@ -472,6 +472,8 @@ CALL local.system.offload_index(table => 'db.docs', index => '<uuid>');
 
 `retain_for` 接受 `0`（不保护）、`forever`、`<n>smhd`（如 `30m`、`1h`），不给则保持当前保护期。输出是每文件一行的放置结果。
 
+BM25 和向量索引共用 executor 的容量预算、LRU 和状态入口。用文本索引的 UUID 调用同一个 `load_index`。启用调度局部性时，查询优先调度到已确认持有分片的 executor。分布式 BM25 查询命中驻留时直接从内存读取分片，未命中时按范围读取且不自动回填。查看合计占用使用 `CALL local.system.index_cache_status(refresh => true)`。
+
 当前版本的行为（不是建议）：
 
 - executor 被杀后，driver 只有在**收到下一次上报**时才把它标记为丢失；在那之前它仍在账上，但已超过 10 秒没上报的节点不再是放置目标。

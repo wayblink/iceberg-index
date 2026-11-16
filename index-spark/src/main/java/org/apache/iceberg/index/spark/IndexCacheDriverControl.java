@@ -21,6 +21,7 @@ package org.apache.iceberg.index.spark;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Set;
 import org.apache.iceberg.relocated.com.google.common.base.Preconditions;
 
 /**
@@ -89,6 +90,10 @@ final class IndexCacheDriverControl {
 
   synchronized Map<String, String> placements(String planId) {
     return coordinator.placements(planId);
+  }
+
+  synchronized Map<String, List<String>> residentExecutors(Set<String> cacheKeys) {
+    return coordinator.residentExecutors(cacheKeys);
   }
 
   synchronized Map<String, Long> plannedBytes(String planId) {

@@ -22,6 +22,7 @@ import java.lang.reflect.Array;
 import java.util.Collections;
 import java.util.IdentityHashMap;
 import java.util.Set;
+import org.apache.iceberg.index.IndexMemoryLayout;
 import org.apache.iceberg.relocated.com.google.common.base.Preconditions;
 
 /**
@@ -35,9 +36,9 @@ import org.apache.iceberg.relocated.com.google.common.base.Preconditions;
  */
 final class PreparedStructureSize {
 
-  static final int HEADER_BYTES = 16;
-  static final int REFERENCE_BYTES = 4;
-  static final int ALIGNMENT = 8;
+  static final int HEADER_BYTES = IndexMemoryLayout.HEADER_BYTES;
+  static final int REFERENCE_BYTES = IndexMemoryLayout.REFERENCE_BYTES;
+  static final int ALIGNMENT = IndexMemoryLayout.ALIGNMENT;
   private static final int STRING_OBJECT_BYTES = 24;
 
   private PreparedStructureSize() {}

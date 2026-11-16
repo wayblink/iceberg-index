@@ -22,8 +22,8 @@ import java.io.Serializable;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
+import org.apache.spark.SparkContext;
 import org.apache.spark.api.java.JavaRDD;
-import org.apache.spark.api.java.JavaSparkContext;
 import org.apache.spark.sql.SparkSession;
 
 /**
@@ -151,46 +151,27 @@ public final class IndexCacheStatus {
    * a caller can do from SQL.
    */
   public static List<Row> refresh(SparkSession spark) {
-    IndexCacheLocations table = IndexCacheLocations.forContext(spark.sparkContext());
-    int tasks = Math.max(1, Math.min(64, table.size()));
-    List<Integer> slices = new ArrayList<>(tasks);
-    for (int i = 0; i < tasks; i++) {
-      slices.add(i);
-    }
-
-    JavaSparkContext context = JavaSparkContext.fromSparkContext(spark.sparkContext());
+    SparkContext context = spark.sparkContext();
+    IndexCacheLocations table = IndexCacheLocations.forContext(context);
     JavaRDD<IndexCacheLocations.Report> reports =
-        context
-            .parallelize(slices, tasks)
+        IndexFileRdds.statusProbes(context, IndexCacheLocations.executorLocations(context).values())
             .map(
-                (org.apache.spark.api.java.function.Function<Integer, IndexCacheLocations.Report>)
-                    slice -> {
-                      String executor = "unknown";
-                      String host = "unknown";
-                      try {
-                        if (org.apache.spark.SparkEnv.get() != null) {
-                          executor = org.apache.spark.SparkEnv.get().executorId();
-                          host =
-                              org.apache.spark.SparkEnv.get()
-                                  .blockManager()
-                                  .blockManagerId()
-                                  .host();
-                        }
-                      } catch (RuntimeException e) {
-                        host = "unknown";
-                      }
+                probe -> {
+                  String executor = "unknown";
+                  String host = "unknown";
+                  try {
+                    if (org.apache.spark.SparkEnv.get() != null) {
+                      executor = org.apache.spark.SparkEnv.get().executorId();
+                      host = org.apache.spark.SparkEnv.get().blockManager().blockManagerId().host();
+                    }
+                  } catch (RuntimeException e) {
+                    host = "unknown";
+                  }
 
-                      // a local session runs this in the driver's JVM, which the summary row
-                      // already covers
-                      return DRIVER.equals(executor)
-                          ? null
-                          : ExecutorIndexCache.get().report(executor, host);
-                    });
+                  return ExecutorIndexCache.get().report(executor, host);
+                });
 
-    table.mergeAll(
-        reports.collect().stream()
-            .filter(r -> r != null)
-            .collect(java.util.stream.Collectors.toList()));
+    table.mergeAll(reports.collect());
     return rows(table);
   }
 

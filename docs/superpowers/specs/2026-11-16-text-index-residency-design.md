@@ -19,7 +19,7 @@
 
 # 让文本索引进入驻留缓存
 
-行号对应 `index` 分支 `022d0ce55b`。本文只描述设计与施工顺序，不含实现。
+第 1–8 节记录设计时的状态，所引行号对应 `index` 分支 `022d0ce55b`。第 9 节记录实现验证。
 
 ## 1. 为什么做
 
@@ -112,11 +112,11 @@ query
 
 ## 7. 风险与未验证
 
-- **R1 · `runtimeProfile` 常量复制会漂移。** `PreparedStructureSize` 是 `index-vector` 的包私有类，`index-text` 用不到，只能复制 `REFERENCE_BYTES` / `ALIGNMENT` / 头大小与 profile 串。常量一旦与向量侧不一致，`compatible()` 会判不兼容，记录静默失效退回上界——不会算错，但会悄悄失去精确值。缓解：要么把常量提到公共位置（推荐），要么在两侧各留一条指向对方的注释与一条对拍测试。
-- **R2 · payload 字节比压缩文件大。** blob 默认 ZSTD，解压后可能显著大于文件。若实测比例超过 2，`fileBytes × 2` 上界反而不够，planning 会低估 → 需要在 S4 里用实测值取代上界（本来就该有 memory 记录），并记录比例。
+- **R1 · 保持 `runtimeProfile` 一致。** 文本和向量现从 Core 的 `IndexMemoryLayout` 读取同一套 JVM 布局判定、头大小、引用宽度、对齐及 profile，避免容量记录因两份常量漂移而失效。
+- **R2 · 区分磁盘和驻留字节。** BM25 v1 的压缩发生在各词的倒排块内，Puffin 不给整个文本 blob 再加外层压缩。驻留持有 payload 字节数组，计入对象头与对齐。新构建把估算写入 manifest，缺少记录的旧分片仍走通用容量估算，加载时由 executor 计算实际占用。
 - **R3 · 键一致性。** `load_index` 写入的 key 与查询时 `acquireManagedKey` 的 key 必须逐字一致（`owner|adapterKey|location`）。`adapterKey` 来自 `readerKey`，对文本是新引入的，若两侧在不同 JVM 上算出不同 `readerId`/profile，就会永远 miss 且没有任何报错——**这是本设计最容易静默失败的地方**，验收第 2 条就是为它设的。
 - **R4 · 文本索引是 auxiliary blob。** `load_index` 的 target 用 `file.kind()` / `file.blobType()` 规划，需确认文本（`writesAuxiliaryFiles() == true`）在放置与租约路径上与向量走同一套代码，没有按 kind 排除的分支。
-- **未验证（本文按代码推断，未实跑）**：文本索引 `load_index` 的实际报错文本与失败位置；单文件解压 payload 与文件字节的比例；预热后 p50 的真实下降幅度。
+- 尚未测量对象存储环境下预热对查询延迟的影响。
 
 ## 8. 参考
 
@@ -129,3 +129,11 @@ query
 - `index-text/src/main/java/org/apache/iceberg/index/text/TextIndexPayload.java:117`
 - `index-vector/src/main/java/org/apache/iceberg/index/vector/VectorMemoryEstimates.java:20-70`（要照抄的形状）
 - 相关卡：#2992（本设计）、#2869（driver 侧 payload 上界的旧问题，已关）、#3042（每任务 2.8 MB/s 的实测来源）、#3043（存储配置通道）
+
+## 9. 实现验证
+
+文本与向量复用同一个 executor 缓存、容量预算、LRU、租约以及 `load_index`、`offload_index`、`index_cache_status` 入口。BM25 继续按索引快照读取语料统计。文本分片命中驻留时从字节数组打分，未命中时仍按范围读取。查询不新增驻留。
+
+本地 Spark 插件测试跟踪分片的 FileIO 打开次数，核对冷查、加载后热查及卸载后冷查的结果，并检查混合索引的容量和状态。该样本的三个文本分片合计 1,688 字节 payload、2,231 字节 Puffin 文件，比例约为 76%。
+
+调度使用驻留控制器确认的 executor 作为首选位置。双 executor 的独立 JVM 测试中，`load_index` 返回后的首查命中全部四个 BM25 分片，结果与冷查一致。

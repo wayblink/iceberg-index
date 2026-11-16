@@ -157,6 +157,10 @@ final class ExecutorIndexCache {
       return DISABLED;
     }
 
+    static boolean enabled(org.apache.spark.sql.SparkSession spark) {
+      return Boolean.parseBoolean(setting(spark, ENABLED, "false"));
+    }
+
     static Config of(boolean enabled, long maxBytes) {
       Preconditions.checkArgument(maxBytes > 0, "The cache budget must be positive: %s", maxBytes);
       return new Config(enabled, maxBytes, Mode.PIN_ALL, 0, "");
@@ -185,8 +189,7 @@ final class ExecutorIndexCache {
      */
     static Config from(
         org.apache.spark.sql.SparkSession spark, long workingSetBytes, String owner) {
-      boolean enabled = Boolean.parseBoolean(setting(spark, ENABLED, "false"));
-      if (!enabled) {
+      if (!enabled(spark)) {
         return DISABLED;
       }
 
@@ -1827,6 +1830,18 @@ final class ExecutorIndexCache {
       releaseIfUnowned(cacheKey);
       mapLock.notifyAll();
       return released;
+    }
+  }
+
+  /** Releases the claim only if a newer target has not already taken ownership. */
+  boolean releaseCopy(String indexUuid, String cacheKey, long epoch) {
+    synchronized (mapLock) {
+      if (ownership.epoch(indexUuid) > epoch) {
+        return false;
+      }
+
+      releaseCopy(indexUuid, cacheKey);
+      return true;
     }
   }
 

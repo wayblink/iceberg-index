@@ -1217,9 +1217,19 @@ public final class DistributedIndexSearch {
     return admitted;
   }
 
-  private record TextFilterRead(
-      FileIO io, Schema projection, Predicate<Row> predicate, Map<String, String> properties)
-      implements Serializable {
+  private static final class TextFilterRead implements Serializable {
+    private final FileIO io;
+    private final Schema projection;
+    private final Predicate<Row> predicate;
+    private final Map<String, String> properties;
+
+    private TextFilterRead(
+        FileIO io, Schema projection, Predicate<Row> predicate, Map<String, String> properties) {
+      this.io = io;
+      this.projection = projection;
+      this.predicate = predicate;
+      this.properties = properties;
+    }
 
     IndexCandidates candidates(List<FileScanTask> tasks) {
       Map<String, long[]> admitted = Maps.newHashMap();
@@ -1233,8 +1243,6 @@ public final class DistributedIndexSearch {
       return IndexCandidates.of(admitted);
     }
   }
-
-  private record TextShard(String location, List<FileScanTask> tasks) implements Serializable {}
 
   private static List<List<IndexSearchResult>> searchText(
       SparkSession spark,
@@ -1268,7 +1276,7 @@ public final class DistributedIndexSearch {
       return orderedHits(Map.of(), limits, order);
     }
 
-    List<TextShard> searchShards = Lists.newArrayListWithCapacity(files.size());
+    List<IndexFileTask> searchShards = Lists.newArrayListWithCapacity(files.size());
     for (IndexFile file : files) {
       List<FileScanTask> shardTasks = Lists.newArrayList();
       if (filteredTasks != null) {
@@ -1281,7 +1289,7 @@ public final class DistributedIndexSearch {
       }
 
       if (filteredTasks == null || !shardTasks.isEmpty()) {
-        searchShards.add(new TextShard(file.location(), shardTasks));
+        searchShards.add(new IndexFileTask(file.location(), file.entryCount(), shardTasks));
       }
     }
 
@@ -1290,6 +1298,22 @@ public final class DistributedIndexSearch {
     }
 
     JavaSparkContext context = JavaSparkContext.fromSparkContext(spark.sparkContext());
+    String owner = table.location();
+    String readerKey = adapterKey(adapter);
+    // Query cache lookup uses only the manifest and residency metadata. A shard that predates
+    // memory records can still be loaded explicitly, with its actual charge measured by the worker.
+    long workingSet =
+        ExecutorIndexCache.Config.enabled(spark)
+                && files.stream().allMatch(file -> IndexCacheMemory.compatible(file.memory(), adapter))
+            ? workingSetBytes(table.io(), files, adapter, owner)
+            : -1L;
+    ExecutorIndexCache.Config config = ExecutorIndexCache.Config.from(spark, workingSet, owner);
+    IndexCacheLocations locationsTable = IndexCacheLocations.forContext(context.sc());
+    boolean locality = config.enabled() && localityEnabled(spark);
+    List<String> keys =
+        cacheKeys(owner, readerKey, searchShards.stream().map(IndexFileTask::location).toList());
+    var cacheReports = cacheReports(context, config);
+    String queryRun = java.util.UUID.randomUUID().toString();
     Broadcast<FileIO> io = context.broadcast(table.io());
     Broadcast<TextIndexAdapter> scorer = context.broadcast(adapter);
     Broadcast<TextFilterRead> filterRef = filter != null ? context.broadcast(filter) : null;
@@ -1297,14 +1321,14 @@ public final class DistributedIndexSearch {
       String publishedStatistics = reader.statisticsLocation(first);
       CorpusStatistics corpus =
           publishedStatistics == null
-              ? mergeTextStatistics(context, files, io, scorer, terms)
+              ? mergeTextStatistics(
+                  context, files, io, scorer, terms, owner, readerKey, locationsTable, locality)
               : adapter.snapshotStatistics(table.io().newInputFile(publishedStatistics), terms);
       Broadcast<CorpusStatistics> statistics = context.broadcast(corpus);
       Broadcast<List<byte[]>> encodedQueries = context.broadcast(payloads);
       try {
         JavaPairRDD<Integer, Tuple3<String, Long, Double>> hits =
-            context
-                .parallelize(searchShards, searchShards.size())
+            IndexFileRdds.tasks(context.sc(), searchShards, keys, locationsTable, locality)
                 .flatMapToPair(
                     file -> {
                       IndexCandidates candidates =
@@ -1315,15 +1339,33 @@ public final class DistributedIndexSearch {
 
                       List<Tuple2<Integer, Tuple3<String, Long, Double>>> shardHits =
                           Lists.newArrayList();
-                      List<List<IndexSearchResult>> results =
-                          scorer
-                              .value()
-                              .searchShardBatch(
-                                  io.value().newInputFile(file.location()),
-                                  encodedQueries.value(),
-                                  limits,
-                                  statistics.value(),
-                                  candidates);
+                      TextIndexAdapter text = scorer.value();
+                      List<byte[]> queriesForShard = encodedQueries.value();
+                      CorpusStatistics corpusForShard = statistics.value();
+                      List<List<IndexSearchResult>> results;
+                      try (ExecutorIndexCache.Lease lease =
+                          ExecutorIndexCache.get()
+                              .acquireManagedKey(cacheKey(owner, readerKey, file.location()))) {
+                        results =
+                            lease == null
+                                ? text.searchShardBatch(
+                                    io.value().newInputFile(file.location()),
+                                    queriesForShard,
+                                    limits,
+                                    corpusForShard,
+                                    candidates)
+                                : lease
+                                    .file()
+                                    .searching(
+                                        prepared ->
+                                            text.searchShardBatch(
+                                                prepared,
+                                                queriesForShard,
+                                                limits,
+                                                corpusForShard,
+                                                candidates));
+                      }
+                      reportCache(cacheReports, queryRun);
                       for (int queryId = 0; queryId < results.size(); queryId++) {
                         for (IndexSearchResult hit : results.get(queryId)) {
                           shardHits.add(
@@ -1336,7 +1378,9 @@ public final class DistributedIndexSearch {
                     });
 
         int widest = Arrays.stream(limits).max().orElseThrow();
-        return orderedHits(aggregateHits(hits, order, widest), limits, order);
+        Map<Integer, List<Tuple3<String, Long, Double>>> top = aggregateHits(hits, order, widest);
+        mergeCacheReports(cacheReports, locationsTable, keys, config, workingSet);
+        return orderedHits(top, limits, order);
       } finally {
         encodedQueries.destroy();
         statistics.destroy();
@@ -1355,15 +1399,33 @@ public final class DistributedIndexSearch {
       List<IndexFile> files,
       Broadcast<FileIO> io,
       Broadcast<TextIndexAdapter> scorer,
-      Set<String> terms) {
+      Set<String> terms,
+      String owner,
+      String readerKey,
+      IndexCacheLocations locationsTable,
+      boolean locality) {
     List<String> locations = files.stream().map(IndexFile::location).toList();
     Broadcast<Set<String>> queryTerms = context.broadcast(terms);
     try {
-      return context
-          .parallelize(locations, locations.size())
+      return IndexFileRdds.javaRdd(
+              context.sc(),
+              locations,
+              cacheKeys(owner, readerKey, locations),
+              locationsTable,
+              locality)
           .map(
-              file ->
-                  scorer.value().shardStatistics(io.value().newInputFile(file), queryTerms.value()))
+              file -> {
+                TextIndexAdapter text = scorer.value();
+                Set<String> selectedTerms = queryTerms.value();
+                try (ExecutorIndexCache.Lease lease =
+                    ExecutorIndexCache.get().acquireManagedKey(cacheKey(owner, readerKey, file))) {
+                  return lease == null
+                      ? text.shardStatistics(io.value().newInputFile(file), selectedTerms)
+                      : lease
+                          .file()
+                          .searching(prepared -> text.shardStatistics(prepared, selectedTerms));
+                }
+              })
           .treeReduce(CorpusCounts::merge, 2)
           .corpus();
     } finally {
@@ -1621,6 +1683,7 @@ public final class DistributedIndexSearch {
     }
 
     IndexCacheMemory.Estimates estimates = new IndexCacheMemory.Estimates();
+    String readerKey = adapterKey(adapter);
     try {
       List<IndexCacheProtocol.File> planned = new ArrayList<>();
       for (IndexFile file : files) {
@@ -1631,7 +1694,7 @@ public final class DistributedIndexSearch {
         planned.add(
             IndexCacheProtocol.File.builder()
                 .location(file.location())
-                .cacheKey(cacheKey(owner, adapterKey(adapter), file.location()))
+                .cacheKey(cacheKey(owner, readerKey, file.location()))
                 .owner(owner)
                 .memory(memory)
                 .estimatedBytes(IndexCacheMemory.residentBytes(memory))

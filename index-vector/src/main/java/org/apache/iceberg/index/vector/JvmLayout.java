@@ -18,14 +18,12 @@
  */
 package org.apache.iceberg.index.vector;
 
-import com.sun.management.HotSpotDiagnosticMXBean;
-import java.lang.management.ManagementFactory;
+import org.apache.iceberg.index.IndexMemoryLayout;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 /**
- * The one place that decides whether this JVM's object layout is the one the retained-memory model
- * describes.
+ * Access to the JVM layout used by the index cache memory model.
  *
  * <p>{@link PreparedStructureSize} states that layout as constants: a 16-byte header allowance, a
  * four-byte reference, eight-byte alignment, compact strings. Those constants are wrong on a JVM
@@ -40,13 +38,11 @@ public final class JvmLayout {
 
   private static final Logger LOG = LoggerFactory.getLogger(JvmLayout.class);
 
-  private static final String UNSUPPORTED = probeLayout();
-
   private JvmLayout() {}
 
   /** Whether the retained-memory model describes this JVM's object layout. */
   public static boolean supported() {
-    return UNSUPPORTED == null;
+    return IndexMemoryLayout.supported();
   }
 
   /**
@@ -55,7 +51,7 @@ public final class JvmLayout {
    * <p>For a caller that reports the reason rather than only the consequence.
    */
   public static String unsupportedReason() {
-    return UNSUPPORTED;
+    return IndexMemoryLayout.unsupportedReason();
   }
 
   /**
@@ -65,7 +61,7 @@ public final class JvmLayout {
    * wherever it is noticed rather than a debug message per estimate.
    */
   public static boolean supportedOrWarn(String consumer) {
-    if (UNSUPPORTED == null) {
+    if (supported()) {
       return true;
     }
 
@@ -73,50 +69,7 @@ public final class JvmLayout {
         "{} is unavailable: {} Retained-memory estimates report unknown and the index cache keeps"
             + " no derived budget.",
         consumer,
-        UNSUPPORTED);
+        unsupportedReason());
     return false;
-  }
-
-  private static String probeLayout() {
-    String version = System.getProperty("java.specification.version");
-    if (!"17".equals(version)) {
-      return "the retained-memory model describes HotSpot 17, this JVM is " + version + ".";
-    }
-
-    if (!"64".equals(System.getProperty("sun.arch.data.model"))) {
-      return "the retained-memory model describes a 64-bit JVM.";
-    }
-
-    try {
-      HotSpotDiagnosticMXBean bean =
-          ManagementFactory.getPlatformMXBean(HotSpotDiagnosticMXBean.class);
-      if (bean == null) {
-        return "this JVM exposes no HotSpot diagnostic options to confirm its layout.";
-      }
-
-      String compressedOops = bean.getVMOption("UseCompressedOops").getValue();
-      if (!"true".equals(compressedOops)) {
-        return "this JVM runs with UseCompressedOops=" + compressedOops + ".";
-      }
-
-      String compressedClassPointers = bean.getVMOption("UseCompressedClassPointers").getValue();
-      if (!"true".equals(compressedClassPointers)) {
-        return "this JVM runs with UseCompressedClassPointers=" + compressedClassPointers + ".";
-      }
-
-      String alignment = bean.getVMOption("ObjectAlignmentInBytes").getValue();
-      if (!"8".equals(alignment)) {
-        return "this JVM runs with ObjectAlignmentInBytes=" + alignment + ".";
-      }
-
-      String compactStrings = bean.getVMOption("CompactStrings").getValue();
-      if (!"true".equals(compactStrings)) {
-        return "this JVM runs with CompactStrings=" + compactStrings + ".";
-      }
-
-      return null;
-    } catch (RuntimeException | LinkageError e) {
-      return "this JVM does not expose the layout options the model depends on (" + e + ").";
-    }
   }
 }

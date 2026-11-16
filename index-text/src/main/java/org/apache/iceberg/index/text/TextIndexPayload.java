@@ -41,7 +41,8 @@ import org.apache.iceberg.io.SeekableInputStream;
 
 /** Sorted bucket directories followed by independently compressed term postings. */
 final class TextIndexPayload {
-  private static final int MAGIC = 0x424D3101;
+  static final int FORMAT_VERSION = 1;
+  private static final int MAGIC = 0x424D3100 | FORMAT_VERSION;
   private static final int BUCKET_COUNT = 64;
   private static final int HEADER_SIZE =
       Integer.BYTES + 2 * Long.BYTES + (BUCKET_COUNT + 1) * Integer.BYTES;

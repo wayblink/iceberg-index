@@ -34,6 +34,7 @@ import java.util.PriorityQueue;
 import java.util.Set;
 import org.apache.iceberg.index.IndexAdapter;
 import org.apache.iceberg.index.IndexBlob;
+import org.apache.iceberg.index.IndexBuildResult;
 import org.apache.iceberg.index.IndexCandidates;
 import org.apache.iceberg.index.IndexDefinition;
 import org.apache.iceberg.index.IndexEntry;
@@ -186,6 +187,38 @@ public final class TextIndexAdapter implements IndexAdapter, java.io.Serializabl
     }
   }
 
+  @Override
+  public IndexBuildResult encodeAuxiliaryPayloadWithMemory(
+      List<IndexEntry> entries, int parallelism) {
+    return TextMemoryEstimates.result(encodeAuxiliaryPayload(entries), parallelism);
+  }
+
+  @Override
+  public Long retainedBytes(long payloadBytes, Map<String, Long> structure) {
+    return TextMemoryEstimates.retainedBytes(payloadBytes, structure);
+  }
+
+  @Override
+  public PreparedSearch prepareAuxiliary(ByteBuffer payload) {
+    byte[] bytes = ByteBuffers.toByteArray(payload.asReadOnlyBuffer());
+    PreparedShard shard = new PreparedShard(bytes);
+    try {
+      shard.open();
+      return shard;
+    } catch (IOException e) {
+      throw new IllegalArgumentException("Invalid BM25 shard payload", e);
+    }
+  }
+
+  /** Reads shard statistics from a prepared payload without opening its file. */
+  public CorpusCounts shardStatistics(PreparedSearch prepared, Set<String> terms) {
+    try {
+      return ((PreparedShard) prepared).open().counts(terms);
+    } catch (IOException e) {
+      throw new UncheckedIOException("Failed to read prepared BM25 shard statistics", e);
+    }
+  }
+
   /** Reads only the requested term frequencies from an uncompressed Puffin blob. */
   public CorpusCounts shardStatistics(InputFile file, Set<String> terms) {
     BlobMetadata blob = rangeBlob(file);
@@ -264,6 +297,45 @@ public final class TextIndexAdapter implements IndexAdapter, java.io.Serializabl
       return searchShardBatch(queries, limits, statistics, candidates, reader::shard);
     } catch (IOException e) {
       throw new UncheckedIOException("Failed to read BM25 shard " + file.location(), e);
+    }
+  }
+
+  /** Scores a batch from a prepared shard using statistics supplied by the caller. */
+  public List<List<IndexSearchResult>> searchShardBatch(
+      PreparedSearch prepared,
+      List<byte[]> queries,
+      int[] limits,
+      CorpusStatistics statistics,
+      IndexCandidates candidates) {
+    try {
+      return searchShardBatch(
+          queries, limits, statistics, candidates, ((PreparedShard) prepared).open()::shard);
+    } catch (IOException e) {
+      throw new UncheckedIOException("Failed to read prepared BM25 shard", e);
+    }
+  }
+
+  private static final class PreparedShard implements PreparedSearch {
+    private final byte[] payload;
+
+    private PreparedShard(byte[] payload) {
+      this.payload = payload;
+    }
+
+    private TextIndexPayload.Reader open() throws IOException {
+      return TextIndexPayload.open(
+          TextIndexPayload.source(ByteBuffer.wrap(payload)), payload.length);
+    }
+
+    @Override
+    public List<IndexSearchResult> search(ByteBuffer query, int topK) {
+      throw new UnsupportedOperationException(
+          "BM25 requires corpus statistics; use searchShardBatch");
+    }
+
+    @Override
+    public long estimatedBytes() {
+      return TextMemoryEstimates.preparedBytes(payload.length);
     }
   }
 

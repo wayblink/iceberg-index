@@ -662,7 +662,7 @@ final class IndexResidencyCoordinator {
               .owner(modeFor(cacheKey))
               .build(),
           holder.bytes(),
-          holder.epoch(),
+          plan.epoch,
           holder.installedBy());
     }
 
@@ -779,6 +779,26 @@ final class IndexResidencyCoordinator {
     }
 
     return placements;
+  }
+
+  /** Live executor IDs for confirmed copies in the current targets, for query scheduling. */
+  Map<String, List<String>> residentExecutors(Set<String> cacheKeys) {
+    Set<String> lost = lostIncarnations();
+    Map<String, List<String>> executors = new LinkedHashMap<>();
+    holdersByCacheKey(cacheKeys)
+        .forEach(
+            (key, holders) -> {
+              List<String> live =
+                  holders.stream()
+                      .filter(holder -> !lost.contains(holder.incarnation()))
+                      .map(Holder::executorId)
+                      .distinct()
+                      .toList();
+              if (!live.isEmpty()) {
+                executors.put(key, live);
+              }
+            });
+    return executors;
   }
 
   /** The clock this coordinator compares deadlines and report ages with. */
@@ -1954,8 +1974,9 @@ final class IndexResidencyCoordinator {
    */
   private List<Holder> holders(String indexUuid) {
     List<Holder> holders = new ArrayList<>();
-    Map<String, List<Holder>> byKey = holdersByCacheKey();
-    for (String cacheKey : keysOf(indexUuid)) {
+    Set<String> keys = keysOf(indexUuid);
+    Map<String, List<Holder>> byKey = holdersByCacheKey(keys);
+    for (String cacheKey : keys) {
       holders.addAll(byKey.getOrDefault(cacheKey, List.of()));
     }
 
@@ -1985,7 +2006,7 @@ final class IndexResidencyCoordinator {
    * must stay visible, otherwise offload or target replacement would miss them; a copy whose
    * release was acknowledged is already gone from {@code plan.loaded}.
    */
-  private Map<String, List<Holder>> holdersByCacheKey() {
+  private Map<String, List<Holder>> holdersByCacheKey(Set<String> cacheKeys) {
     Map<String, List<Holder>> byKey = new LinkedHashMap<>();
     for (PlanState plan : plans.values()) {
       IndexState index = indexes.get(plan.indexUuid);
@@ -1996,7 +2017,7 @@ final class IndexResidencyCoordinator {
       for (PlanFile loaded : plan.loaded.values()) {
         // A copy released by a later plan, or no longer part of the current target, is not a
         // holder any more; a paused index still holds its files until release is acknowledged.
-        if (!index.retains(loaded.cacheKey)) {
+        if (!cacheKeys.contains(loaded.cacheKey) || !index.retains(loaded.cacheKey)) {
           continue;
         }
 

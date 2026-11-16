@@ -23,6 +23,20 @@ import static org.assertj.core.api.Assertions.assertThat;
 import java.nio.file.Path;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.atomic.AtomicInteger;
+import org.apache.hadoop.conf.Configuration;
+import org.apache.iceberg.BaseTable;
+import org.apache.iceberg.HasTableOperations;
+import org.apache.iceberg.StaticTableOperations;
+import org.apache.iceberg.Table;
+import org.apache.iceberg.hadoop.HadoopFileIO;
+import org.apache.iceberg.hadoop.HadoopTables;
+import org.apache.iceberg.index.IndexMetadata;
+import org.apache.iceberg.index.IndexQuery;
+import org.apache.iceberg.index.IndexReader;
+import org.apache.iceberg.index.text.TextIndexAdapter;
+import org.apache.iceberg.index.text.TextIndexDefinition;
+import org.apache.iceberg.io.InputFile;
 import org.apache.spark.sql.Row;
 import org.apache.spark.sql.SparkSession;
 import org.junit.jupiter.api.Test;
@@ -31,6 +45,147 @@ import org.junit.jupiter.api.io.TempDir;
 class TestPluginExecutorBudget {
   private static final long MB = 1024L * 1024L;
   @TempDir Path warehouse;
+
+  @Test
+  void textResidencyUsesTheSameScoresWithoutOpeningShards() {
+    SparkSession spark = start(null);
+    String name = "local.db.cached_text";
+    ExecutorIndexCache cache = ExecutorIndexCache.get();
+    try {
+      spark.sql("CREATE NAMESPACE IF NOT EXISTS local.db");
+      spark.sql("CREATE TABLE " + name + " (id bigint, body string) USING iceberg");
+      spark.sql("INSERT INTO " + name + " VALUES (1, 'ice ice glacier'), (2, 'ice')");
+      spark.sql("INSERT INTO " + name + " VALUES (3, 'glacier water')");
+      String uuid =
+          spark
+              .sql(
+                  "CALL local.system.build_text_index(table=>'db.cached_text', column=>'body',"
+                      + " max_entries_per_index_file=>1L)")
+              .head()
+              .getString(0);
+      Configuration conf = spark.sessionState().newHadoopConf();
+      Table table =
+          new HadoopTables(conf).load(warehouse.resolve("db/cached_text").toUri().toString());
+      IndexMetadata metadata = VectorIndexes.indexCatalog(table).loadIndex(table.location(), uuid);
+      TextIndexAdapter adapter = new TextIndexAdapter((TextIndexDefinition) metadata.definition());
+      IndexQuery query =
+          IndexQuery.of(
+              table.currentSnapshot().snapshotId(), adapter.encodeQuery("ice glacier ice"), 3);
+      ShardCountingFileIO io = new ShardCountingFileIO(conf);
+      Table observed =
+          new BaseTable(
+              new StaticTableOperations(((HasTableOperations) table).operations().current(), io),
+              table.name());
+      ShardCountingFileIO.OPENS.set(0);
+      var cold = DistributedIndexSearch.searchBatch(spark, metadata, observed, List.of(query));
+      assertThat(cold.get(0)).hasSize(3);
+      assertThat(ShardCountingFileIO.OPENS.get()).isPositive();
+      assertThat(cache.stats().entries()).isZero();
+
+      var shards = new IndexReader(metadata, table).indexFiles(query);
+      assertThat(shards)
+          .hasSizeGreaterThan(1)
+          .allSatisfy(
+              file -> {
+                assertThat(file.memory()).isNotNull();
+                assertThat(file.memory().preparedBytes())
+                    .isGreaterThan(file.memory().payloadBytes());
+                assertThat(file.memory().fileBytes()).isGreaterThan(file.memory().payloadBytes());
+              });
+      long payloadBytes = shards.stream().mapToLong(file -> file.memory().payloadBytes()).sum();
+      long fileBytes = shards.stream().mapToLong(file -> file.memory().fileBytes()).sum();
+      System.out.printf(
+          "BM25 residency sample: %d payload bytes / %d Puffin bytes%n", payloadBytes, fileBytes);
+
+      Row load =
+          spark
+              .sql("CALL local.system.load_index(table=>'" + name + "', index=>'" + uuid + "')")
+              .head();
+      assertThat(load.getString(0)).isEqualTo("COMPLETE");
+      assertThat(cache.stats().entries()).isEqualTo(shards.size());
+      ShardCountingFileIO.OPENS.set(0);
+      var warm = DistributedIndexSearch.searchBatch(spark, metadata, observed, List.of(query));
+      assertThat(warm).isEqualTo(cold);
+      assertThat(ShardCountingFileIO.OPENS.get()).isZero();
+
+      long textCharge = cache.stats().bytes();
+      assertThat(textCharge)
+          .isEqualTo(
+              DistributedIndexSearch.workingSetBytes(
+                  table.io(), shards, adapter, table.location()));
+
+      spark.sql(
+          "CREATE TABLE local.db.cached_vectors (id bigint, embedding array<double>) USING"
+              + " iceberg");
+      spark.sql("INSERT INTO local.db.cached_vectors VALUES (1, array(1.0d, 0.0d))");
+      String vectorUuid =
+          spark
+              .sql(
+                  "CALL local.system.build_vector_index(table=>'db.cached_vectors',"
+                      + " column=>'embedding', dimension=>2, structure=>'FLAT',"
+                      + " metric=>'EUCLIDEAN')")
+              .head()
+              .getString(0);
+      assertThat(
+              spark
+                  .sql(
+                      "CALL local.system.load_index(table=>'local.db.cached_vectors', index=>'"
+                          + vectorUuid
+                          + "')")
+                  .head()
+                  .getString(0))
+          .isEqualTo("COMPLETE");
+      long combinedCharge = cache.stats().bytes();
+      assertThat(combinedCharge).isGreaterThan(textCharge);
+      assertThat(cache.stats().entries()).isEqualTo(shards.size() + 1);
+      List<Row> status =
+          spark.sql("CALL local.system.index_cache_status(refresh=>true)").collectAsList();
+      assertThat(status)
+          .anySatisfy(
+              row -> {
+                assertThat(row.getLong(4)).isEqualTo(shards.size() + 1);
+                assertThat(row.getLong(5)).isEqualTo(combinedCharge);
+              });
+
+      assertThat(
+              spark
+                  .sql(
+                      "CALL local.system.offload_index(table=>'"
+                          + name
+                          + "', index=>'"
+                          + uuid
+                          + "')")
+                  .head()
+                  .getString(0))
+          .isEqualTo("OFFLOADED");
+      assertThat(cache.stats().entries()).isEqualTo(1);
+      long vectorCharge = cache.stats().bytes();
+      ShardCountingFileIO.OPENS.set(0);
+      assertThat(DistributedIndexSearch.searchBatch(spark, metadata, observed, List.of(query)))
+          .isEqualTo(cold);
+      assertThat(ShardCountingFileIO.OPENS.get()).isPositive();
+      assertThat(cache.stats().bytes()).isEqualTo(vectorCharge);
+    } finally {
+      cache.clear();
+      spark.stop();
+    }
+  }
+
+  private static final class ShardCountingFileIO extends HadoopFileIO {
+    private static final AtomicInteger OPENS = new AtomicInteger();
+
+    private ShardCountingFileIO(Configuration conf) {
+      super(conf);
+    }
+
+    @Override
+    public InputFile newInputFile(String path) {
+      if (path.contains("/data/index-file-")) {
+        OPENS.incrementAndGet();
+      }
+      return super.newInputFile(path);
+    }
+  }
 
   @Test
   void realPluginLoadOffloadAndReloadKeepQueryResults() {

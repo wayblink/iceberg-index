@@ -31,8 +31,11 @@ import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import org.apache.spark.SparkContext;
+import org.apache.spark.scheduler.ExecutorCacheTaskLocation;
 import org.apache.spark.scheduler.SparkListener;
 import org.apache.spark.scheduler.SparkListenerExecutorRemoved;
+import org.apache.spark.status.api.v1.ExecutorSummary;
+import org.apache.spark.util.Utils;
 
 /**
  * Which executor holds which index file, as the driver knows it.
@@ -435,6 +438,46 @@ final class IndexCacheLocations {
     }
 
     return holders;
+  }
+
+  /** Scheduler hints for explicit loads, available as soon as the coordinator receives an ACK. */
+  static Map<String, List<String>> confirmedLocations(
+      SparkContext context, Collection<String> cacheKeys) {
+    IndexCacheDriverControl control = IndexCacheDriverRegistry.find(context);
+    if (control == null) {
+      return Map.of();
+    }
+
+    Map<String, List<String>> residents = control.residentExecutors(Set.copyOf(cacheKeys));
+    if (residents.isEmpty()) {
+      return Map.of();
+    }
+
+    Map<String, String> locations = executorLocations(context);
+    Map<String, List<String>> hints = new LinkedHashMap<>();
+    residents.forEach(
+        (key, ids) -> {
+          List<String> preferred =
+              ids.stream().filter(locations::containsKey).limit(2).map(locations::get).toList();
+          if (!preferred.isEmpty()) {
+            hints.put(key, preferred);
+          }
+        });
+    return hints;
+  }
+
+  static Map<String, String> executorLocations(SparkContext context) {
+    Map<String, String> locations = new LinkedHashMap<>();
+    var executors = context.statusStore().executorList(true).iterator();
+    while (executors.hasNext()) {
+      ExecutorSummary executor = executors.next();
+      if (context.isLocal() || !"driver".equals(executor.id())) {
+        String host = Utils.parseHostPort(executor.hostPort())._1();
+        locations.put(executor.id(), new ExecutorCacheTaskLocation(host, executor.id()).toString());
+      }
+    }
+
+    return locations;
   }
 
   /** How many of the given keys at least one executor holds. */
