@@ -33,7 +33,6 @@ import org.apache.iceberg.index.IndexBlob;
 import org.apache.iceberg.index.IndexBuildResult;
 import org.apache.iceberg.index.IndexEntry;
 import org.apache.iceberg.index.IndexFile;
-import org.apache.iceberg.index.IndexFileContainer;
 import org.apache.iceberg.index.IndexFileMemory;
 import org.apache.iceberg.index.IndexManifest;
 import org.apache.iceberg.index.IndexManifestList;
@@ -43,15 +42,20 @@ import org.apache.iceberg.index.IndexSnapshot;
 import org.apache.iceberg.index.IndexSnapshotWriter;
 import org.apache.iceberg.index.IndexTypes;
 import org.apache.iceberg.index.PuffinIndexFileContainer;
+import org.apache.iceberg.index.text.TextIndexAdapter;
+import org.apache.iceberg.index.text.TextIndexAdapter.CorpusCounts;
 import org.apache.iceberg.index.text.TextIndexTypes;
 import org.apache.iceberg.index.vector.VectorIndexTypes;
 import org.apache.iceberg.io.FileIO;
+import org.apache.iceberg.io.IOUtil;
+import org.apache.iceberg.io.PositionOutputStream;
 import org.apache.iceberg.relocated.com.google.common.collect.Lists;
 import org.apache.iceberg.relocated.com.google.common.collect.Maps;
 import org.apache.iceberg.relocated.com.google.common.collect.Sets;
 import org.apache.iceberg.util.ByteBuffers;
 import org.apache.spark.SparkContext;
 import org.apache.spark.api.java.JavaRDD;
+import org.apache.spark.api.java.JavaSparkContext;
 import org.apache.spark.sql.Row;
 import org.apache.spark.sql.RowFactory;
 import org.apache.spark.sql.SparkSession;
@@ -113,6 +117,7 @@ public final class SparkIndexBuilder {
     IndexSnapshotWriter writer = new IndexSnapshotWriter(fileIO);
     List<IndexFile> indexFiles;
     String manifestList;
+    Map<String, String> snapshotProperties;
     try {
       writer.startAttempt(indexLocation);
       indexFiles =
@@ -128,6 +133,8 @@ public final class SparkIndexBuilder {
               null,
               currentMetadata.maxEntriesPerIndexFile(),
               writer);
+      snapshotProperties =
+          writeTextStatistics(spark, table, adapter, indexLocation, snapshotId, indexFiles, writer);
       manifestList = writer.writeManifestList(indexLocation, snapshotId, indexFiles);
     } catch (Exception | Error e) {
       writer.abortAttempt(indexLocation);
@@ -142,6 +149,7 @@ public final class SparkIndexBuilder {
             .parentIndexSnapshotId(null)
             .timestampMillis(timestampMillis)
             .indexManifestList(manifestList)
+            .properties(snapshotProperties)
             .build();
     return currentMetadata.withSnapshot(snapshot);
   }
@@ -244,6 +252,7 @@ public final class SparkIndexBuilder {
     IndexSnapshotWriter writer = new IndexSnapshotWriter(fileIO);
     List<IndexFile> indexFiles;
     String manifestList;
+    Map<String, String> snapshotProperties;
     try {
       writer.startAttempt(indexLocation);
       List<IndexFile> newIndexFiles =
@@ -263,6 +272,8 @@ public final class SparkIndexBuilder {
                   writer);
       indexFiles = Lists.newArrayList(carried);
       indexFiles.addAll(newIndexFiles);
+      snapshotProperties =
+          writeTextStatistics(spark, table, adapter, indexLocation, snapshotId, indexFiles, writer);
       manifestList = writer.writeManifestList(indexLocation, snapshotId, indexFiles);
     } catch (Exception | Error e) {
       // carried-over files belong to the parent snapshot and must survive a failed refresh
@@ -278,6 +289,7 @@ public final class SparkIndexBuilder {
             .parentIndexSnapshotId(previous.snapshotId())
             .timestampMillis(timestampMillis)
             .indexManifestList(manifestList)
+            .properties(snapshotProperties)
             .build();
     return currentMetadata.withSnapshot(snapshot);
   }
@@ -338,8 +350,8 @@ public final class SparkIndexBuilder {
         // scans them instead of searching them. Saying so here is the only place the operator is
         // guaranteed to look; the status report keeps the count, and check_indexes reports the gap.
         LOG.warn(
-            "Index build for table {} finished with {} data files not indexed; the index covers the "
-                + "rest and queries scan the uncovered files until a refresh covers them",
+            "Index build for table {} finished with {} data files not indexed; the index covers the"
+                + " rest and queries scan the uncovered files until a refresh covers them",
             table.name(),
             failedFiles);
       }
@@ -455,7 +467,6 @@ public final class SparkIndexBuilder {
         allRows
             .mapPartitionsWithIndex(
                 (index, iterator) -> {
-                  IndexFileContainer fileContainer = new PuffinIndexFileContainer();
                   int seq = index;
                   List<IndexEntry> groupEntries = Lists.newArrayList();
                   Set<String> covered = Sets.newLinkedHashSet();
@@ -493,9 +504,7 @@ public final class SparkIndexBuilder {
                   IndexPayloadLimits.checkFits(
                       built.payload().remaining(), groupEntries.size(), location);
                   try {
-                    fileContainer.write(
-                        fileIO.newOutputFile(location),
-                        List.of(IndexBlob.of(blobType, ByteBuffers.toByteArray(built.payload()))));
+                    writeIndexPayload(fileIO, location, adapter, kind, blobType, built);
                     if (memory != null) {
                       memory =
                           memory.toBuilder()
@@ -697,7 +706,6 @@ public final class SparkIndexBuilder {
       int sequence,
       LongAccumulator filesBuilt) {
     FileIO fileIO = table.io();
-    IndexFileContainer fileContainer = new PuffinIndexFileContainer();
     String location =
         indexLocation
             + "/"
@@ -725,9 +733,7 @@ public final class SparkIndexBuilder {
     IndexFileMemory memory = built.memory();
     IndexPayloadLimits.checkFits(built.payload().remaining(), 0, location);
     try {
-      fileContainer.write(
-          fileIO.newOutputFile(location),
-          List.of(IndexBlob.of(blobType, ByteBuffers.toByteArray(built.payload()))));
+      writeIndexPayload(fileIO, location, adapter, kind, blobType, built);
     } catch (java.io.IOException e) {
       throw new java.io.UncheckedIOException("Cannot write " + location, e);
     }
@@ -750,6 +756,57 @@ public final class SparkIndexBuilder {
         .coveredDataFiles(Lists.newArrayList(coveredDataFiles))
         .memory(memory)
         .build();
+  }
+
+  private static void writeIndexPayload(
+      FileIO io,
+      String location,
+      IndexAdapter adapter,
+      IndexFile.Kind kind,
+      String blobType,
+      IndexBuildResult built)
+      throws IOException {
+    IndexBlob blob =
+        kind == IndexFile.Kind.AUXILIARY
+            ? adapter.auxiliaryBlob(built.payload())
+            : IndexBlob.of(blobType, ByteBuffers.toByteArray(built.payload()));
+    new PuffinIndexFileContainer().write(io.newOutputFile(location), List.of(blob));
+  }
+
+  private static Map<String, String> writeTextStatistics(
+      SparkSession spark,
+      Table table,
+      IndexAdapter adapter,
+      String indexLocation,
+      long snapshotId,
+      List<IndexFile> files,
+      IndexSnapshotWriter writer) {
+    if (!(adapter instanceof TextIndexAdapter text)) {
+      return Map.of();
+    }
+
+    FileIO io = table.io();
+    CorpusCounts counts = CorpusCounts.empty();
+    if (!files.isEmpty()) {
+      List<String> shards = files.stream().map(IndexFile::location).toList();
+      counts =
+          JavaSparkContext.fromSparkContext(spark.sparkContext())
+              .parallelize(
+                  shards, Math.min(shards.size(), spark.sparkContext().defaultParallelism()))
+              .map(shard -> text.shardStatistics(io.newInputFile(shard), null))
+              .treeReduce(CorpusCounts::merge, 2);
+    }
+
+    String location =
+        indexLocation + "/" + DATA_DIR + "/bm25-statistics-" + snapshotId + "-" + UUID.randomUUID();
+    writer.recordStatistics(indexLocation, location);
+    try (PositionOutputStream output = io.newOutputFile(location).create()) {
+      IOUtil.writeFully(output, text.encodeSnapshotStatistics(counts));
+    } catch (IOException e) {
+      throw new UncheckedIOException("Failed to write BM25 snapshot statistics " + location, e);
+    }
+
+    return Map.of(IndexSnapshot.STATISTICS_LOCATION_PROPERTY, location);
   }
 
   private static int dataFileCount(Map<Integer, List<FileScanTask>> tasksByIndexFile, int index) {

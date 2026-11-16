@@ -24,10 +24,13 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import javax.annotation.Nullable;
+import org.apache.iceberg.io.FileIO;
+import org.apache.iceberg.io.InputFile;
 import org.apache.iceberg.relocated.com.google.common.base.Preconditions;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableList;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableSet;
 import org.apache.iceberg.relocated.com.google.common.collect.Lists;
+import org.apache.iceberg.util.ByteBuffers;
 
 /**
  * Type-specific codec and search strategy for one index.
@@ -216,6 +219,17 @@ public interface IndexAdapter {
     return searchAndMerge(payloads, payload -> searchAuxiliary(payload, query, topK), topK);
   }
 
+  /** Searches auxiliary files directly when the adapter can use a snapshot statistics file. */
+  default List<IndexSearchResult> searchAuxiliaryFiles(
+      FileIO io, IndexSnapshot snapshot, List<IndexFile> files, IndexQuery query) {
+    return null;
+  }
+
+  /** Reads published statistics, or returns null to use the payload-based interface. */
+  default Object readSnapshotStatistics(InputFile file, ByteBuffer query) {
+    return null;
+  }
+
   /**
    * Statistics this adapter needs in order to score rows itself, merged from the payloads of one
    * index snapshot. An engine that computes scores outside the index, a query expression for
@@ -313,6 +327,11 @@ public interface IndexAdapter {
    */
   default Set<String> readableAuxiliaryBlobTypes() {
     return writesAuxiliaryFiles() ? ImmutableSet.of(auxiliaryBlobType()) : ImmutableSet.of();
+  }
+
+  /** Wraps an encoded auxiliary payload for the file container. */
+  default IndexBlob auxiliaryBlob(ByteBuffer payload) {
+    return IndexBlob.of(auxiliaryBlobType(), ByteBuffers.toByteArray(payload));
   }
 
   /** Encodes entries into the payload of an auxiliary index file. */

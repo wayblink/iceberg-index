@@ -33,12 +33,14 @@ public final class IndexBlob {
 
   private final String type;
   private final byte[] payload;
+  private final boolean uncompressed;
 
-  private IndexBlob(String type, byte[] payload) {
+  private IndexBlob(String type, byte[] payload, boolean uncompressed) {
     Preconditions.checkArgument(type != null && !type.isEmpty(), "Blob type is empty");
     Preconditions.checkNotNull(payload, "Blob payload is null");
     this.type = type;
     this.payload = payload;
+    this.uncompressed = uncompressed;
   }
 
   /**
@@ -49,7 +51,16 @@ public final class IndexBlob {
    * query. The caller must not keep using the array afterwards.
    */
   public static IndexBlob of(String type, byte[] payload) {
-    return new IndexBlob(type, payload);
+    return new IndexBlob(type, payload, false);
+  }
+
+  /** Wraps a payload whose internal byte ranges must remain readable. */
+  public static IndexBlob uncompressed(String type, byte[] payload) {
+    return new IndexBlob(type, payload, true);
+  }
+
+  boolean requiresUncompressedStorage() {
+    return uncompressed;
   }
 
   public String type() {

@@ -25,6 +25,8 @@ import static org.assertj.core.api.Assertions.assertThat;
 import java.io.IOException;
 import java.nio.file.Path;
 import java.util.List;
+import org.apache.iceberg.puffin.Puffin;
+import org.apache.iceberg.puffin.PuffinReader;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
@@ -55,6 +57,23 @@ class TestPuffinIndexFileContainer {
 
     container.write(localOutput(location), List.of(first, second));
     assertThat(container.read(localInput(location))).containsExactly(first, second);
+  }
+
+  @Test
+  void preservesRangesInBlobsThatRequireUncompressedStorage(@TempDir Path tempDir)
+      throws IOException {
+    String location = tempDir.resolve("range-readable.puffin").toString();
+    IndexBlob blob = IndexBlob.uncompressed("iceberg-text-bm25-v1", new byte[] {1, 2, 3});
+    container.write(localOutput(location), List.of(blob));
+    try (PuffinReader reader = Puffin.read(localInput(location)).build()) {
+      assertThat(reader.fileMetadata().blobs())
+          .singleElement()
+          .satisfies(
+              metadata -> {
+                assertThat(metadata.compressionCodec()).isNull();
+                assertThat(metadata.length()).isEqualTo(3);
+              });
+    }
   }
 
   @Test

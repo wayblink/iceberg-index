@@ -94,6 +94,15 @@ public final class IndexReader {
     ReadableFiles readable = readable(adapter, readManifestList(snapshot));
     checkReadable(readable, adapter);
     if (adapter.searchesAllPayloadsTogether()) {
+      if (readable.entry().isEmpty()
+          && readable.skippedBlobTypes().isEmpty()
+          && snapshot.statisticsLocation() != null) {
+        List<IndexSearchResult> hits =
+            adapter.searchAuxiliaryFiles(fileIO, snapshot, readable.auxiliary(), query);
+        if (hits != null) {
+          return hits;
+        }
+      }
       return searchCorrelated(adapter, readable, query);
     }
 
@@ -263,12 +272,25 @@ public final class IndexReader {
 
     ReadableFiles readable = readable(adapter, readManifestList(snapshot));
     checkReadable(readable, adapter);
+    if (snapshot.statisticsLocation() != null && readable.skippedBlobTypes().isEmpty()) {
+      Object statistics =
+          adapter.readSnapshotStatistics(
+              fileIO.newInputFile(snapshot.statisticsLocation()), query.payload());
+      if (statistics != null) {
+        return statistics;
+      }
+    }
     Payloads payloads = readPayloads(readable);
     List<ByteBuffer> statisticsPayloads =
         adapter.writesAuxiliaryFiles() && !payloads.auxiliary.isEmpty()
             ? payloads.auxiliary
             : payloads.entry;
     return adapter.searchStatistics(statisticsPayloads);
+  }
+
+  /** Returns the statistics file of the snapshot selected by the query, if published. */
+  public String statisticsLocation(IndexQuery query) {
+    return snapshotForQuery(query).statisticsLocation();
   }
 
   /** The payloads of the given index files, by kind. */

@@ -20,14 +20,28 @@ package org.apache.iceberg.index.text;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.assertj.core.data.Offset.offset;
 
+import java.io.IOException;
+import java.io.UncheckedIOException;
 import java.nio.ByteBuffer;
+import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
+import java.util.Set;
 import org.apache.iceberg.index.IndexEntry;
 import org.apache.iceberg.index.IndexMetadata;
 import org.apache.iceberg.index.IndexMetadataParser;
 import org.apache.iceberg.index.IndexSearchResult;
 import org.apache.iceberg.index.IndexTypes;
+import org.apache.iceberg.index.PuffinIndexFileContainer;
+import org.apache.iceberg.index.text.TextIndexAdapter.CorpusCounts;
+import org.apache.iceberg.index.text.TextIndexAdapter.CorpusStatistics;
+import org.apache.iceberg.inmemory.InMemoryInputFile;
+import org.apache.iceberg.inmemory.InMemoryOutputFile;
+import org.apache.iceberg.io.InputFile;
+import org.apache.iceberg.io.RangeReadable;
+import org.apache.iceberg.io.SeekableInputStream;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 
@@ -37,6 +51,126 @@ class TestTextIndexAdapter {
   @BeforeAll
   static void registerTextIndexType() {
     TextIndexTypes.register();
+  }
+
+  @Test
+  void snapshotStatisticsScoreWithLongDocumentFrequency() throws IOException {
+    TextIndexDefinition definition = TextIndexDefinition.builder().fieldId(1).build();
+    TextIndexAdapter adapter = new TextIndexAdapter(definition);
+    CorpusCounts first =
+        new CorpusCounts(
+            Integer.MAX_VALUE, Integer.MAX_VALUE, Map.of("ice", (long) Integer.MAX_VALUE));
+    CorpusCounts second = new CorpusCounts(2, 2, Map.of("ice", 1L, "snow", 1L));
+    CorpusCounts merged = first.merge(second);
+    long documents = (long) Integer.MAX_VALUE + 2;
+    long frequency = documents - 1;
+    InputFile input = new InMemoryInputFile(adapter.encodeSnapshotStatistics(merged).array());
+    CorpusStatistics statistics = adapter.snapshotStatistics(input, Set.of("ice"));
+    assertThat(statistics.totalDocuments()).isEqualTo(documents);
+    assertThat(statistics.documentFrequency("ice")).isEqualTo(frequency);
+    assertThat(statistics.documentFrequency("snow")).isZero();
+
+    double expectedScore = Math.log1p((documents - frequency + 0.5) / (frequency + 0.5));
+    assertThat(TextIndexAdapter.score(definition, statistics, "ice", "ice"))
+        .isCloseTo(expectedScore, offset(1e-18));
+
+    InMemoryOutputFile shard = new InMemoryOutputFile();
+    ByteBuffer payload = adapter.encodeAuxiliaryPayload(List.of(entry("ice.parquet", 0, "ice")));
+    new PuffinIndexFileContainer().write(shard, List.of(adapter.auxiliaryBlob(payload)));
+    List<IndexSearchResult> hits =
+        adapter
+            .searchShardBatch(
+                shard.toInputFile(),
+                List.of(adapter.encodeQuery("ice").array()),
+                new int[] {1},
+                statistics,
+                null)
+            .get(0);
+    assertThat(hits)
+        .singleElement()
+        .satisfies(hit -> assertThat(hit.score()).isCloseTo(expectedScore, offset(1e-18)));
+  }
+
+  @Test
+  void searchStatisticsMergeLongDocumentFrequency() {
+    TextIndexAdapter adapter =
+        new TextIndexAdapter(TextIndexDefinition.builder().fieldId(1).build());
+    ByteBuffer large =
+        adapter.encodeSnapshotStatistics(
+            new CorpusCounts(
+                Integer.MAX_VALUE, Integer.MAX_VALUE, Map.of("ice", (long) Integer.MAX_VALUE)));
+    ByteBuffer small = adapter.encodeSnapshotStatistics(new CorpusCounts(1, 1, Map.of("ice", 1L)));
+    CorpusStatistics statistics =
+        (CorpusStatistics) adapter.searchStatistics(List.of(large, small));
+    assertThat(statistics.documentFrequency("ice")).isEqualTo((long) Integer.MAX_VALUE + 1);
+  }
+
+  @Test
+  void rejectsOversizedShardDocumentCount() {
+    TextIndexAdapter adapter =
+        new TextIndexAdapter(TextIndexDefinition.builder().fieldId(1).build());
+    long count = (long) Integer.MAX_VALUE + 1;
+    ByteBuffer payload =
+        adapter.encodeSnapshotStatistics(new CorpusCounts(count, count, Map.of("ice", count)));
+    assertThatThrownBy(
+            () -> adapter.searchAuxiliaryAll(List.of(payload), adapter.encodeQuery("ice"), 1))
+        .isInstanceOf(UncheckedIOException.class)
+        .hasCauseInstanceOf(IOException.class)
+        .hasRootCauseMessage("Invalid BM25 v1 shard document count");
+  }
+
+  @Test
+  void readsOnlyRequestedPostingRanges() throws IOException {
+    TextIndexAdapter adapter =
+        new TextIndexAdapter(TextIndexDefinition.builder().fieldId(1).build());
+    List<IndexEntry> entries = new ArrayList<>();
+    entries.add(entry("first.parquet", 0, "ice iceberg"));
+    entries.add(entry("other.parquet", 1, "ice ice iceberg glacier"));
+    for (int row = 0; row < 4000; row++) {
+      entries.add(entry("many.parquet", row, "other" + row));
+    }
+    ByteBuffer payload = adapter.encodeAuxiliaryPayload(entries);
+    RangeOnlyStream stream = new RangeOnlyStream(payload);
+    TextIndexPayload.Reader rangeReader =
+        TextIndexPayload.open(TextIndexPayload.source(stream, 0), payload.remaining());
+    TextIndexAdapter.FileIndex selected = rangeReader.shard(Set.of("ice", "glacier"), false);
+    assertThat(selected.postingsByTerm).containsOnlyKeys("ice", "glacier");
+    assertThat(stream.bytesRead).isLessThan(payload.remaining() / 10L);
+  }
+
+  private static final class RangeOnlyStream extends SeekableInputStream implements RangeReadable {
+    private final ByteBuffer bytes;
+    private long bytesRead;
+
+    private RangeOnlyStream(ByteBuffer bytes) {
+      this.bytes = bytes;
+    }
+
+    @Override
+    public void readFully(long position, byte[] buffer, int offset, int length) {
+      bytes.slice(Math.toIntExact(position), length).get(buffer, offset, length);
+      bytesRead += length;
+    }
+
+    @Override
+    public int readTail(byte[] buffer, int offset, int length) {
+      throw new UnsupportedOperationException("Only positional reads are expected");
+    }
+
+    @Override
+    public int read() {
+      throw new UnsupportedOperationException("Only positional reads are expected");
+    }
+
+    @Override
+    public long getPos() {
+      throw new UnsupportedOperationException("Only positional reads are expected");
+    }
+
+    @Override
+    public void seek(long newPos) {
+      throw new UnsupportedOperationException("Only positional reads are expected");
+    }
   }
 
   @Test

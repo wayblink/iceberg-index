@@ -27,15 +27,30 @@ import java.io.UncheckedIOException;
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.util.Comparator;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.PriorityQueue;
+import java.util.Set;
 import org.apache.iceberg.index.IndexAdapter;
+import org.apache.iceberg.index.IndexBlob;
+import org.apache.iceberg.index.IndexCandidates;
 import org.apache.iceberg.index.IndexDefinition;
 import org.apache.iceberg.index.IndexEntry;
+import org.apache.iceberg.index.IndexFile;
+import org.apache.iceberg.index.IndexQuery;
 import org.apache.iceberg.index.IndexSearchResult;
+import org.apache.iceberg.index.IndexSnapshot;
+import org.apache.iceberg.io.FileIO;
+import org.apache.iceberg.io.InputFile;
+import org.apache.iceberg.io.SeekableInputStream;
+import org.apache.iceberg.puffin.BlobMetadata;
+import org.apache.iceberg.puffin.Puffin;
+import org.apache.iceberg.puffin.PuffinReader;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableMap;
 import org.apache.iceberg.relocated.com.google.common.collect.Lists;
 import org.apache.iceberg.relocated.com.google.common.collect.Maps;
+import org.apache.iceberg.util.ByteBuffers;
 
 /**
  * BM25 text index adapter.
@@ -43,10 +58,8 @@ import org.apache.iceberg.relocated.com.google.common.collect.Maps;
  * <p>Scoring a document needs corpus-wide statistics: the document frequency of each query term and
  * the average document length. Those are sums over the whole snapshot, so this adapter searches all
  * index file payloads of a snapshot together ({@link #searchesAllPayloadsTogether()}). Each index
- * file carries the <b>local</b> postings and statistics of the data files it covers, and the
- * statistics are merged at search time, exactly like Lucene merges per-segment statistics. That
- * keeps index files per data file, so incremental refresh, coverage, lineage and delete semantics
- * are unchanged.
+ * file carries the local postings and statistics of the data files it covers. The shared statistics
+ * can be published with an index snapshot so queries only need the requested terms.
  *
  * <p>Score of document d for query q: {@code Σ_t∈q idf(t) · tf(t,d)·(k1+1) / (tf(t,d) + k1·(1 − b +
  * b·|d|/avgdl))}, with {@code idf(t) = ln(1 + (N − df(t) + 0.5)/(df(t) + 0.5))}. A query term that
@@ -58,9 +71,6 @@ public final class TextIndexAdapter implements IndexAdapter, java.io.Serializabl
 
   static final String ENTRY_BLOB_TYPE = "iceberg-text-entries-v1";
   static final String AUXILIARY_BLOB_TYPE = "iceberg-text-bm25-v1";
-
-  private static final byte[] MAGIC = "ICEBM25".getBytes(StandardCharsets.US_ASCII);
-  private static final byte FORMAT_VERSION = 1;
 
   private final TextIndexDefinition definition;
 
@@ -81,6 +91,11 @@ public final class TextIndexAdapter implements IndexAdapter, java.io.Serializabl
   @Override
   public String auxiliaryBlobType() {
     return AUXILIARY_BLOB_TYPE;
+  }
+
+  @Override
+  public IndexBlob auxiliaryBlob(ByteBuffer payload) {
+    return IndexBlob.uncompressed(auxiliaryBlobType(), ByteBuffers.toByteArray(payload));
   }
 
   @Override
@@ -135,8 +150,7 @@ public final class TextIndexAdapter implements IndexAdapter, java.io.Serializabl
    * Builds the payload of one index file: the local postings and local statistics of the given
    * entries, plus the mapping from local document id to row reference and document length.
    */
-  @Override
-  public ByteBuffer encodeAuxiliaryPayload(List<IndexEntry> entries) {
+  private static FileIndex indexEntries(List<IndexEntry> entries) {
     List<Document> documents = Lists.newArrayListWithCapacity(entries.size());
     Map<String, List<Posting>> postingsByTerm = Maps.newHashMap();
     long totalLength = 0;
@@ -157,44 +171,125 @@ public final class TextIndexAdapter implements IndexAdapter, java.io.Serializabl
       }
     }
 
+    Map<String, Long> frequencies = Maps.newHashMap();
+    postingsByTerm.forEach((term, postings) -> frequencies.put(term, (long) postings.size()));
+    return new FileIndex(documents.size(), totalLength, frequencies, postingsByTerm, documents);
+  }
+
+  @Override
+  public ByteBuffer encodeAuxiliaryPayload(List<IndexEntry> entries) {
+    FileIndex index = indexEntries(entries);
     try {
-      ByteArrayOutputStream bytes = new ByteArrayOutputStream();
-      try (DataOutputStream out = new DataOutputStream(bytes)) {
-        out.write(MAGIC);
-        out.writeByte(FORMAT_VERSION);
-        out.writeDouble(definition.k1());
-        out.writeDouble(definition.lengthNorm());
-        // local statistics header: merged across payloads at search time
-        out.writeInt(documents.size());
-        out.writeLong(totalLength);
+      return TextIndexPayload.encode(counts(index), index);
+    } catch (IOException e) {
+      throw new UncheckedIOException("Failed to write BM25 v1 shard", e);
+    }
+  }
 
-        out.writeInt(postingsByTerm.size());
-        for (Map.Entry<String, List<Posting>> term : postingsByTerm.entrySet()) {
-          byte[] termBytes = term.getKey().getBytes(StandardCharsets.UTF_8);
-          out.writeShort(termBytes.length);
-          out.write(termBytes);
-          // the document frequency doubles as the posting count: one posting per document
-          out.writeInt(term.getValue().size());
-          for (Posting posting : term.getValue()) {
-            out.writeInt(posting.docId);
-            out.writeInt(posting.termFrequency);
-          }
-        }
+  /** Reads only the requested term frequencies from an uncompressed Puffin blob. */
+  public CorpusCounts shardStatistics(InputFile file, Set<String> terms) {
+    BlobMetadata blob = rangeBlob(file);
+    try (SeekableInputStream stream = file.newStream()) {
+      return rangeReader(stream, blob).counts(terms);
+    } catch (IOException e) {
+      throw new UncheckedIOException("Failed to read BM25 shard statistics " + file.location(), e);
+    }
+  }
 
-        out.writeInt(documents.size());
-        for (Document document : documents) {
-          byte[] dataFile = document.dataFile.getBytes(StandardCharsets.UTF_8);
-          out.writeShort(dataFile.length);
-          out.write(dataFile);
-          out.writeLong(document.rowPosition);
-          out.writeInt(document.length);
+  /** Encodes the merged counts for a snapshot's term dictionary. */
+  public ByteBuffer encodeSnapshotStatistics(CorpusCounts counts) {
+    try {
+      return TextIndexPayload.encode(counts, null);
+    } catch (IOException e) {
+      throw new UncheckedIOException("Failed to write BM25 snapshot statistics", e);
+    }
+  }
+
+  @Override
+  public Object readSnapshotStatistics(InputFile file, ByteBuffer query) {
+    return snapshotStatistics(file, query.hasRemaining() ? queryTerms(query) : null);
+  }
+
+  @Override
+  public List<IndexSearchResult> searchAuxiliaryFiles(
+      FileIO io, IndexSnapshot snapshot, List<IndexFile> files, IndexQuery query) {
+    Map<String, Integer> frequencies = queryTermFrequency(query.payload());
+    if (files.isEmpty() || frequencies.isEmpty() || query.topK() <= 0) {
+      return List.of();
+    }
+
+    CorpusStatistics statistics =
+        snapshotStatistics(io.newInputFile(snapshot.statisticsLocation()), frequencies.keySet());
+    PriorityQueue<IndexSearchResult> best = new PriorityQueue<>(resultComparator().reversed());
+    List<byte[]> queries = List.of(ByteBuffers.toByteArray(query.payload()));
+    int[] limits = {query.topK()};
+    for (IndexFile file : files) {
+      InputFile input = io.newInputFile(file.location());
+      for (IndexSearchResult hit :
+          searchShardBatch(input, queries, limits, statistics, null).get(0)) {
+        best.add(hit);
+        if (best.size() > query.topK()) {
+          best.poll();
         }
       }
-
-      return ByteBuffer.wrap(bytes.toByteArray());
-    } catch (IOException e) {
-      throw new UncheckedIOException("Failed to write the text index payload", e);
     }
+    List<IndexSearchResult> results = Lists.newArrayList(best);
+    results.sort(resultComparator());
+    return List.copyOf(results);
+  }
+
+  /** Opens a snapshot dictionary and reads statistics only for the supplied query terms. */
+  public CorpusStatistics snapshotStatistics(InputFile file, Set<String> terms) {
+    try (SeekableInputStream stream = file.newStream()) {
+      return TextIndexPayload.open(
+              TextIndexPayload.source(stream, 0), Math.toIntExact(file.getLength()))
+          .counts(terms)
+          .corpus();
+    } catch (IOException e) {
+      throw new UncheckedIOException(
+          "Failed to read BM25 snapshot statistics " + file.location(), e);
+    }
+  }
+
+  /** Scores a batch with the posting ranges of its distinct terms. */
+  public List<List<IndexSearchResult>> searchShardBatch(
+      InputFile file,
+      List<byte[]> queries,
+      int[] limits,
+      CorpusStatistics statistics,
+      IndexCandidates candidates) {
+    BlobMetadata blob = rangeBlob(file);
+    try (SeekableInputStream stream = file.newStream()) {
+      TextIndexPayload.Reader reader = rangeReader(stream, blob);
+      return searchShardBatch(queries, limits, statistics, candidates, reader::shard);
+    } catch (IOException e) {
+      throw new UncheckedIOException("Failed to read BM25 shard " + file.location(), e);
+    }
+  }
+
+  private static BlobMetadata rangeBlob(InputFile file) {
+    try (PuffinReader reader = Puffin.read(file).build()) {
+      for (BlobMetadata blob : reader.fileMetadata().blobs()) {
+        if (AUXILIARY_BLOB_TYPE.equals(blob.type())) {
+          if (blob.compressionCodec() != null
+              || blob.offset() < 0
+              || blob.length() < 0
+              || blob.length() > file.getLength() - blob.offset()) {
+            throw new IOException("Invalid BM25 v1 blob range");
+          }
+          return blob;
+        }
+      }
+      throw new IOException("Missing BM25 v1 blob");
+    } catch (IOException e) {
+      throw new UncheckedIOException("Failed to open BM25 shard " + file.location(), e);
+    }
+  }
+
+  private static TextIndexPayload.Reader rangeReader(SeekableInputStream stream, BlobMetadata blob)
+      throws IOException {
+    return TextIndexPayload.open(
+        TextIndexPayload.source(stream, blob.offset()), Math.toIntExact(blob.length()));
   }
 
   @Override
@@ -210,48 +305,112 @@ public final class TextIndexAdapter implements IndexAdapter, java.io.Serializabl
   @Override
   public List<IndexSearchResult> searchAuxiliaryAll(
       List<ByteBuffer> payloads, ByteBuffer query, int topK) {
-    List<String> queryTokens = definition.analyze(decodeQuery(query));
-    if (queryTokens.isEmpty() || topK <= 0 || payloads.isEmpty()) {
+    Map<String, Integer> queryTerms = queryTermFrequency(query);
+    if (queryTerms.isEmpty() || topK <= 0 || payloads.isEmpty()) {
       return Lists.newArrayList();
     }
 
     List<FileIndex> indexes = Lists.newArrayListWithCapacity(payloads.size());
     for (ByteBuffer payload : payloads) {
-      indexes.add(readPayload(payload));
+      indexes.add(readPayload(payload, queryTerms.keySet(), false));
     }
 
-    // merge the local statistics into corpus-wide statistics, then score the candidates with them
-    CorpusStatistics statistics = mergeStatistics(indexes);
-    Map<String, Integer> queryTermFrequency = Maps.newHashMap();
-    for (String token : queryTokens) {
-      queryTermFrequency.merge(token, 1, Integer::sum);
+    return searchIndexes(indexes, queryTerms, mergeStatistics(indexes), topK, null);
+  }
+
+  /** Returns the terms whose document frequencies a query needs. */
+  public Set<String> queryTerms(ByteBuffer query) {
+    return new HashSet<>(definition.analyze(decodeQuery(query)));
+  }
+
+  private static CorpusCounts counts(FileIndex index) {
+    return new CorpusCounts(
+        index.localDocuments, index.localTotalLength, index.localDocumentFrequency);
+  }
+
+  private List<List<IndexSearchResult>> searchShardBatch(
+      List<byte[]> queries,
+      int[] limits,
+      CorpusStatistics statistics,
+      IndexCandidates candidates,
+      ShardReader reader)
+      throws IOException {
+    List<Map<String, Integer>> frequencies = Lists.newArrayListWithCapacity(queries.size());
+    Set<String> needed = new HashSet<>();
+    for (int queryId = 0; queryId < queries.size(); queryId++) {
+      Map<String, Integer> frequency =
+          limits[queryId] > 0
+              ? queryTermFrequency(ByteBuffer.wrap(queries.get(queryId)))
+              : Map.of();
+      frequencies.add(frequency);
+      needed.addAll(frequency.keySet());
+    }
+
+    FileIndex index = reader.read(needed, false);
+    List<List<IndexSearchResult>> hits = Lists.newArrayListWithCapacity(queries.size());
+    for (int queryId = 0; queryId < queries.size(); queryId++) {
+      hits.add(
+          searchIndexes(
+              List.of(index), frequencies.get(queryId), statistics, limits[queryId], candidates));
+    }
+    return hits;
+  }
+
+  @FunctionalInterface
+  private interface ShardReader {
+    FileIndex read(Set<String> terms, boolean statisticsOnly) throws IOException;
+  }
+
+  private Map<String, Integer> queryTermFrequency(ByteBuffer query) {
+    Map<String, Integer> frequency = Maps.newHashMap();
+    for (String token : definition.analyze(decodeQuery(query))) {
+      frequency.merge(token, 1, Integer::sum);
+    }
+    return frequency;
+  }
+
+  private List<IndexSearchResult> searchIndexes(
+      List<FileIndex> indexes,
+      Map<String, Integer> queryTerms,
+      CorpusStatistics statistics,
+      int topK,
+      IndexCandidates candidates) {
+    if (queryTerms.isEmpty() || topK <= 0) {
+      return List.of();
     }
 
     Map<String, Map<Long, Double>> scoresByFile =
-        scoreCandidates(indexes, queryTermFrequency, statistics);
-
-    List<IndexSearchResult> results = Lists.newArrayList();
+        scoreCandidates(indexes, queryTerms, statistics, candidates);
+    Comparator<IndexSearchResult> order = resultComparator();
+    PriorityQueue<IndexSearchResult> best = new PriorityQueue<>(order.reversed());
     for (Map.Entry<String, Map<Long, Double>> fileScores : scoresByFile.entrySet()) {
       for (Map.Entry<Long, Double> score : fileScores.getValue().entrySet()) {
-        results.add(IndexSearchResult.of(fileScores.getKey(), score.getKey(), score.getValue()));
+        IndexSearchResult hit =
+            IndexSearchResult.of(fileScores.getKey(), score.getKey(), score.getValue());
+        if (best.size() < topK) {
+          best.add(hit);
+        } else if (order.compare(hit, best.element()) < 0) {
+          best.remove();
+          best.add(hit);
+        }
       }
     }
 
-    results.sort(resultComparator());
-    return results.size() > topK ? Lists.newArrayList(results.subList(0, topK)) : results;
+    List<IndexSearchResult> results = Lists.newArrayList(best);
+    results.sort(order);
+    return results;
   }
 
   /** The corpus-wide statistics merged from the local statistics of every index file. */
   private static CorpusStatistics mergeStatistics(List<FileIndex> indexes) {
     long totalDocuments = 0;
     long totalLength = 0;
-    Map<String, Integer> documentFrequency = Maps.newHashMap();
+    Map<String, Long> documentFrequency = Maps.newHashMap();
     for (FileIndex index : indexes) {
-      totalDocuments += index.localDocuments;
-      totalLength += index.localTotalLength;
-      for (Map.Entry<String, Integer> term : index.localDocumentFrequency.entrySet()) {
-        documentFrequency.merge(term.getKey(), term.getValue(), Integer::sum);
-      }
+      totalDocuments = Math.addExact(totalDocuments, index.localDocuments);
+      totalLength = Math.addExact(totalLength, index.localTotalLength);
+      index.localDocumentFrequency.forEach(
+          (term, count) -> documentFrequency.merge(term, count, Math::addExact));
     }
 
     return new CorpusStatistics(
@@ -264,7 +423,8 @@ public final class TextIndexAdapter implements IndexAdapter, java.io.Serializabl
   private Map<String, Map<Long, Double>> scoreCandidates(
       List<FileIndex> indexes,
       Map<String, Integer> queryTermFrequency,
-      CorpusStatistics statistics) {
+      CorpusStatistics statistics,
+      IndexCandidates candidates) {
     Map<String, Map<Long, Double>> scoresByFile = Maps.newHashMap();
     for (FileIndex index : indexes) {
       for (Map.Entry<String, Integer> queryTerm : queryTermFrequency.entrySet()) {
@@ -273,11 +433,13 @@ public final class TextIndexAdapter implements IndexAdapter, java.io.Serializabl
           continue;
         }
 
-        int frequency = statistics.documentFrequency.getOrDefault(queryTerm.getKey(), 0);
-        double idf =
-            Math.log(1.0 + (statistics.totalDocuments - frequency + 0.5) / (frequency + 0.5));
+        double idf = inverseDocumentFrequency(statistics, queryTerm.getKey());
         for (Posting posting : postings) {
           Document document = index.documents.get(posting.docId);
+          if (candidates != null && !candidates.contains(document.dataFile, document.rowPosition)) {
+            continue;
+          }
+
           double score =
               queryTerm.getValue()
                   * documentScore(
@@ -300,7 +462,7 @@ public final class TextIndexAdapter implements IndexAdapter, java.io.Serializabl
   public Object searchStatistics(List<ByteBuffer> payloads) {
     List<FileIndex> indexes = Lists.newArrayListWithCapacity(payloads.size());
     for (ByteBuffer payload : payloads) {
-      indexes.add(readPayload(payload));
+      indexes.add(readPayload(payload, null, true));
     }
     return mergeStatistics(indexes);
   }
@@ -333,9 +495,7 @@ public final class TextIndexAdapter implements IndexAdapter, java.io.Serializabl
         continue;
       }
 
-      int documents = statistics.documentFrequency().getOrDefault(queryTerm.getKey(), 0);
-      double idf =
-          Math.log(1.0 + (statistics.totalDocuments() - documents + 0.5) / (documents + 0.5));
+      double idf = inverseDocumentFrequency(statistics, queryTerm.getKey());
       score +=
           queryTerm.getValue()
               * documentScore(
@@ -343,6 +503,11 @@ public final class TextIndexAdapter implements IndexAdapter, java.io.Serializabl
     }
 
     return score;
+  }
+
+  private static double inverseDocumentFrequency(CorpusStatistics statistics, String term) {
+    long frequency = statistics.documentFrequency(term);
+    return Math.log1p((statistics.totalDocuments() - frequency + 0.5) / (frequency + 0.5));
   }
 
   private static Map<String, Integer> termFrequency(List<String> tokens) {
@@ -380,55 +545,10 @@ public final class TextIndexAdapter implements IndexAdapter, java.io.Serializabl
     return StandardCharsets.UTF_8.decode(query.duplicate()).toString();
   }
 
-  private FileIndex readPayload(ByteBuffer buffer) {
+  private FileIndex readPayload(ByteBuffer buffer, Set<String> terms, boolean statisticsOnly) {
     try {
-      byte[] bytes = new byte[buffer.remaining()];
-      buffer.duplicate().get(bytes);
-      try (DataInputStream in = new DataInputStream(new ByteArrayInputStream(bytes))) {
-        byte[] magic = new byte[MAGIC.length];
-        in.readFully(magic);
-        if (!java.util.Arrays.equals(magic, MAGIC)) {
-          throw new IllegalArgumentException("Not a text index payload");
-        }
-        byte version = in.readByte();
-        if (version != FORMAT_VERSION) {
-          throw new IllegalArgumentException("Unsupported text index format version: " + version);
-        }
-        in.readDouble(); // k1, already in the definition
-        in.readDouble(); // b, already in the definition
-        int localDocuments = in.readInt();
-        long localTotalLength = in.readLong();
-
-        int termCount = in.readInt();
-        Map<String, Integer> localDocumentFrequency = Maps.newHashMap();
-        Map<String, List<Posting>> postingsByTerm = Maps.newHashMap();
-        for (int i = 0; i < termCount; i++) {
-          byte[] termBytes = new byte[in.readUnsignedShort()];
-          in.readFully(termBytes);
-          String term = new String(termBytes, StandardCharsets.UTF_8);
-          // the document frequency doubles as the posting count: one posting per document
-          int postingCount = in.readInt();
-          localDocumentFrequency.put(term, postingCount);
-          List<Posting> postings = Lists.newArrayListWithCapacity(postingCount);
-          for (int p = 0; p < postingCount; p++) {
-            postings.add(new Posting(in.readInt(), in.readInt()));
-          }
-          postingsByTerm.put(term, postings);
-        }
-
-        int documentCount = in.readInt();
-        List<Document> documents = Lists.newArrayListWithCapacity(documentCount);
-        for (int i = 0; i < documentCount; i++) {
-          byte[] dataFile = new byte[in.readUnsignedShort()];
-          in.readFully(dataFile);
-          documents.add(
-              new Document(
-                  new String(dataFile, StandardCharsets.UTF_8), in.readLong(), in.readInt()));
-        }
-
-        return new FileIndex(
-            localDocuments, localTotalLength, localDocumentFrequency, postingsByTerm, documents);
-      }
+      return TextIndexPayload.open(TextIndexPayload.source(buffer), buffer.remaining())
+          .shard(terms, statisticsOnly);
     } catch (IOException e) {
       throw new UncheckedIOException("Failed to read the text index payload", e);
     }
@@ -471,12 +591,12 @@ public final class TextIndexAdapter implements IndexAdapter, java.io.Serializabl
   }
 
   /** A document of one index file: its row reference and its token count. */
-  private static final class Document {
-    private final String dataFile;
-    private final long rowPosition;
-    private final int length;
+  static final class Document {
+    final String dataFile;
+    final long rowPosition;
+    final int length;
 
-    private Document(String dataFile, long rowPosition, int length) {
+    Document(String dataFile, long rowPosition, int length) {
       this.dataFile = dataFile;
       this.rowPosition = rowPosition;
       this.length = length;
@@ -484,13 +604,47 @@ public final class TextIndexAdapter implements IndexAdapter, java.io.Serializabl
   }
 
   /** One term occurrence: the local document id and the term frequency in that document. */
-  private static final class Posting {
-    private final int docId;
-    private final int termFrequency;
+  static final class Posting {
+    final int docId;
+    final int termFrequency;
 
-    private Posting(int docId, int termFrequency) {
+    Posting(int docId, int termFrequency) {
       this.docId = docId;
       this.termFrequency = termFrequency;
+    }
+  }
+
+  /** Additive corpus statistics that can be reduced across shards. */
+  public static final class CorpusCounts implements java.io.Serializable {
+    private static final long serialVersionUID = 1L;
+
+    final long documents;
+    final long tokens;
+    final Map<String, Long> documentFrequency;
+
+    CorpusCounts(long documents, long tokens, Map<String, Long> documentFrequency) {
+      this.documents = documents;
+      this.tokens = tokens;
+      this.documentFrequency = ImmutableMap.copyOf(documentFrequency);
+    }
+
+    public static CorpusCounts empty() {
+      return new CorpusCounts(0, 0, Map.of());
+    }
+
+    public CorpusCounts merge(CorpusCounts other) {
+      Map<String, Long> frequency = Maps.newHashMap(documentFrequency);
+      other.documentFrequency.forEach(
+          (term, count) -> frequency.merge(term, count, Math::addExact));
+      return new CorpusCounts(
+          Math.addExact(documents, other.documents),
+          Math.addExact(tokens, other.tokens),
+          frequency);
+    }
+
+    public CorpusStatistics corpus() {
+      double average = documents == 0 ? 0.0 : (double) tokens / documents;
+      return new CorpusStatistics(documents, average, documentFrequency);
     }
   }
 
@@ -504,10 +658,10 @@ public final class TextIndexAdapter implements IndexAdapter, java.io.Serializabl
 
     private final long totalDocuments;
     private final double averageLength;
-    private final Map<String, Integer> documentFrequency;
+    private final Map<String, Long> documentFrequency;
 
     private CorpusStatistics(
-        long totalDocuments, double averageLength, Map<String, Integer> documentFrequency) {
+        long totalDocuments, double averageLength, Map<String, Long> documentFrequency) {
       this.totalDocuments = totalDocuments;
       this.averageLength = averageLength;
       this.documentFrequency = ImmutableMap.copyOf(documentFrequency);
@@ -530,24 +684,35 @@ public final class TextIndexAdapter implements IndexAdapter, java.io.Serializabl
       return averageLength;
     }
 
-    /** How many documents of that snapshot contain each term. */
+    /**
+     * How many documents of that snapshot contain each term.
+     *
+     * @throws ArithmeticException if a term occurs in more than {@link Integer#MAX_VALUE} documents
+     */
     public Map<String, Integer> documentFrequency() {
-      return documentFrequency;
+      ImmutableMap.Builder<String, Integer> frequencies = ImmutableMap.builder();
+      documentFrequency.forEach((term, count) -> frequencies.put(term, Math.toIntExact(count)));
+      return frequencies.build();
+    }
+
+    /** How many documents of that snapshot contain the term, or zero if absent. */
+    public long documentFrequency(String term) {
+      return documentFrequency.getOrDefault(term, 0L);
     }
   }
 
   /** The decoded content of one index file payload. */
-  private static final class FileIndex {
-    private final int localDocuments;
-    private final long localTotalLength;
-    private final Map<String, Integer> localDocumentFrequency;
-    private final Map<String, List<Posting>> postingsByTerm;
-    private final List<Document> documents;
+  static final class FileIndex {
+    final int localDocuments;
+    final long localTotalLength;
+    final Map<String, Long> localDocumentFrequency;
+    final Map<String, List<Posting>> postingsByTerm;
+    final List<Document> documents;
 
-    private FileIndex(
+    FileIndex(
         int localDocuments,
         long localTotalLength,
-        Map<String, Integer> localDocumentFrequency,
+        Map<String, Long> localDocumentFrequency,
         Map<String, List<Posting>> postingsByTerm,
         List<Document> documents) {
       this.localDocuments = localDocuments;

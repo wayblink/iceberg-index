@@ -285,7 +285,10 @@ public final class IndexSnapshotWriter {
       built = adapter.encodeEntriesWithMemory(batch);
       kind = IndexFile.Kind.ENTRY_BEARING;
     }
-    IndexBlob blob = IndexBlob.of(blobType, ByteBuffers.toByteArray(built.payload()));
+    IndexBlob blob =
+        kind == IndexFile.Kind.AUXILIARY
+            ? adapter.auxiliaryBlob(built.payload())
+            : IndexBlob.of(blobType, ByteBuffers.toByteArray(built.payload()));
     write(location, out -> container.write(out, ImmutableList.of(blob)));
     IndexFileMemory memory = built.memory();
     if (memory != null) {

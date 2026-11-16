@@ -21,6 +21,7 @@ package org.apache.iceberg.index;
 import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.util.List;
+import java.util.Map;
 import org.apache.iceberg.io.InputFile;
 import org.apache.iceberg.io.OutputFile;
 import org.apache.iceberg.puffin.Blob;
@@ -79,7 +80,9 @@ public final class PuffinIndexFileContainer implements IndexFileContainer {
                 NO_INPUT_FIELDS,
                 NO_SNAPSHOT_ID,
                 NO_SEQUENCE_NUMBER,
-                ByteBuffer.wrap(blob.payload())));
+                ByteBuffer.wrap(blob.payload()),
+                blob.requiresUncompressedStorage() ? PuffinCompressionCodec.NONE : null,
+                Map.of()));
       }
       writer.finish();
     }
