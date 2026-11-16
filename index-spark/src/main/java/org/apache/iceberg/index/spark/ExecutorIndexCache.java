@@ -1845,10 +1845,11 @@ final class ExecutorIndexCache {
     }
   }
 
-  void releaseIndex(String indexUuid, long epoch) {
+  /** Fences the index even when a dispatched load has not applied its target yet. */
+  boolean releaseIndex(String indexUuid, long epoch) {
     synchronized (mapLock) {
-      if (!ownership.hasTarget(indexUuid)) {
-        return;
+      if (ownership.epoch(indexUuid) > epoch) {
+        return false;
       }
       Set<String> keys = ownership.keys(indexUuid);
       ownership.offload(indexUuid, epoch);
@@ -1857,6 +1858,7 @@ final class ExecutorIndexCache {
         releaseIfUnowned(key);
       }
       mapLock.notifyAll();
+      return true;
     }
   }
 

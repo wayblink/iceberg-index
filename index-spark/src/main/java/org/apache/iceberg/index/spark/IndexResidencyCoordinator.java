@@ -278,6 +278,8 @@ final class IndexResidencyCoordinator {
     // the table's FileIO, so an answered or fenced one is dropped instead of being kept for as long
     // as the driver runs.
     private final Map<String, IndexCacheProtocol.Command> issued = new LinkedHashMap<>();
+    // One representative of the latest epoch sent to this executor, without its read context.
+    private final Map<String, PlanFile> dispatchedLoads = new LinkedHashMap<>();
     private final Map<String, Long> reservedByCommand = new LinkedHashMap<>();
     private final Map<String, String> planOfCommand = new LinkedHashMap<>();
 
@@ -601,14 +603,33 @@ final class IndexResidencyCoordinator {
     Objects.requireNonNull(indexUuid, "Index identity is null");
     IndexState index = indexes.computeIfAbsent(indexUuid, IndexState::new);
     index.epoch = index.epoch + 1;
-    // Withdraw the target so the index stops accepting new files, but keep the old keys until the
-    // holders are collected: they are what the release commands are built from.
-    Set<String> previous = new LinkedHashSet<>(index.targetCacheKeys);
     index.targetCacheKeys.clear();
+    Map<String, PlanFile> toRelease = new LinkedHashMap<>();
+    Set<String> coveredExecutors = new LinkedHashSet<>();
     for (PlanState open : plans.values()) {
-      if (open.indexUuid.equals(indexUuid) && !open.finalized()) {
+      if (!open.indexUuid.equals(indexUuid)) {
+        continue;
+      }
+
+      for (PlanFile copy : open.loaded.values()) {
+        NodeState node = nodes.get(copy.executorId);
+        if (node != null && node.report.incarnation().equals(copy.incarnation)) {
+          toRelease.putIfAbsent(replicaKey(copy.cacheKey, copy.executorId), copy);
+          coveredExecutors.add(copy.executorId);
+        }
+      }
+      if (!open.finalized()) {
         fencePlan(open, "OFFLOADED");
         open.superseded = true;
+      }
+      open.loaded.clear();
+    }
+
+    // A dispatched LOAD can still take ownership even if no copy has been acknowledged.
+    for (NodeState node : nodes.values()) {
+      PlanFile dispatched = node.dispatchedLoads.get(indexUuid);
+      if (dispatched != null && !coveredExecutors.contains(dispatched.executorId)) {
+        toRelease.put(replicaKey(dispatched.cacheKey, dispatched.executorId), dispatched);
       }
     }
 
@@ -617,53 +638,29 @@ final class IndexResidencyCoordinator {
     plans.put(plan.planId, plan);
     lastPlanId = plan.planId;
     prunePlans();
-    List<Holder> toRelease = holders(indexUuid);
-    for (String cacheKey : previous) {
-      for (Holder holder : holdersOfKey(cacheKey)) {
-        if (toRelease.stream()
-            .noneMatch(
-                h -> h.cacheKey().equals(cacheKey) && h.executorId().equals(holder.executorId()))) {
-          toRelease.add(holder);
-        }
-      }
-    }
-
     plan.snapshotId = index.snapshotId;
-    for (Holder holder : toRelease) {
-      plan.addFile(
-          IndexCacheProtocol.File.builder()
-              .location(holder.location())
-              .cacheKey(holder.cacheKey())
-              .build());
-    }
-
     index.paused = true;
-    // The paused index keeps no confirmed copy: the pending release commands are the only owner.
-    for (PlanState open : plans.values()) {
-      if (open.indexUuid.equals(indexUuid)) {
-        open.loaded.clear();
+    for (PlanFile copy : toRelease.values()) {
+      IndexCacheProtocol.File file =
+          IndexCacheProtocol.File.builder()
+              .location(copy.location)
+              .cacheKey(copy.cacheKey)
+              .owner(modeFor(copy.cacheKey))
+              .build();
+      if (plan.planned(copy.cacheKey) == null) {
+        plan.addFile(file);
       }
-    }
-
-    for (Holder holder : toRelease) {
-      NodeState node = nodes.get(holder.executorId());
-      String location = holder.location();
-      String cacheKey = holder.cacheKey();
       enqueue(
           plan,
-          node,
+          nodes.get(copy.executorId),
           "RELEASE",
           IndexCacheProtocol.CommandType.RELEASE,
           indexUuid,
-          modeFor(cacheKey),
-          IndexCacheProtocol.File.builder()
-              .location(location)
-              .cacheKey(cacheKey)
-              .owner(modeFor(cacheKey))
-              .build(),
-          holder.bytes(),
+          IndexCacheProtocol.OFFLOAD_MODE,
+          file,
+          copy.bytes,
           plan.epoch,
-          holder.installedBy());
+          copy.commandId);
     }
 
     return plan.planId;
@@ -850,6 +847,25 @@ final class IndexResidencyCoordinator {
         node.queue.size() <= maxCommandsPerReply
             ? new ArrayList<>(node.queue)
             : new ArrayList<>(node.queue.subList(0, maxCommandsPerReply));
+    for (IndexCacheProtocol.Command command : batch) {
+      if (command.type() == IndexCacheProtocol.CommandType.LOAD) {
+        node.dispatchedLoads.compute(
+            command.indexUuid(),
+            (id, previous) ->
+                previous != null && previous.epoch >= command.epoch()
+                    ? previous
+                    : new PlanFile(
+                        command.file().location(),
+                        command.file().cacheKey(),
+                        command.executorId(),
+                        command.incarnation(),
+                        command.file().estimatedBytes(),
+                        command.type(),
+                        command.epoch(),
+                        command.commandId(),
+                        null));
+      }
+    }
     return IndexCacheProtocol.Reply.builder()
         .commands(batch)
         .nextSequence(report.sequence())
@@ -952,6 +968,10 @@ final class IndexResidencyCoordinator {
     if (command.type == IndexCacheProtocol.CommandType.RELEASE) {
       if (ack.status() == IndexCacheProtocol.AckStatus.RELEASED) {
         plan.released.add(replicaKey(command.cacheKey, command.executorId));
+        if (plan.offload) {
+          node.dispatchedLoads.computeIfPresent(
+              plan.indexUuid, (id, sent) -> sent.epoch <= command.epoch ? null : sent);
+        }
         // Only the copy on that node stops counting; a migrated copy of the same key survives.
         forgetCopy(
             command.cacheKey,
@@ -1093,15 +1113,18 @@ final class IndexResidencyCoordinator {
     IndexState index = indexes.get(plan.indexUuid);
     IndexCacheProtocol.Protection protection = index == null ? null : index.protection;
     if (plan.offload) {
-      Map<String, String> pending = new LinkedHashMap<>();
-      Set<String> released = new java.util.HashSet<>();
-      for (String replica : plan.released) {
-        released.add(replica.substring(0, replica.lastIndexOf('@')));
+      if (plan.superseded) {
+        return resultOf(
+            plan, IndexCacheProtocol.Status.CANCELLED, protection, Map.of(), plan.evicted);
       }
 
-      for (IndexCacheProtocol.File file : plan.files) {
-        if (!released.contains(file.cacheKey())) {
-          pending.put(file.location(), "RELEASE_PENDING");
+      Map<String, String> pending = new LinkedHashMap<>();
+      for (PlanFile copy : plan.commands.values()) {
+        NodeState node = nodes.get(copy.executorId);
+        if (node != null
+            && node.report.incarnation().equals(copy.incarnation)
+            && !plan.released.contains(replicaKey(copy.cacheKey, copy.executorId))) {
+          pending.put(copy.location, "RELEASE_PENDING");
         }
       }
 
@@ -1616,9 +1639,10 @@ final class IndexResidencyCoordinator {
       return;
     }
 
+    Set<String> queuedCopies = new LinkedHashSet<>();
     for (Holder holder : victims) {
       NodeState node = nodes.get(holder.executorId());
-      if (node != null) {
+      if (node != null && queuedCopies.add(replicaKey(holder.cacheKey(), holder.executorId()))) {
         enqueue(
             plan,
             node,
@@ -1632,7 +1656,7 @@ final class IndexResidencyCoordinator {
                 .owner(modeFor(holder.cacheKey()))
                 .build(),
             holder.bytes(),
-            holder.epoch(),
+            victim.epoch,
             holder.installedBy());
       }
     }

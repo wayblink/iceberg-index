@@ -280,8 +280,12 @@ final class ExecutorIndexCacheWorker implements AutoCloseable {
 
   private IndexCacheProtocol.Ack release(IndexCacheProtocol.Command command) {
     String cacheKey = command.file().cacheKey();
-    // Detach the claim and any pending admission under the same lock as the epoch check.
-    if (!cache.releaseCopy(command.indexUuid(), cacheKey, command.epoch())) {
+    // Offload fences all keys of the index. Other releases only detach one file.
+    boolean released =
+        IndexCacheProtocol.OFFLOAD_MODE.equals(command.mode())
+            ? cache.releaseIndex(command.indexUuid(), command.epoch())
+            : cache.releaseCopy(command.indexUuid(), cacheKey, command.epoch());
+    if (!released) {
       return reject(command, "STALE_EPOCH");
     }
 

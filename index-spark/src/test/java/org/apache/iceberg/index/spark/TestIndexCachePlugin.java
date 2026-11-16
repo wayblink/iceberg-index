@@ -323,8 +323,10 @@ class TestIndexCachePlugin {
     control.receive(runner.worker.execute(command));
     assertThat(runner.worker.holders()).containsKey(command.file().cacheKey());
 
-    // The next poll carries the orphan release, and executing it frees the copy.
-    for (int i = 0; i < 100 && !runner.worker.holders().isEmpty(); i++) {
+    // Wait for the offload acknowledgement to reach the driver as well as the worker release.
+    for (int i = 0;
+        i < 100 && coordinator.result(offload).status() != IndexCacheProtocol.Status.OFFLOADED;
+        i++) {
       runner.loop.pollOnce();
       sleepQuietly(20);
     }

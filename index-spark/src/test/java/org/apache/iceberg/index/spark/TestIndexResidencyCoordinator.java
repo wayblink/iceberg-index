@@ -401,6 +401,24 @@ class TestIndexResidencyCoordinator {
   }
 
   @Test
+  void offloadWaitsForTheExecutorWithAnUnacknowledgedLoad() {
+    coordinator.report(node("a", "a-1", 1, 100));
+    String load =
+        coordinator.acceptLoad(target("A", "f", 10), IndexResidencyPolicy.parse("0"), clock.now());
+    assertThat(coordinator.report(node("a", "a-1", 2, 100)).commands())
+        .containsExactly(loadCommand(load));
+
+    String offload = coordinator.acceptOffload("A", clock.now());
+    assertThat(coordinator.result(offload).status()).isEqualTo(IndexCacheProtocol.Status.RELEASING);
+    IndexCacheProtocol.Command release = coordinator.commands("a", "a-1").get(0);
+    assertThat(release.planId()).isEqualTo(offload);
+    assertThat(release.epoch()).isGreaterThan(planEpoch(load));
+
+    coordinator.ack(ack(offload, "a", "a-1", release, IndexCacheProtocol.AckStatus.RELEASED));
+    assertThat(coordinator.result(offload).status()).isEqualTo(IndexCacheProtocol.Status.OFFLOADED);
+  }
+
+  @Test
   void offloadFencesInFlightLoadSoALateAckCannotPublish() {
     coordinator.report(node("a", "a-1", 1, 100));
     String load =
@@ -817,7 +835,10 @@ class TestIndexResidencyCoordinator {
 
     IndexCacheProtocol.Command releaseOnA =
         coordinator.commands("a", "a-1").stream()
-            .filter(c -> c.type() == IndexCacheProtocol.CommandType.RELEASE)
+            .filter(
+                c ->
+                    c.planId().equals(offload)
+                        && c.type() == IndexCacheProtocol.CommandType.RELEASE)
             .findFirst()
             .orElseThrow();
     coordinator.ack(ack(offload, "a", "a-1", releaseOnA, IndexCacheProtocol.AckStatus.RELEASED));
@@ -827,7 +848,10 @@ class TestIndexResidencyCoordinator {
 
     IndexCacheProtocol.Command releaseOnB =
         coordinator.commands("b", "b-1").stream()
-            .filter(c -> c.type() == IndexCacheProtocol.CommandType.RELEASE)
+            .filter(
+                c ->
+                    c.planId().equals(offload)
+                        && c.type() == IndexCacheProtocol.CommandType.RELEASE)
             .findFirst()
             .orElseThrow();
     coordinator.ack(ack(offload, "b", "b-1", releaseOnB, IndexCacheProtocol.AckStatus.RELEASED));
@@ -1016,6 +1040,27 @@ class TestIndexResidencyCoordinator {
         target("A", "new", 10), IndexResidencyPolicy.parse("forever"), clock.now());
 
     assertThat(coordinator.result(first).status()).isEqualTo(IndexCacheProtocol.Status.CANCELLED);
+  }
+
+  @Test
+  void evictionUsesTheVictimsCurrentEpochForAReusedCopy() {
+    coordinator.report(node("a", "a-1", 1, 100));
+    String first =
+        coordinator.acceptLoad(target("V", "v1", 40), IndexResidencyPolicy.parse("0"), clock.now());
+    ackFile(first, "v1", IndexCacheProtocol.AckStatus.LOADED);
+    coordinator.report(node("a", "a-1", 2, 100, file("V", "v1", 40)));
+    String reload =
+        coordinator.acceptLoad(target("V", "v1", 40), IndexResidencyPolicy.parse("0"), clock.now());
+    ackFile(reload, "v1", IndexCacheProtocol.AckStatus.LOADED);
+    coordinator.report(node("a", "a-1", 3, 100, file("V", "v1", 40)));
+
+    String requester =
+        coordinator.acceptLoad(target("W", "w1", 70), IndexResidencyPolicy.parse("0"), clock.now());
+    assertThat(coordinator.result(requester).evictedIndexes()).containsExactly("V");
+    assertThat(coordinator.commands("a", "a-1"))
+        .filteredOn(c -> c.type() == IndexCacheProtocol.CommandType.RELEASE)
+        .extracting(IndexCacheProtocol.Command::epoch)
+        .containsExactly(planEpoch(reload));
   }
 
   @Test

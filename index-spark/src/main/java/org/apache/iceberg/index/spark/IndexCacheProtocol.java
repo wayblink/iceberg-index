@@ -35,6 +35,8 @@ import org.apache.iceberg.relocated.com.google.common.base.Preconditions;
 final class IndexCacheProtocol {
   private IndexCacheProtocol() {}
 
+  static final String OFFLOAD_MODE = "OFFLOAD";
+
   enum CommandType {
     LOAD,
     RELEASE

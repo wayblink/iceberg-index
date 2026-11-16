@@ -28,6 +28,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.FutureTask;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import org.apache.iceberg.index.IndexDefinition;
@@ -291,6 +292,55 @@ class TestExecutorIndexCacheWorker {
     assertThat(report.holders())
         .containsEntry("adapter|A|f1", cache.chargeSnapshot().residentBytes());
     assertThat(report.accessAgeNanos()).containsEntry("A", 5_000L);
+  }
+
+  @Test
+  void offloadFencesAnEarlierLoadBeforeItStarts() {
+    IndexCacheProtocol.Command delayed = load("A", "f1", 1);
+
+    assertThat(worker.execute(release("A", "f1", 2, IndexCacheProtocol.OFFLOAD_MODE)).status())
+        .isEqualTo(IndexCacheProtocol.AckStatus.RELEASED);
+    assertThat(worker.execute(delayed).reason()).isEqualTo("STALE_EPOCH");
+    assertThat(cache.residentKeys()).isEmpty();
+    assertThat(worker.execute(load("A", "f1", 3)).status())
+        .isEqualTo(IndexCacheProtocol.AckStatus.LOADED);
+    assertThat(
+            worker
+                .execute(release("A", "other-shard", 2, IndexCacheProtocol.OFFLOAD_MODE))
+                .reason())
+        .isEqualTo("STALE_EPOCH");
+    assertThat(cache.residentKeys()).containsExactly(delayed.file().cacheKey());
+  }
+
+  @Test
+  void offloadPreventsASelectedShardFromPublishingWhileItIsPreparing() throws Exception {
+    worker.close();
+    CountDownLatch loading = new CountDownLatch(1);
+    CountDownLatch finish = new CountDownLatch(1);
+    worker =
+        newWorker(
+            command -> {
+              loading.countDown();
+              assertThat(awaitLatch(finish)).isTrue();
+              return loaded(command);
+            });
+    var task = new FutureTask<>(() -> worker.execute(load("A", "preparing", 1)));
+    Thread thread = new Thread(task);
+    thread.start();
+    try {
+      assertThat(awaitLatch(loading)).isTrue();
+      assertThat(
+              worker
+                  .execute(release("A", "other-shard", 2, IndexCacheProtocol.OFFLOAD_MODE))
+                  .status())
+          .isEqualTo(IndexCacheProtocol.AckStatus.RELEASED);
+    } finally {
+      finish.countDown();
+    }
+
+    assertThat(task.get(30, TimeUnit.SECONDS).status())
+        .isNotEqualTo(IndexCacheProtocol.AckStatus.LOADED);
+    assertThat(cache.residentKeys()).isEmpty();
   }
 
   @Test
@@ -649,6 +699,11 @@ class TestExecutorIndexCacheWorker {
   }
 
   private IndexCacheProtocol.Command release(String indexUuid, String location, long epoch) {
+    return release(indexUuid, location, epoch, "OTHER");
+  }
+
+  private IndexCacheProtocol.Command release(
+      String indexUuid, String location, long epoch, String mode) {
     return IndexCacheProtocol.Command.builder()
         .session(SESSION)
         .executorId(EXECUTOR)
@@ -658,7 +713,7 @@ class TestExecutorIndexCacheWorker {
         .planId("plan-" + epoch)
         .commandId("plan-" + epoch + "#" + location + "-RELEASE")
         .type(IndexCacheProtocol.CommandType.RELEASE)
-        .mode("OTHER")
+        .mode(mode)
         .file(
             IndexCacheProtocol.File.builder()
                 .location(location)
