@@ -818,6 +818,55 @@ class TestIndexCacheMemory {
   }
 
   @Test
+  void legacyRaBitQManifestIsRepricedWithoutOpeningTheShard() {
+    int dimension = 16;
+    VectorIndexAdapter adapter =
+        new VectorIndexAdapter(
+            VectorIndexDefinition.builder()
+                .fieldId(1)
+                .dimension(dimension)
+                .metric(Metric.EUCLIDEAN)
+                .structure(VectorStructure.IVF)
+                .quantizer(VectorQuantizer.RABITQ)
+                .properties(Map.of("nlist", "4", "nprobe", "1"))
+                .build());
+    List<IndexEntry> entries = new ArrayList<>();
+    for (int row = 0; row < 32; row++) {
+      float[] vector = new float[dimension];
+      vector[0] = row;
+      entries.add(IndexEntry.of("data", row, adapter.encodeVector(vector)));
+    }
+
+    var built = adapter.encodeAuxiliaryPayloadWithMemory(entries, 1);
+    long preparedBytes = adapter.prepareAuxiliary(built.payload()).estimatedBytes();
+    long rotationBytes = 16L + Float.BYTES * dimension;
+    // Each list used to charge a quantizer, a center of the same size, and a rotation.
+    long legacyQuantizerBytes = 4 * (48 + 2 * rotationBytes);
+    Map<String, Long> structure = new LinkedHashMap<>(built.memory().structure());
+    structure.put("quantizer-bytes", legacyQuantizerBytes);
+    IndexFileMemory legacy =
+        built.memory().toBuilder()
+            .preparedBytes(preparedBytes + 3 * rotationBytes)
+            .runtimeProfile(built.memory().runtimeProfile().replace(";rabitq-rotation=shared", ""))
+            .structure(structure)
+            .build();
+    IndexFile file =
+        IndexFile.builder()
+            .location("legacy-ivf-rabitq.puffin")
+            .kind(IndexFile.Kind.AUXILIARY)
+            .blobType(adapter.auxiliaryBlobType())
+            .entryCount(entries.size())
+            .memory(legacy)
+            .build();
+
+    IndexFileMemory planned = new IndexCacheMemory.Estimates().resolve(null, file, adapter);
+    assertThat(planned).isNotNull();
+    assertThat(planned.preparedBytes()).isEqualTo(preparedBytes);
+    assertThat(IndexCacheMemory.compatible(planned, adapter)).isTrue();
+    assertThat(IndexCacheMemory.compatibleModel(legacy, adapter)).isTrue();
+  }
+
+  @Test
   void aRecordWrittenUnderAnotherProcessorCountIsReestimatedRatherThanRefused() {
     VectorIndexAdapter adapter =
         new VectorIndexAdapter(

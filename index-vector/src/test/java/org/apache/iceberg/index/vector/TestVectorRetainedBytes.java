@@ -57,12 +57,11 @@ class TestVectorRetainedBytes {
    * The figures one production index recorded, taken from its manifest: 100M rows of 128 dimensions
    * in 256 files of 390,625 rows, 3-bit RaBitQ over 625 lists.
    *
-   * <p>A recomputation that does not land on the recorded number to the byte is a formula that
-   * describes something other than what the build measured, so this is the case that says the
-   * resolver can price a file without reading it.
+   * <p>The manifest recorded one rotation per list. Repricing uses the shared rotation retained by
+   * the current reader.
    */
   @Test
-  void reproducesTheFigureAProductionBuildRecorded() {
+  void repricesAProductionManifestUsingOneSharedRotation() {
     VectorIndexDefinition production =
         VectorIndexDefinition.builder()
             .fieldId(2)
@@ -75,7 +74,8 @@ class TestVectorRetainedBytes {
     RetainedBytes kernel = (RetainedBytes) new IvfKernel.QuantizedFactory().create(production);
 
     long payloadBytes = 28_767_710L;
-    long preparedBytes = 30_130_688L;
+    long legacyPreparedBytes = 30_130_688L;
+    long legacyExtraRotationBytes = (625 - 1) * (16L + Float.BYTES * 128);
     Map<String, Long> structure =
         Map.of(
             "code-bytes", 48L,
@@ -90,8 +90,7 @@ class TestVectorRetainedBytes {
             "quantizer-bytes", 690_000L);
 
     assertThat(kernel.retainedBytes(payloadBytes, structure))
-        .as("the counts a build records price the file it wrote")
-        .isEqualTo(preparedBytes);
+        .isEqualTo(legacyPreparedBytes - legacyExtraRotationBytes);
   }
 
   @Test

@@ -98,7 +98,7 @@ public final class IvfKernel implements VectorKernel, RetainedBytes {
     this.quantizer = quantizer;
   }
 
-  private boolean isQuantized() {
+  boolean isQuantized() {
     return quantizer != null;
   }
 
@@ -144,7 +144,6 @@ public final class IvfKernel implements VectorKernel, RetainedBytes {
     int listCount = options.nlistFor(count);
     float[][] centroids = listCount == 0 ? new float[0][] : train(vectors, listCount, threads);
     int[][] assignments = assign(vectors, centroids, threads);
-    long quantizerBytes = 0;
     ByteArrayOutputStream payload = new ByteArrayOutputStream();
     try (DataOutputStream out = new DataOutputStream(payload)) {
       VectorPayloads.writeHeader(out, NAME, payloadVersion());
@@ -169,7 +168,7 @@ public final class IvfKernel implements VectorKernel, RetainedBytes {
       for (int list = 0; list < centroids.length; list++) {
         int[] members = assignments[list];
         if (isQuantized()) {
-          quantizerBytes += writeQuantizedList(out, dataFiles, materialized, vectors, members);
+          writeQuantizedList(out, dataFiles, materialized, vectors, members);
         } else {
           out.writeInt(members.length);
           for (int member : members) {
@@ -187,6 +186,8 @@ public final class IvfKernel implements VectorKernel, RetainedBytes {
 
     byte[] encoded = payload.toByteArray();
     long dictionaryBytes = VectorMemoryEstimates.dictionaryBytes(dataFiles);
+    long quantizerBytes =
+        isQuantized() ? RaBitQQuantizer.estimatedListBytes(dimension, listCount) : 0L;
     return VectorMemoryEstimates.result(
         this,
         ByteBuffer.wrap(encoded),
@@ -259,7 +260,7 @@ public final class IvfKernel implements VectorKernel, RetainedBytes {
    * when the residuals it codes are small, and the residuals of a partition are smaller than those
    * of the file it came from.
    */
-  private long writeQuantizedList(
+  private void writeQuantizedList(
       DataOutputStream out,
       List<String> dataFiles,
       List<IndexEntry> entries,
@@ -292,8 +293,6 @@ public final class IvfKernel implements VectorKernel, RetainedBytes {
         out.writeFloat(factor);
       }
     }
-
-    return listQuantizer.estimatedBytes();
   }
 
   @Override
@@ -370,16 +369,13 @@ public final class IvfKernel implements VectorKernel, RetainedBytes {
     int dataFileCount = VectorMemoryEstimates.intCount(structure, "data-file-count");
     int dimension = VectorMemoryEstimates.intCount(structure, "dimension");
     long dictionaryBytes = VectorMemoryEstimates.count(structure, "data-file-string-bytes");
-    long quantizerBytes =
-        isQuantized() ? VectorMemoryEstimates.count(structure, "quantizer-bytes") : 0L;
-    if (listCount < 0
-        || dataFileCount < 0
-        || dimension < 0
-        || dictionaryBytes < 0
-        || quantizerBytes < 0) {
+    if (listCount < 0 || dataFileCount < 0 || dimension <= 0 || dictionaryBytes < 0) {
       return 0L;
     }
 
+    // Historical manifests include a quantizer byte total that charged the rotation per list.
+    long quantizerBytes =
+        isQuantized() ? RaBitQQuantizer.estimatedListBytes(dimension, listCount) : 0L;
     return preparedBytes(
         payloadBytes,
         listCount,
@@ -581,10 +577,8 @@ public final class IvfKernel implements VectorKernel, RetainedBytes {
   /**
    * The bytes a list costs beyond its own payload bytes.
    *
-   * <p>The centre is allocated per list, and a quantized list also builds a {@link RaBitQQuantizer}
-   * that clones that centre and carries its own copy of the signs. Those allocations are sized by
-   * the list count, which is a four-byte field: without a bound, a payload of a few gigabytes names
-   * enough lists to ask for tens of gigabytes of structures.
+   * <p>A quantized list also builds a {@link RaBitQQuantizer} that clones the centre. The
+   * allocation guard conservatively includes room for the shared rotation in each list.
    */
   long structureBytesPerList() {
     long centre = ARRAY_HEADER_BYTES + (long) Float.BYTES * dimension;

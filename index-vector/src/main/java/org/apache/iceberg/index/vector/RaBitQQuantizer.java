@@ -74,6 +74,8 @@ public final class RaBitQQuantizer implements java.io.Serializable {
   private static final long DEFAULT_SEED = 0x9E3779B97F4A7C15L;
 
   private static final int MAX_BITS = 8;
+  private static final long RETAINED_FIELDS =
+      3L * Integer.BYTES + Long.BYTES + 2L * PreparedStructureSize.REFERENCE_BYTES;
 
   /**
    * The signs in use, by seed and padded length.
@@ -448,16 +450,22 @@ public final class RaBitQQuantizer implements java.io.Serializable {
     return sum;
   }
 
-  /** Estimates the retained center, padded signs and quantizer fields without copying arrays. */
-  long estimatedBytes() {
-    return estimatedBytes(new PreparedStructureSize.Receipt());
+  /** Prices the per-list quantizers and the one rotation array shared by all lists of a file. */
+  static long estimatedListBytes(int dimension, int listCount) {
+    if (listCount == 0) {
+      return 0;
+    }
+
+    long perList =
+        PreparedStructureSize.object(RETAINED_FIELDS) + PreparedStructureSize.floats(dimension);
+    return Math.addExact(
+        Math.multiplyExact(listCount, perList),
+        PreparedStructureSize.floats(nextPowerOfTwo(dimension)));
   }
 
+  /** Counts each retained object or array once within the prepared file. */
   long estimatedBytes(PreparedStructureSize.Receipt receipt) {
-    return receipt.object(
-            this, 3L * Integer.BYTES + Long.BYTES + 2L * PreparedStructureSize.REFERENCE_BYTES)
-        + receipt.array(center)
-        + receipt.array(signs);
+    return receipt.object(this, RETAINED_FIELDS) + receipt.array(center) + receipt.array(signs);
   }
 
   private static int nextPowerOfTwo(int value) {

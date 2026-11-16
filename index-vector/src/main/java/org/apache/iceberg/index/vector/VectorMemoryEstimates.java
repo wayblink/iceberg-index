@@ -42,6 +42,9 @@ final class VectorMemoryEstimates {
 
     if (kernel instanceof HnswlibKernel) {
       profile += ";" + HnswStructureSize.profile();
+    } else if (kernel instanceof IvfKernel ivf && ivf.isQuantized()) {
+      // Layout comparisons ignore the processor suffix. An older record needs to be repriced.
+      profile = profile.replace(";processors=", ";rabitq-rotation=shared;processors=");
     }
 
     return IndexBuildResult.of(
