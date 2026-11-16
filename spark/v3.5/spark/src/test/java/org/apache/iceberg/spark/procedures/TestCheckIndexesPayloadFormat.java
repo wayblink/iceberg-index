@@ -47,13 +47,13 @@ class TestCheckIndexesPayloadFormat {
   }
 
   @Test
-  public void aPayloadOfALaterVersionIsNotReadable() {
+  public void aPayloadOfAnUnknownFormatIsNotReadable() {
     // the version is part of the name, so a blob type this build does not list is exactly what a
     // query would skip, and reporting it as readable would send an operator away with a broken
     // index
     assertThat(
             CheckIndexesProcedure.readablePayload(
-                textAdapter(), IndexFile.Kind.AUXILIARY, "iceberg-text-bm25-v2"))
+                textAdapter(), IndexFile.Kind.AUXILIARY, "iceberg-text-bm25-unknown"))
         .isFalse();
   }
 

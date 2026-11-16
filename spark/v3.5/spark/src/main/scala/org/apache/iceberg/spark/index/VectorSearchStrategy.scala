@@ -32,7 +32,7 @@ import org.apache.spark.sql.execution.metric.SQLMetric
 import org.apache.spark.sql.execution.metric.SQLMetrics
 
 /**
- * Plans a lowered vector source as a physical operator.
+ * Plans index searches as physical operators.
  *
  * <p>The strategy handles only its own node; ordering, projection and the limit above it stay
  * Spark's own operators. Building the operator does not search: the search runs when the operator
@@ -45,6 +45,7 @@ case class VectorSearchStrategy(spark: SparkSession) extends Strategy {
   // node and drop the operators above it, including the limit
   override def apply(plan: LogicalPlan): Seq[SparkPlan] = plan match {
     case source: VectorSearchSource => VectorSearchSourceExec(spark, source, source.output) :: Nil
+    case text: TextSearchSource => TextSearchExec(spark, text, text.output) :: Nil
     case hits: VectorSearchHitsRequest => VectorSearchHitsRequestExec(spark, hits) :: Nil
     case _ => Nil
   }

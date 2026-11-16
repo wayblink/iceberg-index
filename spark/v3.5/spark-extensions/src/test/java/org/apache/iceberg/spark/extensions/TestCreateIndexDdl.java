@@ -41,6 +41,7 @@ public class TestCreateIndexDdl extends ExtensionsTestBase {
   public void removeTables() {
     sql("DROP TABLE IF EXISTS %s", qualified("create_index_" + catalogName));
     sql("DROP TABLE IF EXISTS %s", qualified("create_index_text_" + catalogName));
+    sql("DROP TABLE IF EXISTS %s", qualified("create_index_text_range_" + catalogName));
     sql("DROP TABLE IF EXISTS %s", qualified("create_index_missing_" + catalogName));
     sql("DROP TABLE IF EXISTS %s", qualified("create_index_nested_" + catalogName));
   }
@@ -97,6 +98,25 @@ public class TestCreateIndexDdl extends ExtensionsTestBase {
     assertThat(listed.get(0)[1]).isEqualTo("body");
     assertThat(listed.get(0)[2]).isEqualTo("text");
     assertThat(listed.get(0)[8]).isNull();
+  }
+
+  @TestTemplate
+  void buildsRangeReadableTextIndexThroughDdl() {
+    String table = qualified("create_index_text_range_" + catalogName);
+    sql("CREATE TABLE %s (id bigint, body string) USING iceberg", table);
+    sql("INSERT INTO %s VALUES (1, 'error 1064'), (2, 'error error 1215'), (3, 'warning')", table);
+    sql("ALTER TABLE %s CREATE INDEX USING fts (body)", table);
+    sql("CALL %s.system.cleanup_index_files(table => '%s')", catalogName, table);
+
+    assertThat(
+            scalarSql(
+                "SELECT id FROM search(table => '%s', query => 'error', "
+                    + "search_columns => array('body'), limit => 1)",
+                table))
+        .isEqualTo(2L);
+    assertThat(
+            scalarSql("SELECT id FROM %s ORDER BY text_score(body, 'error') DESC LIMIT 1", table))
+        .isEqualTo(2L);
   }
 
   @TestTemplate

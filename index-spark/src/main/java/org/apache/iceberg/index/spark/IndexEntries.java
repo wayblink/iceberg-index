@@ -28,12 +28,16 @@ import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.function.Predicate;
 import org.apache.iceberg.DeleteFile;
 import org.apache.iceberg.FileContent;
 import org.apache.iceberg.FileFormat;
 import org.apache.iceberg.FileScanTask;
 import org.apache.iceberg.Schema;
 import org.apache.iceberg.Table;
+import org.apache.iceberg.TableProperties;
+import org.apache.iceberg.TableScan;
+import org.apache.iceberg.data.IdentityPartitionConverters;
 import org.apache.iceberg.data.Record;
 import org.apache.iceberg.formats.FormatModelRegistry;
 import org.apache.iceberg.formats.ReadBuilder;
@@ -41,9 +45,11 @@ import org.apache.iceberg.hadoop.HadoopInputFile;
 import org.apache.iceberg.hadoop.SerializableConfiguration;
 import org.apache.iceberg.index.IndexAdapter;
 import org.apache.iceberg.io.CloseableIterable;
+import org.apache.iceberg.io.CloseableIterator;
 import org.apache.iceberg.io.DeleteSchemaUtil;
 import org.apache.iceberg.io.FileIO;
 import org.apache.iceberg.io.InputFile;
+import org.apache.iceberg.mapping.NameMappingParser;
 import org.apache.iceberg.relocated.com.google.common.base.Preconditions;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableList;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableMap;
@@ -52,6 +58,7 @@ import org.apache.iceberg.relocated.com.google.common.collect.Maps;
 import org.apache.iceberg.relocated.com.google.common.collect.Sets;
 import org.apache.iceberg.types.Type;
 import org.apache.iceberg.types.Types;
+import org.apache.iceberg.util.PartitionUtil;
 import org.apache.spark.api.java.JavaPairRDD;
 import org.apache.spark.api.java.JavaRDD;
 import org.apache.spark.api.java.JavaSparkContext;
@@ -925,6 +932,58 @@ public final class IndexEntries {
     return java.util.Arrays.copyOf(admitted, count);
   }
 
+  /**
+   * Reads the positions admitted by a text predicate. Visibility comes from the postings of the
+   * exact index snapshot, so only the columns that the predicate needs are read here.
+   */
+  static long[] textFilterPositions(
+      FileIO io,
+      FileScanTask task,
+      Schema projection,
+      Predicate<Row> predicate,
+      Map<String, String> properties) {
+    InputFile input = io.newInputFile(task.file());
+    ReadBuilder<Record, ?> reader =
+        FormatModelRegistry.readBuilder(task.file().format(), Record.class, input)
+            .project(projection)
+            .setAll(properties)
+            .idToConstant(
+                PartitionUtil.constantsMap(task, IdentityPartitionConverters::convertConstant));
+    String mapping = properties.get(TableProperties.DEFAULT_NAME_MAPPING);
+    if (mapping != null) {
+      reader.withNameMapping(NameMappingParser.fromJson(mapping));
+    }
+
+    List<Types.NestedField> fields = projection.columns();
+    long[] admitted = new long[64];
+    int count = 0;
+    long position = 0;
+    try (CloseableIterable<Record> records = reader.build();
+        CloseableIterator<Record> iterator = records.iterator()) {
+      while (iterator.hasNext()) {
+        Record record = iterator.next();
+        Object[] values = new Object[fields.size()];
+        for (int i = 0; i < fields.size(); i++) {
+          Types.NestedField field = fields.get(i);
+          values[i] = toSparkValue(field.type(), record.get(i));
+        }
+
+        if (predicate.test(RowFactory.create(values))) {
+          if (count == admitted.length) {
+            admitted = Arrays.copyOf(admitted, Math.multiplyExact(admitted.length, 2));
+          }
+          admitted[count++] = position;
+        }
+
+        position++;
+      }
+    } catch (IOException e) {
+      throw new UncheckedIOException("Failed to filter " + input.location(), e);
+    }
+
+    return Arrays.copyOf(admitted, count);
+  }
+
   /** Whether a row survives the equality deletes of the snapshot. */
   private static boolean survivesEqualityDeletes(Row row, List<EqualityKeySet> keySets) {
     // a snapshot can hold equality deletes keyed on different columns, and each removes its own
@@ -1032,15 +1091,16 @@ public final class IndexEntries {
 
   /** The Spark schema of an Iceberg projection, for the rows the format model returns. */
   private static StructType toSparkSchema(Schema schema) {
-    StructField[] fields = new StructField[schema.columns().size()];
+    return toSparkSchema(schema.asStruct());
+  }
+
+  private static StructType toSparkSchema(Types.StructType struct) {
+    StructField[] fields = new StructField[struct.fields().size()];
     for (int i = 0; i < fields.length; i++) {
-      Types.NestedField field = schema.columns().get(i);
+      Types.NestedField field = struct.fields().get(i);
       fields[i] =
           new StructField(
-              field.name(),
-              toSparkType(field.type()),
-              field.isOptional(),
-              org.apache.spark.sql.types.Metadata.empty());
+              field.name(), toSparkType(field.type()), field.isOptional(), Metadata.empty());
     }
     return new StructType(fields);
   }
@@ -1077,8 +1137,15 @@ public final class IndexEntries {
       case DECIMAL:
         Types.DecimalType decimal = (Types.DecimalType) type;
         return DataTypes.createDecimalType(decimal.precision(), decimal.scale());
+      case STRUCT:
+        return toSparkSchema(type.asStructType());
       case LIST:
-        return DataTypes.createArrayType(toSparkType(type.asListType().elementType()));
+        Types.ListType list = type.asListType();
+        return DataTypes.createArrayType(toSparkType(list.elementType()), list.isElementOptional());
+      case MAP:
+        Types.MapType map = type.asMapType();
+        return DataTypes.createMapType(
+            toSparkType(map.keyType()), toSparkType(map.valueType()), map.isValueOptional());
       default:
         throw new UnsupportedOperationException(
             "Unsupported column type for the index layer: " + type);
@@ -1122,6 +1189,14 @@ public final class IndexEntries {
     }
 
     switch (type.typeId()) {
+      case STRUCT:
+        Record record = (Record) value;
+        List<Types.NestedField> fields = type.asStructType().fields();
+        Object[] values = new Object[fields.size()];
+        for (int i = 0; i < values.length; i++) {
+          values[i] = toSparkValue(fields.get(i).type(), record.get(i));
+        }
+        return RowFactory.create(values);
       case LIST:
         {
           // Spark hands array columns to external rows as Scala sequences, which is what callers of
@@ -1133,6 +1208,18 @@ public final class IndexEntries {
           }
           return scala.collection.JavaConverters.asScalaBuffer(elements);
         }
+      case MAP:
+        Types.MapType mapType = type.asMapType();
+        Map<Object, Object> entries = Maps.newLinkedHashMap();
+        ((Map<?, ?>) value)
+            .forEach(
+                (key, item) ->
+                    entries.put(
+                        toSparkValue(mapType.keyType(), key),
+                        toSparkValue(mapType.valueType(), item)));
+        return scala.collection.JavaConverters.mapAsScalaMap(entries);
+      case STRING:
+        return value.toString();
       case DATE:
         return java.sql.Date.valueOf((java.time.LocalDate) value);
       case TIME:
@@ -1257,10 +1344,22 @@ public final class IndexEntries {
    * again.
    */
   public static List<FileScanTask> scanTasks(Table table, long snapshotId) {
+    return scanTasks(table, snapshotId, List.of());
+  }
+
+  /** Plans the snapshot's files and retains column statistics for the requested columns. */
+  public static List<FileScanTask> scanTasks(
+      Table table, long snapshotId, Collection<String> statsColumns) {
+    TableScan scan = table.newScan().useSnapshot(snapshotId);
+    if (!statsColumns.isEmpty()) {
+      scan = scan.includeColumnStats(statsColumns);
+    }
+
     List<FileScanTask> tasks = Lists.newArrayList();
-    try (CloseableIterable<FileScanTask> planned =
-        table.newScan().useSnapshot(snapshotId).planFiles()) {
-      tasks.addAll(Lists.newArrayList(planned));
+    try (CloseableIterable<FileScanTask> planned = scan.planFiles()) {
+      for (FileScanTask task : planned) {
+        tasks.add(task);
+      }
     } catch (IOException e) {
       throw new UncheckedIOException(
           "Failed to plan files for snapshot " + snapshotId + " of table " + table.name(), e);
@@ -1512,7 +1611,7 @@ public final class IndexEntries {
    * The file system settings a format that opens files itself needs, in the spelling the engine
    * already carried them in.
    */
-  private static Map<String, String> storageProperties(FileIO io) {
+  static Map<String, String> storageProperties(FileIO io) {
     try {
       return io.properties();
     } catch (UnsupportedOperationException e) {
@@ -1521,7 +1620,7 @@ public final class IndexEntries {
   }
 
   /** The same, for a path that only has the Hadoop configuration. */
-  private static Map<String, String> storageProperties(org.apache.hadoop.conf.Configuration conf) {
+  static Map<String, String> storageProperties(org.apache.hadoop.conf.Configuration conf) {
     Map<String, String> properties = Maps.newHashMap();
     for (Map.Entry<String, String> entry : conf) {
       String key = entry.getKey();

@@ -380,8 +380,9 @@ case class RewriteTextSearch(spark: SparkSession) extends Rule[LogicalPlan] {
     val reader = new IndexReader(index, table)
     val statistics =
       try {
+        val payload = new TextIndexAdapter(definition).encodeQuery(query)
         reader
-          .searchStatistics(IndexQuery.of(snapshotId, java.nio.ByteBuffer.allocate(0), 0))
+          .searchStatistics(IndexQuery.of(snapshotId, payload, 0))
           .asInstanceOf[CorpusStatistics]
       } catch {
         case scala.util.control.NonFatal(e) =>

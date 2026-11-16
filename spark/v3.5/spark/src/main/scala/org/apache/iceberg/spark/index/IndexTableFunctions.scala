@@ -19,14 +19,15 @@
 package org.apache.iceberg.spark.index
 
 import java.util.Locale
+import org.apache.iceberg.SerializableTable
 import org.apache.iceberg.index.spark.IndexSearch
 import org.apache.iceberg.index.spark.VectorIndexes
-import org.apache.iceberg.index.spark.VectorIndexSearch
 import org.apache.iceberg.index.text.TextIndexTypes
 import org.apache.iceberg.index.vector.VectorIndexDefinition.Metric
 import org.apache.iceberg.index.vector.VectorIndexTypes
 import org.apache.iceberg.relocated.com.google.common.base.Preconditions
 import org.apache.iceberg.spark.Spark3Util
+import org.apache.iceberg.spark.source.SparkTable
 import org.apache.spark.sql.catalyst.analysis.IndexErrors
 import org.apache.spark.sql.catalyst.expressions.IsNotNull
 import org.apache.spark.sql.catalyst.plans.logical.Filter
@@ -36,7 +37,7 @@ import org.apache.spark.sql.catalyst.FunctionIdentifier
 import org.apache.spark.sql.catalyst.expressions.Alias
 import org.apache.spark.sql.catalyst.expressions.Ascending
 import org.apache.spark.sql.catalyst.expressions.Attribute
-import org.apache.spark.sql.catalyst.expressions.Descending
+import org.apache.spark.sql.catalyst.expressions.AttributeReference
 import org.apache.spark.sql.catalyst.expressions.Expression
 import org.apache.spark.sql.catalyst.expressions.ExpressionInfo
 import org.apache.spark.sql.catalyst.expressions.Literal
@@ -52,16 +53,14 @@ import org.apache.spark.sql.connector.catalog.TableCatalog
 import org.apache.spark.sql.execution.datasources.v2.DataSourceV2Relation
 import org.apache.spark.sql.types.DoubleType
 import org.apache.spark.sql.util.CaseInsensitiveStringMap
-import scala.collection.JavaConverters._
 
 /**
  * Registers the index table-valued functions: functions that take a table, a column and a query and
  * return the matched rows as a table, so they can be used in a FROM clause and composed with the
  * rest of a query.
  *
- * <p>Each function is a thin wrapper over the same search the corresponding CALL procedure runs, so
- * the two always agree. The rows are computed on the driver when the query is planned, which is why
- * the result is a local relation: index files are small and there is nothing to distribute.
+ * <p>Business row functions bind a table snapshot and use a physical search operator. Index hit
+ * functions expose the file, position and score of each hit.
  */
 object IndexTableFunctions {
 
@@ -134,14 +133,7 @@ object IndexTableFunctions {
    */
   private def analysisError(message: String): Nothing = throw IndexErrors.analysis(message)
 
-  /**
-   * The rows a text index ranks for a query, as the table's own columns plus the score.
-   *
-   * <p>Like the vector function, this is an ordinary projection over a sort over a limit, so the
-   * search is answered by the rewrite that binds the score to the index statistics. Naming one
-   * column is required: a text index belongs to one column, and asking for several would need a
-   * fusion rule that does not exist yet.
-   */
+  /** Returns rows of one table snapshot ranked by its text index. */
   private def textSearch(args: Seq[Expression]): LogicalPlan = {
     val spark = SparkSession.active
     TextIndexTypes.register()
@@ -150,7 +142,7 @@ object IndexTableFunctions {
       new TableFunctionArguments(TEXT_SEARCH, args, Seq("table", "query", "search_columns", "k"))
     arguments.requireOnly(
       required = Seq("table", "search_columns"),
-      optional = Seq("query", "query_string", "limit", "k", "num_results", "columns"))
+      optional = Seq("query", "query_string", "limit", "k", "num_results", "columns", "filter"))
 
     val tableName = arguments.string("table")
     val query = arguments
@@ -174,9 +166,14 @@ object IndexTableFunctions {
     val catalogAndIdent = Spark3Util.catalogAndIdentifier(spark, tableName)
     val catalog = catalogAndIdent.catalog()
     val ident = catalogAndIdent.identifier()
-    val table = catalog.asInstanceOf[TableCatalog].loadTable(ident)
+    val sparkTable = catalog.asInstanceOf[TableCatalog].loadTable(ident) match {
+      case table: SparkTable => table
+      case _ => analysisError(s"search needs an Iceberg table: $tableName")
+    }
+    val icebergTable = sparkTable.table()
+    icebergTable.refresh()
     val relation = DataSourceV2Relation.create(
-      table,
+      sparkTable,
       Some(catalog),
       Some(ident),
       CaseInsensitiveStringMap.empty())
@@ -188,20 +185,28 @@ object IndexTableFunctions {
           relation.output.map(_.name).mkString(", ")))
     }
 
-    val vector = columnOf(searched.head)
+    val column = columnOf(searched.head).name
     val selected = if (columns.isEmpty) relation.output else columns.map(columnOf)
     if (relation.output.exists(attribute => attribute.name.equalsIgnoreCase(SCORE_COLUMN))) {
       analysisError(s"$tableName already has a column named $SCORE_COLUMN")
     }
 
-    // the score is the whole search here: the rule finds the query and the searched column in the
-    // expression, binds its statistics from the index of that column, and the projection above then
-    // reads the score it produced
-    val score = TextScoreExpression(null, null, vector, Literal(query))
-    val ordered =
-      Sort(Seq(SortOrder(score, Descending, NullsFirst, Seq.empty)), global = true, relation)
-    val limited = GlobalLimit(Literal(k), ordered)
-    Project(selected :+ Alias(score, SCORE_COLUMN)(), limited)
+    val snapshotId = IndexRewriteSupport
+      .scanSnapshotId(sparkTable)
+      .getOrElse(
+        analysisError(s"Table $tableName has no snapshot; build a text index after writing data"))
+    val frozen = SerializableTable.copyOf(icebergTable)
+    val index = VectorIndexes.findIndex(frozen, column, "text")
+    if (index.snapshotForSourceTableSnapshot(snapshotId) == null) {
+      analysisError(s"Text index of $tableName.$column does not cover snapshot $snapshotId; " +
+        "run refresh_text_index")
+    }
+
+    val filter = arguments.stringOption("filter").map { sql =>
+      TextSearchFilter.bind(spark, frozen.schema(), relation.output, sql)
+    }
+    val score = AttributeReference(SCORE_COLUMN, DoubleType, nullable = false)()
+    TextSearchSource(frozen, index, snapshotId, query, k, filter, selected :+ score)
   }
 
   private def vectorSearch(args: Seq[Expression]): LogicalPlan = {

@@ -327,6 +327,10 @@ ALTER TABLE local.db.papers CREATE INDEX USING fts (body);
 
 写成 `CREATE INDEX body_fts USING fts (body)` 会报 "a text index cannot be named"。这条限制会牵连后续的按名寻址（5.5）。
 
+BM25 v1 默认将每个词的倒排独立压缩，查询按字节范围读取所需词项。构建和刷新都会为索引快照发布全局 DF、文档数和总 token 数，查询直接读取所需统计。此前实验格式写出的索引文件需要重新构建。
+
+仅重写 manifest 也会产生新的表快照。运行 `refresh_text_index` 后，新索引快照会复用相同的倒排分片和语料统计。
+
 停用词请用小写：分词后的 token 是小写的，停用词表不做归一化，大写写的停用词不会生效。
 
 **同列已有任何类型的索引时会被拒**（不只是文本索引）。
@@ -350,6 +354,20 @@ SELECT id, body, _score FROM search(
 
 -- 表函数：返回命中地址
 SELECT * FROM text_index_search('local.db.papers', 'body', 'table format', 10);
+```
+
+`search` 在执行阶段用全局 BM25 统计给各索引分片打分，只回表读取全局命中行。它返回最多 `limit` 条正分结果，要求索引完整覆盖查询快照。索引落后时先运行 `refresh_text_index`。
+
+要在某个业务范围内选 top‑k，把条件作为 `filter` 参数传入。参数是一个 SQL 字符串，内容可以是引用顶层标量列的确定性布尔表达式。只有确认安全的条件才用于文件裁剪，Spark 对候选行计算完整条件。过滤列可以不出现在 `columns` 中。过滤影响入选资格，BM25 的语料统计仍来自完整快照。外层 `WHERE` 则过滤已选出的结果。
+
+```sql
+SELECT id, _score FROM search(
+  table => 'local.db.papers',
+  query => 'table format',
+  search_columns => array('body'),
+  columns => array('id'),
+  filter => 'year >= 2020',
+  limit => 10);
 ```
 
 函数签名：`text_score(列, 查询)`、`match(列, 查询)`，都**恰好两个参数**，不支持第三个参数（AND/OR 之类的选项还没有）。多词查询是 **OR**：任一命中即算命中。
@@ -550,7 +568,7 @@ CALL local.system.offload_index(table => 'db.docs', index => '<uuid>');
 | `text_score needs a text index … none was found`（但索引存在） | 索引落后，或 `match` 与别的谓词并列，或零命中 | 先 `refresh_text_index`；把 `match` 单独用（5.4） |
 | 文本查询搜不到中文 | 分词不支持 | 见 5.1 |
 | 文本建索引失败后无法重试 | 注册未回滚且无删除入口 | 见 5.5，需手工清理 |
-| `cleanup_index_files` 报 `in_flight_builds > 0` | 有构建可能正在写 | 等构建结束后重跑 |
+| `cleanup_index_files` 返回 `in_flight_builds > 0` | 有构建或刷新正在写入或等待发布 | 等发布完成后重跑 |
 | `index_cache_status()` 返回 0 行 | 缓存没开 | 先开缓存 |
 | 过程与改写结果不同 | 过程不做候选放宽也不做精确重排 | 要精确用改写或 `FROM vector_search(...)` |
 

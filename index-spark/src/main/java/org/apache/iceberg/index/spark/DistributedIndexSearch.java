@@ -21,16 +21,25 @@ package org.apache.iceberg.index.spark;
 import java.io.Serializable;
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collections;
 import java.util.Comparator;
+import java.util.HashSet;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
+import java.util.function.Predicate;
 import org.apache.iceberg.FileScanTask;
 import org.apache.iceberg.Schema;
 import org.apache.iceberg.Table;
+import org.apache.iceberg.encryption.EncryptingFileIO;
+import org.apache.iceberg.expressions.Evaluator;
+import org.apache.iceberg.expressions.Expression;
+import org.apache.iceberg.expressions.InclusiveMetricsEvaluator;
+import org.apache.iceberg.expressions.Projections;
 import org.apache.iceberg.hadoop.SerializableConfiguration;
 import org.apache.iceberg.index.IndexAdapter;
 import org.apache.iceberg.index.IndexAdapter.PreparedSearch;
@@ -44,6 +53,10 @@ import org.apache.iceberg.index.IndexReader;
 import org.apache.iceberg.index.IndexSearchResult;
 import org.apache.iceberg.index.IndexTypes;
 import org.apache.iceberg.index.PuffinIndexFileContainer;
+import org.apache.iceberg.index.text.TextIndexAdapter;
+import org.apache.iceberg.index.text.TextIndexAdapter.CorpusCounts;
+import org.apache.iceberg.index.text.TextIndexAdapter.CorpusStatistics;
+import org.apache.iceberg.index.text.TextIndexDefinition;
 import org.apache.iceberg.io.FileIO;
 import org.apache.iceberg.io.IOUtil;
 import org.apache.iceberg.io.InputFile;
@@ -823,6 +836,22 @@ public final class DistributedIndexSearch {
     IndexCacheControl.recordAccess(spark, metadata.indexUuid());
     IndexAdapter adapter =
         IndexTypes.fromType(metadata.indexType()).createAdapter(metadata.definition());
+    if (adapter instanceof TextIndexAdapter text && candidates == null) {
+      int limit = query.topK();
+      if (limit == 0) {
+        return new SearchOutcome(ImmutableList.of(), false);
+      }
+
+      int window = limit == Integer.MAX_VALUE ? limit : limit + 1;
+      IndexQuery widened =
+          IndexQuery.of(query.sourceTableSnapshotId(), query.payload(), window)
+              .withConsistency(query.consistency());
+      List<IndexSearchResult> hits =
+          searchText(spark, metadata, table, text, List.of(widened), null, null).get(0);
+      boolean more = hits.size() > limit;
+      return new SearchOutcome(more ? ImmutableList.copyOf(hits.subList(0, limit)) : hits, more);
+    }
+
     if (adapter.searchesAllPayloadsTogether()) {
       // the payloads have to be merged before any of them can be scored, and such a search only
       // ever sees its own top-k, so it cannot report whether more hits exist
@@ -993,6 +1022,10 @@ public final class DistributedIndexSearch {
     IndexCacheControl.recordAccess(spark, metadata.indexUuid());
     IndexAdapter adapter =
         IndexTypes.fromType(metadata.indexType()).createAdapter(metadata.definition());
+    if (adapter instanceof TextIndexAdapter text) {
+      return searchText(spark, metadata, table, text, queries, null, null);
+    }
+
     if (adapter.searchesAllPayloadsTogether()) {
       // each query needs the merged payloads, and such a search has no per-file form to batch
       List<List<IndexSearchResult>> perQuery = Lists.newArrayListWithCapacity(queries.size());
@@ -1119,6 +1152,229 @@ public final class DistributedIndexSearch {
     // entry per (query, index file) instead of every hit
     Comparator<Tuple3<String, Long, Double>> order = hitOrder(adapter);
     int mergeLimit = localTopK;
+    Map<Integer, List<Tuple3<String, Long, Double>>> topByQuery =
+        aggregateHits(fileHits, order, mergeLimit);
+    mergeCacheReports(cacheReports, locationsTable, cacheKeys, cacheRef.getValue(), workingSet);
+
+    return orderedHits(topByQuery, queries.stream().mapToInt(IndexQuery::topK).toArray(), order);
+  }
+
+  /** Searches the full text corpus while ranking only rows admitted by the predicate. */
+  public static List<IndexSearchResult> searchFilteredText(
+      SparkSession spark,
+      IndexMetadata metadata,
+      Table table,
+      IndexQuery query,
+      List<FileScanTask> tasks,
+      Schema projection,
+      Expression pruning,
+      Predicate<Row> predicate) {
+    Preconditions.checkArgument(
+        query.consistency() == IndexQuery.Consistency.EXACT_SNAPSHOT,
+        "A filtered text search requires an exact source snapshot");
+    Preconditions.checkArgument(
+        predicate instanceof Serializable, "Text predicate is not serializable");
+    IndexCacheControl.recordAccess(spark, metadata.indexUuid());
+    TextIndexAdapter adapter = new TextIndexAdapter((TextIndexDefinition) metadata.definition());
+    Map<String, String> properties =
+        Maps.newHashMap(IndexEntries.storageProperties(spark.sessionState().newHadoopConf()));
+    properties.putAll(IndexEntries.storageProperties(table.io()));
+    properties.putAll(table.properties());
+    TextFilterRead filter =
+        new TextFilterRead(
+            EncryptingFileIO.combine(table.io(), table.encryption()),
+            projection,
+            predicate,
+            properties);
+    return searchText(
+            spark,
+            metadata,
+            table,
+            adapter,
+            List.of(query),
+            filter,
+            textTasks(table.schema(), tasks, pruning))
+        .get(0);
+  }
+
+  private static Map<String, FileScanTask> textTasks(
+      Schema schema, List<FileScanTask> tasks, Expression pruning) {
+    InclusiveMetricsEvaluator metrics = new InclusiveMetricsEvaluator(schema, pruning);
+    Map<Integer, Evaluator> partitions = Maps.newHashMap();
+    Map<String, FileScanTask> admitted = Maps.newHashMap();
+    for (FileScanTask task : tasks) {
+      Evaluator partition =
+          partitions.computeIfAbsent(
+              task.spec().specId(),
+              id ->
+                  new Evaluator(
+                      task.spec().partitionType(),
+                      Projections.inclusive(task.spec()).project(pruning)));
+      if (partition.eval(task.file().partition()) && metrics.eval(task.file())) {
+        admitted.put(task.file().location(), task);
+      }
+    }
+    return admitted;
+  }
+
+  private record TextFilterRead(
+      FileIO io, Schema projection, Predicate<Row> predicate, Map<String, String> properties)
+      implements Serializable {
+
+    IndexCandidates candidates(List<FileScanTask> tasks) {
+      Map<String, long[]> admitted = Maps.newHashMap();
+      for (FileScanTask task : tasks) {
+        long[] positions =
+            IndexEntries.textFilterPositions(io, task, projection, predicate, properties);
+        if (positions.length > 0) {
+          admitted.put(task.file().location(), positions);
+        }
+      }
+      return IndexCandidates.of(admitted);
+    }
+  }
+
+  private record TextShard(String location, List<FileScanTask> tasks) implements Serializable {}
+
+  private static List<List<IndexSearchResult>> searchText(
+      SparkSession spark,
+      IndexMetadata metadata,
+      Table table,
+      TextIndexAdapter adapter,
+      List<IndexQuery> queries,
+      TextFilterRead filter,
+      Map<String, FileScanTask> filteredTasks) {
+    int[] limits = queries.stream().mapToInt(IndexQuery::topK).toArray();
+
+    IndexQuery first = queries.get(0);
+    IndexReader reader = new IndexReader(metadata, table);
+    List<IndexFile> files = reader.indexFiles(first);
+    Set<String> terms = new HashSet<>();
+    List<byte[]> payloads = Lists.newArrayListWithCapacity(queries.size());
+    for (int i = 0; i < queries.size(); i++) {
+      IndexQuery query = queries.get(i);
+      Preconditions.checkArgument(
+          query.sourceTableSnapshotId() == first.sourceTableSnapshotId()
+              && query.consistency() == first.consistency(),
+          "BM25 batch queries must use the same source snapshot and consistency");
+      payloads.add(toBytes(query.payload()));
+      if (limits[i] > 0) {
+        terms.addAll(adapter.queryTerms(query.payload()));
+      }
+    }
+
+    Comparator<Tuple3<String, Long, Double>> order = hitOrder(adapter);
+    if (files.isEmpty() || terms.isEmpty()) {
+      return orderedHits(Map.of(), limits, order);
+    }
+
+    List<TextShard> searchShards = Lists.newArrayListWithCapacity(files.size());
+    for (IndexFile file : files) {
+      List<FileScanTask> shardTasks = Lists.newArrayList();
+      if (filteredTasks != null) {
+        for (String location : file.coveredDataFiles()) {
+          FileScanTask task = filteredTasks.get(location);
+          if (task != null) {
+            shardTasks.add(task);
+          }
+        }
+      }
+
+      if (filteredTasks == null || !shardTasks.isEmpty()) {
+        searchShards.add(new TextShard(file.location(), shardTasks));
+      }
+    }
+
+    if (searchShards.isEmpty()) {
+      return orderedHits(Map.of(), limits, order);
+    }
+
+    JavaSparkContext context = JavaSparkContext.fromSparkContext(spark.sparkContext());
+    Broadcast<FileIO> io = context.broadcast(table.io());
+    Broadcast<TextIndexAdapter> scorer = context.broadcast(adapter);
+    Broadcast<TextFilterRead> filterRef = filter != null ? context.broadcast(filter) : null;
+    try {
+      String publishedStatistics = reader.statisticsLocation(first);
+      CorpusStatistics corpus =
+          publishedStatistics == null
+              ? mergeTextStatistics(context, files, io, scorer, terms)
+              : adapter.snapshotStatistics(table.io().newInputFile(publishedStatistics), terms);
+      Broadcast<CorpusStatistics> statistics = context.broadcast(corpus);
+      Broadcast<List<byte[]>> encodedQueries = context.broadcast(payloads);
+      try {
+        JavaPairRDD<Integer, Tuple3<String, Long, Double>> hits =
+            context
+                .parallelize(searchShards, searchShards.size())
+                .flatMapToPair(
+                    file -> {
+                      IndexCandidates candidates =
+                          filterRef == null ? null : filterRef.value().candidates(file.tasks());
+                      if (candidates != null && candidates.isEmpty()) {
+                        return Collections.emptyIterator();
+                      }
+
+                      List<Tuple2<Integer, Tuple3<String, Long, Double>>> shardHits =
+                          Lists.newArrayList();
+                      List<List<IndexSearchResult>> results =
+                          scorer
+                              .value()
+                              .searchShardBatch(
+                                  io.value().newInputFile(file.location()),
+                                  encodedQueries.value(),
+                                  limits,
+                                  statistics.value(),
+                                  candidates);
+                      for (int queryId = 0; queryId < results.size(); queryId++) {
+                        for (IndexSearchResult hit : results.get(queryId)) {
+                          shardHits.add(
+                              new Tuple2<>(
+                                  queryId,
+                                  new Tuple3<>(hit.dataFile(), hit.rowPosition(), hit.score())));
+                        }
+                      }
+                      return shardHits.iterator();
+                    });
+
+        int widest = Arrays.stream(limits).max().orElseThrow();
+        return orderedHits(aggregateHits(hits, order, widest), limits, order);
+      } finally {
+        encodedQueries.destroy();
+        statistics.destroy();
+      }
+    } finally {
+      if (filterRef != null) {
+        filterRef.destroy();
+      }
+      scorer.destroy();
+      io.destroy();
+    }
+  }
+
+  private static CorpusStatistics mergeTextStatistics(
+      JavaSparkContext context,
+      List<IndexFile> files,
+      Broadcast<FileIO> io,
+      Broadcast<TextIndexAdapter> scorer,
+      Set<String> terms) {
+    List<String> locations = files.stream().map(IndexFile::location).toList();
+    Broadcast<Set<String>> queryTerms = context.broadcast(terms);
+    try {
+      return context
+          .parallelize(locations, locations.size())
+          .map(
+              file ->
+                  scorer.value().shardStatistics(io.value().newInputFile(file), queryTerms.value()))
+          .treeReduce(CorpusCounts::merge, 2)
+          .corpus();
+    } finally {
+      queryTerms.destroy();
+    }
+  }
+
+  private static Map<Integer, List<Tuple3<String, Long, Double>>> aggregateHits(
+      JavaPairRDD<Integer, Tuple3<String, Long, Double>> fileHits,
+      Comparator<Tuple3<String, Long, Double>> order,
+      int mergeLimit) {
     Function2<
             List<Tuple3<String, Long, Double>>,
             Tuple3<String, Long, Double>,
@@ -1137,16 +1393,20 @@ public final class DistributedIndexSearch {
               left.addAll(right);
               return bounded(left, order, mergeLimit);
             };
-    Map<Integer, List<Tuple3<String, Long, Double>>> topByQuery =
-        fileHits
-            .aggregateByKey(Lists.<Tuple3<String, Long, Double>>newArrayList(), mergeHit, mergeHits)
-            .collectAsMap();
-    mergeCacheReports(cacheReports, locationsTable, cacheKeys, cacheRef.getValue(), workingSet);
+    return fileHits
+        .aggregateByKey(Lists.<Tuple3<String, Long, Double>>newArrayList(), mergeHit, mergeHits)
+        .collectAsMap();
+  }
 
-    for (int queryId = 0; queryId < queries.size(); queryId++) {
+  private static List<List<IndexSearchResult>> orderedHits(
+      Map<Integer, List<Tuple3<String, Long, Double>>> topByQuery,
+      int[] limits,
+      Comparator<Tuple3<String, Long, Double>> order) {
+    List<List<IndexSearchResult>> perQuery = Lists.newArrayListWithCapacity(limits.length);
+    for (int queryId = 0; queryId < limits.length; queryId++) {
       List<Tuple3<String, Long, Double>> top =
           topByQuery.getOrDefault(queryId, Lists.newArrayList());
-      top = bounded(top, order, queries.get(queryId).topK());
+      top = bounded(top, order, limits[queryId]);
       List<IndexSearchResult> hits = Lists.newArrayListWithCapacity(top.size());
       for (Tuple3<String, Long, Double> hit : top) {
         hits.add(IndexSearchResult.of(hit._1(), hit._2(), hit._3()));
