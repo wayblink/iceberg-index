@@ -57,6 +57,8 @@ import org.apache.iceberg.relocated.com.google.common.collect.ImmutableMap;
  */
 public final class IndexSnapshot {
 
+  public static final String STATISTICS_LOCATION_PROPERTY = "snapshot-statistics-location";
+
   /** Publication status of an index snapshot. */
   public enum Status {
     /** Built and published; readers and planners may use it. */
@@ -133,6 +135,11 @@ public final class IndexSnapshot {
 
   public String indexManifestList() {
     return indexManifestList;
+  }
+
+  /** Location of the optional snapshot statistics file. */
+  public String statisticsLocation() {
+    return properties.get(STATISTICS_LOCATION_PROPERTY);
   }
 
   public Map<String, String> properties() {

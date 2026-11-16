@@ -18,7 +18,10 @@
  */
 package org.apache.iceberg.spark.procedures;
 
+import java.io.BufferedReader;
+import java.io.FileNotFoundException;
 import java.io.IOException;
+import java.io.InputStreamReader;
 import java.io.UncheckedIOException;
 import java.nio.charset.StandardCharsets;
 import java.util.List;
@@ -67,8 +70,7 @@ import org.apache.spark.unsafe.types.UTF8String;
  * referenced by any retained index snapshot are deleted. That covers files of expired index
  * snapshots as well as leftovers of failed builds, including index files written by executors of a
  * job that died before the driver could record them. The registry and metadata files are never
- * touched. Do not run this while a build or refresh is in flight: files of in-progress writes are
- * not yet referenced and would be deleted.
+ * touched. A recent attempt whose files are not published holds back the orphan sweep.
  *
  * <p>Attempt ledgers under {@code staging/} are cleaned up as well. A ledger whose attempt did not
  * complete names the files that attempt may have written, and they are deleted; a ledger that does
@@ -80,10 +82,12 @@ import org.apache.spark.unsafe.types.UTF8String;
  * }</pre>
  */
 class CleanupIndexFilesProcedure extends BaseProcedure {
+  private static final String STARTED_MARKER = "started";
   private static final String COMPLETE_MARKER = "complete";
   private static final String FILE_MARKER_PREFIX = "f";
   private static final String MANIFEST_MARKER_PREFIX = "m";
   private static final String MANIFEST_LIST_MARKER = "ml";
+  private static final String STATISTICS_MARKER = "statistics";
 
   /**
    * How long an unfinished attempt may go without leaving a trace before it is treated as dead.
@@ -155,20 +159,6 @@ class CleanupIndexFilesProcedure extends BaseProcedure {
 
   private InternalRow cleanupIndex(
       Table table, SidecarIndexCatalog catalog, IndexMetadata metadata) {
-    Set<Long> liveTableSnapshotIds = liveTableSnapshotIds(table);
-    List<IndexSnapshot> snapshots = metadata.snapshots();
-
-    // drop the prefix of index snapshots whose source table snapshot no longer exists; the first
-    // retained snapshot becomes a root so its parent lineage stays valid
-    int retainedFrom = 0;
-    while (retainedFrom < snapshots.size()
-        && !liveTableSnapshotIds.contains(snapshots.get(retainedFrom).sourceTableSnapshotId())) {
-      retainedFrom++;
-    }
-
-    List<IndexSnapshot> retained = snapshots.subList(retainedFrom, snapshots.size());
-    int expiredSnapshots = retainedFrom;
-
     long nowMillis = System.currentTimeMillis();
     // a build writes its files before the metadata that references them is published, so an orphan
     // sweep that runs in between deletes files the build is about to point at. An attempt without
@@ -181,11 +171,35 @@ class CleanupIndexFilesProcedure extends BaseProcedure {
           locationKey(new Path(file.getKey())), file.getValue().getModificationTime());
     }
 
-    int inFlight = inFlightAttempts(table, metadata, nowMillis, listedModifiedTimes);
+    IndexMetadata observed = catalog.loadIndex(table.location(), metadata.indexUuid());
+    Set<String> referenced = referencedFiles(table.io(), observed.snapshots());
+    int inFlight = inFlightAttempts(observed, nowMillis, listedModifiedTimes, referenced);
+    long expiredSnapshots = 0;
     Map<String, Long> orphans = Maps.newHashMap();
     if (inFlight == 0) {
-      Set<String> referenced = referencedFiles(table.io(), retained);
-      orphans = orphansOf(listed, referenced);
+      Set<Long> liveTableSnapshotIds = liveTableSnapshotIds(table);
+      List<IndexSnapshot> retained = liveSnapshots(observed, liveTableSnapshotIds);
+      if (retained.size() != observed.snapshots().size()) {
+        // Only expire the prefix assessed above. A new publication must have its own assessment.
+        catalog.updateIndex(
+            table.location(),
+            metadata.indexUuid(),
+            current -> current.equals(observed) ? withoutSnapshots(current, retained) : current);
+      }
+
+      // A writer may have published since the directory listing or while staging was read.
+      // Read the references again before treating any listed file as an orphan.
+      IndexMetadata published = catalog.loadIndex(table.location(), metadata.indexUuid());
+      expiredSnapshots =
+          observed.snapshots().stream()
+              .filter(
+                  snapshot ->
+                      published.snapshotForSourceTableSnapshot(snapshot.sourceTableSnapshotId())
+                          == null)
+              .count();
+      Set<String> currentReferences = referencedFiles(table.io(), published.snapshots());
+      orphans = orphansOf(listed, currentReferences);
+      referenced.addAll(currentReferences);
     }
 
     long deletedBytes = 0L;
@@ -194,24 +208,11 @@ class CleanupIndexFilesProcedure extends BaseProcedure {
     }
     deleteFiles(table, orphans.keySet());
 
-    // the staging sweep runs last: the orphan sweep above already deletes the files an abandoned
-    // attempt left under data/ and snapshots/, so this only has to drop the ledgers themselves
-    int abandonedAttempts = cleanupStaging(table, metadata, nowMillis, listedModifiedTimes);
-
-    if (expiredSnapshots > 0) {
-      // the rule is re-applied to the metadata as it stands when the publication lands: a refresh
-      // that published while this sweep was running has a snapshot that may still be live, and
-      // dropping it because the copy read at the start did not name it would delete an index the
-      // table is using
-      catalog.updateIndex(
-          table.location(),
-          metadata.indexUuid(),
-          current -> withoutSnapshots(current, liveSnapshots(current, liveTableSnapshotIds)));
-    }
+    int abandonedAttempts = cleanupStaging(observed, nowMillis, listedModifiedTimes, referenced);
 
     return newInternalRow(
         UTF8String.fromString(metadata.indexUuid()),
-        (long) expiredSnapshots,
+        expiredSnapshots,
         (long) orphans.size(),
         deletedBytes,
         (long) abandonedAttempts,
@@ -244,15 +245,20 @@ class CleanupIndexFilesProcedure extends BaseProcedure {
       org.apache.iceberg.io.FileIO fileIO, List<IndexSnapshot> retained) {
     Set<String> referenced = Sets.newHashSet();
     for (IndexSnapshot snapshot : retained) {
-      referenced.add(snapshot.indexManifestList());
+      if (snapshot.statisticsLocation() != null) {
+        referenced.add(snapshot.statisticsLocation());
+      }
       try {
-        IndexManifestList manifestList =
-            IndexManifestList.read(fileIO.newInputFile(snapshot.indexManifestList()));
-        for (ManifestRef ref : manifestList.manifests()) {
-          referenced.add(ref.location());
-          for (IndexFile indexFile :
-              IndexManifest.read(fileIO.newInputFile(ref.location())).indexFiles()) {
-            referenced.add(indexFile.location());
+        if (referenced.add(snapshot.indexManifestList())) {
+          IndexManifestList manifestList =
+              IndexManifestList.read(fileIO.newInputFile(snapshot.indexManifestList()));
+          for (ManifestRef ref : manifestList.manifests()) {
+            if (referenced.add(ref.location())) {
+              for (IndexFile indexFile :
+                  IndexManifest.read(fileIO.newInputFile(ref.location())).indexFiles()) {
+                referenced.add(indexFile.location());
+              }
+            }
           }
         }
       } catch (IOException e) {
@@ -319,11 +325,7 @@ class CleanupIndexFilesProcedure extends BaseProcedure {
    */
   private static Map<String, Long> orphansOf(
       Map<String, LocatedFileStatus> listed, Set<String> referenced) {
-    Set<String> referencedPaths = Sets.newHashSet();
-    for (String location : referenced) {
-      referencedPaths.add(locationKey(new Path(location)));
-    }
-
+    Set<String> referencedPaths = normalizedPaths(referenced);
     Map<String, Long> orphans = Maps.newHashMap();
     for (Map.Entry<String, LocatedFileStatus> file : listed.entrySet()) {
       if (!referencedPaths.contains(locationKey(new Path(file.getKey())))) {
@@ -334,15 +336,27 @@ class CleanupIndexFilesProcedure extends BaseProcedure {
     return orphans;
   }
 
+  private static Set<String> normalizedPaths(Set<String> locations) {
+    Set<String> normalized = Sets.newHashSet();
+    for (String location : locations) {
+      normalized.add(locationKey(new Path(location)));
+    }
+    return normalized;
+  }
+
   /**
-   * Counts the attempt directories a build may still be writing into.
+   * Counts recent attempts that may still write or publish files.
    *
    * <p>This is the same judgement {@link #cleanupStaging} makes per directory: an attempt without
    * its completion marker is either running now or died, and only how recently it left a trace
    * separates the two.
    */
   private int inFlightAttempts(
-      Table table, IndexMetadata metadata, long nowMillis, Map<String, Long> listedModifiedTimes) {
+      IndexMetadata metadata,
+      long nowMillis,
+      Map<String, Long> listedModifiedTimes,
+      Set<String> referenced) {
+    Set<String> publishedPaths = normalizedPaths(referenced);
     try {
       Configuration conf = spark().sessionState().newHadoopConf();
       Path stagingDir = new Path(metadata.location(), SidecarIndexCatalog.STAGING_DIR);
@@ -364,7 +378,9 @@ class CleanupIndexFilesProcedure extends BaseProcedure {
             fileSystem,
             attempt,
             ledgerPaths(fileSystem, attemptDir),
+            fileSystem.exists(new Path(attemptDir, STARTED_MARKER)),
             fileSystem.exists(new Path(attemptDir, COMPLETE_MARKER)),
+            publishedPaths,
             listedModifiedTimes,
             nowMillis)) {
           inFlight += 1;
@@ -378,7 +394,7 @@ class CleanupIndexFilesProcedure extends BaseProcedure {
   }
 
   /**
-   * Whether a build may still be writing into an attempt directory.
+   * Whether a build may still write or publish files from this attempt.
    *
    * <p>An attempt that has not written its completion marker is either in flight or dead, and
    * nothing in the directory says which. The evidence of life is what is left alone: deleting the
@@ -389,11 +405,17 @@ class CleanupIndexFilesProcedure extends BaseProcedure {
       FileSystem fileSystem,
       LocatedFileStatus attempt,
       List<String> ledger,
+      boolean started,
       boolean complete,
+      Set<String> publishedPaths,
       Map<String, Long> listedModifiedTimes,
       long nowMillis)
       throws IOException {
-    if (ledger.isEmpty() || complete) {
+    if (ledger.isEmpty()
+        ? !started
+        : complete
+            && ledger.stream()
+                .allMatch(path -> publishedPaths.contains(locationKey(new Path(path))))) {
       return false;
     }
 
@@ -436,7 +458,11 @@ class CleanupIndexFilesProcedure extends BaseProcedure {
    * completion marker are dropped on their own. Returns the number of abandoned attempts.
    */
   private int cleanupStaging(
-      Table table, IndexMetadata metadata, long nowMillis, Map<String, Long> listedModifiedTimes) {
+      IndexMetadata metadata,
+      long nowMillis,
+      Map<String, Long> listedModifiedTimes,
+      Set<String> referenced) {
+    Set<String> publishedPaths = normalizedPaths(referenced);
     int abandoned = 0;
     try {
       Configuration conf = spark().sessionState().newHadoopConf();
@@ -455,8 +481,17 @@ class CleanupIndexFilesProcedure extends BaseProcedure {
         }
 
         List<String> ledger = ledgerPaths(fileSystem, attemptDir);
+        boolean started = fileSystem.exists(new Path(attemptDir, STARTED_MARKER));
         boolean complete = fileSystem.exists(new Path(attemptDir, COMPLETE_MARKER));
-        if (mayBeInFlight(fileSystem, attempt, ledger, complete, listedModifiedTimes, nowMillis)) {
+        if (mayBeInFlight(
+            fileSystem,
+            attempt,
+            ledger,
+            started,
+            complete,
+            publishedPaths,
+            listedModifiedTimes,
+            nowMillis)) {
           // a build may be writing this attempt right now, and the files its ledger names are not
           // garbage yet
           continue;
@@ -466,7 +501,10 @@ class CleanupIndexFilesProcedure extends BaseProcedure {
           // the attempt died before completing: the files its ledger names are garbage
           abandoned += 1;
           for (String path : ledger) {
-            fileSystem.delete(new Path(path), false);
+            Path candidate = new Path(path);
+            if (!publishedPaths.contains(locationKey(candidate))) {
+              fileSystem.delete(candidate, false);
+            }
           }
         }
         // a directory without markers is what a finished attempt leaves behind, since FileIO
@@ -490,6 +528,10 @@ class CleanupIndexFilesProcedure extends BaseProcedure {
     if (manifestList != null) {
       paths.add(manifestList);
     }
+    String statistics = readMarker(fileSystem, attemptDir, STATISTICS_MARKER);
+    if (statistics != null) {
+      paths.add(statistics);
+    }
     return paths;
   }
 
@@ -511,11 +553,14 @@ class CleanupIndexFilesProcedure extends BaseProcedure {
     if (!fileSystem.exists(markerPath)) {
       return null;
     }
-    try (java.io.BufferedReader reader =
-        new java.io.BufferedReader(
-            new java.io.InputStreamReader(fileSystem.open(markerPath), StandardCharsets.UTF_8))) {
+    try (BufferedReader reader =
+        new BufferedReader(
+            new InputStreamReader(fileSystem.open(markerPath), StandardCharsets.UTF_8))) {
       String line = reader.readLine();
       return line == null || line.isEmpty() ? null : line;
+    } catch (FileNotFoundException e) {
+      // Publication can release the ledger between the existence probe and open.
+      return null;
     }
   }
 
@@ -537,17 +582,23 @@ class CleanupIndexFilesProcedure extends BaseProcedure {
     IndexMetadata.Builder builder =
         IndexMetadata.builder()
             .indexUuid(metadata.indexUuid())
+            .name(metadata.name())
             .tableUuid(metadata.tableUuid())
             .tableLocation(metadata.tableLocation())
             .location(metadata.location())
             .indexType(metadata.indexType())
             .definition(metadata.definition())
             .properties(metadata.properties());
-    for (int i = 0; i < retained.size(); i++) {
-      IndexSnapshot snapshot = retained.get(i);
-      // the new oldest snapshot is a root: its parent was dropped
+    Set<Long> retainedIds = Sets.newHashSet();
+    for (IndexSnapshot snapshot : retained) {
+      retainedIds.add(snapshot.snapshotId());
+    }
+    for (IndexSnapshot snapshot : retained) {
+      Long parent = snapshot.parentIndexSnapshotId();
       builder.addSnapshot(
-          i == 0 ? snapshot.toBuilder().parentIndexSnapshotId(null).build() : snapshot);
+          parent != null && !retainedIds.contains(parent)
+              ? snapshot.toBuilder().parentIndexSnapshotId(null).build()
+              : snapshot);
     }
     return builder.build();
   }

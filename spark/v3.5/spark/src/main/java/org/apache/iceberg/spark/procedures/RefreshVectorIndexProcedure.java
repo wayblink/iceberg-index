@@ -19,6 +19,7 @@
 package org.apache.iceberg.spark.procedures;
 
 import org.apache.iceberg.index.IndexMetadata;
+import org.apache.iceberg.index.IndexSnapshot;
 import org.apache.iceberg.index.SidecarIndexCatalog;
 import org.apache.iceberg.index.spark.SparkIndexBuilder;
 import org.apache.iceberg.spark.procedures.SparkProcedures.ProcedureBuilder;
@@ -117,9 +118,11 @@ class RefreshVectorIndexProcedure extends BaseProcedure {
             return new InternalRow[] {row};
           }
 
-          VectorIndexProcedures.publishSnapshot(
-              catalog, table, metadata.indexUuid(), updated.latestSnapshot());
-          long[] counts = VectorIndexProcedures.counts(table.io(), updated.latestSnapshot());
+          IndexSnapshot published =
+              VectorIndexProcedures.publishSnapshot(
+                  catalog, table, metadata.indexUuid(), updated.latestSnapshot());
+          long[] counts =
+              published == null ? new long[2] : VectorIndexProcedures.counts(table.io(), published);
           InternalRow row =
               newInternalRow(
                   UTF8String.fromString(metadata.indexUuid()),

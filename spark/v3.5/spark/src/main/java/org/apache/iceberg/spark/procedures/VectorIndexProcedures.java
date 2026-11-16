@@ -21,12 +21,17 @@ package org.apache.iceberg.spark.procedures;
 import org.apache.iceberg.Table;
 import org.apache.iceberg.index.IndexMetadata;
 import org.apache.iceberg.index.IndexSnapshot;
+import org.apache.iceberg.index.IndexSnapshotWriter;
 import org.apache.iceberg.index.SidecarIndexCatalog;
 import org.apache.iceberg.index.spark.VectorIndexes;
+import org.apache.iceberg.util.SnapshotUtil;
 import org.apache.spark.sql.connector.iceberg.catalog.ProcedureParameter;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 /** Shared helpers for the vector index SQL procedures. */
 final class VectorIndexProcedures {
+  private static final Logger LOG = LoggerFactory.getLogger(VectorIndexProcedures.class);
 
   /**
    * The default entry budget that groups data files into index files. Large enough that a data file
@@ -59,23 +64,41 @@ final class VectorIndexProcedures {
    * refresh and a rebuild, or two refreshes) would otherwise each write a document containing only
    * their own snapshot, and the one that landed first would be lost without anyone noticing.
    *
-   * <p>The append is skipped when the metadata already names the snapshot, because a publication
-   * that lost a race is retried against the newer document.
+   * <p>If another publisher covered the same source snapshot, keep its result. Distinct refreshes
+   * can have the same provisional index snapshot ID, so the published ID is assigned from the
+   * current metadata while preserving the parent used to build the snapshot. An older refresh that
+   * finishes after its descendant is skipped so it cannot become the latest index.
    */
-  static void publishSnapshot(
+  static IndexSnapshot publishSnapshot(
       SidecarIndexCatalog catalog, Table table, String indexUuid, IndexSnapshot snapshot) {
-    catalog.updateIndex(
-        table.location(),
-        indexUuid,
-        current -> {
-          for (IndexSnapshot existing : current.snapshots()) {
-            if (existing.snapshotId() == snapshot.snapshotId()) {
-              return current;
-            }
-          }
+    long source = snapshot.sourceTableSnapshotId();
+    IndexMetadata result =
+        catalog.updateIndex(
+            table.location(),
+            indexUuid,
+            current -> {
+              if (current.snapshotForSourceTableSnapshot(source) != null) {
+                return current;
+              }
 
-          return current.withSnapshot(snapshot);
-        });
+              IndexSnapshot latest = current.latestSnapshot();
+              table.refresh();
+              if (latest != null
+                  && SnapshotUtil.isAncestorOf(table, latest.sourceTableSnapshotId(), source)) {
+                return current;
+              }
+
+              long nextId = latest == null ? 1L : Math.addExact(latest.snapshotId(), 1L);
+              return current.withSnapshot(snapshot.toBuilder().snapshotId(nextId).build());
+            });
+    try {
+      IndexSnapshotWriter.finishPublication(
+          table.io(), result.location(), snapshot.indexManifestList());
+    } catch (RuntimeException e) {
+      LOG.warn("Failed to release the build ledger for index {}", indexUuid, e);
+    }
+
+    return result.snapshotForSourceTableSnapshot(source);
   }
 
   /** Resolves the field ID of the vector column, failing if the column does not exist. */

@@ -114,6 +114,7 @@ public final class SparkIndexBuilder {
     List<IndexFile> indexFiles;
     String manifestList;
     try {
+      writer.startAttempt(indexLocation);
       indexFiles =
           buildIndexFiles(
               spark,
@@ -133,10 +134,6 @@ public final class SparkIndexBuilder {
       throw e;
     }
     writer.completeAttempt(indexLocation);
-    // the ledger has served its purpose once the files are in place: the failure modes that remain
-    // (the publish itself failing, or the process dying) leave at most unreferenced files, which
-    // the cleanup sweep removes
-    writer.finishAttempt(indexLocation);
 
     IndexSnapshot snapshot =
         IndexSnapshot.builder()
@@ -180,6 +177,10 @@ public final class SparkIndexBuilder {
           "Cannot refresh an index without an index snapshot; build it first");
     }
 
+    if (currentMetadata.snapshotForSourceTableSnapshot(sourceTableSnapshotId) != null) {
+      return currentMetadata;
+    }
+
     validateSourceLineage(table, currentMetadata, sourceTableSnapshotId);
 
     IndexAdapter adapter = adapterFor(currentMetadata);
@@ -201,7 +202,13 @@ public final class SparkIndexBuilder {
             sourceTableSnapshotId,
             Sets.intersection(currentFiles, previouslyCovered));
     if (removedFiles.isEmpty() && newFiles.isEmpty() && deleteChangedFiles.isEmpty()) {
-      return currentMetadata;
+      return currentMetadata.withSnapshot(
+          previous.toBuilder()
+              .snapshotId(snapshotId)
+              .sourceTableSnapshotId(sourceTableSnapshotId)
+              .parentIndexSnapshotId(previous.snapshotId())
+              .timestampMillis(timestampMillis)
+              .build());
     }
 
     // A data file whose contents changed is re-indexed here, together with every data file that
@@ -238,6 +245,7 @@ public final class SparkIndexBuilder {
     List<IndexFile> indexFiles;
     String manifestList;
     try {
+      writer.startAttempt(indexLocation);
       List<IndexFile> newIndexFiles =
           rebuildFiles.isEmpty()
               ? Lists.newArrayList()

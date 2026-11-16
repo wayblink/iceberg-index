@@ -62,10 +62,14 @@ public final class IndexSnapshotWriter {
   private static final String DATA_DIR = "data";
   private static final String SNAPSHOTS_DIR = "snapshots";
   private static final String STAGING_DIR = "staging";
+  private static final String STARTED_MARKER = "started";
   private static final String COMPLETE_MARKER = "complete";
   private static final String FILE_MARKER_PREFIX = "f";
   private static final String MANIFEST_MARKER_PREFIX = "m";
   private static final String MANIFEST_LIST_MARKER = "ml";
+  private static final String STATISTICS_MARKER = "statistics";
+  private static final String MANIFEST_LIST_PREFIX = "index-manifest-list-";
+  private static final String ATTEMPT_SEPARATOR = "-attempt-";
 
   private final FileIO fileIO;
   private final IndexFileContainer container;
@@ -108,10 +112,14 @@ public final class IndexSnapshotWriter {
     return attemptId;
   }
 
+  /** Records an attempt before workers start writing files. */
+  public void startAttempt(String indexLocation) {
+    writeMarker(indexLocation, STARTED_MARKER, "");
+  }
+
   /**
-   * Records that every file of this attempt is in place. Must be called before the snapshot is
-   * published, so that a crash afterwards leaves at most unreferenced files and never an attempt
-   * whose files a recovery sweep would have to guess at.
+   * Records that every file is in place. The ledger protects these files until publication or until
+   * cleanup finds that the attempt has stopped making progress.
    */
   public void completeAttempt(String indexLocation) {
     writeMarker(indexLocation, COMPLETE_MARKER, "");
@@ -123,6 +131,26 @@ public final class IndexSnapshotWriter {
    */
   public void finishAttempt(String indexLocation) {
     deleteLedger(indexLocation);
+  }
+
+  /** Removes the ledger associated with a manifest list after the catalog resolves publication. */
+  public static void finishPublication(FileIO io, String indexLocation, String manifestList) {
+    String prefix = indexLocation + "/" + SNAPSHOTS_DIR + "/" + MANIFEST_LIST_PREFIX;
+    int separator = manifestList.indexOf(ATTEMPT_SEPARATOR, prefix.length());
+    if (manifestList.startsWith(prefix) && separator >= 0) {
+      String attempt = manifestList.substring(separator + ATTEMPT_SEPARATOR.length());
+      if (!attempt.matches("[a-zA-Z0-9-]+")) {
+        return;
+      }
+
+      new IndexSnapshotWriter(
+              io,
+              new PuffinIndexFileContainer(),
+              DEFAULT_ENTRIES_PER_FILE,
+              DEFAULT_FILES_PER_MANIFEST,
+              attempt)
+          .finishAttempt(indexLocation);
+    }
   }
 
   /**
@@ -195,7 +223,14 @@ public final class IndexSnapshotWriter {
         declare(
             indexLocation,
             MANIFEST_LIST_MARKER,
-            SNAPSHOTS_DIR + "/index-manifest-list-" + snapshotId + "-" + newId());
+            SNAPSHOTS_DIR
+                + "/"
+                + MANIFEST_LIST_PREFIX
+                + snapshotId
+                + "-"
+                + newId()
+                + ATTEMPT_SEPARATOR
+                + attemptId);
     write(listLocation, out -> IndexManifestList.write(out, refs.build()));
     return listLocation;
   }
@@ -295,6 +330,11 @@ public final class IndexSnapshotWriter {
     declaredPaths.add(location);
   }
 
+  /** Records the location of the snapshot statistics before writing it. */
+  public void recordStatistics(String indexLocation, String location) {
+    record(indexLocation, STATISTICS_MARKER, location);
+  }
+
   private void writeMarker(String indexLocation, String marker, String path) {
     write(
         stagingPath(indexLocation, marker),
@@ -318,7 +358,9 @@ public final class IndexSnapshotWriter {
       deleteIfExists(stagingPath(indexLocation, MANIFEST_MARKER_PREFIX + seq));
     }
     deleteIfExists(stagingPath(indexLocation, MANIFEST_LIST_MARKER));
+    deleteIfExists(stagingPath(indexLocation, STATISTICS_MARKER));
     deleteIfExists(stagingPath(indexLocation, COMPLETE_MARKER));
+    deleteIfExists(stagingPath(indexLocation, STARTED_MARKER));
   }
 
   private boolean markerExists(String indexLocation, String marker) {

@@ -177,6 +177,52 @@ class TestVersionedIndexRegistry {
   }
 
   @Test
+  void snapshotPublicationRetriesAfterAnotherPublisherCommits() {
+    TestTables.TestTableOperations ops = operations();
+    SidecarIndexCatalog winner = versionedCatalog(ops);
+    winner.createIndex(request("index-a"));
+    FailFirstCommit racing =
+        new FailFirstCommit(
+            new TestTables.TestTableOperations(TABLE_NAME, tableDir),
+            () ->
+                winner.updateIndex(
+                    tableDir.toString(), "index-a", current -> current.withSnapshot(snapshot(1))));
+    SidecarIndexCatalog loser =
+        new SidecarIndexCatalog(new LocalFileIO(), new BaseTable(racing, TABLE_NAME));
+
+    loser.updateIndex(tableDir.toString(), "index-a", current -> current.withSnapshot(snapshot(2)));
+
+    assertThat(winner.loadIndex(tableDir.toString(), "index-a").snapshots())
+        .extracting(IndexSnapshot::snapshotId)
+        .containsExactly(1L, 2L);
+  }
+
+  @Test
+  void firstSnapshotPublicationMigratesLegacyMetadata() {
+    writeIndex("index-legacy", "table-uuid");
+    writeLegacyRegistry("index-legacy");
+    TestTables.TestTableOperations ops = operations();
+    SidecarIndexCatalog catalog = versionedCatalog(ops);
+
+    catalog.updateIndex(
+        tableDir.toString(), "index-legacy", current -> current.withSnapshot(snapshot(1)));
+
+    assertThat(registryPointer(ops)).isNotNull();
+    assertThat(catalog.loadIndex(tableDir.toString(), "index-legacy").snapshots())
+        .containsExactly(snapshot(1));
+    assertThat(new File(indexesRoot(), "index-legacy/metadata/index-metadata-v1.json")).exists();
+  }
+
+  private static IndexSnapshot snapshot(long id) {
+    return IndexSnapshot.builder()
+        .snapshotId(id)
+        .sourceTableSnapshotId(id)
+        .timestampMillis(id)
+        .indexManifestList("manifest-list-" + id)
+        .build();
+  }
+
+  @Test
   void refusesToStartFromEmptyWhenTheRegistryFileIsGone() {
     TestTables.TestTableOperations ops = operations();
     SidecarIndexCatalog catalog = versionedCatalog(ops);
@@ -215,7 +261,7 @@ class TestVersionedIndexRegistry {
 
     catalog.createIndex(request("index-a"));
     IndexMetadata dropped = catalog.createIndex(request("index-b"));
-    assertThat(new File(dropped.location(), "metadata/index-metadata-v1-g1.json")).exists();
+    assertThat(new File(dropped.location(), "metadata").listFiles()).hasSize(1);
 
     assertThat(catalog.dropIndex(tableDir.toString(), "index-b", true)).isTrue();
 
@@ -354,10 +400,16 @@ class TestVersionedIndexRegistry {
   /** Fails the first commit, standing in for a writer that lost the race. */
   private static final class FailFirstCommit implements TableOperations {
     private final TableOperations delegate;
+    private final Runnable onConflict;
     private boolean failed = false;
 
     FailFirstCommit(TableOperations delegate) {
+      this(delegate, () -> {});
+    }
+
+    FailFirstCommit(TableOperations delegate, Runnable onConflict) {
       this.delegate = delegate;
+      this.onConflict = onConflict;
     }
 
     @Override
@@ -374,6 +426,7 @@ class TestVersionedIndexRegistry {
     public void commit(TableMetadata base, TableMetadata updatedMetadata) {
       if (!failed) {
         this.failed = true;
+        onConflict.run();
         throw new CommitFailedException("Injected conflict");
       }
       delegate.commit(base, updatedMetadata);
