@@ -50,7 +50,7 @@ import org.slf4j.LoggerFactory;
  *
  * <pre>{@code
  * CALL spark_catalog.system.build_vector_index(
- *   table => 'db.documents', column => 'embedding', dimension => 768, metric => 'cosine');
+ *   table => 'db.documents', column => 'embedding', dimension => 768, metric => 'l2');
  * }</pre>
  */
 class BuildVectorIndexProcedure extends BaseProcedure {
@@ -149,7 +149,7 @@ class BuildVectorIndexProcedure extends BaseProcedure {
     String tableName = input.asString(TABLE_PARAM);
     String column = input.asString(COLUMN_PARAM);
     int dimension = input.asInt(DIMENSION_PARAM);
-    Metric metric = parseMetric(input.asString(METRIC_PARAM, Metric.COSINE.name()));
+    Metric metric = parseMetric(input.asString(METRIC_PARAM, Metric.DEFAULT.name()));
     VectorStructure structure = parseStructure(input, MODE_PARAM);
     VectorQuantizer quantizer = parseQuantizer(input, QUANTIZER_PARAM);
     Map<String, String> options = input.asStringMap(OPTIONS_PARAM, java.util.Map.of());
@@ -316,11 +316,7 @@ class BuildVectorIndexProcedure extends BaseProcedure {
   }
 
   private static Metric parseMetric(String metric) {
-    try {
-      return Metric.valueOf(metric.toUpperCase(java.util.Locale.ROOT));
-    } catch (IllegalArgumentException e) {
-      throw new IllegalArgumentException("Unknown metric: " + metric, e);
-    }
+    return Metric.fromName(metric);
   }
 
   /**

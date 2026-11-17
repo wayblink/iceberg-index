@@ -110,7 +110,7 @@ class TestIndexBuildNullValues {
             + "(3, null)");
     spark.sql(
         "CALL local.system.build_vector_index(table => 'db.null_lance', column => 'embedding', "
-            + "dimension => 2, metric => 'euclidean', structure => 'flat')");
+            + "dimension => 2, metric => 'l2', structure => 'flat')");
 
     assertThat(entries("null_lance")).as("the rows that have a vector").isEqualTo(2L);
 

@@ -125,7 +125,7 @@ public class TestIndexBuildMemory extends ExtensionsTestBase {
       List<Object[]> built =
           sql(
               "CALL %s.system.build_vector_index(table => '%s', column => 'embedding', "
-                  + "dimension => 2, metric => 'euclidean', structure => '%s', quantizer => '%s')",
+                  + "dimension => 2, metric => 'l2', structure => '%s', quantizer => '%s')",
               catalogName, name, structure, quantizer);
       assertThat(built).hasSize(1);
       indexUuid = built.get(0)[0].toString();

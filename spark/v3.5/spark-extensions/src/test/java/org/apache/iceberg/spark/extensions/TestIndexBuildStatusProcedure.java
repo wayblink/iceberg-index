@@ -206,7 +206,7 @@ public class TestIndexBuildStatusProcedure extends ExtensionsTestBase {
                 VectorIndexDefinition.builder()
                     .fieldId(table.schema().findField("embedding").fieldId())
                     .dimension(2)
-                    .metric(Metric.EUCLIDEAN)
+                    .metric(Metric.L2)
                     .structure(VectorStructure.FLAT)
                     .build())
             .build();
@@ -391,7 +391,7 @@ public class TestIndexBuildStatusProcedure extends ExtensionsTestBase {
         table, rows, rows);
     sql(
         "CALL %s.system.build_vector_index(table => '%s', column => 'embedding', dimension => 2, "
-            + "metric => 'euclidean')",
+            + "metric => 'l2')",
         catalogName, table);
   }
 

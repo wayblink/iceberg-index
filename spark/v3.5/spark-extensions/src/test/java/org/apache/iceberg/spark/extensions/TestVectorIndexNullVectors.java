@@ -201,7 +201,7 @@ class TestVectorIndexNullVectors {
     spark.sql(
         "CALL local.system.build_vector_index(table => 'db."
             + name
-            + "', column => 'embedding', dimension => 2, metric => 'euclidean', "
+            + "', column => 'embedding', dimension => 2, metric => 'l2', "
             + "structure => 'flat')");
     return name;
   }

@@ -38,7 +38,7 @@ public class TestIndexCacheStatus extends ExtensionsTestBase {
         tableName);
     sql(
         "CALL %s.system.build_vector_index("
-            + "table => '%s', column => 'embedding', dimension => 2, metric => 'euclidean')",
+            + "table => '%s', column => 'embedding', dimension => 2, metric => 'l2')",
         catalogName, tableName);
 
     spark.conf().set(CACHE_ENABLED, "true");

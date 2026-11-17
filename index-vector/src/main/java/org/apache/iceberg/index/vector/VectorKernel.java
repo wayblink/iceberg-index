@@ -58,10 +58,10 @@ import org.apache.iceberg.index.IndexSearchResult;
  *
  * <h2>What every kernel has to get right</h2>
  *
- * <p>A score obeys {@link VectorScoring#score}: a distance for {@code EUCLIDEAN} and a similarity
- * for the others, because that is what the index layer orders results by when it merges the hits of
- * several index files. A kernel whose graph traversal measures something else still has to report
- * the score this way, which usually means re-scoring its candidates against the stored vectors.
+ * <p>A score obeys {@link VectorScoring#score}: a distance for {@code L2} and a similarity for the
+ * others, because that is what the index layer orders results by when it merges the hits of several
+ * index files. A kernel whose graph traversal measures something else still has to report the score
+ * this way, which usually means re-scoring its candidates against the stored vectors.
  *
  * <p>A kernel that cannot re-score, because the payload carries no vectors to re-score against (a
  * quantizer exists to make sure it does not), reports an estimate of the same quantity instead.

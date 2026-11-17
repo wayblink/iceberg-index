@@ -102,11 +102,7 @@ public final class VectorIndexType implements IndexType {
   }
 
   private static VectorIndexDefinition.Metric parseMetric(String value) {
-    try {
-      return VectorIndexDefinition.Metric.valueOf(value.toUpperCase(Locale.ROOT));
-    } catch (IllegalArgumentException e) {
-      throw new IllegalArgumentException("Unsupported vector index metric: " + value, e);
-    }
+    return VectorIndexDefinition.Metric.fromName(value);
   }
 
   /**

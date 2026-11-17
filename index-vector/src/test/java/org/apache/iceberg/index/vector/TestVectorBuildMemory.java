@@ -330,7 +330,7 @@ class TestVectorBuildMemory {
         VectorIndexDefinition.builder()
             .fieldId(1)
             .dimension(dimension)
-            .metric(Metric.EUCLIDEAN)
+            .metric(Metric.L2)
             .structure(structure)
             .quantizer(quantizer)
             .properties(options)

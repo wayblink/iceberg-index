@@ -39,7 +39,7 @@ CALL prod.system.build_vector_index(
   table                    => 'db.docs',
   column                   => 'embedding',
   dimension                => 128,
-  metric                   => 'EUCLIDEAN',   -- EUCLIDEAN | COSINE | DOT_PRODUCT，默认 COSINE
+  metric                   => 'l2',          -- l2 | cosine | dot，默认 l2
   structure                => 'IVF',         -- IVF | HNSW | FLAT
   quantizer                => 'RABITQ',      -- RABITQ | NONE
   options                  => map('rabitq-bits', '1', 'nprobe', '32', 'nlist', '0'),
@@ -69,7 +69,7 @@ SHOW INDEXES FROM hms.db.docs;
 
 ALTER TABLE hms.db.docs
   CREATE INDEX docs_ivf_1bit USING vector (embedding)
-  WITH (dimension = 128, metric = 'euclidean', structure = 'IVF',
+  WITH (dimension = 128, metric = 'l2', structure = 'IVF',
         options = map('nprobe', '32', 'rabitq-bits', '1'));
 
 ALTER TABLE hms.db.docs CREATE INDEX USING fts (body);   -- 文本索引暂时没有名字
@@ -118,7 +118,7 @@ SET spark.iceberg.index.vector.over-sample = 100;
 
 **近似 kernel 要拿到与精确扫描一致的结果，必须放大 over-sample。** 集群验收实测：200k 行、16 维、IVF+RaBitQ 4bit、`nprobe=1024`、`nlist=256` 时，`over-sample` 为默认值 1 的 Top-10 与 L2 真值**不同**（召回不满）；把 `spark.iceberg.index.vector.over-sample` 设成 4000 后，Top-10 与 L2 真值逐行一致。也就是说"索引结果 = 精确结果"不是默认行为，而是候选预算足够的产物。
 
-**注意度量**：`vec_distance` 默认算余弦，只有在被改写命中时才特化成索引的 metric。所以"手写一个不走索引的对照查询"时，`vec_distance(...) + 0.0d` 这种写法其实是余弦排序——若索引是 EUCLIDEAN，两者排序不同，会出现"精确索引也差一行"的假象。做对照必须自己写 L2 表达式。
+**注意度量**：`vec_distance` 默认算 L2，只有在被改写命中时才特化成索引的 metric。所以"手写一个不走索引的对照查询"时，`vec_distance(...) + 0.0d` 这种写法其实是 L2 排序——若索引是 COSINE，两者排序不同，会出现"精确索引也差一行"的假象。做对照必须自己写与索引一致的 metric（如显式 `'cosine'`）。
 
 ### 2.1.1 索引 DDL（2026-10-30 起）
 
@@ -126,7 +126,7 @@ SET spark.iceberg.index.vector.over-sample = 100;
 SHOW INDEXES FROM hms.db.docs;
 
 ALTER TABLE hms.db.docs CREATE INDEX docs_ivf_1bit USING vector (embedding)
-  WITH (dimension = 128, metric = 'euclidean', structure = 'IVF',
+  WITH (dimension = 128, metric = 'l2', structure = 'IVF',
         options = map('nprobe', '32', 'rabitq-bits', '1'));
 ALTER TABLE hms.db.docs CREATE INDEX USING fts (body);   -- 文本索引暂时没有名字
 ALTER TABLE hms.db.docs REFRESH INDEX docs_ivf_1bit;      -- 补段 + 重建内容变过的组
@@ -257,7 +257,7 @@ docker push hub.i.basemind.com/spark/sparkann-e2e:<tag>
 |---|---|---|
 | `list_indexes` 抛 `Unsupported index manifest format version: 2` | 该索引的清单是旧构建器写的 v2（每文件内嵌 memory），镜像里的 `IndexManifest` 只认 v1（#2756） | 重建镜像；**不要手改清单文件、也不要靠重建索引**——重建只会再写一次 v2。当前构建器已回到 v1 + 尾部附加段，新写的清单旧读者也能读 |
 | 查询没走索引、计划里是扫描 | 列上无索引 / 索引快照对读快照没有覆盖 / 一列多索引但没设 `spark.iceberg.index.vector.name` / 形状不命中白名单（Join、聚合、窗口、OFFSET、多排序键、非纯属性投影） | 先看 `EXPLAIN EXTENDED` 里有没有 `VectorSearchSource`，再按 §2.2 的命中条件逐条查 |
-| 结果比全表扫描少几行 | 用了 `vec_distance` 的默认余弦做对照，而索引是 EUCLIDEAN | 用 L2 表达式做对照（§2.2 末尾） |
+| 结果比全表扫描少几行 | 用了 `vec_distance` 的默认 L2 做对照，而索引是 COSINE | 用与索引一致 metric 的表达式做对照（§2.2 末尾） |
 | 构建中断后索引"存在但查不到" | 早期版本会留下空注册 | 已修（失败构建会 `dropIndex(..., true)`），仍建议跑 `cleanup_index_files` |
 | 100M 级查询退化成扫描速度 | 索引装不进缓存（HNSW 典型） | 换 IVF + 量化；或提高缓存预算 |
 | executor 挂掉后结果不一致 | 不应该发生（缓存丢失只影响速度） | 按缺陷处理，附 `index_cache_status` 与两次结果 |
@@ -367,7 +367,7 @@ docker push hub.i.basemind.com/spark/sparkann-e2e:<tag>
 | 镜像内 runtime | 只有一个：`iceberg-spark-runtime-3.5_2.12-1.9.1-shb.1.jar`，sha256 `e7cc11d9c25c5e8fd9cca02814a06c72ce60d6bd31e9fca35c45d2955d581bca` |
 | 镜像内 Spark 库 | `parquet-column-1.13.1.jar`（sha256 `3ff4222b…`）、`avro-1.11.4.jar`（sha256 `eeba11b7…`），与 7.1 的"不动 Spark 外部 jar"一致 |
 
-**目标镜像上跑过的真实验收（`spark-sql -f`，本地 hadoop catalog，`local[2]`）**：建向量索引 → `list_indexes` 返回 1 行 → `EXPLAIN EXTENDED` 出现 `VectorSearchSource[metric=EUCLIDEAN, uncoveredFiles=0, indexSnapshot=1]` → `ORDER BY vec_distance(...) LIMIT 2` 返回 `1, 2` → `check_indexes` 返回 `needs_rebuild=false` → `index_cache_status` 可读；文本侧建 BM25 → `text_search` 返回 2 条带分数 → `check_indexes` 不再抛类型转换异常（即 §7.4 里那条 `#2796` 修复已在目标镜像中）。
+**目标镜像上跑过的真实验收（`spark-sql -f`，本地 hadoop catalog，`local[2]`）**：建向量索引 → `list_indexes` 返回 1 行 → `EXPLAIN EXTENDED` 出现 `VectorSearchSource[metric=EUCLIDEAN, uncoveredFiles=0, indexSnapshot=1]` → `ORDER BY vec_distance(...) LIMIT 2` 返回 `1, 2` → `check_indexes` 返回 `needs_rebuild=false` → `index_cache_status` 可读；文本侧建 BM25 → `text_search` 返回 2 条带分数 → `check_indexes` 不再抛类型转换异常（即 §7.4 里那条 `#2796` 修复已在目标镜像中）。注：该次验收时枚举名是 `EUCLIDEAN`，现在等价于 `l2`。
 
 **仍未做的**：集群六条验收（k8s + 生产 catalog）与 10M 基准回归 —— 上面是单机 `local[2]` 的制品验收，不能替代 #2769。
 
@@ -381,7 +381,7 @@ docker push hub.i.basemind.com/spark/sparkann-e2e:<tag>
 |---|---|---|
 | 1 `list_indexes` 返回全部行 | PASS | 1 行，含 `PUBLISHED`、`200000` 条、定义 JSON |
 | 2 建索引成功 + `index_build_status` 终态 | PASS | `SUCCEEDED`，起止时间与 200000 行 |
-| 3 计划里有索引算子 | PASS | `EXPLAIN` 出现 `VectorSearchSource[... metric=EUCLIDEAN, uncoveredFiles=0 ...]`，日志 `RewriteVectorSearch: rewrote a vector query into VectorSearchSource` |
+| 3 计划里有索引算子 | PASS | `EXPLAIN` 出现 `VectorSearchSource[... metric=L2, uncoveredFiles=0 ...]`（当时写作 `EUCLIDEAN`），日志 `RewriteVectorSearch: rewrote a vector query into VectorSearchSource` |
 | 4 与 **L2 全扫**逐行一致 | PASS | 索引 Top-10 与 L2 表达式 Top-10 完全相同 `[129507, 18804, 57749, 90562, 162320, 168452, 96694, 51617, 24936, 123375]` |
 | 5 杀掉 executor 后仍一致 | PASS | 第 1 次迭代后 `Lost executor 2 ... deleted by a user`，其后 5 次迭代 Top-10 与 L2 真值逐行相同 |
 | 6 `index_cache_status` 可读、不 OOM | PASS（附带说明） | 可读、无 OOM；返回 **0 行**，因为该路径 `driverMaterialization=true`，索引检索在 driver 侧完成，执行器没有缓存条目可报。这不是缺陷，但意味着"缓存状态"目前不能用来判断这个计划下的缓存占用 |
@@ -392,7 +392,7 @@ docker push hub.i.basemind.com/spark/sparkann-e2e:<tag>
 
 ### 7.5.3 10M 基准回归（2026-10-28）
 
-目的只有一个：换了基线之后，**召回与延迟有没有退化**。用同一套 harness（工具仓 `vector-benchmark`）在同一张 `sift10m_base`（Parquet，10M × 128 维）上重建索引再测，6 个查询 × 2 轮 = 每格 12 次测量，metric 传 `euclidean`（真值按 L2 排序）。
+目的只有一个：换了基线之后，**召回与延迟有没有退化**。用同一套 harness（工具仓 `vector-benchmark`）在同一张 `sift10m_base`（Parquet，10M × 128 维）上重建索引再测，6 个查询 × 2 轮 = 每格 12 次测量，metric 传 `l2`（真值按 L2 排序）。
 
 | arm | over | 中位延迟 | 召回 |
 |---|---|---|---|

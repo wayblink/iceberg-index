@@ -129,7 +129,7 @@ class TestIndexBuildShuffle {
                     VectorIndexDefinition.builder()
                         .fieldId(2)
                         .dimension(2)
-                        .metric(Metric.EUCLIDEAN)
+                        .metric(Metric.L2)
                         .build())
                 .build());
 

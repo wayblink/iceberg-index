@@ -35,7 +35,7 @@ class TestVectorCandidateBudget {
             VectorIndexDefinition.builder()
                 .fieldId(1)
                 .dimension(2)
-                .metric(VectorIndexDefinition.Metric.EUCLIDEAN)
+                .metric(VectorIndexDefinition.Metric.L2)
                 .structure(VectorIndexDefinition.VectorStructure.FLAT)
                 .build());
     VectorCandidateBudget budget = VectorCandidateBudget.derive(10, parameters.overSample(), 20L);

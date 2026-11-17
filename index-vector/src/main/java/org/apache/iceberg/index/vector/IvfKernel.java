@@ -1108,11 +1108,11 @@ public final class IvfKernel implements VectorKernel, RetainedBytes {
 
           double score =
               switch (scoring.metric()) {
-                case EUCLIDEAN ->
+                case L2 ->
                     Math.sqrt(
                         listQuantizer.estimatedDistanceSquared(
                             listPayload, codeBase, factors, rotatedQuery, queryLengthSquared));
-                case DOT_PRODUCT ->
+                case DOT ->
                     listQuantizer.estimatedInnerProduct(
                         listPayload, codeBase, factors, rotatedQuery, queryVector);
                 case COSINE -> {
@@ -1349,8 +1349,8 @@ public final class IvfKernel implements VectorKernel, RetainedBytes {
           .structure(VectorIndexDefinition.VectorStructure.IVF)
           .quantizer(VectorIndexDefinition.VectorQuantizer.RABITQ)
           .metric(VectorIndexDefinition.Metric.COSINE)
-          .metric(VectorIndexDefinition.Metric.DOT_PRODUCT)
-          .metric(VectorIndexDefinition.Metric.EUCLIDEAN)
+          .metric(VectorIndexDefinition.Metric.DOT)
+          .metric(VectorIndexDefinition.Metric.L2)
           .nativeLibrary(false)
           .incrementalAdd(false)
           .build();
@@ -1380,8 +1380,8 @@ public final class IvfKernel implements VectorKernel, RetainedBytes {
           .structure(VectorIndexDefinition.VectorStructure.IVF)
           .quantizer(VectorIndexDefinition.VectorQuantizer.NONE)
           .metric(VectorIndexDefinition.Metric.COSINE)
-          .metric(VectorIndexDefinition.Metric.DOT_PRODUCT)
-          .metric(VectorIndexDefinition.Metric.EUCLIDEAN)
+          .metric(VectorIndexDefinition.Metric.DOT)
+          .metric(VectorIndexDefinition.Metric.L2)
           .nativeLibrary(false)
           // the centroids are trained over the whole file, so growing a payload in place would mean
           // retraining them; a refresh rebuilds the index files of the data files that changed

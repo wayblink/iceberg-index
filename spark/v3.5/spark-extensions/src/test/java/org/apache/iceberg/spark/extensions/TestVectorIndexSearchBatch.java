@@ -63,7 +63,7 @@ public class TestVectorIndexSearchBatch extends ExtensionsTestBase {
         tableName);
     sql(
         "CALL %s.system.build_vector_index("
-            + "table => '%s', column => 'embedding', dimension => 2, metric => 'euclidean')",
+            + "table => '%s', column => 'embedding', dimension => 2, metric => 'l2')",
         catalogName, tableName);
 
     String search =
@@ -106,7 +106,7 @@ public class TestVectorIndexSearchBatch extends ExtensionsTestBase {
     sql("INSERT INTO %s VALUES (4, array(0.0d, -1.0d))", tableName);
     sql(
         "CALL %s.system.build_vector_index("
-            + "table => '%s', column => 'embedding', dimension => 2, metric => 'euclidean')",
+            + "table => '%s', column => 'embedding', dimension => 2, metric => 'l2')",
         catalogName, tableName);
 
     String search =
@@ -167,7 +167,7 @@ public class TestVectorIndexSearchBatch extends ExtensionsTestBase {
         tableName);
     sql(
         "CALL %s.system.build_vector_index("
-            + "table => '%s', column => 'embedding', dimension => 2, metric => 'euclidean')",
+            + "table => '%s', column => 'embedding', dimension => 2, metric => 'l2')",
         catalogName, tableName);
 
     String search =
@@ -214,7 +214,7 @@ public class TestVectorIndexSearchBatch extends ExtensionsTestBase {
         tableName);
     sql(
         "CALL %s.system.build_vector_index("
-            + "table => '%s', column => 'embedding', dimension => 2, metric => 'euclidean')",
+            + "table => '%s', column => 'embedding', dimension => 2, metric => 'l2')",
         catalogName, tableName);
 
     String search =
@@ -249,7 +249,7 @@ public class TestVectorIndexSearchBatch extends ExtensionsTestBase {
         tableName);
     sql(
         "CALL %s.system.build_vector_index("
-            + "table => '%s', column => 'embedding', dimension => 2, metric => 'euclidean')",
+            + "table => '%s', column => 'embedding', dimension => 2, metric => 'l2')",
         catalogName, tableName);
 
     // three queries: closest to (0,10), (10,0) and (5,5)
@@ -308,7 +308,7 @@ public class TestVectorIndexSearchBatch extends ExtensionsTestBase {
     sql("INSERT INTO %s SELECT id, array(CAST(id AS double), 0.0) FROM range(0, 5)", tableName);
     sql(
         "CALL %s.system.build_vector_index("
-            + "table => '%s', column => 'embedding', dimension => 2, metric => 'euclidean')",
+            + "table => '%s', column => 'embedding', dimension => 2, metric => 'l2')",
         catalogName, tableName);
 
     assertThatThrownBy(
@@ -350,7 +350,7 @@ public class TestVectorIndexSearchBatch extends ExtensionsTestBase {
         tableName);
     sql(
         "CALL %s.system.build_vector_index("
-            + "table => '%s', column => 'embedding', dimension => 2, metric => 'euclidean')",
+            + "table => '%s', column => 'embedding', dimension => 2, metric => 'l2')",
         catalogName, tableName);
 
     sql("CREATE TABLE %s (query_id bigint, q array<double>) USING iceberg", queriesName);

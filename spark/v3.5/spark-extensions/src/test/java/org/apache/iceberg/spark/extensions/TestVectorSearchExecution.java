@@ -197,7 +197,7 @@ class TestVectorSearchExecution {
     // the number the query ran with, and where it came from, are part of the plan
     // a flat index stores every vector, so the width cannot matter and the default is one
     assertThat(text).contains("overSample=0 [DEFAULT]");
-    assertThat(text).contains("metric=EUCLIDEAN");
+    assertThat(text).contains("metric=L2");
     // the request and the budget it was shrunk to are both visible
     assertThat(text).contains("requestedCandidates=");
     assertThat(text).contains("initialCandidates=");
@@ -397,7 +397,7 @@ class TestVectorSearchExecution {
 
   @Test
   void everyMetricAgreesWithAFullScan() {
-    for (String metric : List.of("euclidean", "cosine", "dot_product")) {
+    for (String metric : List.of("l2", "cosine", "dot")) {
       String table = tableWithIndex("exec_metric_" + metric, metric);
       String indexed =
           String.format(
@@ -667,7 +667,7 @@ class TestVectorSearchExecution {
   }
 
   private static String tableWithIndex(String name) {
-    return tableWithIndex(name, "euclidean");
+    return tableWithIndex(name, "l2");
   }
 
   private static String tableWithIndex(String name, String metric) {

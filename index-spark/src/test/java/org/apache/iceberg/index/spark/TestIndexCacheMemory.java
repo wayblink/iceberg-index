@@ -72,7 +72,7 @@ class TestIndexCacheMemory {
             VectorIndexDefinition.builder()
                 .fieldId(1)
                 .dimension(2)
-                .metric(Metric.EUCLIDEAN)
+                .metric(Metric.L2)
                 .structure(VectorStructure.FLAT)
                 .build());
     IndexAdapter.PreparedSearch prepared = adapter.prepare(adapter.encodeEntries(List.of()));
@@ -436,7 +436,7 @@ class TestIndexCacheMemory {
             VectorIndexDefinition.builder()
                 .fieldId(1)
                 .dimension(2)
-                .metric(Metric.EUCLIDEAN)
+                .metric(Metric.L2)
                 .structure(VectorStructure.FLAT)
                 .build());
     IndexAdapter.PreparedSearch prepared = adapter.prepare(adapter.encodeEntries(List.of()));
@@ -732,7 +732,7 @@ class TestIndexCacheMemory {
             VectorIndexDefinition.builder()
                 .fieldId(1)
                 .dimension(16)
-                .metric(Metric.EUCLIDEAN)
+                .metric(Metric.L2)
                 .structure(structure)
                 .quantizer(quantizer)
                 .properties(
@@ -825,7 +825,7 @@ class TestIndexCacheMemory {
             VectorIndexDefinition.builder()
                 .fieldId(1)
                 .dimension(dimension)
-                .metric(Metric.EUCLIDEAN)
+                .metric(Metric.L2)
                 .structure(VectorStructure.IVF)
                 .quantizer(VectorQuantizer.RABITQ)
                 .properties(Map.of("nlist", "4", "nprobe", "1"))
@@ -873,7 +873,7 @@ class TestIndexCacheMemory {
             VectorIndexDefinition.builder()
                 .fieldId(1)
                 .dimension(2)
-                .metric(Metric.EUCLIDEAN)
+                .metric(Metric.L2)
                 .structure(VectorStructure.FLAT)
                 .build());
     IndexFileMemory current = IndexCacheMemory.currentDescriptor(adapter);

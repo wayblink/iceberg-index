@@ -77,7 +77,7 @@ class TestVectorIndexCleanupOnUriLocation {
             + "SELECT id, array(CAST(id AS double), CAST(10 - id AS double)) FROM range(0, 10)");
     spark.sql(
         "CALL local.system.build_vector_index(table => 'db.uri_cleanup', column => 'embedding', "
-            + "dimension => 2, metric => 'euclidean', structure => 'IVF', quantizer => 'RABITQ')");
+            + "dimension => 2, metric => 'l2', structure => 'IVF', quantizer => 'RABITQ')");
 
     List<Row> before = nearest();
     assertThat(before).hasSize(3);

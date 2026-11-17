@@ -36,7 +36,7 @@ class TestVectorQueryParameters {
       VectorIndexDefinition.builder()
           .fieldId(1)
           .dimension(2)
-          .metric(VectorIndexDefinition.Metric.EUCLIDEAN)
+          .metric(VectorIndexDefinition.Metric.L2)
           .structure(VectorIndexDefinition.VectorStructure.FLAT)
           .build();
 
@@ -51,7 +51,7 @@ class TestVectorQueryParameters {
     return VectorIndexDefinition.builder()
         .fieldId(1)
         .dimension(2)
-        .metric(VectorIndexDefinition.Metric.EUCLIDEAN)
+        .metric(VectorIndexDefinition.Metric.L2)
         .structure(structure)
         .quantizer(quantizer)
         .properties(properties)

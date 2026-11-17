@@ -37,10 +37,8 @@ import org.junit.jupiter.api.Test;
  */
 class TestVectorTopK {
 
-  private static final VectorScoring EUCLIDEAN =
-      new VectorScoring(VectorIndexDefinition.Metric.EUCLIDEAN);
-  private static final VectorScoring DOT =
-      new VectorScoring(VectorIndexDefinition.Metric.DOT_PRODUCT);
+  private static final VectorScoring EUCLIDEAN = new VectorScoring(VectorIndexDefinition.Metric.L2);
+  private static final VectorScoring DOT = new VectorScoring(VectorIndexDefinition.Metric.DOT);
   private static final VectorScoring COSINE =
       new VectorScoring(VectorIndexDefinition.Metric.COSINE);
 

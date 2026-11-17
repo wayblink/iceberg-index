@@ -56,12 +56,12 @@ class TestIvfKernel {
 
   @Test
   public void answersExactlyWhenItVisitsEveryPartition() {
-    List<IndexEntry> entries = entries(VectorIndexDefinition.Metric.EUCLIDEAN);
+    List<IndexEntry> entries = entries(VectorIndexDefinition.Metric.L2);
 
-    VectorIndexAdapter ivf = adapterLegacy(VectorIndexDefinition.Metric.EUCLIDEAN, 0, ENTRIES);
+    VectorIndexAdapter ivf = adapterLegacy(VectorIndexDefinition.Metric.L2, 0, ENTRIES);
     ByteBuffer payload = ivf.encodeAuxiliaryPayload(entries, 1);
 
-    VectorIndexAdapter exact = flatAdapter(VectorIndexDefinition.Metric.EUCLIDEAN);
+    VectorIndexAdapter exact = flatAdapter(VectorIndexDefinition.Metric.L2);
     ByteBuffer exactPayload = exact.encodeEntries(entries);
 
     for (int query = 0; query < 20; query++) {
@@ -76,12 +76,13 @@ class TestIvfKernel {
 
   @Test
   public void visitsOnlyThePartitionsItWasTold() {
-    List<IndexEntry> entries = entries(VectorIndexDefinition.Metric.EUCLIDEAN);
+    List<IndexEntry> entries = entries(VectorIndexDefinition.Metric.L2);
 
-    VectorIndexAdapter patient = adapterLegacy(VectorIndexDefinition.Metric.EUCLIDEAN, 0, ENTRIES);
+    VectorIndexAdapter patient = adapterLegacy(VectorIndexDefinition.Metric.L2, 0, ENTRIES);
     ByteBuffer payload = patient.encodeAuxiliaryPayload(entries, 1);
     IndexAdapter.PreparedSearch prepared = patient.prepareAuxiliary(payload);
-    List<IndexSearchResult> all = prepared.search(patient.encodeQuery(vector(11), ENTRIES), ENTRIES);
+    List<IndexSearchResult> all =
+        prepared.search(patient.encodeQuery(vector(11), ENTRIES), ENTRIES);
     List<IndexSearchResult> one = prepared.search(patient.encodeQuery(vector(11), 1), ENTRIES);
     assertThat(all).hasSize(ENTRIES);
     assertThat(one).isNotEmpty().hasSizeLessThan(all.size());
@@ -91,8 +92,8 @@ class TestIvfKernel {
 
   @Test
   void usesTheQueryDefaultEvenWhenTheDefinitionContainsAnOldProbeCount() {
-    VectorIndexAdapter ivf = adapter(VectorIndexDefinition.Metric.EUCLIDEAN, 20, ENTRIES);
-    ByteBuffer payload = ivf.encodeAuxiliaryPayload(entries(VectorIndexDefinition.Metric.EUCLIDEAN), 1);
+    VectorIndexAdapter ivf = adapter(VectorIndexDefinition.Metric.L2, 20, ENTRIES);
+    ByteBuffer payload = ivf.encodeAuxiliaryPayload(entries(VectorIndexDefinition.Metric.L2), 1);
     assertThat(ivf.prepareAuxiliary(payload).search(ivf.encodeQuery(vector(11)), ENTRIES))
         .hasSizeLessThan(ENTRIES);
   }
@@ -115,8 +116,8 @@ class TestIvfKernel {
 
   @Test
   public void buildsTheSamePayloadTwice() {
-    List<IndexEntry> entries = entries(VectorIndexDefinition.Metric.EUCLIDEAN);
-    VectorIndexAdapter ivf = adapterLegacy(VectorIndexDefinition.Metric.EUCLIDEAN, 0, ENTRIES);
+    List<IndexEntry> entries = entries(VectorIndexDefinition.Metric.L2);
+    VectorIndexAdapter ivf = adapterLegacy(VectorIndexDefinition.Metric.L2, 0, ENTRIES);
 
     ByteBuffer first = ivf.encodeAuxiliaryPayload(entries, 1);
     ByteBuffer second = ivf.encodeAuxiliaryPayload(entries, 1);
@@ -128,7 +129,7 @@ class TestIvfKernel {
 
   @Test
   public void indexesASingleVector() {
-    VectorIndexAdapter ivf = adapterLegacy(VectorIndexDefinition.Metric.EUCLIDEAN, 0, 1);
+    VectorIndexAdapter ivf = adapterLegacy(VectorIndexDefinition.Metric.L2, 0, 1);
     List<IndexEntry> entries =
         Lists.newArrayList(IndexEntry.of("data-1.parquet", 0, ivf.encodeVector(vector(0))));
 
@@ -140,7 +141,7 @@ class TestIvfKernel {
 
   @Test
   public void indexesVectorsThatAreAllTheSame() {
-    VectorIndexAdapter ivf = adapterLegacy(VectorIndexDefinition.Metric.EUCLIDEAN, 0, 50);
+    VectorIndexAdapter ivf = adapterLegacy(VectorIndexDefinition.Metric.L2, 0, 50);
     float[] same = vector(1);
     List<IndexEntry> entries = Lists.newArrayList();
     for (int i = 0; i < 50; i++) {
@@ -177,7 +178,7 @@ class TestIvfKernel {
                     VectorIndexDefinition.builder()
                         .fieldId(1)
                         .dimension(DIMENSION)
-                        .metric(VectorIndexDefinition.Metric.EUCLIDEAN)
+                        .metric(VectorIndexDefinition.Metric.L2)
                         .structure(VectorIndexDefinition.VectorStructure.IVF)
                         // an option of the graph structure, not of this one
                         .property(HnswOptions.MAX_M, "16")
@@ -195,7 +196,7 @@ class TestIvfKernel {
                     VectorIndexDefinition.builder()
                         .fieldId(1)
                         .dimension(DIMENSION)
-                        .metric(VectorIndexDefinition.Metric.EUCLIDEAN)
+                        .metric(VectorIndexDefinition.Metric.L2)
                         .structure(VectorIndexDefinition.VectorStructure.IVF)
                         .property(IvfOptions.NLIST, "many")
                         .build()))
@@ -207,10 +208,9 @@ class TestIvfKernel {
   public void quantizesTheVectorsWhenAskedTo() {
     // the same partitioning with the vectors stored as codes: this is the form whose payload is
     // small enough to matter, and what it costs is accuracy of the scores
-    List<IndexEntry> entries = entries(VectorIndexDefinition.Metric.EUCLIDEAN);
-    VectorIndexAdapter quantized =
-        quantizedAdapter(VectorIndexDefinition.Metric.EUCLIDEAN, ENTRIES);
-    VectorIndexAdapter exact = flatAdapter(VectorIndexDefinition.Metric.EUCLIDEAN);
+    List<IndexEntry> entries = entries(VectorIndexDefinition.Metric.L2);
+    VectorIndexAdapter quantized = quantizedAdapter(VectorIndexDefinition.Metric.L2, ENTRIES);
+    VectorIndexAdapter exact = flatAdapter(VectorIndexDefinition.Metric.L2);
 
     ByteBuffer codes = quantized.encodeAuxiliaryPayload(entries, 1);
     ByteBuffer vectors = exact.encodeEntries(entries);
@@ -257,11 +257,10 @@ class TestIvfKernel {
     // handful of partitions visited.
     int total = 4000;
     int nlist = 20;
-    List<IndexEntry> entries = entries(VectorIndexDefinition.Metric.EUCLIDEAN, total);
+    List<IndexEntry> entries = entries(VectorIndexDefinition.Metric.L2, total);
 
-    VectorIndexAdapter quantized =
-        quantizedAdapter(VectorIndexDefinition.Metric.EUCLIDEAN, nlist, 2);
-    VectorIndexAdapter exact = flatAdapter(VectorIndexDefinition.Metric.EUCLIDEAN);
+    VectorIndexAdapter quantized = quantizedAdapter(VectorIndexDefinition.Metric.L2, nlist, 2);
+    VectorIndexAdapter exact = flatAdapter(VectorIndexDefinition.Metric.L2);
 
     ByteBuffer codes = quantized.encodeAuxiliaryPayload(entries, 1);
     ByteBuffer vectors = exact.encodeEntries(entries);
@@ -287,7 +286,7 @@ class TestIvfKernel {
 
     // the same partitioning with the vectors stored as they are: if this finds them, the partitions
     // a narrow search visits are the right ones and the codes are what loses the order
-    VectorIndexAdapter unquantized = adapter(VectorIndexDefinition.Metric.EUCLIDEAN, nlist, 2);
+    VectorIndexAdapter unquantized = adapter(VectorIndexDefinition.Metric.L2, nlist, 2);
     ByteBuffer stored = unquantized.encodeAuxiliaryPayload(entries, 1);
     int foundUnquantized = 0;
     for (int q = 0; q < probes; q++) {

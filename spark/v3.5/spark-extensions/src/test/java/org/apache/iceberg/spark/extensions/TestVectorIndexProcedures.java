@@ -50,6 +50,49 @@ public class TestVectorIndexProcedures extends ExtensionsTestBase {
   }
 
   @TestTemplate
+  public void testBuildsAnL2IndexWhenNoMetricIsNamed() {
+    String tableName = tableName("vectors_default_metric_" + catalogName);
+    sql("CREATE TABLE %s (id bigint, embedding array<double>) USING iceberg", tableName);
+    sql("INSERT INTO %s VALUES (1, array(1.0, 0.0)), (2, array(0.0, 1.0))", tableName);
+
+    sql(
+        "CALL %s.system.build_vector_index(table => '%s', column => 'embedding', dimension => 2)",
+        catalogName, tableName);
+
+    List<Object[]> listOutput =
+        sql("CALL %s.system.list_indexes(table => '%s')", catalogName, tableName);
+    assertThat(listOutput).hasSize(1);
+    assertThat(listOutput.get(0)[7].toString()).contains("\"metric\":\"L2\"");
+  }
+
+  @TestTemplate
+  public void testReadsTheMetricNamesWrittenBeforeTheRename() {
+    // an index built before the metric names changed is still an index the table can read, and one
+    // rebuilt with the old spelling is written with the name the queries now use
+    String tableName = tableName("vectors_legacy_metric_" + catalogName);
+    sql("CREATE TABLE %s (id bigint, embedding array<double>) USING iceberg", tableName);
+    sql("INSERT INTO %s VALUES (1, array(1.0, 0.0)), (2, array(0.0, 1.0))", tableName);
+
+    sql(
+        "CALL %s.system.build_vector_index(table => '%s', column => 'embedding', dimension => 2, "
+            + "metric => 'euclidean')",
+        catalogName, tableName);
+
+    List<Object[]> listOutput =
+        sql("CALL %s.system.list_indexes(table => '%s')", catalogName, tableName);
+    assertThat(listOutput).hasSize(1);
+    assertThat(listOutput.get(0)[7].toString()).contains("\"metric\":\"L2\"");
+
+    List<Object[]> searchOutput =
+        sql(
+            "CALL %s.system.vector_search(table => '%s', column => 'embedding', "
+                + "query => array(0.95d, 0.05d), k => 1)",
+            catalogName, tableName);
+    assertThat(searchOutput).hasSize(1);
+    assertThat(searchOutput.get(0)[3].toString()).contains("\"id\":1");
+  }
+
+  @TestTemplate
   public void testBuildListAndSearchVectorIndex() {
     String tableName = tableName("vectors_build_list_" + catalogName);
     sql(
@@ -62,7 +105,7 @@ public class TestVectorIndexProcedures extends ExtensionsTestBase {
 
     List<Object[]> buildOutput =
         sql(
-            "CALL %s.system.build_vector_index(table => '%s', column => 'embedding', dimension => 2, metric => 'cosine')",
+            "CALL %s.system.build_vector_index(table => '%s', column => 'embedding', dimension => 2, metric => 'l2')",
             catalogName, tableName);
     assertThat(buildOutput).hasSize(1);
     String indexUuid = buildOutput.get(0)[0].toString();
@@ -88,13 +131,14 @@ public class TestVectorIndexProcedures extends ExtensionsTestBase {
     assertThat(listOutput.get(0)[7].toString())
         .contains("\"structure\":\"FLAT\"")
         .contains("\"quantizer\":\"NONE\"");
-    assertThat(listOutput.get(0)[7].toString()).contains("\"metric\":\"COSINE\"");
+    assertThat(listOutput.get(0)[7].toString()).contains("\"metric\":\"L2\"");
     assertThat(listOutput.get(0)[7].toString()).contains("\"dimension\":2");
 
-    // a query close to (1.0, 0.0) must return id=1 first, with the resolved row attached
+    // a query close to (1.0, 0.0) must return id=1 first, with the resolved row attached. The query
+    // is exactly that row's vector, so the first two rows are not equidistant under L2.
     List<Object[]> searchOutput =
         sql(
-            "CALL %s.system.vector_search(table => '%s', column => 'embedding', query => array(0.95d, 0.05d), k => 2)",
+            "CALL %s.system.vector_search(table => '%s', column => 'embedding', query => array(1.0d, 0.0d), k => 2)",
             catalogName, tableName);
     assertThat(searchOutput).hasSize(2);
     assertThat(searchOutput.get(0)[0]).isInstanceOf(String.class);
@@ -110,7 +154,7 @@ public class TestVectorIndexProcedures extends ExtensionsTestBase {
     // vec_distance, carry the distances the procedure reported
     List<Object[]> byDistance =
         sql(
-            "SELECT vec_distance(embedding, array(0.95d, 0.05d)) AS distance FROM %s "
+            "SELECT vec_distance(embedding, array(1.0d, 0.0d)) AS distance FROM %s "
                 + "ORDER BY distance ASC LIMIT 2",
             tableName);
     assertThat(byDistance).hasSize(2);
@@ -213,7 +257,7 @@ public class TestVectorIndexProcedures extends ExtensionsTestBase {
     // and the same call, with parameters that can be built, still works
     sql(
         "CALL %s.system.build_vector_index(table => '%s', column => 'embedding', "
-            + "dimension => 2, metric => 'euclidean', structure => 'IVF')",
+            + "dimension => 2, metric => 'l2', structure => 'IVF')",
         catalogName, tableName);
     assertThat(sql("CALL %s.system.list_indexes(table => '%s')", catalogName, tableName))
         .hasSize(1);

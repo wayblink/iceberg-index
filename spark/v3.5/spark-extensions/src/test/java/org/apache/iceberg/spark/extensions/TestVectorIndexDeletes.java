@@ -66,7 +66,7 @@ public class TestVectorIndexDeletes extends ExtensionsTestBase {
 
     sql(
         "CALL %s.system.build_vector_index("
-            + "table => '%s', column => 'embedding', dimension => 2, metric => 'euclidean')",
+            + "table => '%s', column => 'embedding', dimension => 2, metric => 'l2')",
         catalogName, tableName);
 
     // only the 8 live rows are indexed
@@ -90,7 +90,7 @@ public class TestVectorIndexDeletes extends ExtensionsTestBase {
     sql("DELETE FROM %s WHERE id IN (3, 7)", tableName);
     sql(
         "CALL %s.system.build_vector_index("
-            + "table => '%s', column => 'embedding', dimension => 2, metric => 'euclidean')",
+            + "table => '%s', column => 'embedding', dimension => 2, metric => 'l2')",
         catalogName, tableName);
     assertThat(indexEntries(tableName)).isEqualTo(8L);
 
@@ -116,7 +116,7 @@ public class TestVectorIndexDeletes extends ExtensionsTestBase {
     sql("DELETE FROM %s WHERE id IN (3, 7)", tableName);
     sql(
         "CALL %s.system.build_vector_index("
-            + "table => '%s', column => 'embedding', dimension => 2, metric => 'euclidean')",
+            + "table => '%s', column => 'embedding', dimension => 2, metric => 'l2')",
         catalogName, tableName);
 
     // new data files and a new delete file at the same time
@@ -141,7 +141,7 @@ public class TestVectorIndexDeletes extends ExtensionsTestBase {
     sql("INSERT INTO %s SELECT id, array(CAST(id AS double), 0.0) FROM range(0, 10)", tableName);
     sql(
         "CALL %s.system.build_vector_index("
-            + "table => '%s', column => 'embedding', dimension => 2, metric => 'euclidean')",
+            + "table => '%s', column => 'embedding', dimension => 2, metric => 'l2')",
         catalogName, tableName);
 
     // a newer table snapshot, then the index refreshed onto it

@@ -267,7 +267,7 @@ class TestIvfFilteredSearch {
         VectorIndexDefinition.builder()
             .fieldId(1)
             .dimension(DIMENSION)
-            .metric(Metric.EUCLIDEAN)
+            .metric(Metric.L2)
             .structure(VectorStructure.IVF)
             .quantizer(quantizer)
             .properties(options)

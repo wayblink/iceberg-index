@@ -67,7 +67,7 @@ public class TestVectorIndexCleanup extends ExtensionsTestBase {
     sql("INSERT INTO %s SELECT id, array(CAST(id AS double), 0.0) FROM range(0, 10)", tableName);
     sql(
         "CALL %s.system.build_vector_index("
-            + "table => '%s', column => 'embedding', dimension => 2, metric => 'euclidean')",
+            + "table => '%s', column => 'embedding', dimension => 2, metric => 'l2')",
         catalogName, tableName);
 
     int filesBefore = indexFilesOnDisk(tableName);
@@ -98,7 +98,7 @@ public class TestVectorIndexCleanup extends ExtensionsTestBase {
     sql("INSERT INTO %s SELECT id, array(CAST(id AS double), 0.0) FROM range(0, 10)", tableName);
     sql(
         "CALL %s.system.build_vector_index("
-            + "table => '%s', column => 'embedding', dimension => 2, metric => 'euclidean')",
+            + "table => '%s', column => 'embedding', dimension => 2, metric => 'l2')",
         catalogName, tableName);
 
     // a second table snapshot with a refreshed index snapshot bound to it
@@ -155,7 +155,7 @@ public class TestVectorIndexCleanup extends ExtensionsTestBase {
     sql("INSERT INTO %s SELECT id, array(CAST(id AS double), 0.0) FROM range(0, 10)", tableName);
     sql(
         "CALL %s.system.build_vector_index("
-            + "table => '%s', column => 'embedding', dimension => 2, metric => 'euclidean')",
+            + "table => '%s', column => 'embedding', dimension => 2, metric => 'l2')",
         catalogName, tableName);
 
     Path indexDir = indexDirectory(tableName);
@@ -201,7 +201,7 @@ public class TestVectorIndexCleanup extends ExtensionsTestBase {
     sql("INSERT INTO %s SELECT id, array(CAST(id AS double), 0.0) FROM range(0, 10)", tableName);
     sql(
         "CALL %s.system.build_vector_index("
-            + "table => '%s', column => 'embedding', dimension => 2, metric => 'euclidean')",
+            + "table => '%s', column => 'embedding', dimension => 2, metric => 'l2')",
         catalogName, tableName);
 
     Path indexDir = indexDirectory(tableName);
@@ -239,7 +239,7 @@ public class TestVectorIndexCleanup extends ExtensionsTestBase {
     sql("INSERT INTO %s SELECT id, array(CAST(id AS double), 0.0) FROM range(0, 10)", tableName);
     sql(
         "CALL %s.system.build_vector_index("
-            + "table => '%s', column => 'embedding', dimension => 2, metric => 'euclidean')",
+            + "table => '%s', column => 'embedding', dimension => 2, metric => 'l2')",
         catalogName, tableName);
 
     Path indexDir = indexDirectory(tableName);
@@ -281,7 +281,7 @@ public class TestVectorIndexCleanup extends ExtensionsTestBase {
     sql("INSERT INTO %s SELECT id, array(CAST(id AS double), 0.0) FROM range(0, 10)", tableName);
     sql(
         "CALL %s.system.build_vector_index("
-            + "table => '%s', column => 'embedding', dimension => 2, metric => 'euclidean')",
+            + "table => '%s', column => 'embedding', dimension => 2, metric => 'l2')",
         catalogName, tableName);
 
     Path indexDir = indexDirectory(tableName);

@@ -49,7 +49,7 @@ INSERT INTO local.db.docs VALUES
   (3, 'parquet files',  array(0.0, 1.0));
 
 CALL local.system.build_vector_index(
-  table => 'db.docs', column => 'embedding', dimension => 2, metric => 'COSINE');
+  table => 'db.docs', column => 'embedding', dimension => 2, metric => 'l2');
 
 -- 推荐写法：普通 SQL，优化器会改写成索引查询
 SELECT id, title FROM local.db.docs
@@ -138,7 +138,7 @@ CALL local.system.build_vector_index(
   table => 'db.docs',
   column => 'embedding',
   dimension => 768,
-  metric => 'COSINE',           -- COSINE | DOT_PRODUCT | EUCLIDEAN，默认 COSINE
+  metric => 'l2',               -- l2 | cosine | dot，默认 l2
   structure => 'IVF',           -- FLAT | HNSW | IVF，默认 FLAT
   quantizer => 'RABITQ',        -- NONE | RABITQ，默认 NONE
   options => MAP('nlist', '64', 'rabitq-bits', '1'),
@@ -146,14 +146,14 @@ CALL local.system.build_vector_index(
   max_entries_per_index_file => 1000000);
 ```
 
-注意 `metric` 这里**只认枚举名**：`COSINE` / `DOT_PRODUCT` / `EUCLIDEAN`，写 `L2` 或 `cos` 会失败（与 `vec_distance` 的第三参数不同，见 4.3）。
+`metric` 接受 `l2`、`cosine`、`dot`，大小写不敏感。早期索引定义里写下的 `euclidean`、`dot_product` 仍能读出来（分别等价于 `l2`、`dot`），写入时统一用新名。
 
 DDL 写法，`WITH` 的键就是上面这些参数名：
 
 ```sql
 ALTER TABLE local.db.docs CREATE INDEX emb_ivf
   USING vector (embedding)
-  WITH (dimension = 768, metric = 'COSINE', structure = 'IVF',
+  WITH (dimension = 768, metric = 'l2', structure = 'IVF',
         options = MAP('nlist', '64'));
 ```
 
@@ -161,7 +161,7 @@ DDL 必须给名字；`CALL` 在列上还没有索引时可以不命名。**`dim
 
 | 参数 | 默认 | 说明 |
 |---|---|---|
-| `metric` | `COSINE` | 只认枚举名 |
+| `metric` | `l2` | `l2` / `cosine` / `dot` |
 | `structure` | `FLAT` | 见 4.1 |
 | `quantizer` | `NONE` | `RABITQ` 仅配合 `IVF` |
 | `options` | 空 | 结构/量化器选项；最后应用，会覆盖同名具名参数 |
@@ -209,7 +209,7 @@ SELECT id, title, _distance FROM vector_search(
   k => 3);
 ```
 
-`vector_search` 表函数的 `distance_type` 可以显式指定 `cosine` / `dot_product` / `euclidean`（也接受 `cos`、`l2` 等别名）；**不写它就跟随索引的 metric**（索引是 euclidean，返回的就是 euclidean 距离）；写了但与索引不一致时，改写会退让并做全表扫描，但**答案仍是你要的那个 metric 的精确值**。
+`vector_search` 表函数的 `distance_type` 可以显式指定 `l2` / `cosine` / `dot`（早期的 `euclidean`、`dot_product` 等写法仍接受）；**不写它就跟随索引的 metric**（索引是 `l2`，返回的就是 L2 距离）；写了但与索引不一致时，改写会退让并做全表扫描，但**答案仍是你要的那个 metric 的精确值**。
 
 #### 改写发生的条件（全部满足）
 
@@ -223,7 +223,7 @@ SELECT id, title, _distance FROM vector_search(
 
 标量过滤（`WHERE year = 2020`、`WHERE price < 100`）**不再导致退让**：它会被带进检索，在 task 内按 `filter-mode` 决定先于打分还是后于打分生效（4.6）。这也意味着**带过滤的查询结果是近似的**（与不带过滤时同为索引本身的近似程度），而不再是全表扫描的精确值；过滤后符合条件的行不足 k 时，返回找到的那些行而不是补齐。
 
-一个容易忽略的细节：改写后排序键会被绑定成**索引的 metric**。所以不带第三参数的 `ORDER BY vec_distance(col, q)` 是按索引的 metric 计算的，与"没有索引时全扫描默认 COSINE"可能不是同一个量。
+一个容易忽略的细节：改写后排序键会被绑定成**索引的 metric**。所以不带第三参数的 `ORDER BY vec_distance(col, q)` 是按索引的 metric 计算的，与"没有索引时全扫描默认 l2"可能不是同一个量。
 
 ### 4.4 候选宽度：默认值从哪里来，什么时候要自己调
 
@@ -601,7 +601,7 @@ BM25 和向量索引共用 executor 的容量预算、LRU 和状态入口。用�
 
 ### SQL 表达式与 DDL
 
-`vec_distance(vector, query [, metric])` 越小越近，metric 接受 `cosine|cos`、`dot|dot_product|inner_product|ip`、`euclidean|l2`。
+`vec_distance(vector, query [, metric])` 越小越近，metric 接受 `l2`、`cosine`、`dot`，默认 `l2`；早期写法 `euclidean`、`cos`、`dot_product`、`inner_product`、`ip` 仍被接受。
 `text_score(column, query)` 越大越相关。`match(column, query)` 布尔。
 
 | 语句 | 支持的类型 | 说明 |

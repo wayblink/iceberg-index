@@ -267,7 +267,7 @@ object IndexTableFunctions {
     }
 
     val distance = VectorDistanceExpression(
-      named.getOrElse(Metric.COSINE),
+      named.getOrElse(Metric.DEFAULT),
       vector,
       query,
       explicitMetric = named.isDefined)
@@ -389,14 +389,13 @@ object IndexTableFunctions {
             analysisError(s"$key of $name must be a constant")
           }
 
-          Some(value.eval().toString.toLowerCase(Locale.ROOT) match {
-            case "cosine" | "cos" => Metric.COSINE
-            case "dot" | "dot_product" | "inner_product" | "ip" => Metric.DOT_PRODUCT
-            case "euclidean" | "l2" => Metric.EUCLIDEAN
-            case other =>
-              analysisError(
-                s"Unknown distance_type $other: expected cosine, dot_product or euclidean")
-          })
+          val metricName = value.eval().toString
+          try {
+            Some(Metric.fromName(metricName))
+          } catch {
+            case _: IllegalArgumentException =>
+              analysisError(s"Unknown distance_type $metricName: expected l2, cosine or dot")
+          }
       }
     }
   }

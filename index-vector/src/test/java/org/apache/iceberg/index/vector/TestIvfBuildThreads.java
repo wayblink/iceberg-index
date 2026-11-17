@@ -50,7 +50,7 @@ class TestIvfBuildThreads {
   }
 
   @ParameterizedTest(name = "{0}")
-  @ValueSource(strings = {"EUCLIDEAN", "COSINE"})
+  @ValueSource(strings = {"L2", "COSINE"})
   void thePayloadDoesNotDependOnHowManyThreadsBuiltIt(String metric) {
     Map<String, String> quantizedOptions = Map.of("nlist", "8", "nprobe", "2", "rabitq-bits", "3");
     Map<String, String> plainOptions = Map.of("nlist", "8", "nprobe", "2");

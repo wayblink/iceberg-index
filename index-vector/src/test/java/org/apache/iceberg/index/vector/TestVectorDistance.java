@@ -35,12 +35,12 @@ class TestVectorDistance {
     assertThat(VectorDistance.distance(Metric.COSINE, vector, query)).isEqualTo(1.0);
 
     // dot product of orthogonal vectors is zero, so the distance is its negation
-    assertThat(VectorDistance.score(Metric.DOT_PRODUCT, vector, query)).isEqualTo(0.0);
-    assertThat(VectorDistance.distance(Metric.DOT_PRODUCT, vector, query)).isEqualTo(0.0);
+    assertThat(VectorDistance.score(Metric.DOT, vector, query)).isEqualTo(0.0);
+    assertThat(VectorDistance.distance(Metric.DOT, vector, query)).isEqualTo(0.0);
 
     // euclidean keeps the distance as it is
-    assertThat(VectorDistance.score(Metric.EUCLIDEAN, vector, query)).isEqualTo(Math.sqrt(2.0));
-    assertThat(VectorDistance.distance(Metric.EUCLIDEAN, vector, query)).isEqualTo(Math.sqrt(2.0));
+    assertThat(VectorDistance.score(Metric.L2, vector, query)).isEqualTo(Math.sqrt(2.0));
+    assertThat(VectorDistance.distance(Metric.L2, vector, query)).isEqualTo(Math.sqrt(2.0));
   }
 
   @Test
@@ -54,7 +54,7 @@ class TestVectorDistance {
           .isLessThan(VectorDistance.distance(metric, far, query));
       // and the index score agrees on which one is closer, in its own direction
       boolean closerByScore =
-          metric == Metric.EUCLIDEAN
+          metric == Metric.L2
               ? VectorDistance.score(metric, near, query) < VectorDistance.score(metric, far, query)
               : VectorDistance.score(metric, near, query)
                   > VectorDistance.score(metric, far, query);
@@ -70,9 +70,9 @@ class TestVectorDistance {
     // cosine and euclidean are zero for identical vectors; dot product is negated, so identical
     // vectors give the smallest (most negative) distance rather than zero
     assertThat(VectorDistance.distance(Metric.COSINE, vector, vector)).isEqualTo(0.0);
-    assertThat(VectorDistance.distance(Metric.EUCLIDEAN, vector, vector)).isEqualTo(0.0);
-    assertThat(VectorDistance.distance(Metric.DOT_PRODUCT, vector, vector))
-        .isLessThan(VectorDistance.distance(Metric.DOT_PRODUCT, vector, other));
+    assertThat(VectorDistance.distance(Metric.L2, vector, vector)).isEqualTo(0.0);
+    assertThat(VectorDistance.distance(Metric.DOT, vector, vector))
+        .isLessThan(VectorDistance.distance(Metric.DOT, vector, other));
 
     for (Metric metric : Metric.values()) {
       assertThat(VectorDistance.distance(metric, vector, vector))

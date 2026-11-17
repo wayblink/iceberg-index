@@ -355,9 +355,9 @@ public final class HnswlibKernel implements VectorKernel {
     switch (scoring.metric()) {
       case COSINE:
         return com.github.jelmerk.knn.DistanceFunctions.FLOAT_COSINE_DISTANCE;
-      case DOT_PRODUCT:
+      case DOT:
         return com.github.jelmerk.knn.DistanceFunctions.FLOAT_INNER_PRODUCT;
-      case EUCLIDEAN:
+      case L2:
         return com.github.jelmerk.knn.DistanceFunctions.FLOAT_EUCLIDEAN_DISTANCE;
       default:
         throw new IllegalStateException("Unknown vector index metric: " + scoring.metric());
@@ -403,8 +403,8 @@ public final class HnswlibKernel implements VectorKernel {
           .structure(VectorIndexDefinition.VectorStructure.HNSW)
           .quantizer(VectorIndexDefinition.VectorQuantizer.NONE)
           .metric(VectorIndexDefinition.Metric.COSINE)
-          .metric(VectorIndexDefinition.Metric.DOT_PRODUCT)
-          .metric(VectorIndexDefinition.Metric.EUCLIDEAN)
+          .metric(VectorIndexDefinition.Metric.DOT)
+          .metric(VectorIndexDefinition.Metric.L2)
           // hnswlib-java is pure Java, so a deployment needs nothing beyond the jar
           .nativeLibrary(false)
           // the library can add to a graph, which a refresh does not use because it rebuilds the

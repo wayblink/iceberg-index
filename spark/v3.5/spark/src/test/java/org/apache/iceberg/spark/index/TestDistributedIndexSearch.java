@@ -368,7 +368,7 @@ class TestDistributedIndexSearch {
                     VectorIndexDefinition.builder()
                         .fieldId(2)
                         .dimension(2)
-                        .metric(Metric.EUCLIDEAN)
+                        .metric(Metric.L2)
                         .build())
                 .build());
     // one entry per index file, which is what gives the query many index files to merge

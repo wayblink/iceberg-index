@@ -184,7 +184,7 @@ class TestIndexRowLookup {
             VectorIndexDefinition.builder()
                 .fieldId(2)
                 .dimension(2)
-                .metric(VectorIndexDefinition.Metric.EUCLIDEAN)
+                .metric(VectorIndexDefinition.Metric.L2)
                 .build());
 
     Map<String, Map<Long, Long>> fromEntries = Maps.newLinkedHashMap();

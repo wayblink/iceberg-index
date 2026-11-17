@@ -469,8 +469,8 @@ public final class BruteforceKernel implements VectorKernel, RetainedBytes {
           .structure(VectorIndexDefinition.VectorStructure.FLAT)
           .quantizer(VectorIndexDefinition.VectorQuantizer.NONE)
           .metric(VectorIndexDefinition.Metric.COSINE)
-          .metric(VectorIndexDefinition.Metric.DOT_PRODUCT)
-          .metric(VectorIndexDefinition.Metric.EUCLIDEAN)
+          .metric(VectorIndexDefinition.Metric.DOT)
+          .metric(VectorIndexDefinition.Metric.L2)
           .nativeLibrary(false)
           // the list could be appended to, but a payload is read back by position, so a rebuild is
           // what a refresh does anyway

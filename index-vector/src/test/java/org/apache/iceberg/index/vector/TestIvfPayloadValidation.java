@@ -291,7 +291,7 @@ class TestIvfPayloadValidation {
         VectorIndexDefinition.builder()
             .fieldId(1)
             .dimension(DIMENSION)
-            .metric(VectorIndexDefinition.Metric.EUCLIDEAN)
+            .metric(VectorIndexDefinition.Metric.L2)
             .structure(VectorIndexDefinition.VectorStructure.IVF)
             .property(IvfOptions.NPROBE, Integer.toString(nprobe));
     if (quantized) {

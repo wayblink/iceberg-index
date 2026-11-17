@@ -69,8 +69,8 @@ class TestVectorIndexAdapter {
   public void readsPayloadsWrittenBeforeTheKernelWasNamed() {
     // the entry-bearing role belongs to the flat structure, the auxiliary role to one that builds
     // something over the vectors; both headers changed, so both are checked
-    VectorIndexAdapter scan = flatAdapter(VectorIndexDefinition.Metric.EUCLIDEAN);
-    VectorIndexAdapter graph = hnswAdapter(VectorIndexDefinition.Metric.EUCLIDEAN);
+    VectorIndexAdapter scan = flatAdapter(VectorIndexDefinition.Metric.L2);
+    VectorIndexAdapter graph = hnswAdapter(VectorIndexDefinition.Metric.L2);
 
     List<IndexEntry> entries =
         Lists.newArrayList(
@@ -93,7 +93,7 @@ class TestVectorIndexAdapter {
 
   @Test
   public void refusesAPayloadFromAKernelItDoesNotHave() {
-    VectorIndexAdapter adapter = flatAdapter(VectorIndexDefinition.Metric.EUCLIDEAN);
+    VectorIndexAdapter adapter = flatAdapter(VectorIndexDefinition.Metric.L2);
 
     ByteBuffer entries =
         adapter.encodeEntries(
@@ -165,7 +165,7 @@ class TestVectorIndexAdapter {
 
   @Test
   public void roundTripsEntries() {
-    VectorIndexAdapter adapter = adapter(VectorIndexDefinition.Metric.EUCLIDEAN);
+    VectorIndexAdapter adapter = adapter(VectorIndexDefinition.Metric.L2);
     List<IndexEntry> entries =
         List.of(
             IndexEntry.of("data-1.parquet", 0, adapter.encodeVector(new float[] {1.0f, 0.0f})),
@@ -177,7 +177,7 @@ class TestVectorIndexAdapter {
 
   @Test
   public void writesADataFileOncePerIndexFileRatherThanOncePerEntry() {
-    VectorIndexAdapter adapter = adapter(VectorIndexDefinition.Metric.EUCLIDEAN);
+    VectorIndexAdapter adapter = adapter(VectorIndexDefinition.Metric.L2);
     // many entries over few data files is the shape a real index file has, and it is where writing
     // the path per entry costs the most
     List<IndexEntry> entries = Lists.newArrayList();
@@ -230,13 +230,13 @@ class TestVectorIndexAdapter {
         .containsExactly("data-a.parquet", "data-b.parquet");
 
     // DOT_PRODUCT prefers the larger magnitude
-    VectorIndexAdapter dot = adapter(VectorIndexDefinition.Metric.DOT_PRODUCT);
+    VectorIndexAdapter dot = adapter(VectorIndexDefinition.Metric.DOT);
     assertThat(dot.search(payload, query, 2))
         .extracting(IndexSearchResult::dataFile)
         .containsExactly("data-b.parquet", "data-a.parquet");
 
     // EUCLIDEAN prefers the smaller distance
-    VectorIndexAdapter euclidean = adapter(VectorIndexDefinition.Metric.EUCLIDEAN);
+    VectorIndexAdapter euclidean = adapter(VectorIndexDefinition.Metric.L2);
     assertThat(euclidean.search(payload, query, 2))
         .extracting(IndexSearchResult::dataFile)
         .containsExactly("data-a.parquet", "data-b.parquet");
@@ -325,7 +325,7 @@ class TestVectorIndexAdapter {
   public void preparedSearchDoesNotReadThePayloadAgain() {
     // the whole point of preparing a payload is that the decode happens once, so a search that
     // happens after the payload has been overwritten still answers from the loaded form
-    VectorIndexAdapter hnsw = hnswAdapter(VectorIndexDefinition.Metric.EUCLIDEAN);
+    VectorIndexAdapter hnsw = hnswAdapter(VectorIndexDefinition.Metric.L2);
     List<IndexEntry> entries = circleEntries(hnsw, 40);
     ByteBuffer auxiliary = hnsw.encodeAuxiliaryPayload(entries);
     ByteBuffer query = hnsw.encodeQuery(new float[] {0.8f, 0.6f});
@@ -346,7 +346,7 @@ class TestVectorIndexAdapter {
 
   @Test
   public void preparedEntrySearchDoesNotDecodeThePayloadAgain() {
-    VectorIndexAdapter exact = adapter(VectorIndexDefinition.Metric.EUCLIDEAN);
+    VectorIndexAdapter exact = adapter(VectorIndexDefinition.Metric.L2);
     List<IndexEntry> entries = circleEntries(exact, 40);
     ByteBuffer payload = exact.encodeEntries(entries);
     ByteBuffer query = exact.encodeQuery(new float[] {0.8f, 0.6f});

@@ -1142,7 +1142,7 @@ already exists for the column.
 | `table`          | ✔️        | string | Name of the table                                  |
 | `column`         | ✔️        | string | Name of the numeric array column to index          |
 | `dimension`      | ✔️        | int    | Vector dimension                                   |
-| `metric`         |           | string | `cosine` (default), `euclidean` or `dot_product`   |
+| `metric`         |           | string | `l2` (default), `cosine` or `dot`                  |
 | `mode`           |           | string | `EXACT` (default) or `HNSW`                        |
 | `max_m`          |           | int    | HNSW max connections per node (default 16)         |
 | `ef_construction`|           | int    | HNSW build-time search width (default 200)         |
@@ -1159,10 +1159,10 @@ already exists for the column.
 
 #### Examples
 
-Build an exact cosine index on `embedding`
+Build an exact L2 index on `embedding`
 ```sql
 CALL catalog_name.system.build_vector_index(
-    table => 'db.documents', column => 'embedding', dimension => 768, metric => 'cosine');
+    table => 'db.documents', column => 'embedding', dimension => 768, metric => 'l2');
 ```
 
 Build an HNSW (approximate) index
@@ -1579,8 +1579,11 @@ JOIN local.db.docs d ON get_json_object(h.row, '$.id') = CAST(d.id AS string);
 
 `vec_distance(vector, query)` returns the distance between a vector column and a query vector, for
 which **smaller always means closer**: cosine distance is `1 - cos`, dot product distance is
-`-dot`, and euclidean distance is the L2 norm. The metric is not part of the signature; the
-expression uses cosine unless the rewrite below specializes it to the metric of the index it uses.
+`-dot`, and L2 distance is the euclidean norm. The metric is not part of the signature; the
+expression uses L2 unless the rewrite below specializes it to the metric of the index it uses.
+An optional third argument names the metric: `l2`, `cosine` or `dot`. The older spellings
+(`euclidean`, `cos`, `dot_product`, `inner_product`, `ip`) are still read, because index
+definitions written before the rename carry them.
 
 A nearest-neighbour query written the ordinary way can be answered by a vector index:
 

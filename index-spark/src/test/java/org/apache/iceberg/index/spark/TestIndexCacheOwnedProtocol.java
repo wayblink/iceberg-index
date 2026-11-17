@@ -57,7 +57,7 @@ class TestIndexCacheOwnedProtocol {
           VectorIndexDefinition.builder()
               .fieldId(1)
               .dimension(2)
-              .metric(Metric.EUCLIDEAN)
+              .metric(Metric.L2)
               .structure(VectorStructure.FLAT)
               .build());
   private ExecutorIndexCacheWorker worker;

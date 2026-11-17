@@ -90,7 +90,7 @@ class TestVectorSearchFiltered {
                 "SELECT id, price FROM local.db.filtered_pre "
                     + "WHERE price < 40 ORDER BY vec_distance(embedding, array("
                     + query()
-                    + "), 'euclidean') LIMIT 5")
+                    + "), 'l2') LIMIT 5")
             .collectAsList();
 
     assertThat(rows)
@@ -110,7 +110,7 @@ class TestVectorSearchFiltered {
                 "SELECT id FROM local.db.filtered_plan "
                     + "WHERE price < 40 ORDER BY vec_distance(embedding, array("
                     + query()
-                    + "), 'euclidean') LIMIT 5")
+                    + "), 'l2') LIMIT 5")
             .queryExecution()
             .executedPlan()
             .toString();
@@ -130,7 +130,7 @@ class TestVectorSearchFiltered {
             .sql(
                 "SELECT id FROM local.db.filtered_none ORDER BY vec_distance(embedding, array("
                     + query()
-                    + "), 'euclidean') LIMIT 5")
+                    + "), 'l2') LIMIT 5")
             .collectAsList();
 
     assertThat(rows).hasSize(5);
@@ -151,7 +151,7 @@ class TestVectorSearchFiltered {
                         "SELECT id, price FROM local.db.filtered_dense "
                             + "WHERE price >= 0 ORDER BY vec_distance(embedding, array("
                             + query()
-                            + "), 'euclidean') LIMIT 5")
+                            + "), 'l2') LIMIT 5")
                     .collectAsList());
 
     assertThat(rows).as("a dense filter is still answered with a full window").hasSize(5);
@@ -171,7 +171,7 @@ class TestVectorSearchFiltered {
                         "SELECT id, price FROM local.db.filtered_mode_pre "
                             + "WHERE price < 40 ORDER BY vec_distance(embedding, array("
                             + query()
-                            + "), 'euclidean') LIMIT 5")
+                            + "), 'l2') LIMIT 5")
                     .collectAsList());
 
     assertThat(rows).hasSize(5);
@@ -191,7 +191,7 @@ class TestVectorSearchFiltered {
                         "SELECT id, price FROM local.db.filtered_mode_post "
                             + "WHERE price < 40 ORDER BY vec_distance(embedding, array("
                             + query()
-                            + "), 'euclidean') LIMIT 5")
+                            + "), 'l2') LIMIT 5")
                     .collectAsList());
 
     assertThat(rows)
@@ -214,7 +214,7 @@ class TestVectorSearchFiltered {
                                 "SELECT id FROM local.db.filtered_mode_bad "
                                     + "WHERE price < 40 ORDER BY vec_distance(embedding, array("
                                     + query()
-                                    + "), 'euclidean') LIMIT 5")
+                                    + "), 'l2') LIMIT 5")
                             .collectAsList()))
         .as("an unknown mode is refused rather than answered some other way")
         .hasMessageContaining("filter-mode");
@@ -251,7 +251,7 @@ class TestVectorSearchFiltered {
                       + where
                       + " ORDER BY vec_distance(embedding, array("
                       + query()
-                      + "), 'euclidean') LIMIT 5");
+                      + "), 'l2') LIMIT 5");
           // the rounds are added by the tasks as they run, so the query has to have run before the
           // metric means anything
           frame.collectAsList();
@@ -270,7 +270,7 @@ class TestVectorSearchFiltered {
                         + where
                         + " ORDER BY vec_distance(embedding, array("
                         + query()
-                        + "), 'euclidean') LIMIT 5")
+                        + "), 'l2') LIMIT 5")
                 .collectAsList()
                 .stream()
                 .map(row -> row.getLong(0))
@@ -317,7 +317,7 @@ class TestVectorSearchFiltered {
                 "SELECT id, day FROM local.db.filtered_date "
                     + "WHERE day > DATE '2021-01-01' ORDER BY vec_distance(embedding, array("
                     + query()
-                    + "), 'euclidean') LIMIT 5")
+                    + "), 'l2') LIMIT 5")
             .collectAsList();
 
     assertThat(rows)
@@ -341,7 +341,7 @@ class TestVectorSearchFiltered {
                         "SELECT id, price FROM local.db.filtered_deleted_pre "
                             + "WHERE price < 40 ORDER BY vec_distance(embedding, array("
                             + query()
-                            + "), 'euclidean') LIMIT 5")
+                            + "), 'l2') LIMIT 5")
                     .collectAsList());
 
     assertThat(rows).isNotEmpty();
@@ -364,7 +364,7 @@ class TestVectorSearchFiltered {
                         "SELECT id, price FROM local.db.filtered_deleted_post "
                             + "WHERE price < 40 ORDER BY vec_distance(embedding, array("
                             + query()
-                            + "), 'euclidean') LIMIT 5")
+                            + "), 'l2') LIMIT 5")
                     .collectAsList());
 
     assertThat(rows)
@@ -387,7 +387,7 @@ class TestVectorSearchFiltered {
                           "SELECT id, price FROM local.db.filtered_short WHERE price = 6 "
                               + "ORDER BY vec_distance(embedding, array("
                               + query()
-                              + "), 'euclidean') LIMIT 5")
+                              + "), 'l2') LIMIT 5")
                       .collectAsList());
 
       assertThat(rows)
@@ -460,7 +460,7 @@ class TestVectorSearchFiltered {
                           + where
                           + " ORDER BY vec_distance(embedding, array("
                           + query()
-                          + "), 'euclidean') LIMIT 5")
+                          + "), 'l2') LIMIT 5")
                   .collectAsList());
     } finally {
       spark.conf().unset("spark.iceberg.index.vector.filter-mode");
@@ -521,7 +521,7 @@ class TestVectorSearchFiltered {
             + name
             + "', column => 'embedding', dimension => "
             + DIMENSION
-            + ", metric => 'euclidean', structure => 'ivf')");
+            + ", metric => 'l2', structure => 'ivf')");
     return Spark3Util.loadIcebergTable(spark, "local.db." + name);
   }
 }

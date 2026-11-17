@@ -101,7 +101,7 @@ class TestFlatInPlaceSearch {
   void matchesTheFullSortWhenScoresTieAndPathsRepeat() {
     // every entry holds the same vector, so every score ties and only the path and the row order
     // the answers; the paths repeat, the rows arrive out of order, and one entry is a duplicate
-    VectorIndexAdapter flat = flatAdapter(VectorIndexDefinition.Metric.EUCLIDEAN);
+    VectorIndexAdapter flat = flatAdapter(VectorIndexDefinition.Metric.L2);
     float[] shared = vector(1);
     long[] rows = {7, 2, 9, 2, 5};
     String[] paths = {
@@ -115,7 +115,7 @@ class TestFlatInPlaceSearch {
     IndexAdapter.PreparedSearch prepared = flat.prepare(flat.encodeEntries(entries));
     for (int topK : new int[] {1, 2, 3, rows.length}) {
       List<IndexSearchResult> expected =
-          reference(entries, vector(3), topK, VectorIndexDefinition.Metric.EUCLIDEAN);
+          reference(entries, vector(3), topK, VectorIndexDefinition.Metric.L2);
       List<IndexSearchResult> actual = prepared.search(flat.encodeQuery(vector(3)), topK);
       assertThat(actual).as("top-k %s", topK).hasSameSizeAs(expected);
       for (int rank = 0; rank < expected.size(); rank++) {
@@ -162,8 +162,8 @@ class TestFlatInPlaceSearch {
 
   @Test
   void takesTheSmallerOfTopKAndTheEntriesItHas() {
-    List<IndexEntry> entries = entries(VectorIndexDefinition.Metric.EUCLIDEAN);
-    VectorIndexAdapter flat = flatAdapter(VectorIndexDefinition.Metric.EUCLIDEAN);
+    List<IndexEntry> entries = entries(VectorIndexDefinition.Metric.L2);
+    VectorIndexAdapter flat = flatAdapter(VectorIndexDefinition.Metric.L2);
     IndexAdapter.PreparedSearch prepared = flat.prepare(flat.encodeEntries(entries));
     ByteBuffer query = flat.encodeQuery(vector(3));
 
@@ -179,8 +179,8 @@ class TestFlatInPlaceSearch {
 
   @Test
   void refusesANegativeTopK() {
-    List<IndexEntry> entries = entries(VectorIndexDefinition.Metric.EUCLIDEAN);
-    VectorIndexAdapter flat = flatAdapter(VectorIndexDefinition.Metric.EUCLIDEAN);
+    List<IndexEntry> entries = entries(VectorIndexDefinition.Metric.L2);
+    VectorIndexAdapter flat = flatAdapter(VectorIndexDefinition.Metric.L2);
     IndexAdapter.PreparedSearch prepared = flat.prepare(flat.encodeEntries(entries));
     assertThatThrownBy(() -> prepared.search(flat.encodeQuery(vector(3)), -1))
         .isInstanceOf(IllegalArgumentException.class)
@@ -232,8 +232,8 @@ class TestFlatInPlaceSearch {
 
   @Test
   void answersTheSameWhateverTheCallerDoesToTheBufferAfterwards() {
-    List<IndexEntry> entries = entries(VectorIndexDefinition.Metric.EUCLIDEAN, ENTRIES);
-    VectorIndexAdapter flat = flatAdapter(VectorIndexDefinition.Metric.EUCLIDEAN);
+    List<IndexEntry> entries = entries(VectorIndexDefinition.Metric.L2, ENTRIES);
+    VectorIndexAdapter flat = flatAdapter(VectorIndexDefinition.Metric.L2);
     byte[] payload = VectorPayloads.toBytes(flat.encodeEntries(entries));
     ByteBuffer query = flat.encodeQuery(vector(0));
 
@@ -269,8 +269,8 @@ class TestFlatInPlaceSearch {
   @Test
   @Timeout(60)
   void answersTheSameWhenTheSearcherIsSearchedConcurrently() throws Exception {
-    List<IndexEntry> entries = entries(VectorIndexDefinition.Metric.EUCLIDEAN, 400);
-    VectorIndexAdapter flat = flatAdapter(VectorIndexDefinition.Metric.EUCLIDEAN);
+    List<IndexEntry> entries = entries(VectorIndexDefinition.Metric.L2, 400);
+    VectorIndexAdapter flat = flatAdapter(VectorIndexDefinition.Metric.L2);
     IndexAdapter.PreparedSearch prepared = flat.prepare(flat.encodeEntries(entries));
 
     List<ByteBuffer> queries = Lists.newArrayList();
@@ -312,13 +312,13 @@ class TestFlatInPlaceSearch {
   void preparesTheLegacyHeaderFormat() {
     // the header written before kernels were named is a bare format version, and the entries under
     // it are read the same way, so an index built before the header changed still answers
-    List<IndexEntry> entries = entries(VectorIndexDefinition.Metric.EUCLIDEAN, 12);
-    VectorIndexAdapter flat = flatAdapter(VectorIndexDefinition.Metric.EUCLIDEAN);
+    List<IndexEntry> entries = entries(VectorIndexDefinition.Metric.L2, 12);
+    VectorIndexAdapter flat = flatAdapter(VectorIndexDefinition.Metric.L2);
     float[] queryVector = vector(4);
 
     IndexAdapter.PreparedSearch prepared = flat.prepare(ByteBuffer.wrap(legacyPayload(entries)));
     List<IndexSearchResult> expected =
-        reference(entries, queryVector, 12, VectorIndexDefinition.Metric.EUCLIDEAN);
+        reference(entries, queryVector, 12, VectorIndexDefinition.Metric.L2);
     List<IndexSearchResult> actual = prepared.search(flat.encodeQuery(queryVector), 12);
     assertThat(actual).hasSameSizeAs(expected);
     for (int rank = 0; rank < expected.size(); rank++) {
@@ -331,8 +331,8 @@ class TestFlatInPlaceSearch {
 
   @Test
   void refusesAPayloadItCannotRead() {
-    List<IndexEntry> entries = entries(VectorIndexDefinition.Metric.EUCLIDEAN, 4);
-    VectorIndexAdapter flat = flatAdapter(VectorIndexDefinition.Metric.EUCLIDEAN);
+    List<IndexEntry> entries = entries(VectorIndexDefinition.Metric.L2, 4);
+    VectorIndexAdapter flat = flatAdapter(VectorIndexDefinition.Metric.L2);
     byte[] payload = VectorPayloads.toBytes(flat.encodeEntries(entries));
     byte[] value = value(1, DIMENSION, vector(0));
 
@@ -372,8 +372,8 @@ class TestFlatInPlaceSearch {
 
   @Test
   void entriesKeepTheirPayloadsImmutable() {
-    List<IndexEntry> entries = entries(VectorIndexDefinition.Metric.EUCLIDEAN, 6);
-    VectorIndexAdapter flat = flatAdapter(VectorIndexDefinition.Metric.EUCLIDEAN);
+    List<IndexEntry> entries = entries(VectorIndexDefinition.Metric.L2, 6);
+    VectorIndexAdapter flat = flatAdapter(VectorIndexDefinition.Metric.L2);
     byte[] payload = VectorPayloads.toBytes(flat.encodeEntries(entries));
 
     List<IndexEntry> decoded = flat.decodeEntries(ByteBuffer.wrap(payload));

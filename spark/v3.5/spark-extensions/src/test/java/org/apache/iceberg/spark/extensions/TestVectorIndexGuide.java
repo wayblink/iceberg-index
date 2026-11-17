@@ -321,7 +321,7 @@ class TestVectorIndexGuide {
     createTable("deleted", 8);
     spark.sql(
         "CALL local.system.build_vector_index("
-            + "table => 'db.deleted', column => 'embedding', dimension => 2, metric => 'euclidean', "
+            + "table => 'db.deleted', column => 'embedding', dimension => 2, metric => 'l2', "
             + "structure => 'IVF', quantizer => 'RABITQ', options => map('nprobe', '64'))");
 
     spark.sql("DELETE FROM local.db.deleted WHERE id = 1");

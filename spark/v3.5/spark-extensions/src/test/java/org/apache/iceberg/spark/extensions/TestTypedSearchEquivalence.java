@@ -227,7 +227,7 @@ class TestTypedSearchEquivalence {
           String.format(
               "CALL local.system.build_vector_index("
                   + "table => 'db.%s', column => 'embedding', dimension => 2, "
-                  + "structure => 'FLAT', metric => 'EUCLIDEAN')",
+                  + "structure => 'FLAT', metric => 'L2')",
               name));
     }
 

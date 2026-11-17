@@ -123,7 +123,7 @@ class TestPluginExecutorBudget {
               .sql(
                   "CALL local.system.build_vector_index(table=>'db.cached_vectors',"
                       + " column=>'embedding', dimension=>2, structure=>'FLAT',"
-                      + " metric=>'EUCLIDEAN')")
+                      + " metric=>'L2')")
               .head()
               .getString(0);
       assertThat(
@@ -199,7 +199,7 @@ class TestPluginExecutorBudget {
       String index =
           spark
               .sql(
-                  "CALL local.system.build_vector_index(table=>'db.plugin_budget_vectors', column=>'embedding', dimension=>2, structure=>'FLAT', metric=>'EUCLIDEAN')")
+                  "CALL local.system.build_vector_index(table=>'db.plugin_budget_vectors', column=>'embedding', dimension=>2, structure=>'FLAT', metric=>'L2')")
               .head()
               .getString(0);
       String query =
@@ -267,7 +267,7 @@ class TestPluginExecutorBudget {
           spark
               .sql(
                   "CALL local.system.build_vector_index(table=>'db.plugin_many_files', "
-                      + "column=>'embedding', dimension=>2, structure=>'FLAT', metric=>'EUCLIDEAN', "
+                      + "column=>'embedding', dimension=>2, structure=>'FLAT', metric=>'L2', "
                       + "max_entries_per_index_file=>1)")
               .head()
               .getString(0);
@@ -412,7 +412,7 @@ class TestPluginExecutorBudget {
           spark
               .sql(
                   "CALL local.system.build_vector_index(table=>'db.plugin_disabled_vectors',"
-                      + " column=>'embedding', dimension=>2, structure=>'FLAT', metric=>'EUCLIDEAN')")
+                      + " column=>'embedding', dimension=>2, structure=>'FLAT', metric=>'L2')")
               .head()
               .getString(0);
 

@@ -97,7 +97,7 @@ class TestLanceVectorSearch {
     spark.sql(
         String.format(
             "CALL local.system.build_vector_index("
-                + "table => '%s', column => 'embedding', dimension => 2, metric => 'euclidean')",
+                + "table => '%s', column => 'embedding', dimension => 2, metric => 'l2')",
             table));
 
     List<Row> single =
@@ -196,7 +196,7 @@ class TestLanceVectorSearch {
     spark.sql(
         String.format(
             "CALL local.system.build_vector_index("
-                + "table => '%s', column => 'embedding', dimension => 2, metric => 'euclidean')",
+                + "table => '%s', column => 'embedding', dimension => 2, metric => 'l2')",
             table));
 
     // A hit whose row was deleted comes back without a row, and id 0 was the nearest one, so a
@@ -258,7 +258,7 @@ class TestLanceVectorSearch {
     spark.sql(
         String.format(
             "CALL local.system.build_vector_index("
-                + "table => '%s', column => 'embedding', dimension => 2, metric => 'euclidean')",
+                + "table => '%s', column => 'embedding', dimension => 2, metric => 'l2')",
             table));
 
     Table iceberg = Spark3Util.loadIcebergTable(spark, table);
@@ -394,7 +394,7 @@ class TestLanceVectorSearch {
     spark.sql(
         String.format(
             "CALL local.system.build_vector_index("
-                + "table => '%s', column => 'embedding', dimension => 2, metric => 'euclidean'%s)",
+                + "table => '%s', column => 'embedding', dimension => 2, metric => 'l2'%s)",
             table, choice));
   }
 

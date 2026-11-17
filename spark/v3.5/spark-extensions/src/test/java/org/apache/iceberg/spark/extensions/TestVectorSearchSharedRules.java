@@ -111,7 +111,7 @@ class TestVectorSearchSharedRules {
         "INSERT INTO local.db.shared_rabitq VALUES (1, array(1.0d, 0.0d)), (2, array(0.0d, 1.0d))");
     spark.sql(
         "CALL local.system.build_vector_index(table => 'db.shared_rabitq', column => 'embedding', "
-            + "dimension => 2, metric => 'euclidean', structure => 'IVF', quantizer => 'RABITQ', "
+            + "dimension => 2, metric => 'l2', structure => 'IVF', quantizer => 'RABITQ', "
             + "options => map('nlist', '2', 'nprobe', '2'))");
     Table table = Spark3Util.loadIcebergTable(spark, "local.db.shared_rabitq");
 
@@ -305,7 +305,7 @@ class TestVectorSearchSharedRules {
             + "(2, array(0.0d, 1.0d))");
     spark.sql(
         "CALL local.system.build_vector_index(table => 'db.shared_nullable', "
-            + "column => 'embedding', dimension => 2, metric => 'euclidean', structure => 'flat')");
+            + "column => 'embedding', dimension => 2, metric => 'l2', structure => 'flat')");
     spark.sql("INSERT INTO local.db.shared_nullable VALUES (3, null)");
 
     String query =
@@ -441,7 +441,7 @@ class TestVectorSearchSharedRules {
     spark.sql(
         "CALL local.system.build_vector_index(table => 'db."
             + name
-            + "', column => 'embedding', dimension => 2, metric => 'euclidean', "
+            + "', column => 'embedding', dimension => 2, metric => 'l2', "
             + "structure => 'flat')");
     return Spark3Util.loadIcebergTable(spark, "local.db." + name);
   }
@@ -469,7 +469,7 @@ class TestVectorSearchSharedRules {
     spark.sql(
         "CALL local.system.build_vector_index(table => 'db."
             + name
-            + "', column => 'embedding', dimension => 2, metric => 'euclidean', "
+            + "', column => 'embedding', dimension => 2, metric => 'l2', "
             + "structure => 'flat')");
     Table table = Spark3Util.loadIcebergTable(spark, "local.db." + name);
     assertThat(table.location()).isNotEmpty();

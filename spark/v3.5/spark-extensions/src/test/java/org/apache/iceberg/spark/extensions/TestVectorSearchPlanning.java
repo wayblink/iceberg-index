@@ -334,7 +334,7 @@ class TestVectorSearchPlanning {
         "INSERT INTO " + table + " SELECT id, array(CAST(id AS double), 1.0d) FROM range(32, 64)");
     spark.sql(
         "CALL local.system.build_vector_index(table => 'db.planning_range_lists', "
-            + "column => 'embedding', dimension => 2, metric => 'euclidean', structure => 'IVF', "
+            + "column => 'embedding', dimension => 2, metric => 'l2', structure => 'IVF', "
             + "max_entries_per_index_file => 128, "
             + "options => map('nlist', '8', 'ivf-list-blocks', 'true'))");
     String range = "spark.iceberg.index.vector.ivf.range-read.enabled";
@@ -344,7 +344,7 @@ class TestVectorSearchPlanning {
     String query =
         "SELECT id FROM "
             + table
-            + " ORDER BY vec_distance(embedding, array(31.1d, 1.0d), 'euclidean') LIMIT 4";
+            + " ORDER BY vec_distance(embedding, array(31.1d, 1.0d), 'l2') LIMIT 4";
     try {
       spark.conf().set(cache, "false");
       spark.conf().set(probes, "2");
@@ -378,7 +378,7 @@ class TestVectorSearchPlanning {
   private static String nearestOf(String name) {
     return "SELECT id FROM local.db."
         + name
-        + " ORDER BY vec_distance(embedding, array(0.95d, 0.05d)) LIMIT 1";
+        + " ORDER BY vec_distance(embedding, array(0.95d, 0.05d), 'cosine') LIMIT 1";
   }
 
   private static String plan(String query) {

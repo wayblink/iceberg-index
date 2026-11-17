@@ -114,7 +114,7 @@ class TestIvfRangeRead {
         VectorIndexDefinition.builder()
             .fieldId(1)
             .dimension(2)
-            .metric(Metric.EUCLIDEAN)
+            .metric(Metric.L2)
             .structure(VectorStructure.IVF)
             .quantizer(quantizer)
             .properties(

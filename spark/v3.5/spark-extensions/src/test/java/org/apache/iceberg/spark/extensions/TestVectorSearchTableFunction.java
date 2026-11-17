@@ -135,7 +135,7 @@ class TestVectorSearchTableFunction {
   public void followsTheMetricOfTheIndexWhenTheCallerNamesNone() {
     // the index is euclidean, so a call that names no metric is the same question and the index
     // answers it: the distance is the euclidean one, not the cosine the caller did not ask for
-    String table = tableWithMetric("vs_default_metric", "EUCLIDEAN");
+    String table = tableWithMetric("vs_default_metric", "L2");
 
     String query =
         String.format(
@@ -159,13 +159,13 @@ class TestVectorSearchTableFunction {
   public void answersWithAScanWhenTheIndexUsesAnotherMetric() {
     // the index is cosine; asking for euclidean is a different question, so the rows come from a
     // scan and the distance is the euclidean one, not a re-labelled cosine
-    String table = tableWithIndex("vs_metric", "hnsw");
+    String table = tableWithMetric("vs_metric", "COSINE");
 
     String query =
         String.format(
             "SELECT id, _distance FROM vector_search("
                 + "table => 'local.%s', query_vector => array(0.9d, 0.1d), "
-                + "vector_column => 'embedding', k => 1, distance_type => 'euclidean')",
+                + "vector_column => 'embedding', k => 1, distance_type => 'l2')",
             table);
 
     Row row = spark.sql(query).head();
@@ -200,7 +200,7 @@ class TestVectorSearchTableFunction {
                 String.format(
                     "SELECT id, _distance FROM vector_search("
                         + "table => 'local.%s', query_vector => array(0.9d, 0.1d), "
-                        + "vector_column => 'embedding', k => 5, distance_type => 'euclidean')",
+                        + "vector_column => 'embedding', k => 5, distance_type => 'l2')",
                     table))
             .collectAsList();
 

@@ -220,7 +220,7 @@ class TestPreparedStructureSize {
 
     @Override
     public Float distance(float[] first, float[] second) {
-      return (float) new VectorScoring(Metric.EUCLIDEAN).score(first, second) + retained[0];
+      return (float) new VectorScoring(Metric.L2).score(first, second) + retained[0];
     }
   }
 
@@ -637,7 +637,7 @@ class TestPreparedStructureSize {
         VectorIndexDefinition.builder()
             .fieldId(1)
             .dimension(dimension)
-            .metric(Metric.EUCLIDEAN)
+            .metric(Metric.L2)
             .structure(structure)
             .quantizer(quantizer)
             .properties(options)
@@ -687,7 +687,7 @@ class TestPreparedStructureSize {
         VectorIndexDefinition.builder()
             .fieldId(1)
             .dimension(DIMENSION)
-            .metric(Metric.EUCLIDEAN)
+            .metric(Metric.L2)
             .structure(structure)
             .quantizer(VectorQuantizer.valueOf(quantizer))
             .properties(options)

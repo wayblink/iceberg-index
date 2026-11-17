@@ -70,7 +70,7 @@ class TestVectorIndexDefinitionSerialization {
         VectorIndexDefinition.builder()
             .fieldId(2)
             .dimension(128)
-            .metric(VectorIndexDefinition.Metric.EUCLIDEAN)
+            .metric(VectorIndexDefinition.Metric.L2)
             .structure(VectorStructure.HNSW)
             .quantizer(VectorQuantizer.NONE)
             .maxM(16)
@@ -108,12 +108,82 @@ class TestVectorIndexDefinitionSerialization {
   }
 
   @Test
+  public void defaultsToL2() {
+    VectorIndexDefinition definition =
+        VectorIndexDefinition.builder().fieldId(2).dimension(4).build();
+    assertThat(definition.metric()).isEqualTo(VectorIndexDefinition.Metric.L2);
+  }
+
+  @Test
+  public void writesTheMetricNamesTheQueriesUse() {
+    for (VectorIndexDefinition.Metric metric : VectorIndexDefinition.Metric.values()) {
+      VectorIndexDefinition definition =
+          VectorIndexDefinition.builder().fieldId(2).dimension(4).metric(metric).build();
+
+      String json =
+          JsonUtil.generate(
+              generator -> {
+                generator.writeStartObject();
+                TYPE.writeDefinition(definition, generator);
+                generator.writeEndObject();
+              },
+              false);
+
+      assertThat(json).contains("\"metric\":\"" + metric.name() + "\"");
+      assertThat(metric.name()).isIn("COSINE", "DOT", "L2");
+      assertThat(TYPE.parseDefinition(node(json))).isEqualTo(definition);
+    }
+  }
+
+  @Test
+  public void readsTheMetricNamesWrittenBeforeTheRename() {
+    // metadata written before the metric names changed holds the old spellings, and an index that
+    // cannot be read is an index the table has lost
+    VectorIndexDefinition euclidean =
+        (VectorIndexDefinition)
+            TYPE.parseDefinition(
+                node(
+                    "{\"field-id\":2,\"dimension\":4,\"metric\":\"EUCLIDEAN\",\"structure\":\"FLAT\"}"));
+    assertThat(euclidean.metric()).isEqualTo(VectorIndexDefinition.Metric.L2);
+
+    VectorIndexDefinition dotProduct =
+        (VectorIndexDefinition)
+            TYPE.parseDefinition(
+                node(
+                    "{\"field-id\":2,\"dimension\":4,\"metric\":\"DOT_PRODUCT\",\"structure\":\"FLAT\"}"));
+    assertThat(dotProduct.metric()).isEqualTo(VectorIndexDefinition.Metric.DOT);
+  }
+
+  @Test
+  public void acceptsTheSpellingsOtherVectorEnginesUse() {
+    assertThat(VectorIndexDefinition.Metric.fromName("l2"))
+        .isEqualTo(VectorIndexDefinition.Metric.L2);
+    assertThat(VectorIndexDefinition.Metric.fromName("EUCLIDEAN"))
+        .isEqualTo(VectorIndexDefinition.Metric.L2);
+    assertThat(VectorIndexDefinition.Metric.fromName("cosine"))
+        .isEqualTo(VectorIndexDefinition.Metric.COSINE);
+    assertThat(VectorIndexDefinition.Metric.fromName("cos"))
+        .isEqualTo(VectorIndexDefinition.Metric.COSINE);
+    assertThat(VectorIndexDefinition.Metric.fromName("Dot"))
+        .isEqualTo(VectorIndexDefinition.Metric.DOT);
+    assertThat(VectorIndexDefinition.Metric.fromName("dot_product"))
+        .isEqualTo(VectorIndexDefinition.Metric.DOT);
+    assertThat(VectorIndexDefinition.Metric.fromName("ip"))
+        .isEqualTo(VectorIndexDefinition.Metric.DOT);
+
+    assertThatThrownBy(() -> VectorIndexDefinition.Metric.fromName("manhattan"))
+        .isInstanceOf(IllegalArgumentException.class)
+        .hasMessageContaining("Unsupported vector index metric: manhattan")
+        .hasMessageContaining("expected l2, cosine or dot");
+  }
+
+  @Test
   public void writesTheHnswOptionsAsPropertiesRatherThanFields() {
     VectorIndexDefinition definition =
         VectorIndexDefinition.builder()
             .fieldId(2)
             .dimension(8)
-            .metric(VectorIndexDefinition.Metric.EUCLIDEAN)
+            .metric(VectorIndexDefinition.Metric.L2)
             .structure(VectorStructure.HNSW)
             .maxM(32)
             .efConstruction(400)
@@ -150,7 +220,7 @@ class TestVectorIndexDefinitionSerialization {
                     VectorIndexDefinition.builder()
                         .fieldId(2)
                         .dimension(8)
-                        .metric(VectorIndexDefinition.Metric.EUCLIDEAN)
+                        .metric(VectorIndexDefinition.Metric.L2)
                         .structure(VectorStructure.HNSW)
                         .property("nlist", "128")
                         .build()))
@@ -167,7 +237,7 @@ class TestVectorIndexDefinitionSerialization {
                     VectorIndexDefinition.builder()
                         .fieldId(2)
                         .dimension(8)
-                        .metric(VectorIndexDefinition.Metric.EUCLIDEAN)
+                        .metric(VectorIndexDefinition.Metric.L2)
                         .structure(VectorStructure.HNSW)
                         .property(HnswOptions.MAX_M, "sixteen")
                         .build()))

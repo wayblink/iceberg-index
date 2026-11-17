@@ -40,7 +40,7 @@ class TestVectorPayloadHeader {
         return KernelCapabilities.builder()
             .structure(VectorIndexDefinition.VectorStructure.FLAT)
             .quantizer(VectorIndexDefinition.VectorQuantizer.NONE)
-            .metric(VectorIndexDefinition.Metric.EUCLIDEAN)
+            .metric(VectorIndexDefinition.Metric.L2)
             .nativeLibrary(false)
             .incrementalAdd(false)
             .build();

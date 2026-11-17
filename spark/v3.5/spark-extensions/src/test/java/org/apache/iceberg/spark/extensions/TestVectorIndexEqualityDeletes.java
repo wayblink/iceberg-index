@@ -68,7 +68,7 @@ public class TestVectorIndexEqualityDeletes extends ExtensionsTestBase {
         table);
     sql(
         "CALL %s.system.build_vector_index(table => '%s', column => 'embedding', dimension => 2, "
-            + "metric => 'euclidean')",
+            + "metric => 'l2')",
         catalogName, table);
 
     assertDeletedRowIsGone(table, "payload", java.nio.ByteBuffer.wrap(new byte[] {2}));
@@ -100,7 +100,7 @@ public class TestVectorIndexEqualityDeletes extends ExtensionsTestBase {
         tableName);
     sql(
         "CALL %s.system.build_vector_index(table => '%s', column => 'embedding', dimension => 2, "
-            + "metric => 'euclidean')",
+            + "metric => 'l2')",
         catalogName, tableName);
   }
 
@@ -143,7 +143,7 @@ public class TestVectorIndexEqualityDeletes extends ExtensionsTestBase {
         table);
     sql(
         "CALL %s.system.build_vector_index(table => '%s', column => 'embedding', dimension => 2, "
-            + "metric => 'euclidean')",
+            + "metric => 'l2')",
         catalogName, table);
 
     // a decimal key is carried as the canonical decimal rather than its text, so a delete does not

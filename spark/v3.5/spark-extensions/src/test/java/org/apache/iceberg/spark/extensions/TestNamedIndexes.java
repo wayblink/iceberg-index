@@ -235,7 +235,7 @@ public class TestNamedIndexes extends ExtensionsTestBase {
         table);
     sql(
         "CALL %s.system.build_vector_index("
-            + "table => '%s', column => 'embedding', dimension => 2, metric => 'euclidean')",
+            + "table => '%s', column => 'embedding', dimension => 2, metric => 'l2')",
         catalogName, table);
   }
 

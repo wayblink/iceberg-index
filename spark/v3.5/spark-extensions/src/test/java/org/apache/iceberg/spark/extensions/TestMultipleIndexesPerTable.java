@@ -297,7 +297,7 @@ public class TestMultipleIndexesPerTable extends ExtensionsTestBase {
             () ->
                 sql(
                     "CALL %s.system.build_vector_index(table => '%s', column => 'vec', "
-                        + "dimension => 2, mode => 'HNSW', metric => 'EUCLIDEAN')",
+                        + "dimension => 2, mode => 'HNSW', metric => 'L2')",
                     catalogName, tableName))
         .isInstanceOf(RuntimeException.class)
         .hasMessageContaining("already exists");

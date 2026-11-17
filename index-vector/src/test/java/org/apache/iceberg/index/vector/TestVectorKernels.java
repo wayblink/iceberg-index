@@ -57,7 +57,7 @@ class TestVectorKernels {
             VectorIndexDefinition.builder()
                 .fieldId(1)
                 .dimension(2)
-                .metric(VectorIndexDefinition.Metric.EUCLIDEAN)
+                .metric(VectorIndexDefinition.Metric.L2)
                 .structure(VectorIndexDefinition.VectorStructure.IVF)
                 .build());
 
@@ -87,7 +87,7 @@ class TestVectorKernels {
                     VectorIndexDefinition.builder()
                         .fieldId(1)
                         .dimension(2)
-                        .metric(VectorIndexDefinition.Metric.EUCLIDEAN)
+                        .metric(VectorIndexDefinition.Metric.L2)
                         // a graph whose vectors are quantized: no kernel offers it, because the
                         // graph library keeps the vectors itself
                         .structure(VectorIndexDefinition.VectorStructure.HNSW)
@@ -138,7 +138,7 @@ class TestVectorKernels {
       return KernelCapabilities.builder()
           .structure(VectorIndexDefinition.VectorStructure.IVF)
           .quantizer(VectorIndexDefinition.VectorQuantizer.NONE)
-          .metric(VectorIndexDefinition.Metric.EUCLIDEAN)
+          .metric(VectorIndexDefinition.Metric.L2)
           .build();
     }
 

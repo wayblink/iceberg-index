@@ -30,8 +30,8 @@ import org.apache.iceberg.index.IndexSearchResult;
  * the two answers merged from several index files would disagree for reasons that have nothing to
  * do with the vectors.
  *
- * <p>A score is a distance for {@link VectorIndexDefinition.Metric#EUCLIDEAN} and a similarity for
- * the others; {@link #comparator()} is what turns that into an order.
+ * <p>A score is a distance for {@link VectorIndexDefinition.Metric#L2} and a similarity for the
+ * others; {@link #comparator()} is what turns that into an order.
  */
 public final class VectorScoring implements Serializable {
 
@@ -47,7 +47,7 @@ public final class VectorScoring implements Serializable {
     return metric;
   }
 
-  /** The distance for EUCLIDEAN and the similarity for the others, between two vectors. */
+  /** The distance for L2 and the similarity for the others, between two vectors. */
   public double score(float[] query, float[] vector) {
     switch (metric) {
       case COSINE:
@@ -62,13 +62,13 @@ public final class VectorScoring implements Serializable {
         return queryNorm == 0.0 || vectorNorm == 0.0
             ? 0.0
             : dot / (Math.sqrt(queryNorm) * Math.sqrt(vectorNorm));
-      case DOT_PRODUCT:
+      case DOT:
         double product = 0.0;
         for (int i = 0; i < query.length; i++) {
           product += (double) query[i] * vector[i];
         }
         return product;
-      case EUCLIDEAN:
+      case L2:
         double distanceSquared = 0.0;
         for (int i = 0; i < query.length; i++) {
           double difference = (double) query[i] - vector[i];
@@ -87,7 +87,7 @@ public final class VectorScoring implements Serializable {
    * has to pick the closest of several candidates asks this rather than assuming a direction.
    */
   public int compareScores(double left, double right) {
-    return metric == VectorIndexDefinition.Metric.EUCLIDEAN
+    return metric == VectorIndexDefinition.Metric.L2
         ? Double.compare(left, right)
         : Double.compare(right, left);
   }
@@ -98,10 +98,10 @@ public final class VectorScoring implements Serializable {
         Comparator.comparing(IndexSearchResult::dataFile)
             .thenComparingLong(IndexSearchResult::rowPosition);
     switch (metric) {
-      case EUCLIDEAN:
+      case L2:
         return Comparator.comparingDouble(IndexSearchResult::score).thenComparing(tieBreaker);
       case COSINE:
-      case DOT_PRODUCT:
+      case DOT:
         return Comparator.comparingDouble(IndexSearchResult::score)
             .reversed()
             .thenComparing(tieBreaker);

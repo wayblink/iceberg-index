@@ -43,7 +43,7 @@ class IcebergSparkSessionExtensions extends (SparkSessionExtensions => Unit) {
   private val TEXT_MATCH = "match"
 
   /**
-   * The metric the query named, or cosine when it named none.
+   * The metric the query named, or {@link Metric#DEFAULT} when it named none.
    *
    * <p>A named metric is taken literally: it is never replaced by whatever an index happens to use,
    * because that would answer a question the caller did not ask.
@@ -60,7 +60,7 @@ class IcebergSparkSessionExtensions extends (SparkSessionExtensions => Unit) {
     }
 
     if (args.size == 2) {
-      Metric.COSINE
+      Metric.DEFAULT
     } else {
       val name = args(2) match {
         case org.apache.spark.sql.catalyst.expressions
@@ -68,16 +68,15 @@ class IcebergSparkSessionExtensions extends (SparkSessionExtensions => Unit) {
           value.toString
         case _ =>
           throw IndexErrors.analysis(
-            "The metric of vec_distance must be a constant: cosine, dot_product or euclidean")
+            "The metric of vec_distance must be a constant: l2, cosine or dot")
       }
 
-      name.trim.toLowerCase(java.util.Locale.ROOT) match {
-        case "cosine" | "cos" => Metric.COSINE
-        case "dot" | "dot_product" | "inner_product" | "ip" => Metric.DOT_PRODUCT
-        case "euclidean" | "l2" => Metric.EUCLIDEAN
-        case other =>
+      try {
+        Metric.fromName(name)
+      } catch {
+        case _: IllegalArgumentException =>
           throw IndexErrors.analysis(
-            s"Unknown metric for vec_distance: $other, expected cosine, dot_product or euclidean")
+            s"Unknown metric for vec_distance: $name, expected l2, cosine or dot")
       }
     }
   }

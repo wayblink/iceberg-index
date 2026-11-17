@@ -132,7 +132,7 @@ class TestSiftVectorIndexEndToEnd {
         .sql(
             "CALL local.system.build_vector_index("
                 + "table => 'db.sift_exact', column => 'embedding', "
-                + "dimension => 128, metric => 'euclidean')")
+                + "dimension => 128, metric => 'l2')")
         .show(false);
     endStage();
 
@@ -141,7 +141,7 @@ class TestSiftVectorIndexEndToEnd {
         .sql(
             "CALL local.system.build_vector_index("
                 + "table => 'db.sift_hnsw', column => 'embedding', "
-                + "dimension => 128, metric => 'euclidean', mode => 'HNSW', "
+                + "dimension => 128, metric => 'l2', mode => 'HNSW', "
                 + "max_m => 16, ef_construction => 200, ef_search => 64)")
         .show(false);
     endStage();

@@ -1726,8 +1726,19 @@ public final class DistributedIndexSearch {
             spark.conf().get(key, spark.sparkContext().getConf().get(key, "false")));
   }
 
-  private record OpenedSearch(ExecutorIndexCache.CachedFile file, Runnable release)
-      implements AutoCloseable {
+  private static final class OpenedSearch implements AutoCloseable {
+    private final ExecutorIndexCache.CachedFile file;
+    private final Runnable release;
+
+    private OpenedSearch(ExecutorIndexCache.CachedFile file, Runnable release) {
+      this.file = file;
+      this.release = release;
+    }
+
+    private ExecutorIndexCache.CachedFile file() {
+      return file;
+    }
+
     @Override
     public void close() {
       release.run();

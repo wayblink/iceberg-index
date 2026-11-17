@@ -152,7 +152,7 @@ class TestRewriteVectorSearch {
                     .collectAsList())
         .isInstanceOf(AnalysisException.class)
         .hasMessageContaining("Unknown metric for vec_distance: manhattan")
-        .hasMessageContaining("cosine, dot_product or euclidean");
+        .hasMessageContaining("l2, cosine or dot");
   }
 
   @Test
@@ -212,7 +212,7 @@ class TestRewriteVectorSearch {
         String.format(
             "CALL local.system.build_vector_index("
                 + "table => 'db.%s', column => 'embedding', dimension => 128, "
-                + "metric => 'euclidean', structure => 'IVF', quantizer => 'RABITQ', "
+                + "metric => 'l2', structure => 'IVF', quantizer => 'RABITQ', "
                 + "options => map('nlist', '20', 'rabitq-bits', '3'), "
                 + "max_entries_per_index_file => 100000)",
             table));
@@ -365,7 +365,7 @@ class TestRewriteVectorSearch {
     spark.sql(
         String.format(
             "CALL local.system.build_vector_index("
-                + "table => '%s', column => 'embedding', dimension => 2, metric => 'euclidean', "
+                + "table => '%s', column => 'embedding', dimension => 2, metric => 'l2', "
                 + "structure => 'IVF', "
                 + "options => map('nlist', '4', 'nprobe', '4'))",
             table));
@@ -458,7 +458,7 @@ class TestRewriteVectorSearch {
     spark.sql(
         String.format(
             "CALL local.system.build_vector_index("
-                + "table => '%s', column => 'embedding', dimension => 2, metric => 'euclidean', "
+                + "table => '%s', column => 'embedding', dimension => 2, metric => 'l2', "
                 + "structure => 'flat')",
             table));
 
@@ -477,7 +477,7 @@ class TestRewriteVectorSearch {
                 table,
                 "SELECT id FROM local.%s "
                     + "ORDER BY vec_distance(embedding, array(1.0d, 0.0d)) LIMIT 1"))
-        .contains("vec_distance(EUCLIDEAN");
+        .contains("vec_distance(L2");
   }
 
   @Test
@@ -500,7 +500,7 @@ class TestRewriteVectorSearch {
     spark.sql(
         String.format(
             "CALL local.system.build_vector_index("
-                + "table => '%s', column => 'embedding', dimension => 2, metric => 'euclidean', "
+                + "table => '%s', column => 'embedding', dimension => 2, metric => 'l2', "
                 + "structure => 'flat')",
             table));
 
@@ -535,8 +535,9 @@ class TestRewriteVectorSearch {
     List<Row> hits = spark.sql(query).collectAsList();
     assertThat(hits).hasSize(2);
     assertThat(hits).extracting(row -> row.getLong(0)).containsExactly(1L, 3L);
-    // the distance is still the one the caller asked for, so it is reported with the row
-    assertThat(hits.get(0).getDouble(1)).isCloseTo(0.0053, within(0.001));
+    // the distance is still the one the caller asked for, so it is reported with the row: the
+    // query named no metric, so it is the default one, L2
+    assertThat(hits.get(0).getDouble(1)).isCloseTo(Math.sqrt(0.02d), within(1e-6d));
   }
 
   @Test
@@ -554,7 +555,7 @@ class TestRewriteVectorSearch {
     spark.sql(
         String.format(
             "CALL local.system.build_vector_index("
-                + "table => '%s', column => 'embedding', dimension => 2, metric => 'euclidean', "
+                + "table => '%s', column => 'embedding', dimension => 2, metric => 'l2', "
                 + "structure => 'flat')",
             table));
 
@@ -567,7 +568,7 @@ class TestRewriteVectorSearch {
     List<Row> hits = spark.sql(query).collectAsList();
     assertThat(hits).hasSize(1);
     assertThat(hits.get(0).getLong(0)).isEqualTo(2L);
-    assertThat(planOf(table, query)).contains("vec_distance(EUCLIDEAN");
+    assertThat(planOf(table, query)).contains("vec_distance(L2");
   }
 
   @Test
@@ -624,9 +625,9 @@ class TestRewriteVectorSearch {
     assertThat(planOf(table, nearestNeighbour(table, 2))).contains("VectorSearchSource");
 
     // the indexed row is the closest one, and the new row comes from the scan of the data file the
-    // index does not cover
+    // index does not cover: it is far under L2, so it does not make the two nearest
     List<Row> hits = search(table, 2);
-    assertThat(hits.stream().map(row -> row.getLong(0))).containsExactly(1L, 5L);
+    assertThat(hits.stream().map(row -> row.getLong(0))).containsExactly(1L, 3L);
     assertThat(hits).isEqualTo(fullScan(table, 2));
   }
 
@@ -752,16 +753,31 @@ class TestRewriteVectorSearch {
 
   @Test
   public void usesAMatchingIndexWhenTheMetricIsSpelledOut() {
-    String table = tableWithIndex("docs_explicit_cosine", "hnsw");
+    String table = table("docs_explicit_cosine");
+    spark.sql(
+        String.format(
+            "CALL local.system.build_vector_index("
+                + "table => '%s', column => 'embedding', dimension => 2, metric => 'cosine', "
+                + "mode => 'hnsw')",
+            table));
 
-    // the same question as the two-argument form, now said out loud
+    // the metric the query names is the one the index was built with
     String explicit =
         String.format(
             "SELECT id FROM local.%s "
                 + "ORDER BY vec_distance(embedding, array(0.9d, 0.1d), 'cosine') LIMIT 2",
             table);
+    List<Row> cosineScan =
+        spark
+            .sql(
+                String.format(
+                    "SELECT id FROM local.%s "
+                        + "ORDER BY vec_distance(embedding, array(0.9d, 0.1d), 'cosine') + 0.0d "
+                        + "LIMIT 2",
+                    table))
+            .collectAsList();
     assertThat(planOf(table, explicit)).contains("VectorSearchSource");
-    assertThat(spark.sql(explicit).collectAsList()).containsExactlyElementsOf(search(table, 2));
+    assertThat(spark.sql(explicit).collectAsList()).containsExactlyElementsOf(cosineScan);
   }
 
   @Test
@@ -769,11 +785,17 @@ class TestRewriteVectorSearch {
     // the index answers cosine; the query asks for euclidean. Re-binding the query to the index
     // metric would answer a question nobody asked, so the index is left alone and the table is
     // scanned with the distance the query named
-    String table = tableWithIndex("docs_explicit_euclidean", "hnsw");
+    String table = table("docs_explicit_euclidean");
+    spark.sql(
+        String.format(
+            "CALL local.system.build_vector_index("
+                + "table => '%s', column => 'embedding', dimension => 2, metric => 'cosine', "
+                + "mode => 'hnsw')",
+            table));
 
     String mismatched =
         String.format(
-            "SELECT id, vec_distance(embedding, array(0.9d, 0.1d), 'euclidean') AS d "
+            "SELECT id, vec_distance(embedding, array(0.9d, 0.1d), 'l2') AS d "
                 + "FROM local.%s ORDER BY d LIMIT 2",
             table);
     assertThat(planOf(table, mismatched)).doesNotContain("VectorSearchSource");
@@ -784,7 +806,14 @@ class TestRewriteVectorSearch {
     assertThat(hits.get(0).getDouble(1)).isCloseTo(Math.sqrt(0.02d), within(1e-6d));
 
     // the same table still answers the cosine question from the index
-    assertThat(planOf(table, nearestNeighbour(table, 2))).contains("VectorSearchSource");
+    assertThat(
+            planOf(
+                table,
+                String.format(
+                    "SELECT id FROM local.%s "
+                        + "ORDER BY vec_distance(embedding, array(0.9d, 0.1d), 'cosine') LIMIT 2",
+                    table)))
+        .contains("VectorSearchSource");
   }
 
   @Test
@@ -795,21 +824,21 @@ class TestRewriteVectorSearch {
         spark
             .sql(
                 String.format(
-                    "SELECT vec_distance(embedding, array(0.9d, 0.1d), 'euclidean') FROM local.%s "
+                    "SELECT vec_distance(embedding, array(0.9d, 0.1d), 'l2') FROM local.%s "
                         + "WHERE id = 1",
                     table))
             .head();
     assertThat(euclidean.getDouble(0)).isCloseTo(Math.sqrt(0.02d), within(1e-6d));
 
-    // the two-argument form keeps the cosine distance it has always computed
-    Row cosine =
+    // the two-argument form computes the default metric, which is L2
+    Row defaultMetric =
         spark
             .sql(
                 String.format(
                     "SELECT vec_distance(embedding, array(0.9d, 0.1d)) FROM local.%s WHERE id = 1",
                     table))
             .head();
-    assertThat(cosine.getDouble(0)).isCloseTo(1.0d - 0.9d / Math.sqrt(0.82d), within(1e-6d));
+    assertThat(defaultMetric.getDouble(0)).isCloseTo(Math.sqrt(0.02d), within(1e-6d));
   }
 
   @Test

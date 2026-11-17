@@ -62,8 +62,8 @@ class TestIvfInPlaceSearch {
 
   @Test
   void answersTheSameWhateverTheCallerDoesToTheBufferAfterwards() {
-    List<IndexEntry> entries = entries(VectorIndexDefinition.Metric.EUCLIDEAN, ENTRIES);
-    VectorIndexAdapter ivf = ivfAdapter(VectorIndexDefinition.Metric.EUCLIDEAN, NLIST, NLIST);
+    List<IndexEntry> entries = entries(VectorIndexDefinition.Metric.L2, ENTRIES);
+    VectorIndexAdapter ivf = ivfAdapter(VectorIndexDefinition.Metric.L2, NLIST, NLIST);
     byte[] payload = VectorPayloads.toBytes(ivf.encodeAuxiliaryPayload(entries, 1));
     ByteBuffer query = ivf.encodeQuery(vector(0));
 
@@ -130,8 +130,8 @@ class TestIvfInPlaceSearch {
 
   @Test
   void takesTheSmallerOfTopKAndTheCandidatesItHas() {
-    List<IndexEntry> entries = entries(VectorIndexDefinition.Metric.EUCLIDEAN, ENTRIES);
-    VectorIndexAdapter ivf = ivfAdapter(VectorIndexDefinition.Metric.EUCLIDEAN, NLIST, NLIST);
+    List<IndexEntry> entries = entries(VectorIndexDefinition.Metric.L2, ENTRIES);
+    VectorIndexAdapter ivf = ivfAdapter(VectorIndexDefinition.Metric.L2, NLIST, NLIST);
     IndexAdapter.PreparedSearch prepared =
         ivf.prepareAuxiliary(ivf.encodeAuxiliaryPayload(entries, 1));
     ByteBuffer query = ivf.encodeQuery(vector(3));
@@ -194,8 +194,8 @@ class TestIvfInPlaceSearch {
   @Test
   @Timeout(60)
   void answersTheSameWhenTheSearcherIsSearchedConcurrently() throws Exception {
-    List<IndexEntry> entries = entries(VectorIndexDefinition.Metric.EUCLIDEAN, 400);
-    VectorIndexAdapter ivf = ivfAdapter(VectorIndexDefinition.Metric.EUCLIDEAN, 8, 8);
+    List<IndexEntry> entries = entries(VectorIndexDefinition.Metric.L2, 400);
+    VectorIndexAdapter ivf = ivfAdapter(VectorIndexDefinition.Metric.L2, 8, 8);
     IndexAdapter.PreparedSearch prepared =
         ivf.prepareAuxiliary(ivf.encodeAuxiliaryPayload(entries, 1));
 

@@ -26,10 +26,10 @@ import org.apache.iceberg.relocated.com.google.common.base.Preconditions;
  * entries and by any engine that has to score a query the same way.
  *
  * <p>Two views of the same math are exposed because they are needed for different purposes. {@link
- * #score} is what the index stores and orders by: for {@link Metric#COSINE} and {@link
- * Metric#DOT_PRODUCT} a higher score is closer, for {@link Metric#EUCLIDEAN} a lower one is. {@link
- * #distance} is what a query asks for: smaller always means closer, whatever the metric, so that
- * {@code ORDER BY vec_distance(...)} can be ascending for every metric.
+ * #score} is what the index stores and orders by: for {@link Metric#COSINE} and {@link Metric#DOT}
+ * a higher score is closer, for {@link Metric#L2} a lower one is. {@link #distance} is what a query
+ * asks for: smaller always means closer, whatever the metric, so that {@code ORDER BY
+ * vec_distance(...)} can be ascending for every metric.
  */
 public final class VectorDistance {
 
@@ -41,7 +41,7 @@ public final class VectorDistance {
    * @param metric the metric of the index
    * @param vector the stored vector
    * @param query the query vector
-   * @return the index score: higher is closer for cosine and dot product, lower for euclidean
+   * @return the index score: higher is closer for cosine and dot, lower for L2
    */
   public static double score(Metric metric, float[] vector, float[] query) {
     Preconditions.checkArgument(
@@ -52,9 +52,9 @@ public final class VectorDistance {
     switch (metric) {
       case COSINE:
         return cosineSimilarity(vector, query);
-      case DOT_PRODUCT:
+      case DOT:
         return dotProduct(vector, query);
-      case EUCLIDEAN:
+      case L2:
         return euclideanDistance(vector, query);
       default:
         throw new IllegalArgumentException("Unknown vector index metric: " + metric);
@@ -78,9 +78,9 @@ public final class VectorDistance {
     switch (metric) {
       case COSINE:
         return 1.0 - cosineSimilarity(vector, query);
-      case DOT_PRODUCT:
+      case DOT:
         return -dotProduct(vector, query);
-      case EUCLIDEAN:
+      case L2:
         return euclideanDistance(vector, query);
       default:
         throw new IllegalArgumentException("Unknown vector index metric: " + metric);

@@ -183,7 +183,7 @@ class TestVectorCoverageModes {
     spark.sql(
         "CALL local.system.build_vector_index(table => 'db.t_"
             + name
-            + "', column => 'embedding', dimension => 2, metric => 'euclidean', "
+            + "', column => 'embedding', dimension => 2, metric => 'l2', "
             + "structure => 'flat')");
 
     // the nearest rows arrive after the index was built, so no index snapshot covers their file
@@ -216,7 +216,7 @@ class TestVectorCoverageModes {
     spark.sql(
         "CALL local.system.build_vector_index(table => 'db.t_"
             + name
-            + "', column => 'embedding', dimension => 2, metric => 'euclidean', "
+            + "', column => 'embedding', dimension => 2, metric => 'l2', "
             + "structure => 'flat')");
 
     // the delete is a position delete of its own, so the data file the index saw stays in place

@@ -18,6 +18,7 @@
  */
 package org.apache.iceberg.index.vector;
 
+import java.util.Locale;
 import java.util.Map;
 import org.apache.iceberg.index.IndexDefinition;
 import org.apache.iceberg.relocated.com.google.common.base.MoreObjects;
@@ -77,9 +78,45 @@ public final class VectorIndexDefinition implements IndexDefinition {
 
   /** Similarity and distance metrics supported by the vector index. */
   public enum Metric {
+    /** Cosine similarity: the angle between two vectors. */
     COSINE,
-    DOT_PRODUCT,
-    EUCLIDEAN
+
+    /** Dot product: the inner product of two vectors. */
+    DOT,
+
+    /** Euclidean distance, also called L2. */
+    L2;
+
+    /** The metric used when a caller does not name one. */
+    public static final Metric DEFAULT = L2;
+
+    /**
+     * Parses a metric name, accepting the spellings callers and old metadata use.
+     *
+     * <p>The names this project writes are {@code l2}, {@code cosine} and {@code dot}, in any case.
+     * The other spellings are read because metadata written before the rename holds them, and SQL
+     * written for other vector engines uses them.
+     */
+    public static Metric fromName(String name) {
+      String normalized = name.trim().toLowerCase(Locale.ROOT);
+      switch (normalized) {
+        case "cosine":
+        case "cos":
+          return COSINE;
+        case "dot":
+        case "dot_product":
+        case "dot-product":
+        case "inner_product":
+        case "ip":
+          return DOT;
+        case "l2":
+        case "euclidean":
+          return L2;
+        default:
+          throw new IllegalArgumentException(
+              "Unsupported vector index metric: " + name + ", expected l2, cosine or dot");
+      }
+    }
   }
 
   private final int fieldId;
@@ -188,7 +225,7 @@ public final class VectorIndexDefinition implements IndexDefinition {
   public static final class Builder {
     private Integer fieldId;
     private Integer dimension;
-    private Metric metric;
+    private Metric metric = Metric.DEFAULT;
     private VectorStructure structure = VectorStructure.FLAT;
     private VectorQuantizer quantizer = VectorQuantizer.NONE;
     private final Map<String, String> properties = Maps.newLinkedHashMap();
