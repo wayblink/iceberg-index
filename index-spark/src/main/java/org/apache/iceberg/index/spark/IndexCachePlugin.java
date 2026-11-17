@@ -25,6 +25,8 @@ import org.apache.spark.api.plugin.DriverPlugin;
 import org.apache.spark.api.plugin.ExecutorPlugin;
 import org.apache.spark.api.plugin.PluginContext;
 import org.apache.spark.api.plugin.SparkPlugin;
+import org.apache.spark.scheduler.SparkListener;
+import org.apache.spark.scheduler.SparkListenerExecutorRemoved;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -51,6 +53,7 @@ public class IndexCachePlugin implements SparkPlugin {
     private static final Logger LOG = LoggerFactory.getLogger(IndexCacheDriverPlugin.class);
     private IndexCacheDriverControl control;
     private SparkContext context;
+    private SparkListener executorListener;
 
     @Override
     public Map<String, String> init(SparkContext sc, PluginContext pluginContext) {
@@ -65,6 +68,15 @@ public class IndexCachePlugin implements SparkPlugin {
       // by the context: Spark has not assigned the application id when a driver plugin starts.
       context = sc;
       IndexCacheDriverRegistry.register(sc, control);
+      IndexCacheDriverControl driver = control;
+      executorListener =
+          new SparkListener() {
+            @Override
+            public void onExecutorRemoved(SparkListenerExecutorRemoved event) {
+              driver.executorRemoved(event.executorId());
+            }
+          };
+      sc.addSparkListener(executorListener);
       return Map.of();
     }
 
@@ -104,6 +116,11 @@ public class IndexCachePlugin implements SparkPlugin {
 
     @Override
     public void shutdown() {
+      if (context != null && executorListener != null) {
+        context.removeSparkListener(executorListener);
+        executorListener = null;
+      }
+
       IndexCacheDriverRegistry.unregister(context);
       context = null;
       control = null;

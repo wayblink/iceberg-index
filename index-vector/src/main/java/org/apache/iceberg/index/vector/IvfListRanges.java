@@ -45,19 +45,19 @@ final class IvfListRanges implements AutoCloseable {
     this.metadataReads = input.metrics();
   }
 
-  void plan(int[] lists, boolean[] scored) {
+  /** Plans the reads and orders the selected lists so each coalesced run is consumed together. */
+  void planInReadOrder(int[] lists, boolean[] scored) {
+    Arrays.sort(lists);
     if (wholeLists != null || lists.length == 0) {
       return;
     }
 
     planned.clear();
-    int[] ordered = lists.clone();
-    Arrays.sort(ordered);
     long selectedBytes = 0L;
     long missingBytes = 0L;
     int runStart = -1;
     int runEnd = -1;
-    for (int list : ordered) {
+    for (int list : lists) {
       int start = starts[list];
       int end = endOf(list);
       selectedBytes += end - start;

@@ -908,7 +908,7 @@ public final class IvfKernel implements VectorKernel, RetainedBytes {
 
       VectorTopK top = new VectorTopK(topK, candidates, scoring, index -> loaded.dataFiles[index]);
       if (ranges != null) {
-        ranges.lists().plan(lists, null);
+        ranges.lists().planInReadOrder(lists, null);
       }
 
       VectorPayloadReader reader = ranges == null ? new VectorPayloadReader(loaded.payload) : null;
@@ -957,7 +957,7 @@ public final class IvfKernel implements VectorKernel, RetainedBytes {
       while (true) {
         int[] lists = nearestCentroids(queryVector, loaded.centroids, probed, scoring);
         if (ranges != null) {
-          ranges.lists().plan(lists, scored);
+          ranges.lists().planInReadOrder(lists, scored);
         }
 
         if (codeBytes == 0) {
@@ -1028,7 +1028,8 @@ public final class IvfKernel implements VectorKernel, RetainedBytes {
 
         int count = loaded.listCounts[list];
         reader = ranges == null ? whole : readList(list, false);
-        long offset = ranges == null ? loaded.listStarts[list] : (long) reader.position() + Integer.BYTES;
+        long offset =
+            ranges == null ? loaded.listStarts[list] : (long) reader.position() + Integer.BYTES;
         for (int record = 0; record < count; record++, offset += stride) {
           int dataFileIndex = reader.intAt(offset);
           long rowPosition = reader.longAt(offset + Integer.BYTES);

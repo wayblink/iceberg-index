@@ -101,6 +101,29 @@ class TestVectorSearchFiltered {
   }
 
   @Test
+  void skipsIndexSearchWhenNoRowsPassThePrefilter() throws Exception {
+    String table = "filtered_empty_prefilter";
+    tableWithIndex(table);
+    spark.conf().set("spark.iceberg.index.vector.filter-mode", "pre");
+    try {
+      Dataset<Row> frame =
+          spark.sql(
+              "SELECT id FROM local.db."
+                  + table
+                  + " WHERE price < 0 ORDER BY vec_distance(embedding, array("
+                  + query()
+                  + "), 'l2') LIMIT 5");
+
+      assertThat(frame.collectAsList()).isEmpty();
+      SparkPlan source = sourceExec(frame);
+      assertThat(metric(source, "numCandidateRounds")).isZero();
+      assertThat(metric(source, "numRowsAtFiles")).isZero();
+    } finally {
+      spark.conf().unset("spark.iceberg.index.vector.filter-mode");
+    }
+  }
+
+  @Test
   void plansTheFilteredQueryAsAnIndexSearch() throws Exception {
     tableWithIndex("filtered_plan");
 

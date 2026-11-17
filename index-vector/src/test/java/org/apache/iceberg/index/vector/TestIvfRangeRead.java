@@ -100,12 +100,39 @@ class TestIvfRangeRead {
     CountingFile file = new CountingFile(payload);
     IvfRangeInput input = new IvfRangeInput(file.newStream(), 0, payload.length, file.location());
     try (IvfListRanges ranges = new IvfListRanges(input, starts)) {
-      ranges.plan(new int[] {5, 4, 1}, null);
-      assertThat(ranges.read(5).readInt()).isEqualTo(5);
-      assertThat(ranges.read(4).readInt()).isEqualTo(4);
-      assertThat(ranges.read(1).readInt()).isEqualTo(1);
+      int[] selected = {5, 4, 1};
+      ranges.planInReadOrder(selected, null);
+      for (int list : selected) {
+        assertThat(ranges.read(list).readInt()).isEqualTo(list);
+      }
+
       assertThat(file.reads).isEqualTo(2);
       assertThat(file.bytes).isEqualTo(3 * Integer.BYTES);
+    }
+  }
+
+  @Test
+  void readsEachCoalescedRangeOnceWhenCentroidOrderInterleavesRanges() {
+    int blockSize = 3 * 1024 * 1024;
+    byte[] payload = new byte[LISTS * blockSize];
+    ByteBuffer buffer = ByteBuffer.wrap(payload);
+    int[] starts = new int[LISTS];
+    for (int list = 0; list < starts.length; list++) {
+      starts[list] = list * blockSize;
+      buffer.putInt(starts[list], list);
+    }
+
+    CountingFile file = new CountingFile(payload);
+    IvfRangeInput input = new IvfRangeInput(file.newStream(), 0, payload.length, file.location());
+    try (IvfListRanges ranges = new IvfListRanges(input, starts)) {
+      int[] selected = {0, 4, 1, 5};
+      ranges.planInReadOrder(selected, null);
+      for (int list : selected) {
+        assertThat(ranges.read(list).readInt()).isEqualTo(list);
+      }
+
+      assertThat(file.reads).isEqualTo(2);
+      assertThat(file.bytes).isEqualTo(4L * blockSize);
     }
   }
 

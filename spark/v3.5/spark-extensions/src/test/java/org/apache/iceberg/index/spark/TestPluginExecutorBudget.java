@@ -108,6 +108,17 @@ class TestPluginExecutorBudget {
       assertThat(warm).isEqualTo(cold);
       assertThat(ShardCountingFileIO.OPENS.get()).isZero();
 
+      spark.conf().set(ExecutorIndexCache.Config.ENABLED, "false");
+      try {
+        ShardCountingFileIO.OPENS.set(0);
+        assertThat(DistributedIndexSearch.searchBatch(spark, metadata, observed, List.of(query)))
+            .isEqualTo(cold);
+        assertThat(ShardCountingFileIO.OPENS.get()).isPositive();
+        assertThat(cache.stats().entries()).isEqualTo(shards.size());
+      } finally {
+        spark.conf().unset(ExecutorIndexCache.Config.ENABLED);
+      }
+
       long textCharge = cache.stats().bytes();
       assertThat(textCharge)
           .isEqualTo(

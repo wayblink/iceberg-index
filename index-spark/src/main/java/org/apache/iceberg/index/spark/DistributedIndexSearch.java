@@ -364,6 +364,15 @@ public final class DistributedIndexSearch {
                   List<Row> partitionRows = Lists.newArrayList();
                   while (indexFiles.hasNext()) {
                     IndexFileTask indexFile = indexFiles.next();
+                    IndexCandidates candidates = plan.candidatesOf(fileIO, indexFile.tasks());
+                    if (candidates != null && candidates.isEmpty()) {
+                      if (tally != null) {
+                        tally.report(0, 0, 0, 0, 0, 0, 0, indexFile.tasks().size(), true);
+                      }
+
+                      continue;
+                    }
+
                     String location = indexFile.location();
                     long readStart = System.nanoTime();
                     OpenedSearch opened =
@@ -372,9 +381,6 @@ public final class DistributedIndexSearch {
                     long searchStart = System.nanoTime();
                     try (opened) {
                       ExecutorIndexCache.CachedFile file = opened.file;
-                      // what this task may score at all, when the query asked for the filter to run
-                      // before the search: the admitted rows of the files this index file covers
-                      IndexCandidates candidates = plan.candidatesOf(fileIO, indexFile.tasks());
                       FileOutcome outcome =
                           rowsOfIndexFile(
                               file,
@@ -469,7 +475,6 @@ public final class DistributedIndexSearch {
     // a kernel that filters while it searches scores the admitted rows and nothing else, so the
     // window is filled from them; one that cannot do that answers the unfiltered question instead,
     // and the hits outside the set are dropped below rather than counted as rejected
-    IndexCandidates admitted = candidates == null || candidates.isEmpty() ? null : candidates;
     // a searcher that scores everything and then keeps what the set admits cannot say by its answer
     // size that it has nothing left: a selective filter makes its answer small however much it
     // still
@@ -477,7 +482,7 @@ public final class DistributedIndexSearch {
     // all
     // been asked for.
     boolean filtersWhileSearching =
-        admitted == null || file.searching(prepared -> prepared.joinsCandidateSet());
+        candidates == null || file.searching(prepared -> prepared.joinsCandidateSet());
     Map<String, FetchedRow> found = Maps.newLinkedHashMap();
     int limit = opening;
     int last = 0;
@@ -495,7 +500,7 @@ public final class DistributedIndexSearch {
       for (byte[] payload : payloads) {
         List<IndexSearchResult> hits =
             file.searching(
-                prepared -> searchFile(prepared, ByteBuffer.wrap(payload), asked, admitted));
+                prepared -> searchFile(prepared, ByteBuffer.wrap(payload), asked, candidates));
         // a kernel that returned the whole window may hold more; one that returned less has nothing
         // left to offer, which is what stops the widening. A kernel that keeps the set afterwards
         // is asked for everything its file holds instead, because its answer size says nothing
@@ -1263,7 +1268,8 @@ public final class DistributedIndexSearch {
             : -1L;
     ExecutorIndexCache.Config config = ExecutorIndexCache.Config.from(spark, workingSet, owner);
     IndexCacheLocations locationsTable = IndexCacheLocations.forContext(context.sc());
-    boolean locality = config.enabled() && localityEnabled(spark);
+    boolean useResidentCache = config.enabled();
+    boolean locality = useResidentCache && localityEnabled(spark);
     List<String> keys =
         cacheKeys(owner, readerKey, searchShards.stream().map(IndexFileTask::location).toList());
     var cacheReports = cacheReports(context, config);
@@ -1276,7 +1282,16 @@ public final class DistributedIndexSearch {
       CorpusStatistics corpus =
           publishedStatistics == null
               ? mergeTextStatistics(
-                  context, files, io, scorer, terms, owner, readerKey, locationsTable, locality)
+                  context,
+                  files,
+                  io,
+                  scorer,
+                  terms,
+                  owner,
+                  readerKey,
+                  locationsTable,
+                  locality,
+                  useResidentCache)
               : adapter.snapshotStatistics(table.io().newInputFile(publishedStatistics), terms);
       Broadcast<CorpusStatistics> statistics = context.broadcast(corpus);
       Broadcast<List<byte[]>> encodedQueries = context.broadcast(payloads);
@@ -1298,8 +1313,10 @@ public final class DistributedIndexSearch {
                       CorpusStatistics corpusForShard = statistics.value();
                       List<List<IndexSearchResult>> results;
                       try (ExecutorIndexCache.Lease lease =
-                          ExecutorIndexCache.get()
-                              .acquireManagedKey(cacheKey(owner, readerKey, file.location()))) {
+                          useResidentCache
+                              ? ExecutorIndexCache.get()
+                                  .acquireManagedKey(cacheKey(owner, readerKey, file.location()))
+                              : null) {
                         results =
                             lease == null
                                 ? text.searchShardBatch(
@@ -1357,7 +1374,8 @@ public final class DistributedIndexSearch {
       String owner,
       String readerKey,
       IndexCacheLocations locationsTable,
-      boolean locality) {
+      boolean locality,
+      boolean useResidentCache) {
     List<String> locations = files.stream().map(IndexFile::location).toList();
     Broadcast<Set<String>> queryTerms = context.broadcast(terms);
     try {
@@ -1372,7 +1390,10 @@ public final class DistributedIndexSearch {
                 TextIndexAdapter text = scorer.value();
                 Set<String> selectedTerms = queryTerms.value();
                 try (ExecutorIndexCache.Lease lease =
-                    ExecutorIndexCache.get().acquireManagedKey(cacheKey(owner, readerKey, file))) {
+                    useResidentCache
+                        ? ExecutorIndexCache.get()
+                            .acquireManagedKey(cacheKey(owner, readerKey, file))
+                        : null) {
                   return lease == null
                       ? text.shardStatistics(io.value().newInputFile(file), selectedTerms)
                       : lease

@@ -24,6 +24,7 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Comparator;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.Iterator;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
@@ -527,6 +528,7 @@ final class IndexResidencyCoordinator {
   private final Clock clock;
   private final IndexPlacementPlanner planner = new IndexPlacementPlanner();
   private final Map<String, NodeState> nodes = new LinkedHashMap<>();
+  private final Set<String> removedExecutors = new HashSet<>();
   private final Map<String, IndexState> indexes = new HashMap<>();
   private final Map<String, PlanState> plans = new LinkedHashMap<>();
   private long planCount;
@@ -811,8 +813,24 @@ final class IndexResidencyCoordinator {
     return lastPlanId;
   }
 
+  void executorRemoved(String executorId) {
+    // A report already in flight must not restore a Spark executor that has been removed.
+    removedExecutors.add(executorId);
+    NodeState node = nodes.remove(executorId);
+    if (node != null) {
+      forgetIncarnation(executorId, node.report.incarnation());
+    }
+  }
+
   IndexCacheProtocol.Reply report(IndexCacheProtocol.NodeReport report) {
     Objects.requireNonNull(report, "Executor report is null");
+    if (removedExecutors.contains(report.executorId())) {
+      return IndexCacheProtocol.Reply.builder()
+          .commands(List.of())
+          .nextSequence(report.sequence())
+          .build();
+    }
+
     NodeState node = nodes.get(report.executorId());
     if (node == null) {
       node = new NodeState(report, clock.nowNanos());

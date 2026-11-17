@@ -20,6 +20,9 @@ package org.apache.iceberg.index.spark;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.when;
 
 import java.time.Duration;
 import java.util.ArrayList;
@@ -36,10 +39,16 @@ import org.apache.iceberg.index.vector.VectorIndexAdapter;
 import org.apache.iceberg.index.vector.VectorIndexDefinition;
 import org.apache.iceberg.index.vector.VectorIndexDefinition.Metric;
 import org.apache.iceberg.index.vector.VectorIndexDefinition.VectorStructure;
+import org.apache.spark.SparkConf;
+import org.apache.spark.SparkContext;
+import org.apache.spark.api.plugin.PluginContext;
+import org.apache.spark.scheduler.SparkListener;
+import org.apache.spark.scheduler.SparkListenerExecutorRemoved;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.mockito.ArgumentCaptor;
 
 /**
  * Exercises the control channel through its Spark-free seam: the same messages Spark's plugin
@@ -96,6 +105,36 @@ class TestIndexCachePlugin {
     assertThat(reply.commands().get(0).type()).isEqualTo(IndexCacheProtocol.CommandType.LOAD);
     assertThat(reply.commands().get(0).planId()).isEqualTo(plan);
     assertThat(reply.commands().get(0).file().location()).isEqualTo("f1");
+  }
+
+  @Test
+  void offloadCompletesWhenSparkRemovesAnExecutorWithADispatchedLoad() {
+    SparkContext spark = mock(SparkContext.class);
+    PluginContext context = mock(PluginContext.class);
+    when(context.conf()).thenReturn(new SparkConf(false));
+    IndexCachePlugin.IndexCacheDriverPlugin plugin = new IndexCachePlugin.IndexCacheDriverPlugin();
+    plugin.init(spark, context);
+    try {
+      IndexCacheDriverControl driver = IndexCacheDriverRegistry.require(spark);
+      driver.receive(report(1));
+      driver.acceptLoad(target("f1"), IndexResidencyPolicy.parse("forever"), driver.nowNanos());
+      assertThat(driver.receive(report(2)).commands())
+          .extracting(IndexCacheProtocol.Command::type)
+          .containsExactly(IndexCacheProtocol.CommandType.LOAD);
+
+      String offload = driver.acceptOffload(INDEX_UUID, driver.nowNanos());
+      assertThat(driver.result(offload).status()).isEqualTo(IndexCacheProtocol.Status.RELEASING);
+
+      ArgumentCaptor<SparkListener> listener = ArgumentCaptor.forClass(SparkListener.class);
+      verify(spark).addSparkListener(listener.capture());
+      listener.getValue().onExecutorRemoved(new SparkListenerExecutorRemoved(0, EXECUTOR, "lost"));
+
+      assertThat(driver.result(offload).status()).isEqualTo(IndexCacheProtocol.Status.OFFLOADED);
+      assertThat(driver.receive(report(3)).commands()).isEmpty();
+      assertThat(driver.nodeReports()).isEmpty();
+    } finally {
+      plugin.shutdown();
+    }
   }
 
   @Test

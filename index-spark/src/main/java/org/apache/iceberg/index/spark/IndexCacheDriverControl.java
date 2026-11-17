@@ -70,6 +70,10 @@ final class IndexCacheDriverControl {
     return coordinator.acceptOffload(indexUuid, nowNanos);
   }
 
+  synchronized void executorRemoved(String executorId) {
+    coordinator.executorRemoved(executorId);
+  }
+
   synchronized IndexCacheProtocol.Result result(String planId) {
     return coordinator.result(planId);
   }
