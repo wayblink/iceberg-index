@@ -506,7 +506,7 @@ BM25 和向量索引共用 executor 的容量预算、LRU 和状态入口。用�
 
 `metric`、`structure`、`quantizer`、`max-m`、`ef-construction`、`ef-search`、`nlist`、`rabitq-bits`、`max-entries-per-index-file`，以及文本侧的 `k1`、`b`（入参名 `length_norm`）、`min-token-length`、`lowercase`、`stopwords`。
 
-`ef-search` 的值来自索引定义，调整它需要重建。IVF 的 `nprobe` 由 Spark 查询会话设置，历史定义中的值会被忽略。
+`ef-search` 的值来自索引定义，调整它需要重建。IVF 的 `nprobe` 由 Spark 查询会话设置，历史定义中的值会被忽略。旧脚本须从构建选项移除 `nprobe`，并在查询会话设置原值。
 
 ---
 

@@ -75,7 +75,7 @@ public class TestCreateIndexDdl extends ExtensionsTestBase {
     // parameters, so a build that a CALL can run is a build this statement can run
     sql(
         "ALTER TABLE %s CREATE INDEX emb_ivf USING vector (embedding) "
-            + "WITH (dimension = 2, structure = 'IVF', options = MAP('nlist', '4', 'nprobe', '4'))",
+            + "WITH (dimension = 2, structure = 'IVF', options = MAP('nlist', '4'))",
         table);
 
     List<Object[]> listed = sql("CALL %s.system.list_indexes(table => '%s')", catalogName, table);

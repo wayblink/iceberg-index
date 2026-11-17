@@ -42,7 +42,7 @@ CALL prod.system.build_vector_index(
   metric                   => 'l2',          -- l2 | cosine | dot，默认 l2
   structure                => 'IVF',         -- IVF | HNSW | FLAT
   quantizer                => 'RABITQ',      -- RABITQ | NONE
-  options                  => map('rabitq-bits', '1', 'nprobe', '32', 'nlist', '0'),
+  options                  => map('rabitq-bits', '1', 'nlist', '0'),
   name                     => 'docs_ivf_1bit',
   max_entries_per_index_file => 262144);
 ```
@@ -60,7 +60,7 @@ CALL prod.system.build_vector_index(
 
 `4bit` 在四张实测表上没有一处优于 3bit（recall 不需要它、体积最大），**不建议作为默认**。
 
-**埋点提示**：`rabitq-bits` 与 `nprobe` 写在索引定义里，同一个列上可以并存多个不同参数的索引（用 `name` 区分），这是做 A/B 对比的正确方式，也是 benchmark 的做法。
+`rabitq-bits` 随索引持久化。要比较不同量化位数，在同一列上用不同名称建索引。要比较不同探测数，对同一索引切换查询会话的 `spark.iceberg.index.vector.ivf.nprobe`（默认 `8`）。从旧脚本的建索引选项移除 `nprobe`，把原值设到查询会话。
 
 ### 2.1.1 索引 DDL
 
@@ -70,7 +70,7 @@ SHOW INDEXES FROM hms.db.docs;
 ALTER TABLE hms.db.docs
   CREATE INDEX docs_ivf_1bit USING vector (embedding)
   WITH (dimension = 128, metric = 'l2', structure = 'IVF',
-        options = map('nprobe', '32', 'rabitq-bits', '1'));
+        options = map('rabitq-bits', '1'));
 
 ALTER TABLE hms.db.docs CREATE INDEX USING fts (body);   -- 文本索引暂时没有名字
 
@@ -109,14 +109,15 @@ LIMIT 10;
 
 ```
 SET spark.iceberg.index.vector.name = docs_ivf_1bit;
-SET spark.iceberg.index.vector.over-sample = 100;
+SET `spark.iceberg.index.vector.ivf.nprobe` = 32;
+SET `spark.iceberg.index.vector.over-sample` = 100;
 ```
 
 `over-sample` 的含义是"向索引要 k×over 个候选，再取前 k"。对 `ORDER BY` 的自动改写，取前 k 之前会**精确重排**，所以放大倍数提高的是**召回**；对 `CALL vector_search` / 两个向量 TVF，结果合同是"索引自己的原始分数、按索引顺序取前 k、删掉的行以 `row = null` 保留"，**不精确重排、不扫未覆盖文件**，因此放大倍数只扩大候选范围、不会让结果变成"精确 Top-K"（近似 kernel 扩大范围后候选集本身可能变，但不保证与旧 `C=k` 逐条一致）。
 
-它是唯一在查询时能调的召回/延迟旋钮：一次设成 100 是安全的（实测 10M/100M 的 1bit 都要 100 倍候选才追平精确召回）。未设置时宽度由索引形态推导（量化 IVF 按位数 50/25/10/5、图 3、无量化结构 1），计划里标成 `overSample=<值> [STRUCTURE_DEFAULT, documented-experience-values]`——那是公布经验区间的插值，不是"已-calibrated 的最优值"。索引不会因为没设置这个旋钮就不被使用。显式设置（包括显式写 1）一律保留；空串、非整数、0、负数会报错而不是被静默改成 1。
+`over-sample` 默认 `0`，基础候选预算为 K，计划显示 `overSample=0 [DEFAULT]`。显式正整数按 K 乘倍数计算。IVF 的 `nprobe` 控制初始探测的列表数，和候选预算分别设置。
 
-**近似 kernel 要拿到与精确扫描一致的结果，必须放大 over-sample。** 集群验收实测：200k 行、16 维、IVF+RaBitQ 4bit、`nprobe=1024`、`nlist=256` 时，`over-sample` 为默认值 1 的 Top-10 与 L2 真值**不同**（召回不满）；把 `spark.iceberg.index.vector.over-sample` 设成 4000 后，Top-10 与 L2 真值逐行一致。也就是说"索引结果 = 精确结果"不是默认行为，而是候选预算足够的产物。
+**近似 kernel 要拿到与精确扫描一致的结果，必须放大 over-sample。** 集群验收实测：200k 行、16 维、IVF+RaBitQ 4bit、`nprobe=1024`、`nlist=256` 时，`over-sample` 的实验值为 1 时，Top-10 与 L2 真值**不同**（召回不满）；把 `spark.iceberg.index.vector.over-sample` 设成 4000 后，Top-10 与 L2 真值逐行一致。也就是说"索引结果 = 精确结果"不是默认行为，而是候选预算足够的产物。
 
 **注意度量**：`vec_distance` 默认算 L2，只有在被改写命中时才特化成索引的 metric。所以"手写一个不走索引的对照查询"时，`vec_distance(...) + 0.0d` 这种写法其实是 L2 排序——若索引是 COSINE，两者排序不同，会出现"精确索引也差一行"的假象。做对照必须自己写与索引一致的 metric（如显式 `'cosine'`）。
 
@@ -127,7 +128,7 @@ SHOW INDEXES FROM hms.db.docs;
 
 ALTER TABLE hms.db.docs CREATE INDEX docs_ivf_1bit USING vector (embedding)
   WITH (dimension = 128, metric = 'l2', structure = 'IVF',
-        options = map('nprobe', '32', 'rabitq-bits', '1'));
+        options = map('rabitq-bits', '1'));
 ALTER TABLE hms.db.docs CREATE INDEX USING fts (body);   -- 文本索引暂时没有名字
 ALTER TABLE hms.db.docs REFRESH INDEX docs_ivf_1bit;      -- 补段 + 重建内容变过的组
 ALTER TABLE hms.db.docs DROP INDEX docs_ivf_1bit;

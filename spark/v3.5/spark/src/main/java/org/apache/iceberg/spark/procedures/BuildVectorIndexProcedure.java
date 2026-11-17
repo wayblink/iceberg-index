@@ -18,7 +18,6 @@
  */
 package org.apache.iceberg.spark.procedures;
 
-import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.UUID;
 import org.apache.iceberg.Table;
@@ -153,6 +152,11 @@ class BuildVectorIndexProcedure extends BaseProcedure {
     VectorStructure structure = parseStructure(input, MODE_PARAM);
     VectorQuantizer quantizer = parseQuantizer(input, QUANTIZER_PARAM);
     Map<String, String> options = input.asStringMap(OPTIONS_PARAM, java.util.Map.of());
+    if (structure == VectorStructure.IVF && options.containsKey("nprobe")) {
+      throw new IllegalArgumentException(
+          "IVF nprobe is a query setting. Remove nprobe from build options and set "
+              + "spark.iceberg.index.vector.ivf.nprobe before searching");
+    }
     int maxM = input.asInt(MAX_M_PARAM, 16);
     int efConstruction = input.asInt(EF_CONSTRUCTION_PARAM, 200);
     int efSearch = input.asInt(EF_SEARCH_PARAM, 50);
@@ -350,12 +354,6 @@ class BuildVectorIndexProcedure extends BaseProcedure {
     if (structure == VectorStructure.HNSW) {
       builder.maxM(maxM).efConstruction(efConstruction).efSearch(efSearch);
     }
-    if (structure == VectorStructure.IVF && options.containsKey("nprobe")) {
-      Map<String, String> buildOptions = new LinkedHashMap<>(options);
-      buildOptions.remove("nprobe");
-      return builder.properties(buildOptions).build();
-    }
-
     return builder.properties(options).build();
   }
 

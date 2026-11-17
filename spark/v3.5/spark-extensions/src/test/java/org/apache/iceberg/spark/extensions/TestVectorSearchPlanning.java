@@ -403,7 +403,7 @@ class TestVectorSearchPlanning {
         "CALL local.system.build_vector_index(table => 'db."
             + name
             + "', column => 'embedding', dimension => 2, metric => 'cosine', "
-            + "structure => 'IVF', quantizer => 'RABITQ', options => map('nprobe', '32'))");
+            + "structure => 'IVF', quantizer => 'RABITQ')");
   }
 
   private static String planOf(String name) {

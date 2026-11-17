@@ -112,7 +112,7 @@ class TestVectorSearchSharedRules {
     spark.sql(
         "CALL local.system.build_vector_index(table => 'db.shared_rabitq', column => 'embedding', "
             + "dimension => 2, metric => 'l2', structure => 'IVF', quantizer => 'RABITQ', "
-            + "options => map('nlist', '2', 'nprobe', '2'))");
+            + "options => map('nlist', '2'))");
     Table table = Spark3Util.loadIcebergTable(spark, "local.db.shared_rabitq");
 
     try {

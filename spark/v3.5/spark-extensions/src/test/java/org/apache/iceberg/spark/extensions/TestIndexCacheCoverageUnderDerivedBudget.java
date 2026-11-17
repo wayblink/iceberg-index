@@ -162,7 +162,7 @@ class TestIndexCacheCoverageUnderDerivedBudget {
         "CALL local.system.build_vector_index(table => 'db."
             + name
             + "', column => 'embedding', dimension => 2, metric => 'l2', "
-            + "structure => 'IVF', quantizer => 'RABITQ', options => map('nlist', '2', "
-            + "'nprobe', '2'), max_entries_per_index_file => 2)");
+            + "structure => 'IVF', quantizer => 'RABITQ', options => map('nlist', '2'), "
+            + "max_entries_per_index_file => 2)");
   }
 }

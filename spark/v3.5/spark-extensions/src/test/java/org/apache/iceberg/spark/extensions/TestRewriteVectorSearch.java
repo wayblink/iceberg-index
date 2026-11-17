@@ -291,7 +291,7 @@ class TestRewriteVectorSearch {
             "CALL local.system.build_vector_index("
                 + "table => '%s', column => 'embedding', dimension => 2, "
                 + "structure => 'IVF', quantizer => 'NONE', "
-                + "options => map('nlist', '4', 'nprobe', '4'))",
+                + "options => map('nlist', '4'))",
             table));
 
     try {
@@ -319,7 +319,7 @@ class TestRewriteVectorSearch {
             "CALL local.system.build_vector_index("
                 + "table => '%s', column => 'embedding', dimension => 2, "
                 + "structure => 'IVF', quantizer => 'RABITQ', "
-                + "options => map('nlist', '4', 'nprobe', '4', 'rabitq-bits', '3'))",
+                + "options => map('nlist', '4', 'rabitq-bits', '3'))",
             table));
 
     try {
@@ -367,7 +367,7 @@ class TestRewriteVectorSearch {
             "CALL local.system.build_vector_index("
                 + "table => '%s', column => 'embedding', dimension => 2, metric => 'l2', "
                 + "structure => 'IVF', "
-                + "options => map('nlist', '4', 'nprobe', '4'))",
+                + "options => map('nlist', '4'))",
             table));
 
     String query =

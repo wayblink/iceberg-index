@@ -196,7 +196,7 @@ public class TestNamedIndexes extends ExtensionsTestBase {
         catalogName, table);
     sql(
         "CALL %s.system.build_vector_index(table => '%s', column => 'embedding', dimension => 2, "
-            + "name => 'ivf', structure => 'IVF', options => map('nprobe', '4'))",
+            + "name => 'ivf', structure => 'IVF')",
         catalogName, table);
 
     String query = "SELECT id FROM %s ORDER BY vec_distance(embedding, array(0.0d, 10.0d)) LIMIT 3";

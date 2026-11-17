@@ -203,7 +203,7 @@ public class TestVectorIndexProcedures extends ExtensionsTestBase {
     // over the table is involved and nothing is redistributed
     List<Object[]> built =
         sql(
-            "CALL %s.system.build_vector_index(table => '%s', column => 'embedding', dimension => 2, structure => 'IVF', options => map('nprobe', '4'))",
+            "CALL %s.system.build_vector_index(table => '%s', column => 'embedding', dimension => 2, structure => 'IVF')",
             catalogName, tableName);
     assertThat(built).hasSize(1);
 

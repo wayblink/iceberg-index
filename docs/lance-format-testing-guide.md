@@ -89,7 +89,8 @@ INSERT INTO hms.sparkann.lance_smoke SELECT id, array(CAST(id AS double), CAST(1
 CALL hms.system.build_vector_index(table => 'sparkann.lance_smoke', column => 'embedding',
                                    dimension => 2, metric => 'euclidean',
                                    structure => 'IVF', quantizer => 'RABITQ', name => 'smoke_ivf1',
-                                   options => map('nprobe','32','rabitq-bits','1'));
+                                   options => map('rabitq-bits','1'));
+SET `spark.iceberg.index.vector.ivf.nprobe` = 32;
 
 CALL hms.system.check_indexes(table => 'sparkann.lance_smoke');   -- readable=true, stale=false
 CALL hms.system.vector_search(table => 'sparkann.lance_smoke', column => 'embedding',

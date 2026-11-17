@@ -132,6 +132,19 @@ class TestVectorIndexGuide {
     assertThat(status.get(0).getString(14)).isNotNull();
   }
 
+  @Test
+  void theOldBuildProbeSettingNamesItsQueryReplacement() {
+    createTable("ivf_legacy_option", 4);
+    assertThatThrownBy(
+            () ->
+                spark.sql(
+                    "CALL local.system.build_vector_index(table => 'db.ivf_legacy_option', "
+                        + "column => 'embedding', dimension => 2, structure => 'IVF', "
+                        + "options => map('nprobe', '32'))"))
+        .hasMessageContaining("Remove nprobe from build options")
+        .hasMessageContaining("spark.iceberg.index.vector.ivf.nprobe");
+  }
+
   /** §3 · the full parameter list of the build, as the manual spells it. */
   @Test
   void theDocumentedBuildParametersAreAccepted() {
@@ -141,7 +154,7 @@ class TestVectorIndexGuide {
         "CALL local.system.build_vector_index("
             + "table => 'db.ivf', column => 'embedding', dimension => 2, metric => 'cosine', "
             + "structure => 'IVF', quantizer => 'RABITQ', "
-            + "options => map('nlist', '0', 'nprobe', '32', 'rabitq-bits', '1'), "
+            + "options => map('nlist', '0', 'rabitq-bits', '1'), "
             + "name => 'arm_ivf_1bit', max_entries_per_index_file => 1000000)");
 
     List<Row> indexes =
@@ -294,7 +307,7 @@ class TestVectorIndexGuide {
     spark.sql(
         "CALL local.system.build_vector_index("
             + "table => 'db.over', column => 'embedding', dimension => 2, structure => 'IVF', "
-            + "quantizer => 'RABITQ', options => map('nprobe', '32', 'rabitq-bits', '4'))");
+            + "quantizer => 'RABITQ', options => map('rabitq-bits', '4'))");
 
     // the same ordering with an addition the rewrite does not recognize, so the table is scanned
     // and the answer is exact
@@ -322,7 +335,7 @@ class TestVectorIndexGuide {
     spark.sql(
         "CALL local.system.build_vector_index("
             + "table => 'db.deleted', column => 'embedding', dimension => 2, metric => 'l2', "
-            + "structure => 'IVF', quantizer => 'RABITQ', options => map('nprobe', '64'))");
+            + "structure => 'IVF', quantizer => 'RABITQ')");
 
     spark.sql("DELETE FROM local.db.deleted WHERE id = 1");
 
@@ -611,8 +624,7 @@ class TestVectorIndexGuide {
     spark.sql(
         String.format(
             "CALL local.system.build_vector_index(table => '%s', column => 'embedding', "
-                + "dimension => 2, structure => 'IVF', quantizer => 'RABITQ', "
-                + "options => map('nprobe', '64'))",
+                + "dimension => 2, structure => 'IVF', quantizer => 'RABITQ')",
             table));
   }
 
