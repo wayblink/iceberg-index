@@ -118,12 +118,9 @@ case class RewriteVectorSearch(spark: SparkSession) extends Rule[LogicalPlan] {
     if (sparkTable.table().schema().findField(column) == null) {
       return None
     }
-    // a data file does not carry the values of its partition columns, but the ones an identity
-    // partition puts in the path are recovered from it, so only the other transforms are a reason
-    // to stand aside
-    if (!IndexRewriteSupport.hasOnlyIdentityPartitions(sparkTable.table())) {
-      return None
-    }
+    // every column the search has to return has to be one the data files carry: a partition column
+    // derived from a transform is not visible in the table schema at all, and a query cannot name
+    // it, so the columns a scan was asked for are what decides whether the rows can be read back
     IndexRewriteSupport.scanColumns(scan).getOrElse(return None)
 
     val query = IndexRewriteSupport.queryOf(distance).getOrElse(return None)

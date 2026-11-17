@@ -99,7 +99,7 @@ LIMIT 10;
 
 1. 该列上存在向量索引；
 2. 至少有一个数据文件被索引覆盖（未覆盖的部分仍会残余扫描，所以索引落后于快照也能用）；
-3. **表的非恒等分区不能存在**：数据文件里不含分区列的值，只有恒等分区能从路径里还原，所以 `bucket(...)`、`days(...)` 之类的表上规则会让路、查询退回扫描。恒等分区（`PARTITIONED BY (dt)`）可以。这条是集群验收时实测到的（`RewriteVectorSearch` 里的 `hasOnlyIdentityPartitions`），不是猜测——用 `bucket(4, id)` 建表时 `EXPLAIN` 里没有 `VectorSearchSource`，去掉分区后立刻出现。
+3. **查询要返回的列必须是数据文件里能读到的列**（`RewriteVectorSearch` 里的 `scanColumns`）。`bucket(...)`、`days(...)` 这类变换分区**不再**阻止改写：它们产生的分区列在表 schema 里不可见、查询也写不出来，所以查询实际需要的只有数据文件里的普通列，回表读得到。早先按 `hasOnlyIdentityPartitions` 整表让路的规则已经删掉（`TestRewriteVectorSearch.usesAnIndexOnABucketedTableWhenThePartitionColumnIsNotNeeded` 断言 `bucket(4, id)` 表上 `EXPLAIN` 出现 `VectorSearchSource`，且结果与全扫描逐行相同）。
 
 **FLAT 也参与改写。** 早先的规则因为"FLAT 每个条目都要打分、代价等同扫描"把精确索引排除在改写之外；现在这条成本判断已被移除——能不能用索引只看正确性，不看代价（`TestVectorIndexGuide.theRewriteUsesWhateverStructureTheIndexHas` 断言了 `EXPLAIN` 里出现 `VectorSearchSource`）。所以 `ORDER BY` 自动改写对 FLAT 也生效，只是它省不了多少开销：候选就是全部条目，重排后仍然是全量打分。用户手册里"索引不能是 FLAT"的说法属于旧行为，以本条为准。
 
@@ -386,7 +386,7 @@ docker push hub.i.basemind.com/spark/sparkann-e2e:<tag>
 | 5 杀掉 executor 后仍一致 | PASS | 第 1 次迭代后 `Lost executor 2 ... deleted by a user`，其后 5 次迭代 Top-10 与 L2 真值逐行相同 |
 | 6 `index_cache_status` 可读、不 OOM | PASS（附带说明） | 可读、无 OOM；返回 **0 行**，因为该路径 `driverMaterialization=true`，索引检索在 driver 侧完成，执行器没有缓存条目可报。这不是缺陷，但意味着"缓存状态"目前不能用来判断这个计划下的缓存占用 |
 
-**验收过程中学到的两条（已写回 §2.2）**：非恒等分区（`bucket(...)`）会让改写规则让路；近似 kernel 要拿到与精确扫描一致的结果，必须把 `over-sample` 放大（默认 1 时 Top-10 与真值不同，4000 时一致）。
+**验收过程中学到的两条（已写回 §2.2）**：非恒等分区（`bucket(...)`）曾让改写规则让路，现已改为按查询需要的列判断（见 §2.2 第 3 条）；近似 kernel 要拿到与精确扫描一致的结果，必须把 `over-sample` 放大（默认 1 时 Top-10 与真值不同，4000 时一致）。
 
 **本节不做的事**：没有测 100M、没有测多索引并存、没有更新集群默认配置。验收用的表与索引留在 HDFS `/user/wanganyang/iceberg-acc/warehouse` 作为证据。
 

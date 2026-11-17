@@ -713,7 +713,7 @@ class TestRewriteVectorSearch {
   }
 
   @Test
-  public void leavesThePlanAloneForATransformedPartition() {
+  public void usesAnIndexOnABucketedTableWhenThePartitionColumnIsNotNeeded() {
     String table = "db.docs_bucketed";
     spark.sql(
         String.format(
@@ -727,8 +727,10 @@ class TestRewriteVectorSearch {
                 + "table => '%s', column => 'embedding', dimension => 2, mode => 'hnsw')",
             table));
 
-    // the bucket number is in the path but the column value is not, so the rows cannot be read back
-    assertThat(planOf(table, nearestNeighbour(table, 2))).doesNotContain("VectorSearchSource");
+    // the query reads columns the data files carry, so the bucket number in the path is not in the
+    // way: the index answers and the rows it returns are the rows a scan returns
+    assertThat(planOf(table, nearestNeighbour(table, 2))).contains("VectorSearchSource");
+    assertThat(search(table, 2)).isEqualTo(fullScan(table, 2));
   }
 
   private static List<Row> partitionRows(String table) {

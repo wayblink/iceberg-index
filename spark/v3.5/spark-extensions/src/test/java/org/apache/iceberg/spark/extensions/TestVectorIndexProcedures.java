@@ -105,7 +105,7 @@ public class TestVectorIndexProcedures extends ExtensionsTestBase {
 
     List<Object[]> buildOutput =
         sql(
-            "CALL %s.system.build_vector_index(table => '%s', column => 'embedding', dimension => 2, metric => 'l2')",
+            "CALL %s.system.build_vector_index(table => '%s', column => 'embedding', dimension => 2, metric => 'cosine')",
             catalogName, tableName);
     assertThat(buildOutput).hasSize(1);
     String indexUuid = buildOutput.get(0)[0].toString();
@@ -131,7 +131,7 @@ public class TestVectorIndexProcedures extends ExtensionsTestBase {
     assertThat(listOutput.get(0)[7].toString())
         .contains("\"structure\":\"FLAT\"")
         .contains("\"quantizer\":\"NONE\"");
-    assertThat(listOutput.get(0)[7].toString()).contains("\"metric\":\"L2\"");
+    assertThat(listOutput.get(0)[7].toString()).contains("\"metric\":\"COSINE\"");
     assertThat(listOutput.get(0)[7].toString()).contains("\"dimension\":2");
 
     // a query close to (1.0, 0.0) must return id=1 first, with the resolved row attached. The query

@@ -261,7 +261,7 @@ class TestVectorIndexGuide {
 
   /** §2 · only identity partitioning is rewritten. */
   @Test
-  void aTransformedPartitionIsNotRewritten() {
+  void aTransformedPartitionIsRewritten() {
     spark.sql(
         "CREATE TABLE local.db.bucketed (id bigint, embedding array<double>) USING iceberg "
             + "PARTITIONED BY (bucket(4, id))");
@@ -274,8 +274,8 @@ class TestVectorIndexGuide {
             + "quantizer => 'RABITQ')");
 
     assertThat(planOf("db.bucketed"))
-        .as("a bucket partition has no value in the path to recover")
-        .doesNotContain("VectorSearchSource");
+        .as("a bucket partition hides no column the query reads")
+        .contains("VectorSearchSource");
 
     // the explicit entry point does not care about partitioning
     assertThat(
