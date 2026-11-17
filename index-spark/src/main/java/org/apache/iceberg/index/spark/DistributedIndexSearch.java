@@ -57,6 +57,8 @@ import org.apache.iceberg.index.text.TextIndexAdapter;
 import org.apache.iceberg.index.text.TextIndexAdapter.CorpusCounts;
 import org.apache.iceberg.index.text.TextIndexAdapter.CorpusStatistics;
 import org.apache.iceberg.index.text.TextIndexDefinition;
+import org.apache.iceberg.index.vector.VectorIndexAdapter;
+import org.apache.iceberg.index.vector.VectorIndexDefinition;
 import org.apache.iceberg.io.FileIO;
 import org.apache.iceberg.io.IOUtil;
 import org.apache.iceberg.io.InputFile;
@@ -343,15 +345,13 @@ public final class DistributedIndexSearch {
         cacheReports(sparkContext, cacheRef.getValue());
     // identifies this search, so its tasks report this executor's cache once instead of once each
     String queryRun = java.util.UUID.randomUUID().toString();
+    boolean rangeRead = rangeReadEnabled(spark, adapter);
     RowCounters tally = counters;
 
     int topK = query.topK();
     int initial = Math.max(opening, topK + 1);
 
-    // one index file per partition, because an index file is the unit of work: it carries a graph
-    // or
-    // a posting list of its own, so it is read whole and searched as a whole, and the number of
-    // partitions is the number of index files rather than whatever a byte budget would make of them
+    // Each index file carries an independent search structure and is one unit of work.
     return IndexFileRdds.tasks(sparkContext.sc(), shipped, cacheKeys, locationsTable, locality)
         .mapPartitions(
             (FlatMapFunction<Iterator<IndexFileTask>, Row>)
@@ -365,22 +365,10 @@ public final class DistributedIndexSearch {
                   while (indexFiles.hasNext()) {
                     IndexFileTask indexFile = indexFiles.next();
                     String location = indexFile.location();
-                    ExecutorIndexCache cache = ExecutorIndexCache.get();
-                    String managedKey = cacheKey(cacheConfig.owner(), cacheKey, location);
-                    // A file residency management owns is leased, so a release waits for this
-                    // query;
-                    // anything else keeps the old lazy behaviour.
-                    ExecutorIndexCache.Lease lease = cache.acquireManagedKey(managedKey);
-                    ExecutorIndexCache.CachedFile file =
-                        lease != null
-                            ? lease.file()
-                            : cache.file(
-                                location,
-                                cacheConfig,
-                                cacheKey,
-                                sizeHint(fileIO, location),
-                                () -> loadFile(fileIO, location, fileAdapter));
-                    try {
+                    OpenedSearch opened =
+                        openSearch(fileIO, location, fileAdapter, cacheConfig, cacheKey, rangeRead);
+                    try (opened) {
+                      ExecutorIndexCache.CachedFile file = opened.file();
                       // what this task may score at all, when the query asked for the filter to run
                       // before the search: the admitted rows of the files this index file covers
                       IndexCandidates candidates = plan.candidatesOf(fileIO, indexFile.tasks());
@@ -409,10 +397,6 @@ public final class DistributedIndexSearch {
                             outcome.rows.size() < topK);
                       }
                       partitionRows.addAll(outcome.rows);
-                    } finally {
-                      if (lease != null) {
-                        lease.close();
-                      }
                     }
                   }
                   reportCache(cacheReports, queryRun);
@@ -901,16 +885,14 @@ public final class DistributedIndexSearch {
         cacheReports(context, cacheRef.getValue());
     // identifies this search, so its tasks report this executor's cache once instead of once each
     String queryRun = java.util.UUID.randomUUID().toString();
+    boolean rangeRead = rangeReadEnabled(spark, adapter);
 
     // the limit is captured as a primitive: the query itself is not serializable. One more than the
     // query asks for is kept, because that is what says whether there is another round to ask for.
     int topK = query.topK();
     int localTopK = topK + 1;
 
-    // one index file per partition, because an index file is the unit of work: it carries a graph
-    // or
-    // a posting list of its own, so it is read whole and searched as a whole, and the number of
-    // partitions is the number of index files rather than whatever a byte budget would make of them
+    // Each index file carries an independent search structure and is one unit of work.
     List<Tuple3<String, Long, Double>> top =
         IndexFileRdds.javaRdd(context.sc(), locations, cacheKeys, locationsTable, locality)
             .mapPartitions(
@@ -926,23 +908,13 @@ public final class DistributedIndexSearch {
                       while (locations1.hasNext()) {
                         String location = locations1.next();
                         long readStart = System.nanoTime();
-                        ExecutorIndexCache cache = ExecutorIndexCache.get();
-                        String managedKey = cacheKey(cacheConfig.owner(), cacheKey, location);
-                        // A file residency management owns is leased, so a release waits for this
-                        // query; anything else keeps the old lazy behaviour.
-                        ExecutorIndexCache.Lease lease = cache.acquireManagedKey(managedKey);
-                        ExecutorIndexCache.CachedFile file =
-                            lease != null
-                                ? lease.file()
-                                : cache.file(
-                                    location,
-                                    cacheConfig,
-                                    cacheKey,
-                                    sizeHint(fileIO, location),
-                                    () -> loadFile(fileIO, location, fileAdapter));
+                        OpenedSearch opened =
+                            openSearch(
+                                fileIO, location, fileAdapter, cacheConfig, cacheKey, rangeRead);
                         long readNanos = System.nanoTime() - readStart;
                         long searchStart = System.nanoTime();
-                        try {
+                        try (opened) {
+                          ExecutorIndexCache.CachedFile file = opened.file();
                           for (IndexSearchResult hit :
                               file.searching(
                                   prepared ->
@@ -953,10 +925,6 @@ public final class DistributedIndexSearch {
                                           fileCandidates))) {
                             fileHits.add(
                                 new Tuple3<>(hit.dataFile(), hit.rowPosition(), hit.score()));
-                          }
-                        } finally {
-                          if (lease != null) {
-                            lease.close();
                           }
                         }
                         LOG.debug(
@@ -1080,6 +1048,7 @@ public final class DistributedIndexSearch {
         cacheReports(context, cacheRef.getValue());
     // identifies this search, so its tasks report this executor's cache once instead of once each
     String queryRun = java.util.UUID.randomUUID().toString();
+    boolean rangeRead = rangeReadEnabled(spark, adapter);
 
     // one more than the widest query asks for is kept per query, because that is what says whether
     // there is another round to ask for
@@ -1099,22 +1068,14 @@ public final class DistributedIndexSearch {
                       while (locations1.hasNext()) {
                         String location = locations1.next();
                         long readStart = System.nanoTime();
-                        ExecutorIndexCache cache = ExecutorIndexCache.get();
-                        String managedKey = cacheKey(cacheConfig.owner(), cacheKey, location);
-                        ExecutorIndexCache.Lease lease = cache.acquireManagedKey(managedKey);
-                        ExecutorIndexCache.CachedFile file =
-                            lease != null
-                                ? lease.file()
-                                : cache.file(
-                                    location,
-                                    cacheConfig,
-                                    cacheKey,
-                                    sizeHint(fileIO, location),
-                                    () -> loadFile(fileIO, location, fileAdapter));
+                        OpenedSearch opened =
+                            openSearch(
+                                fileIO, location, fileAdapter, cacheConfig, cacheKey, rangeRead);
                         long readNanos = System.nanoTime() - readStart;
 
                         long searchStart = System.nanoTime();
-                        try {
+                        try (opened) {
+                          ExecutorIndexCache.CachedFile file = opened.file();
                           file.searching(
                               prepared -> {
                                 for (int queryId = 0; queryId < fileQueries.size(); queryId++) {
@@ -1130,10 +1091,6 @@ public final class DistributedIndexSearch {
                                 }
                                 return null;
                               });
-                        } finally {
-                          if (lease != null) {
-                            lease.close();
-                          }
                         }
 
                         LOG.debug(
@@ -1304,7 +1261,8 @@ public final class DistributedIndexSearch {
     // memory records can still be loaded explicitly, with its actual charge measured by the worker.
     long workingSet =
         ExecutorIndexCache.Config.enabled(spark)
-                && files.stream().allMatch(file -> IndexCacheMemory.compatible(file.memory(), adapter))
+                && files.stream()
+                    .allMatch(file -> IndexCacheMemory.compatible(file.memory(), adapter))
             ? workingSetBytes(table.io(), files, adapter, owner)
             : -1L;
     ExecutorIndexCache.Config config = ExecutorIndexCache.Config.from(spark, workingSet, owner);
@@ -1756,6 +1714,60 @@ public final class DistributedIndexSearch {
     long payloadBytes() {
       return payloadBytes;
     }
+  }
+
+  private static boolean rangeReadEnabled(SparkSession spark, IndexAdapter adapter) {
+    String key = "spark.iceberg.index.vector.ivf.range-read.enabled";
+    return adapter instanceof VectorIndexAdapter
+        && adapter.definition() instanceof VectorIndexDefinition definition
+        && definition.structure() == VectorIndexDefinition.VectorStructure.IVF
+        && Boolean.parseBoolean(definition.properties().get("ivf-list-blocks"))
+        && Boolean.parseBoolean(
+            spark.conf().get(key, spark.sparkContext().getConf().get(key, "false")));
+  }
+
+  private record OpenedSearch(ExecutorIndexCache.CachedFile file, Runnable release)
+      implements AutoCloseable {
+    @Override
+    public void close() {
+      release.run();
+    }
+  }
+
+  private static OpenedSearch openSearch(
+      FileIO io,
+      String location,
+      IndexAdapter adapter,
+      ExecutorIndexCache.Config config,
+      String readerKey,
+      boolean rangeRead) {
+    ExecutorIndexCache cache = ExecutorIndexCache.get();
+    String key = cacheKey(config.owner(), readerKey, location);
+    ExecutorIndexCache.Lease lease = cache.acquireManagedKey(key);
+    if (lease != null) {
+      return new OpenedSearch(lease.file(), lease::close);
+    }
+
+    if (rangeRead && adapter instanceof VectorIndexAdapter vector) {
+      ExecutorIndexCache.CachedFile hit = cache.unmanagedHit(key, config);
+      if (hit != null) {
+        return new OpenedSearch(hit, () -> {});
+      }
+
+      VectorIndexAdapter.RangeSearch search = vector.prepareRange(io.newInputFile(location));
+      if (search != null) {
+        return new OpenedSearch(ExecutorIndexCache.loaded(0L, search), search::close);
+      }
+    }
+
+    ExecutorIndexCache.CachedFile file =
+        cache.file(
+            location,
+            config,
+            readerKey,
+            sizeHint(io, location),
+            () -> loadFile(io, location, adapter));
+    return new OpenedSearch(file, () -> {});
   }
 
   static ExecutorIndexCache.CachedFile loadFile(FileIO io, String location, IndexAdapter adapter) {

@@ -59,6 +59,15 @@ public final class VectorPayloadHeader {
   public static VectorPayloadHeader of(ByteBuffer payload) {
     Preconditions.checkNotNull(payload, "Payload is null");
     ByteBuffer copy = payload.duplicate();
+    if (IvfKernel.isBlocked(copy)) {
+      Preconditions.checkArgument(
+          copy.remaining() >= IvfKernel.BLOCK_PREFIX_BYTES, "Truncated IVF block header");
+      int version = copy.getInt(copy.position() + Integer.BYTES);
+      Preconditions.checkArgument(
+          version == IvfKernel.BLOCK_VERSION, "Unsupported IVF block format: %s", version);
+      copy.position(copy.position() + IvfKernel.BLOCK_PREFIX_BYTES);
+    }
+
     try (DataInputStream in =
         new DataInputStream(
             new ByteArrayInputStream(

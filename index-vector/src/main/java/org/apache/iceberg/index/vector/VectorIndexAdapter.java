@@ -18,17 +18,24 @@
  */
 package org.apache.iceberg.index.vector;
 
+import java.io.IOException;
+import java.io.UncheckedIOException;
 import java.nio.ByteBuffer;
 import java.util.Comparator;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import org.apache.iceberg.index.IndexAdapter;
+import org.apache.iceberg.index.IndexBlob;
 import org.apache.iceberg.index.IndexBuildResult;
 import org.apache.iceberg.index.IndexDefinition;
 import org.apache.iceberg.index.IndexEntry;
 import org.apache.iceberg.index.IndexSearchResult;
 import org.apache.iceberg.index.vector.VectorIndexDefinition.VectorStructure;
+import org.apache.iceberg.io.InputFile;
+import org.apache.iceberg.puffin.BlobMetadata;
+import org.apache.iceberg.puffin.Puffin;
+import org.apache.iceberg.puffin.PuffinReader;
 import org.apache.iceberg.relocated.com.google.common.base.Preconditions;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableSet;
 
@@ -86,6 +93,73 @@ public final class VectorIndexAdapter implements IndexAdapter, java.io.Serializa
     // one type per role: the algorithm that wrote a payload is recorded inside it, so it never
     // belongs in the type a reader looks for
     return ImmutableSet.of(AUXILIARY_BLOB_TYPE);
+  }
+
+  @Override
+  public IndexBlob auxiliaryBlob(ByteBuffer payload) {
+    if (kernel instanceof IvfKernel && IvfKernel.isBlocked(payload)) {
+      return IndexBlob.uncompressed(auxiliaryBlobType(), VectorPayloads.toBytes(payload));
+    }
+
+    return IndexAdapter.super.auxiliaryBlob(payload);
+  }
+
+  /** A search that owns the stream for a single task's IVF reads. */
+  public interface RangeSearch extends PreparedSearch, AutoCloseable {
+    @Override
+    default void close() {}
+  }
+
+  /** Opens a block-addressable IVF file, or returns null if it uses whole-file storage. */
+  public RangeSearch prepareRange(InputFile file) {
+    if (!(kernel instanceof IvfKernel ivf)) {
+      return null;
+    }
+
+    BlobMetadata blob = null;
+    try (PuffinReader reader = Puffin.read(file).build()) {
+      for (BlobMetadata candidate : reader.fileMetadata().blobs()) {
+        if (readableAuxiliaryBlobTypes().contains(candidate.type())) {
+          blob = candidate;
+          break;
+        }
+      }
+    } catch (IOException e) {
+      throw new UncheckedIOException("Failed to read IVF metadata in " + file.location(), e);
+    }
+
+    if (blob == null || blob.compressionCodec() != null) {
+      return null;
+    }
+
+    long length = file.getLength();
+    Preconditions.checkArgument(
+        blob.offset() >= 0
+            && blob.length() >= 0
+            && blob.length() <= length - blob.offset()
+            && length <= Integer.MAX_VALUE,
+        "Invalid IVF blob range in %s",
+        file.location());
+    IvfRangeInput input =
+        new IvfRangeInput(file.newStream(), blob.offset(), (int) blob.length(), file.location());
+    RangeSearch search;
+    try {
+      search = ivf.prepareRange(input);
+    } catch (RuntimeException | Error failure) {
+      try {
+        input.close();
+      } catch (RuntimeException closeFailure) {
+        failure.addSuppressed(closeFailure);
+      }
+
+      throw failure;
+    }
+
+    if (search == null) {
+      input.close();
+    }
+
+    return search;
   }
 
   @Override

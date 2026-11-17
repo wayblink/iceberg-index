@@ -37,7 +37,7 @@ public final class IvfOptions implements java.io.Serializable {
   /** How many lists the vectors are partitioned into; zero means derive it from the entry count. */
   public static final String NLIST = "nlist";
 
-  /** How many of those lists a search visits. */
+  /** Historical property kept for reading existing index definitions. */
   public static final String NPROBE = "nprobe";
 
   static final int DEFAULT_NPROBE = 8;
@@ -50,13 +50,17 @@ public final class IvfOptions implements java.io.Serializable {
    */
   private static final int SAMPLES_PER_LIST = 39;
 
-  private static final ImmutableSet<String> KEYS = ImmutableSet.of(NLIST);
+  static final String LIST_BLOCKS = "ivf-list-blocks";
+
+  private static final ImmutableSet<String> KEYS = ImmutableSet.of(NLIST, LIST_BLOCKS);
 
   private final int nlist;
+  private final boolean listBlocks;
 
-  private IvfOptions(int nlist) {
+  private IvfOptions(int nlist, boolean listBlocks) {
     Preconditions.checkArgument(nlist >= 0, "Invalid IVF %s: %s", NLIST, nlist);
     this.nlist = nlist;
+    this.listBlocks = listBlocks;
   }
 
   /** The property keys this structure reads, for a caller that has to report what it supports. */
@@ -92,7 +96,17 @@ public final class IvfOptions implements java.io.Serializable {
           Sets.newTreeSet(readable));
     }
 
-    return new IvfOptions(intOption(properties, NLIST, 0));
+    String blocks = properties.getOrDefault(LIST_BLOCKS, "false");
+    Preconditions.checkArgument(
+        "true".equalsIgnoreCase(blocks) || "false".equalsIgnoreCase(blocks),
+        "Invalid IVF %s: %s",
+        LIST_BLOCKS,
+        blocks);
+    return new IvfOptions(intOption(properties, NLIST, 0), Boolean.parseBoolean(blocks));
+  }
+
+  boolean listBlocks() {
+    return listBlocks;
   }
 
   /** The list count asked for, or zero to derive it from the entry count. */
@@ -100,7 +114,9 @@ public final class IvfOptions implements java.io.Serializable {
     return nlist;
   }
 
-  /** @deprecated Configure the probe count on the query. */
+  /**
+   * @deprecated Configure the probe count on the query.
+   */
   @Deprecated
   public int nprobe() {
     return DEFAULT_NPROBE;

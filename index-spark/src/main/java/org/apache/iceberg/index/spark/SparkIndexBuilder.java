@@ -506,10 +506,9 @@ public final class SparkIndexBuilder {
                   try {
                     writeIndexPayload(fileIO, location, adapter, kind, blobType, built);
                     if (memory != null) {
-                      memory =
-                          memory.toBuilder()
-                              .fileBytes(fileIO.newInputFile(location).getLength())
-                              .build();
+                      long fileBytes = fileIO.newInputFile(location).getLength();
+                      IndexPayloadLimits.checkFits(fileBytes, groupEntries.size(), location);
+                      memory = memory.toBuilder().fileBytes(fileBytes).build();
                     }
                   } catch (RuntimeException | Error e) {
                     filesFailed.add(1);
@@ -738,7 +737,9 @@ public final class SparkIndexBuilder {
       throw new java.io.UncheckedIOException("Cannot write " + location, e);
     }
     if (memory != null) {
-      memory = memory.toBuilder().fileBytes(fileIO.newInputFile(location).getLength()).build();
+      long fileBytes = fileIO.newInputFile(location).getLength();
+      IndexPayloadLimits.checkFits(fileBytes, 0, location);
+      memory = memory.toBuilder().fileBytes(fileBytes).build();
     }
 
     filesBuilt.add(1);

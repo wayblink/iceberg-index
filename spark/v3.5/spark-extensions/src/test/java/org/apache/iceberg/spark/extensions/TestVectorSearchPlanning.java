@@ -323,6 +323,58 @@ class TestVectorSearchPlanning {
     }
   }
 
+  @Test
+  void groupedIvfBlocksCanBeReadWholeOrByRange() {
+    String table = "local.db.planning_range_lists";
+    spark.sql("CREATE NAMESPACE IF NOT EXISTS local.db");
+    spark.sql("CREATE TABLE " + table + " (id bigint, embedding array<double>) USING iceberg");
+    spark.sql(
+        "INSERT INTO " + table + " SELECT id, array(CAST(id AS double), 1.0d) FROM range(0, 32)");
+    spark.sql(
+        "INSERT INTO " + table + " SELECT id, array(CAST(id AS double), 1.0d) FROM range(32, 64)");
+    spark.sql(
+        "CALL local.system.build_vector_index(table => 'db.planning_range_lists', "
+            + "column => 'embedding', dimension => 2, metric => 'euclidean', structure => 'IVF', "
+            + "max_entries_per_index_file => 128, "
+            + "options => map('nlist', '8', 'ivf-list-blocks', 'true'))");
+    String range = "spark.iceberg.index.vector.ivf.range-read.enabled";
+    String probes = "spark.iceberg.index.vector.ivf.nprobe";
+    String cache = "spark.iceberg.index.cache.enabled";
+    String budget = "spark.iceberg.index.cache.bytes";
+    String query =
+        "SELECT id FROM "
+            + table
+            + " ORDER BY vec_distance(embedding, array(31.1d, 1.0d), 'euclidean') LIMIT 4";
+    try {
+      spark.conf().set(cache, "false");
+      spark.conf().set(probes, "2");
+      List<Row> whole = spark.sql(query).collectAsList();
+      assertThat(whole).extracting(row -> row.getLong(0)).containsExactly(31L, 32L, 30L, 33L);
+      spark.conf().set(range, "true");
+      assertThat(spark.sql(query).collectAsList()).containsExactlyElementsOf(whole);
+
+      spark.conf().set(cache, "true");
+      spark.conf().set(budget, "16m");
+      spark.conf().set(range, "false");
+      assertThat(spark.sql(query).collectAsList()).containsExactlyElementsOf(whole);
+      long hits = cacheHits();
+      spark.conf().set(range, "true");
+      assertThat(spark.sql(query).collectAsList()).containsExactlyElementsOf(whole);
+      assertThat(cacheHits()).isGreaterThan(hits);
+    } finally {
+      spark.conf().unset(range);
+      spark.conf().unset(probes);
+      spark.conf().unset(cache);
+      spark.conf().unset(budget);
+    }
+  }
+
+  private static long cacheHits() {
+    return spark.sql("CALL local.system.index_cache_status(refresh => true)").collectAsList().stream()
+        .mapToLong(row -> row.<Long>getAs("hits"))
+        .sum();
+  }
+
   private static String nearestOf(String name) {
     return "SELECT id FROM local.db."
         + name

@@ -167,6 +167,7 @@ DDL 必须给名字；`CALL` 在列上还没有索引时可以不命名。**`dim
 | `options` | 空 | 结构/量化器选项；最后应用，会覆盖同名具名参数 |
 | `max_m` / `ef_construction` / `ef_search` | 16 / 200 / 50 | 仅 `HNSW` 时写入 |
 | `options.nlist` | 0（按 `round(sqrt(entries))` 推导） | IVF 分区数 |
+| `options['ivf-list-blocks']` | `'false'` | 设为 `'true'` 时，在一个 Puffin 文件内将 IVF 列表写成可独立读取的块。 |
 | `options.rabitq-bits` | 1 | 1–8 |
 | `max_entries_per_index_file` | 1,000,000 | 索引文件的条目预算，决定如何分组；不拆单个数据文件 |
 | `name` | 无 | 同列多索引时必须给 |
@@ -475,6 +476,7 @@ BM25 和向量索引共用 executor 的容量预算、LRU 和状态入口。用�
 
 | 键 | 默认 | 作用 |
 |---|---|---|
+| `spark.iceberg.index.vector.ivf.range-read.enabled` | `false` | 整索引缓存未命中时，按字节范围读取分块 IVF 索引。 |
 | `spark.iceberg.index.vector.ivf.nprobe` | `8` | 每次查询在每个 IVF 索引文件中初始探测的列表数。使用正整数。 |
 | `spark.iceberg.index.vector.over-sample` | `0` | 基础候选预算为 K。显式正值按 K 乘倍数计算。 |
 | `spark.iceberg.index.vector.name` | 不设 | 同列多索引时选哪个 |

@@ -1543,6 +1543,18 @@ final class ExecutorIndexCache {
    * @param key what the prepared structure depends on besides the payload
    * @param loader reads the payload and prepares it, only called on a miss
    */
+  CachedFile unmanagedHit(String key, Config config) {
+    if (!config.caching()) {
+      return null;
+    }
+
+    sweepIfDue(config);
+    synchronized (mapLock) {
+      metadataBudget = config.maxBytes();
+      return ownership.isManagedKey(key) ? null : lookup(key);
+    }
+  }
+
   CachedFile file(String location, Config config, String key, Loader loader) {
     return file(location, config, key, 0L, loader);
   }
