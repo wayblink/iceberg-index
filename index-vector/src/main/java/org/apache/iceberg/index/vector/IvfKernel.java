@@ -867,7 +867,7 @@ public final class IvfKernel implements VectorKernel, RetainedBytes {
           block.intAt(countOffset) == loaded.listCounts[list],
           "Invalid IVF list %s block count",
           list);
-      long offset = countOffset + Integer.BYTES;
+      long offset = (long) countOffset + Integer.BYTES;
       for (int row = 0; row < loaded.listCounts[list]; row++, offset += stride) {
         int fileID = block.intAt(offset);
         Preconditions.checkArgument(
