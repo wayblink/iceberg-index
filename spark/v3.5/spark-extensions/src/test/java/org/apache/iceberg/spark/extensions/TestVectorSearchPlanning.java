@@ -259,8 +259,7 @@ class TestVectorSearchPlanning {
    * estimates and not for the k nearest rows. The index is used anyway: whether a query is answered
    * approximately is a property of the index the caller built, not of whether they also set a
    * multiple. What the multiple decides is how many candidates the estimate hands to the exact
-   * re-scoring, and when it is unset that width comes from the structure - a one-bit code needs a
-   * wide net, which the plan states along with where the number came from.
+   * re-scoring. The plan shows when the base budget was selected by default.
    */
   @Test
   void anApproximateIndexIsUsedWithoutAnExplicitOverSample() {
@@ -271,7 +270,7 @@ class TestVectorSearchPlanning {
         .contains("VectorSearchSource")
         .contains("result=approximate")
         .as("and the width it used is stated with its source")
-        .contains("overSample=50 [STRUCTURE_DEFAULT, documented-experience-values]");
+        .contains("overSample=0 [DEFAULT]");
 
     try {
       // a caller who knows what they want still decides: the configured value replaces the default
@@ -285,28 +284,20 @@ class TestVectorSearchPlanning {
     }
   }
 
-  /**
-   * The answer of the default configuration is the answer of a full scan, on a table where the
-   * index's own first candidate is not the nearest row.
-   */
   @Test
-  void theDefaultConfigurationReturnsWhatAFullScanReturns() {
+  void anExplicitWiderWindowRecoversTheNearestRow() {
     createApproximateTable("planning_approx_correct");
     String nearest = nearestOf("planning_approx_correct");
-    // the same ordering with an addition the rewrite does not recognise, so the table is scanned
     List<Row> scanned = spark.sql(nearest.replace("LIMIT 1", "+ 0.0d LIMIT 1")).collectAsList();
-
-    assertThat(spark.sql(nearest).collectAsList())
-        .as("a default configuration may be slower than an index, but it is not wrong")
-        .isEqualTo(scanned);
+    List<Row> base = spark.sql(nearest).collectAsList();
 
     try {
-      // the fixture is one where a single candidate per hit really is not the nearest row: a kernel
-      // that no longer diverges here would make this test pass for the wrong reason
-      spark.conf().set(OVER_SAMPLE, "1");
-      assertThat(spark.sql(nearest).collectAsList())
-          .as("the fixture must be one where the index's first candidate is not the answer")
-          .isNotEqualTo(scanned);
+      spark.conf().set(OVER_SAMPLE, "0");
+      assertThat(spark.sql(nearest).collectAsList()).isEqualTo(base);
+      assertThat(base).isNotEqualTo(scanned);
+
+      spark.conf().set(OVER_SAMPLE, "50");
+      assertThat(spark.sql(nearest).collectAsList()).isEqualTo(scanned);
     } finally {
       spark.conf().unset(OVER_SAMPLE);
     }

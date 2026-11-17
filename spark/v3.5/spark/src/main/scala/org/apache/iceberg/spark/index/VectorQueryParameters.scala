@@ -20,12 +20,7 @@ package org.apache.iceberg.spark.index
 
 import java.lang.{Long => JLong}
 import java.util.{Map => JMap}
-import org.apache.iceberg.index.vector.RaBitQQuantizer
 import org.apache.iceberg.index.vector.VectorIndexDefinition
-import org.apache.iceberg.index.vector.RaBitQQuantizer
-import org.apache.iceberg.index.vector.VectorIndexDefinition.VectorQuantizer
-import org.apache.iceberg.index.vector.RaBitQQuantizer
-import org.apache.iceberg.index.vector.VectorIndexDefinition.VectorStructure
 private[spark] case class VectorParameter(
     value: String,
     origin: String,
@@ -117,16 +112,16 @@ private[spark] object VectorQueryParameters {
     val mode = filterModeOf(raw.filterMode)
     if (parameter == null) {
       ResolvedVectorParameters(
-        defaultOverSample(definition),
-        "STRUCTURE_DEFAULT",
+        0L,
+        "DEFAULT",
         false,
         null,
-        "documented-experience-values",
+        null,
         index,
         mode._1,
         mode._2)
     } else {
-      val message = s"Invalid $OverSampleConf: '${parameter.value}'; expected a positive integer"
+      val message = s"Invalid $OverSampleConf: '${parameter.value}'; expected a non-negative integer"
       require(parameter.value != null, message)
       val value =
         try {
@@ -134,7 +129,7 @@ private[spark] object VectorQueryParameters {
         } catch {
           case cause: NumberFormatException => throw new IllegalArgumentException(message, cause)
         }
-      require(value > 0L, message)
+      require(value >= 0L, message)
       ResolvedVectorParameters(
         value,
         parameter.origin,
@@ -167,47 +162,6 @@ private[spark] object VectorQueryParameters {
       s"Invalid $FilterModeConf: '${parameter.value}'; expected one of pre, post")
     (value, parameter.origin)
   }
-
-  /**
-   * The multiple applied when the caller configured none, chosen from how the index stores vectors.
-   *
-   * <p>A query is not answered by a scan because a knob was left alone: the index is used, and this
-   * is the width it uses. Picking the width is unavoidable, so it is picked from what the structure
-   * does rather than from a compatibility constant:
-   *
-   * <ul>
-   *   <li>a flat index walks every entry, so any width is the whole table;
-   *   <li>an IVF index over unquantized vectors scores exactly, so the k nearest of the partitions
-   *       nprobe visits are the k nearest of them at any width;
-   *   <li>an IVF index over a quantized code orders candidates by an estimate, and the digits of
-   *       separation between candidates shrink with the bits stored: one bit per dimension needs a
-   *       much wider net than three or four before the true neighbours are inside it;
-   *   <li>a graph's breadth is its own ef, and a wider request can widen the search itself.
-   * </ul>
-   *
-   * <p>The numbers are the ranges this project has published for these tables (one bit needs fifty
-   * to a hundred, three bits about ten, a graph one to three), interpolated rather than measured per
-   * table. They are a default, not a guarantee: a caller who needs a different width sets
-   * {@link #OverSampleConf} and the plan then says so.
-   */
-  def defaultOverSample(definition: VectorIndexDefinition): Long =
-    definition.structure() match {
-      case VectorStructure.FLAT => 1L
-      case VectorStructure.IVF =>
-        definition.quantizer() match {
-          case VectorQuantizer.NONE => 1L
-          case _ =>
-            // the quantizer reads its own option, including the default it applies when the build
-            // did not write one - asking it rather than parsing the map keeps the two in step
-            RaBitQQuantizer.bitsFrom(definition.properties()) match {
-              case b if b <= 1 => 50L
-              case 2 => 25L
-              case 3 => 10L
-              case _ => 5L
-            }
-        }
-      case VectorStructure.HNSW => 3L
-    }
 
   private def configured(
       session: JMap[String, String],

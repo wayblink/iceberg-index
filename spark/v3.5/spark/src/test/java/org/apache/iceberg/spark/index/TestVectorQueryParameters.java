@@ -114,9 +114,9 @@ class TestVectorQueryParameters {
   @Test
   void explicitDefaultIsLocked() {
     RawVectorParameters raw =
-        VectorQueryParameters.capture(Map.of(OVER_SAMPLE, "1"), Map.of(), null);
+        VectorQueryParameters.capture(Map.of(OVER_SAMPLE, "0"), Map.of(), null);
     ResolvedVectorParameters chosen = VectorQueryParameters.decide(raw, FLAT);
-    assertThat(chosen.overSample()).isEqualTo(1L);
+    assertThat(chosen.overSample()).isZero();
     assertThat(chosen.overSampleLocked()).isTrue();
     assertThat(chosen.overSampleOrigin()).isEqualTo("SESSION_CONF");
   }
@@ -126,10 +126,10 @@ class TestVectorQueryParameters {
     RawVectorParameters raw = VectorQueryParameters.capture(Map.of(), Map.of(), null);
     assertThat(raw.overSample()).isNull();
     ResolvedVectorParameters chosen = VectorQueryParameters.decide(raw, FLAT);
-    assertThat(chosen.overSample()).isEqualTo(1L);
+    assertThat(chosen.overSample()).isZero();
     assertThat(chosen.overSampleLocked()).isFalse();
-    assertThat(chosen.overSampleOrigin()).isEqualTo("STRUCTURE_DEFAULT");
-    assertThat(chosen.overSampleReason()).isEqualTo("documented-experience-values");
+    assertThat(chosen.overSampleOrigin()).isEqualTo("DEFAULT");
+    assertThat(chosen.overSampleReason()).isNull();
   }
 
   @Test
@@ -190,7 +190,7 @@ class TestVectorQueryParameters {
   }
 
   @ParameterizedTest
-  @ValueSource(strings = {"", " ", "abc", "0", "-1", "9223372036854775808"})
+  @ValueSource(strings = {"", " ", "abc", "-1", "9223372036854775808"})
   void invalidExplicitOverSampleFails(String configured) {
     RawVectorParameters raw =
         VectorQueryParameters.capture(Map.of(OVER_SAMPLE, configured), Map.of(), null);
@@ -228,12 +228,10 @@ class TestVectorQueryParameters {
   }
 
   @Test
-  void anUnsetMultipleIsDerivedFromHowTheIndexStoresVectors() {
+  void anUnsetMultipleIsZeroAcrossStructures() {
     RawVectorParameters unset = VectorQueryParameters.capture(Map.of(), Map.of(), null);
 
-    // a flat index walks every entry, and an IVF index over unquantized vectors scores exactly:
-    // in both, a wider net cannot change which k rows are nearest
-    assertThat(VectorQueryParameters.decide(unset, FLAT).overSample()).isEqualTo(1L);
+    assertThat(VectorQueryParameters.decide(unset, FLAT).overSample()).isZero();
     assertThat(
             VectorQueryParameters.decide(
                     unset,
@@ -242,16 +240,13 @@ class TestVectorQueryParameters {
                         VectorIndexDefinition.VectorQuantizer.NONE,
                         0))
                 .overSample())
-        .isEqualTo(1L);
+        .isZero();
 
-    // a quantized code orders by an estimate, so the net has to be wider: the published ranges are
-    // fifty to a hundred at one bit and about ten at three
-    assertThat(defaultFor(VectorIndexDefinition.VectorStructure.IVF, 1)).isEqualTo(50L);
-    assertThat(defaultFor(VectorIndexDefinition.VectorStructure.IVF, 2)).isEqualTo(25L);
-    assertThat(defaultFor(VectorIndexDefinition.VectorStructure.IVF, 3)).isEqualTo(10L);
-    assertThat(defaultFor(VectorIndexDefinition.VectorStructure.IVF, 4)).isEqualTo(5L);
+    assertThat(defaultFor(VectorIndexDefinition.VectorStructure.IVF, 1)).isZero();
+    assertThat(defaultFor(VectorIndexDefinition.VectorStructure.IVF, 2)).isZero();
+    assertThat(defaultFor(VectorIndexDefinition.VectorStructure.IVF, 3)).isZero();
+    assertThat(defaultFor(VectorIndexDefinition.VectorStructure.IVF, 4)).isZero();
 
-    // a graph's breadth is its own ef
     assertThat(
             VectorQueryParameters.decide(
                     unset,
@@ -260,7 +255,7 @@ class TestVectorQueryParameters {
                         VectorIndexDefinition.VectorQuantizer.NONE,
                         0))
                 .overSample())
-        .isEqualTo(3L);
+        .isZero();
   }
 
   private static long defaultFor(VectorIndexDefinition.VectorStructure structure, int bits) {

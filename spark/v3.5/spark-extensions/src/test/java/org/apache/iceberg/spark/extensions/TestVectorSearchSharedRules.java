@@ -81,10 +81,10 @@ class TestVectorSearchSharedRules {
       VectorSearchContext sql = plan(table, "TABLE_LIVE_TOPK");
       VectorSearchContext call = plan(table, "INDEX_HITS");
       // neither entry point scans because a multiple was left unset: both decide the same width
-      assertThat(sql.parameters().overSample()).isEqualTo(1L);
-      assertThat(call.parameters().overSample()).isEqualTo(1L);
-      assertThat(call.parameters().overSampleOrigin()).isEqualTo("STRUCTURE_DEFAULT");
-      assertThat(sql.parameters().overSampleOrigin()).isEqualTo("STRUCTURE_DEFAULT");
+      assertThat(sql.parameters().overSample()).isZero();
+      assertThat(call.parameters().overSample()).isZero();
+      assertThat(call.parameters().overSampleOrigin()).isEqualTo("DEFAULT");
+      assertThat(sql.parameters().overSampleOrigin()).isEqualTo("DEFAULT");
 
       spark.conf().set(OVER_SAMPLE, "7");
       VectorSearchContext sqlSet = plan(table, "TABLE_LIVE_TOPK");
@@ -119,12 +119,10 @@ class TestVectorSearchSharedRules {
       spark.conf().unset(OVER_SAMPLE);
       VectorSearchContext sql = plan(table, "TABLE_LIVE_TOPK");
       VectorSearchContext call = plan(table, "INDEX_HITS");
-      assertThat(sql.parameters().overSample())
-          .as("one bit per dimension: the published range is fifty to a hundred")
-          .isEqualTo(50L);
-      assertThat(call.parameters().overSample()).isEqualTo(50L);
-      assertThat(sql.parameters().overSampleOrigin()).isEqualTo("STRUCTURE_DEFAULT");
-      assertThat(call.parameters().overSampleOrigin()).isEqualTo("STRUCTURE_DEFAULT");
+      assertThat(sql.parameters().overSample()).isZero();
+      assertThat(call.parameters().overSample()).isZero();
+      assertThat(sql.parameters().overSampleOrigin()).isEqualTo("DEFAULT");
+      assertThat(call.parameters().overSampleOrigin()).isEqualTo("DEFAULT");
 
       // and the rewrite actually uses the index, rather than deciding the width for a plan it then
       // abandons
@@ -138,7 +136,7 @@ class TestVectorSearchSharedRules {
               .toString();
       assertThat(planText).contains("VectorSearchSource");
       assertThat(planText).contains("result=approximate");
-      assertThat(planText).contains("overSample=50 [STRUCTURE_DEFAULT");
+      assertThat(planText).contains("overSample=0 [DEFAULT");
 
       // the procedure really answers, rather than resolving a width for a search it never runs
       assertThat(
@@ -162,7 +160,7 @@ class TestVectorSearchSharedRules {
   void aValueThatCannotBeAMultiplierIsReportedByEveryEntryPoint() throws Exception {
     Table table = tableWithIndex("shared_invalid");
     try {
-      spark.conf().set(OVER_SAMPLE, "0");
+      spark.conf().set(OVER_SAMPLE, "-1");
       assertThatThrownBy(() -> plan(table, "TABLE_LIVE_TOPK")).hasMessageContaining(OVER_SAMPLE);
       assertThatThrownBy(() -> plan(table, "INDEX_HITS")).hasMessageContaining(OVER_SAMPLE);
       assertThatThrownBy(
@@ -412,7 +410,7 @@ class TestVectorSearchSharedRules {
   void anEmptyRequestIsAnsweredWithoutJudgingTheParameters() throws Exception {
     tableWithIndex("shared_empty");
     try {
-      spark.conf().set(OVER_SAMPLE, "0");
+      spark.conf().set(OVER_SAMPLE, "-1");
       assertThat(
               spark
                   .sql(

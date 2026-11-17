@@ -218,7 +218,7 @@ class TestVectorIndexGuide {
         .as("an approximate index answers, and says so")
         .contains("VectorSearchSource")
         .contains("result=approximate")
-        .contains("[STRUCTURE_DEFAULT, documented-experience-values]");
+        .contains("[DEFAULT]");
 
     try {
       spark.sql("SET `spark.iceberg.index.vector.over-sample`=10");

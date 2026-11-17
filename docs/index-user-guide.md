@@ -231,19 +231,7 @@ SELECT id, title, _distance FROM vector_search(
 
 计划里标 `exact` 还是 `approximate` 由另一件事决定——**候选集是否完整**：只有 `FLAT` 且无量化才枚举全部条目（`exact`）；`IVF` 只访问 `nprobe` 个分区，`HNSW` 只走图的一部分，两者都是表的一个样本（`approximate`）。近似与否是索引形态的属性，不是参数设置的属性。
 
-不配置倍数时，宽度由索引形态决定，计划里会写明数值与来源（`overSample=10 [STRUCTURE_DEFAULT, documented-experience-values]`）：
-
-| 形态 | 默认倍数 | 为什么 |
-|---|---|---|
-| `FLAT` 无量化 | 1 | 枚举全部条目，宽度改变不了答案 |
-| `IVF` 无量化 | 1 | 打分是精确的（向量本体保留），被访问分区内的 k 个最近与宽度无关 |
-| `IVF·1bit` | 50 | 一位量化下估计最粗，候选要宽才包得住真实近邻 |
-| `IVF·2bit` | 25 | 介于两者之间 |
-| `IVF·3bit` | 10 | 三位量化下估计已较细 |
-| `IVF·4bit` 及以上 | 5 | 估计接近精确 |
-| `HNSW` | 3 | 图的广度由它自己的 `ef` 决定，倍数用来把候选再放宽一点 |
-
-这些数字是本项目在这些表上公布的**经验区间**（1bit 需要 50–100、3bit 约 10、图 1–3）的插值，**是默认值不是保证**；按表校准过的倍数还在做（见 #3004-B2）。要自己定宽度：
+默认值为 `0`，基础候选预算为 `K`，执行计划显示 `overSample=0 [DEFAULT]`。业务行查询仍按原始向量精排，过滤或删除导致活行不足时可以扩窗。显式正整数按 `K × over-sample` 计算候选预算。使用量化索引时，扩大候选窗口可能提高召回率，也可能增加回表成本。可以为会话显式设置倍数。
 
 ```sql
 SET `spark.iceberg.index.vector.over-sample`=10;
@@ -488,7 +476,7 @@ BM25 和向量索引共用 executor 的容量预算、LRU 和状态入口。用�
 
 | 键 | 默认 | 作用 |
 |---|---|---|
-| `spark.iceberg.index.vector.over-sample` | 按形态推导 | 候选放宽倍数；不设时由结构决定，计划里写明数值与来源 |
+| `spark.iceberg.index.vector.over-sample` | `0` | 基础候选预算为 K。显式正值按 K 乘倍数计算。 |
 | `spark.iceberg.index.vector.name` | 不设 | 同列多索引时选哪个 |
 | `spark.iceberg.index.vector.filter-mode` | `pre` | task 内过滤落在打分前（`pre`）还是后（`post`）：`pre` 只给放行行打分，`post` 打分后逐行判定再扩样；见 4.6，非法值直接失败 |
 | `spark.iceberg.index.cache.enabled` | `false` | 缓存开关；关掉时 `load_index` 报 `CACHE_DISABLED` |

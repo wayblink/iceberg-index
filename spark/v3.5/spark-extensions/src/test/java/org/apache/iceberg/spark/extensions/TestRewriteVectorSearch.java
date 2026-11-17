@@ -258,17 +258,14 @@ class TestRewriteVectorSearch {
       spark.conf().set("spark.iceberg.index.vector.over-sample", "1");
       widenedOnce = spark.sql(String.format(query, indexed)).collectAsList();
 
-      for (String overSample : new String[] {"5", "50"}) {
+      for (String overSample : new String[] {"0", "5", "50"}) {
         spark.conf().set("spark.iceberg.index.vector.over-sample", overSample);
         assertThat(spark.sql(String.format(query, indexed)).collectAsList())
             .as("the same rows in the same order, over-sampling by %s", overSample)
             .containsExactlyElementsOf(widenedOnce);
       }
 
-      // a value that cannot be a multiplier is reported rather than quietly replaced: a setting
-      // the query asked for is not something the rule may rewrite, and turning 0 into 1 would hide
-      // the mistake instead of naming it
-      for (String nonsense : new String[] {"0", "-3"}) {
+      for (String nonsense : new String[] {"-3", "abc"}) {
         spark.conf().set("spark.iceberg.index.vector.over-sample", nonsense);
         assertThatThrownBy(() -> spark.sql(String.format(query, indexed)).collectAsList())
             .as("the configured value %s is rejected", nonsense)
@@ -313,11 +310,7 @@ class TestRewriteVectorSearch {
   }
 
   @Test
-  public void aQuantizedIndexIsUsedWithTheWidthItsStructureCallsFor() {
-    // The index is used whether or not the caller configured a multiple: a query is not answered by
-    // a scan because a knob was left alone. What the multiple does is decide how many candidates
-    // the estimate hands to the exact re-scoring, and the default width comes from the structure:
-    // three bits per dimension needs about ten, not one.
+  public void aQuantizedIndexIsUsedWithTheBaseWidth() {
     String table = table("docs_rab_default");
     spark.sql(
         String.format(
@@ -335,11 +328,9 @@ class TestRewriteVectorSearch {
           .contains("VectorSearchSource");
       assertThat(plan)
           .as("the width and where it came from are part of the plan")
-          .contains("overSample=10 [STRUCTURE_DEFAULT");
+          .contains("overSample=0 [DEFAULT");
       assertThat(plan).contains("result=approximate");
-      // the budget the width produced: two hits at three bits, ten candidates each, before the
-      // entry bound shrinks what a file can actually offer
-      assertThat(plan).contains("requestedCandidates=20");
+      assertThat(plan).contains("requestedCandidates=2");
 
       // and the answer is the exact ordering over the rows the estimate offered, which is what the
       // re-scoring above the source produces

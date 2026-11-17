@@ -46,6 +46,13 @@ class TestVectorCandidateBudget {
   }
 
   @Test
+  void zeroRequestsTheBaseTopK() {
+    VectorCandidateBudget budget = VectorCandidateBudget.derive(10, 0L, null);
+    assertThat(budget.requested()).isEqualTo(10L);
+    assertThat(budget.initial()).isEqualTo(10);
+  }
+
+  @Test
   void unknownUpperBoundIsNotEmpty() {
     VectorCandidateBudget budget = VectorCandidateBudget.derive(10, 100L, null);
     assertThat(budget.requested()).isEqualTo(1000L);
