@@ -24,6 +24,7 @@ import org.apache.iceberg.index.IndexQuery
 import org.apache.iceberg.index.IndexQuery.Consistency
 import org.apache.iceberg.index.IndexSearchResult
 import org.apache.iceberg.index.spark.DistributedIndexSearch
+import org.apache.iceberg.index.spark.VectorIndexSearch
 import org.apache.iceberg.index.spark.IndexEntries
 import org.apache.iceberg.index.spark.IndexSearch
 import org.apache.iceberg.index.vector.VectorDistance
@@ -184,7 +185,7 @@ private[spark] object VectorSearchBridge {
     val inputs = context.inputs
     val k = context.request.input.topK
     val adapter = new VectorIndexAdapter(inputs.definition)
-    val payload = adapter.encodeQuery(query)
+    val payload = VectorIndexSearch.encodeQuery(spark, adapter, query)
     var budget = context.budget
     var round = 0
     val hits = mutable.LinkedHashMap.empty[(String, Long), IndexSearchResult]
@@ -300,7 +301,7 @@ private[spark] object VectorSearchBridge {
     val names = columnNames(context)
     val vectorIndex = names.indexOf(request.column)
     val adapter = new VectorIndexAdapter(inputs.definition)
-    val payload = adapter.encodeQuery(query)
+    val payload = VectorIndexSearch.encodeQuery(spark, adapter, query)
 
     val found = mutable.LinkedHashMap.empty[(String, Long), Row]
     var budget = context.budget

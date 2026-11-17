@@ -22,6 +22,7 @@ import org.apache.iceberg.index.IndexQuery
 import org.apache.iceberg.index.IndexQuery.Consistency
 import org.apache.iceberg.index.spark.IndexEntries
 import org.apache.iceberg.index.spark.DistributedIndexSearch
+import org.apache.iceberg.index.spark.VectorIndexSearch
 import org.apache.iceberg.index.spark.IndexRowFilter
 import org.apache.iceberg.index.vector.VectorIndexAdapter
 import org.apache.spark.rdd.RDD
@@ -110,7 +111,7 @@ private[spark] object VectorSearchExec {
         null
       }
     val adapter = new VectorIndexAdapter(inputs.definition)
-    val payloads = queries.map(query => adapter.encodeQuery(query.toArray)).asJava
+    val payloads = queries.map(query => VectorIndexSearch.encodeQuery(spark, adapter, query.toArray)).asJava
     val opening =
       if (context.budget == null) {
         VectorCandidateBudget.derive(k, context.parameters.overSample, inputs.entryUpperBound)
@@ -137,7 +138,7 @@ private[spark] object VectorSearchExec {
         IndexQuery
           .of(
             inputs.indexSnapshot.sourceTableSnapshotId(),
-            adapter.encodeQuery(queries.head.toArray),
+            payloads.get(0),
             opening.initial)
           .withConsistency(Consistency.AT_OR_BEFORE),
         payloads,

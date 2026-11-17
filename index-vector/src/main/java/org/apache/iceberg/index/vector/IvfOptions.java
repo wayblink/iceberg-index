@@ -40,7 +40,7 @@ public final class IvfOptions implements java.io.Serializable {
   /** How many of those lists a search visits. */
   public static final String NPROBE = "nprobe";
 
-  private static final int DEFAULT_NPROBE = 8;
+  static final int DEFAULT_NPROBE = 8;
 
   /**
    * How many training samples each list gets, following the usual heuristic.
@@ -50,16 +50,13 @@ public final class IvfOptions implements java.io.Serializable {
    */
   private static final int SAMPLES_PER_LIST = 39;
 
-  private static final ImmutableSet<String> KEYS = ImmutableSet.of(NLIST, NPROBE);
+  private static final ImmutableSet<String> KEYS = ImmutableSet.of(NLIST);
 
   private final int nlist;
-  private final int nprobe;
 
-  private IvfOptions(int nlist, int nprobe) {
+  private IvfOptions(int nlist) {
     Preconditions.checkArgument(nlist >= 0, "Invalid IVF %s: %s", NLIST, nlist);
-    Preconditions.checkArgument(nprobe > 0, "Invalid IVF %s: %s", NPROBE, nprobe);
     this.nlist = nlist;
-    this.nprobe = nprobe;
   }
 
   /** The property keys this structure reads, for a caller that has to report what it supports. */
@@ -89,14 +86,13 @@ public final class IvfOptions implements java.io.Serializable {
 
     for (String key : properties.keySet()) {
       Preconditions.checkArgument(
-          readable.contains(key),
+          NPROBE.equals(key) || readable.contains(key),
           "Unknown IVF option %s: this structure reads %s",
           key,
           Sets.newTreeSet(readable));
     }
 
-    return new IvfOptions(
-        intOption(properties, NLIST, 0), intOption(properties, NPROBE, DEFAULT_NPROBE));
+    return new IvfOptions(intOption(properties, NLIST, 0));
   }
 
   /** The list count asked for, or zero to derive it from the entry count. */
@@ -104,8 +100,10 @@ public final class IvfOptions implements java.io.Serializable {
     return nlist;
   }
 
+  /** @deprecated Configure the probe count on the query. */
+  @Deprecated
   public int nprobe() {
-    return nprobe;
+    return DEFAULT_NPROBE;
   }
 
   /**

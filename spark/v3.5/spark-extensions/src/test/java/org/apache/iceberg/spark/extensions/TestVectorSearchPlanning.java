@@ -303,6 +303,26 @@ class TestVectorSearchPlanning {
     }
   }
 
+  @Test
+  void sessionProbeCountChangesTheListsVisitedWithoutRebuilding() {
+    createApproximateTable("planning_query_probe");
+    String key = "spark.iceberg.index.vector.ivf.nprobe";
+    String query =
+        "CALL local.system.vector_search(table => 'db.planning_query_probe', "
+            + "column => 'embedding', query => array(0.95d, 0.05d), k => 32, "
+            + "coverage => 'index_hits')";
+    try {
+      spark.conf().set(key, "32");
+      List<Row> all = spark.sql(query).collectAsList();
+      spark.conf().set(key, "1");
+      assertThat(spark.sql(query).collectAsList()).isNotEmpty().hasSizeLessThan(all.size());
+      spark.conf().set(key, "32");
+      assertThat(spark.sql(query).collectAsList()).containsExactlyElementsOf(all);
+    } finally {
+      spark.conf().unset(key);
+    }
+  }
+
   private static String nearestOf(String name) {
     return "SELECT id FROM local.db."
         + name

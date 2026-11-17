@@ -141,7 +141,7 @@ CALL local.system.build_vector_index(
   metric => 'COSINE',           -- COSINE | DOT_PRODUCT | EUCLIDEAN，默认 COSINE
   structure => 'IVF',           -- FLAT | HNSW | IVF，默认 FLAT
   quantizer => 'RABITQ',        -- NONE | RABITQ，默认 NONE
-  options => MAP('nlist', '64', 'nprobe', '32', 'rabitq-bits', '1'),
+  options => MAP('nlist', '64', 'rabitq-bits', '1'),
   name => 'ivf_1bit',
   max_entries_per_index_file => 1000000);
 ```
@@ -154,7 +154,7 @@ DDL 写法，`WITH` 的键就是上面这些参数名：
 ALTER TABLE local.db.docs CREATE INDEX emb_ivf
   USING vector (embedding)
   WITH (dimension = 768, metric = 'COSINE', structure = 'IVF',
-        options = MAP('nlist', '64', 'nprobe', '32'));
+        options = MAP('nlist', '64'));
 ```
 
 DDL 必须给名字；`CALL` 在列上还没有索引时可以不命名。**`dimension` 是必填的**，`ALTER TABLE … CREATE INDEX i USING vector (embedding)` 不带 `WITH (dimension = …)` 会失败。
@@ -167,7 +167,6 @@ DDL 必须给名字；`CALL` 在列上还没有索引时可以不命名。**`dim
 | `options` | 空 | 结构/量化器选项；最后应用，会覆盖同名具名参数 |
 | `max_m` / `ef_construction` / `ef_search` | 16 / 200 / 50 | 仅 `HNSW` 时写入 |
 | `options.nlist` | 0（按 `round(sqrt(entries))` 推导） | IVF 分区数 |
-| `options.nprobe` | 8 | 每查询访问的分区数 |
 | `options.rabitq-bits` | 1 | 1–8 |
 | `max_entries_per_index_file` | 1,000,000 | 索引文件的条目预算，决定如何分组；不拆单个数据文件 |
 | `name` | 无 | 同列多索引时必须给 |
@@ -476,6 +475,7 @@ BM25 和向量索引共用 executor 的容量预算、LRU 和状态入口。用�
 
 | 键 | 默认 | 作用 |
 |---|---|---|
+| `spark.iceberg.index.vector.ivf.nprobe` | `8` | 每次查询在每个 IVF 索引文件中初始探测的列表数。使用正整数。 |
 | `spark.iceberg.index.vector.over-sample` | `0` | 基础候选预算为 K。显式正值按 K 乘倍数计算。 |
 | `spark.iceberg.index.vector.name` | 不设 | 同列多索引时选哪个 |
 | `spark.iceberg.index.vector.filter-mode` | `pre` | task 内过滤落在打分前（`pre`）还是后（`post`）：`pre` 只给放行行打分，`post` 打分后逐行判定再扩样；见 4.6，非法值直接失败 |
@@ -502,9 +502,9 @@ BM25 和向量索引共用 executor 的容量预算、LRU 和状态入口。用�
 
 ### 8.3 建索引时写死、事后不可改
 
-`metric`、`structure`、`quantizer`、`max-m`、`ef-construction`、`ef-search`、`nlist`、`nprobe`、`rabitq-bits`、`max-entries-per-index-file`，以及文本侧的 `k1`、`b`（入参名 `length_norm`）、`min-token-length`、`lowercase`、`stopwords`。
+`metric`、`structure`、`quantizer`、`max-m`、`ef-construction`、`ef-search`、`nlist`、`rabitq-bits`、`max-entries-per-index-file`，以及文本侧的 `k1`、`b`（入参名 `length_norm`）、`min-token-length`、`lowercase`、`stopwords`。
 
-其中 `nprobe` 与 `ef-search` 是**查询时读取但值来自定义**，所以想调整它们只能重建索引。
+`ef-search` 的值来自索引定义，调整它需要重建。IVF 的 `nprobe` 由 Spark 查询会话设置，历史定义中的值会被忽略。
 
 ---
 

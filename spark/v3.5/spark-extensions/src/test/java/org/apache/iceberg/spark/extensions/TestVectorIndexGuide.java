@@ -150,7 +150,9 @@ class TestVectorIndexGuide {
     Row index = indexes.get(0);
     assertThat(index.getString(2)).isEqualTo("vector");
     assertThat(index.getString(8)).isEqualTo("arm_ivf_1bit");
-    assertThat(index.getString(7)).contains("RABITQ").contains("nprobe");
+    assertThat(index.getString(7))
+        .contains("RABITQ", "nlist", "rabitq-bits")
+        .doesNotContain("nprobe");
 
     List<Row> hits =
         spark

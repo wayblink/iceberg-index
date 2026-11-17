@@ -213,7 +213,7 @@ class TestRewriteVectorSearch {
             "CALL local.system.build_vector_index("
                 + "table => 'db.%s', column => 'embedding', dimension => 128, "
                 + "metric => 'euclidean', structure => 'IVF', quantizer => 'RABITQ', "
-                + "options => map('nlist', '20', 'nprobe', '20', 'rabitq-bits', '3'), "
+                + "options => map('nlist', '20', 'rabitq-bits', '3'), "
                 + "max_entries_per_index_file => 100000)",
             table));
 
@@ -226,6 +226,7 @@ class TestRewriteVectorSearch {
     // to choose from and its answer is the exact one
     try {
       spark.conf().set("spark.iceberg.index.vector.over-sample", "200");
+      spark.conf().set("spark.iceberg.index.vector.ivf.nprobe", "20");
       List<Long> returned =
           spark
               .sql(
@@ -242,6 +243,7 @@ class TestRewriteVectorSearch {
           .containsExactlyElementsOf(exactNearest(vectors, query, 10));
     } finally {
       spark.conf().unset("spark.iceberg.index.vector.over-sample");
+      spark.conf().unset("spark.iceberg.index.vector.ivf.nprobe");
     }
   }
 

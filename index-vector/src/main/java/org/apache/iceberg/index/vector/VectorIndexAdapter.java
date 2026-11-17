@@ -104,6 +104,20 @@ public final class VectorIndexAdapter implements IndexAdapter, java.io.Serializa
     return ByteBuffer.wrap(VectorPayloads.encodeVector(query, definition.dimension(), "Query"));
   }
 
+  /** Encodes a query with its IVF probe count. Other structures use the standard query format. */
+  public ByteBuffer encodeQuery(float[] query, int nprobe) {
+    Preconditions.checkArgument(nprobe > 0, "Invalid IVF nprobe: %s", nprobe);
+    ByteBuffer encoded = encodeQuery(query);
+    if (definition.structure() != VectorStructure.IVF) {
+      return encoded;
+    }
+
+    return ByteBuffer.allocate(encoded.remaining() + Integer.BYTES)
+        .put(encoded)
+        .putInt(nprobe)
+        .flip();
+  }
+
   @Override
   public boolean skipsNullValues() {
     return true;

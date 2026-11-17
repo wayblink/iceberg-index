@@ -24,6 +24,7 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import java.nio.ByteBuffer;
 import java.util.List;
 import java.util.Set;
+import org.apache.iceberg.index.IndexAdapter;
 import org.apache.iceberg.index.IndexEntry;
 import org.apache.iceberg.index.IndexSearchResult;
 import org.apache.iceberg.relocated.com.google.common.collect.Lists;
@@ -79,17 +80,21 @@ class TestIvfKernel {
 
     VectorIndexAdapter patient = adapterLegacy(VectorIndexDefinition.Metric.EUCLIDEAN, 0, ENTRIES);
     ByteBuffer payload = patient.encodeAuxiliaryPayload(entries, 1);
-    ByteBuffer query = patient.encodeQuery(vector(11));
-    List<IndexSearchResult> all = patient.prepareAuxiliary(payload).search(query, 10);
-
-    VectorIndexAdapter hasty = adapterLegacy(VectorIndexDefinition.Metric.EUCLIDEAN, 1, ENTRIES);
-    List<IndexSearchResult> one = hasty.prepareAuxiliary(payload).search(query, 10);
-
-    // visiting one partition cannot return more than one partition holds, and cannot return more
-    // than was asked for
-    assertThat(one).hasSizeLessThanOrEqualTo(10);
-    assertThat(one.size()).isLessThanOrEqualTo(all.size());
+    IndexAdapter.PreparedSearch prepared = patient.prepareAuxiliary(payload);
+    List<IndexSearchResult> all = prepared.search(patient.encodeQuery(vector(11), ENTRIES), ENTRIES);
+    List<IndexSearchResult> one = prepared.search(patient.encodeQuery(vector(11), 1), ENTRIES);
+    assertThat(all).hasSize(ENTRIES);
+    assertThat(one).isNotEmpty().hasSizeLessThan(all.size());
     assertThat(all).containsAll(one);
+    assertThat(prepared.search(patient.encodeQuery(vector(11), ENTRIES), ENTRIES)).isEqualTo(all);
+  }
+
+  @Test
+  void usesTheQueryDefaultEvenWhenTheDefinitionContainsAnOldProbeCount() {
+    VectorIndexAdapter ivf = adapter(VectorIndexDefinition.Metric.EUCLIDEAN, 20, ENTRIES);
+    ByteBuffer payload = ivf.encodeAuxiliaryPayload(entries(VectorIndexDefinition.Metric.EUCLIDEAN), 1);
+    assertThat(ivf.prepareAuxiliary(payload).search(ivf.encodeQuery(vector(11)), ENTRIES))
+        .hasSizeLessThan(ENTRIES);
   }
 
   @Test
@@ -192,10 +197,10 @@ class TestIvfKernel {
                         .dimension(DIMENSION)
                         .metric(VectorIndexDefinition.Metric.EUCLIDEAN)
                         .structure(VectorIndexDefinition.VectorStructure.IVF)
-                        .property(IvfOptions.NPROBE, "many")
+                        .property(IvfOptions.NLIST, "many")
                         .build()))
         .isInstanceOf(IllegalArgumentException.class)
-        .hasMessageContaining("IVF option nprobe is not a number: many");
+        .hasMessageContaining("IVF option nlist is not a number: many");
   }
 
   @Test

@@ -18,6 +18,7 @@
  */
 package org.apache.iceberg.spark.procedures;
 
+import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.UUID;
 import org.apache.iceberg.Table;
@@ -73,7 +74,7 @@ class BuildVectorIndexProcedure extends BaseProcedure {
       optionalInParameter("mode", DataTypes.StringType);
 
   /**
-   * Options of the structure being built, such as nlist and nprobe for IVF.
+   * Options of the structure being built, such as nlist for IVF.
    *
    * <p>A map rather than a parameter per option, because the options of one structure mean nothing
    * to another, and a procedure that named them all would have to name each new one as well.
@@ -353,6 +354,12 @@ class BuildVectorIndexProcedure extends BaseProcedure {
     if (structure == VectorStructure.HNSW) {
       builder.maxM(maxM).efConstruction(efConstruction).efSearch(efSearch);
     }
+    if (structure == VectorStructure.IVF && options.containsKey("nprobe")) {
+      Map<String, String> buildOptions = new LinkedHashMap<>(options);
+      buildOptions.remove("nprobe");
+      return builder.properties(buildOptions).build();
+    }
+
     return builder.properties(options).build();
   }
 

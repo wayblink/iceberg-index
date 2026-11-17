@@ -313,7 +313,6 @@ public final class IvfKernel implements VectorKernel, RetainedBytes {
     return new ListSearcher(
         loaded,
         dimension,
-        options.nprobe(),
         scoring.metric(),
         stride,
         isQuantized() ? quantizer.codeBytes() : 0,
@@ -661,11 +660,23 @@ public final class IvfKernel implements VectorKernel, RetainedBytes {
     }
   }
 
+  private static int queryNprobe(ByteBuffer query, int dimension) {
+    long vectorBytes = 2L * Integer.BYTES + (long) dimension * Float.BYTES;
+    if (query.remaining() == vectorBytes) {
+      return IvfOptions.DEFAULT_NPROBE;
+    }
+
+    Preconditions.checkArgument(
+        query.remaining() == vectorBytes + Integer.BYTES, "Invalid IVF query length");
+    int nprobe = query.duplicate().getInt(query.limit() - Integer.BYTES);
+    Preconditions.checkArgument(nprobe > 0, "Invalid IVF nprobe: %s", nprobe);
+    return nprobe;
+  }
+
   /** A prepared search that reads records where they lie and keeps a bounded top-k. */
   private static final class ListSearcher implements PreparedSearch {
     private final Loaded loaded;
     private final int dimension;
-    private final int nprobe;
     private final VectorScoring scoring;
     private final long bytes;
     private final long stride;
@@ -674,14 +685,12 @@ public final class IvfKernel implements VectorKernel, RetainedBytes {
     private ListSearcher(
         Loaded loaded,
         int dimension,
-        int nprobe,
         VectorIndexDefinition.Metric metric,
         long stride,
         int codeBytes,
         long bytes) {
       this.loaded = loaded;
       this.dimension = dimension;
-      this.nprobe = nprobe;
       this.scoring = new VectorScoring(metric);
       this.stride = stride;
       this.codeBytes = codeBytes;
@@ -700,6 +709,7 @@ public final class IvfKernel implements VectorKernel, RetainedBytes {
         return ImmutableList.of();
       }
 
+      int nprobe = queryNprobe(query, dimension);
       float[] queryVector =
           VectorPayloads.decodeVector(VectorPayloads.toBytes(query), dimension, "Query");
       // the partitions worth visiting, chosen by the same measure the vectors were partitioned by
@@ -737,6 +747,7 @@ public final class IvfKernel implements VectorKernel, RetainedBytes {
         return ImmutableList.of();
       }
 
+      int nprobe = queryNprobe(query, dimension);
       float[] queryVector =
           VectorPayloads.decodeVector(VectorPayloads.toBytes(query), dimension, "Query");
       IndexCandidates.LongSet[] admitted = admittedRows(candidates);

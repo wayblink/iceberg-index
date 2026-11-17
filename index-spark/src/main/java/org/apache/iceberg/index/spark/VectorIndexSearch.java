@@ -48,6 +48,36 @@ import org.apache.spark.sql.types.StructType;
  */
 public final class VectorIndexSearch {
 
+  private static final String IVF_NPROBE = "spark.iceberg.index.vector.ivf.nprobe";
+
+  /** Encodes the query with the session's probe count when configured for an IVF index. */
+  public static ByteBuffer encodeQuery(SparkSession spark, VectorIndexAdapter adapter, float[] query) {
+    VectorIndexDefinition definition = (VectorIndexDefinition) adapter.definition();
+    if (definition.structure() != VectorIndexDefinition.VectorStructure.IVF) {
+      return adapter.encodeQuery(query);
+    }
+
+    String configured =
+        spark.conf().get(IVF_NPROBE, spark.sparkContext().getConf().get(IVF_NPROBE, null));
+    if (configured == null) {
+      return adapter.encodeQuery(query);
+    }
+
+    String message = "Invalid " + IVF_NPROBE + ": '" + configured + "', expected a positive integer";
+    int nprobe;
+    try {
+      nprobe = Integer.parseInt(configured.trim());
+    } catch (NumberFormatException e) {
+      throw new IllegalArgumentException(message, e);
+    }
+
+    if (nprobe <= 0) {
+      throw new IllegalArgumentException(message);
+    }
+
+    return adapter.encodeQuery(query, nprobe);
+  }
+
   /** Column of the index of the query a hit belongs to. */
   public static final String QUERY_ID_COLUMN = IndexSearch.QUERY_ID_COLUMN;
 
@@ -110,7 +140,7 @@ public final class VectorIndexSearch {
                 + " does not match index dimension "
                 + definition.dimension());
       }
-      payloads.add(adapter.encodeQuery(query));
+      payloads.add(encodeQuery(spark, adapter, query));
     }
 
     return IndexSearch.search(spark, table, vectorColumn, metadata, payloads, topK);
