@@ -365,10 +365,13 @@ public final class DistributedIndexSearch {
                   while (indexFiles.hasNext()) {
                     IndexFileTask indexFile = indexFiles.next();
                     String location = indexFile.location();
+                    long readStart = System.nanoTime();
                     OpenedSearch opened =
                         openSearch(fileIO, location, fileAdapter, cacheConfig, cacheKey, rangeRead);
+                    long readNanos = System.nanoTime() - readStart;
+                    long searchStart = System.nanoTime();
                     try (opened) {
-                      ExecutorIndexCache.CachedFile file = opened.file();
+                      ExecutorIndexCache.CachedFile file = opened.file;
                       // what this task may score at all, when the query asked for the filter to run
                       // before the search: the admitted rows of the files this index file covers
                       IndexCandidates candidates = plan.candidatesOf(fileIO, indexFile.tasks());
@@ -397,6 +400,10 @@ public final class DistributedIndexSearch {
                             outcome.rows.size() < topK);
                       }
                       partitionRows.addAll(outcome.rows);
+                    }
+
+                    if (opened.rangeSearch != null) {
+                      logReadTimes(location, opened, readNanos, System.nanoTime() - searchStart);
                     }
                   }
                   reportCache(cacheReports, queryRun);
@@ -914,7 +921,7 @@ public final class DistributedIndexSearch {
                         long readNanos = System.nanoTime() - readStart;
                         long searchStart = System.nanoTime();
                         try (opened) {
-                          ExecutorIndexCache.CachedFile file = opened.file();
+                          ExecutorIndexCache.CachedFile file = opened.file;
                           for (IndexSearchResult hit :
                               file.searching(
                                   prepared ->
@@ -927,12 +934,7 @@ public final class DistributedIndexSearch {
                                 new Tuple3<>(hit.dataFile(), hit.rowPosition(), hit.score()));
                           }
                         }
-                        LOG.debug(
-                            "index file {} read {} ms, search {} ms",
-                            location.substring(location.lastIndexOf('/') + 1),
-                            TimeUnit.MILLISECONDS.convert(readNanos, TimeUnit.NANOSECONDS),
-                            TimeUnit.MILLISECONDS.convert(
-                                System.nanoTime() - searchStart, TimeUnit.NANOSECONDS));
+                        logReadTimes(location, opened, readNanos, System.nanoTime() - searchStart);
                       }
                       reportCache(cacheReports, queryRun);
                       return fileHits.iterator();
@@ -1075,7 +1077,7 @@ public final class DistributedIndexSearch {
 
                         long searchStart = System.nanoTime();
                         try (opened) {
-                          ExecutorIndexCache.CachedFile file = opened.file();
+                          ExecutorIndexCache.CachedFile file = opened.file;
                           file.searching(
                               prepared -> {
                                 for (int queryId = 0; queryId < fileQueries.size(); queryId++) {
@@ -1093,13 +1095,7 @@ public final class DistributedIndexSearch {
                               });
                         }
 
-                        LOG.debug(
-                            "index file {} read {} ms, batch search of {} queries {} ms",
-                            location.substring(location.lastIndexOf('/') + 1),
-                            TimeUnit.MILLISECONDS.convert(readNanos, TimeUnit.NANOSECONDS),
-                            fileQueries.size(),
-                            TimeUnit.MILLISECONDS.convert(
-                                System.nanoTime() - searchStart, TimeUnit.NANOSECONDS));
+                        logReadTimes(location, opened, readNanos, System.nanoTime() - searchStart);
                       }
                       reportCache(cacheReports, queryRun);
                       return batchHits.iterator();
@@ -1726,17 +1722,44 @@ public final class DistributedIndexSearch {
             spark.conf().get(key, spark.sparkContext().getConf().get(key, "false")));
   }
 
+  private static void logReadTimes(
+      String location, OpenedSearch opened, long openNanos, long searchNanos) {
+    if (!LOG.isDebugEnabled()) {
+      return;
+    }
+
+    String name = location.substring(location.lastIndexOf('/') + 1);
+    long listNanos = 0L;
+    if (opened.rangeSearch != null) {
+      VectorIndexAdapter.RangeReadMetrics metrics = opened.rangeSearch.listReadMetrics();
+      listNanos = metrics.nanos();
+      LOG.debug(
+          "index file {} IVF list I/O {} ms, {} bytes, {} reads",
+          name,
+          TimeUnit.NANOSECONDS.toMillis(listNanos),
+          metrics.bytes(),
+          metrics.requests());
+    }
+
+    LOG.debug(
+        "index file {} read {} ms, search {} ms",
+        name,
+        TimeUnit.NANOSECONDS.toMillis(openNanos + listNanos),
+        TimeUnit.NANOSECONDS.toMillis(searchNanos - listNanos));
+  }
+
   private static final class OpenedSearch implements AutoCloseable {
     private final ExecutorIndexCache.CachedFile file;
     private final Runnable release;
+    private final VectorIndexAdapter.RangeSearch rangeSearch;
 
-    private OpenedSearch(ExecutorIndexCache.CachedFile file, Runnable release) {
+    private OpenedSearch(
+        ExecutorIndexCache.CachedFile file,
+        Runnable release,
+        VectorIndexAdapter.RangeSearch rangeSearch) {
       this.file = file;
       this.release = release;
-    }
-
-    private ExecutorIndexCache.CachedFile file() {
-      return file;
+      this.rangeSearch = rangeSearch;
     }
 
     @Override
@@ -1756,18 +1779,18 @@ public final class DistributedIndexSearch {
     String key = cacheKey(config.owner(), readerKey, location);
     ExecutorIndexCache.Lease lease = cache.acquireManagedKey(key);
     if (lease != null) {
-      return new OpenedSearch(lease.file(), lease::close);
+      return new OpenedSearch(lease.file(), lease::close, null);
     }
 
     if (rangeRead && adapter instanceof VectorIndexAdapter vector) {
       ExecutorIndexCache.CachedFile hit = cache.unmanagedHit(key, config);
       if (hit != null) {
-        return new OpenedSearch(hit, () -> {});
+        return new OpenedSearch(hit, () -> {}, null);
       }
 
       VectorIndexAdapter.RangeSearch search = vector.prepareRange(io.newInputFile(location));
       if (search != null) {
-        return new OpenedSearch(ExecutorIndexCache.loaded(0L, search), search::close);
+        return new OpenedSearch(ExecutorIndexCache.loaded(0L, search), search::close, search);
       }
     }
 
@@ -1778,7 +1801,7 @@ public final class DistributedIndexSearch {
             readerKey,
             sizeHint(io, location),
             () -> loadFile(io, location, adapter));
-    return new OpenedSearch(file, () -> {});
+    return new OpenedSearch(file, () -> {}, null);
   }
 
   static ExecutorIndexCache.CachedFile loadFile(FileIO io, String location, IndexAdapter adapter) {

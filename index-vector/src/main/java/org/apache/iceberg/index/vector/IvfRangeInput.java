@@ -20,6 +20,7 @@ package org.apache.iceberg.index.vector;
 
 import java.io.IOException;
 import java.io.UncheckedIOException;
+import org.apache.iceberg.index.vector.VectorIndexAdapter.RangeReadMetrics;
 import org.apache.iceberg.io.IOUtil;
 import org.apache.iceberg.io.RangeReadable;
 import org.apache.iceberg.io.SeekableInputStream;
@@ -31,6 +32,9 @@ final class IvfRangeInput implements AutoCloseable {
   private final long offset;
   private final int length;
   private final String location;
+  private long nanos;
+  private long bytesRead;
+  private long requests;
 
   IvfRangeInput(SeekableInputStream stream, long offset, int length, String location) {
     this.stream = stream;
@@ -52,6 +56,7 @@ final class IvfRangeInput implements AutoCloseable {
         length,
         location);
     byte[] bytes = new byte[size];
+    long started = System.nanoTime();
     try {
       if (stream instanceof RangeReadable range) {
         range.readFully(offset + position, bytes);
@@ -60,10 +65,18 @@ final class IvfRangeInput implements AutoCloseable {
         IOUtil.readFully(stream, bytes, 0, size);
       }
 
+      bytesRead += size;
+      requests++;
       return bytes;
     } catch (IOException e) {
       throw new UncheckedIOException("Failed to read IVF range in " + location, e);
+    } finally {
+      nanos += System.nanoTime() - started;
     }
+  }
+
+  RangeReadMetrics metrics() {
+    return new RangeReadMetrics(nanos, bytesRead, requests);
   }
 
   @Override

@@ -803,7 +803,8 @@ public final class IvfKernel implements VectorKernel, RetainedBytes {
         recordStride(),
         isQuantized() ? quantizer.codeBytes() : 0,
         0L,
-        new RangeLists(input, metadata.seed(), metadata.bits()));
+        new RangeLists(
+            new IvfListRanges(input, directory.starts()), metadata.seed(), metadata.bits()));
   }
 
   private static int queryNprobe(ByteBuffer query, int dimension) {
@@ -819,7 +820,7 @@ public final class IvfKernel implements VectorKernel, RetainedBytes {
     return nprobe;
   }
 
-  private record RangeLists(IvfRangeInput input, long seed, int bits) {}
+  private record RangeLists(IvfListRanges lists, long seed, int bits) {}
 
   /** A prepared search that reads records where they lie and keeps a bounded top-k. */
   private static final class ListSearcher implements VectorIndexAdapter.RangeSearch {
@@ -851,23 +852,25 @@ public final class IvfKernel implements VectorKernel, RetainedBytes {
     @Override
     public void close() {
       if (ranges != null) {
-        ranges.input().close();
+        ranges.lists().close();
       }
     }
 
+    @Override
+    public VectorIndexAdapter.RangeReadMetrics listReadMetrics() {
+      return ranges == null
+          ? VectorIndexAdapter.RangeSearch.super.listReadMetrics()
+          : ranges.lists().metrics();
+    }
+
     private VectorPayloadReader readList(int list, boolean quantized) {
-      int start = loaded.listStarts[list];
-      int end =
-          list + 1 == loaded.listStarts.length
-              ? ranges.input().length()
-              : loaded.listStarts[list + 1];
-      VectorPayloadReader block = new VectorPayloadReader(ranges.input().read(start, end - start));
-      int countOffset = quantized ? dimension * Float.BYTES : 0;
+      VectorPayloadReader block = ranges.lists().read(list);
+      long countOffset = block.position() + (quantized ? (long) dimension * Float.BYTES : 0L);
       Preconditions.checkArgument(
           block.intAt(countOffset) == loaded.listCounts[list],
           "Invalid IVF list %s block count",
           list);
-      long offset = (long) countOffset + Integer.BYTES;
+      long offset = countOffset + Integer.BYTES;
       for (int row = 0; row < loaded.listCounts[list]; row++, offset += stride) {
         int fileID = block.intAt(offset);
         Preconditions.checkArgument(
@@ -904,6 +907,10 @@ public final class IvfKernel implements VectorKernel, RetainedBytes {
       }
 
       VectorTopK top = new VectorTopK(topK, candidates, scoring, index -> loaded.dataFiles[index]);
+      if (ranges != null) {
+        ranges.lists().plan(lists, null);
+      }
+
       VectorPayloadReader reader = ranges == null ? new VectorPayloadReader(loaded.payload) : null;
       if (codeBytes == 0) {
         scorePlainLists(queryVector, lists, reader, top, null, null);
@@ -949,6 +956,10 @@ public final class IvfKernel implements VectorKernel, RetainedBytes {
       int probed = Math.max(1, Math.min(nprobe, loaded.centroids.length));
       while (true) {
         int[] lists = nearestCentroids(queryVector, loaded.centroids, probed, scoring);
+        if (ranges != null) {
+          ranges.lists().plan(lists, scored);
+        }
+
         if (codeBytes == 0) {
           scorePlainLists(queryVector, lists, reader, top, admitted, scored);
         } else {
@@ -1017,7 +1028,7 @@ public final class IvfKernel implements VectorKernel, RetainedBytes {
 
         int count = loaded.listCounts[list];
         reader = ranges == null ? whole : readList(list, false);
-        long offset = ranges == null ? loaded.listStarts[list] : Integer.BYTES;
+        long offset = ranges == null ? loaded.listStarts[list] : (long) reader.position() + Integer.BYTES;
         for (int record = 0; record < count; record++, offset += stride) {
           int dataFileIndex = reader.intAt(offset);
           long rowPosition = reader.longAt(offset + Integer.BYTES);

@@ -104,10 +104,17 @@ public final class VectorIndexAdapter implements IndexAdapter, java.io.Serializa
     return IndexAdapter.super.auxiliaryBlob(payload);
   }
 
+  /** Cumulative data reads for the IVF lists used by a search task. */
+  public record RangeReadMetrics(long nanos, long bytes, long requests) {}
+
   /** A search that owns the stream for a single task's IVF reads. */
   public interface RangeSearch extends PreparedSearch, AutoCloseable {
     @Override
     default void close() {}
+
+    default RangeReadMetrics listReadMetrics() {
+      return new RangeReadMetrics(0L, 0L, 0L);
+    }
   }
 
   /** Opens a block-addressable IVF file, or returns null if it uses whole-file storage. */

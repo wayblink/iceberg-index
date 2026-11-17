@@ -73,10 +73,55 @@ class TestIvfRangeRead {
       assertThat(counted.reads - readsBefore).isEqualTo(1);
       assertThat(counted.bytes - bytesBefore).isPositive().isLessThan(payload.remaining());
 
+      long bytesAfter = counted.bytes;
+      assertThat(search.search(query, 5)).isEqualTo(full.search(query, 5));
+      assertThat(counted.bytes).isEqualTo(bytesAfter);
+      assertThat(search.listReadMetrics().bytes()).isEqualTo(bytesAfter - bytesBefore);
+      assertThat(search.listReadMetrics().requests()).isEqualTo(1);
+      assertThat(search.listReadMetrics().nanos()).isPositive();
+
       IndexCandidates admitted = IndexCandidates.of(Map.of("b", new long[] {62L, 63L}));
       assertThat(search.search(query, 2, admitted))
           .hasSize(2)
           .isEqualTo(full.search(query, 2, admitted));
+    }
+  }
+
+  @Test
+  void adjacentSparseListsShareOneRead() {
+    byte[] payload = new byte[8 * Integer.BYTES];
+    ByteBuffer buffer = ByteBuffer.wrap(payload);
+    int[] starts = new int[8];
+    for (int list = 0; list < starts.length; list++) {
+      starts[list] = buffer.position();
+      buffer.putInt(list);
+    }
+
+    CountingFile file = new CountingFile(payload);
+    IvfRangeInput input = new IvfRangeInput(file.newStream(), 0, payload.length, file.location());
+    try (IvfListRanges ranges = new IvfListRanges(input, starts)) {
+      ranges.plan(new int[] {5, 4, 1}, null);
+      assertThat(ranges.read(5).readInt()).isEqualTo(5);
+      assertThat(ranges.read(4).readInt()).isEqualTo(4);
+      assertThat(ranges.read(1).readInt()).isEqualTo(1);
+      assertThat(file.reads).isEqualTo(2);
+      assertThat(file.bytes).isEqualTo(3 * Integer.BYTES);
+    }
+  }
+
+  @Test
+  void probingAllListsReadsTheListAreaOnce() throws IOException {
+    VectorIndexAdapter vector = adapter(VectorQuantizer.NONE, true);
+    ByteBuffer payload = vector.encodeAuxiliaryPayload(entries(vector), 1);
+    InMemoryOutputFile file = new InMemoryOutputFile();
+    new PuffinIndexFileContainer().write(file, List.of(vector.auxiliaryBlob(payload)));
+    CountingFile counted = new CountingFile(file.toByteArray());
+    ByteBuffer query = vector.encodeQuery(new float[] {1F, 1F}, LISTS);
+    try (VectorIndexAdapter.RangeSearch search = vector.prepareRange(counted)) {
+      int readsBefore = counted.reads;
+      assertThat(search.search(query, 5))
+          .isEqualTo(vector.prepareAuxiliary(payload).search(query, 5));
+      assertThat(counted.reads - readsBefore).isEqualTo(1);
     }
   }
 
