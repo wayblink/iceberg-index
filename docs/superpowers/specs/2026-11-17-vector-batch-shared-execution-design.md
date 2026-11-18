@@ -19,9 +19,11 @@
 
 # 向量批量查询共享一次分布式执行（原型设计）
 
-状态：**原型设计，未实现、未验收。** 本文展开[向量查询性能优化路线图](../../2026-11-17-vector-query-performance-roadmap.md)
+状态：**第一步与 `index_hits` 批量化已实现（`0c339652f`、`37ceaba4f`）；
+跨块等价与作业数已有测试覆盖，10,000 条查询的吞吐、shuffle 与峰值堆测量待目标环境。**
+本文展开[向量查询性能优化路线图](../../2026-11-17-vector-query-performance-roadmap.md)
 §1「批量查询共享一次分布式执行」，性能背景与「实测/推算」口径见[向量查询性能诊断](../../2026-11-17-vector-query-performance-analysis.md)。
-基线为 `index` 分支 `b1437e7f8`，下文行号以其为准。本文不含工期承诺，也不提出新的用户可设参数。
+逐条执行的基线为 `index` 分支 `b4852d6e0`，相关旧行号以其为准。本文不含工期承诺，也不提出新的用户可设参数。
 
 ## 1. 要改什么，不改什么
 
@@ -171,26 +173,40 @@ flowchart LR
 
 整批（B = Q）不可行：查询 payload 要广播（Q×dim×4 字节）、每 task 要为每条查询保留堆、
 驱动要同时持有 Q×k 个候选，且块越大单作业失败重试的粒度越粗。块太小则作业数与索引读取次数回升。
-B 由四个预算取最小值：
+B 按三个预算估算，最多 128 条、至少 1 条。最后一块可以少于 B 条：
 
 ```
-B = min( floor(broadcastBudget / (dim × 4)),
-         floor(driverBudget   / ((w+1) × candidateBytes)),
-         floor(shuffleBudget  / (indexFiles × (w+1) × candidateBytes)),
-         Q )
+w = max(1, min(k × max(1, over), entryUpperBound))   （每查询初始候选宽度）
+u = uncoveredFiles，仅 table 模式计入，否则为 0
+s = k（u > 0），否则为 0                            （扫描侧最终回表行数上界）
+
+B = clamp(1, 128, min(floor(payloadBudget / (dim × 4)),
+                      floor(driverBudget / ((w + s) × (dim × 8 + rowOverhead)
+                                            + k × (dim × 20 + jsonOverhead))),
+                      floor(shuffleBudget / max(indexFiles × min(w + 1, INT_MAX) × candidateBytes,
+                                                u × k × candidateBytes))))
 ```
 
-按 Q=10,000、k=10、维度 2,560、586 个索引文件、广播 8 MiB、驱动候选 8 MiB、shuffle 128 MiB
-（候选元组按 ~128 B 估）估算，四个上界分别约为 819、5,957、162、10,000，取 128 附近。更大的块收益有限：
+Driver 项估算块内同时持有的索引回表行、扫描胜出行，以及这些行答案的 JSON。行按每维 8 字节、其余列和
+包装按每行 256 字节；JSON 按每维 20 字节（一个 double 约 18 个字符加分隔符）、每行 32 字节。
+索引 Shuffle 计入每文件用于判断 `moreHits` 的额外一条命中，扫描 Shuffle 只在 `table` 模式有未覆盖文件时计入。
+此估算用于选块大小。实际行宽、扩探、单条查询和整批输出仍可能超出预算。
 
-| B | 块数 | 作业数（每块 3 个） | 索引整块读取次数 | 广播 | 每块驱动候选 | 列表覆盖率（nlist=707, nprobe=32） |
+按 Q=10,000、k=10、over=0（w=10）、维度 2,560、586 个索引文件、一个未覆盖文件、广播 8 MiB、
+Driver 8 MiB、Shuffle 128 MiB 估算，三个上界约为 819、9、162，推导块大小为 9。
+
+| B | 块数 | 作业数（每块 5 个，table 模式含 S4/扫描回表/JSON） | 索引整块读取次数 | 广播 | 每块驱动候选 | 列表覆盖率（nlist=707, nprobe=32） |
 |---:|---:|---:|---:|---:|---:|---:|
-| 32 | 313 | 939 | 183,418 | 0.33 MB | 320 | 77% |
-| 64 | 157 | 471 | 92,002 | 0.65 MB | 640 | 95% |
-| **128** | **79** | **237** | **46,294** | **1.31 MB** | **1,280** | **99.7%** |
-| 256 | 40 | 120 | 23,440 | 2.62 MB | 2,560 | ≈100% |
+| **9**（推导值） | 1,112 | 5,560 | 651,632 | 0.09 MB | 90 | 34% |
+| 32 | 313 | 1,565 | 183,418 | 0.33 MB | 320 | 77% |
+| 64 | 157 | 785 | 92,002 | 0.65 MB | 640 | 95% |
+| **128**（上限） | 79 | **395** | **46,294** | 1.31 MB | **1,280** | 99.7% |
 
-（「列表覆盖率」为 §4.7 的任务内共享读取预留的指标；B=128 之后边际收益已经很小。）
+表中的驱动候选数只计索引侧。列表覆盖率为 §4.7 的任务内共享读取预留的指标。
+
+当预算把 B 压到 1（例如 `table` 模式、未覆盖文件、k 很大或维度很宽）时，块执行退化为逐条：索引文件不再
+跨查询共享加载，且 `table` 模式比旧逐条路径多一次「扫描候选回表」作业。预算优先保证 Driver 不超限，
+这种配置下方案不承诺作业数收益。
 
 块大小是内部常量，按上面的预算推导；只为测量与测试保留内部 system property 覆盖，
 不新增 Spark 会话参数（分析文档 §9.4 要求任何用户可设参数先经批准）。
@@ -203,11 +219,12 @@ B = min( floor(broadcastBudget / (dim × 4)),
 
 - 新增 `searchBatchWithOutcomes(spark, metadata, table, List<IndexQuery>)`，返回 `List<SearchOutcome>`；
   `IndexQuery.topK()` 就是该查询本轮的候选宽度 `w_q`。
-- 每个文件仍按 `widestTopK + 1` 的窗口搜索（沿用 `DistributedIndexSearch.java:1062` 的既有做法），
-  归并时按每查询自己的 `w_q` 截断、按自己的 `w_q` 判定 `moreHits`。窗口取最宽只会多扫，不会少答案。
+- 每条查询在每个文件都按自己的 `w_q + 1` 搜索，而不是按块内最宽查询的窗口：HNSW 的图遍历宽度是
+  `max(topK, efSearch)`，用别人的窗口会改变遍历、让批量结果与单条不一致。归并时仍按每查询自己的
+  `w_q` 截断、按自己的 `w_q` 判定 `moreHits`。
 - `searchBatch` 保持原签名与行为（文本入口和既有测试依赖它），实现上委托给新方法或保持独立。
-- 前提断言：块内所有查询共享同一个 `sourceTableSnapshotId`（`searchBatch` 以第一条查询的
-  `indexFiles` 为准，`DistributedIndexSearch.java:1015`）；`adapter.searchesAllPayloadsTogether()` 的索引不走这条路径
+- 块内查询须共享相同的 `sourceTableSnapshotId` 和 `consistency`，这样才能用第一条查询解析出的索引文件。
+  `adapter.searchesAllPayloadsTogether()` 的索引不走这条路径
   （文本 BM25 继续用现有的文本批查路径）。
 
 ### 4.3 回表：一次读取，同时服务判活、精确距离与 JSON
@@ -216,9 +233,9 @@ B = min( floor(broadcastBudget / (dim × 4)),
 `rowsJsonOf`（`:261`）再读一遍只为 JSON。批量化后：
 
 - 位置集合是块内并集（`Map<file, Set<pos>>`），`IndexEntries.rowsAt` 已支持按位置读取，API 不变。
-- 一次读取拿到完整行，判活、精确距离、JSON 都从同一份行算；JSON 在 driver 上按块序列化
-  （`createDataFrame(本地列表).toJSON` 不启动作业，`resolveRows:500-523` 已是这种写法）。
-- 代价是每行完整行过一次 driver 屏障（现状同样如此），但峰值从 Q×k 降到 B×k。
+- 一次读取拿到完整行，判活、精确距离、JSON 都使用这份数据。`indexed` 和 `table` 模式按块对唯一行生成 JSON，
+  `toJSON.collectAsList()` 会提交一个 Spark 作业。
+- 完整行过一次 Driver 屏障。块限制的是临时回表行的数量，已完成块的输出仍会累积在 Driver。
 
 ### 4.4 未覆盖文件：一趟扫描，给块内所有查询评分
 
@@ -259,7 +276,9 @@ B = min( floor(broadcastBudget / (dim × 4)),
 1. 先在 task 内算出 `(query_id, list_id)` 集合（探哪些列表是查询期的决定，与列表内容无关）。
 2. 以 list 为单位读取一次，对探测该 list 的所有查询评分；共享程度取决于列表覆盖率。
    假设各查询独立且均匀选择列表，期望覆盖率为 `1 - (1 - nprobe/nlist)^B`：`nlist=707`、`nprobe=32` 时
-   B=32 为 77%，64 为 95%，100 为 99%，128 为 99.7%。这正是 B≈128 的另一个理由。
+   B=32 为 77%，64 为 95%，100 为 99%，128 为 99.7%。按 §4.1 的预算，当前推导出的 B 约为 9，
+   对应覆盖率只有约 34%；因此任务内 list 共享若要接近全覆盖，需要单独评估块大小（例如只按列表维度
+   放宽块上限），不能把 B≈128 当成现状。
 3. 真实数据可能集中在少数热点列表，先测每块被探列表的直方图、top-1% 列表的探测占比与最大单列表字节数，
    再决定按范围选读还是连续读。可参考 [Faiss 的批量 IVF 实现](https://github.com/facebookresearch/faiss/blob/main/contrib/README.md)。
 4. 这需要 `IndexAdapter.PreparedSearch`（`IndexAdapter.java`）暴露「按 list 子集搜索」的能力，
@@ -276,7 +295,8 @@ public static List<SearchOutcome> searchBatchWithOutcomes(
 ```
 
 - `IndexQuery.topK()` = 该查询本轮宽度 `w_q`；返回的 `hits()` ≤ `w_q`，`moreHits()` 与逐条搜索同义。
-- 断言：所有查询的 `sourceTableSnapshotId()` 相同；adapter 不是 `searchesAllPayloadsTogether()`。
+- 断言：所有查询的 `sourceTableSnapshotId()` 与 `consistency()` 相同；adapter 不是
+  `searchesAllPayloadsTogether()`。
 
 回表直接复用现有 API，不新增：
 
@@ -321,21 +341,21 @@ private def scanBlock(
 ## 6. 成本对照（推算）
 
 假设 Q=10,000、k=10、`over=0`、586 个索引文件、dim=2560、缓存关闭、无删除（R=1）、
-存在未覆盖文件（U=1）、B=128：
+存在一个未覆盖文件（U=1）、推导 B=9（块数 1,112）：
 
 | 指标 | 现状（逐条） | 目标（按块） | 变化 |
 |---|---:|---:|---|
-| Spark 作业数 | ≈ 4Q = 40,000 | 块数×(2R+U) = 237 | 约 169× 减少 |
-| 索引 payload 整块读取次数 | Q × 586 = 5.86M | 79 × 586 = 46.3k | 约 127× 减少 |
+| Spark 作业数 | ≈ 4Q = 40,000 | 块数×(2R+U+扫描回表+JSON)=1,112×5=5,560 | 约 7.2 倍减少 |
+| 索引 payload 整块读取次数 | Q × 586 = 5.86M | 1,112 × 586 = 651.6k | 约 9 倍减少 |
 | 命中的数据文件读取 | ≈ 每查询每命中文件 2 次 | 每块每命中文件 1 次 | 取决于命中分布 |
-| 未覆盖文件扫描趟数 | Q = 10,000 | 79 | 约 127× 减少 |
-| 跨屏障候选元组 | 每查询 586×11 ≈ 6.4k | 每块 586×B×11 ≈ 825k | 总量不变（约 64M） |
-| 驱动中间态峰值 | 整批 Q×k 行 + JSON | 每块 B×k 行 + JSON | 约 78× 降低 |
+| 未覆盖文件扫描趟数 | Q = 10,000 | 1,112 | 9 倍减少 |
+| 跨屏障候选元组 | 每查询 586×11 ≈ 6.4k | 每块 586×9×11 ≈ 58k | 总量不变（约 64M） |
+| 单个执行单元临时回表行 | 每查询至多 w+s 行 | 每块至多 B×(w+s) 行 | 同一行可供多条查询复用 |
+| Driver 累计结果及 JSON | 至多 Q×k 条结果 | 至多 Q×k 条结果 | 两种执行均随结果数增长 |
 
 两点必须说清：跨屏障候选总量不随分块下降（每条查询仍要把 `文件数×(k+1)` 个元组汇总一次），
-本方案的收益是作业数、索引读取次数、未覆盖扫描趟数与驱动峰值；真正的候选量下降要靠全局质心
-（路线图 §4）。另外，`CALL` 过程最后仍要返回 `Q×k` 个 `InternalRow`，这一步的 driver 物化在第二步
-（分布式结果）之前无法消除。
+本方案直接减少作业数、索引读取次数与未覆盖扫描趟数。候选总量可以通过全局质心减少（路线图 §4）。
+`CALL` 过程仍物化各块的结果及 JSON，直到分布式输出落地。Driver 总峰值需要在目标环境实测。
 
 ## 7. 实施顺序与验收
 
@@ -361,13 +381,13 @@ private def scanBlock(
 
 ### 实现记录
 
-第一步与 `index_hits` 批量化已在工作区实现（未提交），与设计的差异记在这里：
+第一步与 `index_hits` 批量化已实现（`0c339652f`、`37ceaba4f`），与设计的差异记在这里：
 
 - 块大小按 §4.1 的预算推导并封顶 128；内部 JVM 属性 `iceberg.index.batch.queries-per-block` 只用于测试与测量；`query_table` 改为 `toLocalIterator` 逐行读取。
-- 每块作业数：`table` 模式为每轮 S1 + S3，另加一次 S4 和一次「扫描候选回表」——S4 只返回位置与距离，入选行的行值在这一步读一次，因此比 §6 的 3 个估算多一个小的回表作业；`indexed` 为每轮 2 个；`index_hits` 为每块 1 次搜索 + 1 次整块回表。
-- 行 JSON 在 driver 上按块内唯一行序列化一次（`createDataFrame(本地列表).toJSON` 不启动作业）。
+- 每块作业数：`table` 模式为每轮 S1 + S3，另加一次 S4、一次「扫描候选回表」（S4 只返回位置与距离，入选行的行值在这里读一次）和一次 JSON 作业；`indexed` 为每轮 2 个 + 1 个 JSON；`index_hits` 为每块 1 次搜索 + 1 次整块回表。
+- 行 JSON 在 driver 上按块内唯一行序列化：`createDataFrame(本地列表)` 是 `LocalRelation`，但 `.toJSON` 之后是 `ProjectExec`，`collectAsList` 仍会启动一个作业（Spark 3.5 只有 `LocalTableScanExec` 覆写了 `executeCollect`），所以每块多 1 个作业。
 - 未覆盖文件按块一趟扫描：分区内每查询一个有界堆，`aggregateByKey` 归并到每查询 top-k。
-- 已验证：130 条查询跨块用例、索引建后新增文件的用例、块大小覆盖用例、作业数差分用例；Spark 3.5 定向测试全绿（详见看板 #26/#27/#28/#29/#31 的 note）。
+- 已验证：130 条查询跨块用例、索引建后新增文件的用例、块大小覆盖用例、作业数差分用例、HNSW 混合 topK 用例、构建后 ADD COLUMN 的 JSON 用例、不同 consistency 拒绝用例；Spark 3.5 定向测试全绿（详见看板 #26/#27/#28/#29/#31 的 note）。
 - 尚未完成：10,000 条查询的吞吐、shuffle 字节与 driver/executor 峰值堆测量（需要目标集群与数据）；按 (query_id, list_id) 的任务内共享读取（§4.7）。
 
 ### 验收

@@ -161,10 +161,13 @@ g < 请求延迟 × 单流带宽 / 并发修正
 
 S3 上按 40 ms、100 MB/s 估，盈亏平衡点约 4 MB；HDFS 上按 1–2 ms、200 MB/s 估约 200–400 KB。真实值受任务并发
 共享带宽影响，必须先实测（§5），所以默认不改变现有行为。合并段仍受 8 MiB 上限约束（`MAX_CACHED_BYTES`），
-不会一次读入超大区间。相邻合并已在基线中由
-[`8207199a9`](https://github.com/apache/iceberg/commit/8207199a9) 实现，本设计只补间隔阈值。
+不会一次读入超大区间。相邻合并已在基线中由 `8207199a9`（本分支 `index`，非 apache/iceberg 仓库）实现，本设计只补间隔阈值。
 
 ### 3.4 读取统计
+
+已知长度不只用于 `newInputFile`，也传给 `PuffinIndexFileContainer.read(input, size)`，由后者交给
+`PuffinReader.withFileSize`：即使 FileIO 忽略长度提示，整读也不会再为 footer 取长度。测试用
+“忽略长度提示的 FileIO”锁定了这一点。
 
 `VectorIndexAdapter.RangeSearch.openReadMetrics()` 返回一次打开的
 `VectorIndexAdapter.OpenReadMetrics`，按区域分类：
