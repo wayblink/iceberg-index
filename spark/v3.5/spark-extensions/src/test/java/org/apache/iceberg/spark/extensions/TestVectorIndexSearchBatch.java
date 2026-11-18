@@ -258,6 +258,67 @@ public class TestVectorIndexSearchBatch extends ExtensionsTestBase {
     }
   }
 
+  /**
+   * A block starts every query at the same window, but only the queries that came up short may take
+   * another round: one query's nearest rows are gone, the other's are all there, and both still
+   * answer with k rows that match their own single query.
+   */
+  @TestTemplate
+  public void aBlockWidensOnlyTheQueriesThatFallShort() {
+    String tableName = tableName("vectors_batch_mixed_rounds_" + catalogName);
+    sql("CREATE TABLE %s (id bigint, embedding array<double>) USING iceberg", tableName);
+    sql(
+        "INSERT INTO %s SELECT id, array(CAST(id AS double), CAST(10 - id AS double)) "
+            + "FROM range(0, 30)",
+        tableName);
+    sql(
+        "CALL %s.system.build_vector_index("
+            + "table => '%s', column => 'embedding', dimension => 2, metric => 'l2')",
+        catalogName, tableName);
+    // four of the first six hits of one query are removed, so its first window cannot fill; the
+    // other query's window is intact
+    sql("DELETE FROM %s WHERE id IN (0, 1, 2, 3)", tableName);
+
+    String[] queries = {"0.0,10.0", "10.0,0.0"};
+    String[] doubles = {"0.0d, 10.0d", "10.0d, 0.0d"};
+    List<Object[]> batched =
+        sql(
+            "CALL %s.system.vector_search_batch(table => '%s', column => 'embedding', "
+                + "queries => array('%s', '%s'), k => 5)",
+            catalogName, tableName, queries[0], queries[1]);
+
+    for (int query = 0; query < queries.length; query += 1) {
+      List<Object[]> single =
+          sql(
+              "CALL %s.system.vector_search(table => '%s', column => 'embedding', "
+                  + "query => array(%s), k => 5)",
+              catalogName, tableName, doubles[query]);
+      int queried = query;
+      List<Object[]> fromBatch =
+          batched.stream()
+              .filter(row -> ((Number) row[0]).intValue() == queried)
+              .collect(Collectors.toList());
+      assertThat(fromBatch).as("query %s", queries[query]).hasSameSizeAs(single);
+      for (int i = 0; i < single.size(); i += 1) {
+        assertThat(java.util.Arrays.copyOfRange(fromBatch.get(i), 1, 5))
+            .as("query %s row %s", queries[query], i)
+            .isEqualTo(single.get(i));
+      }
+    }
+
+    // the widened query answered k live rows, and some of them came from beyond the window it
+    // started with, which is what says a later round was taken for it and not for the other query
+    List<Long> widened =
+        batched.stream()
+            .filter(row -> ((Number) row[0]).intValue() == 0 && row[4] != null)
+            .map(row -> parseId((String) row[4]))
+            .collect(Collectors.toList());
+    assertThat(widened).hasSize(5).doesNotContain(0L, 1L, 2L, 3L);
+    assertThat(widened)
+        .as("the short query had to ask its index file for more than its first window")
+        .anySatisfy(id -> assertThat(id).isGreaterThanOrEqualTo(6L));
+  }
+
   @TestTemplate
   public void cachedSearchRecordsWhereItIsCached() {
     String tableName = tableName("vectors_batch_located_" + catalogName);

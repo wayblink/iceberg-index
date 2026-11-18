@@ -265,6 +265,21 @@ docker push hub.i.basemind.com/spark/sparkann-e2e:<tag>
 
 ---
 
+### 5.6 内部测量开关（不是用户参数）
+
+下面三项是 **JVM 系统属性**（`-D...` 或测试里 `System.setProperty`），不是 session conf，也不在
+`CALL`/表函数的参数里。它们只用于测量与测试，默认关闭；**不要写进生产配置**，运维不需要理解它们。
+
+| 属性 | 默认 | 作用 | 备注 |
+|---|---|---|---|
+| `iceberg.index.batch.queries-per-block` | 未设（按预算推导，封顶 128） | 覆盖批量入口的块大小 | 覆盖值仍被 128 封顶；只给压测用 |
+| `iceberg.index.vector.refine` | `false` | 打开 IVF+RaBitQ 的“宽候选 + 精确重排” | 实验开关：打开后回表行数约 ×8（`refine.candidates`），换 recall；结论出来要么删要么按形状自动启用，不作为用户开关 |
+| `iceberg.index.vector.refine.candidates` | `8` | 精排每 k 的候选倍数 | 只在 `refine=true` 时生效 |
+
+查询期的正常调参走**语句参数**（`CALL ... nprobe => ...`、`SELECT ... FROM vector_search(..., nprobe => ...)`）
+或 **session conf**（`SET spark.iceberg.index.vector.ivf.nprobe=...`），优先级是
+**语句 > session > 索引定义默认**，见 `docs/docs/spark-procedures.md` 与 `docs/index-user-guide.md`。
+
 ## 6. 安全与权限
 
 - 建索引会写表元数据（提交一次 `MetadataUpdate`），因此**必须由表 owner 或具备修改表元数据权限的 principal 执行**，不能用只读账号。
