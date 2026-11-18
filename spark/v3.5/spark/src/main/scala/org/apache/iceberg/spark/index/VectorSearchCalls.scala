@@ -158,15 +158,15 @@ private[spark] object VectorSearchCalls {
       spark)
 
   /**
-   * Loads the table of a request and searches it; the table function's execution path.
+   * Loads the table of a request and binds it, without searching it.
    *
-   * <p>A table function has no coverage parameter, so it answers for the whole table. Only a caller
-   * that names the mode through a procedure can ask for the index-only answer.
+   * <p>This is the table function's planning step: the bound context is what its operator hands to
+   * the per-block execution, so the search starts when the plan is executed and one block at a time.
    */
-  def searchRequested(spark: SparkSession, request: VectorSearchHitsRequest): JList[Row] = {
+  def planRequested(spark: SparkSession, request: VectorSearchHitsRequest): VectorSearchHitsPlan = {
     val queries = new java.util.ArrayList[Array[Float]](request.queries.size)
     request.queries.foreach(query => queries.add(query.clone()))
-    search(
+    plan(
       spark,
       Spark3Util.loadIcebergTable(spark, request.tableName),
       request.column,
@@ -179,4 +179,13 @@ private[spark] object VectorSearchCalls {
       request.overSampleArgument,
       request.filterModeArgument)
   }
+
+  /**
+   * Loads the table of a request and searches it; the table function's execution path.
+   *
+   * <p>A table function has no coverage parameter, so it answers for the whole table. Only a caller
+   * that names the mode through a procedure can ask for the index-only answer.
+   */
+  def searchRequested(spark: SparkSession, request: VectorSearchHitsRequest): JList[Row] =
+    search(planRequested(spark, request), spark)
 }

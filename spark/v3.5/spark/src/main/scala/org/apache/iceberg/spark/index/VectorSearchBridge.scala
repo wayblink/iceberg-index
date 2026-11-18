@@ -312,17 +312,31 @@ private[spark] object VectorSearchBridge {
 
     // one block of queries at a time: the block shares one load of every index file and one row
     // resolution, so a data file several queries hit is read once for the whole block
-    val blockSize = queriesPerBlock(context)
-    val answered = mutable.ListBuffer.empty[Row]
-    var start = 0
-    while (start < request.queries.size) {
-      val end = math.min(start + blockSize, request.queries.size)
-      val block = (start until end).map(queryId => (queryId, request.queries(queryId)))
-      answered ++= indexHitsInBlock(spark, context, block)
-      start = end
+    spark.createDataFrame(hitBlocks(spark, context).flatten.toSeq.asJava, schema).collectAsList()
+  }
+
+  /**
+   * The index's own hits of a request, one block at a time.
+   *
+   * <p>Each block is searched, resolved and serialised when the iterator's next element is asked
+   * for, so a caller that consumes the blocks as they arrive holds one block's rows rather than the
+   * whole batch's. The procedure collects them because its answer is a result set; the table
+   * function's operator turns each block into a partition instead.
+   */
+  private[spark] def hitBlocks(
+      spark: SparkSession,
+      context: VectorSearchContext): Iterator[Seq[Row]] = {
+    val request = context.request.input
+    if (request.topK <= 0 || request.queries.isEmpty) {
+      return Iterator.empty
     }
 
-    spark.createDataFrame(answered.asJava, schema).collectAsList()
+    val blockSize = queriesPerBlock(context)
+    (0 until request.queries.size by blockSize).iterator.map { start =>
+      val end = math.min(start + blockSize, request.queries.size)
+      val block = (start until end).map(queryId => (queryId, request.queries(queryId)))
+      indexHitsInBlock(spark, context, block)
+    }
   }
 
   /**

@@ -391,6 +391,7 @@ private def scanBlock(
   （旧 `rowsAtJson` 重读）。这条是按代码路径推的账，未用 event log 实测。
 - 行 JSON 在 driver 上按块内唯一行序列化：`createDataFrame(本地列表)` 是 `LocalRelation`，但 `.toJSON` 之后是 `ProjectExec`，`collectAsList` 仍会启动一个作业（Spark 3.5 只有 `LocalTableScanExec` 覆写了 `executeCollect`），所以每块多 1 个作业。
 - 未覆盖文件按块一趟扫描：分区内每查询一个有界堆，`aggregateByKey` 归并到每查询 top-k。
+- **输出的逐块产出（#3124）**：表函数 `vector_index_search(_batch)` 不再先把整批结果攒在 driver，而是每块搜索/回表/JSON 完成后立刻转成一个分区，最后一次 `union`（`VectorSearchHitsRequestExec`）。driver 峰值是“一块”而不是整批：`index_hits` 每行 JSON 约 51 KB（2560 维）时，10k×k=10 的峰值从约 5 GB 降到一块（@块 10 → 约 5 MB 级；`positions` 契约下块 128、每行约 30 B，峰值 KB 级）。代价是每块一次本地 `createDataFrame`（一个无 shuffle 的小作业），块数越多固定开销越高；这也是块预算之外愿意用吞吐换内存的显式取舍。`CALL vector_search_batch` 仍是过程 API：返回结果集，driver 必须收全，**没有**逐块产出；需要流式消费请用表函数，或等写表模式（未做）。
 - **查询载体的表示（#3115）**：`VectorRequestInput.queries` 从 `Vector[Vector[Float]]`（每个元素一个装箱
   `java.lang.Float`）改成 `Vector[Array[Float]]`，driver 的常驻尺寸从约 20 B/dim（16 B 对象 + 引用）
   降到 4 B/dim：10,000×2,560 从约 0.5 GB 降到 **102.4 MB**（推算，未用 `jmap` 实测）。请求仍持有

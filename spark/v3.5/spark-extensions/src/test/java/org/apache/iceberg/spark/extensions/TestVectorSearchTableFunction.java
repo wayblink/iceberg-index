@@ -113,6 +113,37 @@ class TestVectorSearchTableFunction {
   }
 
   @Test
+  public void theOutputIsAssembledFromTheBlocks() {
+    String table = tableWithIndex("vs_blocks", "hnsw");
+    String sql =
+        String.format(
+            "SELECT * FROM vector_index_search_batch('local.%s', 'embedding', "
+                + "array('0.9,0.1', '0.1,0.9', '0.5,0.5', '1.0,0.0', '0.0,1.0'), 2)",
+            table);
+    List<Row> whole = spark.sql(sql).collectAsList();
+    assertThat(whole).isNotEmpty();
+
+    // the operator turns each block into a partition, so a block size that splits the batch must
+    // produce the same rows in the same order
+    System.setProperty("iceberg.index.batch.queries-per-block", "2");
+    try {
+      List<Row> blocks = spark.sql(sql).collectAsList();
+      assertThat(blocks).hasSameSizeAs(whole);
+      for (int i = 0; i < whole.size(); i += 1) {
+        Row expected = whole.get(i);
+        Row actual = blocks.get(i);
+        assertThat(actual.getInt(0)).as("query id of row %s", i).isEqualTo(expected.getInt(0));
+        assertThat(actual.getString(1)).as("file of row %s", i).isEqualTo(expected.getString(1));
+        assertThat(actual.getLong(2)).as("position of row %s", i).isEqualTo(expected.getLong(2));
+        assertThat(actual.getDouble(3)).as("score of row %s", i).isEqualTo(expected.getDouble(3));
+        assertThat(actual.getString(4)).as("row of row %s", i).isEqualTo(expected.getString(4));
+      }
+    } finally {
+      System.clearProperty("iceberg.index.batch.queries-per-block");
+    }
+  }
+
+  @Test
   public void projectsTheColumnsThatWereAskedFor() {
     String table = tableWithIndex("vs_columns", "hnsw");
 

@@ -30,6 +30,8 @@ import org.apache.spark.sql.execution.LeafExecNode
 import org.apache.spark.sql.execution.SparkPlan
 import org.apache.spark.sql.execution.metric.SQLMetric
 import org.apache.spark.sql.execution.metric.SQLMetrics
+import scala.collection.JavaConverters._
+import scala.collection.mutable
 
 /**
  * Plans index searches as physical operators.
@@ -60,14 +62,33 @@ private[spark] case class VectorSearchHitsRequestExec(
   override def output: Seq[Attribute] = request.output
 
   override protected def doExecute(): RDD[InternalRow] = {
-    val rows = VectorSearchCalls.searchRequested(spark, request)
+    val plan = VectorSearchCalls.planRequested(spark, request)
     val schema =
       if (request.batch) {
         org.apache.iceberg.index.spark.IndexSearch.RESULT_SCHEMA
       } else {
         org.apache.iceberg.index.spark.IndexSearch.SINGLE_RESULT_SCHEMA
       }
-    spark.createDataFrame(rows, schema).queryExecution.toRdd.map(row => row.copy())
+    // the search answers a block at a time, so this converts each block to one partition as it
+    // arrives and never holds the whole batch's rows: a 10,000-query batch of row JSON would
+    // otherwise put gigabytes on the driver before anything downstream saw a row
+    val sc = spark.sparkContext
+    val partitions = mutable.ArrayBuffer.empty[RDD[InternalRow]]
+    VectorSearchBridge.hitBlocks(spark, plan.context).foreach { rows =>
+      if (rows.nonEmpty) {
+        // a partition has to be made of the rows Spark can serialise, which the local frame gives
+        // UnsafeRow copies for; it starts one small job per block, which is the cost of not holding
+        // the whole batch's rows on the driver
+        partitions += spark
+          .createDataFrame(rows.asJava, schema)
+          .queryExecution
+          .toRdd
+          .map(row => row.copy())
+      }
+    }
+
+    // one union over the blocks keeps the tree flat however many blocks a batch took
+    if (partitions.isEmpty) sc.emptyRDD[InternalRow] else sc.union(partitions)
   }
 
   override def outputPartitioning: Partitioning = UnknownPartitioning(0)
