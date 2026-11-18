@@ -113,6 +113,9 @@ private[spark] case class VectorSearchSourceExec(
       "numLiveCandidates" -> SQLMetrics.createMetric(
         spark.sparkContext,
         "candidate hits that resolved to a live row"),
+      "numFetchedRows" -> SQLMetrics.createMetric(
+        spark.sparkContext,
+        "rows read at their data files to resolve candidates, summed over the rounds"),
       "numDeletedOrInvisibleHits" -> SQLMetrics.createMetric(
         spark.sparkContext,
         "candidate hits with no live row at the frozen snapshot"),

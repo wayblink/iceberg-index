@@ -78,6 +78,25 @@ class TestGlobalIvfRouting {
   }
 
   @Test
+  void aSampleOfTwoKeepsBothEndsOfTheInput() {
+    List<float[]> vectors = Lists.newArrayList();
+    for (int i = 0; i < 10; i += 1) {
+      vectors.add(new float[] {i, 0F});
+    }
+
+    float[][] sample = IvfCentroids.sample(vectors, 2);
+    assertThat(sample.length).isEqualTo(2);
+    assertThat(sample[0][0]).as("the first vector is always sampled").isZero();
+    assertThat(sample[1][0]).as("the last vector is always sampled").isEqualTo(9F);
+  }
+
+  @Test
+  void aSampleLargerThanTheInputKeepsEveryVector() {
+    List<float[]> vectors = Lists.newArrayList(new float[] {1F, 2F}, new float[] {3F, 4F});
+    assertThat(IvfCentroids.sample(vectors, 10).length).isEqualTo(2);
+  }
+
+  @Test
   void trainsTheSameCentroidsForTheSameInputAndSeed() {
     GlobalIvfRouter first = GlobalIvfRouter.train(clusterShards.shards, 32, SEED, SCORING);
     GlobalIvfRouter second = GlobalIvfRouter.train(clusterShards.shards, 32, SEED, SCORING);

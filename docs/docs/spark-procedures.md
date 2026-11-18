@@ -1295,8 +1295,8 @@ a JSON string. Rows are ordered by query and then by distance. `coverage` means 
 `vector_search`. Queries are answered in blocks: one block shares one load of every index file, one
 row resolution and, in the whole-table mode, one scan of the files the index does not cover.
 
-Queries are passed as an array of strings, one comma-separated list of numbers per query. How the
-matched rows are resolved depends on `coverage`:
+Queries are passed either as an array of strings, one comma-separated list of numbers per query, or
+read from a table with `query_table`. How the matched rows are resolved depends on `coverage`:
 
 | `coverage`   | How the batch is resolved |
 |--------------|---------------------------|
@@ -1315,15 +1315,23 @@ matched rows are resolved depends on `coverage`:
 |---------------|-----------|---------------|----------------------------------------------|
 | `table`       | ✔️        | string        | Name of the table                            |
 | `column`      | ✔️        | string        | Name of the indexed column                   |
-| `queries`     | ✔️        | array<string> | Query vectors, each a comma-separated list   |
 | `k`           | ✔️        | int           | Number of results per query                  |
+| `queries`     | ✔️*       | array<string> | Query vectors, each a comma-separated list   |
+| `query_table` | ✔️*       | string        | Table of query vectors, one row per query    |
+| `query_id_column` |        | string        | Column that orders `query_table`, so `query_id` lines up with the table's own ids |
+| `vector_column` |          | string        | Vector column of `query_table` (default `vector`) |
+| `index`       |           | string        | Name of the index, when several indexes share the column |
 | `coverage`    |           | string        | `table` (default), `indexed` or `index_hits` |
+
+\* Pass either `queries` or `query_table`. With `query_table`, the table is read once a row at a
+time and each row's vector column is one query; `query_id` is the row's position in that order, or
+the value of `query_id_column` when one is given.
 
 #### Output
 
 | Output Name | Type   | Description                                    |
 |-------------|--------|------------------------------------------------|
-| `query_id`  | int    | Index of the query in the `queries` argument   |
+| `query_id`  | int    | Index of the query, in `queries` order or `query_table` order |
 | `data_file` | string | Data file of the matched row                   |
 | `pos`       | long   | Row position within the data file (`_pos`)     |
 | `score`     | double | Distance from the query                        |

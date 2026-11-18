@@ -137,6 +137,66 @@ class TestIvfRangeRead {
   }
 
   @Test
+  void aSparseSelectionFallsBackToTheWholeListAreaAndSaysSo() {
+    int blockSize = 1024;
+    byte[] payload = new byte[LISTS * blockSize];
+    ByteBuffer buffer = ByteBuffer.wrap(payload);
+    int[] starts = new int[LISTS];
+    for (int list = 0; list < starts.length; list++) {
+      starts[list] = list * blockSize;
+      buffer.putInt(starts[list], list);
+    }
+
+    // seven of eight lists has to read almost the whole list area anyway, so it is read as one
+    // range and the fallback says so
+    CountingFile fallback = new CountingFile(payload);
+    IvfRangeInput input =
+        new IvfRangeInput(fallback.newStream(), 0, payload.length, fallback.location());
+    try (IvfListRanges ranges = new IvfListRanges(input, starts)) {
+      int[] selected = {0, 1, 2, 3, 4, 5, 6};
+      ranges.planInReadOrder(selected, null);
+      for (int list : selected) {
+        assertThat(ranges.read(list).readInt()).isEqualTo(list);
+      }
+
+      assertThat(ranges.wholeListAreaReads()).as("the whole-list-area fallback says so").isOne();
+      assertThat(fallback.reads).isEqualTo(1);
+      assertThat(fallback.bytes).isEqualTo(payload.length);
+    }
+
+    // half the lists is below the threshold, so the selection stays sparse and nothing falls back
+    CountingFile sparse = new CountingFile(payload);
+    IvfRangeInput sparseInput =
+        new IvfRangeInput(sparse.newStream(), 0, payload.length, sparse.location());
+    try (IvfListRanges ranges = new IvfListRanges(sparseInput, starts)) {
+      int[] selected = {0, 1, 2, 3};
+      ranges.planInReadOrder(selected, null);
+      for (int list : selected) {
+        assertThat(ranges.read(list).readInt()).isEqualTo(list);
+      }
+
+      assertThat(ranges.wholeListAreaReads()).isZero();
+      assertThat(sparse.reads).isEqualTo(1);
+      assertThat(sparse.bytes).isEqualTo(4L * blockSize);
+    }
+  }
+
+  @Test
+  void aNegativeMergeGapIsRejected() {
+    byte[] payload = new byte[4 * Integer.BYTES];
+    int[] starts = new int[4];
+    for (int list = 0; list < starts.length; list++) {
+      starts[list] = list * Integer.BYTES;
+    }
+
+    CountingFile file = new CountingFile(payload);
+    IvfRangeInput input = new IvfRangeInput(file.newStream(), 0, payload.length, file.location());
+    assertThatThrownBy(() -> new IvfListRanges(input, starts, -1))
+        .isInstanceOf(IllegalArgumentException.class)
+        .hasMessageContaining("Invalid merge gap");
+  }
+
+  @Test
   void probingAllListsReadsTheListAreaOnce() throws IOException {
     VectorIndexAdapter vector = adapter(VectorQuantizer.NONE, true);
     ByteBuffer payload = vector.encodeAuxiliaryPayload(entries(vector), 1);

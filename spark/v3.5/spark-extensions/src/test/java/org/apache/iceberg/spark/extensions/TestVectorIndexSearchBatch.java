@@ -213,6 +213,51 @@ public class TestVectorIndexSearchBatch extends ExtensionsTestBase {
     }
   }
 
+  /** A batch answers each query the way that query's own call would, deletes included. */
+  @TestTemplate
+  public void aBatchAfterDeletesAnswersEachQueryLikeItsSingleSearch() {
+    String tableName = tableName("vectors_batch_delete_equivalence_" + catalogName);
+    sql("CREATE TABLE %s (id bigint, embedding array<double>) USING iceberg", tableName);
+    sql(
+        "INSERT INTO %s SELECT id, array(CAST(id AS double), CAST(10 - id AS double)) "
+            + "FROM range(0, 20)",
+        tableName);
+    sql(
+        "CALL %s.system.build_vector_index("
+            + "table => '%s', column => 'embedding', dimension => 2, metric => 'l2')",
+        catalogName, tableName);
+    sql("DELETE FROM %s WHERE id IN (0, 1, 10)", tableName);
+
+    String[] queries = {"0.0,10.0", "10.0,0.0"};
+    String[] doubles = {"0.0d, 10.0d", "10.0d, 0.0d"};
+    List<Object[]> batched =
+        sql(
+            "CALL %s.system.vector_search_batch(table => '%s', column => 'embedding', "
+                + "queries => array('%s', '%s'), k => 5)",
+            catalogName, tableName, queries[0], queries[1]);
+
+    for (int query = 0; query < queries.length; query += 1) {
+      List<Object[]> single =
+          sql(
+              "CALL %s.system.vector_search(table => '%s', column => 'embedding', "
+                  + "query => array(%s), k => 5)",
+              catalogName, tableName, doubles[query]);
+      int queried = query;
+      List<Object[]> fromBatch =
+          batched.stream()
+              .filter(row -> ((Number) row[0]).intValue() == queried)
+              .collect(Collectors.toList());
+      assertThat(fromBatch).as("query %s", queries[query]).hasSameSizeAs(single);
+      for (int i = 0; i < single.size(); i += 1) {
+        // the batch row is (query_id, data file, position, score, json) and the single row is the
+        // same without the query id
+        assertThat(java.util.Arrays.copyOfRange(fromBatch.get(i), 1, 5))
+            .as("query %s row %s", queries[query], i)
+            .isEqualTo(single.get(i));
+      }
+    }
+  }
+
   @TestTemplate
   public void cachedSearchRecordsWhereItIsCached() {
     String tableName = tableName("vectors_batch_located_" + catalogName);

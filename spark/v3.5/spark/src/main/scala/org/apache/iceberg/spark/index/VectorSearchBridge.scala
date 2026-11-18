@@ -19,6 +19,7 @@
 package org.apache.iceberg.spark.index
 
 import java.lang.{Long => JLong}
+import java.nio.ByteBuffer
 import java.util.{Comparator, List => JList, PriorityQueue}
 import org.apache.iceberg.index.IndexQuery
 import org.apache.iceberg.index.IndexQuery.Consistency
@@ -29,6 +30,7 @@ import org.apache.iceberg.index.spark.IndexEntries
 import org.apache.iceberg.index.spark.IndexSearch
 import org.apache.iceberg.index.vector.VectorDistance
 import org.apache.iceberg.index.vector.VectorIndexAdapter
+import org.apache.iceberg.index.vector.VectorIndexDefinition
 import org.apache.spark.sql.Row
 import org.apache.spark.sql.RowFactory
 import org.apache.spark.sql.SparkSession
@@ -342,7 +344,7 @@ private[spark] object VectorSearchBridge {
       spark: SparkSession,
       context: VectorSearchContext,
       block: Seq[(Int, Array[Float])],
-      payloads: Seq[java.nio.ByteBuffer]): Seq[Seq[IndexSearchResult]] = {
+      payloads: Seq[ByteBuffer]): Seq[Seq[IndexSearchResult]] = {
     val inputs = context.inputs
     val k = context.request.input.topK
     val hits =
@@ -533,10 +535,10 @@ private[spark] object VectorSearchBridge {
       spark: SparkSession,
       context: VectorSearchContext,
       block: Seq[(Int, Array[Float])],
-      payloads: Seq[java.nio.ByteBuffer],
+      payloads: Seq[ByteBuffer],
       names: Seq[String],
       vectorIndex: Int,
-      metric: org.apache.iceberg.index.vector.VectorIndexDefinition.Metric): Seq[Seq[Candidate]] = {
+      metric: VectorIndexDefinition.Metric): Seq[Seq[Candidate]] = {
     val inputs = context.inputs
     val topK = context.request.input.topK
     val found = Array.fill(block.size)(mutable.LinkedHashMap.empty[(String, Long), Row])
@@ -644,8 +646,7 @@ private[spark] object VectorSearchBridge {
       block: Seq[(Int, Array[Float])],
       names: Seq[String],
       vectorIndex: Int,
-      metric: org.apache.iceberg.index.vector.VectorIndexDefinition.Metric)
-      : Seq[Seq[(String, Long, Double)]] = {
+      metric: VectorIndexDefinition.Metric): Seq[Seq[(String, Long, Double)]] = {
     val inputs = context.inputs
     val topK = context.request.input.topK
     val uncovered = inputs.uncoveredDataFiles
@@ -769,7 +770,13 @@ private[spark] object VectorSearchBridge {
       s"Cannot serialise rows of ${rowSchema.simpleString} as ${context.inputs.readSchema.simpleString}")
     val frame =
       spark.createDataFrame(rows.map(entry => entry._2).asJava, context.inputs.readSchema)
-    rows.map(entry => entry._1).zip(frame.toJSON.collectAsList().asScala).toMap
+    // the JSON is paired back by position, so the count has to match the rows it was asked for;
+    // a mismatch would rename every row after it without any other symptom
+    val json = frame.toJSON.collectAsList()
+    require(
+      json.size == rows.size,
+      s"Expected one JSON per row of ${rows.size}, but serialised ${json.size}")
+    rows.map(entry => entry._1).zip(json.asScala).toMap
   }
 
   /** The schema a request answers with, which is what its output attributes declare. */
@@ -787,7 +794,7 @@ private[spark] object VectorSearchBridge {
 
   /** The distance of one row's vector from the query, which is what the rewrite sorts by. */
   private def distanceOf(
-      metric: org.apache.iceberg.index.vector.VectorIndexDefinition.Metric,
+      metric: VectorIndexDefinition.Metric,
       row: Row,
       vectorIndex: Int,
       query: Array[Float]): Double = {

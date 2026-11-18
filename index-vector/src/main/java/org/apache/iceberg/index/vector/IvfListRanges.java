@@ -50,6 +50,7 @@ final class IvfListRanges implements AutoCloseable {
   private final TreeMap<Integer, byte[]> cachedByOffset = new TreeMap<>();
   private final LinkedHashMap<Integer, byte[]> lru = new LinkedHashMap<>(16, 0.75f, true);
   private int cachedBytes;
+  private int wholeListAreaReads;
   private byte[] wholeLists;
 
   IvfListRanges(IvfRangeInput input, int[] starts) {
@@ -117,6 +118,7 @@ final class IvfListRanges implements AutoCloseable {
       cachedByOffset.clear();
       cachedBytes = 0;
       wholeLists = input.read(starts[0], listAreaBytes);
+      wholeListAreaReads += 1;
     }
   }
 
@@ -180,6 +182,11 @@ final class IvfListRanges implements AutoCloseable {
         total.nanos() - metadataReads.nanos(),
         total.bytes() - metadataReads.bytes(),
         total.requests() - metadataReads.requests());
+  }
+
+  /** How many times the selected ranges were replaced by one read of the whole list area. */
+  int wholeListAreaReads() {
+    return wholeListAreaReads;
   }
 
   @Override

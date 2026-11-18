@@ -161,6 +161,18 @@ public final class VectorIndexAdapter implements IndexAdapter, java.io.Serializa
     default OpenReadMetrics openReadMetrics() {
       return null;
     }
+
+    /**
+     * How many times a search fell back to reading the whole list area instead of its selected
+     * ranges.
+     *
+     * <p>The fallback reads one contiguous region whose bytes are still reported as list bytes, so
+     * a caller that compares selected bytes with the list area needs this count to tell a sparse
+     * selection from a whole-area read.
+     */
+    default long wholeListAreaReads() {
+      return 0L;
+    }
   }
 
   /** Opens a block-addressable IVF file, or returns null if it uses whole-file storage. */
@@ -187,6 +199,7 @@ public final class VectorIndexAdapter implements IndexAdapter, java.io.Serializa
 
     CountedInputFile counted = new CountedInputFile(file);
     long length = knownLength > 0 ? knownLength : counted.getLength();
+    counted.fileLength(length);
     BlobMetadata blob = null;
     try (PuffinReader reader = Puffin.read(counted).withFileSize(length).build()) {
       for (BlobMetadata candidate : reader.fileMetadata().blobs()) {
@@ -392,6 +405,7 @@ public final class VectorIndexAdapter implements IndexAdapter, java.io.Serializa
     private long lengthRequests;
     private long bytes;
     private long requests;
+    private long fileLength;
 
     private CountedInputFile(InputFile delegate) {
       this.delegate = delegate;
@@ -422,9 +436,13 @@ public final class VectorIndexAdapter implements IndexAdapter, java.io.Serializa
       return delegate.getLength();
     }
 
+    private void fileLength(long length) {
+      this.fileLength = length;
+    }
+
     @Override
     public SeekableInputStream newStream() {
-      return new CountedStream(delegate.newStream(), this);
+      return new CountedStream(delegate.newStream(), this, fileLength);
     }
 
     @Override
@@ -438,14 +456,38 @@ public final class VectorIndexAdapter implements IndexAdapter, java.io.Serializa
     }
   }
 
+  /**
+   * Reads the last bytes of a stream that cannot serve a tail read itself.
+   *
+   * <p>A stream handed to a reader has to answer {@link RangeReadable}, but the file behind it may
+   * not support positional reads. The file length locates the tail, so the read is a seek and a
+   * full read rather than an unsupported operation.
+   *
+   * @return the number of bytes read, which is {@code length}
+   */
+  static int readTail(
+      SeekableInputStream stream, long fileLength, byte[] buffer, int offset, int length)
+      throws IOException {
+    Preconditions.checkArgument(
+        length >= 0 && length <= fileLength,
+        "Invalid tail read of %s bytes from a file of %s",
+        length,
+        fileLength);
+    stream.seek(fileLength - length);
+    IOUtil.readFully(stream, buffer, offset, length);
+    return length;
+  }
+
   /** A seekable stream that reports what it reads to the input file it came from. */
   private static final class CountedStream extends SeekableInputStream implements RangeReadable {
     private final SeekableInputStream delegate;
     private final CountedInputFile owner;
+    private final long fileLength;
 
-    private CountedStream(SeekableInputStream delegate, CountedInputFile owner) {
+    private CountedStream(SeekableInputStream delegate, CountedInputFile owner, long fileLength) {
       this.delegate = delegate;
       this.owner = owner;
+      this.fileLength = fileLength;
     }
 
     @Override
@@ -492,9 +534,9 @@ public final class VectorIndexAdapter implements IndexAdapter, java.io.Serializa
         return read;
       }
 
-      // the footer reader locates its bytes by position, so a stream the interface cannot serve
-      // through its delegate is never asked for a tail read
-      throw new UnsupportedOperationException("Tail reads are not supported");
+      int read = VectorIndexAdapter.readTail(delegate, fileLength, buffer, offset, length);
+      owner.read(read);
+      return read;
     }
 
     @Override

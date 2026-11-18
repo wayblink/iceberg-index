@@ -138,6 +138,21 @@ class TestIndexCachePlugin {
   }
 
   @Test
+  void aLaterIncarnationOfARemovedExecutorIsAccepted() {
+    control.receive(report(1));
+    assertThat(control.nodeReports()).hasSize(1);
+
+    control.executorRemoved(EXECUTOR);
+    assertThat(control.nodeReports()).isEmpty();
+
+    // a report for the same ID from another incarnation is a new executor, not the removed one
+    control.receive(report(2, INCARNATION + "-2"));
+    assertThat(control.nodeReports())
+        .singleElement()
+        .satisfies(node -> assertThat(node.incarnation()).isEqualTo(INCARNATION + "-2"));
+  }
+
+  @Test
   void driverAppliesAcknowledgements() {
     control.receive(report(1));
     String plan = coordinator.acceptLoad(target("f1"), IndexResidencyPolicy.parse("forever"), now);
@@ -448,10 +463,14 @@ class TestIndexCachePlugin {
   }
 
   private static IndexCacheProtocol.NodeReport report(long sequence) {
+    return report(sequence, INCARNATION);
+  }
+
+  private static IndexCacheProtocol.NodeReport report(long sequence, String incarnation) {
     return IndexCacheProtocol.NodeReport.builder()
         .session(SESSION)
         .executorId(EXECUTOR)
-        .incarnation(INCARNATION)
+        .incarnation(incarnation)
         .sequence(sequence)
         .budgetBytes(CACHE_BYTES)
         // A report without the capacity shape is planned as unknown capacity, so it plans nothing.

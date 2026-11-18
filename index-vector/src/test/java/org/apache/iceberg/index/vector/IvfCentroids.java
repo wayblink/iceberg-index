@@ -42,11 +42,6 @@ import org.apache.iceberg.relocated.com.google.common.base.Preconditions;
  */
 final class IvfCentroids {
 
-  /**
-   * How many training samples each centroid gets, following the heuristic IVF uses for its lists.
-   */
-  private static final int SAMPLES_PER_CENTROID = 39;
-
   private static final int MAX_ITERATIONS = 25;
 
   private final float[][] centroids;
@@ -77,7 +72,7 @@ final class IvfCentroids {
     }
 
     int dimension = dimension(vectors);
-    int sampleCount = Math.min(vectors.size(), Math.max(count, count * SAMPLES_PER_CENTROID));
+    int sampleCount = IvfOptions.samplesFor(vectors.size(), count);
     float[][] sample = sample(vectors, sampleCount);
     float[][] centroids = startingCentroids(sample, count, seed);
     for (int iteration = 0; iteration < MAX_ITERATIONS; iteration++) {
@@ -147,7 +142,7 @@ final class IvfCentroids {
    * after the last multiple, which on a large snapshot is a whole tail of shards that never vote on
    * a centroid. The seed chooses the starting centroids, not the sample.
    */
-  private static float[][] sample(List<float[]> vectors, int sampleCount) {
+  static float[][] sample(List<float[]> vectors, int sampleCount) {
     if (sampleCount >= vectors.size()) {
       return vectors.toArray(new float[0][]);
     }

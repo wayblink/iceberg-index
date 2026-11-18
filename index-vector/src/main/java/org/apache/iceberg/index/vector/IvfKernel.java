@@ -899,6 +899,11 @@ public final class IvfKernel implements VectorKernel, RetainedBytes {
     }
 
     @Override
+    public long wholeListAreaReads() {
+      return ranges == null ? 0L : ranges.lists().wholeListAreaReads();
+    }
+
+    @Override
     public VectorIndexAdapter.OpenReadMetrics openReadMetrics() {
       if (costs == null) {
         return null;

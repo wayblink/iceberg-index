@@ -24,7 +24,6 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Comparator;
 import java.util.HashMap;
-import java.util.HashSet;
 import java.util.Iterator;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
@@ -528,7 +527,20 @@ final class IndexResidencyCoordinator {
   private final Clock clock;
   private final IndexPlacementPlanner planner = new IndexPlacementPlanner();
   private final Map<String, NodeState> nodes = new LinkedHashMap<>();
-  private final Set<String> removedExecutors = new HashSet<>();
+  // A removed executor is remembered with the incarnation that was removed, so a report still in
+  // flight cannot restore it while a later incarnation of the same ID starts from scratch. The
+  // map is bounded: executor IDs come and go with dynamic allocation, and a long-lived driver
+  // would otherwise hold every one it ever saw.
+  private static final int MAX_REMOVED_EXECUTORS = 4096;
+
+  private final Map<String, String> removedExecutors =
+      new LinkedHashMap<>(16, 0.75f, true) {
+        @Override
+        protected boolean removeEldestEntry(Map.Entry<String, String> eldest) {
+          return size() > MAX_REMOVED_EXECUTORS;
+        }
+      };
+
   private final Map<String, IndexState> indexes = new HashMap<>();
   private final Map<String, PlanState> plans = new LinkedHashMap<>();
   private long planCount;
@@ -814,21 +826,35 @@ final class IndexResidencyCoordinator {
   }
 
   void executorRemoved(String executorId) {
-    // A report already in flight must not restore a Spark executor that has been removed.
-    removedExecutors.add(executorId);
     NodeState node = nodes.remove(executorId);
     if (node != null) {
+      // A report already in flight for this incarnation must not restore a Spark executor that has
+      // been removed. Only an executor this coordinator has seen is remembered: with no state to
+      // restore, a later report is a new executor that happens to carry the same ID.
+      removedExecutors.put(
+          executorId, incarnationKey(node.report.session(), node.report.incarnation()));
       forgetIncarnation(executorId, node.report.incarnation());
     }
   }
 
+  /** The incarnation a removal recorded, so a report can tell the removed one from a later one. */
+  private static String incarnationKey(String session, String incarnation) {
+    return session + '\u0000' + incarnation;
+  }
+
   IndexCacheProtocol.Reply report(IndexCacheProtocol.NodeReport report) {
     Objects.requireNonNull(report, "Executor report is null");
-    if (removedExecutors.contains(report.executorId())) {
-      return IndexCacheProtocol.Reply.builder()
-          .commands(List.of())
-          .nextSequence(report.sequence())
-          .build();
+    String removed = removedExecutors.get(report.executorId());
+    if (removed != null) {
+      if (removed.equals(incarnationKey(report.session(), report.incarnation()))) {
+        return IndexCacheProtocol.Reply.builder()
+            .commands(List.of())
+            .nextSequence(report.sequence())
+            .build();
+      }
+
+      // the removed incarnation never comes back: this is another executor reusing the ID
+      removedExecutors.remove(report.executorId());
     }
 
     NodeState node = nodes.get(report.executorId());

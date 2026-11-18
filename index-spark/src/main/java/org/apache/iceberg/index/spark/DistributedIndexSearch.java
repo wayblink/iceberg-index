@@ -153,6 +153,7 @@ public final class DistributedIndexSearch {
     private final SQLMetric requested;
     private final SQLMetric lastRequest;
     private final SQLMetric live;
+    private final SQLMetric fetched;
     private final SQLMetric unresolved;
     private final SQLMetric outsideSnapshot;
     private final SQLMetric files;
@@ -164,6 +165,7 @@ public final class DistributedIndexSearch {
         SQLMetric requested,
         SQLMetric lastRequest,
         SQLMetric live,
+        SQLMetric fetched,
         SQLMetric unresolved,
         SQLMetric outsideSnapshot,
         SQLMetric files,
@@ -173,6 +175,7 @@ public final class DistributedIndexSearch {
       this.requested = requested;
       this.lastRequest = lastRequest;
       this.live = live;
+      this.fetched = fetched;
       this.unresolved = unresolved;
       this.outsideSnapshot = outsideSnapshot;
       this.files = files;
@@ -186,6 +189,7 @@ public final class DistributedIndexSearch {
         int opening,
         int last,
         int liveRows,
+        int fetchedRows,
         int unresolvedHits,
         int outsideHits,
         int filesRead,
@@ -195,6 +199,7 @@ public final class DistributedIndexSearch {
       add(requested, opening);
       add(lastRequest, last);
       add(live, liveRows);
+      add(fetched, fetchedRows);
       add(unresolved, unresolvedHits);
       add(outsideSnapshot, outsideHits);
       add(files, filesRead);
@@ -387,7 +392,7 @@ public final class DistributedIndexSearch {
                     IndexCandidates candidates = plan.candidatesOf(fileIO, indexFile.tasks());
                     if (candidates != null && candidates.isEmpty()) {
                       if (tally != null) {
-                        tally.report(0, 0, 0, 0, 0, 0, 0, indexFile.tasks().size(), true);
+                        tally.report(0, 0, 0, 0, 0, 0, 0, 0, indexFile.tasks().size(), true);
                       }
 
                       continue;
@@ -438,6 +443,7 @@ public final class DistributedIndexSearch {
                             reported,
                             outcome.lastRequest,
                             outcome.rows.size(),
+                            outcome.fetched,
                             outcome.unresolved,
                             outcome.outsideSnapshot,
                             outcome.filesRead,
@@ -457,40 +463,6 @@ public final class DistributedIndexSearch {
                 });
   }
 
-  /** The same search, with the query's candidate budget as the number of rows it finally keeps. */
-  public static JavaRDD<Row> searchWithRows(
-      SparkSession spark,
-      IndexMetadata metadata,
-      Table table,
-      IndexQuery query,
-      List<ByteBuffer> encodedQueries,
-      Schema projection,
-      StructType expected,
-      int keep,
-      int opening,
-      List<FileScanTask> scanTasks,
-      IndexRowFilter filter,
-      IndexRowFilter candidateFilter,
-      List<String> filterColumns,
-      RowCounters counters) {
-    return searchWithRows(
-        spark,
-        metadata,
-        table,
-        query,
-        encodedQueries,
-        projection,
-        expected,
-        keep,
-        query.topK(),
-        opening,
-        scanTasks,
-        filter,
-        candidateFilter,
-        filterColumns,
-        counters);
-  }
-
   /** Every scan task a task may read, which is what the snapshot's deletes are read for. */
   private static List<FileScanTask> coveredTasks(List<IndexFileTask> files) {
     List<FileScanTask> tasks = Lists.newArrayList();
@@ -504,6 +476,7 @@ public final class DistributedIndexSearch {
   /** What one index file's task found, and what it cost to find it. */
   private static final class FileOutcome {
     private final List<Row> rows;
+    private final int fetched;
     private final int lastRequest;
     private final int unresolved;
     private final int outsideSnapshot;
@@ -512,12 +485,14 @@ public final class DistributedIndexSearch {
 
     private FileOutcome(
         List<Row> rows,
+        int fetched,
         int lastRequest,
         int unresolved,
         int outsideSnapshot,
         int filesRead,
         int rounds) {
       this.rows = rows;
+      this.fetched = fetched;
       this.lastRequest = lastRequest;
       this.unresolved = unresolved;
       this.outsideSnapshot = outsideSnapshot;
@@ -568,6 +543,7 @@ public final class DistributedIndexSearch {
     int last = 0;
     int round = 0;
     int unresolved = 0;
+    int fetchedRows = 0;
     int rejected = 0;
     int outside = 0;
     Set<String> filesRead = new java.util.HashSet<>();
@@ -587,6 +563,7 @@ public final class DistributedIndexSearch {
         more = filtersWhileSearching ? hits.size() >= asked : asked < entries;
 
         RowsAtHits read = plan.rowsOf(hits, io, ownTasks);
+        fetchedRows += read.rows.size();
         unresolved += read.unresolved;
         outside += read.outsideSnapshot;
         filesRead.addAll(read.dataFiles);
@@ -634,7 +611,7 @@ public final class DistributedIndexSearch {
       rows = refinedTopK(fetched, refine, refinedQuery, resultK);
     }
 
-    return new FileOutcome(rows, last, unresolved, outside, filesRead.size(), round);
+    return new FileOutcome(rows, fetchedRows, last, unresolved, outside, filesRead.size(), round);
   }
 
   /**
@@ -1979,11 +1956,12 @@ public final class DistributedIndexSearch {
       VectorIndexAdapter.RangeReadMetrics metrics = opened.rangeSearch().listReadMetrics();
       listNanos = metrics.nanos();
       LOG.debug(
-          "index file {} IVF list I/O {} ms, {} bytes, {} reads",
+          "index file {} IVF list I/O {} ms, {} bytes, {} reads, {} whole-list-area reads",
           name,
           TimeUnit.NANOSECONDS.toMillis(listNanos),
           metrics.bytes(),
-          metrics.requests());
+          metrics.requests(),
+          opened.rangeSearch().wholeListAreaReads());
       VectorIndexAdapter.OpenReadMetrics open = opened.rangeSearch().openReadMetrics();
       if (open != null) {
         LOG.debug(
@@ -2046,7 +2024,10 @@ public final class DistributedIndexSearch {
       long knownLength) {
     ExecutorIndexCache cache = ExecutorIndexCache.get();
     String key = cacheKey(config.owner(), readerKey, location);
-    ExecutorIndexCache.Lease lease = cache.acquireManagedKey(key);
+    // the switch is read by the load side and by the query side or by neither: a resident copy
+    // that an earlier load installed must not be leased after the switch was turned off, which is
+    // what makes a session that disables the cache return to reading its index files
+    ExecutorIndexCache.Lease lease = config.enabled() ? cache.acquireManagedKey(key) : null;
     if (lease != null) {
       return new OpenedSearch(lease.file(), lease::close, null);
     }

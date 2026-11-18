@@ -444,6 +444,9 @@ class TestVectorSearchExecution {
       // without a re-rank the window follows k, with the one spare candidate a task asks for
       assertThat(metric(sourceExec(estimated), "numCandidates")).isEqualTo(1L);
       assertThat(metric(sourceExec(estimated), "numCandidateRequests")).isEqualTo(2L);
+      assertThat(metric(sourceExec(estimated), "numFetchedRows"))
+          .as("without a re-rank the window is what the task fetches")
+          .isEqualTo(2L);
 
       System.setProperty(EXPERIMENT_REFINE, "true");
       Dataset<Row> refined = spark.sql(ordering(table, 1));
@@ -457,6 +460,8 @@ class TestVectorSearchExecution {
       assertThat(metric(source, "numCandidates")).isEqualTo(8L);
       assertThat(metric(source, "numCandidateRequests")).isEqualTo(8L);
       assertThat(metric(source, "numLiveCandidates")).isEqualTo(1L);
+      // the fetch-back the wider window paid for; keeping one row does not undo those reads
+      assertThat(metric(source, "numFetchedRows")).isEqualTo(8L);
     } finally {
       System.clearProperty(EXPERIMENT_REFINE);
     }

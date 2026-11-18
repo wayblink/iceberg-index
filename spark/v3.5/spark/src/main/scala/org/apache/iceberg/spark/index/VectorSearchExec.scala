@@ -111,7 +111,8 @@ private[spark] object VectorSearchExec {
         null
       }
     val adapter = new VectorIndexAdapter(inputs.definition)
-    val payloads = queries.map(query => VectorIndexSearch.encodeQuery(spark, adapter, query.toArray)).asJava
+    val payloads =
+      queries.map(query => VectorIndexSearch.encodeQuery(spark, adapter, query.toArray)).asJava
     val opening =
       if (context.budget == null) {
         VectorCandidateBudget.derive(k, context.parameters.overSample, inputs.entryUpperBound)
@@ -123,6 +124,7 @@ private[spark] object VectorSearchExec {
       metrics("numCandidates"),
       metrics("numCandidateRequests"),
       metrics("numLiveCandidates"),
+      metrics("numFetchedRows"),
       metrics("numDeletedOrInvisibleHits"),
       metrics("numHitsOutsideSnapshot"),
       metrics("numRowsAtFiles"),
@@ -136,10 +138,7 @@ private[spark] object VectorSearchExec {
         inputs.indexMetadata,
         inputs.table,
         IndexQuery
-          .of(
-            inputs.indexSnapshot.sourceTableSnapshotId(),
-            payloads.get(0),
-            opening.initial)
+          .of(inputs.indexSnapshot.sourceTableSnapshotId(), payloads.get(0), opening.initial)
           .withConsistency(Consistency.AT_OR_BEFORE),
         payloads,
         inputs.table.schema.select(readColumns.asJava),

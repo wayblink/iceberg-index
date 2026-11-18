@@ -385,6 +385,10 @@ private def scanBlock(
 
 - 块大小按 §4.1 的预算推导并封顶 128；内部 JVM 属性 `iceberg.index.batch.queries-per-block` 只用于测试与测量；`query_table` 改为 `toLocalIterator` 逐行读取。
 - 每块作业数：`table` 模式为每轮 S1 + S3，另加一次 S4、一次「扫描候选回表」（S4 只返回位置与距离，入选行的行值在这里读一次）和一次 JSON 作业；`indexed` 为每轮 2 个 + 1 个 JSON；`index_hits` 为每块 1 次搜索 + 1 次整块回表。
+- **单查询也走块执行**：`CALL vector_search` 的 `table`/`indexed` 与批量共用 `nearestRows`，块大小为 1。
+  相对逐条实现，未覆盖文件的候选从 `takeOrdered`（无 shuffle）改成 `aggregateByKey`（一次 shuffle，
+  但每个分区只上送每查询 top-k），作业数从 4 变成 5；省下的是入选的 k 行不再被读第二遍
+  （旧 `rowsAtJson` 重读）。这条是按代码路径推的账，未用 event log 实测。
 - 行 JSON 在 driver 上按块内唯一行序列化：`createDataFrame(本地列表)` 是 `LocalRelation`，但 `.toJSON` 之后是 `ProjectExec`，`collectAsList` 仍会启动一个作业（Spark 3.5 只有 `LocalTableScanExec` 覆写了 `executeCollect`），所以每块多 1 个作业。
 - 未覆盖文件按块一趟扫描：分区内每查询一个有界堆，`aggregateByKey` 归并到每查询 top-k。
 - 已验证：130 条查询跨块用例、索引建后新增文件的用例、块大小覆盖用例、作业数差分用例、HNSW 混合 topK 用例、构建后 ADD COLUMN 的 JSON 用例、不同 consistency 拒绝用例；Spark 3.5 定向测试全绿（详见看板 #26/#27/#28/#29/#31 的 note）。

@@ -35,6 +35,8 @@ import org.apache.iceberg.index.vector.VectorIndexDefinition.VectorQuantizer;
 import org.apache.iceberg.index.vector.VectorIndexDefinition.VectorStructure;
 import org.apache.iceberg.inmemory.InMemoryInputFile;
 import org.apache.iceberg.inmemory.InMemoryOutputFile;
+import org.apache.iceberg.io.IOUtil;
+import org.apache.iceberg.io.RangeReadable;
 import org.apache.iceberg.io.SeekableInputStream;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
@@ -94,6 +96,46 @@ class TestIvfRangeOpenReads {
       assertThat(afterSearch.footerBytes()).isEqualTo(opened.footerBytes());
       assertThat(afterSearch.descriptionBytes()).isEqualTo(opened.descriptionBytes());
     }
+  }
+
+  @Test
+  void aRangeReadableStreamIsReadByPositionAndCountsTheSameBytes() throws IOException {
+    VectorIndexAdapter vector = adapter(VectorQuantizer.NONE, true);
+    ByteBuffer payload = vector.encodeAuxiliaryPayload(entries(vector), 1);
+    ByteBuffer query = vector.encodeQuery(new float[] {1F, 1F}, 1);
+    List<IndexSearchResult> expected = vector.prepareAuxiliary(payload).search(query, TOP_K);
+    CountingFile counted = new CountingFile(file(vector, payload));
+    counted.rangeReadable = true;
+
+    try (VectorIndexAdapter.RangeSearch search = vector.prepareRange(counted, counted.length())) {
+      assertThat(search.openReadMetrics().lengthRequests()).isZero();
+      assertThat(search.search(query.duplicate(), TOP_K)).isEqualTo(expected);
+      assertThat(counted.rangeReads)
+          .as("a file that supports positional reads is read that way")
+          .isPositive();
+      assertThat(search.openReadMetrics().bytes())
+          .as("every byte is counted through the range path")
+          .isEqualTo(counted.bytes);
+    }
+  }
+
+  @Test
+  void aTailReadOfAStreamWithoutPositionalReadsSeeksToTheEnd() throws IOException {
+    byte[] contents = new byte[64];
+    for (int i = 0; i < contents.length; i += 1) {
+      contents[i] = (byte) i;
+    }
+
+    SeekableInputStream stream = new InMemoryInputFile(contents).newStream();
+    byte[] tail = new byte[8];
+    assertThat(VectorIndexAdapter.readTail(stream, contents.length, tail, 0, tail.length))
+        .isEqualTo(tail.length);
+    assertThat(tail)
+        .containsExactly(
+            (byte) 56, (byte) 57, (byte) 58, (byte) 59, (byte) 60, (byte) 61, (byte) 62, (byte) 63);
+    assertThatThrownBy(() -> VectorIndexAdapter.readTail(stream, contents.length, tail, 0, 65))
+        .isInstanceOf(IllegalArgumentException.class)
+        .hasMessageContaining("Invalid tail read");
   }
 
   @Test
@@ -185,7 +227,9 @@ class TestIvfRangeOpenReads {
   private static final class CountingFile extends InMemoryInputFile {
     private long bytes;
     private int reads;
+    private int rangeReads;
     private int lengthReads;
+    private boolean rangeReadable;
 
     private CountingFile(byte[] contents) {
       super(contents);
@@ -204,6 +248,10 @@ class TestIvfRangeOpenReads {
     @Override
     public SeekableInputStream newStream() {
       SeekableInputStream delegate = super.newStream();
+      if (rangeReadable) {
+        return new RangeReadableStream(delegate, length());
+      }
+
       return new SeekableInputStream() {
         @Override
         public long getPos() throws IOException {
@@ -242,6 +290,69 @@ class TestIvfRangeOpenReads {
           delegate.close();
         }
       };
+    }
+
+    /** A stream that serves the positional reads an object store would serve. */
+    private final class RangeReadableStream extends SeekableInputStream implements RangeReadable {
+      private final SeekableInputStream delegate;
+      private final long fileLength;
+
+      private RangeReadableStream(SeekableInputStream delegate, long fileLength) {
+        this.delegate = delegate;
+        this.fileLength = fileLength;
+      }
+
+      @Override
+      public int read() throws IOException {
+        int value = delegate.read();
+        if (value >= 0) {
+          bytes += 1;
+          reads += 1;
+        }
+
+        return value;
+      }
+
+      @Override
+      public int read(byte[] buffer, int offset, int length) throws IOException {
+        int count = delegate.read(buffer, offset, length);
+        if (count > 0) {
+          bytes += count;
+          reads += 1;
+        }
+
+        return count;
+      }
+
+      @Override
+      public void readFully(long position, byte[] buffer, int offset, int length)
+          throws IOException {
+        delegate.seek(position);
+        IOUtil.readFully(delegate, buffer, offset, length);
+        bytes += length;
+        reads += 1;
+        rangeReads += 1;
+      }
+
+      @Override
+      public void seek(long position) throws IOException {
+        delegate.seek(position);
+      }
+
+      @Override
+      public long getPos() throws IOException {
+        return delegate.getPos();
+      }
+
+      @Override
+      public int readTail(byte[] buffer, int offset, int length) throws IOException {
+        return VectorIndexAdapter.readTail(delegate, fileLength, buffer, offset, length);
+      }
+
+      @Override
+      public void close() throws IOException {
+        delegate.close();
+      }
     }
   }
 }

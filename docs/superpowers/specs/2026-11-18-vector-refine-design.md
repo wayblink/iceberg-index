@@ -43,7 +43,8 @@
    已实现「候选宽度与 k 分离 → 已回表的原向量上精确重排 → 只保留 k」：窗口取 `max(调用方窗口, c×k)`，
    默认 `c=8`，由内部系统属性开关控制。关闭时行为与现在逐字节一致（含指标）。
    一个 1 bit、两维的确定性 fixture 上：关闭时索引返回估计值的第一名（错误行），开启后返回真正的最近行，
-   `numCandidates/numCandidateRequests` 从 `1/2` 变为 `8/8`（窗口与回表量有记录）。
+   `numCandidates/numCandidateRequests` 从 `1/2` 变为 `8/8`，`numFetchedRows` 从 `2` 变为 `8`
+  （窗口与回表量各有记录；`numLiveCandidates` 仍是保留行数 1，不随窗口变化）。
 3. **未落地（按 profile 决定）。** 等级查表（LUT）、位平面解包、SIMD/FastScan、native kernel 都是内层循环的
    乘数，但都在 IO 与候选量之后（诊断 §1、§6 P3）。本次实测 LUT + 预计算地址数组在同样的内积循环上是
    中性偏负（L2 距离 22.9 → 23.3 ms，0.98×），因此**没有**落地；取舍分析见 §6。
@@ -205,7 +206,7 @@ W = min(entries, max(initial, c·k))        // c = 8（内部属性，默认 8�
 代价：每个已回表候选一次长度 `d` 的点积（2560 维约 2.6 k 次乘加），相对该候选的码打分
 （padded 4096 次解码乘加 + 读码 + 读因子）更便宜；**不增加任何读取**，因为行与向量本来就在回表里。
 回表字节随窗口从 `min(entries, k+1)` 行增加到 `min(entries, c·k)` 行；这些行在既有指标里可读：
-`numCandidates`（本轮请求窗口）、`numCandidateRequests`（最后一轮窗口）、`numLiveCandidates`（解析出的活行），
+`numCandidates`（本轮请求窗口）、`numCandidateRequests`（最后一轮窗口）、`numLiveCandidates`（任务**保留**的活行，至多 k）、`numFetchedRows`（任务**回表读取**的行数，按轮次累计），
 按投影行宽折算即回表字节的量级；精确的存储端字节数仍需在目标环境用存储计数器测（见 §5）。
 
 ### 4.3 开关、默认值与适用条件
@@ -256,7 +257,7 @@ W = min(entries, max(initial, c·k))        // c = 8（内部属性，默认 8�
 | recall@K | 与暴力真值逐查询比较，声明 K、候选宽度、距离函数 |
 | 打分 CPU | 两段：`RaBitQQuantizer` 微基准（每候选 ns，§3.4 的方法，固定维度/bit/候选数）＋ 任务内 `search` 的 CPU 时间（`System.nanoTime` 临时计时或 task duration 分解） |
 | 探测量 | 每查询访问的 list 数、打分的码数（`nprobe` 与 `W` 的乘积关系；可用现有 `numCandidates`/`numCandidateRequests` 与临时计数器） |
-| 回表字节 | `numLiveCandidates`（活行）与 `numRowsAtFiles`（文件数）× 投影行宽；存储端用 S3/HDFS 计数器另记实际请求与字节（诊断 §8） |
+| 回表字节 | `numFetchedRows`（回表读取的行数，轮次累计）× 投影行宽；`numLiveCandidates` 是**保留**的行数（至多 k），不能用来折算回表字节；存储端用 S3/HDFS 计数器另记实际请求与字节（诊断 §8） |
 | 总延迟 | p50/p95，冷读与确认命中的热查分开；索引读取（payload 加载）与回表、打分分段计 |
 
 ### 5.3 分段与验收

@@ -36,6 +36,8 @@ import org.apache.iceberg.index.IndexQuery;
 import org.apache.iceberg.index.IndexReader;
 import org.apache.iceberg.index.text.TextIndexAdapter;
 import org.apache.iceberg.index.text.TextIndexDefinition;
+import org.apache.iceberg.index.vector.VectorIndexAdapter;
+import org.apache.iceberg.index.vector.VectorIndexDefinition;
 import org.apache.iceberg.io.InputFile;
 import org.apache.spark.sql.Row;
 import org.apache.spark.sql.SparkSession;
@@ -47,7 +49,7 @@ class TestPluginExecutorBudget {
   @TempDir Path warehouse;
 
   @Test
-  void textResidencyUsesTheSameScoresWithoutOpeningShards() {
+  void residentCopiesAreUsedOnlyWhileTheSwitchIsOn() {
     SparkSession spark = start(null);
     String name = "local.db.cached_text";
     ExecutorIndexCache cache = ExecutorIndexCache.get();
@@ -176,6 +178,47 @@ class TestPluginExecutorBudget {
           .isEqualTo(cold);
       assertThat(ShardCountingFileIO.OPENS.get()).isPositive();
       assertThat(cache.stats().bytes()).isEqualTo(vectorCharge);
+
+      // the switch has to be read by the vector side too: after it is turned off, a query must not
+      // lease the resident copy that an earlier load installed
+      Table vectorTable =
+          new HadoopTables(conf).load(warehouse.resolve("db/cached_vectors").toUri().toString());
+      Table observedVectors =
+          new BaseTable(
+              new StaticTableOperations(
+                  ((HasTableOperations) vectorTable).operations().current(), io),
+              vectorTable.name());
+      IndexMetadata vectorMetadata =
+          VectorIndexes.indexCatalog(vectorTable).loadIndex(vectorTable.location(), vectorUuid);
+      VectorIndexAdapter vectorAdapter =
+          new VectorIndexAdapter((VectorIndexDefinition) vectorMetadata.definition());
+      IndexQuery vectorQuery =
+          IndexQuery.of(
+              vectorTable.currentSnapshot().snapshotId(),
+              vectorAdapter.encodeQuery(new float[] {1F, 0F}, 1),
+              1);
+
+      ShardCountingFileIO.OPENS.set(0);
+      var warmVector =
+          DistributedIndexSearch.search(spark, vectorMetadata, observedVectors, vectorQuery).hits();
+      assertThat(warmVector).isNotEmpty();
+      assertThat(ShardCountingFileIO.OPENS.get())
+          .as("a resident vector index file is leased instead of opened")
+          .isZero();
+
+      spark.conf().set(ExecutorIndexCache.Config.ENABLED, "false");
+      try {
+        ShardCountingFileIO.OPENS.set(0);
+        assertThat(
+                DistributedIndexSearch.search(spark, vectorMetadata, observedVectors, vectorQuery)
+                    .hits())
+            .isEqualTo(warmVector);
+        assertThat(ShardCountingFileIO.OPENS.get())
+            .as("a disabled cache does not lease the resident vector index file")
+            .isPositive();
+      } finally {
+        spark.conf().unset(ExecutorIndexCache.Config.ENABLED);
+      }
     } finally {
       cache.clear();
       spark.stop();
