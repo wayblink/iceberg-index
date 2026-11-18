@@ -28,6 +28,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Random;
 import java.util.Set;
 import org.apache.iceberg.FileScanTask;
 import org.apache.iceberg.Table;
@@ -418,6 +419,112 @@ class TestVectorSearchExecution {
       assertThat(fromIndex).as("metric %s answers from the index", metric).hasSize(4);
       assertThat(fromIndex).as("metric %s matches a scan", metric).isEqualTo(fromScan);
     }
+  }
+
+  @Test
+  void aQuantizedSearchReRanksItsFetchedCandidatesExactly() {
+    // a one-bit code is a crude measure in two dimensions, so the row it ranks first is not always
+    // the nearest one; the fixture is a deterministic set where the estimate puts the true nearest
+    // below the second candidate, so a search that keeps by the estimate cannot return it
+    float[][] vectors = quantizedFixture();
+    String table = quantizedTable("exec_refine", vectors);
+    long exact = exactNearest(vectors);
+    assertThat(spark.sql(scanned(table, 1)).collectAsList())
+        .as("the exact answer, from a scan")
+        .extracting(row -> row.getLong(0))
+        .containsExactly(exact);
+
+    try {
+      System.clearProperty(EXPERIMENT_REFINE);
+      Dataset<Row> estimated = spark.sql(ordering(table, 1));
+      assertThat(estimated.collectAsList())
+          .as("the estimate alone orders another row first")
+          .extracting(row -> row.getLong(0))
+          .doesNotContain(exact);
+      // without a re-rank the window follows k, with the one spare candidate a task asks for
+      assertThat(metric(sourceExec(estimated), "numCandidates")).isEqualTo(1L);
+      assertThat(metric(sourceExec(estimated), "numCandidateRequests")).isEqualTo(2L);
+
+      System.setProperty(EXPERIMENT_REFINE, "true");
+      Dataset<Row> refined = spark.sql(ordering(table, 1));
+      assertThat(refined.collectAsList())
+          .as("the exact re-rank of the fetched candidates finds the true nearest")
+          .extracting(row -> row.getLong(0))
+          .containsExactly(exact);
+      SparkPlan source = sourceExec(refined);
+      // the wider window is what the fetch-back paid: eight candidates per result, from which the
+      // exact re-rank kept one
+      assertThat(metric(source, "numCandidates")).isEqualTo(8L);
+      assertThat(metric(source, "numCandidateRequests")).isEqualTo(8L);
+      assertThat(metric(source, "numLiveCandidates")).isEqualTo(1L);
+    } finally {
+      System.clearProperty(EXPERIMENT_REFINE);
+    }
+  }
+
+  /** The system property that enables the internal exact re-ranking, for measurement. */
+  private static final String EXPERIMENT_REFINE = "iceberg.index.vector.refine";
+
+  /**
+   * Twenty spread two-dimensional vectors, seeded deterministically.
+   *
+   * <p>The seed was chosen so that a one-bit code, which is what this fixture builds, ranks a row
+   * other than the true nearest first, and ranks the true nearest inside its eighth candidate: that
+   * is the case an exact re-rank of a fetched window can correct.
+   */
+  private static float[][] quantizedFixture() {
+    Random random = new Random(10L);
+    float[][] vectors = new float[20][2];
+    for (int i = 0; i < vectors.length; i++) {
+      vectors[i][0] = (float) random.nextGaussian();
+      vectors[i][1] = (float) random.nextGaussian();
+    }
+
+    return vectors;
+  }
+
+  /** A table of the fixture whose index is a single quantized IVF list. */
+  private static String quantizedTable(String name, float[][] vectors) {
+    spark.sql("CREATE NAMESPACE IF NOT EXISTS local.db");
+    spark.sql(String.format("CREATE TABLE local.db.%s %s", name, COLUMNS));
+    StringBuilder values = new StringBuilder();
+    for (int i = 0; i < vectors.length; i++) {
+      values.append(i == 0 ? "" : ", ");
+      values.append(String.format("(%d, array(%sd, %sd))", i + 1, vectors[i][0], vectors[i][1]));
+    }
+
+    spark.sql(String.format("INSERT INTO local.db.%s VALUES %s", name, values));
+    spark.sql(
+        String.format(
+            "CALL local.system.build_vector_index(table => 'db.%s', column => 'embedding', "
+                + "dimension => 2, metric => 'l2', structure => 'ivf', quantizer => 'rabitq', "
+                + "options => map('nlist', '1', 'rabitq-bits', '1'))",
+            name));
+    return name;
+  }
+
+  /** The same query without the index rewrite, which is the exact distance ordered by a scan. */
+  private static String scanned(String table, int limit) {
+    return String.format(
+        "SELECT id FROM local.db.%s "
+            + "ORDER BY vec_distance(embedding, array(1.0d, 0.0d)) + 0.0d LIMIT %d",
+        table, limit);
+  }
+
+  /** The id of the row nearest to the query, computed from the vectors the fixture inserted. */
+  private static long exactNearest(float[][] vectors) {
+    int best = 0;
+    double bestDistance = Double.POSITIVE_INFINITY;
+    for (int i = 0; i < vectors.length; i++) {
+      double dx = vectors[i][0] - 1.0;
+      double distance = dx * dx + (double) vectors[i][1] * vectors[i][1];
+      if (distance < bestDistance) {
+        bestDistance = distance;
+        best = i;
+      }
+    }
+
+    return best + 1;
   }
 
   @Test

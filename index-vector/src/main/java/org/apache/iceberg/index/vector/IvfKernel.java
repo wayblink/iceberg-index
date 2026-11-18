@@ -1012,8 +1012,12 @@ public final class IvfKernel implements VectorKernel, RetainedBytes {
       // stops widening once it has visited every list there is.
       boolean[] scored = new boolean[loaded.centroids.length];
       int probed = Math.max(1, Math.min(nprobe, loaded.centroids.length));
+      // the order the query visits the lists in is the same whatever number it visits, so a
+      // widening round takes the next prefix of one order rather than scoring every centroid again
+      int[] nearest =
+          nearestCentroids(queryVector, loaded.centroids, loaded.centroids.length, scoring);
       while (true) {
-        int[] lists = nearestCentroids(queryVector, loaded.centroids, probed, scoring);
+        int[] lists = Arrays.copyOf(nearest, probed);
         if (ranges != null) {
           ranges.lists().planInReadOrder(lists, scored);
         }
@@ -1146,19 +1150,9 @@ public final class IvfKernel implements VectorKernel, RetainedBytes {
           listQuantizer = new RaBitQQuantizer(dimension, ranges.seed(), ranges.bits(), center);
         }
 
-        float[] rotatedQuery = listQuantizer.rotateQuery(queryVector);
-        double queryLengthSquared = 0.0;
-        for (int d = 0; d < dimension; d++) {
-          double difference = queryVector[d] - center[d];
-          queryLengthSquared += difference * difference;
-        }
-
-        double centerSquared = 0.0;
-        double querySquared = 0.0;
-        for (int d = 0; d < dimension; d++) {
-          centerSquared += (double) center[d] * center[d];
-          querySquared += (double) queryVector[d] * queryVector[d];
-        }
+        // the query's terms of the estimate depend on the list but not on the candidate, so they
+        // are derived once here rather than on every call that scores a code
+        RaBitQQuantizer.ListQuery preparedQuery = listQuantizer.prepareQuery(queryVector);
 
         int count = loaded.listCounts[list];
         long offset = ranges == null ? loaded.listStarts[list] : reader.position();
@@ -1181,18 +1175,20 @@ public final class IvfKernel implements VectorKernel, RetainedBytes {
                 case L2 ->
                     Math.sqrt(
                         listQuantizer.estimatedDistanceSquared(
-                            listPayload, codeBase, factors, rotatedQuery, queryLengthSquared));
+                            listPayload, codeBase, factors, preparedQuery));
                 case DOT ->
                     listQuantizer.estimatedInnerProduct(
-                        listPayload, codeBase, factors, rotatedQuery, queryVector);
+                        listPayload, codeBase, factors, preparedQuery);
                 case COSINE -> {
                   double inner =
                       listQuantizer.estimatedInnerProduct(
-                          listPayload, codeBase, factors, rotatedQuery, queryVector);
-                  double vectorSquared = RaBitQQuantizer.squaredLength(factors, centerSquared);
-                  yield vectorSquared <= 0.0 || querySquared <= 0.0
+                          listPayload, codeBase, factors, preparedQuery);
+                  double vectorSquared =
+                      RaBitQQuantizer.squaredLength(factors, preparedQuery.centerSquared());
+                  yield vectorSquared <= 0.0 || preparedQuery.querySquared() <= 0.0
                       ? 0.0
-                      : inner / (Math.sqrt(vectorSquared) * Math.sqrt(querySquared));
+                      : inner
+                          / (Math.sqrt(vectorSquared) * Math.sqrt(preparedQuery.querySquared()));
                 }
               };
           top.offer(dataFileIndex, rowPosition, score);

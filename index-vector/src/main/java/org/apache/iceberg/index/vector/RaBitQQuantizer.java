@@ -110,6 +110,50 @@ public final class RaBitQQuantizer implements java.io.Serializable {
     return SIGNS.computeIfAbsent(Pair.of(seed, length), key -> signs(key.first(), key.second()));
   }
 
+  /**
+   * The parts of a query that one list's quantizer derives from it, computed once per (query,
+   * list).
+   *
+   * <p>These are the terms of the estimate that depend on the query and on the list's centre but
+   * not on which candidate is being scored: the rotated query, the centred query's squared length,
+   * the centre's squared length, the query's own squared length, and the dot product between the
+   * centre and the centred query. The per-candidate methods derive them on every call; a scoring
+   * loop over a list derives them once and passes them to the prepared overloads instead.
+   *
+   * <p>Each is accumulated in the order and at the precision the per-candidate methods use, so the
+   * two produce the same bits, not merely close values.
+   */
+  static final class ListQuery {
+    private final float[] rotated;
+    private final double queryLengthSquared;
+    private final double querySquared;
+    private final double centerSquared;
+    private final double queryDotCenter;
+
+    private ListQuery(
+        float[] rotated,
+        double queryLengthSquared,
+        double querySquared,
+        double centerSquared,
+        double queryDotCenter) {
+      this.rotated = rotated;
+      this.queryLengthSquared = queryLengthSquared;
+      this.querySquared = querySquared;
+      this.centerSquared = centerSquared;
+      this.queryDotCenter = queryDotCenter;
+    }
+
+    /** The squared length of the list's centre, for a caller that reports a cosine. */
+    double centerSquared() {
+      return centerSquared;
+    }
+
+    /** The squared length of the query, for a caller that reports a cosine. */
+    double querySquared() {
+      return querySquared;
+    }
+  }
+
   /** The number of bits per dimension this quantizer was made with. */
   public int bits() {
     return bits;
@@ -318,6 +362,37 @@ public final class RaBitQQuantizer implements java.io.Serializable {
     return centerSquared + queryDotCenter + factors[2] + centeredInner;
   }
 
+  /**
+   * Estimates the square of the distance from a code, using the query's terms computed once.
+   *
+   * <p>This is the per-candidate loop of a search: the query's terms are in {@code prepared}, and
+   * the only per-candidate arithmetic left is the code's projection and the three factors that
+   * scale it.
+   */
+  double estimatedDistanceSquared(
+      byte[] payload, long codeBase, float[] factors, ListQuery prepared) {
+    double norm = factors[0];
+    double correction = factors[1];
+    double projection = projection(payload, codeBase, prepared.rotated);
+
+    double estimatedInner = norm == 0.0 || correction == 0.0 ? 0.0 : norm * projection / correction;
+    double distanceSquared = norm * norm + prepared.queryLengthSquared - 2.0 * estimatedInner;
+    // the estimate can come out slightly negative for a vector that is the query itself, and a
+    // negative squared distance would be worse than a zero one
+    return Math.max(0.0, distanceSquared);
+  }
+
+  /** Estimates the inner product from a code, using the query's terms computed once. */
+  double estimatedInnerProduct(byte[] payload, long codeBase, float[] factors, ListQuery prepared) {
+    double norm = factors[0];
+    double correction = factors[1];
+    double projection = projection(payload, codeBase, prepared.rotated);
+
+    double centeredInner = norm == 0.0 || correction == 0.0 ? 0.0 : norm * projection / correction;
+    // <o, q> = <c, c> + <c, q'> + <o', c> + <o', q'>, and the last term is the one estimated
+    return prepared.centerSquared + prepared.queryDotCenter + factors[2] + centeredInner;
+  }
+
   /** The squared length of a vector, which the distance estimate needs to report a cosine. */
   float[] rotated(float[] vector) {
     return rotate(vector);
@@ -328,6 +403,39 @@ public final class RaBitQQuantizer implements java.io.Serializable {
    */
   float[] rotateQuery(float[] query) {
     return rotate(query);
+  }
+
+  /**
+   * Derives the query's terms of the estimate once, for every candidate of one list.
+   *
+   * <p>The per-candidate methods recompute these terms on every call; a scoring loop over a list
+   * calls this once and then the prepared overloads; each term is accumulated in the order and at
+   * the precision the per-candidate methods use, so the two produce the same bits.
+   *
+   * @param query the query vector, centred and rotated here
+   */
+  ListQuery prepareQuery(float[] query) {
+    float[] rotatedQuery = rotate(query);
+    double queryLengthSquared = 0.0;
+    for (int d = 0; d < dimension; d++) {
+      double difference = query[d] - center[d];
+      queryLengthSquared += difference * difference;
+    }
+
+    double centerSquared = 0.0;
+    double querySquared = 0.0;
+    for (int d = 0; d < dimension; d++) {
+      centerSquared += (double) center[d] * center[d];
+      querySquared += (double) query[d] * query[d];
+    }
+
+    double queryDotCenter = 0.0;
+    for (int d = 0; d < dimension; d++) {
+      queryDotCenter += (double) center[d] * (query[d] - center[d]);
+    }
+
+    return new ListQuery(
+        rotatedQuery, queryLengthSquared, querySquared, centerSquared, queryDotCenter);
   }
 
   /** The squared length of a vector, from the numbers stored with it. */

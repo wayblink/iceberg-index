@@ -173,20 +173,26 @@ class TestIvfInPlaceSearch {
             new float[][] {center},
             List.of(records));
 
-    VectorIndexAdapter ivf = quantizedAdapter(bits, 8);
-    IndexAdapter.PreparedSearch prepared = ivf.prepareAuxiliary(ByteBuffer.wrap(payload));
+    // the metric decides which of the stored numbers a score is built from, so each is checked
+    // against the per-candidate arithmetic the search no longer performs
+    for (VectorIndexDefinition.Metric metric : VectorIndexDefinition.Metric.values()) {
+      VectorIndexAdapter ivf = quantizedAdapter(metric, bits, 8);
+      IndexAdapter.PreparedSearch prepared = ivf.prepareAuxiliary(ByteBuffer.wrap(payload));
 
-    for (int q = 0; q < 5; q++) {
-      float[] queryVector = vector(q * 3 + 2);
-      List<IndexSearchResult> results = prepared.search(ivf.encodeQuery(queryVector), 8);
+      for (int q = 0; q < 5; q++) {
+        float[] queryVector = vector(q * 3 + 2);
+        List<IndexSearchResult> results = prepared.search(ivf.encodeQuery(queryVector), 8);
 
-      List<IndexSearchResult> expected = reference(queryVector, center, codes, factors);
-      assertThat(results).as("records scored for query %s", q).hasSameSizeAs(expected);
-      for (int rank = 0; rank < expected.size(); rank++) {
-        assertThat(results.get(rank).rowPosition()).isEqualTo(expected.get(rank).rowPosition());
-        assertThat(Double.doubleToLongBits(results.get(rank).score()))
-            .as("score bits at rank %s for query %s", rank, q)
-            .isEqualTo(Double.doubleToLongBits(expected.get(rank).score()));
+        List<IndexSearchResult> expected = reference(metric, queryVector, center, codes, factors);
+        assertThat(results).as("%s records scored for query %s", metric, q).hasSameSizeAs(expected);
+        for (int rank = 0; rank < expected.size(); rank++) {
+          assertThat(results.get(rank).rowPosition())
+              .as("%s row at rank %s for query %s", metric, rank, q)
+              .isEqualTo(expected.get(rank).rowPosition());
+          assertThat(Double.doubleToLongBits(results.get(rank).score()))
+              .as("%s score bits at rank %s for query %s", metric, rank, q)
+              .isEqualTo(Double.doubleToLongBits(expected.get(rank).score()));
+        }
       }
     }
   }
@@ -234,9 +240,13 @@ class TestIvfInPlaceSearch {
     }
   }
 
-  /** The score the decoded-code representation produced, computed from a code array. */
+  /** The score the per-candidate arithmetic produces, computed from a code array. */
   private static List<IndexSearchResult> reference(
-      float[] queryVector, float[] center, byte[][] codes, float[][] factors) {
+      VectorIndexDefinition.Metric metric,
+      float[] queryVector,
+      float[] center,
+      byte[][] codes,
+      float[][] factors) {
     RaBitQQuantizer quantizer = new RaBitQQuantizer(DIMENSION, 7, 2, center);
     float[] rotatedQuery = quantizer.rotateQuery(queryVector);
     double queryLengthSquared = 0.0;
@@ -254,19 +264,29 @@ class TestIvfInPlaceSearch {
 
     List<IndexSearchResult> results = Lists.newArrayList();
     for (int record = 0; record < codes.length; record++) {
-      double inner =
-          quantizer.estimatedInnerProduct(
-              codes[record], 0, factors[record], rotatedQuery, queryVector);
-      double vectorSquared = RaBitQQuantizer.squaredLength(factors[record], centerSquared);
-      double similarity =
-          vectorSquared <= 0.0 || querySquared <= 0.0
-              ? 0.0
-              : inner / (Math.sqrt(vectorSquared) * Math.sqrt(querySquared));
-      // the metric is cosine for this fixture, which is the one whose reference needs both terms
-      results.add(IndexSearchResult.of("data-0.parquet", record * 3L, similarity));
+      double score =
+          switch (metric) {
+            case L2 ->
+                Math.sqrt(
+                    quantizer.estimatedDistanceSquared(
+                        codes[record], 0, factors[record], rotatedQuery, queryLengthSquared));
+            case DOT ->
+                quantizer.estimatedInnerProduct(
+                    codes[record], 0, factors[record], rotatedQuery, queryVector);
+            case COSINE -> {
+              double inner =
+                  quantizer.estimatedInnerProduct(
+                      codes[record], 0, factors[record], rotatedQuery, queryVector);
+              double vectorSquared = RaBitQQuantizer.squaredLength(factors[record], centerSquared);
+              yield vectorSquared <= 0.0 || querySquared <= 0.0
+                  ? 0.0
+                  : inner / (Math.sqrt(vectorSquared) * Math.sqrt(querySquared));
+            }
+          };
+      results.add(IndexSearchResult.of("data-0.parquet", record * 3L, score));
     }
 
-    results.sort(new VectorScoring(VectorIndexDefinition.Metric.COSINE).comparator());
+    results.sort(new VectorScoring(metric).comparator());
     return results;
   }
 
@@ -356,12 +376,13 @@ class TestIvfInPlaceSearch {
             .build());
   }
 
-  private static VectorIndexAdapter quantizedAdapter(int bits, int nprobe) {
+  private static VectorIndexAdapter quantizedAdapter(
+      VectorIndexDefinition.Metric metric, int bits, int nprobe) {
     return new VectorIndexAdapter(
         VectorIndexDefinition.builder()
             .fieldId(1)
             .dimension(DIMENSION)
-            .metric(VectorIndexDefinition.Metric.COSINE)
+            .metric(metric)
             .structure(VectorIndexDefinition.VectorStructure.IVF)
             .quantizer(VectorIndexDefinition.VectorQuantizer.RABITQ)
             .property(RaBitQQuantizer.BITS, Integer.toString(bits))

@@ -206,6 +206,90 @@ class TestRaBitQQuantizer {
     assertThat(Math.abs(estimate - exact) / Math.max(exact, 1e-9)).isLessThan(0.5);
   }
 
+  @Test
+  public void thePreparedQueryScoresTheSameBitsAsThePerCandidatePath() {
+    // the per-candidate methods are the definition of the estimate; the per-list path a search
+    // uses has to reproduce them bit for bit, or the faster search answers a different question
+    int dimension = 129; // padded to 256, so padding and bits that straddle two bytes are used
+    for (int bits : new int[] {1, 2, 4, 8}) {
+      float[][] vectors = clusteredVectors(60, dimension, 4, 31L);
+      RaBitQQuantizer quantizer = RaBitQQuantizer.train(vectors, dimension, SEED, bits);
+      int codeBytes = quantizer.codeBytes();
+      float[][] factors = new float[vectors.length][];
+      byte[] codes = new byte[vectors.length * codeBytes];
+      for (int i = 0; i < vectors.length; i++) {
+        factors[i] = new float[RaBitQQuantizer.FACTORS];
+        quantizer.encode(vectors[i], codes, i * codeBytes, factors[i]);
+      }
+
+      float[] center = quantizer.center();
+      for (int q = 0; q < 4; q++) {
+        float[] query = clusteredVectors(1, dimension, 4, 900L + q)[0];
+        // the terms the per-candidate path builds on every call
+        float[] rotatedQuery = quantizer.rotateQuery(query);
+        double queryLengthSquared = 0.0;
+        for (int d = 0; d < dimension; d++) {
+          double difference = query[d] - center[d];
+          queryLengthSquared += difference * difference;
+        }
+        double centerSquared = 0.0;
+        double querySquared = 0.0;
+        for (int d = 0; d < dimension; d++) {
+          centerSquared += (double) center[d] * center[d];
+          querySquared += (double) query[d] * query[d];
+        }
+
+        RaBitQQuantizer.ListQuery prepared = quantizer.prepareQuery(query);
+        assertThat(Double.doubleToLongBits(prepared.centerSquared()))
+            .as("centre length at %s bits", bits)
+            .isEqualTo(Double.doubleToLongBits(centerSquared));
+        assertThat(Double.doubleToLongBits(prepared.querySquared()))
+            .as("query length at %s bits", bits)
+            .isEqualTo(Double.doubleToLongBits(querySquared));
+        for (int i = 0; i < vectors.length; i++) {
+          double legacyDistance =
+              quantizer.estimatedDistanceSquared(
+                  codes, i * codeBytes, factors[i], rotatedQuery, queryLengthSquared);
+          double preparedDistance =
+              quantizer.estimatedDistanceSquared(codes, (long) i * codeBytes, factors[i], prepared);
+          assertThat(Double.doubleToLongBits(preparedDistance))
+              .as("distance bits at %s bits for candidate %s of query %s", bits, i, q)
+              .isEqualTo(Double.doubleToLongBits(legacyDistance));
+
+          double legacyInner =
+              quantizer.estimatedInnerProduct(
+                  codes, i * codeBytes, factors[i], rotatedQuery, query);
+          double preparedInner =
+              quantizer.estimatedInnerProduct(codes, (long) i * codeBytes, factors[i], prepared);
+          assertThat(Double.doubleToLongBits(preparedInner))
+              .as("inner product bits at %s bits for candidate %s of query %s", bits, i, q)
+              .isEqualTo(Double.doubleToLongBits(legacyInner));
+
+          assertThat(
+                  Double.doubleToLongBits(
+                      similarity(
+                          preparedInner,
+                          factors[i],
+                          prepared.centerSquared(),
+                          prepared.querySquared())))
+              .as("cosine bits at %s bits for candidate %s of query %s", bits, i, q)
+              .isEqualTo(
+                  Double.doubleToLongBits(
+                      similarity(legacyInner, factors[i], centerSquared, querySquared)));
+        }
+      }
+    }
+  }
+
+  /** The cosine a search reports, which is the estimate scaled by both lengths. */
+  private static double similarity(
+      double inner, float[] factors, double centerSquared, double querySquared) {
+    double vectorSquared = RaBitQQuantizer.squaredLength(factors, centerSquared);
+    return vectorSquared <= 0.0 || querySquared <= 0.0
+        ? 0.0
+        : inner / (Math.sqrt(vectorSquared) * Math.sqrt(querySquared));
+  }
+
   /** What one pass over the data measured, so the test body reads as one statement. */
   private static final class Measurements {
     private final List<double[]> errors = Lists.newArrayList();

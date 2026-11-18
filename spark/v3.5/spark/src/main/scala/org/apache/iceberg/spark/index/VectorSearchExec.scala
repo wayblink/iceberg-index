@@ -145,6 +145,7 @@ private[spark] object VectorSearchExec {
         inputs.table.schema.select(readColumns.asJava),
         fetchSchema,
         names.size,
+        k,
         opening.initial,
         inputs.scanTasks,
         rowFilter,

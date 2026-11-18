@@ -235,6 +235,7 @@ public final class DistributedIndexSearch {
    * @param projection the columns to read, in this order
    * @param expected the schema to read the data files with, or null to infer it
    * @param keep how many leading columns of a read row are part of the answer
+   * @param resultK the number of rows the query finally keeps, which sizes the refinement window
    * @param opening the number of candidates a task asks for before it has to widen
    * @param scanTasks the scan tasks of the snapshot being answered, where a hit's file is found
    * @param filter the filter a row has to pass after it is read, or null when the query has none or
@@ -256,6 +257,7 @@ public final class DistributedIndexSearch {
       Schema projection,
       StructType expected,
       int keep,
+      int resultK,
       int opening,
       List<FileScanTask> scanTasks,
       IndexRowFilter filter,
@@ -351,6 +353,16 @@ public final class DistributedIndexSearch {
 
     int topK = query.topK();
     int initial = Math.max(opening, topK + 1);
+    // refinement re-ranks one query's fetched candidates, so a task that answers several queries
+    // has no single window to refine; it is off by default and an experiment switch turns it on
+    VectorRefine refine =
+        payloads.length == 1 ? VectorRefine.forSearch(adapter, projection, keep, resultK) : null;
+    if (refine != null) {
+      LOG.info(
+          "Refining vector candidates by exact distance: {} candidates per result, metric={}",
+          refine.candidatesPerResult(),
+          ((VectorIndexDefinition) adapter.definition()).metric());
+    }
 
     // Each index file carries an independent search structure and is one unit of work.
     return IndexFileRdds.tasks(sparkContext.sc(), shipped, cacheKeys, locationsTable, locality)
@@ -359,6 +371,13 @@ public final class DistributedIndexSearch {
                 indexFiles -> {
                   IndexAdapter fileAdapter = adapterRef.getValue();
                   byte[][] filePayloads = payloadsRef.getValue();
+                  // the exact re-ranking measures the query's own distance, so it decodes the query
+                  // the payload already carries rather than shipping a second copy of it
+                  float[] refinedQuery =
+                      refine == null
+                          ? null
+                          : ((VectorIndexAdapter) fileAdapter)
+                              .decodeQuery(ByteBuffer.wrap(filePayloads[0]));
                   FileIO fileIO = ioRef.getValue();
                   ExecutorIndexCache.Config cacheConfig = cacheRef.getValue();
                   RowReadPlan plan = planRef.getValue();
@@ -387,6 +406,16 @@ public final class DistributedIndexSearch {
                             indexFile.fileLength());
                     long readNanos = System.nanoTime() - readStart;
                     long searchStart = System.nanoTime();
+                    // the refined window is asked for in the first round rather than grown towards:
+                    // an extra round would fetch and read the same candidates twice
+                    int requested =
+                        refine == null
+                            ? initial
+                            : refine.window(initial, resultK, indexFile.entryCount());
+                    // what the search was originally asked for is what it reports as its opening
+                    // when nothing re-ranked the window, so a run without refinement reports the
+                    // same numbers it always has
+                    int reported = refine == null ? opening : requested;
                     try (opened) {
                       ExecutorIndexCache.CachedFile file = opened.file;
                       FileOutcome outcome =
@@ -395,15 +424,18 @@ public final class DistributedIndexSearch {
                               fileIO,
                               filePayloads,
                               topK,
-                              initial,
+                              resultK,
+                              requested,
                               indexFile.entryCount(),
                               higherScoreFirst,
                               candidates,
                               plan,
+                              refine,
+                              refinedQuery,
                               indexFile.tasks());
                       if (tally != null) {
                         tally.report(
-                            opening,
+                            reported,
                             outcome.lastRequest,
                             outcome.rows.size(),
                             outcome.unresolved,
@@ -411,7 +443,7 @@ public final class DistributedIndexSearch {
                             outcome.filesRead,
                             outcome.rounds,
                             indexFile.tasks().size(),
-                            outcome.rows.size() < topK);
+                            outcome.rows.size() < (refine == null ? topK : resultK));
                       }
                       partitionRows.addAll(outcome.rows);
                     }
@@ -423,6 +455,40 @@ public final class DistributedIndexSearch {
                   reportCache(cacheReports, queryRun);
                   return partitionRows.iterator();
                 });
+  }
+
+  /** The same search, with the query's candidate budget as the number of rows it finally keeps. */
+  public static JavaRDD<Row> searchWithRows(
+      SparkSession spark,
+      IndexMetadata metadata,
+      Table table,
+      IndexQuery query,
+      List<ByteBuffer> encodedQueries,
+      Schema projection,
+      StructType expected,
+      int keep,
+      int opening,
+      List<FileScanTask> scanTasks,
+      IndexRowFilter filter,
+      IndexRowFilter candidateFilter,
+      List<String> filterColumns,
+      RowCounters counters) {
+    return searchWithRows(
+        spark,
+        metadata,
+        table,
+        query,
+        encodedQueries,
+        projection,
+        expected,
+        keep,
+        query.topK(),
+        opening,
+        scanTasks,
+        filter,
+        candidateFilter,
+        filterColumns,
+        counters);
   }
 
   /** Every scan task a task may read, which is what the snapshot's deletes are read for. */
@@ -474,11 +540,14 @@ public final class DistributedIndexSearch {
       FileIO io,
       byte[][] payloads,
       int topK,
+      int resultK,
       int opening,
       long entries,
       boolean higherScoreFirst,
       IndexCandidates candidates,
       RowReadPlan plan,
+      VectorRefine refine,
+      float[] refinedQuery,
       List<FileScanTask> ownTasks) {
     // a kernel that filters while it searches scores the admitted rows and nothing else, so the
     // window is filled from them; one that cannot do that answers the unfiltered question instead,
@@ -491,8 +560,11 @@ public final class DistributedIndexSearch {
     // been asked for.
     boolean filtersWhileSearching =
         candidates == null || file.searching(prepared -> prepared.joinsCandidateSet());
+    // a refined search fills the window it asked for and lets the exact ranking pick the k rows
+    // from it; without refinement the window is k, filled by the estimate's order
+    int target = refine == null ? topK : Math.max(opening, topK);
     Map<String, FetchedRow> found = Maps.newLinkedHashMap();
-    int limit = opening;
+    int limit = Math.max(opening, target);
     int last = 0;
     int round = 0;
     int unresolved = 0;
@@ -500,7 +572,7 @@ public final class DistributedIndexSearch {
     int outside = 0;
     Set<String> filesRead = new java.util.HashSet<>();
     boolean more = true;
-    while (found.size() < topK && round < MAX_ROUNDS && more) {
+    while (found.size() < target && round < MAX_ROUNDS && more) {
       round++;
       final int asked = (int) Math.min(entries, limit);
       last = asked;
@@ -537,11 +609,11 @@ public final class DistributedIndexSearch {
         }
       }
 
-      if (found.size() >= topK || !more) {
+      if (found.size() >= target || !more) {
         break;
       }
 
-      int wanted = topK + rejected + unresolved;
+      int wanted = target + rejected + unresolved;
       int next = (int) Math.min(entries, Math.max((long) limit * 2, (long) wanted));
       if (next <= limit) {
         break;
@@ -550,14 +622,47 @@ public final class DistributedIndexSearch {
       limit = next;
     }
 
-    List<FetchedRow> best = Lists.newArrayList(found.values());
-    best.sort(byScore(higherScoreFirst));
-    List<Row> rows = Lists.newArrayListWithCapacity(Math.min(topK, best.size()));
-    for (int i = 0; i < best.size() && i < topK; i++) {
-      rows.add(best.get(i).row);
+    List<FetchedRow> fetched = Lists.newArrayList(found.values());
+    List<Row> rows;
+    if (refine == null) {
+      fetched.sort(byScore(higherScoreFirst));
+      rows = Lists.newArrayListWithCapacity(Math.min(topK, fetched.size()));
+      for (int i = 0; i < fetched.size() && i < topK; i++) {
+        rows.add(fetched.get(i).row);
+      }
+    } else {
+      rows = refinedTopK(fetched, refine, refinedQuery, resultK);
     }
 
     return new FileOutcome(rows, last, unresolved, outside, filesRead.size(), round);
+  }
+
+  /**
+   * The exact best {@code topK} of the fetched rows.
+   *
+   * <p>The window was filled by the index's estimate, so its rows are the candidates and this is
+   * where their order and their distance are decided by the metric the query asked for. Every row
+   * was fetched back anyway; re-ranking it costs one distance over its vector, not another read.
+   */
+  private static List<Row> refinedTopK(
+      List<FetchedRow> fetched, VectorRefine refine, float[] query, int topK) {
+    double[] distances = new double[fetched.size()];
+    String[] dataFiles = new String[fetched.size()];
+    long[] positions = new long[fetched.size()];
+    for (int i = 0; i < fetched.size(); i++) {
+      FetchedRow row = fetched.get(i);
+      distances[i] = refine.distance(row.row, query);
+      dataFiles[i] = row.dataFile;
+      positions[i] = row.position;
+    }
+
+    int[] best = VectorRefine.bestFirst(distances, dataFiles, positions, topK);
+    List<Row> rows = Lists.newArrayListWithCapacity(best.length);
+    for (int index : best) {
+      rows.add(fetched.get(index).row);
+    }
+
+    return rows;
   }
 
   /** The order of two rows of a search: the better row first, ties broken by file and position. */
