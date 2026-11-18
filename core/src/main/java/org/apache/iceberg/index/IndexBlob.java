@@ -73,6 +73,17 @@ public final class IndexBlob {
   }
 
   /**
+   * Returns the payload without copying it, transferring its ownership to the caller.
+   *
+   * <p>The array is the one this blob holds. A caller that takes it must treat the blob as consumed
+   * and must not modify the array; a reader that hands the bytes straight to an adapter uses this
+   * instead of {@link #payload()} so that a file of hundreds of megabytes is not copied once more.
+   */
+  public byte[] takePayload() {
+    return payload;
+  }
+
+  /**
    * The payload itself, for a reader that only reads it.
    *
    * <p>Every accessor that copies is a second copy of a file that can be hundreds of megabytes, so

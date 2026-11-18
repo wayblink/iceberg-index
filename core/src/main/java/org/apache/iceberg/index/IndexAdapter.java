@@ -138,6 +138,35 @@ public interface IndexAdapter {
     return (query, topK) -> search(snapshot.duplicate().order(snapshot.order()), query, topK);
   }
 
+  /**
+   * Loads an auxiliary payload whose ownership the caller transfers to the adapter.
+   *
+   * <p>This is {@link #prepareAuxiliary(ByteBuffer)} for a caller that has an array it will not
+   * reuse. The default copies, because an adapter with no loaded form searches the buffer it is
+   * given; an adapter that can keep the array overrides this and avoids the copy.
+   *
+   * @param payload the auxiliary payload of one index file; the caller must not reuse the array
+   * @return a searcher over the loaded payload
+   */
+  default PreparedSearch prepareAuxiliaryOwned(byte[] payload) {
+    Preconditions.checkArgument(payload != null, "Index payload is null");
+    return prepareAuxiliary(ByteBuffer.wrap(payload));
+  }
+
+  /**
+   * Loads an entry-bearing payload whose ownership the caller transfers to the adapter, the
+   * counterpart of {@link #prepareAuxiliaryOwned(byte[])} for an index whose entries are searched.
+   *
+   * <p>The default copies; an adapter that can keep the array overrides this.
+   *
+   * @param payload the entry-bearing payload of one index file; the caller must not reuse the array
+   * @return a searcher over the loaded payload
+   */
+  default PreparedSearch prepareOwned(byte[] payload) {
+    Preconditions.checkArgument(payload != null, "Index payload is null");
+    return prepare(ByteBuffer.wrap(payload));
+  }
+
   private static ByteBuffer snapshot(ByteBuffer payload) {
     Preconditions.checkArgument(payload != null, "Index payload is null");
     byte[] bytes = new byte[payload.remaining()];

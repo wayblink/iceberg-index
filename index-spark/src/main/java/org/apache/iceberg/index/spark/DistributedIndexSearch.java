@@ -2176,13 +2176,13 @@ public final class DistributedIndexSearch {
         continue;
       }
 
-      ByteBuffer payload = ByteBuffer.wrap(blob.payload());
-      long payloadBytes = payload.remaining();
+      byte[] payload = blob.takePayload();
+      long payloadBytes = payload.length;
       try {
         IndexAdapter.PreparedSearch searcher =
             adapter.writesAuxiliaryFiles()
-                ? adapter.prepareAuxiliary(payload)
-                : adapter.prepare(payload);
+                ? adapter.prepareAuxiliaryOwned(payload)
+                : adapter.prepareOwned(payload);
         return new PreparedFile(searcher, payloadBytes);
       } catch (ClassCastException | IllegalArgumentException e) {
         // a payload an index was written with can stop being readable when the entries it holds

@@ -23,6 +23,7 @@ import static org.apache.iceberg.Files.localOutput;
 import static org.assertj.core.api.Assertions.assertThat;
 
 import java.io.IOException;
+import java.nio.ByteBuffer;
 import java.nio.file.Path;
 import java.util.List;
 import org.apache.iceberg.puffin.Puffin;
@@ -47,6 +48,21 @@ class TestPuffinIndexFileContainer {
         .isSameAs(payload);
     assertThat(blob.payload()).as("the public accessor still copies").isNotSameAs(payload);
     assertThat(blob.payload()).containsExactly(1, 2, 3);
+    assertThat(blob.takePayload()).as("a reader takes the array without a copy").isSameAs(payload);
+  }
+
+  @Test
+  public void aReaderTakesTheArrayThePuffinReaderProduced() {
+    byte[] payload = {1, 2, 3, 4};
+    assertThat(PuffinIndexFileContainer.payloadOf(ByteBuffer.wrap(payload)))
+        .as("a whole array-backed buffer is handed over, not copied")
+        .isSameAs(payload);
+
+    ByteBuffer view = ByteBuffer.wrap(payload, 1, 2);
+    assertThat(PuffinIndexFileContainer.payloadOf(view))
+        .as("a buffer that does not cover its array is copied")
+        .containsExactly(2, 3)
+        .isNotSameAs(payload);
   }
 
   @Test

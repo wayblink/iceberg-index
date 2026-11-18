@@ -21,6 +21,7 @@ package org.apache.iceberg.index.vector;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
+import java.lang.reflect.Field;
 import java.nio.ByteBuffer;
 import java.util.List;
 import java.util.Set;
@@ -72,6 +73,27 @@ class TestIvfKernel {
           .as("every partition visited is the same answer as the flat scan, for query %s", query)
           .isEqualTo(fromScan);
     }
+  }
+
+  @Test
+  public void preparedOwnedKeepsTheArrayItWasGiven() throws Exception {
+    VectorIndexAdapter ivf = adapterLegacy(VectorIndexDefinition.Metric.L2, 0, ENTRIES);
+    ByteBuffer payload = ivf.encodeAuxiliaryPayload(entries(VectorIndexDefinition.Metric.L2), 1);
+    byte[] bytes = new byte[payload.remaining()];
+    payload.duplicate().get(bytes);
+
+    IndexAdapter.PreparedSearch prepared = ivf.prepareAuxiliaryOwned(bytes);
+
+    Object loaded = field(prepared, "loaded");
+    assertThat(field(loaded, "payload"))
+        .as("the prepared searcher owns the array it was given instead of copying it")
+        .isSameAs(bytes);
+  }
+
+  private static Object field(Object target, String name) throws Exception {
+    Field field = target.getClass().getDeclaredField(name);
+    field.setAccessible(true);
+    return field.get(target);
   }
 
   @Test

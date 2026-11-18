@@ -112,6 +112,18 @@ public interface VectorKernel extends java.io.Serializable {
   /** Loads a payload once, returning a handle that searches it for as many queries as asked. */
   PreparedSearch prepare(ByteBuffer payload);
 
+  /**
+   * Loads a payload whose ownership the caller transfers to this kernel.
+   *
+   * <p>The default copies through {@link #prepare(ByteBuffer)}; a kernel that can keep the array
+   * overrides this so a file of hundreds of megabytes is not copied again on load.
+   *
+   * @param payload the payload of one index file; the caller must not reuse the array
+   */
+  default PreparedSearch prepareOwned(byte[] payload) {
+    return prepare(ByteBuffer.wrap(payload));
+  }
+
   /** Searches a payload once, for a caller that has a single query to run. */
   default List<IndexSearchResult> search(ByteBuffer payload, ByteBuffer query, int topK) {
     return prepare(payload).search(query, topK);

@@ -111,12 +111,26 @@ public final class PuffinIndexFileContainer implements IndexFileContainer {
       List<BlobMetadata> blobMetadata = reader.fileMetadata().blobs();
       List<IndexBlob> blobs = Lists.newArrayList();
       for (Pair<BlobMetadata, ByteBuffer> read : reader.readAll(blobMetadata)) {
-        ByteBuffer data = read.second();
-        byte[] payload = new byte[data.remaining()];
-        data.duplicate().get(payload);
-        blobs.add(IndexBlob.of(read.first().type(), payload));
+        blobs.add(IndexBlob.of(read.first().type(), payloadOf(read.second())));
       }
       return ImmutableList.copyOf(blobs);
     }
+  }
+
+  /**
+   * The bytes of a buffer the Puffin reader has just produced, without a second copy.
+   *
+   * <p>{@link PuffinReader#readAll} wraps a freshly read or decompressed array in every buffer it
+   * returns, so the array is already the only copy of the blob. A buffer that does not cover its
+   * whole array is copied instead: a caller may not assume a view is the blob.
+   */
+  static byte[] payloadOf(ByteBuffer data) {
+    if (data.hasArray() && data.arrayOffset() == 0 && data.remaining() == data.array().length) {
+      return data.array();
+    }
+
+    byte[] payload = new byte[data.remaining()];
+    data.duplicate().get(payload);
+    return payload;
   }
 }

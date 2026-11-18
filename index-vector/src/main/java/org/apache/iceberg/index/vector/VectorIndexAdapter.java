@@ -338,6 +338,11 @@ public final class VectorIndexAdapter implements IndexAdapter, java.io.Serializa
   }
 
   @Override
+  public PreparedSearch prepareOwned(byte[] payload) {
+    return kernel.prepareOwned(payload);
+  }
+
+  @Override
   public List<IndexSearchResult> search(ByteBuffer payload, ByteBuffer query, int topK) {
     return kernel.search(payload, query, topK);
   }
@@ -361,6 +366,11 @@ public final class VectorIndexAdapter implements IndexAdapter, java.io.Serializa
   @Override
   public PreparedSearch prepareAuxiliary(ByteBuffer payload) {
     return kernel.prepare(payload);
+  }
+
+  @Override
+  public PreparedSearch prepareAuxiliaryOwned(byte[] payload) {
+    return kernel.prepareOwned(payload);
   }
 
   @Override

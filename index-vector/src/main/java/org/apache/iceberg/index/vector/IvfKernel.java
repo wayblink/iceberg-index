@@ -340,8 +340,13 @@ public final class IvfKernel implements VectorKernel, RetainedBytes {
   @Override
   public PreparedSearch prepare(ByteBuffer payload) {
     // the snapshot is this searcher's own array: the caller may reuse or mutate what it passed
-    byte[] snapshot = VectorPayloads.toBytes(payload);
-    Loaded loaded = load(snapshot);
+    return prepareOwned(VectorPayloads.toBytes(payload));
+  }
+
+  @Override
+  public PreparedSearch prepareOwned(byte[] payload) {
+    Preconditions.checkArgument(payload != null, "Index payload is null");
+    Loaded loaded = load(payload);
     return new ListSearcher(
         loaded,
         dimension,
