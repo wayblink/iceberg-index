@@ -34,7 +34,9 @@
 2. **块大小由三个预算里最紧的一个决定**（块内广播 8 MiB、driver 行+JSON 8 MiB、shuffle 128 MiB），
    上限 128。2560 维、k=10、带行时只有约 9–11 条/块；`positions` 下可到 128。
 3. **`positions` 让每块作业数从 3 降到 1**（搜索；不再有回表与 JSON 作业）。本地受控实测
-   （512 维、400 查询、k=10）：作业数 27→7，墙钟约 2.9× 快，driver 堆峰值低 3–4 倍。
+   （512 维、400 查询、k=10）：作业数 27→7，墙钟约 2.9× 快，driver 堆峰值低 3–4 倍；
+   集群实测（2560 维、33 个索引文件、1000 查询、k=10）：作业 290→25、墙钟约 1.9× 快、
+   堆峰值约 2.6× 低（§4.4）。
 4. **表函数路径已经逐块产出**（#3124）：driver 峰值是一块，不是整批；`CALL` 过程是结果集
    API，仍必须收全（用 `positions` 把每行降到 ~30 B）。
 5. **查询期参数可以逐语句指定**（#3105）：`nprobe`/`over_sample`/`filter_mode`/`index`，
@@ -102,7 +104,7 @@ someday（#3109），没有做。
 `numLiveCandidates` 记的是任务**保留**的行（≤ k）。回表成本要看新增的 `numFetchedRows`
 （按轮累计）。整列表区回退没有 SQL 指标，只在 DEBUG 日志里以 `whole-list-area reads` 出现。
 
-## 4. 实测（本地受控，非集群）
+## 4. 实测（本地 + 集群）
 
 ### 4.1 方法
 
@@ -134,9 +136,33 @@ someday（#3109），没有做。
 
 - 单机、512 维、400 查询、单索引文件、无缓存/删除/未覆盖文件；不代表集群；
 - 堆采样有 ±25% 波动（`table` 峰值 496–765 MB），但倍数与方向稳定；
-- 2560 维、10k 查询的“5 GB / 3 MB / 0.5 GB→102 MB”都是按常量与代码路径**推算**，没有实测；
+- 2560 维、10k 查询的“5 GB / 3 MB / 0.5 GB→102 MB”都是按常量与代码路径**推算**；
 - 本次没有单独量化 #3124 的表函数逐块产出（探针走 `CALL`），它的正确性由
   `theOutputIsAssembledFromTheBlocks` 覆盖。
+
+### 4.4 集群（2560 维、33 个索引文件、1000 条查询）
+
+环境：镜像 `oss-bench-20261118-e569321799`（digest `sha256:b530d6ca26d8001eaf20d00038bc57a9e2411aa5042f8923f13c1e32b711b43a`），
+表 `smoke.mm_lance`（Lance 格式的 Iceberg 表），索引 `fmt-ivf-lb-4b`（IVF+RABITQ 4bit、
+`ivf-list-blocks=true`、`max-entries-per-index-file=340000`，33 个索引文件、每个约 700 MB），
+查询表 1000 行（2560 维确定性伪随机），k=10、over=0、nprobe=32；driver 4c/12g，
+12 个 executor × 4c/30g；执行器索引缓存开（`cache.enabled=true`、`cache.bytes=22 GiB`、
+`cache.mode=PIN_ALL`、`spark.plugins=IndexCachePlugin`、`schedule.locality=true`），
+两种模式都在测量前用一条查询暖缓存。
+
+| 模式 | 行数 | 行 JSON | 作业数 | 墙钟 | 堆峰值 | GC 后增长 |
+|---|---|---|---|---|---|---|
+| `table` | 10,000 | 403 MB | 290 | 1671 s（27.9 min） | 2865 MB | 2736 MB |
+| `positions` | 10,000 | 0 | 25 | 858 s（14.3 min） | 1120 MB | 983 MB |
+
+结论：作业数 290→25（约 **11.6×** 少，直接来自块大小 128 vs 约 10）；墙钟约 **1.9×** 快；
+堆峰值约 **2.6×** 低、GC 后增长约 **2.8×** 低；行 JSON 403 MB→0。
+
+边界：只测了 1000 条查询。10k 没有跑：`positions` 按同速率约需 2.4 小时，`table` 约需 4.6 小时，
+且按 403 MB JSON → 2.7 GB 堆增长的比例外推，5 GB JSON 约需 34 GB 增长，12g driver 会 OOM——
+这是**外推，不是实测**。查询向量是确定性伪随机而非 SIFT 真查询，绝对时间不可与论文或别家对比，
+只用于两种模式的相对比较；两种模式共享同一缓存与暖机配置，块大小差异本身来自 JSON 预算，
+属于被比较机制的一部分。
 
 ## 5. 怎么用（决策表）
 
@@ -157,13 +183,15 @@ someday（#3109），没有做。
   `TestBatchSearchOutcomes`、`TestVectorRefine`。
 - 定位命令（`-DsparkVersions=3.5`，JDK17）：
   `./gradlew :iceberg-spark:iceberg-spark-extensions-3.5_2.12:test --tests '<类名>'`。
-- 本次实测的探针没有入库：它在临时 worktree 里写一个 JUnit 类，建表/建索引/跑两种
-  `coverage`，用 `SparkListener` 计作业、`Runtime` 采样堆；数据见 §4。复现时建议固定数据、
-  索引参数与 warmup，并对每种模式跑 3 次取中位数。
+- 本次实测的探针没有入库：本地探针是临时 worktree 里的一个 JUnit 类（§4.1），集群探针是
+  一个临时 `BatchProbe` 主类（建查询表、暖缓存、跑一种 `coverage`、`SparkListener` 计作业、
+  `Runtime` 采样堆，提交到 k8s），两者都不提交产品代码。复现时建议固定数据、索引参数与 warmup，
+  并对每种模式跑多次取中位数；集群数据来自一次 `table` 与一次 `positions` 的独立提交。
 
 ## 7. 未做与后续
 
-- **集群 2560 维、10k 查询的实测**：需要重打镜像并占集群，尚未做；本文的倍数只代表本地机制。
+- **集群 10k 查询的实测**：已测 2560 维、33 个索引文件、1000 查询（§4.4）；10k 未跑，
+  结论按 1000 的外推给出（`table` 会先撞 OOM）。
 - **真正“按块承载查询”**：请求仍持有全部 Q（4 B/dim）；要做到 driver 只持一块，需要改请求承载与
   执行时机，并与共享的已绑定 context 配合。
 - **`CALL` 的写表模式**：过程返回结果集是 API 限制；要流式只能改入口语义（结果写表），未做。
