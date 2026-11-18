@@ -119,7 +119,8 @@ private[spark] case class VectorRequestInput(
     table: Table,
     tableSnapshotId: JLong,
     column: String,
-    queries: Vector[Vector[Float]],
+    // one plain float array per query: the vector is the query, not a boxed copy of its numbers
+    queries: Vector[Array[Float]],
     topK: Int,
     indexArgument: String,
     contract: VectorResultContract,
@@ -189,7 +190,7 @@ private[spark] object VectorSearchRequest {
       table,
       tableSnapshotId,
       column,
-      queries.asScala.map(_.toVector).toVector,
+      queries.asScala.map(_.clone()).toVector,
       k,
       indexArgument,
       contract,
@@ -227,7 +228,7 @@ private[spark] case class VectorSearchContext(
     budget: VectorCandidateBudget = null,
     filter: org.apache.iceberg.expressions.Expression = null,
     filterColumns: Seq[String] = Seq.empty) {
-  def queryVectors: JList[Array[Float]] = request.input.queries.map(_.toArray).asJava
+  def queryVectors: JList[Array[Float]] = request.input.queries.map(_.clone()).asJava
 
   /** Whether a scalar filter narrows the rows this search may answer with. */
   def hasFilter: Boolean = filter != null

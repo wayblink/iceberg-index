@@ -112,7 +112,7 @@ private[spark] object VectorSearchExec {
       }
     val adapter = new VectorIndexAdapter(inputs.definition)
     val payloads =
-      queries.map(query => VectorIndexSearch.encodeQuery(spark, adapter, query.toArray)).asJava
+      queries.map(query => VectorIndexSearch.encodeQuery(spark, adapter, query)).asJava
     val opening =
       if (context.budget == null) {
         VectorCandidateBudget.derive(k, context.parameters.overSample, inputs.entryUpperBound)

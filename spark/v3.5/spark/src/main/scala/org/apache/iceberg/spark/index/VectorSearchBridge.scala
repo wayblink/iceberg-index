@@ -308,7 +308,7 @@ private[spark] object VectorSearchBridge {
     var start = 0
     while (start < request.queries.size) {
       val end = math.min(start + blockSize, request.queries.size)
-      val block = (start until end).map(queryId => (queryId, request.queries(queryId).toArray))
+      val block = (start until end).map(queryId => (queryId, request.queries(queryId)))
       answered ++= indexHitsInBlock(spark, context, block)
       start = end
     }
@@ -457,7 +457,7 @@ private[spark] object VectorSearchBridge {
     var start = 0
     while (start < request.queries.size) {
       val end = math.min(start + blockSize, request.queries.size)
-      val block = (start until end).map(queryId => (queryId, request.queries(queryId).toArray))
+      val block = (start until end).map(queryId => (queryId, request.queries(queryId)))
       answered ++= nearestRowsInBlock(spark, context, block)
       start = end
     }
@@ -899,7 +899,7 @@ private[spark] case class VectorSearchHitsRequest(
     tableName: String,
     column: String,
     indexArgument: String,
-    queries: Seq[Seq[Float]],
+    queries: Seq[Array[Float]],
     topK: Int,
     batch: Boolean,
     nprobeArgument: String,

@@ -100,7 +100,7 @@ private[spark] object VectorSearchCalls {
       nprobeArgument: String = null,
       overSampleArgument: String = null,
       filterModeArgument: String = null): LogicalPlan = {
-    val copied = queries.asScala.map(query => query.toVector).toSeq
+    val copied = queries.asScala.map(query => query.clone()).toSeq
     // the output attributes are created once, here, so a copy the optimizer makes keeps the same
     // expression ids and the callers of the function still refer to them
     val schema =
@@ -165,7 +165,7 @@ private[spark] object VectorSearchCalls {
    */
   def searchRequested(spark: SparkSession, request: VectorSearchHitsRequest): JList[Row] = {
     val queries = new java.util.ArrayList[Array[Float]](request.queries.size)
-    request.queries.foreach(query => queries.add(query.toArray))
+    request.queries.foreach(query => queries.add(query.clone()))
     search(
       spark,
       Spark3Util.loadIcebergTable(spark, request.tableName),

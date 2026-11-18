@@ -391,6 +391,11 @@ private def scanBlock(
   （旧 `rowsAtJson` 重读）。这条是按代码路径推的账，未用 event log 实测。
 - 行 JSON 在 driver 上按块内唯一行序列化：`createDataFrame(本地列表)` 是 `LocalRelation`，但 `.toJSON` 之后是 `ProjectExec`，`collectAsList` 仍会启动一个作业（Spark 3.5 只有 `LocalTableScanExec` 覆写了 `executeCollect`），所以每块多 1 个作业。
 - 未覆盖文件按块一趟扫描：分区内每查询一个有界堆，`aggregateByKey` 归并到每查询 top-k。
+- **查询载体的表示（#3115）**：`VectorRequestInput.queries` 从 `Vector[Vector[Float]]`（每个元素一个装箱
+  `java.lang.Float`）改成 `Vector[Array[Float]]`，driver 的常驻尺寸从约 20 B/dim（16 B 对象 + 引用）
+  降到 4 B/dim：10,000×2,560 从约 0.5 GB 降到 **102.4 MB**（推算，未用 `jmap` 实测）。请求仍持有
+  全部 Q 条查询（`toLocalIterator` 只省掉同时持有行内其它列），**块内广播预算 `byPayload` 只覆盖
+  每块 8 MiB，不覆盖这 102.4 MB 的 driver 常驻**；真正按块承载（每块只驻留一块查询）仍未做。
 - 已验证：130 条查询跨块用例、索引建后新增文件的用例、块大小覆盖用例、作业数差分用例、HNSW 混合 topK 用例、构建后 ADD COLUMN 的 JSON 用例、不同 consistency 拒绝用例；Spark 3.5 定向测试全绿（详见看板 #26/#27/#28/#29/#31 的 note）。
 - 尚未完成：10,000 条查询的吞吐、shuffle 字节与 driver/executor 峰值堆测量（需要目标集群与数据）；按 (query_id, list_id) 的任务内共享读取（§4.7）。
 

@@ -237,6 +237,21 @@ class TestVectorSearchPlanning {
   }
 
   @Test
+  void aQueryVectorIsHeldAsAPlainFloatArray() throws Exception {
+    Table table = tableWithIndex("planning_query_carrier");
+    float[] query = {1.0F, 0.0F};
+    VectorSearchRequest request =
+        VectorSearchRequest.forTable(
+            table, "embedding", List.of(query), 2, null, "INDEX_HITS", null, true);
+    // the driver holds the vector the query gave, not a boxed copy per coordinate: 4 bytes per
+    // dimension instead of an object per dimension
+    float[] carried = (float[]) request.input().queries().apply(0);
+    assertThat(carried).containsExactly(1.0F, 0.0F);
+    query[0] = 100.0F;
+    assertThat(carried).as("the request owns its copy").containsExactly(1.0F, 0.0F);
+  }
+
+  @Test
   void planSaysWhetherTheAnswerCanBeExact() throws Exception {
     // a flat scan over unquantized vectors enumerates every candidate, so its answer is the exact
     // top-k; every other structure samples, and the plan has to say so where a reader will look
