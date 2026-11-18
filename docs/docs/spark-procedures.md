@@ -1292,14 +1292,24 @@ it reports is the index, not a result. `score` is the distance the query asks fo
 Searches a vector index for many queries at once and resolves the matched rows. Every answer carries
 the index of the query it belongs to (`query_id`), its row reference, distance and the matched row as
 a JSON string. Rows are ordered by query and then by distance. `coverage` means the same as in
-`vector_search`; the whole-table mode answers one query at a time, so a batch of N queries runs N
-scans of the uncovered files.
+`vector_search`. Queries are answered in blocks: one block shares one load of every index file, one
+row resolution and, in the whole-table mode, one scan of the files the index does not cover.
 
-Queries are passed as an array of strings, one comma-separated list of numbers per query. Unlike
-repeated single searches, the matched rows of all queries are resolved by reading each hit data
-file once, so a batch of N queries costs one read per distinct hit data file instead of one read
-per query per hit data file (measured on SIFT data: 50 queries in ~1.3s as one batch call versus
-~15s as 50 single calls, with identical results).
+Queries are passed as an array of strings, one comma-separated list of numbers per query. How the
+matched rows are resolved depends on `coverage`:
+
+| `coverage`   | How the batch is resolved |
+|--------------|---------------------------|
+| `index_hits` | Every query in the block searches the index, then the hits of the block are resolved in one pass, so each hit data file is read once for the block. A hit whose row can no longer be read stays with a null row. |
+| `table` (default) | The live rows of the queried snapshot and their exact distance. The hits of the block are resolved in one pass, and the files the index does not cover are scanned once for the block; a hit whose row was removed is dropped, and the answer is the answer a full scan would give. |
+| `indexed`    | The live rows of the files the index covers and their exact distance, resolved once per block. The files the index does not cover are not read, so the answer can be shorter than k. |
+
+!!! note
+    A block of queries is answered by one shared execution: one load of every index file, one row
+    resolution, and, in the whole-table mode, one scan of the files the index does not cover. The
+    block size is an internal bound, so a batch larger than one block is answered in several
+    blocks. The design is in
+    `docs/superpowers/specs/2026-11-17-vector-batch-shared-execution-design.md`.
 
 | Argument Name | Required? | Type          | Description                                  |
 |---------------|-----------|---------------|----------------------------------------------|

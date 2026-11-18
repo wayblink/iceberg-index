@@ -881,11 +881,6 @@ public final class DistributedIndexSearch {
     long workingSet = workingSetBytes(table.io(), files, adapter, table.location());
     Broadcast<ExecutorIndexCache.Config> cacheRef =
         context.broadcast(ExecutorIndexCache.Config.from(spark, workingSet, table.location()));
-    // an index that keeps vectors scores a similarity, so which end of the score is the better row
-    // is the index's own decision and not something to assume
-    IndexSearchResult higher = IndexSearchResult.of("a", 0L, 1.0);
-    IndexSearchResult lower = IndexSearchResult.of("a", 0L, 0.0);
-    boolean higherScoreFirst = adapter.resultComparator().compare(higher, lower) < 0;
     String cacheKey = adapterKey(adapter);
     List<String> cacheKeys = cacheKeys(table.location(), cacheKey, locations);
     // what each executor holds, so a task can be sent to one that already has its file
@@ -982,6 +977,9 @@ public final class DistributedIndexSearch {
    * times that work. This searches each file once for the whole batch: the payload is read once,
    * prepared once, and then scored once per query, so the batch pays one load and N searches.
    *
+   * <p>This is the hits-only form; use {@link #searchBatchWithOutcomes} when the caller also needs
+   * to know whether the index holds more hits than a query asked for.
+   *
    * @param spark the Spark session
    * @param metadata the index to search
    * @param table the table the index belongs to, used to resolve the snapshot and its file IO
@@ -989,6 +987,59 @@ public final class DistributedIndexSearch {
    * @return the hits of each query, best first, in the order the queries were given
    */
   public static List<List<IndexSearchResult>> searchBatch(
+      SparkSession spark, IndexMetadata metadata, Table table, List<IndexQuery> queries) {
+    List<SearchOutcome> outcomes = searchBatchOutcomes(spark, metadata, table, queries);
+    List<List<IndexSearchResult>> perQuery = Lists.newArrayListWithCapacity(outcomes.size());
+    for (SearchOutcome outcome : outcomes) {
+      perQuery.add(outcome.hits());
+    }
+
+    return perQuery;
+  }
+
+  /**
+   * Searches the index snapshot a batch of queries is answered from, loading each index file once,
+   * and reports for each query the hits and whether the index holds more of them.
+   *
+   * <p>This is the batch form of {@link #search}. Each query asks each file for one more hit than
+   * its own window. The merge uses that extra hit to report {@code moreHits} and limits the
+   * returned hits to the query's window.
+   *
+   * <p>An index whose search merges the payloads before scoring only ever sees the top-k it
+   * returns, so it cannot say whether more hits exist; the outcomes of such an index report no more
+   * hits.
+   *
+   * @param spark the Spark session
+   * @param metadata the index to search
+   * @param table the table the index belongs to, used to resolve the snapshot and its file IO
+   * @param queries the queries to answer, with the same source table snapshot and consistency
+   * @return the hits of each query, best first, and whether the index holds more of them, in the
+   *     order the queries were given
+   */
+  public static List<SearchOutcome> searchBatchWithOutcomes(
+      SparkSession spark, IndexMetadata metadata, Table table, List<IndexQuery> queries) {
+    if (!queries.isEmpty()) {
+      long snapshotId = queries.get(0).sourceTableSnapshotId();
+      IndexQuery.Consistency consistency = queries.get(0).consistency();
+      for (IndexQuery query : queries) {
+        Preconditions.checkArgument(
+            query.sourceTableSnapshotId() == snapshotId,
+            "Batch queries must be answered from the same source table snapshot: expected %s but"
+                + " found %s",
+            snapshotId,
+            query.sourceTableSnapshotId());
+        Preconditions.checkArgument(
+            query.consistency() == consistency,
+            "Batch queries must have the same consistency: expected %s but found %s",
+            consistency,
+            query.consistency());
+      }
+    }
+
+    return searchBatchOutcomes(spark, metadata, table, queries);
+  }
+
+  private static List<SearchOutcome> searchBatchOutcomes(
       SparkSession spark, IndexMetadata metadata, Table table, List<IndexQuery> queries) {
     if (queries.isEmpty()) {
       return ImmutableList.of();
@@ -998,25 +1049,27 @@ public final class DistributedIndexSearch {
     IndexAdapter adapter =
         IndexTypes.fromType(metadata.indexType()).createAdapter(metadata.definition());
     if (adapter instanceof TextIndexAdapter text) {
-      return searchText(spark, metadata, table, text, queries, null, null);
+      // the text batch path scores against merged corpus statistics and only ever sees its own
+      // top-k, so it cannot report whether more hits exist
+      return outcomesWithoutMore(searchText(spark, metadata, table, text, queries, null, null));
     }
 
     if (adapter.searchesAllPayloadsTogether()) {
       // each query needs the merged payloads, and such a search has no per-file form to batch
-      List<List<IndexSearchResult>> perQuery = Lists.newArrayListWithCapacity(queries.size());
+      List<SearchOutcome> perQuery = Lists.newArrayListWithCapacity(queries.size());
       IndexReader togetherReader = new IndexReader(metadata, table);
       for (IndexQuery query : queries) {
-        perQuery.add(togetherReader.search(query));
+        perQuery.add(new SearchOutcome(togetherReader.search(query), false));
       }
       return perQuery;
     }
 
     IndexReader reader = new IndexReader(metadata, table);
     List<IndexFile> files = reader.indexFiles(queries.get(0));
-    List<List<IndexSearchResult>> perQuery = Lists.newArrayListWithCapacity(queries.size());
+    List<SearchOutcome> perQuery = Lists.newArrayListWithCapacity(queries.size());
     if (files.isEmpty()) {
       for (int i = 0; i < queries.size(); i++) {
-        perQuery.add(ImmutableList.of());
+        perQuery.add(new SearchOutcome(ImmutableList.of(), false));
       }
       return perQuery;
     }
@@ -1036,15 +1089,18 @@ public final class DistributedIndexSearch {
       widestTopK = Math.max(widestTopK, query.topK());
     }
     Broadcast<List<byte[]>> queriesRef = context.broadcast(queryPayloads);
+    // a query asks its own file for one more than its own window: the window is part of the
+    // question for a structure whose traversal depends on it, so the widest query must not answer
+    // for a narrower one
+    int[] askedPerQuery = new int[queries.size()];
+    for (int i = 0; i < queries.size(); i++) {
+      askedPerQuery[i] = (int) Math.min(Integer.MAX_VALUE, (long) queries.get(i).topK() + 1L);
+    }
+    Broadcast<int[]> askedRef = context.broadcast(askedPerQuery);
     Broadcast<FileIO> ioRef = context.broadcast(table.io());
     long workingSet = workingSetBytes(table.io(), files, adapter, table.location());
     Broadcast<ExecutorIndexCache.Config> cacheRef =
         context.broadcast(ExecutorIndexCache.Config.from(spark, workingSet, table.location()));
-    // an index that keeps vectors scores a similarity, so which end of the score is the better row
-    // is the index's own decision and not something to assume
-    IndexSearchResult higher = IndexSearchResult.of("a", 0L, 1.0);
-    IndexSearchResult lower = IndexSearchResult.of("a", 0L, 0.0);
-    boolean higherScoreFirst = adapter.resultComparator().compare(higher, lower) < 0;
     String cacheKey = adapterKey(adapter);
     List<String> cacheKeys = cacheKeys(table.location(), cacheKey, locations);
     IndexCacheLocations locationsTable = IndexCacheLocations.forContext(context.sc());
@@ -1085,10 +1141,12 @@ public final class DistributedIndexSearch {
                           ExecutorIndexCache.CachedFile file = opened.file;
                           file.searching(
                               prepared -> {
+                                int[] asked = askedRef.getValue();
                                 for (int queryId = 0; queryId < fileQueries.size(); queryId++) {
                                   for (IndexSearchResult hit :
                                       prepared.search(
-                                          ByteBuffer.wrap(fileQueries.get(queryId)), localTopK)) {
+                                          ByteBuffer.wrap(fileQueries.get(queryId)),
+                                          asked[queryId])) {
                                     batchHits.add(
                                         new Tuple2<>(
                                             queryId,
@@ -1114,7 +1172,16 @@ public final class DistributedIndexSearch {
         aggregateHits(fileHits, order, mergeLimit);
     mergeCacheReports(cacheReports, locationsTable, cacheKeys, cacheRef.getValue(), workingSet);
 
-    return orderedHits(topByQuery, queries.stream().mapToInt(IndexQuery::topK).toArray(), order);
+    for (int queryId = 0; queryId < queries.size(); queryId++) {
+      int limit = queries.get(queryId).topK();
+      List<Tuple3<String, Long, Double>> candidates =
+          topByQuery.getOrDefault(queryId, Lists.newArrayList());
+      // the merge keeps one more than the widest window, so a query whose merged candidates fit its
+      // own window is the only case where the index has nothing more to offer it
+      perQuery.add(new SearchOutcome(hitsOf(candidates, limit, order), candidates.size() > limit));
+    }
+
+    return perQuery;
   }
 
   /** Searches the full text corpus while ranking only rows admitted by the predicate. */
@@ -1443,15 +1510,34 @@ public final class DistributedIndexSearch {
     for (int queryId = 0; queryId < limits.length; queryId++) {
       List<Tuple3<String, Long, Double>> top =
           topByQuery.getOrDefault(queryId, Lists.newArrayList());
-      top = bounded(top, order, limits[queryId]);
-      List<IndexSearchResult> hits = Lists.newArrayListWithCapacity(top.size());
-      for (Tuple3<String, Long, Double> hit : top) {
-        hits.add(IndexSearchResult.of(hit._1(), hit._2(), hit._3()));
-      }
-      perQuery.add(ImmutableList.copyOf(hits));
+      perQuery.add(hitsOf(top, limits[queryId], order));
     }
 
     return perQuery;
+  }
+
+  /** The best hits of a query, at most {@code limit} of them, in the order of the merge. */
+  private static List<IndexSearchResult> hitsOf(
+      List<Tuple3<String, Long, Double>> candidates,
+      int limit,
+      Comparator<Tuple3<String, Long, Double>> order) {
+    List<Tuple3<String, Long, Double>> top = bounded(candidates, order, limit);
+    List<IndexSearchResult> hits = Lists.newArrayListWithCapacity(top.size());
+    for (Tuple3<String, Long, Double> hit : top) {
+      hits.add(IndexSearchResult.of(hit._1(), hit._2(), hit._3()));
+    }
+
+    return ImmutableList.copyOf(hits);
+  }
+
+  /** Wraps the hits of a search that only ever sees its own top-k, so it cannot report more. */
+  private static List<SearchOutcome> outcomesWithoutMore(List<List<IndexSearchResult>> perQuery) {
+    List<SearchOutcome> outcomes = Lists.newArrayListWithCapacity(perQuery.size());
+    for (List<IndexSearchResult> hits : perQuery) {
+      outcomes.add(new SearchOutcome(hits, false));
+    }
+
+    return outcomes;
   }
 
   /**

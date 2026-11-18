@@ -18,6 +18,7 @@
  */
 package org.apache.iceberg.spark.procedures;
 
+import java.util.Iterator;
 import java.util.List;
 import org.apache.iceberg.relocated.com.google.common.base.Preconditions;
 import org.apache.iceberg.relocated.com.google.common.collect.Lists;
@@ -37,9 +38,16 @@ import org.apache.spark.unsafe.types.UTF8String;
  *
  * <p>Like {@link VectorSearchProcedure}, each hit carries its row reference ({@code _file} + {@code
  * _pos}), score and the matched row as a JSON string, plus the index of the query it belongs to.
- * Rows are ordered by query and then by score. Unlike repeated single searches, the matched rows of
- * all queries are resolved by reading each hit data file once, and every index file is loaded once
- * for the whole batch, so a batch of N queries costs one read per distinct hit data file.
+ * Rows are ordered by query and then by score.
+ *
+ * <p>A block of queries is answered by one shared execution: every index file is loaded once for
+ * the block, the hits of the block are resolved in one fetch-back, and, in {@code table} mode, the
+ * files the index does not cover are scanned once for the block. Within a block, {@code table} (the
+ * default) and {@code indexed} answer with the live rows of the queried snapshot and their exact
+ * distance, dropping a hit whose row was removed; {@code table} also merges in the rows of the
+ * files the index does not cover, so its answer is the answer a scan would give, while {@code
+ * indexed} stops at the index and can answer fewer than k rows. {@code index_hits} answers with the
+ * index's own hits, and keeps a hit whose row can no longer be read with a null row.
  *
  * <p>Queries are passed as an array of strings, one comma-separated list of numbers per query, for
  * example {@code array('0.95,0.05', '0.0,0.95')} for two 2-dimensional queries.
@@ -133,8 +141,8 @@ class VectorSearchBatchProcedure extends BaseProcedure {
             return new InternalRow[0];
           }
 
-          // one plan for the whole batch: the same parameter decision as the other entry points,
-          // and one row resolution per hit file rather than one per query
+          // one plan for the whole batch: the same parameter decision as the other entry points;
+          // how the rows are resolved depends on coverage, see the class comment
           String indexArgument = input.isProvided(INDEX_PARAM) ? input.asString(INDEX_PARAM) : null;
           String coverage =
               input.isProvided(COVERAGE_PARAM) ? input.asString(COVERAGE_PARAM) : "table";
@@ -173,8 +181,11 @@ class VectorSearchBatchProcedure extends BaseProcedure {
     }
 
     List<float[]> queryVectors = Lists.newArrayList();
-    for (Row row : spark().sql(sql).collectAsList()) {
-      List<?> values = row.getList(0);
+    // the query table is read once, a row at a time: collecting it first would hold every query
+    // row on the driver only to keep the vector each one carries
+    Iterator<Row> rows = spark().sql(sql).toLocalIterator();
+    while (rows.hasNext()) {
+      List<?> values = rows.next().getList(0);
       float[] query = new float[values.size()];
       for (int i = 0; i < query.length; i++) {
         query[i] = ((Number) values.get(i)).floatValue();

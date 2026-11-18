@@ -27,6 +27,45 @@ import org.junit.jupiter.api.Test;
 
 class TestVectorCandidateBudget {
   @Test
+  void tableBatchBudgetsForRowsFetchedFromUncoveredFiles() {
+    assertThat(
+            VectorSearchBridge$.MODULE$.derivedQueriesPerBlock(
+                VectorResultContract.forCoverage("table"), 10_000, 1, 2560, 1, 1))
+        .isEqualTo(1);
+  }
+
+  @Test
+  void indexOnlyBatchesIgnoreUncoveredFiles() {
+    for (String coverage : new String[] {"indexed", "index_hits"}) {
+      VectorResultContract contract = VectorResultContract.forCoverage(coverage);
+      int covered =
+          VectorSearchBridge$.MODULE$.derivedQueriesPerBlock(contract, 1000, 1000, 2, 1, 0);
+      assertThat(covered).isGreaterThan(1);
+      assertThat(
+              VectorSearchBridge$.MODULE$.derivedQueriesPerBlock(contract, 1000, 1000, 2, 1, 1050))
+          .isEqualTo(covered);
+    }
+  }
+
+  @Test
+  void driverBudgetAccountsForTheAnsweredRowsJson() {
+    // 100 rows of 2,560 dimensions: their rows alone would allow four queries, their JSON does not
+    // fit beside them for more than one
+    assertThat(
+            VectorSearchBridge$.MODULE$.derivedQueriesPerBlock(
+                VectorResultContract.forCoverage("indexed"), 100, 100, 2560, 1, 0))
+        .isEqualTo(1);
+  }
+
+  @Test
+  void batchShuffleBudgetsForTheExtraHitPerIndexFile() {
+    assertThat(
+            VectorSearchBridge$.MODULE$.derivedQueriesPerBlock(
+                VectorResultContract.forCoverage("indexed"), 1, 1, 2, 8192, 0))
+        .isEqualTo(64);
+  }
+
+  @Test
   void entryBoundDoesNotChangeMultiplier() {
     ResolvedVectorParameters parameters =
         VectorQueryParameters.decide(

@@ -903,6 +903,9 @@ project(':iceberg-index-spark') {
     testImplementation libs.avro.avro
     testImplementation libs.assertj.core
     testImplementation libs.junit.jupiter
+    // A test that starts a Spark session needs the network classes the spark-hive compileOnly
+    // dependency excludes; the version is the one the io.netty 4.2.x resolution strategy enforces.
+    testImplementation libs.netty.buffer
     testRuntimeOnly libs.junit.jupiter.engine
     testRuntimeOnly libs.junit.platform.launcher
   }

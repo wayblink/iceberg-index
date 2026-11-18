@@ -21,6 +21,7 @@ package org.apache.iceberg.spark.extensions;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
+import java.util.ArrayList;
 import java.util.List;
 import java.util.stream.Collectors;
 import org.apache.iceberg.ParameterizedTestExtension;
@@ -50,7 +51,15 @@ public class TestVectorIndexSearchBatch extends ExtensionsTestBase {
     sql("DROP TABLE IF EXISTS %s", tableName("vectors_batch_from_table_" + catalogName));
     sql("DROP TABLE IF EXISTS %s", tableName("vectors_batch_queries_" + catalogName));
     sql("DROP TABLE IF EXISTS %s", tableName("vectors_batch_empty_" + catalogName));
+    sql("DROP TABLE IF EXISTS %s", tableName("vectors_batch_cached_" + catalogName));
+    sql("DROP TABLE IF EXISTS %s", tableName("vectors_batch_cached_deletes_" + catalogName));
+    sql("DROP TABLE IF EXISTS %s", tableName("vectors_batch_located_" + catalogName));
     sql("DROP TABLE IF EXISTS %s", tableName("vectors_batch_order_" + catalogName));
+    sql("DROP TABLE IF EXISTS %s", tableName("vectors_batch_blocks_" + catalogName));
+    sql("DROP TABLE IF EXISTS %s", tableName("vectors_batch_uncovered_" + catalogName));
+    sql("DROP TABLE IF EXISTS %s", tableName("vectors_batch_override_" + catalogName));
+    sql("DROP TABLE IF EXISTS %s", tableName("vectors_batch_schema_" + catalogName));
+    sql("DROP TABLE IF EXISTS %s", tableName("vectors_batch_jobs_" + catalogName));
   }
 
   @TestTemplate
@@ -379,5 +388,214 @@ public class TestVectorIndexSearchBatch extends ExtensionsTestBase {
           .isEqualTo(parseId((String) inline.get(i)[4]));
     }
     sql("DROP TABLE IF EXISTS %s", queriesName);
+  }
+
+  @TestTemplate
+  public void batchSearchAnswersMoreQueriesThanOneBlock() {
+    String tableName = tableName("vectors_batch_blocks_" + catalogName);
+    sql("CREATE TABLE %s (id bigint, embedding array<double>) USING iceberg", tableName);
+    sql(
+        "INSERT INTO %s SELECT id, array(CAST(id AS double), CAST(10 - id AS double)) "
+            + "FROM range(0, 20)",
+        tableName);
+    sql(
+        "CALL %s.system.build_vector_index("
+            + "table => '%s', column => 'embedding', dimension => 2, metric => 'l2')",
+        catalogName, tableName);
+
+    // more queries than one block answers, so the block boundary is part of the answer
+    List<String> queries = new ArrayList<>();
+    for (int i = 0; i < 130; i += 1) {
+      int id = i % 20;
+      queries.add("'" + id + ".0," + (10 - id) + ".0'");
+    }
+
+    List<Object[]> batch =
+        sql(
+            "CALL %s.system.vector_search_batch(table => '%s', column => 'embedding', "
+                + "queries => array(%s), k => 3)",
+            catalogName, tableName, String.join(",", queries));
+
+    // every query answered, in query order, with its own three rows
+    assertThat(batch).hasSize(130 * 3);
+    for (int i = 0; i < batch.size(); i += 1) {
+      assertThat(((Number) batch.get(i)[0]).intValue()).as("row %s", i).isEqualTo(i / 3);
+    }
+
+    // the queries on both sides of the first block boundary answer what a single search does
+    for (int queryId : new int[] {0, 64, 127, 128, 129}) {
+      int id = queryId % 20;
+      List<Object[]> single =
+          sql(
+              "CALL %s.system.vector_search(table => '%s', column => 'embedding', "
+                  + "query => array(%s.0d, %s.0d), k => 3)",
+              catalogName, tableName, id, 10 - id);
+      assertThat(single).hasSize(3);
+      for (int i = 0; i < single.size(); i += 1) {
+        Object[] batchRow = batch.get(queryId * 3 + i);
+        assertThat(batchRow[1]).isEqualTo(single.get(i)[0]);
+        assertThat(batchRow[2]).isEqualTo(single.get(i)[1]);
+        assertThat(batchRow[3]).isEqualTo(single.get(i)[2]);
+        assertThat(batchRow[4]).isEqualTo(single.get(i)[3]);
+      }
+    }
+  }
+
+  @TestTemplate
+  public void batchSearchAnswersRowsTheIndexDoesNotCover() {
+    String tableName = tableName("vectors_batch_uncovered_" + catalogName);
+    sql("CREATE TABLE %s (id bigint, embedding array<double>) USING iceberg", tableName);
+    sql(
+        "INSERT INTO %s SELECT id, array(CAST(id AS double), CAST(10 - id AS double)) "
+            + "FROM range(0, 5)",
+        tableName);
+    sql(
+        "CALL %s.system.build_vector_index("
+            + "table => '%s', column => 'embedding', dimension => 2, metric => 'l2')",
+        catalogName, tableName);
+
+    // rows written after the index was built are not covered by it; the table mode scans them and
+    // has to prefer them over the covered rows when they are nearer
+    sql("INSERT INTO %s VALUES (5, array(5.0d, 5.0d)), (6, array(6.0d, 4.0d))", tableName);
+
+    List<Object[]> batch =
+        sql(
+            "CALL %s.system.vector_search_batch(table => '%s', column => 'embedding', "
+                + "queries => array('5.0,5.0', '4.0,6.0'), k => 1)",
+            catalogName, tableName);
+
+    assertThat(batch).hasSize(2);
+    assertThat(parseId((String) batch.get(0)[4])).isEqualTo(5L);
+    assertThat(parseId((String) batch.get(1)[4])).isEqualTo(4L);
+  }
+
+  @TestTemplate
+  public void batchSearchBlockSizeOverrideKeepsTheAnswer() {
+    String tableName = tableName("vectors_batch_override_" + catalogName);
+    sql("CREATE TABLE %s (id bigint, embedding array<double>) USING iceberg", tableName);
+    sql(
+        "INSERT INTO %s SELECT id, array(CAST(id AS double), CAST(10 - id AS double)) "
+            + "FROM range(0, 20)",
+        tableName);
+    sql(
+        "CALL %s.system.build_vector_index("
+            + "table => '%s', column => 'embedding', dimension => 2, metric => 'l2')",
+        catalogName, tableName);
+
+    String search =
+        "CALL %s.system.vector_search_batch(table => '%s', column => 'embedding', "
+            + "queries => array('0.0,10.0', '10.0,0.0', '5.0,5.0', '3.0,7.0'), k => 3)";
+    List<Object[]> expected = sql(search, catalogName, tableName);
+
+    // one block per two queries: the answer is the same as the one the default block size gives
+    System.setProperty("iceberg.index.batch.queries-per-block", "2");
+    try {
+      List<Object[]> smallBlocks = sql(search, catalogName, tableName);
+      assertThat(smallBlocks).hasSameSizeAs(expected);
+      for (int i = 0; i < expected.size(); i += 1) {
+        assertThat(java.util.Arrays.asList(smallBlocks.get(i)))
+            .as("row %s", i)
+            .isEqualTo(java.util.Arrays.asList(expected.get(i)));
+      }
+
+      System.setProperty("iceberg.index.batch.queries-per-block", "not-a-number");
+      assertThatThrownBy(() -> sql(search, catalogName, tableName))
+          .hasStackTraceContaining("Invalid iceberg.index.batch.queries-per-block");
+    } finally {
+      System.clearProperty("iceberg.index.batch.queries-per-block");
+    }
+  }
+
+  @TestTemplate
+  public void batchSearchUsesOneExecutionPerBlock() throws Exception {
+    String tableName = tableName("vectors_batch_jobs_" + catalogName);
+    sql("CREATE TABLE %s (id bigint, embedding array<double>) USING iceberg", tableName);
+    sql(
+        "INSERT INTO %s SELECT id, array(CAST(id AS double), CAST(10 - id AS double)) "
+            + "FROM range(0, 20)",
+        tableName);
+    sql(
+        "CALL %s.system.build_vector_index("
+            + "table => '%s', column => 'embedding', dimension => 2, metric => 'l2')",
+        catalogName, tableName);
+
+    String search =
+        "CALL %s.system.vector_search_batch(table => '%s', column => 'embedding', "
+            + "queries => array(%s), k => 3)";
+
+    long oneBlock = countJobs(() -> sql(search, catalogName, tableName, queries(20)));
+    long twoBlocks = countJobs(() -> sql(search, catalogName, tableName, queries(130)));
+
+    // two blocks, not 130 queries: the jobs follow the blocks, they do not follow the queries
+    assertThat(twoBlocks).as("jobs for 130 queries").isLessThan(130L);
+    assertThat(twoBlocks)
+        .as("jobs for one block against jobs for two")
+        .isLessThanOrEqualTo(oneBlock + 12L);
+
+    // one query per block costs more executions than one block for all of them
+    System.setProperty("iceberg.index.batch.queries-per-block", "1");
+    try {
+      long oneQueryPerBlock = countJobs(() -> sql(search, catalogName, tableName, queries(20)));
+      assertThat(oneQueryPerBlock)
+          .as("a smaller block costs more executions")
+          .isGreaterThan(oneBlock);
+    } finally {
+      System.clearProperty("iceberg.index.batch.queries-per-block");
+    }
+  }
+
+  /** The queries of the batch tests, as the comma-separated form the procedure takes. */
+  private static String queries(int count) {
+    List<String> queries = new ArrayList<>();
+    for (int i = 0; i < count; i += 1) {
+      int id = i % 20;
+      queries.add("'" + id + ".0," + (10 - id) + ".0'");
+    }
+    return String.join(",", queries);
+  }
+
+  /** Runs one action and counts the Spark jobs it started. */
+  private long countJobs(Runnable action) throws Exception {
+    String group = "vector-batch-jobs-" + System.nanoTime();
+    spark.sparkContext().setJobGroup(group, "vector batch jobs", false);
+    try {
+      action.run();
+      spark.sparkContext().listenerBus().waitUntilEmpty();
+      return spark.sparkContext().statusTracker().getJobIdsForGroup(group).length;
+    } finally {
+      spark.sparkContext().clearJobGroup();
+    }
+  }
+
+  @TestTemplate
+  public void batchSearchAnswersAfterAColumnWasAdded() {
+    String tableName = tableName("vectors_batch_schema_" + catalogName);
+    sql("CREATE TABLE %s (id bigint, embedding array<double>) USING iceberg", tableName);
+    sql(
+        "INSERT INTO %s SELECT id, array(CAST(id AS double), CAST(10 - id AS double)) "
+            + "FROM range(0, 5)",
+        tableName);
+    sql(
+        "CALL %s.system.build_vector_index("
+            + "table => '%s', column => 'embedding', dimension => 2, metric => 'l2')",
+        catalogName, tableName);
+
+    // the index was built before the column existed, so the row JSON has to carry the column as a
+    // null rather than to fail or to shift the columns it does have
+    sql("ALTER TABLE %s ADD COLUMN label string", tableName);
+    spark.conf().set("spark.sql.jsonGenerator.ignoreNullFields", "false");
+    try {
+      List<Object[]> batch =
+          sql(
+              "CALL %s.system.vector_search_batch(table => '%s', column => 'embedding', "
+                  + "queries => array('5.0,5.0', '2.0,8.0'), k => 2)",
+              catalogName, tableName);
+      assertThat(batch).hasSize(4);
+      for (Object[] row : batch) {
+        assertThat((String) row[4]).contains("\"id\":").contains("\"label\":null");
+      }
+    } finally {
+      spark.conf().unset("spark.sql.jsonGenerator.ignoreNullFields");
+    }
   }
 }
