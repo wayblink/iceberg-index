@@ -197,6 +197,55 @@ class TestIvfRangeRead {
   }
 
   @Test
+  void blocksAreSharedAcrossSearches() throws IOException {
+    VectorIndexAdapter vector = adapter(VectorQuantizer.RABITQ, true);
+    List<IndexEntry> entries = entries(vector);
+    ByteBuffer payload = vector.encodeAuxiliaryPayload(entries, 1);
+    InMemoryOutputFile file = new InMemoryOutputFile();
+    new PuffinIndexFileContainer().write(file, List.of(vector.auxiliaryBlob(payload)));
+    CountingFile counted = new CountingFile(file.toByteArray());
+    InMemoryListBlocks blocks = new InMemoryListBlocks();
+    ByteBuffer query = vector.encodeQuery(new float[] {1F, 1F}, 1);
+    IndexAdapter.PreparedSearch full = vector.prepareAuxiliary(payload);
+
+    try (VectorIndexAdapter.RangeSearch first = vector.prepareRange(counted, 0L, blocks)) {
+      assertThat(first.search(query, 5)).isEqualTo(full.search(query, 5));
+      // the first search reads its lists and leaves them in the shared cache
+      assertThat(blocks.stats().loads()).isPositive();
+      assertThat(first.blockCacheStats().hits()).isZero();
+    }
+
+    try (VectorIndexAdapter.RangeSearch second = vector.prepareRange(counted, 0L, blocks)) {
+      assertThat(second.search(query, 5)).isEqualTo(full.search(query, 5));
+      // the open still reads the container footer and the description; the lists come from the
+      // shared cache, which is what the list metrics and the hit counter say
+      assertThat(second.blockCacheStats().hits()).isPositive();
+      assertThat(second.listReadMetrics().bytes())
+          .as("the second search read no list bytes")
+          .isZero();
+      assertThat(second.listReadMetrics().requests()).isZero();
+    }
+  }
+
+  @Test
+  void aSearchWithoutASharedCacheReadsEveryTime() throws IOException {
+    VectorIndexAdapter vector = adapter(VectorQuantizer.RABITQ, true);
+    ByteBuffer payload = vector.encodeAuxiliaryPayload(entries(vector), 1);
+    InMemoryOutputFile file = new InMemoryOutputFile();
+    new PuffinIndexFileContainer().write(file, List.of(vector.auxiliaryBlob(payload)));
+    CountingFile counted = new CountingFile(file.toByteArray());
+    ByteBuffer query = vector.encodeQuery(new float[] {1F, 1F}, 1);
+
+    for (int search = 0; search < 2; search++) {
+      try (VectorIndexAdapter.RangeSearch opened = vector.prepareRange(counted)) {
+        assertThat(opened.search(query, 5))
+            .isEqualTo(vector.prepareAuxiliary(payload).search(query, 5));
+        assertThat(opened.blockCacheStats().hits()).isZero();
+      }
+    }
+  }
+
+  @Test
   void probingAllListsReadsTheListAreaOnce() throws IOException {
     VectorIndexAdapter vector = adapter(VectorQuantizer.NONE, true);
     ByteBuffer payload = vector.encodeAuxiliaryPayload(entries(vector), 1);
@@ -303,6 +352,46 @@ class TestIvfRangeRead {
     }
 
     return entries;
+  }
+
+  /** A shared block cache with no budget: a block put stays there for the next search. */
+  private static final class InMemoryListBlocks implements ListBlockCache {
+    private final Map<String, byte[]> blocks = new java.util.HashMap<>();
+    private long hits;
+    private long misses;
+    private long loads;
+
+    private static String key(String location, int offset, int size) {
+      return location + "@" + offset + "+" + size;
+    }
+
+    @Override
+    public byte[] get(String location, int offset, int size) {
+      byte[] block = blocks.get(key(location, offset, size));
+      if (block == null) {
+        misses++;
+        return null;
+      }
+
+      hits++;
+      return block;
+    }
+
+    @Override
+    public void put(String location, int offset, byte[] bytes) {
+      blocks.put(key(location, offset, bytes.length), bytes);
+      loads++;
+    }
+
+    @Override
+    public Stats stats() {
+      long bytes = 0L;
+      for (byte[] block : blocks.values()) {
+        bytes += block.length;
+      }
+
+      return new Stats(hits, misses, loads, 0L, bytes);
+    }
   }
 
   private static final class CountingFile extends InMemoryInputFile {

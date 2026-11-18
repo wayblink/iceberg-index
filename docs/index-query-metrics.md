@@ -20,6 +20,10 @@
 | `numIndexWholeListAreaReads` | `searches that read the whole list area instead of their ranges` | range 规划失败时回退读整个 list 区的次数 |
 | `numIndexCacheHits` | `index files an executor already held` | 打开索引文件时内存里已有该文件的次数（缓存开启时才有意义） |
 | `numIndexCacheMisses` | `index file opens that read from storage` | 打开索引文件时付了存储 IO 的次数；`cache.enabled=false` 时每次打开都记一次 |
+| `numIndexBlockCacheHits` | `index list blocks an executor already held` | range 路径要读的 list 块已在 executor 块缓存里的次数 |
+| `numIndexBlockCacheMisses` | `index list blocks a task read because the executor did not hold them` | 块缓存未命中的次数（这些块会从存储读并回填） |
+| `numIndexBlockLoads` | `index list blocks a task added to the executor cache` | 被加入块缓存的 list 块数 |
+| `numIndexBlockEvictions` | `index list blocks the executor cache evicted` | 块缓存按预算逐出的块数 |
 
 四段之和与 `taskTimeNs` 应当一致（单 task 误差 <5%，实测通常 <1%）：这就是"指标没漏算"的自检。判断一条查询慢在哪时，先看四段的占比，再看 `numIndexFileBytesRead` / `numIndexRangeBytesRead` 判断是读得太多还是算得太慢。
 
@@ -37,7 +41,7 @@ Lance 的分布式 `VECTOR_SEARCH` 从 #3089 起上报 12 个读路径指标（`
 
 - **回表的字节数与请求数没有报**：`lance-iceberg` 格式的回表走 Lance SDK，不经过 `InputFile`，无法在现有读路径上计数；`parquet` 格式的 `readFileWithFormat` 同样没有暴露 IO 计数。回表先用 `fetchBackTimeNs` + 已有的 `numFetchedRows` / `numRowsAtFiles` 代理，字节级归因留给回表重写（#3122）。
 - **只有融合路径有这些指标**：`CALL system.vector_search` / `vector_search_batch` 走的是 driver 回表的老路径，不经过 `searchWithRows`，因此不产出这组指标。
-- **range 与整文件缓存目前不能叠加**：`range-read.enabled=true` 时查询绕开整文件缓存，`numIndexCacheHits` 通常为 0、`numIndexCacheMisses` 约等于索引文件数；这是块级缓存（#3121）要解决的问题，不是指标错。
+- **range 与整文件缓存不是同一种缓存**：`range-read.enabled=true` 时查询不读整文件，所以 `numIndexCacheHits` 通常为 0、`numIndexCacheMisses` 约等于索引文件数；range 路径复用内存靠的是 **list 块缓存**（`numIndexBlockCacheHits`/`numIndexBlockCacheMisses`），它与整文件缓存共享同一个开关与预算（`spark.iceberg.index.cache.enabled` / `spark.iceberg.index.cache.bytes`），命中块时 `numIndexRangeBytesRead` 只剩容器 footer 与描述区。
 - **`taskTimeNs` 不是 Spark 的 task 时长**：它只覆盖 task 处理索引文件的那段墙钟，不含调度、反序列化广播、框架开销；和 event log 的 `tasks` 相位对比时，后者还会包含 task 之间的空隙与尾部。
 - **指标只在有 task 的执行里出现**：没有 task 的计划/管理命令（如 `CALL index_cache_status`）不会带这些 accumulable。
 

@@ -30,6 +30,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import org.apache.iceberg.index.IndexAdapter;
 import org.apache.iceberg.index.IndexSearchResult;
+import org.apache.iceberg.index.vector.ListBlockCache;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableList;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
@@ -62,6 +63,53 @@ class TestExecutorIndexCache {
     assertThat(second.metadataShape()).as("a later task does not").isNull();
     assertThat(second.seq()).as("and it is ordered after the first").isGreaterThan(first.seq());
     assertThat(other.metadataShape()).as("a new query carries one again").isNotNull();
+  }
+
+  @Test
+  void listBlocksAreKeptAndReused() {
+    ExecutorIndexCache.Config enabled = config(1024 * 1024);
+    ListBlockCache blocks = cache.listBlocks(enabled);
+
+    assertThat(blocks.get("s3://bucket/index-a.puffin", 0, 16)).isNull();
+    byte[] block = new byte[16];
+    blocks.put("s3://bucket/index-a.puffin", 0, block);
+
+    assertThat(blocks.get("s3://bucket/index-a.puffin", 0, 16)).isSameAs(block);
+    assertThat(blocks.get("s3://bucket/index-a.puffin", 0, 8))
+        .as("a block of another length is another block")
+        .isNull();
+    assertThat(blocks.stats().hits()).isEqualTo(1);
+    assertThat(blocks.stats().misses()).isEqualTo(2);
+    assertThat(blocks.stats().loads()).isEqualTo(1);
+    assertThat(blocks.stats().bytes()).isEqualTo(16);
+  }
+
+  @Test
+  void listBlocksStayWithinTheBudgetTheyShareWithWholeFiles() {
+    ExecutorIndexCache.Config enabled = config(1024);
+    ListBlockCache blocks = cache.listBlocks(enabled);
+
+    blocks.put("s3://bucket/index-a.puffin", 0, new byte[2048]);
+    assertThat(blocks.get("s3://bucket/index-a.puffin", 0, 2048))
+        .as("a block larger than the whole budget is not admitted")
+        .isNull();
+    assertThat(blocks.stats().loads()).isZero();
+
+    blocks.put("s3://bucket/index-a.puffin", 0, new byte[500]);
+    blocks.put("s3://bucket/index-a.puffin", 500, new byte[600]);
+    assertThat(blocks.get("s3://bucket/index-a.puffin", 0, 500))
+        .as("the older block was evicted to keep the newer one inside the budget")
+        .isNull();
+    assertThat(blocks.get("s3://bucket/index-a.puffin", 500, 600)).isNotNull();
+  }
+
+  @Test
+  void aDisabledCacheKeepsNoBlocks() {
+    ListBlockCache blocks = cache.listBlocks(ExecutorIndexCache.Config.of(false, 1024));
+    blocks.put("s3://bucket/index-a.puffin", 0, new byte[16]);
+
+    assertThat(blocks.get("s3://bucket/index-a.puffin", 0, 16)).isNull();
+    assertThat(blocks.stats().loads()).isZero();
   }
 
   @Test

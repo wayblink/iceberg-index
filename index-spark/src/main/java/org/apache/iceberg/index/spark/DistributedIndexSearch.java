@@ -57,6 +57,7 @@ import org.apache.iceberg.index.text.TextIndexAdapter;
 import org.apache.iceberg.index.text.TextIndexAdapter.CorpusCounts;
 import org.apache.iceberg.index.text.TextIndexAdapter.CorpusStatistics;
 import org.apache.iceberg.index.text.TextIndexDefinition;
+import org.apache.iceberg.index.vector.ListBlockCache;
 import org.apache.iceberg.index.vector.VectorIndexAdapter;
 import org.apache.iceberg.index.vector.VectorIndexDefinition;
 import org.apache.iceberg.io.FileIO;
@@ -245,6 +246,10 @@ public final class DistributedIndexSearch {
     public static final String INDEX_WHOLE_LIST_AREA_READS = "numIndexWholeListAreaReads";
     public static final String INDEX_CACHE_HITS = "numIndexCacheHits";
     public static final String INDEX_CACHE_MISSES = "numIndexCacheMisses";
+    public static final String INDEX_BLOCK_CACHE_HITS = "numIndexBlockCacheHits";
+    public static final String INDEX_BLOCK_CACHE_MISSES = "numIndexBlockCacheMisses";
+    public static final String INDEX_BLOCK_LOADS = "numIndexBlockLoads";
+    public static final String INDEX_BLOCK_EVICTIONS = "numIndexBlockEvictions";
 
     private static final Map<String, String> DESCRIPTIONS;
 
@@ -265,6 +270,12 @@ public final class DistributedIndexSearch {
           "searches that read the whole list area instead of their ranges");
       descriptions.put(INDEX_CACHE_HITS, "index files an executor already held");
       descriptions.put(INDEX_CACHE_MISSES, "index file opens that read from storage");
+      descriptions.put(INDEX_BLOCK_CACHE_HITS, "index list blocks an executor already held");
+      descriptions.put(
+          INDEX_BLOCK_CACHE_MISSES,
+          "index list blocks a task read because the executor did not hold them");
+      descriptions.put(INDEX_BLOCK_LOADS, "index list blocks a task added to the executor cache");
+      descriptions.put(INDEX_BLOCK_EVICTIONS, "index list blocks the executor cache evicted");
       DESCRIPTIONS = java.util.Collections.unmodifiableMap(descriptions);
     }
 
@@ -294,6 +305,10 @@ public final class DistributedIndexSearch {
       add(INDEX_WHOLE_LIST_AREA_READS, stages.wholeListAreaReads);
       add(INDEX_CACHE_HITS, stages.cacheHits);
       add(INDEX_CACHE_MISSES, stages.cacheMisses);
+      add(INDEX_BLOCK_CACHE_HITS, stages.blockCacheHits);
+      add(INDEX_BLOCK_CACHE_MISSES, stages.blockCacheMisses);
+      add(INDEX_BLOCK_LOADS, stages.blockLoads);
+      add(INDEX_BLOCK_EVICTIONS, stages.blockEvictions);
     }
 
     private void add(String name, long value) {
@@ -318,6 +333,10 @@ public final class DistributedIndexSearch {
     private long wholeListAreaReads;
     private int cacheHits;
     private int cacheMisses;
+    private long blockCacheHits;
+    private long blockCacheMisses;
+    private long blockLoads;
+    private long blockEvictions;
   }
 
   /**
@@ -598,6 +617,11 @@ public final class DistributedIndexSearch {
 
                     if (stageTally != null && opened.rangeSearch() != null) {
                       stageTally.wholeListAreaReads += opened.rangeSearch().wholeListAreaReads();
+                      ListBlockCache.Stats blocks = opened.blockCacheStats();
+                      stageTally.blockCacheHits += blocks.hits();
+                      stageTally.blockCacheMisses += blocks.misses();
+                      stageTally.blockLoads += blocks.loads();
+                      stageTally.blockEvictions += blocks.evictions();
                     }
 
                     if (opened.rangeSearch != null) {
@@ -2219,6 +2243,11 @@ public final class DistributedIndexSearch {
       return servedFromCache;
     }
 
+    /** What the executor's list block cache did for this search, or empty when it is off. */
+    ListBlockCache.Stats blockCacheStats() {
+      return rangeSearch == null ? ListBlockCache.Stats.EMPTY : rangeSearch.blockCacheStats();
+    }
+
     @Override
     public void close() {
       release.run();
@@ -2249,8 +2278,12 @@ public final class DistributedIndexSearch {
         return new OpenedSearch(hit, () -> {}, null, 0L, true);
       }
 
+      // a range search reads lists rather than the whole file, so the blocks it read are what a
+      // later query of the same file can reuse; the switch and budget that govern whole files
+      // govern these blocks
+      ListBlockCache blocks = config.enabled() ? cache.listBlocks(config) : null;
       VectorIndexAdapter.RangeSearch search =
-          vector.prepareRange(inputFile(io, location, knownLength), knownLength);
+          vector.prepareRange(inputFile(io, location, knownLength), knownLength, blocks);
       if (search != null) {
         return new OpenedSearch(
             ExecutorIndexCache.loaded(0L, search), search::close, search, 0L, false);

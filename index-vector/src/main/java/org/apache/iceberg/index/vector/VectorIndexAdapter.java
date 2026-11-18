@@ -173,6 +173,11 @@ public final class VectorIndexAdapter implements IndexAdapter, java.io.Serializa
     default long wholeListAreaReads() {
       return 0L;
     }
+
+    /** What a shared block cache did for this search, or empty when no cache was given. */
+    default ListBlockCache.Stats blockCacheStats() {
+      return ListBlockCache.Stats.EMPTY;
+    }
   }
 
   /** Opens a block-addressable IVF file, or returns null if it uses whole-file storage. */
@@ -193,6 +198,22 @@ public final class VectorIndexAdapter implements IndexAdapter, java.io.Serializa
    * @return the range search, or null when the file does not store an uncompressed blocked payload
    */
   public RangeSearch prepareRange(InputFile file, long knownLength) {
+    return prepareRange(file, knownLength, null);
+  }
+
+  /**
+   * Opens a block-addressable IVF file whose list blocks a later search may reuse.
+   *
+   * <p>The cache is how a repeated query skips the object-store reads of a whole-file cache while
+   * still reading only the lists it probes: a block the cache holds is scored from memory, and a
+   * block it does not hold is read and offered to it.
+   *
+   * @param file the index file
+   * @param knownLength the file length the manifest recorded, or zero when it is unknown
+   * @param blocks the blocks a previous search kept, or null to read every time
+   * @return the range search, or null when the file does not store an uncompressed blocked payload
+   */
+  public RangeSearch prepareRange(InputFile file, long knownLength, ListBlockCache blocks) {
     if (!(kernel instanceof IvfKernel ivf)) {
       return null;
     }
@@ -233,7 +254,8 @@ public final class VectorIndexAdapter implements IndexAdapter, java.io.Serializa
           ivf.prepareRange(
               input,
               new IvfKernel.OpenCosts(
-                  1L, counted.lengthRequests(), footerBytes, footerRequests, 0L, 0L));
+                  1L, counted.lengthRequests(), footerBytes, footerRequests, 0L, 0L),
+              blocks);
     } catch (RuntimeException | Error failure) {
       try {
         input.close();

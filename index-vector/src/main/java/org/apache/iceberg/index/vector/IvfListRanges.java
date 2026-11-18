@@ -45,23 +45,32 @@ final class IvfListRanges implements AutoCloseable {
   private final IvfRangeInput input;
   private final int[] starts;
   private final int mergeGapBytes;
+  private final ListBlockCache blocks;
   private final RangeReadMetrics metadataReads;
   private final TreeMap<Integer, Integer> planned = new TreeMap<>();
   private final TreeMap<Integer, byte[]> cachedByOffset = new TreeMap<>();
   private final LinkedHashMap<Integer, byte[]> lru = new LinkedHashMap<>(16, 0.75f, true);
   private int cachedBytes;
   private int wholeListAreaReads;
+  private long blockHits;
+  private long blockMisses;
+  private long blockLoads;
   private byte[] wholeLists;
 
   IvfListRanges(IvfRangeInput input, int[] starts) {
-    this(input, starts, MAX_MERGE_GAP_BYTES);
+    this(input, starts, MAX_MERGE_GAP_BYTES, null);
   }
 
   IvfListRanges(IvfRangeInput input, int[] starts, int mergeGapBytes) {
+    this(input, starts, mergeGapBytes, null);
+  }
+
+  IvfListRanges(IvfRangeInput input, int[] starts, int mergeGapBytes, ListBlockCache blocks) {
     Preconditions.checkArgument(mergeGapBytes >= 0, "Invalid merge gap: %s", mergeGapBytes);
     this.input = input;
     this.starts = starts;
     this.mergeGapBytes = mergeGapBytes;
+    this.blocks = blocks;
     this.metadataReads = input.metrics();
   }
 
@@ -135,6 +144,18 @@ final class IvfListRanges implements AutoCloseable {
       return window(bytes, cached.getKey(), start, end);
     }
 
+    // a later search of the same file wants exactly this list, so the shared cache is asked
+    // before the plan widens the read to cover neighbours
+    if (blocks != null) {
+      byte[] shared = blocks.get(input.location(), start, end - start);
+      if (shared != null) {
+        blockHits++;
+        return window(shared, start, start, end);
+      }
+
+      blockMisses++;
+    }
+
     Map.Entry<Integer, Integer> plan = planned.floorEntry(start);
     int readStart = start;
     int readEnd = end;
@@ -158,7 +179,44 @@ final class IvfListRanges implements AutoCloseable {
     lru.put(readStart, bytes);
     cachedByOffset.put(readStart, bytes);
     cachedBytes += size;
+    if (blocks != null) {
+      keepCoveredLists(readStart, readEnd, bytes);
+    }
+
     return window(bytes, readStart, start, end);
+  }
+
+  /**
+   * Offers every list the read covers to the shared cache, not only the one that asked for it.
+   *
+   * <p>A range read can carry several adjacent lists; caching only the requested one would make the
+   * next search read the same bytes again for its neighbour. The block of a list is a view of the
+   * bytes just read, so a cache that keeps it holds a window of one array rather than a copy of the
+   * whole read.
+   */
+  private void keepCoveredLists(int readStart, int readEnd, byte[] bytes) {
+    int list = listAtOrAfter(readStart);
+    while (list < starts.length && starts[list] < readEnd) {
+      int start = starts[list];
+      int end = endOf(list);
+      if (start >= readStart && end <= readEnd) {
+        int from = start - readStart;
+        int length = end - start;
+        byte[] block =
+            from == 0 && length == bytes.length
+                ? bytes
+                : java.util.Arrays.copyOfRange(bytes, from, from + length);
+        blocks.put(input.location(), start, block);
+        blockLoads++;
+      }
+
+      list++;
+    }
+  }
+
+  private int listAtOrAfter(int offset) {
+    int found = java.util.Arrays.binarySearch(starts, offset);
+    return found >= 0 ? found : -(found + 1);
   }
 
   private Map.Entry<Integer, byte[]> find(int start, int end) {
@@ -187,6 +245,19 @@ final class IvfListRanges implements AutoCloseable {
   /** How many times the selected ranges were replaced by one read of the whole list area. */
   int wholeListAreaReads() {
     return wholeListAreaReads;
+  }
+
+  /**
+   * What the shared cache did for this searcher, and what it holds, or empty when there is none.
+   */
+  ListBlockCache.Stats blockStats() {
+    if (blocks == null) {
+      return ListBlockCache.Stats.EMPTY;
+    }
+
+    ListBlockCache.Stats cache = blocks.stats();
+    return new ListBlockCache.Stats(
+        blockHits, blockMisses, blockLoads, cache.evictions(), cache.bytes());
   }
 
   @Override

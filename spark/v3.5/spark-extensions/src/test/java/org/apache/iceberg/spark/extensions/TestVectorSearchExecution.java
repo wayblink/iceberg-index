@@ -468,6 +468,57 @@ class TestVectorSearchExecution {
   }
 
   @Test
+  void aRangeSearchReusesTheListBlocksOfThePreviousQuery() {
+    String table = "local.db.exec_blocks_range";
+    spark.sql("CREATE NAMESPACE IF NOT EXISTS local.db");
+    spark.sql("CREATE TABLE " + table + " (id bigint, embedding array<double>) USING iceberg");
+    spark.sql(
+        "INSERT INTO " + table + " SELECT id, array(CAST(id AS double), 1.0d) FROM range(0, 64)");
+    spark.sql(
+        "CALL local.system.build_vector_index(table => 'db.exec_blocks_range', "
+            + "column => 'embedding', dimension => 2, metric => 'l2', structure => 'IVF', "
+            + "max_entries_per_index_file => 128, "
+            + "options => map('nlist', '8', 'ivf-list-blocks', 'true'))");
+    String range = "spark.iceberg.index.vector.ivf.range-read.enabled";
+    String probes = "spark.iceberg.index.vector.ivf.nprobe";
+    String cache = "spark.iceberg.index.cache.enabled";
+    String budget = "spark.iceberg.index.cache.bytes";
+    String query =
+        "SELECT id FROM "
+            + table
+            + " ORDER BY vec_distance(embedding, array(31.1d, 1.0d), 'l2') LIMIT 4";
+    try {
+      spark.conf().set(cache, "true");
+      spark.conf().set(budget, "64m");
+      spark.conf().set(range, "true");
+      spark.conf().set(probes, "2");
+
+      Dataset<Row> cold = spark.sql(query);
+      assertThat(cold.collectAsList()).hasSize(4);
+      SparkPlan coldSource = sourceExec(cold);
+      assertThat(metric(coldSource, "numIndexBlockCacheMisses")).isPositive();
+      assertThat(metric(coldSource, "numIndexBlockCacheHits")).isZero();
+      assertThat(metric(coldSource, "numIndexBlockLoads")).isPositive();
+      long coldBytes = metric(coldSource, "numIndexRangeBytesRead");
+      assertThat(coldBytes).isPositive();
+
+      Dataset<Row> warm = spark.sql(query);
+      assertThat(warm.collectAsList()).hasSize(4);
+      SparkPlan warmSource = sourceExec(warm);
+      assertThat(metric(warmSource, "numIndexBlockCacheHits")).isPositive();
+      assertThat(metric(warmSource, "numIndexBlockCacheMisses")).isZero();
+      assertThat(metric(warmSource, "numIndexRangeBytesRead"))
+          .as("the repeat query read its lists from the executor cache")
+          .isLessThan(coldBytes);
+    } finally {
+      spark.conf().unset(range);
+      spark.conf().unset(probes);
+      spark.conf().unset(cache);
+      spark.conf().unset(budget);
+    }
+  }
+
+  @Test
   void aSearchReportsWhereItsTaskTimeWent() {
     String table = tableWithIndex("exec_stages");
     Dataset<Row> frame = spark.sql(nearest(table, 2));
@@ -534,6 +585,12 @@ class TestVectorSearchExecution {
       assertThat(metric(source, "numIndexRangeBytesRead")).isPositive();
       assertThat(metric(source, "numIndexRangeReadRequests")).isPositive();
       assertThat(metric(source, "numIndexListBlocksRead")).isPositive();
+      assertThat(metric(source, "numIndexBlockCacheHits"))
+          .as("the block cache is off, so no block is reused")
+          .isZero();
+      assertThat(metric(source, "numIndexBlockLoads"))
+          .as("the block cache is off, so no block is kept")
+          .isZero();
       long stages =
           metric(source, "indexReadTimeNs")
               + metric(source, "probeScoreTimeNs")

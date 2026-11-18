@@ -321,7 +321,7 @@ CALL local.system.drop_vector_index(table => 'db.docs', column => 'embedding', i
 | `numIndexUnderfilled` | 最后一轮仍凑不满 k 的索引文件数 | 只描述索引分支，残差扫描可能已补齐 |
 | `numCandidateRounds` | 每个索引文件跑了几轮扩探 | 轮次多说明窗口被删除/过滤吃掉了 |
 
-整列表区回退（一次读整个 list 区而不是选读）没有 SQL 指标，只在 DEBUG 日志里以 `whole-list-area reads` 出现；用它区分"稀疏选读"和"整区读"。完整的指标口径、event log 读法、与 Lance 侧指标的对应关系，以及已知边界（回表字节未覆盖、range 与整文件缓存不能叠加等）见 `docs/index-query-metrics.md`。
+整列表区回退（一次读整个 list 区而不是选读）由 `numIndexWholeListAreaReads` 计数，用它区分"稀疏选读"和"整区读"。range=on 的查询会复用 executor 的 **list 块缓存**（`numIndexBlockCacheHits` / `numIndexBlockCacheMisses` / `numIndexBlockLoads` / `numIndexBlockEvictions`）：块缓存与整文件缓存共用 `spark.iceberg.index.cache.*` 的开关和预算，命中时不再重复访问对象存储。完整的指标口径、event log 读法、与 Lance 侧指标的对应关系，以及已知边界（回表字节未覆盖等）见 `docs/index-query-metrics.md`。
 
 ### 4.8 批量查询：块、输出模式与内存
 

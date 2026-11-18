@@ -43,6 +43,7 @@ import org.apache.iceberg.index.spark.IndexCacheMetadata.MetadataState;
 import org.apache.iceberg.index.spark.IndexCacheMetadata.OwnedMap;
 import org.apache.iceberg.index.spark.IndexCacheMetadata.OwnedSet;
 import org.apache.iceberg.index.spark.IndexCacheMetadata.Texts;
+import org.apache.iceberg.index.vector.ListBlockCache;
 import org.apache.iceberg.relocated.com.google.common.base.Preconditions;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -1458,6 +1459,117 @@ final class ExecutorIndexCache {
     }
   }
 
+  // ---- list blocks: what a range search read, kept for the next search of the same file ----
+
+  /**
+   * The blocks of one index file's lists, charged against the same budget as whole files.
+   *
+   * <p>A range search reads the lists it probes; those bytes are stable for the life of the file,
+   * so a repeated query can score them from memory instead of asking the object store again. The
+   * blocks live beside the whole-file entries rather than inside them: a file that is read whole
+   * does not need them, and a file that is read by range never fills the whole-file entry. They are
+   * admitted from what the whole files leave spare, so a range search cannot evict the files a
+   * later search may ask for.
+   */
+  private final java.util.LinkedHashMap<ListBlockKey, byte[]> listBlocks =
+      new java.util.LinkedHashMap<>(16, 0.75f, true);
+
+  private long listBlockBytes;
+  private long listBlockHits;
+  private long listBlockMisses;
+  private long listBlockLoads;
+  private long listBlockEvictions;
+
+  /** A view of the blocks this executor keeps, as one search reports what it reused. */
+  ListBlockCache listBlocks(Config config) {
+    return new SharedListBlocks(this, config);
+  }
+
+  private byte[] listBlock(Config config, String location, int offset, int size) {
+    if (!config.caching()) {
+      return null;
+    }
+
+    synchronized (mapLock) {
+      byte[] block = listBlocks.get(new ListBlockKey(location, offset, size));
+      if (block != null) {
+        listBlockHits++;
+      } else {
+        listBlockMisses++;
+      }
+
+      return block;
+    }
+  }
+
+  private void keepListBlock(Config config, String location, int offset, byte[] bytes) {
+    if (!config.caching() || bytes.length == 0) {
+      return;
+    }
+
+    synchronized (mapLock) {
+      ListBlockKey key = new ListBlockKey(location, offset, bytes.length);
+      if (listBlocks.containsKey(key)) {
+        return;
+      }
+
+      long capacity = budget(config.maxBytes());
+      long spare = capacity - bytes() - listBlockBytes;
+      while (spare < bytes.length && !listBlocks.isEmpty()) {
+        java.util.Iterator<java.util.Map.Entry<ListBlockKey, byte[]>> eldest =
+            listBlocks.entrySet().iterator();
+        listBlockBytes -= eldest.next().getValue().length;
+        eldest.remove();
+        listBlockEvictions++;
+        spare = capacity - bytes() - listBlockBytes;
+      }
+
+      if (spare >= bytes.length) {
+        listBlocks.put(key, bytes);
+        listBlockBytes += bytes.length;
+        listBlockLoads++;
+      }
+    }
+  }
+
+  private ListBlockCache.Stats listBlockStats() {
+    synchronized (mapLock) {
+      return new ListBlockCache.Stats(
+          listBlockHits, listBlockMisses, listBlockLoads, listBlockEvictions, listBlockBytes);
+    }
+  }
+
+  private long bytes() {
+    return bytes;
+  }
+
+  private record ListBlockKey(String location, int offset, int size) {}
+
+  private static final class SharedListBlocks implements ListBlockCache {
+    private final ExecutorIndexCache cache;
+    private final Config config;
+
+    private SharedListBlocks(ExecutorIndexCache cache, Config config) {
+      this.cache = cache;
+      this.config = config;
+    }
+
+    @Override
+    public byte[] get(String location, int offset, int size) {
+      return cache.listBlock(config, location, offset, size);
+    }
+
+    @Override
+    public void put(String location, int offset, byte[] bytes) {
+      cache.keepListBlock(config, location, offset, bytes);
+    }
+
+    @Override
+    public Stats stats() {
+      return cache.listBlockStats();
+    }
+  }
+
   private long usedBytes() {
     ChargeProjection projection =
         IndexCacheMemory.project(metadataState(texts, attribution), before -> before);
@@ -2589,6 +2701,12 @@ final class ExecutorIndexCache {
       misses.set(0);
       loads.set(0);
       evictions.set(0);
+      listBlocks.clear();
+      listBlockBytes = 0L;
+      listBlockHits = 0L;
+      listBlockMisses = 0L;
+      listBlockLoads = 0L;
+      listBlockEvictions = 0L;
       lastSweepNanos = System.nanoTime();
       mapLock.notifyAll();
     }

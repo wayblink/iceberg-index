@@ -47,6 +47,11 @@ final class IvfRangeInput implements AutoCloseable {
     return length;
   }
 
+  /** The index file this input reads, which is what a block cache keys its blocks by. */
+  String location() {
+    return location;
+  }
+
   byte[] read(int position, int size) {
     byte[] bytes = new byte[size];
     read(position, bytes, 0, size);

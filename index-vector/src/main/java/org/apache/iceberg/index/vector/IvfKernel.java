@@ -800,6 +800,11 @@ public final class IvfKernel implements VectorKernel, RetainedBytes {
   }
 
   VectorIndexAdapter.RangeSearch prepareRange(IvfRangeInput input, OpenCosts costs) {
+    return prepareRange(input, costs, null);
+  }
+
+  VectorIndexAdapter.RangeSearch prepareRange(
+      IvfRangeInput input, OpenCosts costs, ListBlockCache blocks) {
     byte[] prefix = input.read(0, Math.min(input.length(), BLOCK_PREFIX_BYTES));
     if (!isBlocked(ByteBuffer.wrap(prefix))) {
       return null;
@@ -832,7 +837,9 @@ public final class IvfKernel implements VectorKernel, RetainedBytes {
         isQuantized() ? quantizer.codeBytes() : 0,
         0L,
         new RangeLists(
-            new IvfListRanges(input, directory.starts()), metadata.seed(), metadata.bits()),
+            new IvfListRanges(input, directory.starts(), IvfListRanges.MAX_MERGE_GAP_BYTES, blocks),
+            metadata.seed(),
+            metadata.bits()),
         costs.withDescription(descriptionReads.bytes(), descriptionReads.requests()));
   }
 
@@ -906,6 +913,11 @@ public final class IvfKernel implements VectorKernel, RetainedBytes {
     @Override
     public long wholeListAreaReads() {
       return ranges == null ? 0L : ranges.lists().wholeListAreaReads();
+    }
+
+    @Override
+    public ListBlockCache.Stats blockCacheStats() {
+      return ranges == null ? ListBlockCache.Stats.EMPTY : ranges.lists().blockStats();
     }
 
     @Override
