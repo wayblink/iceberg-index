@@ -19,6 +19,7 @@
 package org.apache.iceberg.index.spark;
 
 import org.apache.iceberg.index.IndexAdapter;
+import org.apache.iceberg.index.IndexFileMemory;
 import org.apache.iceberg.index.IndexTypes;
 import org.apache.iceberg.relocated.com.google.common.base.Preconditions;
 
@@ -64,12 +65,19 @@ final class IndexCacheReadContext implements ExecutorIndexCacheWorker.Loader {
     validate(command);
     IndexAdapter adapter = adapter(command);
     DistributedIndexSearch.LoadedFile loaded =
-        DistributedIndexSearch.loadFileState(command.io(), command.file().location(), adapter);
+        DistributedIndexSearch.loadFileState(
+            command.io(), command.file().location(), adapter, recordedLength(command.file()));
     Preconditions.checkArgument(
         loaded.preparedBytes() > 0,
         "Index prepared memory is unknown: %s",
         command.file().location());
     validate(command, loaded.file());
     return loaded.file();
+  }
+
+  /** The length the command states for the file, or zero when the manifest recorded none. */
+  private static long recordedLength(IndexCacheProtocol.File file) {
+    IndexFileMemory memory = file.memory();
+    return memory != null && memory.fileBytes() != null ? memory.fileBytes() : 0L;
   }
 }

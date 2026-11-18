@@ -299,7 +299,8 @@ public final class DistributedIndexSearch {
       }
 
       locations.add(file.location());
-      shipped.add(new IndexFileTask(file.location(), file.entryCount(), covered));
+      shipped.add(
+          new IndexFileTask(file.location(), file.entryCount(), recordedLength(file), covered));
     }
 
     JavaSparkContext sparkContext = context;
@@ -376,7 +377,14 @@ public final class DistributedIndexSearch {
                     String location = indexFile.location();
                     long readStart = System.nanoTime();
                     OpenedSearch opened =
-                        openSearch(fileIO, location, fileAdapter, cacheConfig, cacheKey, rangeRead);
+                        openSearch(
+                            fileIO,
+                            location,
+                            fileAdapter,
+                            cacheConfig,
+                            cacheKey,
+                            rangeRead,
+                            indexFile.fileLength());
                     long readNanos = System.nanoTime() - readStart;
                     long searchStart = System.nanoTime();
                     try (opened) {
@@ -867,6 +875,10 @@ public final class DistributedIndexSearch {
       locations.add(file.location());
     }
 
+    // a search of one query does not read rows through its scan tasks, but the tasks carry what
+    // each index file's open needs besides its location
+    List<IndexFileTask> shards = indexFileTasks(files);
+
     JavaSparkContext context = JavaSparkContext.fromSparkContext(spark.sparkContext());
     Broadcast<IndexAdapter> adapterRef = context.broadcast(adapter);
     // a ByteBuffer is not serializable, so the payload travels as bytes
@@ -901,10 +913,10 @@ public final class DistributedIndexSearch {
 
     // Each index file carries an independent search structure and is one unit of work.
     List<Tuple3<String, Long, Double>> top =
-        IndexFileRdds.javaRdd(context.sc(), locations, cacheKeys, locationsTable, locality)
+        IndexFileRdds.tasks(context.sc(), shards, cacheKeys, locationsTable, locality)
             .mapPartitions(
-                (FlatMapFunction<Iterator<String>, Tuple3<String, Long, Double>>)
-                    locations1 -> {
+                (FlatMapFunction<Iterator<IndexFileTask>, Tuple3<String, Long, Double>>)
+                    indexFiles -> {
                       IndexAdapter fileAdapter = adapterRef.getValue();
                       ByteBuffer fileQuery = ByteBuffer.wrap(queryRef.getValue());
                       IndexCandidates fileCandidates =
@@ -912,12 +924,19 @@ public final class DistributedIndexSearch {
                       FileIO fileIO = ioRef.getValue();
                       ExecutorIndexCache.Config cacheConfig = cacheRef.getValue();
                       List<Tuple3<String, Long, Double>> fileHits = Lists.newArrayList();
-                      while (locations1.hasNext()) {
-                        String location = locations1.next();
+                      while (indexFiles.hasNext()) {
+                        IndexFileTask indexFile = indexFiles.next();
+                        String location = indexFile.location();
                         long readStart = System.nanoTime();
                         OpenedSearch opened =
                             openSearch(
-                                fileIO, location, fileAdapter, cacheConfig, cacheKey, rangeRead);
+                                fileIO,
+                                location,
+                                fileAdapter,
+                                cacheConfig,
+                                cacheKey,
+                                rangeRead,
+                                indexFile.fileLength());
                         long readNanos = System.nanoTime() - readStart;
                         long searchStart = System.nanoTime();
                         try (opened) {
@@ -1079,6 +1098,10 @@ public final class DistributedIndexSearch {
       locations.add(file.location());
     }
 
+    // a batch search does not read rows through its scan tasks, but the tasks carry what each
+    // index file's open needs besides its location
+    List<IndexFileTask> shards = indexFileTasks(files);
+
     JavaSparkContext context = JavaSparkContext.fromSparkContext(spark.sparkContext());
     Broadcast<IndexAdapter> adapterRef = context.broadcast(adapter);
     // a ByteBuffer is not serializable, so the payloads travel as bytes
@@ -1118,22 +1141,30 @@ public final class DistributedIndexSearch {
     int localTopK = widestTopK + 1;
 
     JavaPairRDD<Integer, Tuple3<String, Long, Double>> fileHits =
-        IndexFileRdds.javaRdd(context.sc(), locations, cacheKeys, locationsTable, locality)
+        IndexFileRdds.tasks(context.sc(), shards, cacheKeys, locationsTable, locality)
             .mapPartitionsToPair(
-                (PairFlatMapFunction<Iterator<String>, Integer, Tuple3<String, Long, Double>>)
-                    locations1 -> {
+                (PairFlatMapFunction<
+                        Iterator<IndexFileTask>, Integer, Tuple3<String, Long, Double>>)
+                    indexFiles -> {
                       IndexAdapter fileAdapter = adapterRef.getValue();
                       List<byte[]> fileQueries = queriesRef.getValue();
                       FileIO fileIO = ioRef.getValue();
                       ExecutorIndexCache.Config cacheConfig = cacheRef.getValue();
                       List<Tuple2<Integer, Tuple3<String, Long, Double>>> batchHits =
                           Lists.newArrayList();
-                      while (locations1.hasNext()) {
-                        String location = locations1.next();
+                      while (indexFiles.hasNext()) {
+                        IndexFileTask indexFile = indexFiles.next();
+                        String location = indexFile.location();
                         long readStart = System.nanoTime();
                         OpenedSearch opened =
                             openSearch(
-                                fileIO, location, fileAdapter, cacheConfig, cacheKey, rangeRead);
+                                fileIO,
+                                location,
+                                fileAdapter,
+                                cacheConfig,
+                                cacheKey,
+                                rangeRead,
+                                indexFile.fileLength());
                         long readNanos = System.nanoTime() - readStart;
 
                         long searchStart = System.nanoTime();
@@ -1314,7 +1345,9 @@ public final class DistributedIndexSearch {
       }
 
       if (filteredTasks == null || !shardTasks.isEmpty()) {
-        searchShards.add(new IndexFileTask(file.location(), file.entryCount(), shardTasks));
+        searchShards.add(
+            new IndexFileTask(
+                file.location(), file.entryCount(), recordedLength(file), shardTasks));
       }
     }
 
@@ -1387,7 +1420,7 @@ public final class DistributedIndexSearch {
                         results =
                             lease == null
                                 ? text.searchShardBatch(
-                                    io.value().newInputFile(file.location()),
+                                    inputFile(io.value(), file.location(), file.fileLength()),
                                     queriesForShard,
                                     limits,
                                     corpusForShard,
@@ -1837,8 +1870,8 @@ public final class DistributedIndexSearch {
 
     String name = location.substring(location.lastIndexOf('/') + 1);
     long listNanos = 0L;
-    if (opened.rangeSearch != null) {
-      VectorIndexAdapter.RangeReadMetrics metrics = opened.rangeSearch.listReadMetrics();
+    if (opened.rangeSearch() != null) {
+      VectorIndexAdapter.RangeReadMetrics metrics = opened.rangeSearch().listReadMetrics();
       listNanos = metrics.nanos();
       LOG.debug(
           "index file {} IVF list I/O {} ms, {} bytes, {} reads",
@@ -1846,6 +1879,21 @@ public final class DistributedIndexSearch {
           TimeUnit.NANOSECONDS.toMillis(listNanos),
           metrics.bytes(),
           metrics.requests());
+      VectorIndexAdapter.OpenReadMetrics open = opened.rangeSearch().openReadMetrics();
+      if (open != null) {
+        LOG.debug(
+            "index file {} open read {} opens, {} length probes, footer {} bytes/{} reads,"
+                + " description {} bytes/{} reads, lists {} bytes/{} reads",
+            name,
+            open.opens(),
+            open.lengthRequests(),
+            open.footerBytes(),
+            open.footerRequests(),
+            open.descriptionBytes(),
+            open.descriptionRequests(),
+            open.listBytes(),
+            open.listRequests());
+      }
     }
 
     LOG.debug(
@@ -1855,7 +1903,7 @@ public final class DistributedIndexSearch {
         TimeUnit.NANOSECONDS.toMillis(searchNanos - listNanos));
   }
 
-  private static final class OpenedSearch implements AutoCloseable {
+  static final class OpenedSearch implements AutoCloseable {
     private final ExecutorIndexCache.CachedFile file;
     private final Runnable release;
     private final VectorIndexAdapter.RangeSearch rangeSearch;
@@ -1869,19 +1917,28 @@ public final class DistributedIndexSearch {
       this.rangeSearch = rangeSearch;
     }
 
+    ExecutorIndexCache.CachedFile file() {
+      return file;
+    }
+
+    VectorIndexAdapter.RangeSearch rangeSearch() {
+      return rangeSearch;
+    }
+
     @Override
     public void close() {
       release.run();
     }
   }
 
-  private static OpenedSearch openSearch(
+  static OpenedSearch openSearch(
       FileIO io,
       String location,
       IndexAdapter adapter,
       ExecutorIndexCache.Config config,
       String readerKey,
-      boolean rangeRead) {
+      boolean rangeRead,
+      long knownLength) {
     ExecutorIndexCache cache = ExecutorIndexCache.get();
     String key = cacheKey(config.owner(), readerKey, location);
     ExecutorIndexCache.Lease lease = cache.acquireManagedKey(key);
@@ -1895,7 +1952,8 @@ public final class DistributedIndexSearch {
         return new OpenedSearch(hit, () -> {}, null);
       }
 
-      VectorIndexAdapter.RangeSearch search = vector.prepareRange(io.newInputFile(location));
+      VectorIndexAdapter.RangeSearch search =
+          vector.prepareRange(inputFile(io, location, knownLength), knownLength);
       if (search != null) {
         return new OpenedSearch(ExecutorIndexCache.loaded(0L, search), search::close, search);
       }
@@ -1906,42 +1964,92 @@ public final class DistributedIndexSearch {
             location,
             config,
             readerKey,
-            sizeHint(io, location),
-            () -> loadFile(io, location, adapter));
+            sizeHint(io, location, knownLength),
+            () -> loadFile(io, location, adapter, knownLength));
     return new OpenedSearch(file, () -> {}, null);
   }
 
   static ExecutorIndexCache.CachedFile loadFile(FileIO io, String location, IndexAdapter adapter) {
-    return loadFileState(io, location, adapter).file();
+    return loadFile(io, location, adapter, 0L);
+  }
+
+  static ExecutorIndexCache.CachedFile loadFile(
+      FileIO io, String location, IndexAdapter adapter, long knownLength) {
+    return loadFileState(io, location, adapter, knownLength).file();
   }
 
   static LoadedFile loadFileState(FileIO io, String location, IndexAdapter adapter) {
-    InputFile input = io.newInputFile(location);
-    long length = input.getLength();
+    return loadFileState(io, location, adapter, 0L);
+  }
+
+  /**
+   * Reads and prepares one index file, using a length the manifest already recorded when there is
+   * one.
+   *
+   * <p>Without the length a load asks storage for it three times: once to reserve room in the
+   * cache, once to bound the payload size before reading, and once inside the container reader to
+   * locate the footer. A known length answers all three without a request.
+   */
+  static LoadedFile loadFileState(
+      FileIO io, String location, IndexAdapter adapter, long knownLength) {
+    InputFile input = inputFile(io, location, knownLength);
+    long length = knownLength > 0 ? knownLength : input.getLength();
     if (length > IndexPayloadLimits.MAX_PAYLOAD_BYTES) {
       throw new IllegalArgumentException(IndexPayloadLimits.tooLargeToRead(length, location));
     }
-    PreparedFile prepared = prepareFile(input, adapter);
+    PreparedFile prepared = prepareFile(input, adapter, knownLength);
     ExecutorIndexCache.CachedFile file =
         ExecutorIndexCache.loaded(prepared.payloadBytes(), prepared.searcher())
             .withContext(adapter);
     return new LoadedFile(file, length, prepared.payloadBytes(), file.preparedBytes());
   }
 
+  /** Opens an index file, using the length the manifest recorded when it recorded one. */
+  private static InputFile inputFile(FileIO io, String location, long knownLength) {
+    return knownLength > 0 ? io.newInputFile(location, knownLength) : io.newInputFile(location);
+  }
+
   /**
    * The length of a file, which a load reserves room against before it reads anything.
    *
-   * <p>It is a lower bound of what the prepared structure costs, and it is free to ask for. Without
-   * it a load would have to reserve the whole budget, which would let one load hold the cache while
-   * it prepares and serialise the loads of a single query.
+   * <p>It is a lower bound of what the prepared structure costs, and it is free to ask for when the
+   * manifest recorded it. Without it a load would have to reserve the whole budget, which would let
+   * one load hold the cache while it prepares and serialise the loads of a single query.
    */
-  private static long sizeHint(FileIO io, String location) {
+  private static long sizeHint(FileIO io, String location, long knownLength) {
+    if (knownLength > 0) {
+      return knownLength;
+    }
+
     try {
       return io.newInputFile(location).getLength();
     } catch (RuntimeException e) {
       // a length is a hint for sizing, never a reason to fail a read that will report the error
       return 0L;
     }
+  }
+
+  /**
+   * The length the index manifest recorded for an index file, which is where a search learns it
+   * without asking storage.
+   */
+  static long recordedLength(IndexFile file) {
+    IndexFileMemory memory = file.memory();
+    return memory != null && memory.fileBytes() != null ? memory.fileBytes() : 0L;
+  }
+
+  /**
+   * One task per index file, carrying what an open needs. A search that does not read rows still
+   * ships an empty task list rather than a second kind of partition.
+   */
+  private static List<IndexFileTask> indexFileTasks(List<IndexFile> files) {
+    List<IndexFileTask> tasks = Lists.newArrayListWithCapacity(files.size());
+    for (IndexFile file : files) {
+      tasks.add(
+          new IndexFileTask(file.location(), file.entryCount(), recordedLength(file), List.of()));
+    }
+
+    return tasks;
   }
 
   /** Reads the payload of one index file, which an executor reads whole. */
@@ -1962,7 +2070,7 @@ public final class DistributedIndexSearch {
   }
 
   /** Prepares one index file, which an executor has read whole, for any number of searches. */
-  private static PreparedFile prepareFile(InputFile input, IndexAdapter adapter) {
+  private static PreparedFile prepareFile(InputFile input, IndexAdapter adapter, long knownLength) {
     // every type the adapter can still read, not just the one it writes: an index built before a
     // rename is still on tables, and a reader that only knew the current name would skip it
     java.util.Set<String> blobTypes =
@@ -1972,7 +2080,7 @@ public final class DistributedIndexSearch {
 
     List<IndexBlob> blobs;
     try {
-      blobs = new PuffinIndexFileContainer().read(input);
+      blobs = new PuffinIndexFileContainer().read(input, knownLength);
     } catch (java.io.IOException e) {
       throw new java.io.UncheckedIOException("Failed to read an index file", e);
     }

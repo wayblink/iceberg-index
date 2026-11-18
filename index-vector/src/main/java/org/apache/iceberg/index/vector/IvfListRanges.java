@@ -30,8 +30,20 @@ final class IvfListRanges implements AutoCloseable {
   private static final int MAX_CACHED_RANGES = 256;
   private static final int MIN_SCATTERED_RANGES = 4;
 
+  /**
+   * The largest gap between two selected runs that is read as part of one range.
+   *
+   * <p>Zero merges only runs that touch, which is what adjacent lists are. A positive value trades
+   * bytes for requests: the gap is read but not scored, so it is worth it when one more read costs
+   * more than the bandwidth the gap takes. That ratio is a property of the storage, not of the
+   * index, so it is a constant to be set from the measurement in the design document rather than a
+   * setting to be carried with a table.
+   */
+  static final int MAX_MERGE_GAP_BYTES = 0;
+
   private final IvfRangeInput input;
   private final int[] starts;
+  private final int mergeGapBytes;
   private final RangeReadMetrics metadataReads;
   private final TreeMap<Integer, Integer> planned = new TreeMap<>();
   private final TreeMap<Integer, byte[]> cachedByOffset = new TreeMap<>();
@@ -40,8 +52,13 @@ final class IvfListRanges implements AutoCloseable {
   private byte[] wholeLists;
 
   IvfListRanges(IvfRangeInput input, int[] starts) {
+    this(input, starts, MAX_MERGE_GAP_BYTES);
+  }
+
+  IvfListRanges(IvfRangeInput input, int[] starts, int mergeGapBytes) {
     this.input = input;
     this.starts = starts;
+    this.mergeGapBytes = mergeGapBytes;
     this.metadataReads = input.metrics();
   }
 
@@ -66,7 +83,9 @@ final class IvfListRanges implements AutoCloseable {
       }
 
       missingBytes += end - start;
-      if (runEnd == start && end - runStart <= MAX_CACHED_BYTES) {
+      if (runEnd >= 0
+          && (long) runEnd + mergeGapBytes >= start
+          && end - runStart <= MAX_CACHED_BYTES) {
         runEnd = end;
       } else {
         if (runStart >= 0) {

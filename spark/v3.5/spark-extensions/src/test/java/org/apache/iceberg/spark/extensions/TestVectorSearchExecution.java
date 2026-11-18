@@ -21,6 +21,7 @@ package org.apache.iceberg.spark.extensions;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
+import java.io.FileNotFoundException;
 import java.net.URI;
 import java.nio.ByteBuffer;
 import java.nio.file.Files;
@@ -489,25 +490,25 @@ class TestVectorSearchExecution {
     IndexMetadata metadata = VectorIndexes.findIndex(iceberg, "embedding", "vector", null);
     String manifestList = metadata.latestSnapshot().indexManifestList();
     IndexManifestList list = IndexManifestList.read(iceberg.io().newInputFile(manifestList));
-    int deleted = 0;
+    Set<Path> deletedPaths = new HashSet<>();
     for (IndexManifestList.ManifestRef ref : list.manifests()) {
       IndexManifest manifest = IndexManifest.read(iceberg.io().newInputFile(ref.location()));
       for (IndexFile file : manifest.indexFiles()) {
-        Files.deleteIfExists(Path.of(URI.create(file.location())));
-        deleted += 1;
+        Path path = Path.of(URI.create(file.location()));
+        Files.delete(path);
+        deletedPaths.add(path);
       }
     }
-    assertThat(deleted).as("the index has payload files to delete").isPositive();
-    String frozenIndex = metadata.indexUuid();
+    assertThat(deletedPaths).as("the index has payload files to delete").isNotEmpty();
 
     assertThatThrownBy(frozen::collectAsList)
-        .as("a deleted index resource fails the first physical read")
+        .as("the frozen plan fails because an index payload is missing")
+        .rootCause()
+        .isInstanceOf(FileNotFoundException.class)
         .satisfies(
-            error ->
-                assertThat(messages(error))
-                    .as("the failure names the index the frozen plan points at")
-                    .contains("File does not exist")
-                    .contains(frozenIndex));
+            cause ->
+                assertThat(deletedPaths)
+                    .anySatisfy(path -> assertThat(cause).hasMessageContaining(path.toString())));
   }
 
   /**

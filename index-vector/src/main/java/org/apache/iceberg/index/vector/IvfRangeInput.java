@@ -48,6 +48,13 @@ final class IvfRangeInput implements AutoCloseable {
   }
 
   byte[] read(int position, int size) {
+    byte[] bytes = new byte[size];
+    read(position, bytes, 0, size);
+    return bytes;
+  }
+
+  /** Fills {@code size} bytes of the target from the given position of the blob. */
+  void read(int position, byte[] target, int targetOffset, int size) {
     Preconditions.checkArgument(
         position >= 0 && size >= 0 && position <= length - size,
         "Invalid IVF range (%s, %s) of %s in %s",
@@ -55,19 +62,17 @@ final class IvfRangeInput implements AutoCloseable {
         size,
         length,
         location);
-    byte[] bytes = new byte[size];
     long started = System.nanoTime();
     try {
       if (stream instanceof RangeReadable range) {
-        range.readFully(offset + position, bytes);
+        range.readFully(offset + position, target, targetOffset, size);
       } else {
         stream.seek(offset + position);
-        IOUtil.readFully(stream, bytes, 0, size);
+        IOUtil.readFully(stream, target, targetOffset, size);
       }
 
       bytesRead += size;
       requests++;
-      return bytes;
     } catch (IOException e) {
       throw new UncheckedIOException("Failed to read IVF range in " + location, e);
     } finally {

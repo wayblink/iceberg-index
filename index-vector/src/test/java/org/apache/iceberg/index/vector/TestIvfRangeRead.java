@@ -153,6 +153,47 @@ class TestIvfRangeRead {
   }
 
   @Test
+  void nearbyListsMergeIntoOneReadWhenTheGapIsWithinTheThreshold() {
+    int blockSize = 4 * 1024;
+    int listCount = 4;
+    byte[] payload = new byte[listCount * blockSize];
+    ByteBuffer buffer = ByteBuffer.wrap(payload);
+    int[] starts = new int[listCount];
+    for (int list = 0; list < listCount; list++) {
+      starts[list] = list * blockSize;
+      buffer.putInt(starts[list], list);
+    }
+
+    int[] selected = {0, 2};
+    CountingFile joined = new CountingFile(payload);
+    IvfRangeInput joinedInput =
+        new IvfRangeInput(joined.newStream(), 0, payload.length, joined.location());
+    try (IvfListRanges ranges = new IvfListRanges(joinedInput, starts, blockSize)) {
+      ranges.planInReadOrder(selected, null);
+      for (int list : selected) {
+        assertThat(ranges.read(list).readInt()).isEqualTo(list);
+      }
+
+      assertThat(joined.reads).as("the gap is read instead of a third request").isEqualTo(1);
+      assertThat(joined.bytes).isEqualTo(3L * blockSize);
+    }
+
+    // the default keeps the runs apart, so only the selected lists are read
+    CountingFile apart = new CountingFile(payload);
+    IvfRangeInput apartInput =
+        new IvfRangeInput(apart.newStream(), 0, payload.length, apart.location());
+    try (IvfListRanges ranges = new IvfListRanges(apartInput, starts)) {
+      ranges.planInReadOrder(selected, null);
+      for (int list : selected) {
+        assertThat(ranges.read(list).readInt()).isEqualTo(list);
+      }
+
+      assertThat(apart.reads).isEqualTo(2);
+      assertThat(apart.bytes).isEqualTo(2L * blockSize);
+    }
+  }
+
+  @Test
   void corruptDirectoryFailsBeforeAnyListIsRead() throws IOException {
     VectorIndexAdapter vector = adapter(VectorQuantizer.NONE, true);
     ByteBuffer payload = vector.encodeAuxiliaryPayload(entries(vector), 1);

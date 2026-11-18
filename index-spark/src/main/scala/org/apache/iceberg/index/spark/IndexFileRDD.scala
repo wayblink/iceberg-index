@@ -70,10 +70,14 @@ class IndexFileRDD(
  * A partition carries what its own task reads and nothing more. Handing every task the table's whole
  * scan task list would put the table's file list in each of them, which is the cost the fuse is
  * meant to remove: what a task needs is its index file and the files that file covers.
+ *
+ * The length is what the index manifest recorded for the file, or zero when it recorded none. It
+ * lets the task open the file without asking storage how long it is.
  */
 class IndexFileTask(
     val location: String,
     val entryCount: Long,
+    val fileLength: Long,
     val tasks: java.util.List[FileScanTask])
   extends Serializable
 

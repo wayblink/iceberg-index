@@ -90,8 +90,24 @@ public final class PuffinIndexFileContainer implements IndexFileContainer {
 
   @Override
   public List<IndexBlob> read(InputFile file) throws IOException {
+    return read(file, 0L);
+  }
+
+  /**
+   * Reads the blobs of a file whose length is already known.
+   *
+   * <p>The length is passed to the Puffin reader, so the reader does not ask the file for it: a
+   * known length is what keeps the open from probing storage for a size the index manifest already
+   * recorded.
+   */
+  public List<IndexBlob> read(InputFile file, long knownFileSize) throws IOException {
     Preconditions.checkNotNull(file, "Input file is null");
-    try (PuffinReader reader = Puffin.read(file).build()) {
+    Puffin.ReadBuilder builder = Puffin.read(file);
+    if (knownFileSize > 0) {
+      builder = builder.withFileSize(knownFileSize);
+    }
+
+    try (PuffinReader reader = builder.build()) {
       List<BlobMetadata> blobMetadata = reader.fileMetadata().blobs();
       List<IndexBlob> blobs = Lists.newArrayList();
       for (Pair<BlobMetadata, ByteBuffer> read : reader.readAll(blobMetadata)) {

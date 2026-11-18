@@ -349,6 +349,7 @@ public final class IvfKernel implements VectorKernel, RetainedBytes {
         recordStride(),
         isQuantized() ? quantizer.codeBytes() : 0,
         preparedBytes(loaded),
+        null,
         null);
   }
 
@@ -774,18 +775,40 @@ public final class IvfKernel implements VectorKernel, RetainedBytes {
         && payload.duplicate().getInt(payload.position()) == BLOCK_MAGIC;
   }
 
-  VectorIndexAdapter.RangeSearch prepareRange(IvfRangeInput input) {
+  /**
+   * What opening the file already cost when the kernel is asked to read the description region.
+   *
+   * <p>The container footer and the length probe are outside the kernel: they locate the payload.
+   * The description region is what this kernel reads first, and the lists are read while searching.
+   */
+  record OpenCosts(
+      long opens,
+      long lengthRequests,
+      long footerBytes,
+      long footerRequests,
+      long descriptionBytes,
+      long descriptionRequests) {
+
+    OpenCosts withDescription(long bytes, long requests) {
+      return new OpenCosts(opens, lengthRequests, footerBytes, footerRequests, bytes, requests);
+    }
+  }
+
+  VectorIndexAdapter.RangeSearch prepareRange(IvfRangeInput input, OpenCosts costs) {
     byte[] prefix = input.read(0, Math.min(input.length(), BLOCK_PREFIX_BYTES));
     if (!isBlocked(ByteBuffer.wrap(prefix))) {
       return null;
     }
 
+    // the bytes already read as the prefix are part of the description, so the rest is appended
+    // rather than the same range being read again
     int metadataEnd = readBlockPrefix(new VectorPayloadReader(prefix), input.length());
     VectorPayloadReader in =
-        new VectorPayloadReader(input.read(0, metadataEnd), BLOCK_PREFIX_BYTES);
+        new VectorPayloadReader(description(input, prefix, metadataEnd), BLOCK_PREFIX_BYTES);
     Metadata metadata = readMetadata(in, true);
     Directory directory = readDirectory(in, metadata, input.length());
     Preconditions.checkArgument(in.remaining() == 0, "Invalid IVF metadata end");
+    VectorIndexAdapter.RangeReadMetrics descriptionReads = input.metrics();
     Loaded loaded =
         new Loaded(
             null,
@@ -804,7 +827,18 @@ public final class IvfKernel implements VectorKernel, RetainedBytes {
         isQuantized() ? quantizer.codeBytes() : 0,
         0L,
         new RangeLists(
-            new IvfListRanges(input, directory.starts()), metadata.seed(), metadata.bits()));
+            new IvfListRanges(input, directory.starts()), metadata.seed(), metadata.bits()),
+        costs.withDescription(descriptionReads.bytes(), descriptionReads.requests()));
+  }
+
+  private static byte[] description(IvfRangeInput input, byte[] prefix, int metadataEnd) {
+    if (metadataEnd <= prefix.length) {
+      return Arrays.copyOf(prefix, metadataEnd);
+    }
+
+    byte[] description = Arrays.copyOf(prefix, metadataEnd);
+    input.read(prefix.length, description, prefix.length, metadataEnd - prefix.length);
+    return description;
   }
 
   private static int queryNprobe(ByteBuffer query, int dimension) {
@@ -831,6 +865,7 @@ public final class IvfKernel implements VectorKernel, RetainedBytes {
     private final long stride;
     private final int codeBytes;
     private final RangeLists ranges;
+    private final OpenCosts costs;
 
     private ListSearcher(
         Loaded loaded,
@@ -839,7 +874,8 @@ public final class IvfKernel implements VectorKernel, RetainedBytes {
         long stride,
         int codeBytes,
         long bytes,
-        RangeLists ranges) {
+        RangeLists ranges,
+        OpenCosts costs) {
       this.loaded = loaded;
       this.dimension = dimension;
       this.scoring = new VectorScoring(metric);
@@ -847,6 +883,7 @@ public final class IvfKernel implements VectorKernel, RetainedBytes {
       this.codeBytes = codeBytes;
       this.bytes = bytes;
       this.ranges = ranges;
+      this.costs = costs;
     }
 
     @Override
@@ -861,6 +898,27 @@ public final class IvfKernel implements VectorKernel, RetainedBytes {
       return ranges == null
           ? VectorIndexAdapter.RangeSearch.super.listReadMetrics()
           : ranges.lists().metrics();
+    }
+
+    @Override
+    public VectorIndexAdapter.OpenReadMetrics openReadMetrics() {
+      if (costs == null) {
+        return null;
+      }
+
+      VectorIndexAdapter.RangeReadMetrics lists =
+          ranges == null
+              ? VectorIndexAdapter.RangeSearch.super.listReadMetrics()
+              : ranges.lists().metrics();
+      return new VectorIndexAdapter.OpenReadMetrics(
+          costs.opens(),
+          costs.lengthRequests(),
+          costs.footerBytes(),
+          costs.footerRequests(),
+          costs.descriptionBytes(),
+          costs.descriptionRequests(),
+          lists.bytes(),
+          lists.requests());
     }
 
     private VectorPayloadReader readList(int list, boolean quantized) {

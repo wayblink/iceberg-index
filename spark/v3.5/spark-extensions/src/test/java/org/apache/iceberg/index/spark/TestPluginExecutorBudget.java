@@ -191,10 +191,20 @@ class TestPluginExecutorBudget {
 
     @Override
     public InputFile newInputFile(String path) {
+      countShardOpen(path);
+      return super.newInputFile(path);
+    }
+
+    @Override
+    public InputFile newInputFile(String path, long length) {
+      countShardOpen(path);
+      return super.newInputFile(path, length);
+    }
+
+    private static void countShardOpen(String path) {
       if (path.contains("/data/index-file-")) {
         OPENS.incrementAndGet();
       }
-      return super.newInputFile(path);
     }
   }
 
