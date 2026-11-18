@@ -96,7 +96,10 @@ private[spark] object VectorSearchCalls {
       indexArgument: String,
       queries: JList[Array[Float]],
       k: Int,
-      batch: Boolean): LogicalPlan = {
+      batch: Boolean,
+      nprobeArgument: String = null,
+      overSampleArgument: String = null,
+      filterModeArgument: String = null): LogicalPlan = {
     val copied = queries.asScala.map(query => query.toVector).toSeq
     // the output attributes are created once, here, so a copy the optimizer makes keeps the same
     // expression ids and the callers of the function still refer to them
@@ -110,7 +113,16 @@ private[spark] object VectorSearchCalls {
       org.apache.spark.sql.catalyst.expressions
         .AttributeReference(field.name, field.dataType, field.nullable, field.metadata)()
     }.toSeq
-    VectorSearchHitsRequest(tableName, column, indexArgument, copied, k, batch)(attributes)
+    VectorSearchHitsRequest(
+      tableName,
+      column,
+      indexArgument,
+      copied,
+      k,
+      batch,
+      nprobeArgument,
+      overSampleArgument,
+      filterModeArgument)(attributes)
   }
 
   /** Searches a request the caller already planned. */
@@ -162,6 +174,9 @@ private[spark] object VectorSearchCalls {
       queries,
       request.topK,
       request.batch,
-      "table")
+      "table",
+      request.nprobeArgument,
+      request.overSampleArgument,
+      request.filterModeArgument)
   }
 }

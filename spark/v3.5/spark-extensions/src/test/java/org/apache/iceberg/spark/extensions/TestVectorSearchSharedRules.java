@@ -184,6 +184,48 @@ class TestVectorSearchSharedRules {
   }
 
   @Test
+  void anIndexHitTableFunctionTakesTheSameQuerySettings() {
+    spark.sql("CREATE NAMESPACE IF NOT EXISTS local.db");
+    spark.sql(
+        "CREATE TABLE local.db.shared_hit_settings (id bigint, embedding array<double>) USING"
+            + " iceberg");
+    spark.sql(
+        "INSERT INTO local.db.shared_hit_settings SELECT id, array(CAST(id AS double),"
+            + " CAST(10 - id AS double)) FROM range(0, 10)");
+    spark.sql(
+        "CALL local.system.build_vector_index(table => 'db.shared_hit_settings',"
+            + " column => 'embedding', dimension => 2, metric => 'l2', structure => 'ivf',"
+            + " options => map('nlist', '2'))");
+    String call =
+        "SELECT * FROM vector_index_search('local.db.shared_hit_settings', 'embedding',"
+            + " array(1.0d, 0.0d), 2";
+
+    try {
+      spark.conf().set("spark.iceberg.index.vector.ivf.nprobe", "8");
+
+      // the call's own count is used, so an impossible one is refused even though the session has
+      // a usable one
+      assertThatThrownBy(() -> spark.sql(call + ", nprobe => 0)").collectAsList())
+          .hasStackTraceContaining("spark.iceberg.index.vector.ivf.nprobe");
+      assertThatThrownBy(() -> spark.sql(call + ", bogus => 1)"))
+          .isInstanceOf(org.apache.spark.sql.AnalysisException.class)
+          .hasMessageContaining("does not have an argument");
+      assertThatThrownBy(() -> spark.sql(call + ", 1)"))
+          .isInstanceOf(org.apache.spark.sql.AnalysisException.class)
+          .hasMessageContaining("only named options");
+
+      // the settings a call names are accepted, and the answer stays the same
+      assertThat(spark.sql(call + ")").collectAsList())
+          .hasSameSizeAs(
+              spark
+                  .sql(call + ", nprobe => 2, over_sample => 0, filter_mode => 'pre')")
+                  .collectAsList());
+    } finally {
+      spark.conf().unset("spark.iceberg.index.vector.ivf.nprobe");
+    }
+  }
+
+  @Test
   void aProbeCountTheCallNamesIsUsedInsteadOfTheSessionSetting() {
     spark.sql("CREATE NAMESPACE IF NOT EXISTS local.db");
     spark.sql(

@@ -901,7 +901,11 @@ private[spark] case class VectorSearchHitsRequest(
     indexArgument: String,
     queries: Seq[Seq[Float]],
     topK: Int,
-    batch: Boolean)(override val output: Seq[org.apache.spark.sql.catalyst.expressions.Attribute])
+    batch: Boolean,
+    nprobeArgument: String,
+    overSampleArgument: String,
+    filterModeArgument: String)(
+    override val output: Seq[org.apache.spark.sql.catalyst.expressions.Attribute])
     extends LeafNode {
 
   override protected def otherCopyArgs: Seq[AnyRef] = output :: Nil

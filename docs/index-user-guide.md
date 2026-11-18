@@ -196,6 +196,11 @@ DDL 必须给名字；`CALL` 在列上还没有索引时可以不命名。**`dim
 ```sql
 SELECT * FROM vector_index_search('local.db.docs', 'embedding', array(0.95d, 0.05d), 3);
 SELECT * FROM vector_index_search_batch('local.db.docs', 'embedding', array('0.95,0.05', '0.1,0.9'), 2);
+
+-- 位置参数之后可以写命名选项，三个函数共用同一套
+SELECT * FROM vector_index_search(
+  'local.db.docs', 'embedding', array(0.95d, 0.05d), 3,
+  nprobe => 32, over_sample => 10, filter_mode => 'pre');
 ```
 
 注意批查的 queries 是**字符串数组**，每个字符串是逗号分隔的数字，不是二维数组。
@@ -601,9 +606,9 @@ BM25 和向量索引共用 executor 的容量预算、LRU 和状态入口。用�
 
 | 函数 | 参数 | 返回 |
 |---|---|---|
-| `vector_search` | `table, query_vector, k, vector_column`（位置序） | 业务行 + `_distance` |
-| `vector_index_search` | `table, column, query(array\<double\>), k` | `data_file, pos, score, row` |
-| `vector_index_search_batch` | `table, column, queries(array\<string\>，逗号分隔), k` | 同上 + `query_id` |
+| `vector_search` | `table, query_vector, k, vector_column`（位置序）＋ `nprobe` / `over_sample` / `filter_mode` / `index` / `distance_type` / `columns` 命名选项 | 业务行 + `_distance` |
+| `vector_index_search` | `table, column, query(array\<double\>), k`（位置序）＋ 同一组命名选项 | `data_file, pos, score, row` |
+| `vector_index_search_batch` | `table, column, queries(array\<string\>，逗号分隔), k`（位置序）＋ 同一组命名选项 | 同上 + `query_id` |
 | `search` | `table, query, search_columns(array\<string\>，恰好 1 列), k` | 业务行 + `_score` |
 | `text_index_search` | `table, column, query(string), k` | `data_file, pos, score, row` |
 

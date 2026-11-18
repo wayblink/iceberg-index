@@ -423,7 +423,11 @@ object IndexTableFunctions {
   }
 
   private def vectorIndexSearch(args: Seq[Expression]): LogicalPlan = {
-    checkArity(args, SearchArgumentCount, VECTOR_INDEX_SEARCH, "(table, column, query, k)")
+    checkAtLeast(
+      args,
+      SearchArgumentCount,
+      VECTOR_INDEX_SEARCH,
+      "(table, column, query, k[, option => value])")
     val spark = SparkSession.active
     VectorIndexTypes.register()
     val tableName = stringArg(args, 0)
@@ -435,13 +439,27 @@ object IndexTableFunctions {
     // not while the plan is being built, and not while it is optimized
     val queries = new java.util.ArrayList[Array[Float]]()
     queries.add(query.map(_.toFloat))
+    val options = queryOptions(VECTOR_INDEX_SEARCH, args)
     // a table function has no parameter for the coverage mode, so it answers for the whole table:
     // the mode that can be short is the one a caller has to ask for by name
-    VectorSearchCalls.planOf(tableName, column, null, queries, topK, batch = false)
+    VectorSearchCalls.planOf(
+      tableName,
+      column,
+      options.index.orNull,
+      queries,
+      topK,
+      batch = false,
+      options.nprobe.map(value => Integer.toString(value)).orNull,
+      options.overSample.map(value => Integer.toString(value)).orNull,
+      options.filterMode.orNull)
   }
 
   private def vectorIndexSearchBatch(args: Seq[Expression]): LogicalPlan = {
-    checkArity(args, SearchArgumentCount, VECTOR_INDEX_SEARCH_BATCH, "(table, column, queries, k)")
+    checkAtLeast(
+      args,
+      SearchArgumentCount,
+      VECTOR_INDEX_SEARCH_BATCH,
+      "(table, column, queries, k[, option => value])")
     val spark = SparkSession.active
     VectorIndexTypes.register()
     val tableName = stringArg(args, 0)
@@ -451,8 +469,18 @@ object IndexTableFunctions {
 
     val vectors = new java.util.ArrayList[Array[Float]]()
     queries.foreach(query => vectors.add(IndexTableFunctions.parseVector(query)))
+    val options = queryOptions(VECTOR_INDEX_SEARCH_BATCH, args)
     // as with the single-query form, the function returns a request and never searches
-    VectorSearchCalls.planOf(tableName, column, null, vectors, topK, batch = true)
+    VectorSearchCalls.planOf(
+      tableName,
+      column,
+      options.index.orNull,
+      vectors,
+      topK,
+      batch = true,
+      options.nprobe.map(value => Integer.toString(value)).orNull,
+      options.overSample.map(value => Integer.toString(value)).orNull,
+      options.filterMode.orNull)
   }
 
   private def textIndexSearch(args: Seq[Expression]): LogicalPlan = {
@@ -487,6 +515,49 @@ object IndexTableFunctions {
   /** Parses a comma-separated list of numbers, the form the batch functions take. */
   def parseVector(text: String): Array[Float] = {
     text.split(",").filter(_.nonEmpty).map(_.trim.toFloat)
+  }
+
+  /** The query settings a call may name after its positional arguments. */
+  private case class QueryOptions(
+      nprobe: Option[Int],
+      overSample: Option[Int],
+      filterMode: Option[String],
+      index: Option[String])
+
+  /**
+   * Reads the named options a table function call wrote after its positional arguments.
+   *
+   * <p>Only named arguments are accepted there: a fifth positional value has no meaning the reader
+   * could agree on, so it is refused rather than guessed. An option the function does not know is
+   * refused for the same reason.
+   */
+  private def queryOptions(name: String, args: Seq[Expression]): QueryOptions = {
+    val extras = args.drop(SearchArgumentCount)
+    extras.foreach {
+      case _: NamedArgumentExpression => ()
+      case other =>
+        analysisError(s"$name takes only named options after its arguments, got $other")
+    }
+
+    val arguments = new TableFunctionArguments(name, extras, Seq.empty)
+    arguments.requireOnly(
+      required = Seq.empty,
+      optional = Seq("nprobe", "over_sample", "filter_mode", "index"))
+    QueryOptions(
+      arguments.int("nprobe"),
+      arguments.int("over_sample"),
+      arguments.stringOption("filter_mode"),
+      arguments.stringOption("index"))
+  }
+
+  private def checkAtLeast(
+      args: Seq[Expression],
+      expected: Int,
+      name: String,
+      signature: String): Unit = {
+    require(
+      args.length >= expected,
+      s"$name expects at least $expected arguments $signature, got ${args.length}")
   }
 
   private def checkArity(
