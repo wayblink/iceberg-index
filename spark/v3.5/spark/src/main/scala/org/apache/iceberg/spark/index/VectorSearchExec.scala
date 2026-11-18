@@ -139,6 +139,34 @@ private[spark] object VectorSearchExec {
     // source declared, so a log that reads one reads the other
     val stages = new DistributedIndexSearch.SearchStages(metrics.asJava)
 
+    // One query without a prefilter can be answered from the index's global hits: the distributed
+    // search fetches the per-file top-k of every index file, which is many more rows than the
+    // query's own window. The operator above this source re-scores and sorts exactly, so a global
+    // window is enough candidates for it; a postfilter is applied to the fetched rows as before.
+    if (queries.size == 1 && candidateFilter == null
+      && inputs.dataFiles.size > 64
+      && !java.lang.Boolean.getBoolean("iceberg.index.vector.refine")) {
+      val fetched = DistributedIndexSearch.searchRowsFromHits(
+        spark,
+        inputs.indexMetadata,
+        inputs.table,
+        IndexQuery
+          .of(inputs.indexSnapshot.sourceTableSnapshotId(), payloads.get(0), opening.initial)
+          .withConsistency(Consistency.AT_OR_BEFORE),
+        inputs.table.schema.select(readColumns.asJava),
+        fetchSchema,
+        names.size,
+        k,
+        opening.initial,
+        inputs.scanTasks,
+        rowFilter,
+        null,
+        if (prefilter) context.filterColumns.toList.asJava else java.util.Collections.emptyList(),
+        counters,
+        stages)
+      return spark.createDataFrame(fetched, readSchema).queryExecution.toRdd
+    }
+
     val rows =
       DistributedIndexSearch.searchWithRows(
         spark,

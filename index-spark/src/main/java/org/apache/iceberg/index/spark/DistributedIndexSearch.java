@@ -67,6 +67,7 @@ import org.apache.iceberg.relocated.com.google.common.base.Preconditions;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableList;
 import org.apache.iceberg.relocated.com.google.common.collect.Lists;
 import org.apache.iceberg.relocated.com.google.common.collect.Maps;
+import org.apache.iceberg.types.Types.NestedField;
 import org.apache.spark.api.java.JavaPairRDD;
 import org.apache.spark.api.java.JavaRDD;
 import org.apache.spark.api.java.JavaSparkContext;
@@ -642,6 +643,152 @@ public final class DistributedIndexSearch {
                   reportCache(cacheReports, queryRun);
                   return partitionRows.iterator();
                 });
+  }
+
+  /**
+   * Answers one query from the index's own global hits, without a task per index file.
+   *
+   * <p>The distributed search fetches rows in every task that owns an index file, so the rows a
+   * query reads are the per-file top-k of every file rather than the query's own top-k. When the
+   * caller has one query and no filter, the global search already returns the best hits of the
+   * whole index; this fetches only those hits' rows and returns their order. The win is the number
+   * of rows read: the query's window instead of the window of every index file.
+   */
+  public static List<Row> searchRowsFromHits(
+      SparkSession spark,
+      IndexMetadata metadata,
+      Table table,
+      IndexQuery query,
+      Schema projection,
+      StructType expected,
+      int keep,
+      int resultK,
+      int opening,
+      List<FileScanTask> scanTasks,
+      IndexRowFilter filter,
+      IndexRowFilter candidateFilter,
+      List<String> filterColumns,
+      RowCounters counters,
+      SearchStages stages) {
+    IndexAdapter adapter =
+        IndexTypes.fromType(metadata.indexType()).createAdapter(metadata.definition());
+    IndexSearchResult higher = IndexSearchResult.of("a", 0L, 1.0);
+    IndexSearchResult lower = IndexSearchResult.of("a", 0L, 0.0);
+    boolean higherScoreFirst = adapter.resultComparator().compare(higher, lower) < 0;
+    IndexEntries.SnapshotDeletes deletes =
+        IndexEntries.SnapshotDeletes.read(spark, table, scanTasks, table.schema());
+    RowReadPlan plan =
+        RowReadPlan.of(
+            projection,
+            expected,
+            deletes,
+            new SerializableConfiguration(spark.sessionState().newHadoopConf()),
+            filter,
+            candidateFilter,
+            filterColumns,
+            table.schema(),
+            keep);
+
+    // the source's operator re-scores and sorts exactly, so the window it gets can be wider than
+    // the answer; the window is the query's top-k times a small factor, not every index file's
+    int target = Math.max(resultK * 4, Math.max(opening, resultK + 1));
+    int window = target;
+    List<Row> rows = Lists.newArrayList();
+    for (int round = 0; round < MAX_ROUNDS && rows.size() < target; round++) {
+      IndexQuery widened =
+          IndexQuery.of(query.sourceTableSnapshotId(), query.payload(), window)
+              .withConsistency(query.consistency());
+      List<SearchOutcome> outcomes =
+          searchBatchWithOutcomes(spark, metadata, table, Lists.newArrayList(widened));
+      if (outcomes.isEmpty()) {
+        break;
+      }
+
+      SearchOutcome outcome = outcomes.get(0);
+      List<IndexSearchResult> hits = outcome.hits();
+      Map<String, List<Long>> positionsByFile = Maps.newLinkedHashMap();
+      for (IndexSearchResult hit : hits) {
+        positionsByFile
+            .computeIfAbsent(hit.dataFile(), key -> Lists.newArrayList())
+            .add(hit.rowPosition());
+      }
+
+      // the fetch-back is a distributed read, not a loop on the driver: the files the window hits
+      // are read in parallel, the same way a task reads the files it owns
+      long fetchStart = System.nanoTime();
+      List<String> columns = Lists.newArrayList();
+      for (NestedField field : projection.columns()) {
+        columns.add(field.name());
+      }
+
+      Map<String, Map<Long, Row>> rowsByFile =
+          IndexEntries.rowsAt(spark, table, positionsByFile, columns, expected, scanTasks);
+      long fetchNanos = System.nanoTime() - fetchStart;
+
+      Set<String> scanned = new HashSet<>();
+      for (FileScanTask task : scanTasks) {
+        scanned.add(task.file().location().toString());
+      }
+
+      List<FetchedRow> fetched = Lists.newArrayList();
+      int unresolved = 0;
+      int outside = 0;
+      Set<String> files = new HashSet<>();
+      for (IndexSearchResult hit : hits) {
+        Map<Long, Row> byPosition = rowsByFile.get(hit.dataFile());
+        Row row = byPosition == null ? null : byPosition.get(hit.rowPosition());
+        if (row == null) {
+          if (scanned.contains(hit.dataFile())) {
+            unresolved++;
+          } else {
+            outside++;
+          }
+        } else {
+          files.add(hit.dataFile());
+          fetched.add(new FetchedRow(hit.dataFile(), hit.rowPosition(), row, hit.score()));
+        }
+      }
+
+      if (counters != null) {
+        counters.report(
+            window,
+            hits.size(),
+            fetched.size(),
+            fetched.size(),
+            unresolved,
+            outside,
+            files.size(),
+            round + 1,
+            scanTasks.size(),
+            fetched.size() < target);
+      }
+      if (stages != null) {
+        Stages tally = new Stages();
+        tally.fetchBackNanos = fetchNanos;
+        tally.taskNanos = fetchNanos;
+        stages.report(tally);
+      }
+      fetched.sort(byScore(higherScoreFirst));
+      rows.clear();
+      for (FetchedRow row : fetched) {
+        if (!plan.admits(row.row)) {
+          continue;
+        }
+
+        rows.add(plan.narrow(row.row));
+        if (rows.size() >= target) {
+          break;
+        }
+      }
+
+      if (rows.size() >= target || !outcome.moreHits()) {
+        break;
+      }
+
+      window = Math.max(window * 2, window + 1);
+    }
+
+    return rows;
   }
 
   /** Every scan task a task may read, which is what the snapshot's deletes are read for. */

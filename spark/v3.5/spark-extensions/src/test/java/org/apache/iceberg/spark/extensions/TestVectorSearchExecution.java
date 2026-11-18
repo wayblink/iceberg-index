@@ -111,6 +111,84 @@ class TestVectorSearchExecution {
   }
 
   @Test
+  void aSingleQueryOverManyFilesFetchesTheGlobalWindow() throws Exception {
+    String table = "exec_global_fetch";
+    spark.sql("CREATE NAMESPACE IF NOT EXISTS local.db");
+    spark.sql(String.format("CREATE TABLE local.db.%s %s", table, COLUMNS));
+    for (int i = 0; i < 65; i++) {
+      spark.sql(
+          String.format(
+              "INSERT INTO local.db.%s VALUES (%d, array(%.2fd, 0.0d))",
+              table, i, 1.0d - i * 0.01d));
+    }
+    spark.sql(
+        String.format(
+            "CALL local.system.build_vector_index(table => 'db.%s', column => 'embedding', "
+                + "dimension => 2, structure => 'flat')",
+            table));
+
+    assertThat(dataFileCount(table)).isGreaterThan(64L);
+    List<Row> rows = spark.sql(nearest(table, 1)).collectAsList();
+    assertThat(rows).hasSize(1);
+    assertThat(rows.get(0).getLong(0)).isEqualTo(0L);
+  }
+
+  @Test
+  void aSingleQueryOverManyFilesResolvesDeletes() throws Exception {
+    String table = "exec_global_fetch_deletes";
+    spark.sql("CREATE NAMESPACE IF NOT EXISTS local.db");
+    spark.sql(
+        String.format(
+            "CREATE TABLE local.db.%s %s TBLPROPERTIES ('write.delete.mode' = 'merge-on-read')",
+            table, COLUMNS));
+    for (int i = 0; i < 65; i++) {
+      spark.sql(
+          String.format(
+              "INSERT INTO local.db.%s VALUES (%d, array(%.2fd, 0.0d))",
+              table, i, 1.0d - i * 0.01d));
+    }
+    spark.sql(
+        String.format(
+            "CALL local.system.build_vector_index(table => 'db.%s', column => 'embedding', "
+                + "dimension => 2, structure => 'flat')",
+            table));
+    spark.sql(String.format("DELETE FROM local.db.%s WHERE id = 0", table));
+
+    List<Row> rows = spark.sql(nearest(table, 1)).collectAsList();
+    assertThat(rows).hasSize(1);
+    assertThat(rows.get(0).getLong(0)).isEqualTo(1L);
+  }
+
+  @Test
+  void aSingleQueryOverManyFilesAppliesAPostfilter() throws Exception {
+    String table = "exec_global_fetch_filter";
+    spark.sql("CREATE NAMESPACE IF NOT EXISTS local.db");
+    spark.sql(String.format("CREATE TABLE local.db.%s %s", table, COLUMNS));
+    for (int i = 0; i < 65; i++) {
+      spark.sql(
+          String.format(
+              "INSERT INTO local.db.%s VALUES (%d, array(%.2fd, 0.0d))",
+              table, i, 1.0d - i * 0.01d));
+    }
+    spark.sql(
+        String.format(
+            "CALL local.system.build_vector_index(table => 'db.%s', column => 'embedding', "
+                + "dimension => 2, structure => 'flat')",
+            table));
+
+    List<Row> rows =
+        spark
+            .sql(
+                String.format(
+                    "SELECT id FROM local.db.%s WHERE id >= 32 "
+                        + "ORDER BY vec_distance(embedding, array(1.0d, 0.0d)) LIMIT 1",
+                    table))
+            .collectAsList();
+    assertThat(rows).hasSize(1);
+    assertThat(rows.get(0).getLong(0)).isEqualTo(32L);
+  }
+
+  @Test
   void sourceStatisticsDoNotApplyTheLimitBeforeOversampling() {
     String table = tableWithIndex("exec_stats_oversampled");
     long tableRows = spark.table("local.db." + table).count();
