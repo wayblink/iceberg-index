@@ -41,10 +41,27 @@ spare = budget(maxBytes) - wholeFileBytes - listBlockBytes
 - `index-spark`：`ExecutorIndexCache` 新增块 LRU 与预算记账、`listBlocks(config)` 视图；`DistributedIndexSearch.openSearch` 在 range 分支取视图并传入，`SearchStages` 上报四个指标。
 - 测试：`TestIvfRangeRead`（跨两次 `prepareRange` 共享块、无缓存时每次读）、`TestExecutorIndexCache`（保留/预算/逐出/关闭）、`TestVectorSearchExecution`（同一 SQL 跑两次，第二次 hits > 0 且 range 读字节下降；cache=off 时 hits/loads 为 0）。
 
+## 真机实测（2026-11-18，run oss32-blocks-1118-1945）
+
+同一个 range=on 查询连续跑 5 次（2 查询 × 2 次重复 + warmup，nprobe=8，cache 预算 22 GiB，33 tasks/次）：
+
+| 执行 | 顺序 | hits | misses | range 读字节 | 请求数 |
+|---|---|---|---|---|---|
+| 9 | 冷 | 0 | 259 | 558,911,130 | 391 |
+| 10 | 热 | 16 | 244 | 540,675,242 | 376 |
+| 11 | 热 | 72 | 187 | 462,594,274 | 319 |
+| 14 | 冷 | 0 | 260 | 572,229,946 | 392 |
+| 15 | 热 | 40 | 221 | 512,167,306 | 353 |
+
+**块缓存功能正确，但命中率只有 6–28%（热执行合计 16.4%，全轮 9.9%）**，range 读字节降 3–19%。原因不是缓存实现，而是调度：每个 task 处理一个索引文件，块缓存在 executor 本地，而第二次查询的同一文件 task 是否落回同一个 executor 由调度决定（12 个 executor、33 个文件，约 1/12 的概率），且不同查询选中的 list 只部分重叠。整文件缓存有 `IndexCacheLocations` 把 executor 持有的 key 上报给 driver 参与 locality；**块缓存没有接这条上报**，所以调度层看不见它。
+
+这与 #3120 的归因一致：range=on 时 index-read 只占 6–9%，块缓存最多省掉这一段的存储读。要让命中率接近理论上限，需要把块缓存内容接进 `IndexCacheLocations` 的 executor 上报与 task locality（独立工作量）；在那之前，本卡的收益是"可测但小"，优先级低于回表重写（#3122）。
+
 ## 已知边界与未做
 
 - 只有 range=on 的查询用块缓存；range=off 仍是整文件缓存，两者不互相迁移（不做整文件↔块的自动转换）。
 - `whole-list-area` 回退不填充（见上）。
 - 没有跨 executor 共享：每个 executor 各自缓存，与整文件缓存一致。
+- 没有接 `IndexCacheLocations` 的 locality 上报，这是命中率低的主因（见实测）。
 - 没有 single-flight 与预取（见上）。
-- 真机验收还没跑：需要 cache=on × range=on 连续两次查询的 benchmark 数据，确认命中率、`numBytesRead`/请求数下降与 p50 改善（卡 #3121 的验收条件）。
+- 真机验收已完成（命中率/字节/请求数有数据，p50 方向性改善），但卡里"7.8 s 压到 7 s 以下"的目标没有成立：本次 run 与那次不可比（资源/并发不同），且收益上限受 index-read 占比约束。
