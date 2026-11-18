@@ -74,8 +74,20 @@ case class RewriteVectorSearch(spark: SparkSession) extends Rule[LogicalPlan] {
 
   override def apply(plan: LogicalPlan): LogicalPlan = {
     plan.transformDown {
+      // a table function call left its settings here; they configure the search this rule lowers,
+      // so they are consumed with it and dropped when the plan keeps its scan
+      case options: VectorSearchOptions => lower(options.child, options.arguments)
       case limit @ GlobalLimit(rows, _) if !alreadyLowered(limit) =>
-        extract(limit, rows).getOrElse(limit)
+        extract(limit, rows, VectorSearchArguments.none).getOrElse(limit)
+      case limit: GlobalLimit => limit
+    }
+  }
+
+  /** Lowers the query under a call's settings, or leaves it as the scan it was. */
+  private def lower(plan: LogicalPlan, arguments: VectorSearchArguments): LogicalPlan = {
+    plan.transformDown {
+      case limit @ GlobalLimit(rows, _) if !alreadyLowered(limit) =>
+        extract(limit, rows, arguments).getOrElse(limit)
       case limit: GlobalLimit => limit
     }
   }
@@ -88,7 +100,10 @@ case class RewriteVectorSearch(spark: SparkSession) extends Rule[LogicalPlan] {
     }
   }
 
-  private def extract(limit: GlobalLimit, rows: Expression): Option[LogicalPlan] = {
+  private def extract(
+      limit: GlobalLimit,
+      rows: Expression,
+      arguments: VectorSearchArguments): Option[LogicalPlan] = {
     val sort = globalSort(limit).getOrElse(return None)
     val order = sort.order.head
     if (order.direction != Ascending) {
@@ -139,8 +154,11 @@ case class RewriteVectorSearch(spark: SparkSession) extends Rule[LogicalPlan] {
         k,
         snapshotId,
         contract,
-        null,
-        batch = false) match {
+        arguments.indexArgument,
+        batch = false,
+        arguments.nprobeArgument,
+        arguments.overSampleArgument,
+        arguments.filterModeArgument) match {
       case request =>
         BindVectorSearch.bind(spark, request) match {
           case BoundVectorSearch(context) =>

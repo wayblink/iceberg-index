@@ -206,8 +206,16 @@ SELECT id, title, _distance FROM vector_search(
   table => 'local.db.docs',
   query_vector => array(0.95d, 0.05d),
   vector_column => 'embedding',
-  k => 3);
+  k => 3,
+  -- 查询期参数，可选项：不写就跟随会话配置
+  nprobe => 32,
+  over_sample => 10,
+  filter_mode => 'pre');
 ```
+
+`nprobe` / `over_sample` / `filter_mode`（以及多索引时的 `index`）都是**逐语句**参数：优先级是
+**语句里写的 > 会话配置（`SET`）> 索引定义里记录的默认值**（这三项目前都不记录默认，所以
+实际是前两层）。写错值会直接报错，不会回退到会话值；`nprobe` 对非 IVF 索引不允许指定。
 
 `vector_search` 表函数的 `distance_type` 可以显式指定 `l2` / `cosine` / `dot`（早期的 `euclidean`、`dot_product` 等写法仍接受）；**不写它就跟随索引的 metric**（索引是 `l2`，返回的就是 L2 距离）；写了但与索引不一致时，改写会退让并做全表扫描，但**答案仍是你要的那个 metric 的精确值**。
 

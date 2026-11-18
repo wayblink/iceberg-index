@@ -315,6 +315,50 @@ class TestVectorSearchTableFunction {
   }
 
   /** Creates the table and builds a vector index over its embedding column. */
+  @Test
+  public void aCallCanNameTheQuerySettings() {
+    String table = "db.vs_call_settings";
+    spark.sql(String.format("CREATE TABLE local.%s %s", table, COLUMNS));
+    spark.sql(String.format("INSERT INTO local.%s VALUES %s", table, VECTORS));
+    spark.sql(
+        String.format(
+            "CALL local.system.build_vector_index(table => '%s', column => 'embedding',"
+                + " dimension => 2, structure => 'ivf', options => map('nlist', '2'))",
+            table));
+
+    try {
+      spark.conf().set("spark.iceberg.index.vector.ivf.nprobe", "8");
+      // the call's own count is what the query asked for, so an impossible one is refused even
+      // though the session names a usable one
+      assertThatThrownBy(
+              () ->
+                  spark
+                      .sql(
+                          String.format(
+                              "SELECT * FROM vector_search(table => 'local.%s',"
+                                  + " query_vector => array(1.0d, 0.0d),"
+                                  + " vector_column => 'embedding', k => 2, nprobe => 0)",
+                              table))
+                      .collectAsList())
+          .hasStackTraceContaining("spark.iceberg.index.vector.ivf.nprobe");
+
+      List<Row> hits =
+          spark
+              .sql(
+                  String.format(
+                      "SELECT id, _distance FROM vector_search(table => 'local.%s',"
+                          + " query_vector => array(1.0d, 0.0d),"
+                          + " vector_column => 'embedding', k => 2, nprobe => 2,"
+                          + " over_sample => 0, filter_mode => 'pre')",
+                      table))
+              .collectAsList();
+      assertThat(hits).hasSize(2);
+      assertThat(hits.get(0).getDouble(1)).isLessThan(hits.get(1).getDouble(1));
+    } finally {
+      spark.conf().unset("spark.iceberg.index.vector.ivf.nprobe");
+    }
+  }
+
   private static String tableWithIndex(String name, String mode) {
     String table = "db." + name;
     spark.sql(String.format("CREATE TABLE local.%s %s", table, COLUMNS));

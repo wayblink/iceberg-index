@@ -220,7 +220,18 @@ object IndexTableFunctions {
       Seq("table", "query_vector", "k", VECTOR_COLUMN))
     arguments.requireOnly(
       required = Seq("table", "query_vector"),
-      optional = Seq("k", "num_results", "limit", VECTOR_COLUMN, "distance_type", "columns"))
+      optional = Seq(
+        "k",
+        "num_results",
+        "limit",
+        VECTOR_COLUMN,
+        "distance_type",
+        "columns",
+        // the query settings: a call may name them, and then they win over the session's
+        "nprobe",
+        "over_sample",
+        "filter_mode",
+        "index"))
 
     val tableName = arguments.string("table")
     val query = arguments.expression("query_vector")
@@ -235,6 +246,10 @@ object IndexTableFunctions {
     // the ordering and the returned distance stay the same measurement either way
     val named = arguments.metric("distance_type")
     val columns = arguments.strings("columns")
+    val nprobe = arguments.int("nprobe")
+    val overSample = arguments.int("over_sample")
+    val filterMode = arguments.stringOption("filter_mode")
+    val index = arguments.stringOption("index")
 
     Preconditions.checkArgument(
       k > 0,
@@ -285,7 +300,13 @@ object IndexTableFunctions {
         Seq(SortOrder(computed.output.last, Ascending, NullsFirst, Seq.empty)),
         global = true,
         computed)
-    GlobalLimit(Literal(k), ordered)
+    VectorSearchOptions(
+      VectorSearchArguments(
+        nprobe.map(value => Integer.toString(value)).orNull,
+        overSample.map(value => Integer.toString(value)).orNull,
+        filterMode.orNull,
+        index.orNull),
+      GlobalLimit(Literal(k), ordered))
   }
 
   /** The named and positional arguments of a table function, refusing what it does not know. */
