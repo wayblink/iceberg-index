@@ -23,6 +23,7 @@ import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.TreeMap;
 import org.apache.iceberg.index.vector.VectorIndexAdapter.RangeReadMetrics;
+import org.apache.iceberg.relocated.com.google.common.base.Preconditions;
 
 /** Selects and retains byte ranges for the lifetime of one index-file search task. */
 final class IvfListRanges implements AutoCloseable {
@@ -56,6 +57,7 @@ final class IvfListRanges implements AutoCloseable {
   }
 
   IvfListRanges(IvfRangeInput input, int[] starts, int mergeGapBytes) {
+    Preconditions.checkArgument(mergeGapBytes >= 0, "Invalid merge gap: %s", mergeGapBytes);
     this.input = input;
     this.starts = starts;
     this.mergeGapBytes = mergeGapBytes;

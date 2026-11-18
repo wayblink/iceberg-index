@@ -832,10 +832,8 @@ public final class IvfKernel implements VectorKernel, RetainedBytes {
   }
 
   private static byte[] description(IvfRangeInput input, byte[] prefix, int metadataEnd) {
-    if (metadataEnd <= prefix.length) {
-      return Arrays.copyOf(prefix, metadataEnd);
-    }
-
+    // readBlockPrefix has already rejected a description that is not longer than the prefix, so
+    // the rest of the description is always read rather than re-reading the prefix
     byte[] description = Arrays.copyOf(prefix, metadataEnd);
     input.read(prefix.length, description, prefix.length, metadataEnd - prefix.length);
     return description;
