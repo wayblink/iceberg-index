@@ -57,9 +57,26 @@ class VectorSearchProcedure extends BaseProcedure {
   private static final ProcedureParameter COVERAGE_PARAM =
       optionalInParameter("coverage", DataTypes.StringType);
 
+  private static final ProcedureParameter NPROBE_PARAM =
+      optionalInParameter("nprobe", DataTypes.IntegerType);
+
+  private static final ProcedureParameter OVER_SAMPLE_PARAM =
+      optionalInParameter("over_sample", DataTypes.IntegerType);
+
+  private static final ProcedureParameter FILTER_MODE_PARAM =
+      optionalInParameter("filter_mode", DataTypes.StringType);
+
   private static final ProcedureParameter[] PARAMETERS =
       new ProcedureParameter[] {
-        TABLE_PARAM, COLUMN_PARAM, QUERY_PARAM, K_PARAM, INDEX_PARAM, COVERAGE_PARAM
+        TABLE_PARAM,
+        COLUMN_PARAM,
+        QUERY_PARAM,
+        K_PARAM,
+        INDEX_PARAM,
+        COVERAGE_PARAM,
+        NPROBE_PARAM,
+        OVER_SAMPLE_PARAM,
+        FILTER_MODE_PARAM
       };
 
   private static final StructType OUTPUT_TYPE =
@@ -115,6 +132,15 @@ class VectorSearchProcedure extends BaseProcedure {
           String indexArgument = input.isProvided(INDEX_PARAM) ? input.asString(INDEX_PARAM) : null;
           String coverage =
               input.isProvided(COVERAGE_PARAM) ? input.asString(COVERAGE_PARAM) : "table";
+          // a value the call names is the query's own question and wins over the session
+          String nprobeArgument =
+              input.isProvided(NPROBE_PARAM) ? Integer.toString(input.asInt(NPROBE_PARAM)) : null;
+          String overSampleArgument =
+              input.isProvided(OVER_SAMPLE_PARAM)
+                  ? Integer.toString(input.asInt(OVER_SAMPLE_PARAM))
+                  : null;
+          String filterModeArgument =
+              input.isProvided(FILTER_MODE_PARAM) ? input.asString(FILTER_MODE_PARAM) : null;
           org.apache.iceberg.spark.index.VectorSearchHitsPlan plan =
               org.apache.iceberg.spark.index.VectorSearchCalls.plan(
                   spark(),
@@ -124,7 +150,10 @@ class VectorSearchProcedure extends BaseProcedure {
                   List.of(toFloats(queryDoubles)),
                   topK,
                   false,
-                  coverage);
+                  coverage,
+                  nprobeArgument,
+                  overSampleArgument,
+                  filterModeArgument);
           List<org.apache.spark.sql.Row> hits =
               org.apache.iceberg.spark.index.VectorSearchCalls.search(plan, spark());
 

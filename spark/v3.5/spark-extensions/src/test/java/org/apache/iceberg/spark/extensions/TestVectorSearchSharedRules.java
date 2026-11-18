@@ -184,6 +184,46 @@ class TestVectorSearchSharedRules {
   }
 
   @Test
+  void aProbeCountTheCallNamesIsUsedInsteadOfTheSessionSetting() {
+    spark.sql("CREATE NAMESPACE IF NOT EXISTS local.db");
+    spark.sql(
+        "CREATE TABLE local.db.shared_call_nprobe (id bigint, embedding array<double>) USING"
+            + " iceberg");
+    spark.sql(
+        "INSERT INTO local.db.shared_call_nprobe SELECT id, array(CAST(id AS double),"
+            + " CAST(10 - id AS double)) FROM range(0, 10)");
+    spark.sql(
+        "CALL local.system.build_vector_index(table => 'db.shared_call_nprobe',"
+            + " column => 'embedding', dimension => 2, metric => 'l2', structure => 'ivf',"
+            + " options => map('nlist', '2'))");
+    String call =
+        "CALL local.system.vector_search(table => 'db.shared_call_nprobe', column => 'embedding',"
+            + " query => array(1.0d, 0.0d), k => 2";
+    try {
+      spark.conf().set("spark.iceberg.index.vector.ivf.nprobe", "8");
+
+      // the call's own count is what the query asked for, so an impossible one is refused even
+      // though the session names a usable one
+      assertThatThrownBy(() -> spark.sql(call + ", nprobe => 0)"))
+          .hasMessageContaining("spark.iceberg.index.vector.ivf.nprobe");
+      assertThatThrownBy(() -> spark.sql(call + ", filter_mode => 'sometimes')"))
+          .hasMessageContaining("spark.iceberg.index.vector.filter-mode");
+      assertThatThrownBy(() -> spark.sql(call + ", over_sample => -1)"))
+          .hasMessageContaining("spark.iceberg.index.vector.over-sample");
+
+      // a count the call names is accepted while the session disagrees
+      assertThat(spark.sql(call + ", nprobe => 1)").collectAsList()).isNotEmpty();
+      assertThat(
+              spark
+                  .sql(call + ", nprobe => 2, over_sample => 0, filter_mode => 'pre')")
+                  .collectAsList())
+          .isNotEmpty();
+    } finally {
+      spark.conf().unset("spark.iceberg.index.vector.ivf.nprobe");
+    }
+  }
+
+  @Test
   void theIndexHitsContractKeepsItsRawScoresAndNullableRows() throws Exception {
     Table table = tableWithIndex("shared_hits");
     List<Row> hits =

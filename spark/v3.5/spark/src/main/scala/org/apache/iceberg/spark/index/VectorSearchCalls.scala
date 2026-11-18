@@ -45,7 +45,21 @@ private[spark] object VectorSearchCalls {
       queries: JList[Array[Float]],
       k: Int,
       batch: Boolean,
-      coverage: String): VectorSearchHitsPlan = {
+      coverage: String): VectorSearchHitsPlan =
+    plan(spark, table, column, indexArgument, queries, k, batch, coverage, null, null, null)
+
+  def plan(
+      spark: SparkSession,
+      table: Table,
+      column: String,
+      indexArgument: String,
+      queries: JList[Array[Float]],
+      k: Int,
+      batch: Boolean,
+      coverage: String,
+      nprobeArgument: String,
+      overSampleArgument: String,
+      filterModeArgument: String): VectorSearchHitsPlan = {
     VectorSearchBridge.plan(
       spark,
       table,
@@ -54,7 +68,10 @@ private[spark] object VectorSearchCalls {
       queries,
       k,
       batch,
-      coverage) match {
+      coverage,
+      nprobeArgument,
+      overSampleArgument,
+      filterModeArgument) match {
       case BoundVectorSearch(context) => VectorSearchHitsPlan(context, batch)
       case NoApplicableVectorIndex =>
         throw new IllegalArgumentException(
@@ -109,8 +126,24 @@ private[spark] object VectorSearchCalls {
       queries: JList[Array[Float]],
       k: Int,
       batch: Boolean,
-      coverage: String): JList[Row] =
-    search(plan(spark, table, column, indexArgument, queries, k, batch, coverage), spark)
+      coverage: String,
+      nprobeArgument: String = null,
+      overSampleArgument: String = null,
+      filterModeArgument: String = null): JList[Row] =
+    search(
+      plan(
+        spark,
+        table,
+        column,
+        indexArgument,
+        queries,
+        k,
+        batch,
+        coverage,
+        nprobeArgument,
+        overSampleArgument,
+        filterModeArgument),
+      spark)
 
   /**
    * Loads the table of a request and searches it; the table function's execution path.

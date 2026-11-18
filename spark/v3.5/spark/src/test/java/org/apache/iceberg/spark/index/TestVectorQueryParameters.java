@@ -59,6 +59,58 @@ class TestVectorQueryParameters {
   }
 
   @Test
+  void aProbeCountTheCallNamesWinsOverTheSession() {
+    RawVectorParameters raw =
+        VectorQueryParameters.capture(
+            Map.of(VectorQueryParameters.NprobeConf(), "8"), Map.of(), null, "64", null, null);
+
+    ResolvedVectorParameters chosen = VectorQueryParameters.decide(raw, FLAT);
+    assertThat(chosen.nprobe())
+        .as("the call asked for 64 and the session was only the default")
+        .isEqualTo(64L);
+    assertThat(chosen.nprobeOrigin()).isEqualTo("CALL_ARGUMENT");
+    assertThat(chosen.nprobeLocked()).isTrue();
+    assertThat(chosen.nprobeShadowedOrigin())
+        .as("the layer the call overrode is still reported")
+        .isEqualTo("SESSION_CONF");
+  }
+
+  @Test
+  void aProbeCountThatIsNotPositiveIsRefused() {
+    for (String bad : new String[] {"0", "-1", "many", " "}) {
+      RawVectorParameters raw =
+          VectorQueryParameters.capture(Map.of(), Map.of(), null, bad, null, null);
+      assertThatThrownBy(() -> VectorQueryParameters.decide(raw, FLAT))
+          .as("%s is refused rather than answered with another probe count", bad)
+          .isInstanceOf(IllegalArgumentException.class)
+          .hasMessageContaining(VectorQueryParameters.NprobeConf());
+    }
+  }
+
+  @Test
+  void theOtherKnobsCanComeFromTheCallToo() {
+    RawVectorParameters raw =
+        VectorQueryParameters.capture(
+            Map.of(VectorQueryParameters.OverSampleConf(), "5"), Map.of(), null, null, "0", "post");
+
+    ResolvedVectorParameters chosen = VectorQueryParameters.decide(raw, FLAT);
+    assertThat(chosen.overSample()).isZero();
+    assertThat(chosen.overSampleOrigin()).isEqualTo("CALL_ARGUMENT");
+    assertThat(chosen.overSampleShadowedOrigin()).isEqualTo("SESSION_CONF");
+    assertThat(chosen.filterMode()).isEqualTo(VectorQueryParameters.FilterModePost());
+    assertThat(chosen.filterModeOrigin()).isEqualTo("CALL_ARGUMENT");
+  }
+
+  @Test
+  void aCallValueThatIsNotANumberIsRefused() {
+    RawVectorParameters raw =
+        VectorQueryParameters.capture(Map.of(), Map.of(), null, null, "two", null);
+    assertThatThrownBy(() -> VectorQueryParameters.decide(raw, FLAT))
+        .isInstanceOf(IllegalArgumentException.class)
+        .hasMessageContaining(VectorQueryParameters.OverSampleConf());
+  }
+
+  @Test
   void theFilterLinkDefaultsToTheOneThatKeepsEveryRow() {
     ResolvedVectorParameters chosen =
         VectorQueryParameters.decide(VectorQueryParameters.capture(Map.of(), Map.of(), null), FLAT);

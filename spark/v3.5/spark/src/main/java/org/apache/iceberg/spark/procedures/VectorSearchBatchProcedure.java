@@ -77,6 +77,12 @@ class VectorSearchBatchProcedure extends BaseProcedure {
       optionalInParameter("query_id_column", DataTypes.StringType);
   private static final ProcedureParameter VECTOR_COLUMN_PARAM =
       optionalInParameter("vector_column", DataTypes.StringType);
+  private static final ProcedureParameter NPROBE_PARAM =
+      optionalInParameter("nprobe", DataTypes.IntegerType);
+  private static final ProcedureParameter OVER_SAMPLE_PARAM =
+      optionalInParameter("over_sample", DataTypes.IntegerType);
+  private static final ProcedureParameter FILTER_MODE_PARAM =
+      optionalInParameter("filter_mode", DataTypes.StringType);
   private static final ProcedureParameter[] PARAMETERS =
       new ProcedureParameter[] {
         // required parameters first: Spark rejects an optional one before a required one
@@ -88,7 +94,10 @@ class VectorSearchBatchProcedure extends BaseProcedure {
         QUERY_ID_COLUMN_PARAM,
         VECTOR_COLUMN_PARAM,
         INDEX_PARAM,
-        COVERAGE_PARAM
+        COVERAGE_PARAM,
+        NPROBE_PARAM,
+        OVER_SAMPLE_PARAM,
+        FILTER_MODE_PARAM
       };
 
   private static final StructType OUTPUT_TYPE =
@@ -146,9 +155,28 @@ class VectorSearchBatchProcedure extends BaseProcedure {
           String indexArgument = input.isProvided(INDEX_PARAM) ? input.asString(INDEX_PARAM) : null;
           String coverage =
               input.isProvided(COVERAGE_PARAM) ? input.asString(COVERAGE_PARAM) : "table";
+          // a value the call names is the query's own question and wins over the session
+          String nprobeArgument =
+              input.isProvided(NPROBE_PARAM) ? Integer.toString(input.asInt(NPROBE_PARAM)) : null;
+          String overSampleArgument =
+              input.isProvided(OVER_SAMPLE_PARAM)
+                  ? Integer.toString(input.asInt(OVER_SAMPLE_PARAM))
+                  : null;
+          String filterModeArgument =
+              input.isProvided(FILTER_MODE_PARAM) ? input.asString(FILTER_MODE_PARAM) : null;
           org.apache.iceberg.spark.index.VectorSearchHitsPlan plan =
               org.apache.iceberg.spark.index.VectorSearchCalls.plan(
-                  spark(), table, column, indexArgument, queryVectors, topK, true, coverage);
+                  spark(),
+                  table,
+                  column,
+                  indexArgument,
+                  queryVectors,
+                  topK,
+                  true,
+                  coverage,
+                  nprobeArgument,
+                  overSampleArgument,
+                  filterModeArgument);
           List<Row> hits = org.apache.iceberg.spark.index.VectorSearchCalls.search(plan, spark());
 
           List<InternalRow> rows = Lists.newArrayListWithCapacity(hits.size());

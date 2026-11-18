@@ -62,12 +62,20 @@ private[spark] object BindVectorSearch {
     val keys = Set(
       VectorQueryParameters.OverSampleConf,
       VectorQueryParameters.IndexNameConf,
-      VectorQueryParameters.FilterModeConf)
+      VectorQueryParameters.FilterModeConf,
+      VectorQueryParameters.NprobeConf)
     val session = spark.conf.getAll.filter { case (key, _) => keys.contains(key) }.asJava
     val submit = spark.sparkContext.getConf.getAll.toMap.filter { case (key, _) =>
       keys.contains(key)
     }.asJava
-    val raw = VectorQueryParameters.capture(session, submit, input.indexArgument)
+    val raw =
+      VectorQueryParameters.capture(
+        session,
+        submit,
+        input.indexArgument,
+        input.nprobeArgument,
+        input.overSampleArgument,
+        input.filterModeArgument)
     val metadata = if (raw.indexName != null) {
       require(
         raw.indexName.value != null && raw.indexName.value.trim.nonEmpty,

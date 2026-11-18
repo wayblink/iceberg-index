@@ -48,14 +48,47 @@ import org.apache.spark.sql.types.StructType;
  */
 public final class VectorIndexSearch {
 
-  private static final String IVF_NPROBE = "spark.iceberg.index.vector.ivf.nprobe";
+  /** The session setting a query uses when it names no probe count of its own. */
+  public static final String IVF_NPROBE = "spark.iceberg.index.vector.ivf.nprobe";
 
   /** Encodes the query with the session's probe count when configured for an IVF index. */
   public static ByteBuffer encodeQuery(
       SparkSession spark, VectorIndexAdapter adapter, float[] query) {
+    return encodeQuery(spark, adapter, query, null);
+  }
+
+  /**
+   * Encodes the query with an explicit probe count, or with the session's when the caller names
+   * none.
+   *
+   * <p>A probe count that comes with the call is what the query asked for, so it is not read from
+   * the session: the explicit value wins and the session setting is only the default. A count for a
+   * structure that does not probe lists is refused rather than ignored.
+   *
+   * @param spark the session the default is read from
+   * @param adapter the index the query is for
+   * @param query the vector
+   * @param nprobe the probe count the call named, or null to use the session's
+   */
+  public static ByteBuffer encodeQuery(
+      SparkSession spark, VectorIndexAdapter adapter, float[] query, Integer explicitNprobe) {
     VectorIndexDefinition definition = (VectorIndexDefinition) adapter.definition();
     if (definition.structure() != VectorIndexDefinition.VectorStructure.IVF) {
+      if (explicitNprobe != null) {
+        throw new IllegalArgumentException(
+            "A probe count applies to an IVF index only, but the index is "
+                + definition.structure());
+      }
+
       return adapter.encodeQuery(query);
+    }
+
+    if (explicitNprobe != null) {
+      if (explicitNprobe <= 0) {
+        throw new IllegalArgumentException("Invalid probe count: " + explicitNprobe);
+      }
+
+      return adapter.encodeQuery(query, explicitNprobe);
     }
 
     String configured =

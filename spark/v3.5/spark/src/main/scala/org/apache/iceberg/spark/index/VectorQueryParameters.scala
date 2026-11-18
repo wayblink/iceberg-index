@@ -30,7 +30,8 @@ private[spark] case class VectorParameter(
 private[spark] case class RawVectorParameters(
     overSample: VectorParameter,
     indexName: VectorParameter,
-    filterMode: VectorParameter)
+    filterMode: VectorParameter,
+    nprobe: VectorParameter)
 
 private[spark] case class ResolvedVectorParameters(
     overSample: Long,
@@ -40,7 +41,11 @@ private[spark] case class ResolvedVectorParameters(
     overSampleReason: String,
     indexName: VectorParameter,
     filterMode: String = VectorQueryParameters.DefaultFilterMode,
-    filterModeOrigin: String = "DEFAULT")
+    filterModeOrigin: String = "DEFAULT",
+    nprobe: Long = 0L,
+    nprobeOrigin: String = "DEFAULT",
+    nprobeLocked: Boolean = false,
+    nprobeShadowedOrigin: String = null)
 
 private[spark] object VectorQueryParameters {
   val OverSampleConf = "spark.iceberg.index.vector.over-sample"
@@ -55,6 +60,14 @@ private[spark] object VectorQueryParameters {
    * it always was, not the way a threshold guessed.
    */
   val FilterModeConf = "spark.iceberg.index.vector.filter-mode"
+
+  /**
+   * The probe count a query uses when it names none.
+   *
+   * <p>It is read from the same setting the encoder reads, so a count the session sets and a count
+   * the call passes cannot disagree about which one is in force.
+   */
+  val NprobeConf: String = org.apache.iceberg.index.spark.VectorIndexSearch.IVF_NPROBE
 
   /** Read the filter's rows first and let the search skip the rest. */
   val FilterModePre = "pre"
@@ -74,25 +87,47 @@ private[spark] object VectorQueryParameters {
   def capture(
       session: JMap[String, String],
       submit: JMap[String, String],
-      indexArgument: String): RawVectorParameters = {
+      indexArgument: String): RawVectorParameters =
+    capture(session, submit, indexArgument, null, null, null)
+
+  def capture(
+      session: JMap[String, String],
+      submit: JMap[String, String],
+      indexArgument: String,
+      nprobeArgument: String,
+      overSampleArgument: String = null,
+      filterModeArgument: String = null): RawVectorParameters = {
     require(session != null, "Session configuration cannot be null")
     require(submit != null, "Submit configuration cannot be null")
-    val overSample = configured(session, submit, OverSampleConf)
-    val configuredIndex = configured(session, submit, IndexNameConf)
-    val filterMode = configured(session, submit, FilterModeConf)
-    val index = if (indexArgument == null) {
-      configuredIndex
+    val overSample = argued(overSampleArgument, configured(session, submit, OverSampleConf))
+    val index = argued(indexArgument, configured(session, submit, IndexNameConf))
+    val filterMode = argued(filterModeArgument, configured(session, submit, FilterModeConf))
+    val nprobe = argued(nprobeArgument, configured(session, submit, NprobeConf))
+    RawVectorParameters(overSample, index, filterMode, nprobe)
+  }
+
+  /**
+   * The value the call named, or the configured one it did not.
+   *
+   * <p>A call's argument is the query's own question, so it wins over the session and names what it
+   * shadowed; the configured value is still reported so a log can say which layer answered.
+   */
+  private def argued(argument: String, configured: VectorParameter): VectorParameter = {
+    if (argument == null) {
+      configured
     } else {
-      val shadowed = if (configuredIndex == null) {
-        null
-      } else if (configuredIndex.shadowedOrigin == null) {
-        configuredIndex.origin
-      } else {
-        s"${configuredIndex.origin},${configuredIndex.shadowedOrigin}"
-      }
-      VectorParameter(indexArgument, "CALL_ARGUMENT", true, shadowed)
+      VectorParameter(argument, "CALL_ARGUMENT", true, shadowedBy(configured))
     }
-    RawVectorParameters(overSample, index, filterMode)
+  }
+
+  private def shadowedBy(configured: VectorParameter): String = {
+    if (configured == null) {
+      null
+    } else if (configured.shadowedOrigin == null) {
+      configured.origin
+    } else {
+      s"${configured.origin},${configured.shadowedOrigin}"
+    }
   }
 
   def decide(
@@ -110,8 +145,21 @@ private[spark] object VectorQueryParameters {
       raw.indexName.copy(value = raw.indexName.value.trim)
     }
     val mode = filterModeOf(raw.filterMode)
+    val probes = nprobeOf(raw.nprobe)
     if (parameter == null) {
-      ResolvedVectorParameters(0L, "DEFAULT", false, null, null, index, mode._1, mode._2)
+      ResolvedVectorParameters(
+        0L,
+        "DEFAULT",
+        false,
+        null,
+        null,
+        index,
+        mode._1,
+        mode._2,
+        probes._1,
+        probes._2,
+        probes._3,
+        probes._4)
     } else {
       val message =
         s"Invalid $OverSampleConf: '${parameter.value}'; expected a non-negative integer"
@@ -131,7 +179,11 @@ private[spark] object VectorQueryParameters {
         null,
         index,
         mode._1,
-        mode._2)
+        mode._2,
+        probes._1,
+        probes._2,
+        probes._3,
+        probes._4)
     }
   }
 
@@ -154,6 +206,29 @@ private[spark] object VectorQueryParameters {
       valid.contains(value),
       s"Invalid $FilterModeConf: '${parameter.value}'; expected one of pre, post")
     (value, parameter.origin)
+  }
+
+  /**
+   * The probe count the query asks for, or zero when it asks for the encoder's default.
+   *
+   * <p>A count that is not a positive integer fails the query: probing a different number of lists
+   * than the caller asked for would answer a different question.
+   */
+  private def nprobeOf(parameter: VectorParameter): (Long, String, Boolean, String) = {
+    if (parameter == null) {
+      return (0L, "DEFAULT", false, null)
+    }
+
+    val message = s"Invalid $NprobeConf: '${parameter.value}'; expected a positive integer"
+    require(parameter.value != null, message)
+    val value =
+      try {
+        JLong.parseLong(parameter.value.trim)
+      } catch {
+        case cause: NumberFormatException => throw new IllegalArgumentException(message, cause)
+      }
+    require(value > 0L, message)
+    (value, parameter.origin, parameter.locked, parameter.shadowedOrigin)
   }
 
   private def configured(

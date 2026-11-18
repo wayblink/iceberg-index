@@ -136,6 +136,21 @@ private[spark] object VectorSearchBridge {
    * <p>Estimates the broadcast, driver and shuffle costs of a block. At least one query is
    * processed at a time, even if its estimated cost exceeds one of the budgets.
    */
+  /**
+   * The probe count the call resolved, or null when it named none and the encoder reads the
+   * session's.
+   *
+   * <p>The parameters are decided once per call, so the encoding of every query of the call uses
+   * the same count. A query planned by the rewrite names none, so it keeps the session's setting.
+   */
+  private def nprobeOf(context: VectorSearchContext): Integer = {
+    if (context.parameters == null || context.parameters.nprobe <= 0L) {
+      null
+    } else {
+      Integer.valueOf(context.parameters.nprobe.toInt)
+    }
+  }
+
   private def queriesPerBlock(context: VectorSearchContext): Int = {
     val configured = System.getProperty(QueriesPerBlockProperty, null)
     if (configured != null && configured.trim.nonEmpty) {
@@ -216,7 +231,21 @@ private[spark] object VectorSearchBridge {
       queries: JList[Array[Float]],
       k: Int,
       batch: Boolean,
-      coverage: String): VectorBindingResult = {
+      coverage: String): VectorBindingResult =
+    plan(spark, table, column, indexArgument, queries, k, batch, coverage, null, null, null)
+
+  def plan(
+      spark: SparkSession,
+      table: org.apache.iceberg.Table,
+      column: String,
+      indexArgument: String,
+      queries: JList[Array[Float]],
+      k: Int,
+      batch: Boolean,
+      coverage: String,
+      nprobeArgument: String,
+      overSampleArgument: String = null,
+      filterModeArgument: String = null): VectorBindingResult = {
     val contract = VectorResultContract.forCoverage(coverage)
     val request = VectorSearchRequest.forTable(
       table,
@@ -228,7 +257,10 @@ private[spark] object VectorSearchBridge {
       null,
       contract.name,
       indexArgument,
-      batch)
+      batch,
+      nprobeArgument,
+      overSampleArgument,
+      filterModeArgument)
     BindVectorSearch.bind(spark, request) match {
       case BoundVectorSearch(context) =>
         // a request that asks for nothing is answered with nothing: its parameters are not judged
@@ -300,7 +332,9 @@ private[spark] object VectorSearchBridge {
     val inputs = context.inputs
     val adapter = new VectorIndexAdapter(inputs.definition)
     val payloads =
-      block.map { case (_, query) => VectorIndexSearch.encodeQuery(spark, adapter, query) }
+      block.map { case (_, query) =>
+        VectorIndexSearch.encodeQuery(spark, adapter, query, nprobeOf(context))
+      }
 
     val hitsPerQuery = hitsForBlock(spark, context, block, payloads)
     val json = resolveRows(spark, context, hitsPerQuery.flatten)
@@ -450,7 +484,7 @@ private[spark] object VectorSearchBridge {
     val vectorIndex = names.indexOf(request.column)
     val adapter = new VectorIndexAdapter(inputs.definition)
     val payloads = block.map { case (_, query) =>
-      VectorIndexSearch.encodeQuery(spark, adapter, query)
+      VectorIndexSearch.encodeQuery(spark, adapter, query, nprobeOf(context))
     }
 
     val indexed =

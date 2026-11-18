@@ -1254,6 +1254,18 @@ ascending: smaller is closer, whatever the metric.
 | `query`       | ✔️        | array<double> | Query vector (same dimension)                |
 | `k`           | ✔️        | int           | Number of results to return                  |
 | `coverage`    |           | string        | `table` (default), `indexed` or `index_hits` |
+| `nprobe`      |           | int           | IVF probe count for this call; overrides `spark.iceberg.index.vector.ivf.nprobe` |
+| `over_sample` |           | int           | Candidate multiplier for this call; overrides `spark.iceberg.index.vector.over-sample` |
+| `filter_mode` |           | string        | `pre` or `post`; overrides `spark.iceberg.index.vector.filter-mode` |
+
+A query setting is read from the call first, then from the session, then from the value the index
+definition records (none of these three records one today, so the session is the default):
+
+| Layer | Example | Notes |
+|---|---|---|
+| the call's argument | `nprobe => 64` | what the query asked for; it wins, and an invalid value fails the call rather than falling back |
+| session configuration | `SET spark.iceberg.index.vector.ivf.nprobe=32` | the default for every query of the session |
+| index definition | — | a default recorded when the index was built; `nprobe` is not recorded, it is a query setting |
 
 `coverage` decides what is searched when the index is behind the table:
 
@@ -1322,6 +1334,9 @@ read from a table with `query_table`. How the matched rows are resolved depends 
 | `vector_column` |          | string        | Vector column of `query_table` (default `vector`) |
 | `index`       |           | string        | Name of the index, when several indexes share the column |
 | `coverage`    |           | string        | `table` (default), `indexed` or `index_hits` |
+| `nprobe`      |           | int           | IVF probe count for this call; overrides the session setting |
+| `over_sample` |           | int           | Candidate multiplier for this call; overrides the session setting |
+| `filter_mode` |           | string        | `pre` or `post`; overrides the session setting |
 
 \* Pass either `queries` or `query_table`. With `query_table`, the table is read once a row at a
 time and each row's vector column is one query; `query_id` is the row's position in that order, or
