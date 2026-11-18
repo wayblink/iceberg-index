@@ -294,6 +294,12 @@ CALL local.system.drop_vector_index(table => 'db.docs', column => 'embedding', i
 
 **指定的链路一定会被遵守，不会静默换成另一种方式。** Unknown 取值（包括已废弃的 `auto`）直接失败。早先 `auto` 按密度阈值在两者之间选，已经去掉：同一句 SQL 换一张表换一种分布可能走不同链路，而用户从 SQL 里看不出差别，这种不可预测比"少省一点"更贵。需要按代价自动选择时，那属于优化器的事（#3014）。
 
+### 4.7 一次查询的时间花在哪：分阶段指标
+
+融合查询（`SELECT … FROM vector_search(…)`）的每个 task 会上报四段墙钟——读索引 `indexReadTimeNs`、探测打分 `probeScoreTimeNs`、回表 `fetchBackTimeNs`、合并 `mergeTimeNs`——外加对账用的 `taskTimeNs` 和索引读取的字节 / 请求数。它们默认开启、无需配置，Spark UI 的 SQL 页和 `spark.eventLog` 里都能读到。
+
+四段之和应当等于 `taskTimeNs`（误差 <5%），所以看到"慢"时可以先定位到段，再决定是读多了、算慢了还是回表贵了。完整的指标口径、event log 读法、与 Lance 侧指标的对应关系，以及已知边界（回表字节未覆盖、range 与整文件缓存不能叠加等）见 `docs/index-query-metrics.md`。
+
 ## 5. 全文索引
 
 ### 5.1 能力边界（先看这条再决定用不用）
@@ -627,4 +633,4 @@ BM25 和向量索引共用 executor 的容量预算、LRU 和状态入口。用�
 
 ---
 
-延伸阅读：`vector-index-guide.md`（向量参数曲线、改写规则细节、性能实测）、`docs/vector-index-deployment-guide.md`（上线、镜像、发布流程）。
+延伸阅读：`vector-index-guide.md`（向量参数曲线、改写规则细节、性能实测）、`docs/index-query-metrics.md`（查询分阶段指标与 event log 归因）、`docs/vector-index-deployment-guide.md`（上线、镜像、发布流程）。

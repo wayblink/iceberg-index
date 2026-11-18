@@ -467,6 +467,144 @@ class TestVectorSearchExecution {
     }
   }
 
+  @Test
+  void aSearchReportsWhereItsTaskTimeWent() {
+    String table = tableWithIndex("exec_stages");
+    Dataset<Row> frame = spark.sql(nearest(table, 2));
+    assertThat(frame.collectAsList()).hasSize(2);
+
+    // a stage of a two-row fixture can be fast enough to round to zero, so this pins the three the
+    // query cannot have done without: it opened and read an index file, scored it, and fetched the
+    // rows its hits name
+    SparkPlan source = sourceExec(frame);
+    long indexRead = metric(source, "indexReadTimeNs");
+    long probeScore = metric(source, "probeScoreTimeNs");
+    long fetchBack = metric(source, "fetchBackTimeNs");
+    long merge = metric(source, "mergeTimeNs");
+
+    assertThat(indexRead).isPositive();
+    assertThat(probeScore).isPositive();
+    assertThat(fetchBack).isPositive();
+    assertThat(metric(source, "numIndexFileBytesRead"))
+        .as("a cache that is off reads its index file whole")
+        .isPositive();
+    assertThat(metric(source, "numIndexRangeBytesRead")).isZero();
+    assertThat(metric(source, "numIndexCacheHits")).isZero();
+
+    long stages = indexRead + probeScore + fetchBack + merge;
+    long taskTime = metric(source, "taskTimeNs");
+    assertThat(taskTime).isPositive();
+    assertThat(percentOff(stages, taskTime))
+        .as("the four stages cover the task's wall clock: %s of %s ns", stages, taskTime)
+        .isLessThan(5.0);
+  }
+
+  @Test
+  void rangeReadsReportTheBytesAndRequestsTheyTook() {
+    String table = "local.db.exec_stages_range";
+    spark.sql("CREATE NAMESPACE IF NOT EXISTS local.db");
+    spark.sql("CREATE TABLE " + table + " (id bigint, embedding array<double>) USING iceberg");
+    spark.sql(
+        "INSERT INTO " + table + " SELECT id, array(CAST(id AS double), 1.0d) FROM range(0, 32)");
+    spark.sql(
+        "INSERT INTO " + table + " SELECT id, array(CAST(id AS double), 1.0d) FROM range(32, 64)");
+    spark.sql(
+        "CALL local.system.build_vector_index(table => 'db.exec_stages_range', "
+            + "column => 'embedding', dimension => 2, metric => 'l2', structure => 'IVF', "
+            + "max_entries_per_index_file => 128, "
+            + "options => map('nlist', '8', 'ivf-list-blocks', 'true'))");
+    String range = "spark.iceberg.index.vector.ivf.range-read.enabled";
+    String cache = "spark.iceberg.index.cache.enabled";
+    try {
+      spark.conf().set(cache, "false");
+      spark.conf().set(range, "true");
+      Dataset<Row> frame =
+          spark.sql(
+              "SELECT id FROM "
+                  + table
+                  + " ORDER BY vec_distance(embedding, array(31.1d, 1.0d), 'l2') LIMIT 4");
+      assertThat(frame.collectAsList())
+          .extracting(row -> row.getLong(0))
+          .containsExactly(31L, 32L, 30L, 33L);
+
+      SparkPlan source = sourceExec(frame);
+      assertThat(metric(source, "numIndexFileBytesRead"))
+          .as("a range read does not read an index file whole")
+          .isZero();
+      assertThat(metric(source, "numIndexRangeBytesRead")).isPositive();
+      assertThat(metric(source, "numIndexRangeReadRequests")).isPositive();
+      assertThat(metric(source, "numIndexListBlocksRead")).isPositive();
+      long stages =
+          metric(source, "indexReadTimeNs")
+              + metric(source, "probeScoreTimeNs")
+              + metric(source, "fetchBackTimeNs")
+              + metric(source, "mergeTimeNs");
+      assertThat(percentOff(stages, metric(source, "taskTimeNs"))).isLessThan(5.0);
+    } finally {
+      spark.conf().unset(range);
+      spark.conf().unset(cache);
+    }
+  }
+
+  @Test
+  void aWarmCacheReportsHitsRatherThanReads() {
+    String table = tableWithIndex("exec_stages_cache");
+    String cache = "spark.iceberg.index.cache.enabled";
+    String budget = "spark.iceberg.index.cache.bytes";
+    try {
+      spark.conf().set(cache, "true");
+      spark.conf().set(budget, "16m");
+
+      Dataset<Row> cold = spark.sql(nearest(table, 2));
+      assertThat(cold.collectAsList()).hasSize(2);
+      SparkPlan coldSource = sourceExec(cold);
+      assertThat(metric(coldSource, "numIndexCacheMisses")).isPositive();
+      assertThat(metric(coldSource, "numIndexCacheHits")).isZero();
+      assertThat(metric(coldSource, "numIndexFileBytesRead")).isPositive();
+
+      Dataset<Row> warm = spark.sql(nearest(table, 2));
+      assertThat(warm.collectAsList()).hasSize(2);
+      SparkPlan warmSource = sourceExec(warm);
+      assertThat(metric(warmSource, "numIndexCacheHits")).isPositive();
+      assertThat(metric(warmSource, "numIndexCacheMisses")).isZero();
+      assertThat(metric(warmSource, "numIndexFileBytesRead")).isZero();
+    } finally {
+      spark.conf().unset(cache);
+      spark.conf().unset(budget);
+    }
+  }
+
+  @Test
+  void anEmptyAnswerStillReportsWhereItsTimeWent() {
+    // every row is deleted after the index was built, so the search reads its index file, scores it
+    // and fetches candidates that turn out not to be live: an empty answer that still cost work,
+    // and the stages have to say so rather than reporting zero because there is no row to return
+    String table = tableWithIndex("exec_stages_empty");
+    spark.sql(String.format("DELETE FROM local.db.%s", table));
+    assertThat(spark.table("local.db." + table).count()).isZero();
+
+    Dataset<Row> frame = spark.sql(nearest(table, 2));
+    assertThat(frame.collectAsList()).isEmpty();
+
+    SparkPlan source = sourceExec(frame);
+    assertThat(metric(source, "numLiveCandidates")).isZero();
+    assertThat(metric(source, "indexReadTimeNs")).isPositive();
+    assertThat(metric(source, "probeScoreTimeNs")).isPositive();
+    assertThat(metric(source, "fetchBackTimeNs")).isPositive();
+    assertThat(metric(source, "numIndexFileBytesRead")).isPositive();
+    long stages =
+        metric(source, "indexReadTimeNs")
+            + metric(source, "probeScoreTimeNs")
+            + metric(source, "fetchBackTimeNs")
+            + metric(source, "mergeTimeNs");
+    assertThat(percentOff(stages, metric(source, "taskTimeNs"))).isLessThan(5.0);
+  }
+
+  /** How far a measured number is from the number it should cover, in percent. */
+  private static double percentOff(long measured, long total) {
+    return Math.abs(measured - total) * 100.0 / Math.max(1L, total);
+  }
+
   /** The system property that enables the internal exact re-ranking, for measurement. */
   private static final String EXPERIMENT_REFINE = "iceberg.index.vector.refine";
 

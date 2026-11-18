@@ -131,6 +131,9 @@ private[spark] object VectorSearchExec {
       metrics("numCandidateRounds"),
       metrics("numIndexUnderfilled"),
       metrics("numScanTasksShipped"))
+    // the stages describe the same tasks' wall clock, and the metrics they write are the ones the
+    // source declared, so a log that reads one reads the other
+    val stages = new DistributedIndexSearch.SearchStages(metrics.asJava)
 
     val rows =
       DistributedIndexSearch.searchWithRows(
@@ -150,7 +153,8 @@ private[spark] object VectorSearchExec {
         rowFilter,
         candidateFilter,
         if (prefilter) context.filterColumns.toList.asJava else java.util.Collections.emptyList(),
-        counters)
+        counters,
+        stages)
 
     // the format model returns rows, and the source's output is internal rows: this conversion is a
     // map over what the tasks produced, not a job that collects them and sends them out again

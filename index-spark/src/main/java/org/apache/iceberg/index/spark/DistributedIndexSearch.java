@@ -218,6 +218,109 @@ public final class DistributedIndexSearch {
   }
 
   /**
+   * What a search's tasks spent their time on, and what reading the index cost them.
+   *
+   * <p>A search is one job whose tasks each read an index file, score its records, fetch the rows
+   * their hits name, and build their own answer. The four stages are wall clock and together cover
+   * the time a task spent on its index files, so a query that took seconds can be told apart from
+   * one that waited, and a stage that is missing is a stage that cost nothing rather than one that
+   * was not measured.
+   *
+   * <p>The names are the contract: a spark event log records these by the description of the
+   * accumulator, so a name changed here silently drops the metric from every log that reads it.
+   * They follow the names the lance reader publishes, so the two formats can be compared.
+   */
+  public static final class SearchStages implements Serializable {
+    private static final long serialVersionUID = 1L;
+
+    public static final String INDEX_READ_TIME = "indexReadTimeNs";
+    public static final String PROBE_SCORE_TIME = "probeScoreTimeNs";
+    public static final String FETCH_BACK_TIME = "fetchBackTimeNs";
+    public static final String MERGE_TIME = "mergeTimeNs";
+    public static final String TASK_TIME = "taskTimeNs";
+    public static final String INDEX_FILE_BYTES_READ = "numIndexFileBytesRead";
+    public static final String INDEX_RANGE_BYTES_READ = "numIndexRangeBytesRead";
+    public static final String INDEX_RANGE_READ_REQUESTS = "numIndexRangeReadRequests";
+    public static final String INDEX_LIST_BLOCKS_READ = "numIndexListBlocksRead";
+    public static final String INDEX_WHOLE_LIST_AREA_READS = "numIndexWholeListAreaReads";
+    public static final String INDEX_CACHE_HITS = "numIndexCacheHits";
+    public static final String INDEX_CACHE_MISSES = "numIndexCacheMisses";
+
+    private static final Map<String, String> DESCRIPTIONS;
+
+    static {
+      Map<String, String> descriptions = new java.util.LinkedHashMap<>();
+      descriptions.put(INDEX_READ_TIME, "time a task spent opening and reading index files (ns)");
+      descriptions.put(
+          PROBE_SCORE_TIME, "time a task spent probing lists and scoring their records (ns)");
+      descriptions.put(FETCH_BACK_TIME, "time a task spent fetching the rows its hits name (ns)");
+      descriptions.put(MERGE_TIME, "time a task spent merging and building its answer (ns)");
+      descriptions.put(TASK_TIME, "time a task spent on its index files (ns)");
+      descriptions.put(INDEX_FILE_BYTES_READ, "bytes a task read to load index files whole");
+      descriptions.put(INDEX_RANGE_BYTES_READ, "bytes a task read from index files in ranges");
+      descriptions.put(INDEX_RANGE_READ_REQUESTS, "range requests a task made to index files");
+      descriptions.put(INDEX_LIST_BLOCKS_READ, "index list blocks a task read through ranges");
+      descriptions.put(
+          INDEX_WHOLE_LIST_AREA_READS,
+          "searches that read the whole list area instead of their ranges");
+      descriptions.put(INDEX_CACHE_HITS, "index files an executor already held");
+      descriptions.put(INDEX_CACHE_MISSES, "index file opens that read from storage");
+      DESCRIPTIONS = java.util.Collections.unmodifiableMap(descriptions);
+    }
+
+    private final Map<String, SQLMetric> metrics;
+
+    public SearchStages(Map<String, SQLMetric> metrics) {
+      this.metrics =
+          metrics == null ? java.util.Collections.emptyMap() : new java.util.HashMap<>(metrics);
+    }
+
+    /** The metric names a caller creates SQL metrics for, keyed by the description Spark uses. */
+    public static Map<String, String> descriptions() {
+      return DESCRIPTIONS;
+    }
+
+    /** Adds what one task spent, if any of its metrics were handed in. */
+    void report(Stages stages) {
+      add(INDEX_READ_TIME, stages.indexReadNanos);
+      add(PROBE_SCORE_TIME, stages.probeScoreNanos);
+      add(FETCH_BACK_TIME, stages.fetchBackNanos);
+      add(MERGE_TIME, stages.mergeNanos);
+      add(TASK_TIME, stages.taskNanos);
+      add(INDEX_FILE_BYTES_READ, stages.fileBytesRead);
+      add(INDEX_RANGE_BYTES_READ, stages.rangeBytesRead);
+      add(INDEX_RANGE_READ_REQUESTS, stages.rangeReadRequests);
+      add(INDEX_LIST_BLOCKS_READ, stages.listBlocksRead);
+      add(INDEX_WHOLE_LIST_AREA_READS, stages.wholeListAreaReads);
+      add(INDEX_CACHE_HITS, stages.cacheHits);
+      add(INDEX_CACHE_MISSES, stages.cacheMisses);
+    }
+
+    private void add(String name, long value) {
+      SQLMetric metric = metrics.get(name);
+      if (metric != null) {
+        metric.add(value);
+      }
+    }
+  }
+
+  /** What one task spent, gathered in the stage a caller reports it for. */
+  static final class Stages {
+    private long indexReadNanos;
+    private long probeScoreNanos;
+    private long fetchBackNanos;
+    private long mergeNanos;
+    private long taskNanos;
+    private long fileBytesRead;
+    private long rangeBytesRead;
+    private long rangeReadRequests;
+    private long listBlocksRead;
+    private long wholeListAreaReads;
+    private int cacheHits;
+    private int cacheMisses;
+  }
+
+  /**
    * Searches the index snapshot a query is answered from, and reads the rows it found, on the
    * executors.
    *
@@ -250,6 +353,7 @@ public final class DistributedIndexSearch {
    * @param filterColumns the columns {@code candidateFilter} names, which is what a task reads to
    *     know which rows of its own files it may score
    * @param counters where the tasks report what they found, or null to report nothing
+   * @param stages where the tasks report what they spent, or null to report nothing
    * @return the rows the index found, at most the query's top-k per index file, best first within a
    *     task
    */
@@ -268,7 +372,8 @@ public final class DistributedIndexSearch {
       IndexRowFilter filter,
       IndexRowFilter candidateFilter,
       List<String> filterColumns,
-      RowCounters counters) {
+      RowCounters counters,
+      SearchStages stages) {
     // A search is what makes an index hot, so this is where the LRU learns about it.
     IndexCacheControl.recordAccess(spark, metadata.indexUuid());
     IndexAdapter adapter =
@@ -387,9 +492,16 @@ public final class DistributedIndexSearch {
                   ExecutorIndexCache.Config cacheConfig = cacheRef.getValue();
                   RowReadPlan plan = planRef.getValue();
                   List<Row> partitionRows = Lists.newArrayList();
+                  Stages stageTally = stages == null ? null : new Stages();
+                  long taskStart = System.nanoTime();
                   while (indexFiles.hasNext()) {
                     IndexFileTask indexFile = indexFiles.next();
+                    long candidatesStart = System.nanoTime();
                     IndexCandidates candidates = plan.candidatesOf(fileIO, indexFile.tasks());
+                    if (stageTally != null) {
+                      // reading the files a prefilter admits is a fetch-back before the search
+                      stageTally.fetchBackNanos += System.nanoTime() - candidatesStart;
+                    }
                     if (candidates != null && candidates.isEmpty()) {
                       if (tally != null) {
                         tally.report(0, 0, 0, 0, 0, 0, 0, 0, indexFile.tasks().size(), true);
@@ -410,6 +522,30 @@ public final class DistributedIndexSearch {
                             rangeRead,
                             indexFile.fileLength());
                     long readNanos = System.nanoTime() - readStart;
+                    if (stageTally != null) {
+                      stageTally.indexReadNanos += readNanos;
+                      stageTally.fileBytesRead += opened.fileBytesRead();
+                      if (opened.servedFromCache()) {
+                        stageTally.cacheHits++;
+                      } else {
+                        stageTally.cacheMisses++;
+                      }
+
+                      VectorIndexAdapter.RangeSearch range = opened.rangeSearch();
+                      if (range != null) {
+                        VectorIndexAdapter.OpenReadMetrics open = range.openReadMetrics();
+                        if (open != null) {
+                          stageTally.rangeBytesRead +=
+                              open.footerBytes() + open.descriptionBytes() + open.listBytes();
+                          stageTally.rangeReadRequests +=
+                              open.footerRequests()
+                                  + open.descriptionRequests()
+                                  + open.listRequests();
+                          stageTally.listBlocksRead += open.listRequests();
+                        }
+                      }
+                    }
+
                     long searchStart = System.nanoTime();
                     // the refined window is asked for in the first round rather than grown towards:
                     // an extra round would fetch and read the same candidates twice
@@ -437,7 +573,9 @@ public final class DistributedIndexSearch {
                               plan,
                               refine,
                               refinedQuery,
-                              indexFile.tasks());
+                              indexFile.tasks(),
+                              opened.rangeSearch(),
+                              stageTally);
                       if (tally != null) {
                         tally.report(
                             reported,
@@ -451,13 +589,27 @@ public final class DistributedIndexSearch {
                             indexFile.tasks().size(),
                             outcome.rows.size() < (refine == null ? topK : resultK));
                       }
+                      long mergeStart = System.nanoTime();
                       partitionRows.addAll(outcome.rows);
+                      if (stageTally != null) {
+                        stageTally.mergeNanos += System.nanoTime() - mergeStart;
+                      }
+                    }
+
+                    if (stageTally != null && opened.rangeSearch() != null) {
+                      stageTally.wholeListAreaReads += opened.rangeSearch().wholeListAreaReads();
                     }
 
                     if (opened.rangeSearch != null) {
                       logReadTimes(location, opened, readNanos, System.nanoTime() - searchStart);
                     }
                   }
+
+                  if (stageTally != null) {
+                    stageTally.taskNanos = System.nanoTime() - taskStart;
+                    stages.report(stageTally);
+                  }
+
                   reportCache(cacheReports, queryRun);
                   return partitionRows.iterator();
                 });
@@ -523,7 +675,9 @@ public final class DistributedIndexSearch {
       RowReadPlan plan,
       VectorRefine refine,
       float[] refinedQuery,
-      List<FileScanTask> ownTasks) {
+      List<FileScanTask> ownTasks,
+      VectorIndexAdapter.RangeSearch range,
+      Stages stageTally) {
     // a kernel that filters while it searches scores the admitted rows and nothing else, so the
     // window is filled from them; one that cannot do that answers the unfiltered question instead,
     // and the hits outside the set are dropped below rather than counted as rejected
@@ -554,15 +708,51 @@ public final class DistributedIndexSearch {
       last = asked;
       more = false;
       for (byte[] payload : payloads) {
+        long listNanosBefore = 0L;
+        long listBytesBefore = 0L;
+        long listRequestsBefore = 0L;
+        if (stageTally != null && range != null) {
+          VectorIndexAdapter.RangeReadMetrics before = range.listReadMetrics();
+          listNanosBefore = before.nanos();
+          listBytesBefore = before.bytes();
+          listRequestsBefore = before.requests();
+        }
+
+        long searchStart = System.nanoTime();
         List<IndexSearchResult> hits =
             file.searching(
                 prepared -> searchFile(prepared, ByteBuffer.wrap(payload), asked, candidates));
+        long searchNanos = System.nanoTime() - searchStart;
+        if (stageTally != null) {
+          // a range search reads the lists it visits inside the search, so that read is index-read
+          // time and not scoring time
+          long listNanos = 0L;
+          long listBytes = 0L;
+          long listRequests = 0L;
+          if (range != null) {
+            VectorIndexAdapter.RangeReadMetrics after = range.listReadMetrics();
+            listNanos = after.nanos() - listNanosBefore;
+            listBytes = after.bytes() - listBytesBefore;
+            listRequests = after.requests() - listRequestsBefore;
+          }
+
+          stageTally.indexReadNanos += Math.max(0L, listNanos);
+          stageTally.probeScoreNanos += Math.max(0L, searchNanos - listNanos);
+          stageTally.rangeBytesRead += Math.max(0L, listBytes);
+          stageTally.rangeReadRequests += Math.max(0L, listRequests);
+          stageTally.listBlocksRead += Math.max(0L, listRequests);
+        }
+
         // a kernel that returned the whole window may hold more; one that returned less has nothing
         // left to offer, which is what stops the widening. A kernel that keeps the set afterwards
         // is asked for everything its file holds instead, because its answer size says nothing
         more = filtersWhileSearching ? hits.size() >= asked : asked < entries;
 
+        long fetchStart = System.nanoTime();
         RowsAtHits read = plan.rowsOf(hits, io, ownTasks);
+        if (stageTally != null) {
+          stageTally.fetchBackNanos += System.nanoTime() - fetchStart;
+        }
         fetchedRows += read.rows.size();
         unresolved += read.unresolved;
         outside += read.outsideSnapshot;
@@ -599,6 +789,7 @@ public final class DistributedIndexSearch {
       limit = next;
     }
 
+    long mergeStart = System.nanoTime();
     List<FetchedRow> fetched = Lists.newArrayList(found.values());
     List<Row> rows;
     if (refine == null) {
@@ -609,6 +800,10 @@ public final class DistributedIndexSearch {
       }
     } else {
       rows = refinedTopK(fetched, refine, refinedQuery, resultK);
+    }
+
+    if (stageTally != null) {
+      stageTally.mergeNanos += System.nanoTime() - mergeStart;
     }
 
     return new FileOutcome(rows, fetchedRows, last, unresolved, outside, filesRead.size(), round);
@@ -1990,14 +2185,20 @@ public final class DistributedIndexSearch {
     private final ExecutorIndexCache.CachedFile file;
     private final Runnable release;
     private final VectorIndexAdapter.RangeSearch rangeSearch;
+    private final long fileBytesRead;
+    private final boolean servedFromCache;
 
     private OpenedSearch(
         ExecutorIndexCache.CachedFile file,
         Runnable release,
-        VectorIndexAdapter.RangeSearch rangeSearch) {
+        VectorIndexAdapter.RangeSearch rangeSearch,
+        long fileBytesRead,
+        boolean servedFromCache) {
       this.file = file;
       this.release = release;
       this.rangeSearch = rangeSearch;
+      this.fileBytesRead = fileBytesRead;
+      this.servedFromCache = servedFromCache;
     }
 
     ExecutorIndexCache.CachedFile file() {
@@ -2006,6 +2207,16 @@ public final class DistributedIndexSearch {
 
     VectorIndexAdapter.RangeSearch rangeSearch() {
       return rangeSearch;
+    }
+
+    /** The bytes this open read to load an index file whole, and zero when it read none. */
+    long fileBytesRead() {
+      return fileBytesRead;
+    }
+
+    /** Whether an executor already held the file, so this open went to no storage. */
+    boolean servedFromCache() {
+      return servedFromCache;
     }
 
     @Override
@@ -2029,30 +2240,38 @@ public final class DistributedIndexSearch {
     // what makes a session that disables the cache return to reading its index files
     ExecutorIndexCache.Lease lease = config.enabled() ? cache.acquireManagedKey(key) : null;
     if (lease != null) {
-      return new OpenedSearch(lease.file(), lease::close, null);
+      return new OpenedSearch(lease.file(), lease::close, null, 0L, true);
     }
 
     if (rangeRead && adapter instanceof VectorIndexAdapter vector) {
       ExecutorIndexCache.CachedFile hit = cache.unmanagedHit(key, config);
       if (hit != null) {
-        return new OpenedSearch(hit, () -> {}, null);
+        return new OpenedSearch(hit, () -> {}, null, 0L, true);
       }
 
       VectorIndexAdapter.RangeSearch search =
           vector.prepareRange(inputFile(io, location, knownLength), knownLength);
       if (search != null) {
-        return new OpenedSearch(ExecutorIndexCache.loaded(0L, search), search::close, search);
+        return new OpenedSearch(
+            ExecutorIndexCache.loaded(0L, search), search::close, search, 0L, false);
       }
     }
 
+    // the load is where a miss pays for the file; a hit never calls it, which is what tells the
+    // two apart without asking the cache
+    long[] loadedBytes = new long[] {0L};
     ExecutorIndexCache.CachedFile file =
         cache.file(
             location,
             config,
             readerKey,
             sizeHint(io, location, knownLength),
-            () -> loadFile(io, location, adapter, knownLength));
-    return new OpenedSearch(file, () -> {}, null);
+            () -> {
+              LoadedFile loaded = loadFileState(io, location, adapter, knownLength);
+              loadedBytes[0] = loaded.fileBytes();
+              return loaded.file();
+            });
+    return new OpenedSearch(file, () -> {}, null, loadedBytes[0], loadedBytes[0] == 0L);
   }
 
   static ExecutorIndexCache.CachedFile loadFile(FileIO io, String location, IndexAdapter adapter) {

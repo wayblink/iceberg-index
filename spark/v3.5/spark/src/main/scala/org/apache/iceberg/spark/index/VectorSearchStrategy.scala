@@ -18,6 +18,7 @@
  */
 package org.apache.iceberg.spark.index
 
+import org.apache.iceberg.index.spark.DistributedIndexSearch
 import org.apache.spark.rdd.RDD
 import org.apache.spark.sql.SparkSession
 import org.apache.spark.sql.Strategy
@@ -120,42 +121,51 @@ private[spark] case class VectorSearchSourceExec(
    * <p>Everything but the files the scan branch was planned over is counted by the tasks that read
    * the rows, because the rows never reach the driver for it to count them.
    */
-  override lazy val metrics: Map[String, SQLMetric] =
-    Map(
-      "numCandidates" -> SQLMetrics.createMetric(
-        spark.sparkContext,
-        "candidates asked for, summed over the index files"),
-      "numCandidateRequests" -> SQLMetrics.createMetric(
-        spark.sparkContext,
-        "candidates asked for in the last round, summed over the index files"),
-      "numCandidateRounds" -> SQLMetrics.createMetric(
-        spark.sparkContext,
-        "rounds the delete-aware search took, summed over the index files"),
-      "numLiveCandidates" -> SQLMetrics.createMetric(
-        spark.sparkContext,
-        "candidate hits that resolved to a live row"),
-      "numFetchedRows" -> SQLMetrics.createMetric(
-        spark.sparkContext,
-        "rows read at their data files to resolve candidates, summed over the rounds"),
-      "numDeletedOrInvisibleHits" -> SQLMetrics.createMetric(
-        spark.sparkContext,
-        "candidate hits with no live row at the frozen snapshot"),
-      "numHitsOutsideSnapshot" -> SQLMetrics.createMetric(
-        spark.sparkContext,
-        "candidate hits whose data file the frozen snapshot no longer has"),
-      "numRowsAtFiles" -> SQLMetrics.createMetric(
-        spark.sparkContext,
-        "data files read to resolve candidates, summed over the index files"),
-      "numResidualFiles" -> SQLMetrics.createMetric(
-        spark.sparkContext,
-        "uncovered files the residual branch was planned over"),
-      "numIndexUnderfilled" -> SQLMetrics.createMetric(
-        spark.sparkContext,
-        "index files that ended with fewer than k live rows"),
-      "numScanTasksShipped" -> SQLMetrics.createMetric(
-        spark.sparkContext,
-        "scan tasks handed to the index tasks, which are the files each covers"),
-      "numOutputRows" -> SQLMetrics.createMetric(spark.sparkContext, "rows produced"))
+  override lazy val metrics: Map[String, SQLMetric] = {
+    val counters =
+      Map(
+        "numCandidates" -> SQLMetrics.createMetric(
+          spark.sparkContext,
+          "candidates asked for, summed over the index files"),
+        "numCandidateRequests" -> SQLMetrics.createMetric(
+          spark.sparkContext,
+          "candidates asked for in the last round, summed over the index files"),
+        "numCandidateRounds" -> SQLMetrics.createMetric(
+          spark.sparkContext,
+          "rounds the delete-aware search took, summed over the index files"),
+        "numLiveCandidates" -> SQLMetrics.createMetric(
+          spark.sparkContext,
+          "candidate hits that resolved to a live row"),
+        "numFetchedRows" -> SQLMetrics.createMetric(
+          spark.sparkContext,
+          "rows read at their data files to resolve candidates, summed over the rounds"),
+        "numDeletedOrInvisibleHits" -> SQLMetrics.createMetric(
+          spark.sparkContext,
+          "candidate hits with no live row at the frozen snapshot"),
+        "numHitsOutsideSnapshot" -> SQLMetrics.createMetric(
+          spark.sparkContext,
+          "candidate hits whose data file the frozen snapshot no longer has"),
+        "numRowsAtFiles" -> SQLMetrics.createMetric(
+          spark.sparkContext,
+          "data files read to resolve candidates, summed over the index files"),
+        "numResidualFiles" -> SQLMetrics.createMetric(
+          spark.sparkContext,
+          "uncovered files the residual branch was planned over"),
+        "numIndexUnderfilled" -> SQLMetrics.createMetric(
+          spark.sparkContext,
+          "index files that ended with fewer than k live rows"),
+        "numScanTasksShipped" -> SQLMetrics.createMetric(
+          spark.sparkContext,
+          "scan tasks handed to the index tasks, which are the files each covers"),
+        "numOutputRows" -> SQLMetrics.createMetric(spark.sparkContext, "rows produced"))
+    // the stage metrics name themselves in one place, so a log that reads them and the search that
+    // reports them cannot drift apart
+    val stages =
+      DistributedIndexSearch.SearchStages.descriptions().asScala.map { case (name, description) =>
+        name -> SQLMetrics.createMetric(spark.sparkContext, description)
+      }
+    counters ++ stages
+  }
 
   override protected def doExecute(): RDD[InternalRow] = {
     val (rows, stats) = VectorSearchExec.rows(spark, source, metrics)
