@@ -1253,7 +1253,7 @@ ascending: smaller is closer, whatever the metric.
 | `column`      | ✔️        | string        | Name of the indexed column                   |
 | `query`       | ✔️        | array<double> | Query vector (same dimension)                |
 | `k`           | ✔️        | int           | Number of results to return                  |
-| `coverage`    |           | string        | `table` (default), `indexed` or `index_hits` |
+| `coverage`    |           | string        | `table` (default), `indexed`, `index_hits` or `positions` |
 | `nprobe`      |           | int           | IVF probe count for this call; overrides `spark.iceberg.index.vector.ivf.nprobe` |
 | `over_sample` |           | int           | Candidate multiplier for this call; overrides `spark.iceberg.index.vector.over-sample` |
 | `filter_mode` |           | string        | `pre` or `post`; overrides `spark.iceberg.index.vector.filter-mode` |
@@ -1274,6 +1274,7 @@ definition records (none of these three records one today, so the session is the
 | `table`      | The index, plus a scan of the files the index does not cover: the full-scan answer | No                       |
 | `indexed`    | Only the files the index covers                                                   | Yes                      |
 | `index_hits` | The index's own hits, as the index produced them (diagnostic view)                 | No                       |
+| `positions`  | The same hits as `index_hits` with the `row` left null: nothing is read at the data files and no hit is judged against the snapshot | No |
 
 In every mode a hit is resolved against the queried snapshot first: a hit whose data file the
 snapshot no longer has, or whose position no longer holds a live row, is not an answer. `table` and
@@ -1313,6 +1314,7 @@ read from a table with `query_table`. How the matched rows are resolved depends 
 | `coverage`   | How the batch is resolved |
 |--------------|---------------------------|
 | `index_hits` | Every query in the block searches the index, then the hits of the block are resolved in one pass, so each hit data file is read once for the block. A hit whose row can no longer be read stays with a null row. |
+| `positions`  | The index's own hits, with the row left null: no data file is read and no hit is judged against the snapshot, so a row deleted after the build still appears. The score is the index's estimate and the answer is the index's own order. |
 | `table` (default) | The live rows of the queried snapshot and their exact distance. The hits of the block are resolved in one pass, and the files the index does not cover are scanned once for the block; a hit whose row was removed is dropped, and the answer is the answer a full scan would give. |
 | `indexed`    | The live rows of the files the index covers and their exact distance, resolved once per block. The files the index does not cover are not read, so the answer can be shorter than k. |
 
@@ -1322,6 +1324,13 @@ read from a table with `query_table`. How the matched rows are resolved depends 
     block size is an internal bound, so a batch larger than one block is answered in several
     blocks. The design is in
     `docs/superpowers/specs/2026-11-17-vector-batch-shared-execution-design.md`.
+
+!!! note
+    `positions` is the mode for a large batch whose caller resolves rows itself: it skips the
+    fetch-back and the row JSON entirely, so a block holds many more queries (the block budget no
+    longer counts rows or their JSON) and no data file is read. The catch is the same as
+    `index_hits`: the score is the index's estimate and a hit deleted after the build is still
+    reported.
 
 | Argument Name | Required? | Type          | Description                                  |
 |---------------|-----------|---------------|----------------------------------------------|

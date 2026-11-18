@@ -58,6 +58,16 @@ class TestVectorCandidateBudget {
   }
 
   @Test
+  void positionsBatchesHoldNeitherRowsNorJson() {
+    // the same shape that budgets one query at a time when rows and their JSON are kept comes out
+    // at the cap when the answer is the index's own positions
+    assertThat(
+            VectorSearchBridge$.MODULE$.derivedQueriesPerBlock(
+                VectorResultContract.forCoverage("positions"), 10, 10, 2560, 33, 0))
+        .isEqualTo(128);
+  }
+
+  @Test
   void batchShuffleBudgetsForTheExtraHitPerIndexFile() {
     assertThat(
             VectorSearchBridge$.MODULE$.derivedQueriesPerBlock(

@@ -259,6 +259,46 @@ public class TestVectorIndexSearchBatch extends ExtensionsTestBase {
   }
 
   /**
+   * The positions mode answers what the index found and nothing more: the same ranking and the same
+   * estimate as the hit view, with the row left null. Nothing is read at the data files and the
+   * hits are not judged against the snapshot, so a row deleted after the build still appears.
+   */
+  @TestTemplate
+  public void positionsCoverageLeavesTheRowToTheCaller() {
+    String tableName = tableName("vectors_batch_positions_" + catalogName);
+    sql("CREATE TABLE %s (id bigint, embedding array<double>) USING iceberg", tableName);
+    sql(
+        "INSERT INTO %s SELECT id, array(CAST(id AS double), CAST(10 - id AS double)) "
+            + "FROM range(0, 20)",
+        tableName);
+    sql(
+        "CALL %s.system.build_vector_index("
+            + "table => '%s', column => 'embedding', dimension => 2, metric => 'l2')",
+        catalogName, tableName);
+    sql("DELETE FROM %s WHERE id IN (0, 1)", tableName);
+
+    List<Object[]> hits =
+        sql(
+            "CALL %s.system.vector_search_batch(table => '%s', column => 'embedding', "
+                + "queries => array('0.0,10.0', '10.0,0.0'), k => 5, coverage => 'index_hits')",
+            catalogName, tableName);
+    List<Object[]> positions =
+        sql(
+            "CALL %s.system.vector_search_batch(table => '%s', column => 'embedding', "
+                + "queries => array('0.0,10.0', '10.0,0.0'), k => 5, coverage => 'positions')",
+            catalogName, tableName);
+
+    assertThat(positions).hasSameSizeAs(hits);
+    for (int i = 0; i < hits.size(); i += 1) {
+      // the query id, the file, the position and the score are the index's own, in its own order
+      assertThat(java.util.Arrays.copyOfRange(positions.get(i), 0, 4))
+          .as("row %s", i)
+          .isEqualTo(java.util.Arrays.copyOfRange(hits.get(i), 0, 4));
+      assertThat(positions.get(i)[4]).as("no row is resolved").isNull();
+    }
+  }
+
+  /**
    * A block starts every query at the same window, but only the queries that came up short may take
    * another round: one query's nearest rows are gone, the other's are all there, and both still
    * answer with k rows that match their own single query.

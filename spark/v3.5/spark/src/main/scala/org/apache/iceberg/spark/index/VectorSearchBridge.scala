@@ -200,9 +200,12 @@ private[spark] object VectorSearchBridge {
     // would let a caller with over-sample raise the real per-block memory behind the bound
     val window = math.max(1, initialWindow).toLong
     val dimension = math.max(1, vectorDimension).toLong
-    val rowBytes = dimension * java.lang.Double.BYTES + RowOverheadBytes
+    // a block of positions holds neither rows nor their JSON: the answer is the index's own hits
+    val holdsRows = contract != VectorResultContract.IndexPositions
+    val rowBytes = if (holdsRows) dimension * java.lang.Double.BYTES + RowOverheadBytes else 0L
     // the block also keeps the JSON of the rows it answers with, which is not in their row size
-    val jsonBytes = dimension * JsonBytesPerDimension + JsonOverheadBytes
+    val jsonBytes =
+      if (holdsRows) dimension * JsonBytesPerDimension + JsonOverheadBytes else 0L
     val indexFiles = math.max(1, indexFileCount).toLong
     val uncoveredFiles =
       if (contract == VectorResultContract.TableCovered) uncoveredFileCount.toLong else 0L
@@ -210,7 +213,8 @@ private[spark] object VectorSearchBridge {
     // Indexed rows are still live when the winners from the uncovered scan are fetched, and the
     // answered rows of the block also carry their JSON
     val scanRows = if (uncoveredFiles > 0L) topK else 0L
-    val byDriver = DriverBudget / ((window + scanRows) * rowBytes + topK * jsonBytes)
+    val perQuery = (window + scanRows) * rowBytes + topK * jsonBytes
+    val byDriver = if (perQuery <= 0L) Long.MaxValue else DriverBudget / perQuery
     // The two stages shuffle separately. The index asks for one extra hit to detect more hits.
     val hitsPerIndexFile = math.min(Int.MaxValue.toLong, window + 1L)
     val byIndexShuffle = ShuffleBudget / CandidateBytes / indexFiles / hitsPerIndexFile
@@ -290,7 +294,12 @@ private[spark] object VectorSearchBridge {
    * {@code ORDER BY vec_distance} would produce for the same row.
    */
   def execute(spark: SparkSession, context: VectorSearchContext): JList[Row] = {
-    if (context.request.input.contract != VectorResultContract.IndexHits) {
+    val contract = context.request.input.contract
+    if (contract == VectorResultContract.IndexPositions) {
+      return indexPositions(spark, context)
+    }
+
+    if (contract != VectorResultContract.IndexHits) {
       return nearestRows(spark, context)
     }
 
@@ -310,6 +319,62 @@ private[spark] object VectorSearchBridge {
       val end = math.min(start + blockSize, request.queries.size)
       val block = (start until end).map(queryId => (queryId, request.queries(queryId)))
       answered ++= indexHitsInBlock(spark, context, block)
+      start = end
+    }
+
+    spark.createDataFrame(answered.asJava, schema).collectAsList()
+  }
+
+  /**
+   * The index's own hits of every query, as positions and scores only.
+   *
+   * <p>No data file is read and no hit is judged against the snapshot: the answer is what the index
+   * ranked, so a row deleted after the build is still reported here. That is the trade the coverage
+   * mode makes: the caller gets the index's own answer and pays for neither the row nor its JSON,
+   * which is what lets one block hold many more queries.
+   */
+  private def indexPositions(spark: SparkSession, context: VectorSearchContext): JList[Row] = {
+    val request = context.request.input
+    val batch = request.batch
+    val schema = if (batch) IndexSearch.RESULT_SCHEMA else IndexSearch.SINGLE_RESULT_SCHEMA
+    if (request.topK <= 0 || request.queries.isEmpty) {
+      return spark.createDataFrame(new java.util.ArrayList[Row](), schema).collectAsList()
+    }
+
+    val inputs = context.inputs
+    val adapter = new VectorIndexAdapter(inputs.definition)
+    val k = request.topK
+    val blockSize = queriesPerBlock(context)
+    val answered = mutable.ListBuffer.empty[Row]
+    var start = 0
+    while (start < request.queries.size) {
+      val end = math.min(start + blockSize, request.queries.size)
+      val block = (start until end).map(queryId => (queryId, request.queries(queryId)))
+      val payloads = block.map { case (_, query) =>
+        VectorIndexSearch.encodeQuery(spark, adapter, query, nprobeOf(context))
+      }
+
+      val hitsPerQuery = hitsForBlock(spark, context, block, payloads)
+      hitsPerQuery.zipWithIndex.foreach { case (hits, query) =>
+        val queryId = block(query)._1
+        hits.take(k).foreach { hit =>
+          answered += (if (batch) {
+                         RowFactory.create(
+                           Integer.valueOf(queryId),
+                           hit.dataFile(),
+                           JLong.valueOf(hit.rowPosition()),
+                           java.lang.Double.valueOf(hit.score()),
+                           null)
+                       } else {
+                         RowFactory.create(
+                           hit.dataFile(),
+                           JLong.valueOf(hit.rowPosition()),
+                           java.lang.Double.valueOf(hit.score()),
+                           null)
+                       })
+        }
+      }
+
       start = end
     }
 

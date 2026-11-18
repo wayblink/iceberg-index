@@ -87,14 +87,28 @@ private[spark] object VectorResultContract {
     override val name: String = "INDEX_HITS"
   }
 
+  /**
+   * The index's own hits, without resolving the rows they name.
+   *
+   * <p>The same hits {@link IndexHits} reports, with the row left null: the search neither reads
+   * the data files nor judges the hits against the snapshot, so the answer is the index's own
+   * ranking and its own estimate, and nothing is paid for a row nobody asked for. It exists because
+   * the row is what a batch pays most for: a 2,560-dimension row is about 51 KB of JSON, which
+   * bounds a block to a handful of queries, while its position and score are about 30 bytes.
+   */
+  case object IndexPositions extends VectorResultContract {
+    override val name: String = "INDEX_POSITIONS"
+  }
+
   /** The coverage modes a caller may name, in the vocabulary the procedures accept. */
-  val CoverageModes: Set[String] = Set("table", "indexed", "index_hits")
+  val CoverageModes: Set[String] = Set("table", "indexed", "index_hits", "positions")
 
   def fromName(name: String): VectorResultContract = name match {
     case "TABLE_LIVE_TOPK" => TableLiveTopK
     case "TABLE_COVERED" => TableCovered
     case "INDEX_COVERED" => IndexCovered
     case "INDEX_HITS" => IndexHits
+    case "INDEX_POSITIONS" => IndexPositions
     case _ => throw new IllegalArgumentException(s"Unknown vector result contract: $name")
   }
 
@@ -108,9 +122,10 @@ private[spark] object VectorResultContract {
     case "table" => TableCovered
     case "indexed" => IndexCovered
     case "index_hits" => IndexHits
+    case "positions" => IndexPositions
     case other =>
       throw new IllegalArgumentException(
-        s"Invalid coverage: '$other'; expected one of table, indexed, index_hits")
+        s"Invalid coverage: '$other'; expected one of table, indexed, index_hits, positions")
   }
 }
 
