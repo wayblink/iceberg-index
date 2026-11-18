@@ -198,8 +198,9 @@ object IndexTableFunctions {
     val frozen = SerializableTable.copyOf(icebergTable)
     val index = VectorIndexes.findIndex(frozen, column, "text")
     if (index.snapshotForSourceTableSnapshot(snapshotId) == null) {
-      analysisError(s"Text index of $tableName.$column does not cover snapshot $snapshotId; " +
-        "run refresh_text_index")
+      analysisError(
+        s"Text index of $tableName.$column does not cover snapshot $snapshotId; " +
+          "run refresh_text_index")
     }
 
     val filter = arguments.stringOption("filter").map { sql =>

@@ -111,17 +111,10 @@ private[spark] object VectorQueryParameters {
     }
     val mode = filterModeOf(raw.filterMode)
     if (parameter == null) {
-      ResolvedVectorParameters(
-        0L,
-        "DEFAULT",
-        false,
-        null,
-        null,
-        index,
-        mode._1,
-        mode._2)
+      ResolvedVectorParameters(0L, "DEFAULT", false, null, null, index, mode._1, mode._2)
     } else {
-      val message = s"Invalid $OverSampleConf: '${parameter.value}'; expected a non-negative integer"
+      val message =
+        s"Invalid $OverSampleConf: '${parameter.value}'; expected a non-negative integer"
       require(parameter.value != null, message)
       val value =
         try {

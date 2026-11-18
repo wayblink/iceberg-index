@@ -370,7 +370,10 @@ class TestVectorSearchPlanning {
   }
 
   private static long cacheHits() {
-    return spark.sql("CALL local.system.index_cache_status(refresh => true)").collectAsList().stream()
+    return spark
+        .sql("CALL local.system.index_cache_status(refresh => true)")
+        .collectAsList()
+        .stream()
         .mapToLong(row -> row.<Long>getAs("hits"))
         .sum();
   }

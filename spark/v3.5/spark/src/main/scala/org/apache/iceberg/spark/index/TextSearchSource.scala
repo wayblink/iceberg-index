@@ -75,7 +75,10 @@ private[spark] case class TextSearchSource(
     extends LeafNode {
 
   override protected def stringArgs: Iterator[Any] =
-    Iterator(s"index=${metadata.indexUuid()}", s"snapshot=$snapshotId", s"k=$limit",
+    Iterator(
+      s"index=${metadata.indexUuid()}",
+      s"snapshot=$snapshotId",
+      s"k=$limit",
       s"prefilter=${filter.isDefined}")
 
   override def computeStats(): Statistics =
@@ -108,18 +111,22 @@ private[spark] case class TextSearchExec(
 
     val hits = source.filter match {
       case Some(filter) =>
-        DistributedIndexSearch.searchFilteredText(
-          spark,
-          metadata,
-          table,
-          query,
-          tasks,
-          filter.projection,
-          filter.pruning,
-          filter).asScala
+        DistributedIndexSearch
+          .searchFilteredText(
+            spark,
+            metadata,
+            table,
+            query,
+            tasks,
+            filter.projection,
+            filter.pruning,
+            filter)
+          .asScala
       case None =>
-        DistributedIndexSearch.searchBatch(
-          spark, metadata, table, java.util.Collections.singletonList(query)).get(0).asScala
+        DistributedIndexSearch
+          .searchBatch(spark, metadata, table, java.util.Collections.singletonList(query))
+          .get(0)
+          .asScala
     }
     if (hits.isEmpty) {
       return spark.sparkContext.emptyRDD[InternalRow]
@@ -127,12 +134,16 @@ private[spark] case class TextSearchExec(
 
     val columns = output.dropRight(1).map(_.name)
     val readSchema = IndexEntries.sparkSchema(table, columns.asJava)
-    val positions = hits.groupBy(_.dataFile()).map { case (file, matches) =>
-      file -> matches.map(hit => java.lang.Long.valueOf(hit.rowPosition())).asJavaCollection
-    }.asJava
+    val positions = hits
+      .groupBy(_.dataFile())
+      .map { case (file, matches) =>
+        file -> matches.map(hit => java.lang.Long.valueOf(hit.rowPosition())).asJavaCollection
+      }
+      .asJava
     val byFile = IndexEntries.rowsAt(spark, table, positions, columns.asJava, readSchema, tasks)
     val rows = hits.map { hit =>
-      val row = Option(byFile.get(hit.dataFile())).flatMap(rows => Option(rows.get(hit.rowPosition())))
+      val row = Option(byFile.get(hit.dataFile()))
+        .flatMap(rows => Option(rows.get(hit.rowPosition())))
         .getOrElse(throw new IllegalStateException(
           s"Text index ${metadata.indexUuid()} referred to a row absent from snapshot $snapshotId " +
             s"at ${hit.dataFile()}:${hit.rowPosition()}; run refresh_text_index"))
@@ -192,19 +203,22 @@ private[spark] object TextSearchFilter {
       throw IndexErrors.analysis("search requires a deterministic scalar filter")
     }
 
-    val (pruning, statsColumns) = try {
-      val folded = NullPropagation(ConstantFolding(Filter(condition, relation))) match {
-        case Filter(expression, _) => expression
-        case _ => condition
+    val (pruning, statsColumns) =
+      try {
+        val folded = NullPropagation(ConstantFolding(Filter(condition, relation))) match {
+          case Filter(expression, _) => expression
+          case _ => condition
+        }
+        val pruning = pruningExpression(folded)
+        val fieldIds =
+          Binder.boundReferences(schema.asStruct(), Collections.singletonList(pruning), true)
+        val names =
+          columns.map(_.name).filter(name => fieldIds.contains(schema.findField(name).fieldId()))
+        (pruning, names)
+      } catch {
+        case _: IllegalArgumentException | _: ValidationException =>
+          (Expressions.alwaysTrue(), Seq.empty)
       }
-      val pruning = pruningExpression(folded)
-      val fieldIds =
-        Binder.boundReferences(schema.asStruct(), Collections.singletonList(pruning), true)
-      val names = columns.map(_.name).filter(name => fieldIds.contains(schema.findField(name).fieldId()))
-      (pruning, names)
-    } catch {
-      case _: IllegalArgumentException | _: ValidationException => (Expressions.alwaysTrue(), Seq.empty)
-    }
 
     TextSearchFilter(
       schema.select(columns.map(_.name).asJava),
@@ -219,7 +233,8 @@ private[spark] object TextSearchFilter {
       case Literal(true, _) => Expressions.alwaysTrue()
       case Literal(false, _) | Literal(null, _) => Expressions.alwaysFalse()
       // Spark treats both signs of zero as equal, while Iceberg orders negative zero first.
-      case other if other.references.exists(a => a.dataType == FloatType || a.dataType == DoubleType) =>
+      case other
+          if other.references.exists(a => a.dataType == FloatType || a.dataType == DoubleType) =>
         Expressions.alwaysTrue()
       case other => SparkExpressionConverter.convertToIcebergExpression(other)
     }

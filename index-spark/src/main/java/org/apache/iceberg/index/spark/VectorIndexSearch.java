@@ -51,7 +51,8 @@ public final class VectorIndexSearch {
   private static final String IVF_NPROBE = "spark.iceberg.index.vector.ivf.nprobe";
 
   /** Encodes the query with the session's probe count when configured for an IVF index. */
-  public static ByteBuffer encodeQuery(SparkSession spark, VectorIndexAdapter adapter, float[] query) {
+  public static ByteBuffer encodeQuery(
+      SparkSession spark, VectorIndexAdapter adapter, float[] query) {
     VectorIndexDefinition definition = (VectorIndexDefinition) adapter.definition();
     if (definition.structure() != VectorIndexDefinition.VectorStructure.IVF) {
       return adapter.encodeQuery(query);
@@ -63,7 +64,8 @@ public final class VectorIndexSearch {
       return adapter.encodeQuery(query);
     }
 
-    String message = "Invalid " + IVF_NPROBE + ": '" + configured + "', expected a positive integer";
+    String message =
+        "Invalid " + IVF_NPROBE + ": '" + configured + "', expected a positive integer";
     int nprobe;
     try {
       nprobe = Integer.parseInt(configured.trim());
