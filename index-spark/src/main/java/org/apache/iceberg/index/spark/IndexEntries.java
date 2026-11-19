@@ -27,6 +27,7 @@ import java.util.Collections;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
+import java.util.NoSuchElementException;
 import java.util.Set;
 import java.util.function.Predicate;
 import org.apache.iceberg.DeleteFile;
@@ -62,6 +63,7 @@ import org.apache.iceberg.util.PartitionUtil;
 import org.apache.spark.api.java.JavaPairRDD;
 import org.apache.spark.api.java.JavaRDD;
 import org.apache.spark.api.java.JavaSparkContext;
+import org.apache.spark.api.java.function.FlatMapFunction;
 import org.apache.spark.api.java.function.Function;
 import org.apache.spark.api.java.function.PairFlatMapFunction;
 import org.apache.spark.api.java.function.PairFunction;
@@ -117,6 +119,15 @@ public final class IndexEntries {
   private static final char NULL_MARKER = '\u0000';
   private static final char VALUE_SEPARATOR = '\u0001';
 
+  // How many data files of one group are read at once. Four streams took the read of a group of 13
+  // Lance files from 54.5 to 122.7 MiB/s on the machine the P4 spike ran on; eight streams added
+  // nothing while holding twice the connections and memory, so four is the number to read with.
+  private static final int READ_STREAMS = 4;
+  // The rows read ahead of the entry loop, per stream: a queue of eight chunks of 128 rows bounds
+  // what a group read holds at once to four streams of that, rather than a whole file of each.
+  private static final int READ_CHUNKS_PER_STREAM = 8;
+  private static final int READ_CHUNK_ROWS = 128;
+
   private IndexEntries() {}
 
   /**
@@ -140,9 +151,10 @@ public final class IndexEntries {
    * The index entries of the given data files, as rows of the entry schema.
    *
    * <p>Unlike {@link #entries} this does not union a whole snapshot into one dataset without saying
-   * how: every data file's rows stay in their own partition. A caller that writes one index file
-   * per group of data files can then read the files of one group into a single task, so the vectors
-   * of that group never cross the cluster. Returns null when there are no data files to read.
+   * how: the rows of one group of data files are kept together, so the caller's task reads the
+   * group whose index file it writes and the vectors of that group never cross the cluster. Within
+   * the group the rows are in data file order and, within a file, in position order. Returns null
+   * when there are no data files to read.
    */
   public static JavaRDD<Row> entryRows(
       SparkSession spark,
@@ -177,7 +189,7 @@ public final class IndexEntries {
     }
 
     SnapshotDeletes deletes = SnapshotDeletes.read(spark, table, taskList, tableSchema);
-    // one configuration for the whole group: each branch of the read would otherwise carry its own
+    // one configuration for the whole group: each stream of the read would otherwise carry its own
     // copy of the Hadoop configuration into the stage's task binary
     SerializableConfiguration conf =
         new SerializableConfiguration(spark.sessionState().newHadoopConf());
@@ -187,19 +199,101 @@ public final class IndexEntries {
     columnsToRead.add(column);
     columnsToRead.addAll(deletes.keyColumns());
     List<String> readColumns = Lists.newArrayList(columnsToRead);
-    // the read is told which columns were asked for, so a column the data file predates comes back
-    // as null rather than as a missing field the row lookup then fails on
+
+    // One partition per group, with the rows read by the task that consumes them: a group is one
+    // index file, so its rows have to reach one task, and a task is one thread. Handing each data
+    // file a partition of its own and merging them with coalesce(1) instead left that one thread
+    // reading the group's files one after another, waiting on the slow request of each file in turn
+    // rather than overlapping them.
+    if (readsInTask(taskList)) {
+      // the read carries the columns in the order the entries index them, so a row's value can be
+      // found by its position in the row: selecting the columns from the table schema instead puts
+      // them in the table's order, which differs as soon as the indexed column is not the first of
+      // the columns a group is read with (equality deletes add their keys to the read)
+      Schema projection = projectionOf(tableSchema, readColumns);
+      StructType rowSchema = toSparkSchema(projection);
+      return JavaSparkContext.fromSparkContext(spark.sparkContext())
+          .parallelize(Collections.singletonList(taskList), 1)
+          .flatMap(
+              (FlatMapFunction<List<FileScanTask>, Row>)
+                  files ->
+                      entryRows(
+                          table.io(),
+                          files,
+                          readColumns,
+                          projection,
+                          rowSchema,
+                          readColumns.indexOf(column),
+                          adapter.skipsNullValues(),
+                          adapter,
+                          deletes,
+                          conf,
+                          skipped));
+    }
+
+    return sparkReadRows(
+        spark, table, taskList, column, readColumns, adapter, deletes, conf, skipped);
+  }
+
+  /** The projection of the given columns, in the order they are read in. */
+  private static Schema projectionOf(Schema tableSchema, List<String> columns) {
+    List<Types.NestedField> fields = Lists.newArrayListWithCapacity(columns.size());
+    for (String column : columns) {
+      Types.NestedField field = tableSchema.findField(column);
+      Preconditions.checkArgument(field != null, "Column is not in the table schema: %s", column);
+      fields.add(field);
+    }
+
+    return new Schema(fields);
+  }
+
+  /**
+   * Whether one task can read the files of the group itself.
+   *
+   * <p>Every format but parquet is already read through the Iceberg format model, in the task, so
+   * reading several files of a group at once reads exactly what the per-file read read. Parquet
+   * keeps Spark's own reader: a task cannot start one for a data file it was handed, and moving
+   * parquet to the format model to gain the concurrency would change the reader a build reads its
+   * data with for a speedup that was measured on Lance files. A group that holds a parquet file
+   * keeps the per-file read.
+   */
+  private static boolean readsInTask(List<FileScanTask> tasks) {
+    for (FileScanTask task : tasks) {
+      if (task.file().format() == FileFormat.PARQUET) {
+        return false;
+      }
+    }
+
+    return true;
+  }
+
+  /**
+   * The entry rows of a group whose files are read by Spark's own readers.
+   *
+   * <p>One partition per data file, merged by the caller: a parquet file is read by the engine's
+   * reader, which a task has to be given a partition to run on.
+   */
+  private static JavaRDD<Row> sparkReadRows(
+      SparkSession spark,
+      Table table,
+      List<FileScanTask> tasks,
+      String column,
+      List<String> readColumns,
+      IndexAdapter adapter,
+      SnapshotDeletes deletes,
+      SerializableConfiguration conf,
+      LongAccumulator skipped) {
+    Schema tableSchema = table.schema();
     StructType readSchema = sparkSchema(table, readColumns);
+    int columnIndex = readColumns.indexOf(column);
+    // only an index type that cannot represent a null asks for the row to be left out: a text index
+    // records a null document as a document with no tokens, and dropping the row would change the
+    // corpus statistics its scores are computed from
+    boolean skipNulls = adapter.skipsNullValues();
 
     JavaRDD<Row> rows = null;
-    for (FileScanTask task : taskList) {
+    for (FileScanTask task : tasks) {
       String dataFile = task.file().location().toString();
-
-      int columnIndex = readColumns.indexOf(column);
-      // only an index type that cannot represent a null asks for the row to be left out: a text
-      // index records a null document as a document with no tokens, and dropping it would change
-      // the corpus statistics its scores are computed from
-      boolean skipNulls = adapter.skipsNullValues();
       JavaRDD<Row> fileRows =
           liveRowsOf(spark, tableSchema, task, readColumns, null, readSchema, deletes, conf)
               .filter(
@@ -220,6 +314,207 @@ public final class IndexEntries {
     }
 
     return rows;
+  }
+
+  /**
+   * The entry rows of the data files of one group, read here on a few streams at once.
+   *
+   * <p>The rows come back in data file order and, within a file, in position order, which is what
+   * the index entries and the list of files an index file covers are written in.
+   *
+   * <p>The value of the indexed column is encoded on the calling thread rather than on the reading
+   * threads: an adapter is handed the rows of one stream at a time, as it was when the files of a
+   * group were read one after another.
+   */
+  private static Iterator<Row> entryRows(
+      FileIO io,
+      List<FileScanTask> files,
+      List<String> readColumns,
+      Schema projection,
+      StructType rowSchema,
+      int columnIndex,
+      boolean skipNulls,
+      IndexAdapter adapter,
+      SnapshotDeletes deletes,
+      SerializableConfiguration conf,
+      LongAccumulator skipped) {
+    List<String> dataFiles = Lists.newArrayListWithCapacity(files.size());
+    List<OrderedParallelReads.Stream<Tuple2<Long, Row>>> streams =
+        Lists.newArrayListWithCapacity(files.size());
+    for (FileScanTask task : files) {
+      String dataFile = task.file().location().toString();
+      dataFiles.add(dataFile);
+      // the deletes belong to the snapshot rather than to the file being read, so the arrays are
+      // looked up once here and closed over by the stream of that file
+      long[] deletedPositions = deletes.deletedPositions(dataFile);
+      List<EqualityKeySet> keySets = deletes.keySets();
+      streams.add(
+          () -> liveRowsOfFile(io, task, projection, rowSchema, deletedPositions, keySets, conf));
+    }
+
+    OrderedParallelReads<Tuple2<Long, Row>> rows =
+        OrderedParallelReads.of(streams, READ_STREAMS, READ_CHUNKS_PER_STREAM, READ_CHUNK_ROWS);
+    return new EntryRows(rows, dataFiles, columnIndex, skipNulls, adapter, skipped);
+  }
+
+  /**
+   * The live rows of one data file, in file order, each with its position in the file.
+   *
+   * <p>The rows are read as they are asked for: a group read on several streams holds a chunk of
+   * each file it is reading rather than a whole file of each. The read carries the columns the
+   * entries need — the indexed column and the equality-delete keys — so no projection follows.
+   */
+  private static CloseableIterator<Tuple2<Long, Row>> liveRowsOfFile(
+      FileIO io,
+      FileScanTask task,
+      Schema projection,
+      StructType rowSchema,
+      long[] deletedPositions,
+      List<EqualityKeySet> keySets,
+      SerializableConfiguration conf) {
+    String dataFile = task.file().location().toString();
+    try {
+      return new LiveRows(
+          openRowsWithFormat(
+              io.newInputFile(task.file()), task.file().format(), projection, rowSchema, conf),
+          deletedPositions,
+          keySets);
+    } catch (IOException e) {
+      throw new UncheckedIOException("Failed to read " + dataFile, e);
+    }
+  }
+
+  /**
+   * The rows of one group's data files as index entries.
+   *
+   * <p>The rows are pulled from the streams in file order and encoded here, one at a time: the
+   * reading threads only read. A failure stops the streams before it is rethrown, because they are
+   * waiting on a queue that nobody would drain again.
+   */
+  private static final class EntryRows implements Iterator<Row> {
+    private final OrderedParallelReads<Tuple2<Long, Row>> rows;
+    private final List<String> dataFiles;
+    private final int columnIndex;
+    private final boolean skipNulls;
+    private final IndexAdapter adapter;
+    private final LongAccumulator skipped;
+    private Row next;
+    private boolean ready;
+
+    private EntryRows(
+        OrderedParallelReads<Tuple2<Long, Row>> rows,
+        List<String> dataFiles,
+        int columnIndex,
+        boolean skipNulls,
+        IndexAdapter adapter,
+        LongAccumulator skipped) {
+      this.rows = rows;
+      this.dataFiles = dataFiles;
+      this.columnIndex = columnIndex;
+      this.skipNulls = skipNulls;
+      this.adapter = adapter;
+      this.skipped = skipped;
+    }
+
+    @Override
+    public boolean hasNext() {
+      return ready || advance();
+    }
+
+    @Override
+    public Row next() {
+      if (!hasNext()) {
+        throw new NoSuchElementException("No more entries to read");
+      }
+
+      ready = false;
+      Row row = next;
+      next = null;
+      return row;
+    }
+
+    private boolean advance() {
+      try {
+        while (rows.hasNext()) {
+          Tuple2<Long, Row> entry = rows.next();
+          Row row = entry._2();
+          // only an index type that cannot represent a null asks for the row to be left out: a text
+          // index records a null document as a document with no tokens, and dropping the row would
+          // change the corpus statistics its scores are computed from
+          if (skipNulls && !hasValue(row, columnIndex, skipped)) {
+            continue;
+          }
+
+          next =
+              RowFactory.create(
+                  dataFiles.get(rows.currentStream()),
+                  entry._1(),
+                  adapter.encodeEntryValue(columnValue(row, columnIndex)));
+          ready = true;
+          return true;
+        }
+
+        return false;
+      } catch (RuntimeException | Error e) {
+        rows.close();
+        throw e;
+      }
+    }
+  }
+
+  /**
+   * The rows of one data file that its delete files leave live, each with its position.
+   *
+   * <p>The position is the row's ordinal in the file, counted as the rows stream past, so the rows
+   * a delete file removes still take up their position.
+   */
+  private static final class LiveRows implements CloseableIterator<Tuple2<Long, Row>> {
+    private final CloseableIterator<Tuple2<Long, Row>> rows;
+    private final long[] deletedPositions;
+    private final List<EqualityKeySet> keySets;
+    private Tuple2<Long, Row> next;
+
+    private LiveRows(
+        CloseableIterator<Tuple2<Long, Row>> rows,
+        long[] deletedPositions,
+        List<EqualityKeySet> keySets) {
+      this.rows = rows;
+      this.deletedPositions = deletedPositions;
+      this.keySets = keySets;
+    }
+
+    @Override
+    public boolean hasNext() {
+      if (next != null) {
+        return true;
+      }
+
+      while (rows.hasNext()) {
+        Tuple2<Long, Row> entry = rows.next();
+        if (isLive(entry._1(), entry._2(), null, deletedPositions, keySets)) {
+          next = entry;
+          return true;
+        }
+      }
+
+      return false;
+    }
+
+    @Override
+    public Tuple2<Long, Row> next() {
+      if (!hasNext()) {
+        throw new NoSuchElementException("No more live rows to read");
+      }
+
+      Tuple2<Long, Row> row = next;
+      next = null;
+      return row;
+    }
+
+    @Override
+    public void close() throws IOException {
+      rows.close();
+    }
   }
 
   /** The delete files of the tasks being read, read once. */
@@ -527,7 +822,16 @@ public final class IndexEntries {
       Collection<Long> positions,
       long[] deletedPositions,
       List<EqualityKeySet> keySets) {
-    long position = tuple._2();
+    return isLive(tuple._2(), tuple._1(), positions, deletedPositions, keySets);
+  }
+
+  /** Whether the row at the given position of a data file survives its delete files. */
+  private static boolean isLive(
+      long position,
+      Row row,
+      Collection<Long> positions,
+      long[] deletedPositions,
+      List<EqualityKeySet> keySets) {
     if (positions != null && !positions.isEmpty() && !positions.contains(position)) {
       return false;
     }
@@ -539,7 +843,7 @@ public final class IndexEntries {
     // a snapshot can hold equality deletes keyed on different columns, and each of them removes its
     // own rows: one key per row would only be able to match one of them
     for (EqualityKeySet keySet : keySets) {
-      if (keySet.keys().contains(equalityKey(tuple._1(), keySet.fields()))) {
+      if (keySet.keys().contains(equalityKey(row, keySet.fields()))) {
         return false;
       }
     }
@@ -1011,6 +1315,72 @@ public final class IndexEntries {
     return RowFactory.create(values);
   }
 
+  /**
+   * Reads every row of one data file in file order, one at a time.
+   *
+   * <p>Unlike {@link #readFileWithFormat} this does not collect the file before returning: a group
+   * whose files are read at once would otherwise hold every file it is reading as rows, which is
+   * both more memory and more work than holding the chunk of each that is being consumed.
+   */
+  private static CloseableIterator<Tuple2<Long, Row>> openRowsWithFormat(
+      InputFile inputFile,
+      FileFormat format,
+      Schema projection,
+      StructType sparkSchema,
+      SerializableConfiguration conf)
+      throws IOException {
+    ReadBuilder<Record, Void> builder =
+        FormatModelRegistry.readBuilder(format, Record.class, inputFile);
+    // a format that opens the file itself does not read through the FileIO, so the storage settings
+    // this table is read with have to be handed to it
+    builder.setAll(storageProperties(taskConf(conf)));
+    return new RowsWithPosition(builder.project(projection).build(), projection, sparkSchema);
+  }
+
+  /** The rows of one data file, each numbered by its position in the file. */
+  private static final class RowsWithPosition implements CloseableIterator<Tuple2<Long, Row>> {
+    private final CloseableIterable<Record> records;
+    private final CloseableIterator<Record> rows;
+    private final Schema projection;
+    private final StructType sparkSchema;
+    private long position = 0;
+
+    private RowsWithPosition(
+        CloseableIterable<Record> records, Schema projection, StructType sparkSchema) {
+      this.records = records;
+      this.rows = records.iterator();
+      this.projection = projection;
+      this.sparkSchema = sparkSchema;
+    }
+
+    @Override
+    public boolean hasNext() {
+      return rows.hasNext();
+    }
+
+    @Override
+    public Tuple2<Long, Row> next() {
+      return new Tuple2<>(position++, rowOf(rows.next(), projection, sparkSchema));
+    }
+
+    @Override
+    public void close() throws IOException {
+      records.close();
+    }
+  }
+
+  /** One record read with the given projection, as the Spark row the index layer works with. */
+  private static Row rowOf(Record record, Schema projection, StructType sparkSchema) {
+    List<Types.NestedField> fields = projection.columns();
+    Object[] values = new Object[fields.size()];
+    for (int i = 0; i < values.length; i++) {
+      Types.NestedField field = fields.get(i);
+      values[i] = toSparkValue(field.type(), record.getField(field.name()));
+    }
+
+    return new GenericRowWithSchema(values, sparkSchema);
+  }
+
   /** Reads every row of one data file with the format model for its format, in file order. */
   private static Iterator<Tuple2<Row, Long>> readFileWithFormat(
       String location,
@@ -1046,15 +1416,10 @@ public final class IndexEntries {
     try (CloseableIterable<Record> records = builder.project(projection).build()) {
       tOpen = System.nanoTime();
       for (Record record : records) {
-        Object[] values = new Object[projection.columns().size()];
-        for (int i = 0; i < values.length; i++) {
-          Types.NestedField field = projection.columns().get(i);
-          values[i] = toSparkValue(field.type(), record.getField(field.name()));
-        }
         // the row is numbered as it streams past, which is its position in the file. A format that
         // honoured the positions returned exactly the rows asked for, and those are relabelled
         // below; until the read ends there is no way to tell the two cases apart
-        rows.add(new Tuple2<>(new GenericRowWithSchema(values, sparkSchema), nextPosition));
+        rows.add(new Tuple2<>(rowOf(record, projection, sparkSchema), nextPosition));
         nextPosition++;
       }
     }
