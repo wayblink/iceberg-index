@@ -39,6 +39,8 @@ import org.apache.iceberg.index.IndexSearchResult;
 import org.apache.iceberg.relocated.com.google.common.base.Preconditions;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableList;
 import org.apache.iceberg.relocated.com.google.common.collect.Lists;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 /**
  * Vectors partitioned around centroids, searched by visiting the nearest partitions.
@@ -65,6 +67,8 @@ public final class IvfKernel implements VectorKernel, RetainedBytes {
   private static final int DIRECTORY_ENTRY_BYTES = 2 * Integer.BYTES;
 
   private static final long serialVersionUID = 1L;
+
+  private static final Logger LOG = LoggerFactory.getLogger(IvfKernel.class);
 
   public static final String NAME = "ivf";
 
@@ -143,11 +147,16 @@ public final class IvfKernel implements VectorKernel, RetainedBytes {
     // build that does not ask for threads produces the bytes it always did.
     int threads = Math.max(1, Math.min(parallelism, Math.max(1, count)));
 
+    long buildStartNanos = System.nanoTime();
     float[][] vectors = decodeAll(materialized, threads);
+    long decodedNanos = System.nanoTime();
 
     int listCount = options.nlistFor(count);
-    float[][] centroids = listCount == 0 ? new float[0][] : train(vectors, listCount, threads);
+    Trained trained = listCount == 0 ? Trained.none() : train(vectors, listCount, threads);
+    float[][] centroids = trained.centroids;
+    long trainedNanos = System.nanoTime();
     int[][] assignments = assign(vectors, centroids, threads);
+    long assignedNanos = System.nanoTime();
     ByteArrayOutputStream payload = new ByteArrayOutputStream();
     boolean blocks = options.listBlocks();
     int directory = 0;
@@ -221,6 +230,19 @@ public final class IvfKernel implements VectorKernel, RetainedBytes {
       }
     }
 
+    long encodedNanos = System.nanoTime();
+    LOG.info(
+        "Encoded an IVF payload of {} entries in {} lists: decode {} ms, train {} ms over {} rounds"
+            + " and {} samples, assign {} ms, encode {} ms",
+        count,
+        centroids.length,
+        millis(decodedNanos - buildStartNanos),
+        millis(trainedNanos - decodedNanos),
+        trained.iterations,
+        trained.samples,
+        millis(assignedNanos - trainedNanos),
+        millis(encodedNanos - assignedNanos));
+
     long dictionaryBytes = VectorMemoryEstimates.dictionaryBytes(dataFiles);
     long quantizerBytes =
         isQuantized() ? RaBitQQuantizer.estimatedListBytes(dimension, listCount) : 0L;
@@ -236,27 +258,24 @@ public final class IvfKernel implements VectorKernel, RetainedBytes {
             isQuantized(),
             quantizerBytes),
         Runtime.getRuntime().availableProcessors(),
-        Map.of(
-            "entry-count",
-            (long) count,
-            "dimension",
-            (long) dimension,
-            "list-count",
-            (long) centroids.length,
-            "data-file-count",
-            (long) dataFiles.size(),
-            "data-file-string-bytes",
-            dictionaryBytes,
-            "payload-bytes",
-            (long) encoded.length,
-            "list-directory-bytes",
-            2L * PreparedStructureSize.ints(centroids.length),
-            "quantizer-bytes",
-            quantizerBytes,
-            "quantizer-bits",
-            isQuantized() ? (long) quantizer.bits() : 0L,
-            "code-bytes",
-            isQuantized() ? (long) quantizer.codeBytes() : 0L));
+        Map.ofEntries(
+            Map.entry("entry-count", (long) count),
+            Map.entry("dimension", (long) dimension),
+            Map.entry("list-count", (long) centroids.length),
+            Map.entry("data-file-count", (long) dataFiles.size()),
+            Map.entry("data-file-string-bytes", dictionaryBytes),
+            Map.entry("payload-bytes", (long) encoded.length),
+            Map.entry("list-directory-bytes", 2L * PreparedStructureSize.ints(centroids.length)),
+            Map.entry("quantizer-bytes", quantizerBytes),
+            Map.entry("quantizer-bits", isQuantized() ? (long) quantizer.bits() : 0L),
+            Map.entry("code-bytes", isQuantized() ? (long) quantizer.codeBytes() : 0L),
+            Map.entry("train-samples", (long) trained.samples),
+            Map.entry("train-iterations", (long) trained.iterations),
+            // the build-time knobs that shift quality against time; zero is the behaviour every
+            // index file had before the knobs existed, and the build records what it actually ran
+            Map.entry("train-tolerance-ppm", 0L),
+            Map.entry("assign-kernel-simd", 0L),
+            Map.entry("build-kernel-native", 0L)));
   }
 
   /** The vectors of the entries, checked against what this index can store. */
@@ -1254,7 +1273,7 @@ public final class IvfKernel implements VectorKernel, RetainedBytes {
    * <p>The sample is every k-th vector, which spreads it over the file without a random draw, so
    * the same file trains the same centroids every time it is built.
    */
-  private float[][] train(float[][] vectors, int listCount, int threads) {
+  private Trained train(float[][] vectors, int listCount, int threads) {
     int sampleCount = IvfOptions.samplesFor(vectors.length, listCount);
     int stride = Math.max(1, vectors.length / sampleCount);
     float[][] sample = new float[sampleCount][];
@@ -1268,7 +1287,9 @@ public final class IvfKernel implements VectorKernel, RetainedBytes {
       centroids[i] = sample[Math.min(sampleCount - 1, (int) ((long) i * sampleCount / listCount))];
     }
 
+    int iterations = 0;
     for (int iteration = 0; iteration < MAX_ITERATIONS; iteration++) {
+      iterations = iteration + 1;
       int[] assignment = nearestCentroid(sample, centroids, threads);
       float[][] sums = new float[listCount][dimension];
       int[] sizes = new int[listCount];
@@ -1301,7 +1322,31 @@ public final class IvfKernel implements VectorKernel, RetainedBytes {
       }
     }
 
-    return centroids;
+    return new Trained(centroids, sampleCount, iterations);
+  }
+
+  /**
+   * The centroids one build trained, and how much it spent: the sample count and the rounds that
+   * actually ran. A build that stops early reports fewer rounds than the cap.
+   */
+  private static final class Trained {
+    private final float[][] centroids;
+    private final int samples;
+    private final int iterations;
+
+    private Trained(float[][] centroids, int samples, int iterations) {
+      this.centroids = centroids;
+      this.samples = samples;
+      this.iterations = iterations;
+    }
+
+    private static Trained none() {
+      return new Trained(new float[0][], 0, 0);
+    }
+  }
+
+  private static long millis(long nanos) {
+    return nanos / 1_000_000L;
   }
 
   /**

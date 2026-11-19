@@ -29,9 +29,11 @@ import java.lang.reflect.Field;
 import java.nio.ByteBuffer;
 import java.nio.file.Path;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import org.apache.iceberg.index.IndexAdapter;
 import org.apache.iceberg.index.IndexBlob;
+import org.apache.iceberg.index.IndexBuildResult;
 import org.apache.iceberg.index.IndexEntry;
 import org.apache.iceberg.index.IndexSearchResult;
 import org.apache.iceberg.index.PuffinIndexFileContainer;
@@ -381,6 +383,26 @@ class TestIvfKernel {
     assertThat(found / (double) (probes * 10))
         .as("the exact top ten among the partitions a narrow search visits")
         .isGreaterThan(0.6);
+  }
+
+  @Test
+  public void aBuildRecordsWhatItSpentOnTheCentroids() {
+    List<IndexEntry> entries = entries(VectorIndexDefinition.Metric.L2);
+    VectorIndexAdapter ivf = quantizedAdapter(VectorIndexDefinition.Metric.L2, 0, 8);
+
+    IndexBuildResult built = ivf.encodeAuxiliaryPayloadWithMemory(entries, 1);
+
+    // 400 entries give round(sqrt(400)) = 20 lists and min(400, max(20, 20 * 39)) = 400 samples
+    Map<String, Long> structure = built.memory().structure();
+    assertThat(structure)
+        .as("a build states the centroids it trained and the rounds it ran")
+        .containsEntry("train-samples", 400L)
+        .containsEntry("train-tolerance-ppm", 0L)
+        .containsEntry("assign-kernel-simd", 0L)
+        .containsEntry("build-kernel-native", 0L);
+    assertThat(structure.get("train-iterations"))
+        .as("a build runs at least one round and never more than the cap")
+        .isBetween(1L, 25L);
   }
 
   private static VectorIndexAdapter quantizedAdapter(
