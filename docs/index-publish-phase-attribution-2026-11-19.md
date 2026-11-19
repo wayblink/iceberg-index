@@ -112,7 +112,7 @@ p4 运行没有程序内计时，只能从 CALL 与提交时间推出两段：
 
 ## 复现
 
-- 计时代码：分支 `card/3146`（基于 `index@1a92ea349c`），只加 `IDXPHASE` 日志，不改语义；镜像 `hub.i.basemind.com/wanganyang/sparkann-e2e:oss-bench-20261119-3146-phase@sha256:6ad2dfbb15bd06f801a7b98810e260d95c88cfb4ea80f4964bfa711b504f3ce8`，runtime jar sha256 `e27c9296fae4e948c872d8f5f3f0458132cd8d1c94a0e7867c8793e454456092`。
+- 计时代码：分支 `measure/3146-phase-timing`（基于 `index@1a92ea349c`，只有 `IDXPHASE` 日志、不改语义；`measure/3152-counts` 是它加上本页两项优化的测量分支），镜像 `hub.i.basemind.com/wanganyang/sparkann-e2e:oss-bench-20261119-3146-phase@sha256:6ad2dfbb15bd06f801a7b98810e260d95c88cfb4ea80f4964bfa711b504f3ce8`，runtime jar sha256 `e27c9296fae4e948c872d8f5f3f0458132cd8d1c94a0e7867c8793e454456092`。
 - 运行：`~/probe3142/launch-3146.sh` → `vb/run-format-benchmark.sh --params params/oss32-4b-3146-phase.yaml --format lance-iceberg --out runs/oss32-3146-phase-1119-1428 --index-only`；产物在 `~/probe3142/vb/runs/oss32-3146-phase-1119-1428/`（driver log、events jsonl、plan、provenance）。
 - 历史四次的证据：`~/probe3142/vb/runs/oss32-{ab-kd,ab-km,ab-kt}-1119-1312/`、`oss32-p4-default-1119-1351/`（driver log + Spark event log）。
 - 本次新建的索引：`fmt-3146-4b`（uuid `beb6d01e-0b91-48fc-9805-3431b9113777`，33 个索引文件、10,784,401 条目），留在同一张基准表上，与之前各卡留下的 `fmt-*` 索引一致。同期表上出现的 `fmt-fx-4b`（无 snapshot）不是本次运行建的，未处理。
