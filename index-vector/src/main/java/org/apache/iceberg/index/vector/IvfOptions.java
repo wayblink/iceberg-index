@@ -72,26 +72,44 @@ public final class IvfOptions implements java.io.Serializable {
 
   static final String LIST_BLOCKS = "ivf-list-blocks";
 
+  /**
+   * The nearest-centroid kernel a build runs: {@code exact} or {@code simd}.
+   *
+   * <p>The {@code simd} kernel is an optional alternative whose classes come from the vector API,
+   * an incubator module that is not in the JDK's default module graph; a JVM that cannot load it
+   * falls back to {@code exact} rather than failing the build. Only the build reads this option.
+   */
+  static final String ASSIGN_KERNEL = "ivf-assign-kernel";
+
+  /** The kernels {@link #ASSIGN_KERNEL} names. */
+  enum AssignKernel {
+    EXACT,
+    SIMD
+  }
+
   private static final ImmutableSet<String> KEYS =
       ImmutableSet.of(
           NLIST,
           LIST_BLOCKS,
           TRAIN_SAMPLES_PER_LIST,
           TRAIN_MAX_ITERATIONS,
-          TRAIN_CONVERGENCE_TOLERANCE);
+          TRAIN_CONVERGENCE_TOLERANCE,
+          ASSIGN_KERNEL);
 
   private final int nlist;
   private final boolean listBlocks;
   private final int trainSamplesPerList;
   private final int trainMaxIterations;
   private final double trainConvergenceTolerance;
+  private final AssignKernel assignKernel;
 
   private IvfOptions(
       int nlist,
       boolean listBlocks,
       int trainSamplesPerList,
       int trainMaxIterations,
-      double trainConvergenceTolerance) {
+      double trainConvergenceTolerance,
+      AssignKernel assignKernel) {
     Preconditions.checkArgument(nlist >= 0, "Invalid IVF %s: %s", NLIST, nlist);
     Preconditions.checkArgument(
         trainSamplesPerList >= 1,
@@ -116,6 +134,7 @@ public final class IvfOptions implements java.io.Serializable {
     this.trainSamplesPerList = trainSamplesPerList;
     this.trainMaxIterations = trainMaxIterations;
     this.trainConvergenceTolerance = trainConvergenceTolerance;
+    this.assignKernel = assignKernel;
   }
 
   /** The property keys this structure reads, for a caller that has to report what it supports. */
@@ -162,11 +181,22 @@ public final class IvfOptions implements java.io.Serializable {
         Boolean.parseBoolean(blocks),
         intOption(properties, TRAIN_SAMPLES_PER_LIST, DEFAULT_TRAIN_SAMPLES_PER_LIST),
         intOption(properties, TRAIN_MAX_ITERATIONS, DEFAULT_TRAIN_MAX_ITERATIONS),
-        doubleOption(properties, TRAIN_CONVERGENCE_TOLERANCE, DEFAULT_TRAIN_CONVERGENCE_TOLERANCE));
+        doubleOption(properties, TRAIN_CONVERGENCE_TOLERANCE, DEFAULT_TRAIN_CONVERGENCE_TOLERANCE),
+        assignKernelOption(properties));
   }
 
   boolean listBlocks() {
     return listBlocks;
+  }
+
+  /**
+   * Whether the build was asked to run the vector API assignment kernel.
+   *
+   * <p>A JVM that cannot load the kernel still reports {@code true} here; the kernel is the build's
+   * choice, and the build records whether it could act on it.
+   */
+  boolean simdAssignKernel() {
+    return assignKernel == AssignKernel.SIMD;
   }
 
   int trainSamplesPerList() {
@@ -239,6 +269,21 @@ public final class IvfOptions implements java.io.Serializable {
       throw new IllegalArgumentException(
           String.format(Locale.ROOT, "IVF option %s is not a number: %s", key, value), e);
     }
+  }
+
+  private static AssignKernel assignKernelOption(Map<String, String> properties) {
+    String value = properties.getOrDefault(ASSIGN_KERNEL, AssignKernel.EXACT.name());
+    return switch (value.trim().toLowerCase(Locale.ROOT)) {
+      case "exact" -> AssignKernel.EXACT;
+      case "simd" -> AssignKernel.SIMD;
+      default ->
+          throw new IllegalArgumentException(
+              String.format(
+                  Locale.ROOT,
+                  "Invalid IVF %s: %s (expected exact or simd)",
+                  ASSIGN_KERNEL,
+                  value));
+    };
   }
 
   private static double doubleOption(

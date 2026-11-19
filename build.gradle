@@ -827,6 +827,28 @@ project(':iceberg-gcp') {
 }
 
 project(':iceberg-index-vector') {
+  sourceSets {
+    // The vector API is an incubator module and is not part of the JDK's default module graph, so
+    // the kernel that uses it is compiled on its own and shipped in the main jar. The main source
+    // set only loads it reflectively, which keeps a JVM without --add-modules working.
+    simd {
+      java.srcDir "$projectDir/src/simd/java"
+      compileClasspath = sourceSets.main.output + sourceSets.main.compileClasspath
+    }
+
+    test {
+      runtimeClasspath += simd.output
+    }
+  }
+
+  tasks.named('compileSimdJava', JavaCompile) {
+    options.compilerArgs += ['--add-modules', 'jdk.incubator.vector']
+  }
+
+  tasks.named('jar', Jar) {
+    from sourceSets.simd.output
+  }
+
   test {
     useJUnitPlatform()
   }

@@ -91,6 +91,15 @@ public final class IvfKernel implements VectorKernel, RetainedBytes {
   private static final int ASSIGN_VECTOR_BLOCK = 16;
 
   /**
+   * Where the optional vector API assignment kernel is loaded from.
+   *
+   * <p>The class lives in its own source set because the module it needs is an incubator one; it
+   * may be absent, and asking for it then falls back to the exact kernel.
+   */
+  private static final String SIMD_ASSIGN_KERNEL_CLASS =
+      "org.apache.iceberg.index.vector.SimdAssignKernel";
+
+  /**
    * The retained fields of the prepared roots, in the layout the estimate describes: the loaded
    * payload, the searcher and the scoring object.
    */
@@ -108,6 +117,14 @@ public final class IvfKernel implements VectorKernel, RetainedBytes {
 
   /** Present when the vectors are stored as codes rather than as themselves. */
   private final RaBitQQuantizer quantizer;
+
+  /**
+   * Whether the build in progress assigned a row with the vector API kernel.
+   *
+   * <p>It is reset when a build starts and read when the build records what it spent, so a
+   * definition that asked for the kernel but ran on a JVM that could not load it says zero.
+   */
+  private boolean simdAssignUsed;
 
   private IvfKernel(
       int dimension, IvfOptions options, VectorScoring scoring, RaBitQQuantizer quantizer) {
@@ -152,6 +169,7 @@ public final class IvfKernel implements VectorKernel, RetainedBytes {
     Preconditions.checkNotNull(entries, "Index entries are null");
     List<IndexEntry> materialized = Lists.newArrayList(entries);
     int count = materialized.size();
+    simdAssignUsed = false;
 
     List<String> dataFiles = VectorPayloads.dataFilesOf(materialized);
     // How many threads this build may use. One keeps every loop on the path it always took, so a
@@ -280,7 +298,7 @@ public final class IvfKernel implements VectorKernel, RetainedBytes {
             // the build-time knobs that trade quality against time; zero is what a definition that
             // sets none of them runs, and a definition that set a tolerance records it here
             Map.entry("train-tolerance-ppm", options.tolerancePartsPerMillion()),
-            Map.entry("assign-kernel-simd", 0L),
+            Map.entry("assign-kernel-simd", simdAssignUsed ? 1L : 0L),
             Map.entry("build-kernel-native", 0L)));
   }
 
@@ -1342,7 +1360,11 @@ public final class IvfKernel implements VectorKernel, RetainedBytes {
     int iterations = 0;
     for (int iteration = 0; iteration < maxIterations; iteration++) {
       iterations = iteration + 1;
-      int[] assignment = nearestCentroid(sample, centroids, threads);
+      // the training assignment stays exact: k-means is where the centroids come from, and a
+      // float32 assignment there would move every list rather than the rows near a tie. The
+      // option accelerates the pass that places the vectors of the file, which is the measured
+      // one, and a build that sets it still trains the centres the exact kernel trains.
+      int[] assignment = nearestCentroid(sample, centroids, threads, false);
       float[][] sums = new float[listCount][dimension];
       int[] sizes = new int[listCount];
       for (int i = 0; i < sample.length; i++) {
@@ -1448,7 +1470,7 @@ public final class IvfKernel implements VectorKernel, RetainedBytes {
       return new int[0][];
     }
 
-    int[] assignment = nearestCentroid(vectors, centroids, threads);
+    int[] assignment = nearestCentroid(vectors, centroids, threads, options.simdAssignKernel());
     int[][] members = new int[centroids.length][];
     int[] sizes = new int[centroids.length];
     for (int list : assignment) {
@@ -1475,8 +1497,17 @@ public final class IvfKernel implements VectorKernel, RetainedBytes {
    * writes only its own slots: the assignment is the one a single thread would have produced, in
    * the same order and to the same list.
    */
-  private int[] nearestCentroid(float[][] vectors, float[][] centroids, int threads) {
+  private int[] nearestCentroid(
+      float[][] vectors, float[][] centroids, int threads, boolean simdKernel) {
     if (scoring.metric() == VectorIndexDefinition.Metric.L2) {
+      if (simdKernel) {
+        int[] vectorized = nearestCentroidL2Simd(vectors, centroids, threads);
+        if (vectorized != null) {
+          simdAssignUsed = true;
+          return vectorized;
+        }
+      }
+
       return nearestCentroidL2(vectors, centroids, threads);
     }
 
@@ -1517,6 +1548,75 @@ public final class IvfKernel implements VectorKernel, RetainedBytes {
         vectors.length,
         range -> assignRange(vectors, centroids, dimension, range, assignment));
     return assignment;
+  }
+
+  /**
+   * Puts every vector under its nearest centroid with the vector API kernel.
+   *
+   * <p>The kernel is optional: it is compiled apart from the rest of the structure because the
+   * module it needs is not in the JDK's default module graph. This returns {@code null} when the
+   * kernel cannot be loaded, which leaves the caller to run the exact kernel rather than fail the
+   * build.
+   *
+   * <p>Package-private so the assignment it produces can be compared with the exact kernel on the
+   * same vectors and centroids.
+   */
+  static int[] nearestCentroidL2Simd(float[][] vectors, float[][] centroids, int threads) {
+    int[] assignment = new int[vectors.length];
+    if (vectors.length == 0 || centroids.length == 0) {
+      return assignment;
+    }
+
+    AssignKernel kernel = SimdAssignHolder.kernel();
+    if (kernel == null) {
+      return null;
+    }
+
+    int dimension = centroids[0].length;
+    runInParallel(
+        threads,
+        vectors.length,
+        range -> kernel.assignRange(vectors, centroids, dimension, range, assignment));
+    return assignment;
+  }
+
+  /**
+   * Loads the optional vector API kernel on first use, and never retries.
+   *
+   * <p>The class is loaded reflectively because the main source set cannot reference the incubator
+   * module: a JVM that was not started with {@code --add-modules jdk.incubator.vector} still builds
+   * every structure, and only a build that asks for this kernel pays for finding out. The probe
+   * call runs the kernel on the calling thread, so a module that is missing fails here rather than
+   * inside a worker, and the build then falls back to the exact kernel.
+   */
+  private static final class SimdAssignHolder {
+    private static final AssignKernel KERNEL = load();
+
+    private static AssignKernel load() {
+      try {
+        Class<?> type =
+            Class.forName(SIMD_ASSIGN_KERNEL_CLASS, true, IvfKernel.class.getClassLoader());
+        AssignKernel kernel = (AssignKernel) type.getDeclaredConstructor().newInstance();
+        // running it once links the classes of the incubator module here, where a failure is
+        // caught, instead of leaving it to the first worker that calls the kernel; the probe is a
+        // full block of rows against two centroids, so both kernel paths run
+        float[][] vectors = {new float[16], new float[16], new float[16], new float[16]};
+        float[][] centroids = {new float[16], new float[16]};
+        kernel.assignRange(vectors, centroids, 16, new int[] {0, 4}, new int[4]);
+        return kernel;
+      } catch (ReflectiveOperationException | LinkageError e) {
+        LOG.warn(
+            "Cannot run the vector API assignment kernel, so builds that ask for it fall back to"
+                + " the exact kernel. Start the JVM with --add-modules jdk.incubator.vector to use"
+                + " it.",
+            e);
+        return null;
+      }
+    }
+
+    private static AssignKernel kernel() {
+      return KERNEL;
+    }
   }
 
   /** Assigns the rows of one range of vectors, one block at a time. */
