@@ -28,8 +28,11 @@ import java.lang.management.ManagementFactory;
 import java.lang.reflect.Field;
 import java.nio.ByteBuffer;
 import java.nio.file.Path;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
 import java.util.List;
 import java.util.Map;
+import java.util.Random;
 import java.util.Set;
 import org.apache.iceberg.index.IndexAdapter;
 import org.apache.iceberg.index.IndexBlob;
@@ -201,6 +204,149 @@ class TestIvfKernel {
     assertThat(VectorPayloads.toBytes(second))
         .as("training samples deterministically, so a rebuild reproduces the partitions")
         .isEqualTo(VectorPayloads.toBytes(first));
+  }
+
+  @Test
+  void blockedL2AssignmentMatchesTheSequentialKernel() {
+    // the kernel now walks a block of vectors against each centroid and sums in four accumulators;
+    // neither may move a row to another list, so every shape below is compared with the sequential
+    // kernel this replaced
+    Random random = new Random(3140L);
+    int[][] shapes = {
+      {1, 1, 37}, // a dimension that is not a multiple of the accumulator count
+      {64, 1, 37}, // one list: every row has to land in it
+      {300, 17, 37},
+      {200, 8, 128}, // a dimension that is a multiple of the accumulator count
+    };
+
+    for (int[] shape : shapes) {
+      float[][] vectors = randomVectors(random, shape[0], shape[2]);
+      float[][] centroids = randomVectors(random, shape[1], shape[2]);
+      int[] expected = referenceAssign(vectors, centroids);
+      for (int threads : new int[] {1, 4}) {
+        assertThat(IvfKernel.nearestCentroidL2(vectors, centroids, threads))
+            .as(
+                "%s vectors against %s centroids of %s dimensions on %s threads",
+                shape[0], shape[1], shape[2], threads)
+            .containsExactly(expected);
+      }
+    }
+  }
+
+  @Test
+  void anEqualDistanceKeepsTheEarlierList() {
+    // every distance below is an exact power of two, so the tie is exact and the tie-break decides
+    float[][] vectors = {{0.0f, 0.0f, 0.0f, 0.0f}};
+    float[][] tieForSecond = {
+      {2.0f, 0.0f, 0.0f, 0.0f}, // distance 2
+      {1.0f, 1.0f, 1.0f, 1.0f}, // distance 2 too, and the earlier list keeps the row
+      {1.0f, 0.0f, 0.0f, 0.0f}, // distance 1: strictly closer, so it wins
+    };
+    assertThat(IvfKernel.nearestCentroidL2(vectors, tieForSecond, 2)).containsExactly(2);
+
+    float[][] tieForNearest = {
+      {3.0f, 0.0f, 0.0f, 0.0f},
+      {1.0f, 0.0f, 0.0f, 0.0f},
+      {-1.0f, 0.0f, 0.0f, 0.0f}, // equal to the previous centroid: the previous one stays
+    };
+    assertThat(IvfKernel.nearestCentroidL2(vectors, tieForNearest, 1)).containsExactly(1);
+
+    float[][] sixDimensional = {{0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f}};
+    float[][] laneSplit = {
+      {0.5f, 0.5f, 0.0f, 0.0f, 0.0f, 0.0f}, // the equal terms land in different accumulators
+      {0.5f, 0.0f, 0.5f, 0.0f, 0.0f, 0.0f},
+    };
+    assertThat(IvfKernel.nearestCentroidL2(sixDimensional, laneSplit, 1)).containsExactly(0);
+  }
+
+  @Test
+  void aBlockedBuildWritesTheSamePayloadEveryTime() {
+    List<IndexEntry> entries = entries(VectorIndexDefinition.Metric.L2);
+    VectorIndexAdapter ivf = adapter(VectorIndexDefinition.Metric.L2, 17, 1);
+
+    byte[] first = VectorPayloads.toBytes(ivf.encodeAuxiliaryPayload(entries, 4));
+    byte[] second = VectorPayloads.toBytes(ivf.encodeAuxiliaryPayload(entries, 4));
+    byte[] serial = VectorPayloads.toBytes(ivf.encodeAuxiliaryPayload(entries, 1));
+
+    assertThat(second).as("a rebuild of the same entries writes the same bytes").isEqualTo(first);
+    assertThat(serial)
+        .as("the list a row lands in does not depend on the thread that placed it")
+        .isEqualTo(first);
+  }
+
+  @Test
+  void theBlockedKernelWritesTheBytesTheSequentialKernelWrote() {
+    // digests of the payloads the sequential kernel wrote at index@3fb696e459, taken before the
+    // blocking change: the block order and the four accumulators must not move a single byte of
+    // the centroids, the list membership or the encoded lists
+    List<IndexEntry> entries = entries(VectorIndexDefinition.Metric.L2);
+    assertThat(
+            digest(
+                adapter(VectorIndexDefinition.Metric.L2, 17, 1).encodeAuxiliaryPayload(entries, 1)))
+        .as("the full payload")
+        .isEqualTo("b0889a26eca32923dc94b4e2b4bae55c9b2bb16dac5149dd0f4646688b8bf171");
+    assertThat(
+            digest(
+                quantizedAdapter(VectorIndexDefinition.Metric.L2, 17, 1)
+                    .encodeAuxiliaryPayload(entries, 1)))
+        .as("the quantized payload")
+        .isEqualTo("2fbad9ff4a998c53f1bada368e98a71959904350f8f943a2bc09d6da07da8156");
+  }
+
+  /**
+   * The assignment kernel as it ran before the blocking change: one vector at a time, in list
+   * order, with the same strict less-than and the same distance.
+   */
+  private static int[] referenceAssign(float[][] vectors, float[][] centroids) {
+    int[] assignment = new int[vectors.length];
+    for (int i = 0; i < vectors.length; i++) {
+      int nearest = 0;
+      double best = referenceDistance(vectors[i], centroids[0]);
+      for (int list = 1; list < centroids.length; list++) {
+        double distance = referenceDistance(vectors[i], centroids[list]);
+        if (Double.compare(distance, best) < 0) {
+          nearest = list;
+          best = distance;
+        }
+      }
+
+      assignment[i] = nearest;
+    }
+
+    return assignment;
+  }
+
+  private static double referenceDistance(float[] vector, float[] centroid) {
+    double squared = 0.0;
+    for (int d = 0; d < vector.length; d++) {
+      double difference = (double) vector[d] - centroid[d];
+      squared += difference * difference;
+    }
+
+    return Math.sqrt(squared);
+  }
+
+  private static float[][] randomVectors(Random random, int count, int dimension) {
+    float[][] vectors = new float[count][dimension];
+    for (float[] vector : vectors) {
+      for (int d = 0; d < dimension; d++) {
+        vector[d] = (random.nextFloat() - 0.5f) * 4.0f;
+      }
+    }
+
+    return vectors;
+  }
+
+  private static String digest(ByteBuffer payload) {
+    try {
+      StringBuilder hex = new StringBuilder();
+      for (byte b : MessageDigest.getInstance("SHA-256").digest(VectorPayloads.toBytes(payload))) {
+        hex.append(String.format("%02x", b));
+      }
+      return hex.toString();
+    } catch (NoSuchAlgorithmException e) {
+      throw new IllegalStateException("Every JVM ships SHA-256", e);
+    }
   }
 
   @Test

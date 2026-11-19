@@ -82,6 +82,15 @@ public final class IvfKernel implements VectorKernel, RetainedBytes {
   private static final double DISPLACEMENT_EPSILON = 1e-12;
 
   /**
+   * How many vectors the assignment kernel walks against one centroid row before it moves on.
+   *
+   * <p>Sixteen rows of 2560 dimensions are 320 KB once converted to double: the block stays in the
+   * core's cache while one centroid row is compared with all of it. No row ever changes block, so
+   * each row's own list is decided without seeing another row.
+   */
+  private static final int ASSIGN_VECTOR_BLOCK = 16;
+
+  /**
    * The retained fields of the prepared roots, in the layout the estimate describes: the loaded
    * payload, the searcher and the scoring object.
    */
@@ -1459,7 +1468,6 @@ public final class IvfKernel implements VectorKernel, RetainedBytes {
     return members;
   }
 
-  /** The index of the centroid each vector is closest to. */
   /**
    * Puts every vector under its nearest centroid.
    *
@@ -1468,6 +1476,13 @@ public final class IvfKernel implements VectorKernel, RetainedBytes {
    * the same order and to the same list.
    */
   private int[] nearestCentroid(float[][] vectors, float[][] centroids, int threads) {
+    if (scoring.metric() == VectorIndexDefinition.Metric.L2) {
+      return nearestCentroidL2(vectors, centroids, threads);
+    }
+
+    // a cosine or dot-product assignment keeps walking one vector at a time: the blocked kernel
+    // is written for the L2 sum, and those two metrics are not what the payloads in use are built
+    // by, so their path stays the one their bytes were built by
     int[] assignment = new int[vectors.length];
     runInParallel(
         threads,
@@ -1478,6 +1493,188 @@ public final class IvfKernel implements VectorKernel, RetainedBytes {
           }
         });
     return assignment;
+  }
+
+  /**
+   * Puts every vector under its nearest centroid by L2 distance.
+   *
+   * <p>The rows are walked in blocks: the block is converted to double once, then each centroid row
+   * is loaded once and compared with every row of the block, two rows at a time so both share the
+   * centroid's loads. A row still decides its list on its own, in list order and with the same
+   * tie-break: when two centroids are equally far away, the earlier list keeps the row.
+   * Package-private so the block order and the four accumulators can be compared with the
+   * sequential kernel they replaced.
+   */
+  static int[] nearestCentroidL2(float[][] vectors, float[][] centroids, int threads) {
+    int[] assignment = new int[vectors.length];
+    if (vectors.length == 0) {
+      return assignment;
+    }
+
+    int dimension = centroids[0].length;
+    runInParallel(
+        threads,
+        vectors.length,
+        range -> assignRange(vectors, centroids, dimension, range, assignment));
+    return assignment;
+  }
+
+  /** Assigns the rows of one range of vectors, one block at a time. */
+  private static void assignRange(
+      float[][] vectors, float[][] centroids, int dimension, int[] range, int[] assignment) {
+    int blockCount = Math.min(ASSIGN_VECTOR_BLOCK, range[1] - range[0]);
+    // the scratch of one range: the block as doubles, one centroid row, and the per-row results
+    double[] rows = new double[blockCount * dimension];
+    double[] centroidRow = new double[dimension];
+    double[] best = new double[blockCount];
+    int[] nearest = new int[blockCount];
+    double[] distances = new double[2];
+
+    for (int begin = range[0]; begin < range[1]; begin += ASSIGN_VECTOR_BLOCK) {
+      int end = Math.min(begin + ASSIGN_VECTOR_BLOCK, range[1]);
+      int block = end - begin;
+      for (int b = 0; b < block; b++) {
+        float[] row = vectors[begin + b];
+        int base = b * dimension;
+        for (int d = 0; d < dimension; d++) {
+          // a float converts to a double exactly, so this is the arithmetic the sequential kernel
+          // did, only out of a layout the inner loop can read without converting every dimension
+          rows[base + d] = row[d];
+        }
+      }
+
+      copyRow(centroids[0], centroidRow);
+      for (int b = 0; b < block; b++) {
+        best[b] = l2Distance(rows, b * dimension, centroidRow, dimension);
+        nearest[b] = 0;
+      }
+
+      for (int list = 1; list < centroids.length; list++) {
+        copyRow(centroids[list], centroidRow);
+        int b = 0;
+        for (; b + 1 < block; b += 2) {
+          l2DistancePair(
+              rows, b * dimension, (b + 1) * dimension, centroidRow, dimension, distances);
+          keepNearer(distances[0], list, b, best, nearest);
+          keepNearer(distances[1], list, b + 1, best, nearest);
+        }
+
+        for (; b < block; b++) {
+          keepNearer(
+              l2Distance(rows, b * dimension, centroidRow, dimension), list, b, best, nearest);
+        }
+      }
+
+      for (int b = 0; b < block; b++) {
+        assignment[begin + b] = nearest[b];
+      }
+    }
+  }
+
+  /** Keeps the list of a strictly closer centroid; an equal distance keeps the earlier list. */
+  private static void keepNearer(double distance, int list, int b, double[] best, int[] nearest) {
+    if (Double.compare(distance, best[b]) < 0) {
+      best[b] = distance;
+      nearest[b] = list;
+    }
+  }
+
+  /** Copies a float row into the double row the inner loops read. */
+  private static void copyRow(float[] source, double[] target) {
+    for (int d = 0; d < target.length; d++) {
+      target[d] = source[d];
+    }
+  }
+
+  /**
+   * The L2 distance of one row from a centroid, with the sum split into four accumulators to
+   * shorten the dependency chain.
+   */
+  private static double l2Distance(double[] rows, int base, double[] centroid, int dimension) {
+    double accumulator0 = 0.0;
+    double accumulator1 = 0.0;
+    double accumulator2 = 0.0;
+    double accumulator3 = 0.0;
+    int d = 0;
+    for (; d + 3 < dimension; d += 4) {
+      double difference0 = rows[base + d] - centroid[d];
+      double difference1 = rows[base + d + 1] - centroid[d + 1];
+      double difference2 = rows[base + d + 2] - centroid[d + 2];
+      double difference3 = rows[base + d + 3] - centroid[d + 3];
+      accumulator0 += difference0 * difference0;
+      accumulator1 += difference1 * difference1;
+      accumulator2 += difference2 * difference2;
+      accumulator3 += difference3 * difference3;
+    }
+
+    double squared = accumulator0 + accumulator1 + accumulator2 + accumulator3;
+    for (; d < dimension; d++) {
+      double difference = rows[base + d] - centroid[d];
+      squared += difference * difference;
+    }
+
+    return Math.sqrt(squared);
+  }
+
+  /**
+   * The L2 distance of two rows from one centroid, loading each centroid value once for both.
+   *
+   * <p>Each row keeps its own four accumulators, so both distances are the ones {@link #l2Distance}
+   * would compute; sharing only the loads changes nothing about the sums.
+   */
+  private static void l2DistancePair(
+      double[] rows,
+      int firstBase,
+      int secondBase,
+      double[] centroid,
+      int dimension,
+      double[] distances) {
+    double first0 = 0.0;
+    double first1 = 0.0;
+    double first2 = 0.0;
+    double first3 = 0.0;
+    double second0 = 0.0;
+    double second1 = 0.0;
+    double second2 = 0.0;
+    double second3 = 0.0;
+    int d = 0;
+    for (; d + 3 < dimension; d += 4) {
+      double centroid0 = centroid[d];
+      double centroid1 = centroid[d + 1];
+      double centroid2 = centroid[d + 2];
+      double centroid3 = centroid[d + 3];
+
+      double firstDifference0 = rows[firstBase + d] - centroid0;
+      double firstDifference1 = rows[firstBase + d + 1] - centroid1;
+      double firstDifference2 = rows[firstBase + d + 2] - centroid2;
+      double firstDifference3 = rows[firstBase + d + 3] - centroid3;
+      first0 += firstDifference0 * firstDifference0;
+      first1 += firstDifference1 * firstDifference1;
+      first2 += firstDifference2 * firstDifference2;
+      first3 += firstDifference3 * firstDifference3;
+
+      double secondDifference0 = rows[secondBase + d] - centroid0;
+      double secondDifference1 = rows[secondBase + d + 1] - centroid1;
+      double secondDifference2 = rows[secondBase + d + 2] - centroid2;
+      double secondDifference3 = rows[secondBase + d + 3] - centroid3;
+      second0 += secondDifference0 * secondDifference0;
+      second1 += secondDifference1 * secondDifference1;
+      second2 += secondDifference2 * secondDifference2;
+      second3 += secondDifference3 * secondDifference3;
+    }
+
+    double firstSquared = first0 + first1 + first2 + first3;
+    double secondSquared = second0 + second1 + second2 + second3;
+    for (; d < dimension; d++) {
+      double centroidValue = centroid[d];
+      double firstDifference = rows[firstBase + d] - centroidValue;
+      firstSquared += firstDifference * firstDifference;
+      double secondDifference = rows[secondBase + d] - centroidValue;
+      secondSquared += secondDifference * secondDifference;
+    }
+
+    distances[0] = Math.sqrt(firstSquared);
+    distances[1] = Math.sqrt(secondSquared);
   }
 
   /** The nearest centroid of one vector, breaking ties towards the earlier list. */
