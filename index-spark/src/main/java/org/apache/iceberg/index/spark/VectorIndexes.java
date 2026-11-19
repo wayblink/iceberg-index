@@ -179,20 +179,32 @@ public final class VectorIndexes {
   /**
    * Counts the index files and entries of an index snapshot.
    *
+   * <p>The manifest list carries a file count and an entry count per manifest, so the totals are
+   * one read rather than one read per manifest: listing a table with N indexes reads N manifest
+   * lists, where opening the manifests as well would read N times the number of manifests.
+   *
    * @return a two-element array: index file count and entry count
    */
   public static long[] counts(FileIO fileIO, IndexSnapshot snapshot) {
-    long entries = 0;
     if (snapshot == null) {
       return new long[] {0L, 0L};
     }
 
-    List<IndexFile> files = indexFiles(fileIO, snapshot);
-    for (IndexFile indexFile : files) {
-      entries += indexFile.entryCount();
+    long files = 0L;
+    long entries = 0L;
+    try {
+      IndexManifestList manifestList =
+          IndexManifestList.read(fileIO.newInputFile(snapshot.indexManifestList()));
+      for (ManifestRef manifest : manifestList.manifests()) {
+        files += manifest.indexFileCount();
+        entries += manifest.entryCount();
+      }
+    } catch (IOException e) {
+      throw new UncheckedIOException(
+          "Failed to read the manifest list of index snapshot " + snapshot.snapshotId(), e);
     }
 
-    return new long[] {(long) files.size(), entries};
+    return new long[] {files, entries};
   }
 
   /**
