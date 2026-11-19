@@ -25,6 +25,7 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collection;
 import java.util.Collections;
+import java.util.Comparator;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
@@ -190,6 +191,12 @@ public final class IndexEntries {
     if (taskList.isEmpty()) {
       return null;
     }
+
+    // The rows of a group are read in data file order, and that order has to be the same on every
+    // build: the training sample is every k-th row, so a scan that planned its files in another
+    // order would sample other vectors from the same table and write another index. Grouping
+    // already sorts the files it packs into a group, so sorting here is what makes the read match.
+    taskList.sort(Comparator.comparing(task -> task.file().location().toString()));
 
     SnapshotDeletes deletes = SnapshotDeletes.read(spark, table, taskList, tableSchema);
     // one configuration for the whole group: each stream of the read would otherwise carry its own

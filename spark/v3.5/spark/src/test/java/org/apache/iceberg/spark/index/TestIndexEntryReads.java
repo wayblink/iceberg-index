@@ -24,6 +24,8 @@ import static org.assertj.core.api.Assertions.catchThrowable;
 
 import java.io.IOException;
 import java.io.UncheckedIOException;
+import java.util.Collections;
+import java.util.Comparator;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -134,6 +136,35 @@ class TestIndexEntryReads extends TestBase {
       assertThat(adapter.decodeVector(row.getAs(2)))
           .containsExactly(floats(vectorsByPosition(row.getString(0)).get(row.getLong(1))));
     }
+  }
+
+  @Test
+  void readsTheFilesOfAGroupInPathOrderWhateverOrderTheScanPlannedThemIn() {
+    sql(
+        "CREATE TABLE %s (id bigint, embedding array<double>) USING iceberg "
+            + "TBLPROPERTIES ('write.format.default'='avro')",
+        TABLE_NAME);
+    sql("INSERT INTO %s VALUES (0, array(0.0, 1.0)), (1, array(1.0, 0.0))", TABLE_NAME);
+    sql("INSERT INTO %s VALUES (2, array(0.5, 0.5)), (3, array(0.1, 0.9))", TABLE_NAME);
+    sql("INSERT INTO %s VALUES (4, array(0.2, 0.8)), (5, array(0.9, 0.1))", TABLE_NAME);
+
+    Table table = catalog.loadTable(TableIdentifier.parse(TABLE_NAME));
+    List<FileScanTask> tasks = IndexEntries.scanTasks(table, table.currentSnapshot().snapshotId());
+    assertThat(tasks).hasSizeGreaterThanOrEqualTo(3);
+
+    List<FileScanTask> sorted = inBuildOrder(tasks);
+    List<FileScanTask> reversed = Lists.newArrayList(sorted);
+    Collections.reverse(reversed);
+
+    List<Tuple2<String, Long>> expected = everyPosition(sorted);
+    assertThat(references(entryRows(table, sorted)))
+        .as("the rows of a group are read in data file path order")
+        .isEqualTo(expected);
+    assertThat(references(entryRows(table, reversed)))
+        .as(
+            "the order the scan planned the files in does not move the rows: the training sample is"
+                + " every k-th row, so it would build another index")
+        .isEqualTo(expected);
   }
 
   @Test
@@ -361,6 +392,13 @@ class TestIndexEntryReads extends TestBase {
     return messages;
   }
 
+  /** The order the build reads a group's files in: by data file location. */
+  private static List<FileScanTask> inBuildOrder(List<FileScanTask> tasks) {
+    List<FileScanTask> ordered = Lists.newArrayList(tasks);
+    ordered.sort(Comparator.comparing(task -> task.file().location().toString()));
+    return ordered;
+  }
+
   private List<Row> entryRows(Table table, List<FileScanTask> tasks) {
     LongAccumulator skipped = spark.sparkContext().longAccumulator();
     List<Row> rows =
@@ -436,7 +474,7 @@ class TestIndexEntryReads extends TestBase {
       Table table, List<FileScanTask> tasks, List<Row> rows, Set<Long> removedIds) {
     VectorIndexAdapter adapter = adapter();
     int index = 0;
-    for (FileScanTask task : tasks) {
+    for (FileScanTask task : inBuildOrder(tasks)) {
       String dataFile = task.file().location().toString();
       List<Record> records = records(table, dataFile, task.file().format());
       for (int position = 0; position < records.size(); position++) {
@@ -472,7 +510,7 @@ class TestIndexEntryReads extends TestBase {
 
   private static List<Tuple2<String, Long>> everyPosition(List<FileScanTask> tasks) {
     List<Tuple2<String, Long>> references = Lists.newArrayList();
-    for (FileScanTask task : tasks) {
+    for (FileScanTask task : inBuildOrder(tasks)) {
       String dataFile = task.file().location().toString();
       for (long position = 0; position < task.file().recordCount(); position++) {
         references.add(new Tuple2<>(dataFile, position));
