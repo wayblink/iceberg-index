@@ -56,9 +56,10 @@ import org.slf4j.LoggerFactory;
  * make the scores approximate as well, and that is a separate choice.
  *
  * <p>Training is deterministic: the sample is every k-th vector rather than a random draw, the
- * starting centroids are points of that sample, and the iteration count is fixed. Rebuilding the
- * same file therefore reproduces the same partitions, which a test that compares recall can rely
- * on.
+ * starting centroids are points of that sample, and the rounds run until the centroids stop
+ * changing. Rebuilding the same file therefore reproduces the same partitions, which a test that
+ * compares recall can rely on. A definition may lower the training budget or set a convergence
+ * tolerance, in which case the build records the rounds and samples it actually spent.
  */
 public final class IvfKernel implements VectorKernel, RetainedBytes {
   static final int BLOCK_MAGIC = 0x49564642;
@@ -77,7 +78,8 @@ public final class IvfKernel implements VectorKernel, RetainedBytes {
   /** The payload written when the vectors are quantized. */
   private static final int QUANTIZED_FORMAT_VERSION = 2;
 
-  private static final int MAX_ITERATIONS = 25;
+  /** Keeps a centroid at the origin from making a small absolute move look unbounded. */
+  private static final double DISPLACEMENT_EPSILON = 1e-12;
 
   /**
    * The retained fields of the prepared roots, in the layout the estimate describes: the loaded
@@ -266,9 +268,9 @@ public final class IvfKernel implements VectorKernel, RetainedBytes {
             Map.entry("code-bytes", isQuantized() ? (long) quantizer.codeBytes() : 0L),
             Map.entry("train-samples", (long) trained.samples),
             Map.entry("train-iterations", (long) trained.iterations),
-            // the build-time knobs that shift quality against time; zero is the behaviour every
-            // index file had before the knobs existed, and the build records what it actually ran
-            Map.entry("train-tolerance-ppm", 0L),
+            // the build-time knobs that trade quality against time; zero is what a definition that
+            // sets none of them runs, and a definition that set a tolerance records it here
+            Map.entry("train-tolerance-ppm", options.tolerancePartsPerMillion()),
             Map.entry("assign-kernel-simd", 0L),
             Map.entry("build-kernel-native", 0L)));
   }
@@ -1313,7 +1315,7 @@ public final class IvfKernel implements VectorKernel, RetainedBytes {
    * the same file trains the same centroids every time it is built.
    */
   private Trained train(float[][] vectors, int listCount, int threads) {
-    int sampleCount = IvfOptions.samplesFor(vectors.length, listCount);
+    int sampleCount = options.samplesFor(vectors.length, listCount);
     int stride = Math.max(1, vectors.length / sampleCount);
     float[][] sample = new float[sampleCount][];
     for (int i = 0; i < sampleCount; i++) {
@@ -1326,8 +1328,10 @@ public final class IvfKernel implements VectorKernel, RetainedBytes {
       centroids[i] = sample[Math.min(sampleCount - 1, (int) ((long) i * sampleCount / listCount))];
     }
 
+    int maxIterations = options.trainMaxIterations();
+    double tolerance = options.trainConvergenceTolerance();
     int iterations = 0;
-    for (int iteration = 0; iteration < MAX_ITERATIONS; iteration++) {
+    for (int iteration = 0; iteration < maxIterations; iteration++) {
       iterations = iteration + 1;
       int[] assignment = nearestCentroid(sample, centroids, threads);
       float[][] sums = new float[listCount][dimension];
@@ -1341,6 +1345,7 @@ public final class IvfKernel implements VectorKernel, RetainedBytes {
       }
 
       boolean changed = false;
+      double displacement = 0.0;
       for (int list = 0; list < listCount; list++) {
         if (sizes[list] == 0) {
           // a centroid nothing was assigned to keeps its position; the list it stands for is
@@ -1352,16 +1357,51 @@ public final class IvfKernel implements VectorKernel, RetainedBytes {
         for (int d = 0; d < dimension; d++) {
           mean[d] = sums[list][d] / sizes[list];
         }
-        changed |= !java.util.Arrays.equals(mean, centroids[list]);
+
+        float[] previous = centroids[list];
         centroids[list] = mean;
+        if (Arrays.equals(mean, previous)) {
+          continue;
+        }
+
+        changed = true;
+        if (tolerance > 0.0) {
+          displacement = Math.max(displacement, relativeDisplacement(mean, previous));
+        }
       }
 
       if (!changed) {
         break;
       }
+
+      // a positive tolerance stops training while the centroids are still settling, once a round
+      // moves them by less than the fraction of their own length that was asked for. Zero keeps the
+      // bitwise criterion above, so the default path runs the same rounds it always did.
+      if (tolerance > 0.0 && displacement < tolerance) {
+        break;
+      }
     }
 
     return new Trained(centroids, sampleCount, iterations);
+  }
+
+  /**
+   * How far a centroid moved relative to where it was: {@code ‖new - old‖ / (‖old‖ + ε)}.
+   *
+   * <p>The sum is accumulated in double because near convergence the difference of two floats is
+   * small and would lose its significant bits if it were squared in float. The epsilon bounds the
+   * fraction for a centroid at the origin instead of dividing by zero.
+   */
+  private static double relativeDisplacement(float[] updated, float[] previous) {
+    double moved = 0.0;
+    double before = 0.0;
+    for (int d = 0; d < updated.length; d++) {
+      double delta = (double) updated[d] - previous[d];
+      moved += delta * delta;
+      before += (double) previous[d] * previous[d];
+    }
+
+    return Math.sqrt(moved) / (Math.sqrt(before) + DISPLACEMENT_EPSILON);
   }
 
   /**

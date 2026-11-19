@@ -42,25 +42,80 @@ public final class IvfOptions implements java.io.Serializable {
 
   static final int DEFAULT_NPROBE = 8;
 
+  /** How many training samples each list gets, following the usual heuristic. */
+  static final String TRAIN_SAMPLES_PER_LIST = "ivf-train-samples-per-list";
+
+  /** The most rounds the centroids are trained for. */
+  static final String TRAIN_MAX_ITERATIONS = "ivf-train-max-iterations";
+
   /**
-   * How many training samples each list gets, following the usual heuristic.
+   * The relative movement of the centroids below which training stops.
    *
-   * <p>More samples fit the centroids better and cost a pass over the sample per iteration; this
-   * many per list is enough to estimate the partitions without training on the whole table.
+   * <p>Zero keeps the bitwise criterion: training ends once a round leaves every centroid where it
+   * was. A positive value stops as soon as a round moves them by less than that fraction of their
+   * own length, which is what lets a build trade quality for time.
    */
-  private static final int SAMPLES_PER_LIST = 39;
+  static final String TRAIN_CONVERGENCE_TOLERANCE = "ivf-train-convergence-tolerance";
+
+  /** More samples fit the centroids better and cost a pass over the sample per iteration. */
+  static final int DEFAULT_TRAIN_SAMPLES_PER_LIST = 39;
+
+  static final int DEFAULT_TRAIN_MAX_ITERATIONS = 25;
+
+  static final double DEFAULT_TRAIN_CONVERGENCE_TOLERANCE = 0.0;
+
+  private static final int MAX_TRAIN_ITERATIONS = 100;
+
+  private static final double MAX_TRAIN_CONVERGENCE_TOLERANCE = 0.1;
+
+  private static final double PARTS_PER_MILLION = 1_000_000.0;
 
   static final String LIST_BLOCKS = "ivf-list-blocks";
 
-  private static final ImmutableSet<String> KEYS = ImmutableSet.of(NLIST, LIST_BLOCKS);
+  private static final ImmutableSet<String> KEYS =
+      ImmutableSet.of(
+          NLIST,
+          LIST_BLOCKS,
+          TRAIN_SAMPLES_PER_LIST,
+          TRAIN_MAX_ITERATIONS,
+          TRAIN_CONVERGENCE_TOLERANCE);
 
   private final int nlist;
   private final boolean listBlocks;
+  private final int trainSamplesPerList;
+  private final int trainMaxIterations;
+  private final double trainConvergenceTolerance;
 
-  private IvfOptions(int nlist, boolean listBlocks) {
+  private IvfOptions(
+      int nlist,
+      boolean listBlocks,
+      int trainSamplesPerList,
+      int trainMaxIterations,
+      double trainConvergenceTolerance) {
     Preconditions.checkArgument(nlist >= 0, "Invalid IVF %s: %s", NLIST, nlist);
+    Preconditions.checkArgument(
+        trainSamplesPerList >= 1,
+        "Invalid IVF %s: %s (at least one sample per list)",
+        TRAIN_SAMPLES_PER_LIST,
+        trainSamplesPerList);
+    Preconditions.checkArgument(
+        trainMaxIterations >= 1 && trainMaxIterations <= MAX_TRAIN_ITERATIONS,
+        "Invalid IVF %s: %s (between 1 and %s)",
+        TRAIN_MAX_ITERATIONS,
+        trainMaxIterations,
+        MAX_TRAIN_ITERATIONS);
+    Preconditions.checkArgument(
+        trainConvergenceTolerance >= 0.0
+            && trainConvergenceTolerance <= MAX_TRAIN_CONVERGENCE_TOLERANCE,
+        "Invalid IVF %s: %s (between 0 and %s)",
+        TRAIN_CONVERGENCE_TOLERANCE,
+        trainConvergenceTolerance,
+        MAX_TRAIN_CONVERGENCE_TOLERANCE);
     this.nlist = nlist;
     this.listBlocks = listBlocks;
+    this.trainSamplesPerList = trainSamplesPerList;
+    this.trainMaxIterations = trainMaxIterations;
+    this.trainConvergenceTolerance = trainConvergenceTolerance;
   }
 
   /** The property keys this structure reads, for a caller that has to report what it supports. */
@@ -102,11 +157,33 @@ public final class IvfOptions implements java.io.Serializable {
         "Invalid IVF %s: %s",
         LIST_BLOCKS,
         blocks);
-    return new IvfOptions(intOption(properties, NLIST, 0), Boolean.parseBoolean(blocks));
+    return new IvfOptions(
+        intOption(properties, NLIST, 0),
+        Boolean.parseBoolean(blocks),
+        intOption(properties, TRAIN_SAMPLES_PER_LIST, DEFAULT_TRAIN_SAMPLES_PER_LIST),
+        intOption(properties, TRAIN_MAX_ITERATIONS, DEFAULT_TRAIN_MAX_ITERATIONS),
+        doubleOption(properties, TRAIN_CONVERGENCE_TOLERANCE, DEFAULT_TRAIN_CONVERGENCE_TOLERANCE));
   }
 
   boolean listBlocks() {
     return listBlocks;
+  }
+
+  int trainSamplesPerList() {
+    return trainSamplesPerList;
+  }
+
+  int trainMaxIterations() {
+    return trainMaxIterations;
+  }
+
+  double trainConvergenceTolerance() {
+    return trainConvergenceTolerance;
+  }
+
+  /** The tolerance in millionths, which is the scale the build records it in. */
+  long tolerancePartsPerMillion() {
+    return Math.round(trainConvergenceTolerance * PARTS_PER_MILLION);
   }
 
   /** The list count asked for, or zero to derive it from the entry count. */
@@ -139,9 +216,15 @@ public final class IvfOptions implements java.io.Serializable {
     return Math.max(1, Math.min(wanted, entries));
   }
 
-  /** How many vectors to train the centroids on, for a group of {@code entries} vectors. */
-  public static int samplesFor(int entries, int listCount) {
-    return Math.min(entries, Math.max(listCount, listCount * SAMPLES_PER_LIST));
+  /**
+   * How many vectors to train the centroids on, for a group of {@code entries} vectors.
+   *
+   * <p>The sample is the list count times the samples per list the definition asked for, so a
+   * smaller budget trains on fewer vectors; the file's own entries always cap it.
+   */
+  int samplesFor(int entries, int listCount) {
+    long wanted = (long) listCount * trainSamplesPerList;
+    return (int) Math.min(entries, Math.max(listCount, wanted));
   }
 
   private static int intOption(Map<String, String> properties, String key, int defaultValue) {
@@ -152,6 +235,21 @@ public final class IvfOptions implements java.io.Serializable {
 
     try {
       return Integer.parseInt(value.trim());
+    } catch (NumberFormatException e) {
+      throw new IllegalArgumentException(
+          String.format(Locale.ROOT, "IVF option %s is not a number: %s", key, value), e);
+    }
+  }
+
+  private static double doubleOption(
+      Map<String, String> properties, String key, double defaultValue) {
+    String value = properties.get(key);
+    if (value == null) {
+      return defaultValue;
+    }
+
+    try {
+      return Double.parseDouble(value.trim());
     } catch (NumberFormatException e) {
       throw new IllegalArgumentException(
           String.format(Locale.ROOT, "IVF option %s is not a number: %s", key, value), e);

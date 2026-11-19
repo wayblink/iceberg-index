@@ -169,11 +169,16 @@ DDL 必须给名字；`CALL` 在列上还没有索引时可以不命名。**`dim
 | `options.nlist` | 0（按 `round(sqrt(entries))` 推导） | IVF 分区数 |
 | `options['ivf-list-blocks']` | `'false'` | 设为 `'true'` 时，在一个 Puffin 文件内将 IVF 列表写成可独立读取的块。 |
 | `options.rabitq-bits` | 1 | 1–8 |
+| `options['ivf-train-samples-per-list']` | `'39'` | 训练每个 list 使用的样本数（样本总数 = `nlist × 该值`，不超过文件条目数）。调小能省训练时间，质心更粗。 |
+| `options['ivf-train-max-iterations']` | `'25'` | Lloyd 迭代轮数上限，1–100。调小能省训练时间，质心更粗。 |
+| `options['ivf-train-convergence-tolerance']` | `'0.0'` | 相邻两轮质心相对位移小于该值即提前停止，取值 0–0.1；`0` 表示默认的“质心逐位相等”判据。调大通常能早停，质量影响需用 recall 验证。 |
 | `max_entries_per_index_file` | 1,000,000 | 索引文件的条目预算，决定如何分组；不拆单个数据文件 |
 | `name` | 无 | 同列多索引时必须给 |
 | `mode` | 无 | 旧名，`EXACT`→`FLAT`、`HNSW`→`HNSW`；与 `structure` 同时给会报错 |
 
 输出四列：`index_uuid`、`source_snapshot_id`、`index_files`、`entries`。
+
+三个 `ivf-train-*` 参数只影响构建（训练预算与收敛判据），不改 payload 格式；不设置时产物与旧版本逐字节相同。实际样本数与轮数记录在索引文件的内存结构里（`train-samples`、`train-iterations`、`train-tolerance-ppm`），`list_indexes` 可以查到。带新键的定义旧版本读不了，滚动升级窗口内不要用新参数构建；候选推荐值 `8` / `3` / `0.001` 需先在目标数据集上用 `build_ms` 与 `recall@10` 实测确认，recall 掉点超过 0.5 个百分点的组合不要上生产。
 
 同列多索引时，查询用 `index => '…'` 指定，或在会话里设 `spark.iceberg.index.vector.name`。
 
@@ -594,7 +599,7 @@ BM25 和向量索引共用 executor 的容量预算、LRU 和状态入口。用�
 
 ### 8.3 建索引时写死、事后不可改
 
-`metric`、`structure`、`quantizer`、`max-m`、`ef-construction`、`ef-search`、`nlist`、`rabitq-bits`、`max-entries-per-index-file`，以及文本侧的 `k1`、`b`（入参名 `length_norm`）、`min-token-length`、`lowercase`、`stopwords`。
+`metric`、`structure`、`quantizer`、`max-m`、`ef-construction`、`ef-search`、`nlist`、`rabitq-bits`、`ivf-train-samples-per-list`、`ivf-train-max-iterations`、`ivf-train-convergence-tolerance`、`max-entries-per-index-file`，以及文本侧的 `k1`、`b`（入参名 `length_norm`）、`min-token-length`、`lowercase`、`stopwords`。
 
 `ef-search` 的值来自索引定义，调整它需要重建。IVF 的 `nprobe` 是查询期参数（调用参数优先，否则读 session 设置），历史定义中的值会被忽略。旧脚本须从构建选项移除 `nprobe`，并在查询会话设置原值。
 

@@ -20,6 +20,7 @@ package org.apache.iceberg.index.vector;
 
 import java.util.Arrays;
 import java.util.List;
+import java.util.Map;
 import java.util.SplittableRandom;
 import org.apache.iceberg.relocated.com.google.common.base.Preconditions;
 
@@ -43,6 +44,8 @@ import org.apache.iceberg.relocated.com.google.common.base.Preconditions;
 final class IvfCentroids {
 
   private static final int MAX_ITERATIONS = 25;
+
+  private static final IvfOptions OPTIONS = IvfOptions.from(Map.of());
 
   private final float[][] centroids;
   private final VectorScoring scoring;
@@ -72,7 +75,7 @@ final class IvfCentroids {
     }
 
     int dimension = dimension(vectors);
-    int sampleCount = IvfOptions.samplesFor(vectors.size(), count);
+    int sampleCount = OPTIONS.samplesFor(vectors.size(), count);
     float[][] sample = sample(vectors, sampleCount);
     float[][] centroids = startingCentroids(sample, count, seed);
     for (int iteration = 0; iteration < MAX_ITERATIONS; iteration++) {
