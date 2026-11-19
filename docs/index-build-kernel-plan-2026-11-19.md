@@ -210,12 +210,13 @@ CALL local.system.build_vector_index(
 
 | 项 | 内容 | 卡 | 提交 | 状态 |
 |---|---|---|---|---|
-| P0 | IVF 构建分阶段计时，参数与实际轮数写进 `structure` | #3138 | `7899b86e2a` | 已合入 |
-| P1 | 一个 payload 的 list 并行编码 | #3139 | `3fb696e459` | 已合入 |
-| P2a | 向量块 × 质心的精确归属内核（默认路径） | #3140 | `13397de974` | 已合入 |
-| P2b | Vector API 归属内核（`ivf-assign-kernel=simd`） | #3141 | `1a92ea349c` | 已合入，默认休眠 |
-| P3 | 训练预算三参数 + 收敛判据 | #3142 | `97f9cff329` | 已合入 |
-| P4 | 索引组的数据文件四流并发读 | #3143 | `fb26db225a` | 已合入 |
+| P0 | IVF 构建分阶段计时，参数与实际轮数写进 `structure` | #3138 | `905759df71` | 已合入 |
+| P1 | 一个 payload 的 list 并行编码 | #3139 | `2aca6aba8d` | 已合入 |
+| P2a | 向量块 × 质心的精确归属内核（默认路径） | #3140 | `e1c033ff4e` | 已合入 |
+| P2b | Vector API 归属内核（`ivf-assign-kernel=simd`） | #3141 | `37a7d76646` | 已合入，默认休眠 |
+| P3 | 训练预算三参数 + 收敛判据 | #3142 | `9fc8dfe841` | 已合入 |
+| P4 | 索引组的数据文件四流并发读 | #3143 | `ace91a824b` | 已合入 |
+| 评审修复 | P2a 恢复顺序求和、并行异常传播、SIMD 测试接线、P4 取消清理与测试 | #3147 | `fed62ab77f`、`db336d853f` | 已合入 |
 | 阶段二 | native 构建内核（N0–N3） | — | — | 未开始 |
 
 - P2b 默认休眠：只有定义里显式写 `ivf-assign-kernel=simd` 才走 SIMD 内核，且执行器 JVM 要带 `--add-modules jdk.incubator.vector`；没开模块时自动回退 P2a 并留一条 WARN，`structure` 的 `assign-kernel-simd` 为 0。
