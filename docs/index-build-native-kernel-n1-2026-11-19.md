@@ -1,5 +1,7 @@
 # 索引构建 native 内核 N1：可配置双路径、逐字节一致与单元级性能对比（2026-11-19）
 
+> 本文性能数字是 A1/A2/A3 优化之前的。优化后的最新数据见 [index-build-native-kernel-a-2026-11-19.md](index-build-native-kernel-a-2026-11-19.md)（40k 真实数据 6.53×，326k 单元外推 ≈55 s）。
+
 ## 结论
 
 - **双路径可用且产物一致**：新增定义参数 `ivf-build-kernel`（`java` 默认 / `native`）。同一份定义与数据下，两条路写出的 payload 逐字节相同；`structure` 只有 `build-kernel-native`（0/1）不同。native 缺库、非 L2、或运行时异常时自动回退 Java 并告警，构建不会因此失败。
