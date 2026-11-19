@@ -121,7 +121,9 @@ final class LanceStorageOptions {
     }
 
     if (!unmapped.isEmpty()) {
-      LOG.warn("Ignoring storage properties Lance has no equivalent for: {}", unmapped);
+      // the Hadoop configuration brings dozens of fs.s3a.* tuning keys of its own, all expected
+      // here; a warning per file open would drown the log
+      LOG.debug("Ignoring storage properties Lance has no equivalent for: {}", unmapped);
     }
 
     return options;

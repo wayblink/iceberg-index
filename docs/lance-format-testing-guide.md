@@ -53,7 +53,7 @@ Lance 的读写都自己开对象存储，它认的是 `object_store` 的**裸�
 | 用 path-style 寻址 | `s3.path-style-access=true` | `fs.s3a.path.style.access=true` | `lance.storage.virtual_hosted_style_request=false` |
 | 走明文 http | — | `fs.s3a.connection.ssl.enabled=false` | `lance.storage.allow_http=true` |
 
-三条容易踩的。一是 path-style 与 `allow_http` 在 Lance 那边是**反向开关**（`virtual_hosted_style_request`、`allow_http`），MinIO / 本厂 OSS 这类自建端点通常两个都要给，否则第一次 PUT 就报 `HTTP error: builder error`。二是 **region 有两个名字**：Iceberg 自己的 `S3FileIO` 认 `client.region`，Lance 认 `region`（由 `s3.region` 翻译而来），少给 `client.region` 会在建 writer 时就报 `Unable to load region from any of the providers`。三是 `lance.storage.*` 是逃逸口，Lance 新增任何键都可以从这里透传，它最后应用、会覆盖同名的翻译结果；`s3.*` 里暂时没有对应项的键（比如 `s3.some-future-knob`）会被忽略并打一条 WARN，不会让已有的表读不出来。
+三条容易踩的。一是 path-style 与 `allow_http` 在 Lance 那边是**反向开关**（`virtual_hosted_style_request`、`allow_http`），MinIO / 本厂 OSS 这类自建端点通常两个都要给，否则第一次 PUT 就报 `HTTP error: builder error`。二是 **region 有两个名字**：Iceberg 自己的 `S3FileIO` 认 `client.region`，Lance 认 `region`（由 `s3.region` 翻译而来），少给 `client.region` 会在建 writer 时就报 `Unable to load region from any of the providers`。三是 `lance.storage.*` 是逃逸口，Lance 新增任何键都可以从这里透传，它最后应用、会覆盖同名的翻译结果；`s3.*` 里暂时没有对应项的键（比如 `s3.some-future-knob`）会被忽略（debug 级记一条；Hadoop 配置本身会带几十个 `fs.s3a.*` 调优键，所以这里不再按 WARN 刷日志），不会让已有的表读不出来。
 
 ```sql
 ALTER TABLE hms.sparkann.sift10m_lance SET TBLPROPERTIES (
