@@ -179,7 +179,7 @@ DDL 必须给名字；`CALL` 在列上还没有索引时可以不命名。**`dim
 
 输出四列：`index_uuid`、`source_snapshot_id`、`index_files`、`entries`。
 
-三个 `ivf-train-*` 参数与 `ivf-assign-kernel` 只影响构建（训练预算、收敛判据与归属内核），不改 payload 格式；不设置时产物与旧版本逐字节相同。实际生效的样本数、轮数、收敛阈值与 SIMD 归属是否跑成记录在索引文件的内存结构里（`train-samples`、`train-iterations`、`train-tolerance-ppm`、`assign-kernel-simd`）；`list_indexes` 的输出没有 `structure` 列，这些值当前没有查询入口——构建日志里有实际轮数与样本数（每写一个 IVF 文件一条 `Encoded an IVF payload … over N rounds and M samples`），SIMD 是否跑成与收敛阈值只在 `structure` 里。要查某个索引用了什么参数，读 `definition` 里**请求的**值即可。带新键的定义旧版本读不了，滚动升级窗口内不要用新参数构建；候选推荐值 `8` / `3` / `0.001` 需先在目标数据集上用 `build_ms` 与 `recall@10` 实测确认，recall 掉点超过 0.5 个百分点的组合不要上生产。
+三个 `ivf-train-*` 参数与 `ivf-assign-kernel` 只影响构建（训练预算、收敛判据与归属内核），不改 payload 格式；不设置时产物与旧版本逐字节相同。实际生效的样本数、轮数、收敛阈值与 SIMD 归属是否跑成记录在索引文件的内存结构里（`train-samples`、`train-iterations`、`train-tolerance-ppm`、`assign-kernel-simd`）；`list_indexes` 的输出没有 `structure` 列，这些值当前没有查询入口——构建日志里有实际轮数与样本数（每写一个 IVF 文件一条 `Encoded an IVF payload … over N rounds and M samples`），SIMD 是否跑成与收敛阈值只在 `structure` 里。要查某个索引用了什么参数，读 `definition` 里**请求的**值即可。带新键的定义旧版本读不了，滚动升级窗口内不要用新参数构建。候选推荐值 `8` / `3` / `0.001` 已在 oss32（10,784,907 行、33 个索引文件）上实测：`build_ms` 506,546 对默认 740,691，`recall@10` 0.98 对默认 0.97（100 个答案的分辨率是 1 个百分点，因此只能表述为“该分辨率下无可见质量损失”）。换数据集仍要用 `build_ms` 与 `recall@10` 复核，掉点超过 0.5 个百分点的组合不要上生产；延迟对比需要独占集群窗口，共享负载下不可归因。
 
 同列多索引时，查询用 `index => '…'` 指定，或在会话里设 `spark.iceberg.index.vector.name`。
 
