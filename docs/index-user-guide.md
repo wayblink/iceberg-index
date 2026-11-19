@@ -216,7 +216,7 @@ ALTER TABLE db.t ALTER COLUMN embedding CREATE INDEX idx
 
 **怎么确认跑成**：构建日志里每条索引文件会有一条 `Built an IVF payload … with the native kernel`；否则有一条 WARN 说明回退原因。索引文件 `structure` 的 `build-kernel-native` 为 1 才算真的 native；`list_indexes` 看不到 structure，只能从 `definition` 读到请求的值。
 
-**性能**：x86 单机、40,000 行 × 2560 维、nlist=570、4-bit、4 线程、release 构建下，整单元 263,806 ms → 110,527 ms（2.39×；train 2.29×、assign 4.35×、encode 2.10×）。那是单元级、单机、共享负载下的背靠背测量，不是集群 `build_ms`，集群 A/B（N2）还没做；也不要拿 dev 档的库去对比。
+**性能**：x86 单机、40,000 行 × 2560 维、nlist=570、4-bit、4 线程、release 构建下，整单元 209,616 ms → 32,082 ms（6.53×；train 6.65×、assign 7.33×、encode 约 10×），两边 payload 长度与 SHA-256 相同。那是单元级、单机、共享负载（load≈4.7）下的背靠背测量，不是集群 `build_ms`，集群 A/B（N2）还在做；也不要拿 dev 档的库去对比。按同口径外推到 326k 行的真实单元约 348 s → 55 s，外推不是实测。
 
 **边界**：这是实验能力，默认关闭；库缺失、版本不匹配、非 L2、运行时异常都会静默回退 Java（日志留 WARN），一致性由测试保证，但回退会丢掉性能收益。带 `ivf-build-kernel` 的定义旧版本读不了，滚动升级窗口内不要用。
 
