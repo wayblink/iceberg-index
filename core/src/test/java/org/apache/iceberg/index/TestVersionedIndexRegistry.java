@@ -300,6 +300,81 @@ class TestVersionedIndexRegistry {
     assertThat(indexUuids(registryPointer(ops))).containsExactly("index-new");
   }
 
+  @Test
+  void recordsTheTableInstanceEachIndexWasBuiltFor() {
+    TestTables.TestTableOperations ops = operations();
+    SidecarIndexCatalog catalog = versionedCatalog(ops);
+
+    catalog.createIndex(request("index-a"));
+    JsonNode tableUuids = registryJson(registryPointer(ops)).get("table-uuids");
+    assertThat(tableUuids).isNotNull();
+    assertThat(tableUuids.get("index-a").asText()).isEqualTo("table-uuid");
+
+    // the entry leaves with the index, so a registry with no indexes names no table instances
+    catalog.dropIndex(tableDir.toString(), "index-a", false);
+    assertThat(registryJson(registryPointer(ops)).get("table-uuids")).isNull();
+  }
+
+  @Test
+  void registrationDoesNotReadTheIndexesTheRegistryNames() {
+    TestTables.TestTableOperations ops = operations();
+    SidecarIndexCatalog catalog = versionedCatalog(ops);
+    catalog.createIndex(request("index-a"));
+
+    // the registry names the table instance of index-a, so registering index-b knows that index is
+    // not foreign without opening its metadata: the metadata is deleted, and a registration that
+    // opened it anyway would fail here instead
+    JsonNode registry = registryJson(registryPointer(ops));
+    deleteMetadataRoot("index-a", registry.get("metadata-files").get("index-a").asText());
+
+    catalog.createIndex(request("index-b"));
+
+    assertThat(indexUuids(registryPointer(ops))).containsExactly("index-a", "index-b");
+  }
+
+  @Test
+  void registrationReadsIndexesTheRegistryNamesNoTableInstanceFor() {
+    TestTables.TestTableOperations ops = operations();
+    SidecarIndexCatalog catalog = versionedCatalog(ops);
+    catalog.createIndex(request("index-a"));
+
+    // a registry written before the table uuids existed names no table instance, so the
+    // registration
+    // reads the metadata to decide whether the index is this table's
+    String registryFile = registryPointer(ops);
+    dropTableUuids(registryFile);
+    deleteMetadataRoot("index-a", "index-metadata-" + rootOf(registryFile) + ".json");
+
+    // the index's metadata is gone, and the registration has to read it to learn its table uuid
+    assertThatThrownBy(() -> catalog.createIndex(request("index-b")))
+        .isInstanceOf(RuntimeException.class)
+        .hasMessageContaining("Index metadata file does not exist");
+  }
+
+  private String rootOf(String registryFile) {
+    String root = registryJson(registryFile).get("metadata-files").get("index-a").asText();
+    return root.substring("index-metadata-".length(), root.length() - ".json".length());
+  }
+
+  private void dropTableUuids(String registryFile) {
+    Path path = indexesRoot().toPath().resolve(registryFile);
+    try {
+      JsonNode node = registryJson(registryFile);
+      ((com.fasterxml.jackson.databind.node.ObjectNode) node).remove("table-uuids");
+      Files.write(path, node.toString().getBytes(UTF_8));
+    } catch (IOException e) {
+      throw new UncheckedIOException(e);
+    }
+  }
+
+  private void deleteMetadataRoot(String indexUuid, String root) {
+    try {
+      Files.delete(Path.of(indexesRoot().toString(), indexUuid, "metadata", root));
+    } catch (IOException e) {
+      throw new UncheckedIOException(e);
+    }
+  }
+
   private TestTables.TestTableOperations operations() {
     TestTables.TestTableOperations ops = new TestTables.TestTableOperations(TABLE_NAME, tableDir);
     TestTables.create(
