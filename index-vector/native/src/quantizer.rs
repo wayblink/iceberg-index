@@ -149,7 +149,9 @@ impl Quantizer {
         }
 
         let levels = 1i32 << bits;
-        let decode = (0..levels).map(|level| decode_level(level, levels)).collect();
+        let decode = (0..levels)
+            .map(|level| decode_level(level, levels))
+            .collect();
         Ok(Self {
             dimension,
             padded: next_power_of_two(dimension)?,
@@ -230,7 +232,12 @@ impl Quantizer {
         factors: &mut [f32; FACTORS],
         scratch: &mut Scratch,
     ) -> Result<(), String> {
-        rotate_into(vector, &self.center, signs, &mut scratch.rotated[..self.padded]);
+        rotate_into(
+            vector,
+            &self.center,
+            signs,
+            &mut scratch.rotated[..self.padded],
+        );
         hadamard(&mut scratch.rotated[..self.padded]);
 
         // The length sum, the largest coordinate and the centre dot are three independent `f64`
@@ -513,12 +520,7 @@ mod x86 {
 
     #[inline]
     #[target_feature(enable = "avx512f")]
-    unsafe fn short_stage(
-        pointer: *mut f32,
-        size: usize,
-        swap: &[i32; 16],
-        combine: &[i32; 16],
-    ) {
+    unsafe fn short_stage(pointer: *mut f32, size: usize, swap: &[i32; 16], combine: &[i32; 16]) {
         let exchange = _mm512_castps_si512(_mm512_loadu_ps(swap.as_ptr() as *const f32));
         let gather = _mm512_castps_si512(_mm512_loadu_ps(combine.as_ptr() as *const f32));
         for offset in (0..size).step_by(16) {
@@ -950,11 +952,7 @@ mod tests {
     fn vectors(seed: u64, count: usize, dimension: usize, scale: f32) -> Vec<Vec<f32>> {
         let mut random = Rng(seed);
         (0..count)
-            .map(|_| {
-                (0..dimension)
-                    .map(|_| random.next_f32() * scale)
-                    .collect()
-            })
+            .map(|_| (0..dimension).map(|_| random.next_f32() * scale).collect())
             .collect()
     }
 
