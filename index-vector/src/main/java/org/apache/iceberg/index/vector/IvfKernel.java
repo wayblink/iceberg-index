@@ -136,6 +136,22 @@ public final class IvfKernel implements VectorKernel, RetainedBytes {
     return quantizer != null;
   }
 
+  int dimension() {
+    return dimension;
+  }
+
+  IvfOptions options() {
+    return options;
+  }
+
+  VectorScoring scoring() {
+    return scoring;
+  }
+
+  RaBitQQuantizer quantizer() {
+    return quantizer;
+  }
+
   private int payloadVersion() {
     // the quantized payload keeps a centre and a code per list instead of the vectors, which a
     // reader of the other form would misread rather than reject

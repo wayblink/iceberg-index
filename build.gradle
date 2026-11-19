@@ -849,12 +849,48 @@ project(':iceberg-index-vector') {
     from sourceSets.simd.output
   }
 
+  // The native IVF kernel is an optional prototype: the tests that use it skip themselves when the
+  // library is missing, so a checkout without cargo still builds and tests everything else. Cargo
+  // decides what it rebuilds, which is why no outputs are declared: declaring them would let a
+  // stale target/ directory make this task up-to-date.
+  def nativeCargoManifest = file("$projectDir/native/Cargo.toml")
+  def nativeCargoExecutable = {
+    def executable = System.getProperty('os.name').toLowerCase(Locale.ROOT).contains('windows') ? 'cargo.exe' : 'cargo'
+    def path = System.getenv('PATH')
+    return path == null ? null : path.split(File.pathSeparator).findAll { !it.isEmpty() }.collect { new File(it, executable) }.find { it.isFile() && it.canExecute() }
+  }()
+
+  tasks.register('cargoBuildNativeIvf', Exec) {
+    description = 'Builds the native IVF kernel that the native index-vector tests load'
+    group = 'build'
+    workingDir = file("$projectDir/native")
+    commandLine = [nativeCargoExecutable == null ? 'cargo' : nativeCargoExecutable.absolutePath, 'build']
+    onlyIf {
+      if (!nativeCargoManifest.isFile()) {
+        return false
+      }
+
+      if (nativeCargoExecutable == null) {
+        logger.lifecycle('cargo is not on PATH: skipping the native IVF build, so the native tests skip too')
+        return false
+      }
+
+      return true
+    }
+  }
+
   test {
     useJUnitPlatform()
     // The vector API is an incubator module: without --add-modules the kernel cannot be loaded,
     // and the tests that exercise it would be skipped instead of proving it works. CI runs this
     // module on JDK 17 and 21, both of which carry the module.
     jvmArgs '--add-modules', 'jdk.incubator.vector'
+    dependsOn tasks.named('cargoBuildNativeIvf')
+    if (nativeCargoManifest.isFile()) {
+      // the native tests load the library at run time, so a change to its sources has to rerun
+      // them even when no Java class changed
+      inputs.files(fileTree("$projectDir/native/src"), nativeCargoManifest, file("$projectDir/native/Cargo.lock"))
+    }
   }
 
   dependencies {

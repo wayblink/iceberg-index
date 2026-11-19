@@ -50,6 +50,8 @@ test-reports
 build/
 dist/
 sdist/
+# the native IVF kernel's cargo output
+index-vector/native/target/
 .coverage
 coverage.xml
 .pytest_cache/
