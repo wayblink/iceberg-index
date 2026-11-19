@@ -218,7 +218,8 @@ CALL local.system.build_vector_index(
 | P4 | 索引组的数据文件四流并发读 | #3143 | `ace91a824b` | 已合入 |
 | 评审修复 | P2a 恢复顺序求和、并行异常传播、SIMD 测试接线、P4 取消清理与测试 | #3147 | `fed62ab77f`、`db336d853f` | 已合入 |
 | N0 | 单文件 native IVF 内核原型 + Java JNI 桥，golden 逐字节一致 | #3148 | `5a6fe35aa2` | 已合入 |
-| N1 首版 | native 接入构建路径，新增 `ivf-build-kernel`（默认 java），双路径逐字节一致 | #3149 | `fae5292459` | 已合入；A 线优化（tiled 质心、encode 向量化）进行中 |
+| N1 首版 | native 接入构建路径，新增 `ivf-build-kernel`（默认 java），双路径逐字节一致 | #3149 | `fae5292459` | 已合入 |
+| A 线 | tiled 质心、RaBitQ encode 向量化、native 直读 entry payload（ABI v2） | #3149 | `f524d24001`、`ac1bf1692f`、`543deb87af` | 已合入；单元 209,616→32,082 ms（6.53×），外推 326k 单元 ≈348→55 s |
 | 阶段二 | native 构建内核（N0–N3） | — | — | 未开始 |
 
 - P2b 默认休眠：只有定义里显式写 `ivf-assign-kernel=simd` 才走 SIMD 内核，且执行器 JVM 要带 `--add-modules jdk.incubator.vector`；没开模块时自动回退 P2a 并留一条 WARN，`structure` 的 `assign-kernel-simd` 为 0。
