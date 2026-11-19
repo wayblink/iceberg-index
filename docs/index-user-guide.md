@@ -173,6 +173,7 @@ DDL 必须给名字；`CALL` 在列上还没有索引时可以不命名。**`dim
 | `options['ivf-train-max-iterations']` | `'25'` | Lloyd 迭代轮数上限，1–100。调小能省训练时间，质心更粗。 |
 | `options['ivf-train-convergence-tolerance']` | `'0.0'` | 相邻两轮质心相对位移小于该值即提前停止，取值 0–0.1；`0` 表示默认的“质心逐位相等”判据。调大通常能早停，质量影响需用 recall 验证。 |
 | `options['ivf-assign-kernel']` | `'exact'` | 归属（最近质心）内核：`exact` 是标量 double 路径，`simd` 用 float32 + Vector API 加速。**只对 `l2` 生效**，`cosine` / `dot` 仍走各自的原路径。`simd` 需要执行器 JVM 带 `--add-modules jdk.incubator.vector`；不带时自动回退 `exact` 并在日志里留一条 WARN，索引文件 `structure` 的 `assign-kernel-simd` 记录实际是否跑成。 |
+| `options['ivf-build-kernel']` | `'java'` | IVF 构建内核：`java` 是默认实现，`native` 用 Rust 内核（**只对 `l2` 生效**，payload 与 `java` 逐字节相同）。native 需要执行器 JVM 能加载 `libiceberg_ivf_native`；加载失败、非 L2 或运行异常时自动回退 `java` 并告警，索引文件 `structure` 的 `build-kernel-native` 记录实际路径（1/0）。 |
 | `max_entries_per_index_file` | 1,000,000 | 索引文件的条目预算，决定如何分组；不拆单个数据文件 |
 | `name` | 无 | 同列多索引时必须给 |
 | `mode` | 无 | 旧名，`EXACT`→`FLAT`、`HNSW`→`HNSW`；与 `structure` 同时给会报错 |
@@ -182,6 +183,42 @@ DDL 必须给名字；`CALL` 在列上还没有索引时可以不命名。**`dim
 三个 `ivf-train-*` 参数与 `ivf-assign-kernel` 只影响构建（训练预算、收敛判据与归属内核），不改 payload 格式；不设置时产物与旧版本逐字节相同。实际生效的样本数、轮数、收敛阈值与 SIMD 归属是否跑成记录在索引文件的内存结构里（`train-samples`、`train-iterations`、`train-tolerance-ppm`、`assign-kernel-simd`）；`list_indexes` 的输出没有 `structure` 列，这些值当前没有查询入口——构建日志里有实际轮数与样本数（每写一个 IVF 文件一条 `Encoded an IVF payload … over N rounds and M samples`），SIMD 是否跑成与收敛阈值只在 `structure` 里。要查某个索引用了什么参数，读 `definition` 里**请求的**值即可。带新键的定义旧版本读不了，滚动升级窗口内不要用新参数构建。候选推荐值 `8` / `3` / `0.001` 已在 oss32（10,784,907 行、33 个索引文件）上实测：`build_ms` 506,546 对默认 740,691，`recall@10` 0.98 对默认 0.97（100 个答案的分辨率是 1 个百分点，因此只能表述为“该分辨率下无可见质量损失”）。换数据集仍要用 `build_ms` 与 `recall@10` 复核，掉点超过 0.5 个百分点的组合不要上生产；延迟对比需要独占集群窗口，共享负载下不可归因。
 
 同列多索引时，查询用 `index => '…'` 指定，或在会话里设 `spark.iceberg.index.vector.name`。
+
+### 4.2.1 用 native 内核构建（实验，默认关闭）
+
+IVF 的构建默认由 JVM 完成（`ivf-build-kernel=java`）。把它设为 `native` 时，训练、归属与量化改由 Rust 内核执行：Java 侧仍然解码一次向量并按块交给 native，写出的 payload 与 Java 内核逐字节相同，`structure` 里只有 `build-kernel-native` 一项不同（1 表示 native 真的跑了，0 表示回退）。native 只实现 `l2`，`cosine` / `dot` 会忽略该键并回退 Java。
+
+**部署前提（当前版本）**：native 库还没有打进 jar，必须由部署侧放到 driver 与每个执行器的 JVM 库路径上。
+
+```bash
+# 仓库自带的 gradle 任务只构建 dev 档（opt-level=1，给测试用），性能对比必须自己建 release
+cd index-vector/native && cargo build --release
+# 产物：target/release/libiceberg_ivf_native.{so,dylib}（Windows 为 .dll）
+```
+
+把库文件放到所有节点都能读到的目录，再给 Spark 加 JVM 参数：
+
+```text
+spark.driver.extraJavaOptions    -Djava.library.path=/opt/iceberg/native
+spark.executor.extraJavaOptions  -Djava.library.path=/opt/iceberg/native
+```
+
+**启用方式**（建索引时写进定义，建完不可改）：
+
+```sql
+ALTER TABLE db.t ALTER COLUMN embedding CREATE INDEX idx
+  USING vector (embedding)
+  WITH (dimension = 2560, structure = 'IVF', quantizer = 'RABITQ',
+        options => map('rabitq-bits', '4', 'ivf-build-kernel', 'native'));
+```
+
+`CALL system.build_vector_index(...)` 的 `options` 参数同样接受这个键。
+
+**怎么确认跑成**：构建日志里每条索引文件会有一条 `Built an IVF payload … with the native kernel`；否则有一条 WARN 说明回退原因。索引文件 `structure` 的 `build-kernel-native` 为 1 才算真的 native；`list_indexes` 看不到 structure，只能从 `definition` 读到请求的值。
+
+**性能**：x86 单机、40,000 行 × 2560 维、nlist=570、4-bit、4 线程、release 构建下，整单元 263,806 ms → 110,527 ms（2.39×；train 2.29×、assign 4.35×、encode 2.10×）。那是单元级、单机、共享负载下的背靠背测量，不是集群 `build_ms`，集群 A/B（N2）还没做；也不要拿 dev 档的库去对比。
+
+**边界**：这是实验能力，默认关闭；库缺失、版本不匹配、非 L2、运行时异常都会静默回退 Java（日志留 WARN），一致性由测试保证，但回退会丢掉性能收益。带 `ivf-build-kernel` 的定义旧版本读不了，滚动升级窗口内不要用。
 
 ### 4.3 查询：五种入口，先分清再用
 
@@ -600,7 +637,7 @@ BM25 和向量索引共用 executor 的容量预算、LRU 和状态入口。用�
 
 ### 8.3 建索引时写死、事后不可改
 
-`metric`、`structure`、`quantizer`、`max-m`、`ef-construction`、`ef-search`、`nlist`、`rabitq-bits`、`ivf-train-samples-per-list`、`ivf-train-max-iterations`、`ivf-train-convergence-tolerance`、`ivf-assign-kernel`、`max-entries-per-index-file`，以及文本侧的 `k1`、`b`（入参名 `length_norm`）、`min-token-length`、`lowercase`、`stopwords`。
+`metric`、`structure`、`quantizer`、`max-m`、`ef-construction`、`ef-search`、`nlist`、`rabitq-bits`、`ivf-train-samples-per-list`、`ivf-train-max-iterations`、`ivf-train-convergence-tolerance`、`ivf-assign-kernel`、`ivf-build-kernel`、`max-entries-per-index-file`，以及文本侧的 `k1`、`b`（入参名 `length_norm`）、`min-token-length`、`lowercase`、`stopwords`。
 
 `ef-search` 的值来自索引定义，调整它需要重建。IVF 的 `nprobe` 是查询期参数（调用参数优先，否则读 session 设置），历史定义中的值会被忽略。旧脚本须从构建选项移除 `nprobe`，并在查询会话设置原值。
 
