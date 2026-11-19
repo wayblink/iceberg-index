@@ -25,6 +25,8 @@ import java.io.IOException;
 import java.util.Iterator;
 import java.util.List;
 import java.util.NoSuchElementException;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
@@ -90,6 +92,116 @@ class TestOrderedParallelReads {
             TestOrderedParallelReads::emptyRows);
 
     assertThat(drain(OrderedParallelReads.of(streams, 3, 2, 2))).containsExactly(1);
+  }
+
+  @Test
+  void keepsTheStreamOfEachRowWhenAStreamInTheMiddleIsEmpty() {
+    List<Integer> many = Lists.newArrayList();
+    for (int i = 0; i < 1000; i++) {
+      many.add(i);
+    }
+
+    List<OrderedParallelReads.Stream<Integer>> streams =
+        List.of(() -> rows(many), TestOrderedParallelReads::emptyRows, () -> rows(List.of(1000)));
+    OrderedParallelReads<Integer> reads = OrderedParallelReads.of(streams, 3, 2, 8);
+    List<Integer> delivered = Lists.newArrayList();
+    List<Integer> streamOfRow = Lists.newArrayList();
+    while (reads.hasNext()) {
+      delivered.add(reads.next());
+      streamOfRow.add(reads.currentStream());
+    }
+
+    assertThat(delivered).hasSize(1001);
+    assertThat(delivered.subList(0, 1000)).containsExactlyElementsOf(many);
+    assertThat(delivered.get(1000)).isEqualTo(1000);
+    // the entries of a group are attributed to a data file by the stream of the row, so the empty
+    // stream must not take a row and the row after it must carry its own stream rather than the
+    // empty one's
+    assertThat(streamOfRow.subList(0, 1000)).containsOnly(0);
+    assertThat(streamOfRow.get(1000)).isEqualTo(2);
+  }
+
+  @Test
+  void handsBackEveryChunkOfEveryStreamInOrder() {
+    List<OrderedParallelReads.Stream<Integer>> streams = Lists.newArrayList();
+    List<Integer> expected = Lists.newArrayList();
+    for (int stream = 0; stream < 5; stream++) {
+      List<Integer> values = Lists.newArrayList();
+      for (int row = 0; row < 10; row++) {
+        values.add(stream * 10 + row);
+      }
+
+      expected.addAll(values);
+      streams.add(() -> rows(values));
+    }
+
+    // a chunk is smaller than a stream, so each stream spans several chunks and the read has to
+    // hand them back in the order of the stream they belong to
+    assertThat(drain(OrderedParallelReads.of(streams, 3, 2, 4)))
+        .containsExactlyElementsOf(expected);
+  }
+
+  @Test
+  void closesTheStreamsWhenTheConsumerFailsOnARow() {
+    AtomicInteger opened = new AtomicInteger();
+    List<AtomicInteger> closes = Lists.newArrayList();
+    List<OrderedParallelReads.Stream<Integer>> streams = Lists.newArrayList();
+    for (int i = 0; i < 4; i++) {
+      AtomicInteger closed = new AtomicInteger();
+      closes.add(closed);
+      streams.add(() -> tracked(opened, closed, new GeneratedRows(10_000, new AtomicLong())));
+    }
+
+    OrderedParallelReads<Integer> reads = OrderedParallelReads.of(streams, 3, 2, 8);
+    // a consumer that fails on a row stops asking for more, which is what the entry loop does when
+    // it cannot encode a value: the streams it started have to be closed with the read rather than
+    // left waiting on a queue nobody drains again
+    assertThatThrownBy(
+            () -> {
+              reads.next();
+              throw new IllegalStateException("the value of the row could not be encoded");
+            })
+        .isInstanceOf(IllegalStateException.class)
+        .hasMessageContaining("could not be encoded");
+    reads.close();
+
+    awaitTrue(() -> closedStreams(closes) == opened.get() && readerThreads().isEmpty(), 5_000L);
+    assertThat(opened.get()).isPositive();
+    for (AtomicInteger closed : closes) {
+      assertThat(closed.get()).as("a stream that was opened is closed once").isLessThanOrEqualTo(1);
+    }
+
+    assertThat(closedStreams(closes)).isEqualTo(opened.get());
+    assertThat(readerThreads()).as("no reader thread outlives the read").isEmpty();
+  }
+
+  @Test
+  void failsTheReadWhenAStreamFailsWhileItsNextChunkIsRead() {
+    CountDownLatch chunksDrained = new CountDownLatch(1);
+    List<OrderedParallelReads.Stream<Integer>> streams = Lists.newArrayList();
+    streams.add(
+        () ->
+            new FailingAfterRows(
+                4, chunksDrained, "the second chunk of the file could not be read"));
+    streams.add(() -> rows(List.of(8, 9)));
+
+    OrderedParallelReads<Integer> reads = OrderedParallelReads.of(streams, 2, 2, 2);
+    List<Integer> delivered = Lists.newArrayList();
+    // the four rows of the first two chunks are delivered, and the failure that follows must reach
+    // the consumer as that failure rather than as the end of the rows, because a silently short
+    // group would be written as a complete index file
+    assertThatThrownBy(
+            () -> {
+              while (reads.hasNext()) {
+                delivered.add(reads.next());
+                if (delivered.size() == 4) {
+                  chunksDrained.countDown();
+                }
+              }
+            })
+        .isInstanceOf(IllegalStateException.class)
+        .hasMessageContaining("the second chunk of the file could not be read");
+    assertThat(delivered).containsExactly(0, 1, 2, 3);
   }
 
   @Test
@@ -270,6 +382,27 @@ class TestOrderedParallelReads {
     return rows;
   }
 
+  private static int closedStreams(List<AtomicInteger> closes) {
+    int closed = 0;
+    for (AtomicInteger close : closes) {
+      closed += close.get();
+    }
+
+    return closed;
+  }
+
+  /** The reader threads of the reads that are still running. */
+  private static List<String> readerThreads() {
+    List<String> names = Lists.newArrayList();
+    for (Thread thread : Thread.getAllStackTraces().keySet()) {
+      if (thread.getName().startsWith("index-group-read")) {
+        names.add(thread.getName());
+      }
+    }
+
+    return names;
+  }
+
   private static void awaitTrue(BooleanSupplier condition, long waitMillis) {
     long deadline = System.currentTimeMillis() + waitMillis;
     while (!condition.getAsBoolean() && System.currentTimeMillis() < deadline) {
@@ -347,6 +480,50 @@ class TestOrderedParallelReads {
       }
 
       produced.incrementAndGet();
+      return next++;
+    }
+
+    @Override
+    public void close() {}
+  }
+
+  /**
+   * Rows that yield their first chunks and then wait for the consumer before failing, so the
+   * failure lands while the read is filling the chunk after them rather than before any row reached
+   * the consumer.
+   */
+  private static final class FailingAfterRows implements CloseableIterator<Integer> {
+    private final int readable;
+    private final CountDownLatch chunksDrained;
+    private final String message;
+    private int next = 0;
+
+    private FailingAfterRows(int readable, CountDownLatch chunksDrained, String message) {
+      this.readable = readable;
+      this.chunksDrained = chunksDrained;
+      this.message = message;
+    }
+
+    @Override
+    public boolean hasNext() {
+      if (next < readable) {
+        return true;
+      }
+
+      try {
+        if (!chunksDrained.await(10L, TimeUnit.SECONDS)) {
+          throw new IllegalStateException("the consumer did not read the rows before the failure");
+        }
+      } catch (InterruptedException e) {
+        Thread.currentThread().interrupt();
+        throw new IllegalStateException("interrupted while the file was failing to read", e);
+      }
+
+      throw new IllegalStateException(message);
+    }
+
+    @Override
+    public Integer next() {
       return next++;
     }
 

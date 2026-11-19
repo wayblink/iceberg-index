@@ -18,6 +18,7 @@
  */
 package org.apache.iceberg.index.spark;
 
+import java.io.Closeable;
 import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.util.ArrayList;
@@ -60,6 +61,7 @@ import org.apache.iceberg.relocated.com.google.common.collect.Sets;
 import org.apache.iceberg.types.Type;
 import org.apache.iceberg.types.Types;
 import org.apache.iceberg.util.PartitionUtil;
+import org.apache.spark.TaskContext;
 import org.apache.spark.api.java.JavaPairRDD;
 import org.apache.spark.api.java.JavaRDD;
 import org.apache.spark.api.java.JavaSparkContext;
@@ -80,6 +82,7 @@ import org.apache.spark.sql.types.Metadata;
 import org.apache.spark.sql.types.StructField;
 import org.apache.spark.sql.types.StructType;
 import org.apache.spark.util.LongAccumulator;
+import org.apache.spark.util.TaskCompletionListener;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import scala.Tuple2;
@@ -216,19 +219,33 @@ public final class IndexEntries {
           .parallelize(Collections.singletonList(taskList), 1)
           .flatMap(
               (FlatMapFunction<List<FileScanTask>, Row>)
-                  files ->
-                      entryRows(
-                          table.io(),
-                          files,
-                          readColumns,
-                          projection,
-                          rowSchema,
-                          readColumns.indexOf(column),
-                          adapter.skipsNullValues(),
-                          adapter,
-                          deletes,
-                          conf,
-                          skipped));
+                  files -> {
+                    CloseableIterator<Row> rows =
+                        entryRows(
+                            table.io(),
+                            files,
+                            readColumns,
+                            projection,
+                            rowSchema,
+                            readColumns.indexOf(column),
+                            adapter.skipsNullValues(),
+                            adapter,
+                            deletes,
+                            conf,
+                            skipped);
+                    // a task that is cancelled or that fails stops consuming the rows before the
+                    // read reaches its end, and the reader threads it started would then wait on a
+                    // queue nobody drains again. The listener runs when the task ends, however it
+                    // ends, so the streams are closed even though the caller never sees the end of
+                    // the rows; a read that does reach its end has already closed itself.
+                    TaskContext taskContext = TaskContext.get();
+                    if (taskContext != null) {
+                      taskContext.addTaskCompletionListener(
+                          (TaskCompletionListener) context -> closeQuietly(rows));
+                    }
+
+                    return rows;
+                  });
     }
 
     return sparkReadRows(
@@ -326,7 +343,7 @@ public final class IndexEntries {
    * threads: an adapter is handed the rows of one stream at a time, as it was when the files of a
    * group were read one after another.
    */
-  private static Iterator<Row> entryRows(
+  private static CloseableIterator<Row> entryRows(
       FileIO io,
       List<FileScanTask> files,
       List<String> readColumns,
@@ -355,6 +372,18 @@ public final class IndexEntries {
     OrderedParallelReads<Tuple2<Long, Row>> rows =
         OrderedParallelReads.of(streams, READ_STREAMS, READ_CHUNKS_PER_STREAM, READ_CHUNK_ROWS);
     return new EntryRows(rows, dataFiles, columnIndex, skipNulls, adapter, skipped);
+  }
+
+  /** Closes a group read that is no longer wanted; the caller is already on its way out. */
+  private static void closeQuietly(Closeable closeable) {
+    if (closeable != null) {
+      try {
+        closeable.close();
+      } catch (IOException e) {
+        // the read is abandoned at the end of a task: a close that fails there cannot be reported
+        // without masking the failure that ended the task
+      }
+    }
   }
 
   /**
@@ -389,9 +418,10 @@ public final class IndexEntries {
    *
    * <p>The rows are pulled from the streams in file order and encoded here, one at a time: the
    * reading threads only read. A failure stops the streams before it is rethrown, because they are
-   * waiting on a queue that nobody would drain again.
+   * waiting on a queue that nobody would drain again, and {@link #close()} stops them when the
+   * caller stops asking for rows before the end, as a task that is cancelled does.
    */
-  private static final class EntryRows implements Iterator<Row> {
+  private static final class EntryRows implements CloseableIterator<Row> {
     private final OrderedParallelReads<Tuple2<Long, Row>> rows;
     private final List<String> dataFiles;
     private final int columnIndex;
@@ -431,6 +461,11 @@ public final class IndexEntries {
       Row row = next;
       next = null;
       return row;
+    }
+
+    @Override
+    public void close() {
+      rows.close();
     }
 
     private boolean advance() {

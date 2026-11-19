@@ -28,6 +28,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
+import java.util.function.BooleanSupplier;
 import org.apache.iceberg.DeleteFile;
 import org.apache.iceberg.FileContent;
 import org.apache.iceberg.FileFormat;
@@ -55,6 +56,8 @@ import org.apache.iceberg.relocated.com.google.common.collect.Maps;
 import org.apache.iceberg.relocated.com.google.common.collect.Sets;
 import org.apache.iceberg.spark.TestBase;
 import org.apache.iceberg.types.Types;
+import org.apache.spark.api.java.JavaRDD;
+import org.apache.spark.api.java.function.VoidFunction;
 import org.apache.spark.sql.Row;
 import org.apache.spark.util.LongAccumulator;
 import org.junit.jupiter.api.AfterEach;
@@ -66,6 +69,12 @@ import scala.Tuple2;
 /**
  * The rows of an index group are read on a few streams at once, and still reach the index file in
  * data file order and, within a file, in position order, with the snapshot's deletes applied.
+ *
+ * <p>A group of avro or other non-parquet data files is read by the task that writes its index
+ * file, on several streams at once; a group that holds a parquet file keeps the per-file read
+ * through Spark's reader, because a task cannot start that reader for a file it was handed. The
+ * tests that cover the multi-stream read therefore write avro tables, and the parquet tests cover
+ * the fallback path.
  */
 class TestIndexEntryReads extends TestBase {
 
@@ -144,6 +153,124 @@ class TestIndexEntryReads extends TestBase {
   }
 
   @Test
+  void readsEveryChunkOfEveryFileOfAGroupInOrder() {
+    sql(
+        "CREATE TABLE %s (id bigint, embedding array<double>) USING iceberg "
+            + "TBLPROPERTIES ('write.format.default'='avro')",
+        TABLE_NAME);
+    // each file holds more than one chunk of the read (128 rows), so the read has to keep the order
+    // of the chunks of a file and of the files of the group, not just of the first chunk of each
+    appendRows(150, 0L);
+    appendRows(200, 1000L);
+    appendRows(130, 2000L);
+
+    Table table = catalog.loadTable(TableIdentifier.parse(TABLE_NAME));
+    List<FileScanTask> tasks = IndexEntries.scanTasks(table, table.currentSnapshot().snapshotId());
+    assertThat(tasks).hasSize(3);
+    for (FileScanTask task : tasks) {
+      assertThat(task.file().recordCount())
+          .as("the file %s spans several read chunks", task.file().location())
+          .isGreaterThan(128L);
+    }
+
+    assertEntriesMatchFiles(table, tasks, entryRows(table, tasks), Sets.newHashSet());
+  }
+
+  @Test
+  void stopsTheReadsOfAGroupWhenTheTaskThatConsumesThemFails() {
+    sql(
+        "CREATE TABLE %s (id bigint, embedding array<double>) USING iceberg "
+            + "TBLPROPERTIES ('write.format.default'='avro')",
+        TABLE_NAME);
+    appendRows(150, 0L);
+    appendRows(200, 1000L);
+    appendRows(130, 2000L);
+
+    Table table = catalog.loadTable(TableIdentifier.parse(TABLE_NAME));
+    List<FileScanTask> tasks = IndexEntries.scanTasks(table, table.currentSnapshot().snapshotId());
+    assertThat(tasks).hasSize(3);
+
+    // a read that a previous test drained has already stopped its readers: starting from no reader
+    // thread makes the assertion below be about this task
+    awaitTrue(() -> readerThreads().isEmpty(), 5_000L);
+
+    // the task that consumes the rows fails before the read reaches its end, as an encoding failure
+    // or a cancelled task does; the streams it started have to be stopped with the task rather than
+    // left waiting on a queue nobody drains again
+    JavaRDD<Row> entries = IndexEntries.entryRows(spark, table, tasks, "embedding", adapter());
+    Throwable failure =
+        catchThrowable(
+            () ->
+                entries.foreach(
+                    (VoidFunction<Row>)
+                        row -> {
+                          throw new IllegalStateException("the consumer failed on its first row");
+                        }));
+    assertThat(failure).as("the failing task fails the job").isNotNull();
+    assertThat(messages(failure)).anyMatch(message -> message.contains("the consumer failed"));
+
+    awaitTrue(() -> readerThreads().isEmpty(), 5_000L);
+    assertThat(readerThreads()).as("no reader thread outlives the failed task").isEmpty();
+  }
+
+  @Test
+  void keepsTheDataFileOfTheRowsWhenAFileInTheMiddleHasNoLiveRows() {
+    sql(
+        "CREATE TABLE %s (id bigint, embedding array<double>) USING iceberg "
+            + "TBLPROPERTIES ('write.format.default'='avro', 'write.delete.mode'='merge-on-read')",
+        TABLE_NAME);
+    appendRows(150, 0L);
+    appendRows(200, 1000L);
+    appendRows(130, 2000L);
+
+    // every row of the second file is deleted, so its stream is empty while the files after it
+    // still have rows: the entries of those rows have to carry their own data file
+    sql("DELETE FROM %s WHERE id >= 1000 AND id < 1200", TABLE_NAME);
+
+    Table table = catalog.loadTable(TableIdentifier.parse(TABLE_NAME));
+    List<FileScanTask> tasks = IndexEntries.scanTasks(table, table.currentSnapshot().snapshotId());
+    assertThat(tasks).hasSize(3);
+
+    String emptyFile = dataFileWithId(table, tasks, 1000L);
+    List<FileScanTask> remaining = Lists.newArrayList();
+    for (FileScanTask task : tasks) {
+      if (!task.file().location().toString().equals(emptyFile)) {
+        remaining.add(task);
+      }
+    }
+
+    assertThat(remaining).hasSize(2);
+    List<Row> rows = entryRows(table, tasks);
+    List<Tuple2<String, Long>> expected = everyPosition(remaining);
+    assertThat(rows).hasSize(expected.size());
+    assertThat(references(rows)).containsExactlyElementsOf(expected);
+    assertEntriesMatchFiles(table, tasks, rows, ids(1000L, 1200L));
+  }
+
+  @Test
+  void leavesOutTheRowsOfAFileWrittenBeforeTheIndexedColumnWasAdded() {
+    sql(
+        "CREATE TABLE %s (id bigint) USING iceberg TBLPROPERTIES ('write.format.default'='avro')",
+        TABLE_NAME);
+    sql("INSERT INTO %s VALUES (0), (1), (2)", TABLE_NAME);
+    // the file above has no column to index, so the read has to produce rows with a null value for
+    // it rather than fail, and the entry loop leaves those rows out and counts them
+    sql("ALTER TABLE %s ADD COLUMN embedding array<double>", TABLE_NAME);
+    sql("INSERT INTO %s VALUES (3, array(0.1, 0.2))", TABLE_NAME);
+
+    Table table = catalog.loadTable(TableIdentifier.parse(TABLE_NAME));
+    List<FileScanTask> tasks = IndexEntries.scanTasks(table, table.currentSnapshot().snapshotId());
+    LongAccumulator skipped = spark.sparkContext().longAccumulator();
+    List<Row> rows =
+        IndexEntries.entryRows(spark, table, tasks, "embedding", adapter(), skipped).collect();
+
+    assertThat(skipped.value()).isEqualTo(3);
+    assertThat(rows).hasSize(1);
+    assertThat(rows.get(0).getLong(1)).isZero();
+    assertThat(adapter().decodeVector(rows.get(0).getAs(2))).containsExactly(0.1f, 0.2f);
+  }
+
+  @Test
   void appliesTheDeleteFilesOfTheSnapshot() throws IOException {
     sql(
         "CREATE TABLE %s (id bigint, embedding array<double>) USING iceberg "
@@ -205,16 +332,18 @@ class TestIndexEntryReads extends TestBase {
 
     // a data file that is gone has to fail the read rather than produce a short group silently
     List<String> dataFiles = IndexEntries.dataFiles(table, table.currentSnapshot().snapshotId());
+    assertThat(dataFiles).isNotEmpty();
     for (String dataFile : dataFiles) {
       table.io().deleteFile(dataFile);
     }
 
-    String gone = dataFiles.get(0).substring(dataFiles.get(0).lastIndexOf('/') + 1);
+    // the files are read on several streams at once, so the failure that surfaces names one of the
+    // missing files rather than in particular the first one
     Throwable failure = catchThrowable(() -> entryRows(table, tasks));
     assertThat(failure).as("reading a group whose data file is gone fails").isNotNull();
     assertThat(messages(failure))
-        .as("the failure names the file it could not read")
-        .anyMatch(message -> message.contains(gone));
+        .as("the failure names a file it could not read")
+        .anyMatch(message -> dataFiles.stream().anyMatch(message::contains));
   }
 
   private static List<String> messages(Throwable failure) {
@@ -238,6 +367,64 @@ class TestIndexEntryReads extends TestBase {
         IndexEntries.entryRows(spark, table, tasks, "embedding", adapter(), skipped).collect();
     assertThat(skipped.value()).isZero();
     return rows;
+  }
+
+  /**
+   * Appends rows whose ids start at the given id, forced to a single task so the append writes one
+   * data file.
+   */
+  private void appendRows(int rows, long firstId) {
+    sql(
+        "INSERT INTO %s SELECT /*+ REPARTITION(1) */ cast(id + %d as bigint) AS id, "
+            + "array(cast(id + %d as double), cast(id as double)) AS embedding FROM range(0, %d)",
+        TABLE_NAME, firstId, firstId, rows);
+  }
+
+  /** The data file whose rows carry the given id. */
+  private static String dataFileWithId(Table table, List<FileScanTask> tasks, long id) {
+    for (FileScanTask task : tasks) {
+      String dataFile = task.file().location().toString();
+      for (Record record : records(table, dataFile, task.file().format())) {
+        if ((Long) record.getField("id") == id) {
+          return dataFile;
+        }
+      }
+    }
+
+    throw new IllegalArgumentException("No data file holds the row " + id);
+  }
+
+  private static Set<Long> ids(long from, long toExclusive) {
+    Set<Long> ids = Sets.newHashSet();
+    for (long id = from; id < toExclusive; id++) {
+      ids.add(id);
+    }
+
+    return ids;
+  }
+
+  /** The reader threads of the group reads that are still running. */
+  private static List<String> readerThreads() {
+    List<String> names = Lists.newArrayList();
+    for (Thread thread : Thread.getAllStackTraces().keySet()) {
+      if (thread.getName().startsWith("index-group-read")) {
+        names.add(thread.getName());
+      }
+    }
+
+    return names;
+  }
+
+  private static void awaitTrue(BooleanSupplier condition, long waitMillis) {
+    long deadline = System.currentTimeMillis() + waitMillis;
+    while (!condition.getAsBoolean() && System.currentTimeMillis() < deadline) {
+      try {
+        Thread.sleep(10L);
+      } catch (InterruptedException e) {
+        Thread.currentThread().interrupt();
+        return;
+      }
+    }
   }
 
   /**
