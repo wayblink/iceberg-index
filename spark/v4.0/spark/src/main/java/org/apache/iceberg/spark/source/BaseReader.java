@@ -118,7 +118,9 @@ abstract class BaseReader<T, TaskT extends ScanTask> implements Closeable {
   }
 
   private static Map<String, String> storageProperties(Table table, FileIO fileIO) {
-    Map<String, String> properties = Maps.newHashMap();
+    // insertion order is the precedence: the cases are added least specific first, and a format
+    // that has several spellings for one setting applies them in the order it encounters them
+    Map<String, String> properties = Maps.newLinkedHashMap();
     try {
       properties.putAll(fileIO.properties());
     } catch (UnsupportedOperationException e) {

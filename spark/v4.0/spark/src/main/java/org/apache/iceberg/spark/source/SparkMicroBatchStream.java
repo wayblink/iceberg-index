@@ -39,6 +39,7 @@ import org.apache.iceberg.io.CloseableIterable;
 import org.apache.iceberg.io.FileIO;
 import org.apache.iceberg.io.InputFile;
 import org.apache.iceberg.io.OutputFile;
+import org.apache.iceberg.io.StorageProperties;
 import org.apache.iceberg.relocated.com.google.common.base.Joiner;
 import org.apache.iceberg.relocated.com.google.common.base.Preconditions;
 import org.apache.iceberg.relocated.com.google.common.collect.Lists;
@@ -96,7 +97,10 @@ public class SparkMicroBatchStream implements MicroBatchStream, SupportsTriggerA
     this.expectedSchema = SchemaParser.toJson(expectedSchema);
     this.localityPreferred = readConf.localityEnabled();
     this.tableBroadcast = sparkContext.broadcast(SerializableTableWithSize.copyOf(table));
-    this.fileIOBroadcast = sparkContext.broadcast(SerializableFileIOWithSize.wrap(fileIO.get()));
+    this.fileIOBroadcast =
+        sparkContext.broadcast(
+            SerializableFileIOWithSize.wrap(
+                fileIO.get(), StorageProperties.fromConf(sparkContext.hadoopConfiguration())));
     this.splitSize = readConf.splitSize();
     this.splitLookback = readConf.splitLookback();
     this.splitOpenFileCost = readConf.splitOpenFileCost();

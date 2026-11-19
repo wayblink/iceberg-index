@@ -25,6 +25,8 @@ import org.apache.iceberg.hadoop.HadoopConfigurable;
 import org.apache.iceberg.io.FileIO;
 import org.apache.iceberg.io.InputFile;
 import org.apache.iceberg.io.OutputFile;
+import org.apache.iceberg.relocated.com.google.common.collect.ImmutableMap;
+import org.apache.iceberg.relocated.com.google.common.collect.Maps;
 import org.apache.iceberg.util.SerializableSupplier;
 import org.apache.spark.util.KnownSizeEstimation;
 import org.slf4j.Logger;
@@ -46,9 +48,11 @@ class SerializableFileIOWithSize
   private static final long SIZE_ESTIMATE = 32_768L;
   private final transient Object serializationMarker;
   private final FileIO fileIO;
+  private final Map<String, String> extraProperties;
 
-  private SerializableFileIOWithSize(FileIO fileIO) {
+  private SerializableFileIOWithSize(FileIO fileIO, Map<String, String> extraProperties) {
     this.fileIO = fileIO;
+    this.extraProperties = extraProperties;
     this.serializationMarker = new Object();
   }
 
@@ -58,7 +62,22 @@ class SerializableFileIOWithSize
   }
 
   public static FileIO wrap(FileIO fileIO) {
-    return new SerializableFileIOWithSize(fileIO);
+    return wrap(fileIO, ImmutableMap.of());
+  }
+
+  /**
+   * Wraps a FileIO with settings the executors have to see on top of the FileIO's own.
+   *
+   * <p>A file format that opens files itself reads the object store settings from the map the
+   * reader is given, and the reader builds that map from {@link FileIO#properties()}. A {@code
+   * HadoopFileIO} exposes only the catalog properties it was initialized with, not the Hadoop
+   * configuration it actually reads through, so the engine's storage keys would never reach the
+   * format. Carrying them here is what makes a table readable from the Hadoop configuration alone;
+   * the FileIO's own properties still win, and the table's properties win over both where a reader
+   * merges them.
+   */
+  public static FileIO wrap(FileIO fileIO, Map<String, String> extraProperties) {
+    return new SerializableFileIOWithSize(fileIO, ImmutableMap.copyOf(extraProperties));
   }
 
   @Override
@@ -96,7 +115,15 @@ class SerializableFileIOWithSize
 
   @Override
   public Map<String, String> properties() {
-    return fileIO.properties();
+    Map<String, String> properties = Maps.newLinkedHashMap();
+    properties.putAll(extraProperties);
+    try {
+      properties.putAll(fileIO.properties());
+    } catch (UnsupportedOperationException e) {
+      // this FileIO does not expose its configuration; the settings carried alongside still apply
+    }
+
+    return properties;
   }
 
   @Override

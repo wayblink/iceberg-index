@@ -63,6 +63,7 @@ import org.apache.iceberg.index.vector.VectorIndexDefinition;
 import org.apache.iceberg.io.FileIO;
 import org.apache.iceberg.io.IOUtil;
 import org.apache.iceberg.io.InputFile;
+import org.apache.iceberg.io.StorageProperties;
 import org.apache.iceberg.relocated.com.google.common.base.Preconditions;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableList;
 import org.apache.iceberg.relocated.com.google.common.collect.Lists;
@@ -460,7 +461,9 @@ public final class DistributedIndexSearch {
                 candidateFilter,
                 filterColumns,
                 table.schema(),
-                keep));
+                keep,
+                StorageProperties.resolve(
+                    table.io(), table.properties(), spark.sessionState().newHadoopConf())));
     long workingSet = workingSetBytes(table.io(), files, adapter, table.location());
     Broadcast<ExecutorIndexCache.Config> cacheRef =
         sparkContext.broadcast(ExecutorIndexCache.Config.from(spark, workingSet, table.location()));
@@ -687,7 +690,9 @@ public final class DistributedIndexSearch {
             candidateFilter,
             filterColumns,
             table.schema(),
-            keep);
+            keep,
+            StorageProperties.resolve(
+                table.io(), table.properties(), spark.sessionState().newHadoopConf()));
 
     // the source's operator re-scores and sorts exactly, so the window it gets can be wider than
     // the answer; the window is the query's top-k times a small factor, not every index file's
@@ -1092,6 +1097,7 @@ public final class DistributedIndexSearch {
     private final List<String> filterColumns;
     private final Schema tableSchema;
     private final int keep;
+    private final Map<String, String> storageProperties;
 
     private RowReadPlan(
         Schema projection,
@@ -1102,7 +1108,8 @@ public final class DistributedIndexSearch {
         IndexRowFilter candidateFilter,
         List<String> filterColumns,
         Schema tableSchema,
-        int keep) {
+        int keep,
+        Map<String, String> storageProperties) {
       this.projection = projection;
       this.expected = expected;
       this.deletes = deletes;
@@ -1112,6 +1119,7 @@ public final class DistributedIndexSearch {
       this.filterColumns = new ArrayList<>(filterColumns);
       this.tableSchema = tableSchema;
       this.keep = keep;
+      this.storageProperties = storageProperties;
     }
 
     static RowReadPlan of(
@@ -1123,7 +1131,8 @@ public final class DistributedIndexSearch {
         IndexRowFilter candidateFilter,
         List<String> filterColumns,
         Schema tableSchema,
-        int keep) {
+        int keep,
+        Map<String, String> storageProperties) {
       return new RowReadPlan(
           projection,
           expected,
@@ -1133,7 +1142,8 @@ public final class DistributedIndexSearch {
           candidateFilter,
           filterColumns,
           tableSchema,
-          keep);
+          keep,
+          storageProperties);
     }
 
     /** The live rows the hits name, with the score the index gave each of them. */
@@ -1171,7 +1181,8 @@ public final class DistributedIndexSearch {
 
         java.util.Collections.sort(positions);
         List<Tuple2<Row, Long>> read =
-            IndexEntries.liveRowsAt(io, task, deletes, positions, projection, expected, conf);
+            IndexEntries.liveRowsAt(
+                io, task, deletes, positions, projection, expected, conf, storageProperties);
         files.add(dataFile);
         for (Tuple2<Row, Long> row : read) {
           Double score = scores.get(row._2());
@@ -1209,7 +1220,15 @@ public final class DistributedIndexSearch {
         String dataFile = task.file().location().toString();
         long[] admitted =
             IndexEntries.positionsMatching(
-                io, task, deletes, candidateFilter, tableSchema, filterColumns, expected, conf);
+                io,
+                task,
+                deletes,
+                candidateFilter,
+                tableSchema,
+                filterColumns,
+                expected,
+                conf,
+                storageProperties);
         if (admitted.length > 0) {
           positions.put(dataFile, admitted);
           count += admitted.length;
@@ -1702,9 +1721,8 @@ public final class DistributedIndexSearch {
     IndexCacheControl.recordAccess(spark, metadata.indexUuid());
     TextIndexAdapter adapter = new TextIndexAdapter((TextIndexDefinition) metadata.definition());
     Map<String, String> properties =
-        Maps.newHashMap(IndexEntries.storageProperties(spark.sessionState().newHadoopConf()));
-    properties.putAll(IndexEntries.storageProperties(table.io()));
-    properties.putAll(table.properties());
+        StorageProperties.resolve(
+            table.io(), table.properties(), spark.sessionState().newHadoopConf());
     TextFilterRead filter =
         new TextFilterRead(
             EncryptingFileIO.combine(table.io(), table.encryption()),

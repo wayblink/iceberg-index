@@ -177,7 +177,7 @@ public class LanceFormatModel<D, S>
     private S engineSchema;
     private FileContent content;
     private final Map<String, String> metadata = Maps.newHashMap();
-    private final Map<String, String> config = Maps.newHashMap();
+    private final Map<String, String> config = Maps.newLinkedHashMap();
     private boolean overwrite;
 
     WriteBuilderWrapper(
@@ -311,7 +311,7 @@ public class LanceFormatModel<D, S>
     private Map<Integer, ?> idToConstant = Collections.emptyMap();
     private int batchSize = DEFAULT_BATCH_SIZE;
     private List<Long> positions;
-    private final Map<String, String> config = Maps.newHashMap();
+    private final Map<String, String> config = Maps.newLinkedHashMap();
 
     ReadBuilderWrapper(
         InputFile inputFile,
@@ -445,7 +445,7 @@ public class LanceFormatModel<D, S>
             return new LanceCloseableIterator<>(
                 path, storageOptions, columns, ranges, readBatchSize, constants, readerFunc);
           } catch (IOException e) {
-            throw new java.io.UncheckedIOException("Failed to open Lance file reader", e);
+            throw new java.io.UncheckedIOException(openFailureMessage(path, storageOptions), e);
           }
         }
 
@@ -455,6 +455,29 @@ public class LanceFormatModel<D, S>
         }
       };
     }
+  }
+
+  /**
+   * What a failed open says, including which setting was missing.
+   *
+   * <p>A format that opens files itself falls back to the object-store client's defaults when the
+   * reader is given no settings, which for an S3-compatible store that is not AWS is a request to
+   * public AWS S3: the failure reads "bucket not found" and says nothing about the configuration
+   * that never arrived. Naming the missing setting here is what turns that into an actionable
+   * error.
+   */
+  static String openFailureMessage(String path, Map<String, String> storageOptions) {
+    String message = "Failed to open Lance file reader " + path;
+    if (storageOptions.containsKey("endpoint")) {
+      return message;
+    }
+
+    return message
+        + ": no object-store endpoint was resolved from the table's properties, the catalog's"
+        + " FileIO properties or the Hadoop configuration, so the reader fell back to the"
+        + " object-store client's defaults (public AWS S3). Set s3.endpoint for the table or the"
+        + " catalog, or fs.s3a.endpoint in the engine's Hadoop configuration, or"
+        + " lance.storage.endpoint on the table for the Lance-only spelling.";
   }
 
   // ---------------------------------------------------------------------------

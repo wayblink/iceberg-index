@@ -52,6 +52,7 @@ import org.apache.iceberg.io.CloseableIterator;
 import org.apache.iceberg.io.DeleteSchemaUtil;
 import org.apache.iceberg.io.FileIO;
 import org.apache.iceberg.io.InputFile;
+import org.apache.iceberg.io.StorageProperties;
 import org.apache.iceberg.mapping.NameMappingParser;
 import org.apache.iceberg.relocated.com.google.common.base.Preconditions;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableList;
@@ -203,6 +204,10 @@ public final class IndexEntries {
     // copy of the Hadoop configuration into the stage's task binary
     SerializableConfiguration conf =
         new SerializableConfiguration(spark.sessionState().newHadoopConf());
+    // the settings a format that opens the file itself needs, resolved once for the whole group:
+    // the table's properties win over the catalog's, which win over the Hadoop configuration's
+    Map<String, String> storageProperties =
+        StorageProperties.resolve(table.io(), table.properties(), conf.get());
 
     // the data read needs the indexed column plus the columns referenced by equality deletes
     Set<String> columnsToRead = Sets.newLinkedHashSet();
@@ -238,7 +243,7 @@ public final class IndexEntries {
                             adapter.skipsNullValues(),
                             adapter,
                             deletes,
-                            conf,
+                            storageProperties,
                             skipped);
                     // a task that is cancelled or that fails stops consuming the rows before the
                     // read reaches its end, and the reader threads it started would then wait on a
@@ -256,7 +261,16 @@ public final class IndexEntries {
     }
 
     return sparkReadRows(
-        spark, table, taskList, column, readColumns, adapter, deletes, conf, skipped);
+        spark,
+        table,
+        taskList,
+        column,
+        readColumns,
+        adapter,
+        deletes,
+        conf,
+        storageProperties,
+        skipped);
   }
 
   /** The projection of the given columns, in the order they are read in. */
@@ -306,6 +320,7 @@ public final class IndexEntries {
       IndexAdapter adapter,
       SnapshotDeletes deletes,
       SerializableConfiguration conf,
+      Map<String, String> storageProperties,
       LongAccumulator skipped) {
     Schema tableSchema = table.schema();
     StructType readSchema = sparkSchema(table, readColumns);
@@ -319,7 +334,16 @@ public final class IndexEntries {
     for (FileScanTask task : tasks) {
       String dataFile = task.file().location().toString();
       JavaRDD<Row> fileRows =
-          liveRowsOf(spark, tableSchema, task, readColumns, null, readSchema, deletes, conf)
+          liveRowsOf(
+                  spark,
+                  tableSchema,
+                  task,
+                  readColumns,
+                  null,
+                  readSchema,
+                  deletes,
+                  conf,
+                  storageProperties)
               .filter(
                   (Function<Tuple2<Long, Row>, Boolean>)
                       entry -> !skipNulls || hasValue(entry._2(), columnIndex, skipped))
@@ -360,7 +384,7 @@ public final class IndexEntries {
       boolean skipNulls,
       IndexAdapter adapter,
       SnapshotDeletes deletes,
-      SerializableConfiguration conf,
+      Map<String, String> storageProperties,
       LongAccumulator skipped) {
     List<String> dataFiles = Lists.newArrayListWithCapacity(files.size());
     List<OrderedParallelReads.Stream<Tuple2<Long, Row>>> streams =
@@ -373,7 +397,9 @@ public final class IndexEntries {
       long[] deletedPositions = deletes.deletedPositions(dataFile);
       List<EqualityKeySet> keySets = deletes.keySets();
       streams.add(
-          () -> liveRowsOfFile(io, task, projection, rowSchema, deletedPositions, keySets, conf));
+          () ->
+              liveRowsOfFile(
+                  io, task, projection, rowSchema, deletedPositions, keySets, storageProperties));
     }
 
     OrderedParallelReads<Tuple2<Long, Row>> rows =
@@ -407,12 +433,16 @@ public final class IndexEntries {
       StructType rowSchema,
       long[] deletedPositions,
       List<EqualityKeySet> keySets,
-      SerializableConfiguration conf) {
+      Map<String, String> storageProperties) {
     String dataFile = task.file().location().toString();
     try {
       return new LiveRows(
           openRowsWithFormat(
-              io.newInputFile(task.file()), task.file().format(), projection, rowSchema, conf),
+              io.newInputFile(task.file()),
+              task.file().format(),
+              projection,
+              rowSchema,
+              storageProperties),
           deletedPositions,
           keySets);
     } catch (IOException e) {
@@ -709,13 +739,24 @@ public final class IndexEntries {
     // the deletes belong to the fetch-back, not to the file being read: the same set applies to
     // every file, so reading them inside the loop would read and broadcast them once per hit file
     SnapshotDeletes deletes = deletesFor(spark, tasks, table);
+    Map<String, String> storageProperties =
+        StorageProperties.resolve(table.io(), table.properties(), conf.get());
 
     JavaPairRDD<String, Tuple2<Long, Row>> rows = null;
     for (FileScanTask task : tasks) {
       String dataFile = task.file().location().toString();
       Collection<Long> positions = positionsByFile.get(dataFile);
       JavaPairRDD<String, Tuple2<Long, Row>> fileRows =
-          liveRowsOf(spark, table.schema(), task, columns, positions, readSchema, deletes, conf)
+          liveRowsOf(
+                  spark,
+                  table.schema(),
+                  task,
+                  columns,
+                  positions,
+                  readSchema,
+                  deletes,
+                  conf,
+                  storageProperties)
               .mapToPair(
                   (PairFunction<Tuple2<Long, Row>, String, Tuple2<Long, Row>>)
                       entry -> new Tuple2<>(dataFile, entry));
@@ -789,10 +830,22 @@ public final class IndexEntries {
     }
 
     SnapshotDeletes deletes = SnapshotDeletes.read(spark, table, tasks, table.schema());
+    Map<String, String> storageProperties =
+        StorageProperties.resolve(
+            table.io(), table.properties(), spark.sessionState().newHadoopConf());
     List<JavaRDD<Row>> perFile = Lists.newArrayList();
     for (FileScanTask task : tasks) {
       perFile.add(
-          liveRowsOf(spark, table.schema(), task, columns, null, readSchema, deletes, null)
+          liveRowsOf(
+                  spark,
+                  table.schema(),
+                  task,
+                  columns,
+                  null,
+                  readSchema,
+                  deletes,
+                  null,
+                  storageProperties)
               .values());
     }
 
@@ -821,7 +874,8 @@ public final class IndexEntries {
       Collection<Long> positions,
       StructType readSchema,
       SnapshotDeletes deletes,
-      SerializableConfiguration conf) {
+      SerializableConfiguration conf,
+      Map<String, String> storageProperties) {
     String dataFile = task.file().location().toString();
 
     // delete files are read on the driver so the executor-side filter is a simple lookup
@@ -838,7 +892,8 @@ public final class IndexEntries {
     // the projection to the requested columns happens below, by name, so the read itself can take
     // every column the file has
     JavaPairRDD<Row, Long> data =
-        positionedRows(spark, tableSchema, task, readColumns, positions, readWith, conf);
+        positionedRows(
+            spark, tableSchema, task, readColumns, positions, readWith, conf, storageProperties);
 
     List<String> capturedReadColumns = readColumns;
     List<String> capturedColumns = columns;
@@ -907,7 +962,8 @@ public final class IndexEntries {
       List<String> columns,
       Collection<Long> positions,
       StructType readSchema,
-      SerializableConfiguration conf) {
+      SerializableConfiguration conf,
+      Map<String, String> storageProperties) {
     String dataFile = task.file().location().toString();
     FileFormat format = task.file().format();
 
@@ -934,7 +990,14 @@ public final class IndexEntries {
         .flatMapToPair(
             (PairFlatMapFunction<String, Row, Long>)
                 file ->
-                    readFileWithFormat(file, format, projection, sparkSchema, positions, readConf));
+                    readFileWithFormat(
+                        file,
+                        format,
+                        projection,
+                        sparkSchema,
+                        positions,
+                        readConf,
+                        storageProperties));
   }
 
   /**
@@ -1127,7 +1190,8 @@ public final class IndexEntries {
       List<Long> positions,
       Schema projection,
       org.apache.spark.sql.types.StructType expected,
-      SerializableConfiguration conf) {
+      SerializableConfiguration conf,
+      Map<String, String> storageProperties) {
     if (positions.isEmpty()) {
       return Lists.newArrayList();
     }
@@ -1171,7 +1235,14 @@ public final class IndexEntries {
     java.util.Iterator<Tuple2<Row, Long>> read;
     try {
       read =
-          readFileWithFormat(dataFile, task.file().format(), readSchema, rowSchema, wanted, conf);
+          readFileWithFormat(
+              dataFile,
+              task.file().format(),
+              readSchema,
+              rowSchema,
+              wanted,
+              conf,
+              storageProperties);
     } catch (java.io.IOException e) {
       throw new java.io.UncheckedIOException("Failed to read " + dataFile, e);
     }
@@ -1223,7 +1294,8 @@ public final class IndexEntries {
       Schema tableSchema,
       List<String> filterColumns,
       org.apache.spark.sql.types.StructType expected,
-      SerializableConfiguration conf) {
+      SerializableConfiguration conf,
+      Map<String, String> storageProperties) {
     String dataFile = task.file().location().toString();
     long[] deleted = deletes.deletedPositions(dataFile);
     List<EqualityKeySet> keySets = deletes.keySets();
@@ -1247,7 +1319,9 @@ public final class IndexEntries {
           expected != null && expected.size() == readSchema.columns().size()
               ? expected
               : toSparkSchema(readSchema);
-      read = readFileWithFormat(dataFile, task.file().format(), readSchema, rowSchema, null, conf);
+      read =
+          readFileWithFormat(
+              dataFile, task.file().format(), readSchema, rowSchema, null, conf, storageProperties);
     } catch (java.io.IOException e) {
       throw new java.io.UncheckedIOException("Failed to read " + dataFile, e);
     }
@@ -1369,13 +1443,13 @@ public final class IndexEntries {
       FileFormat format,
       Schema projection,
       StructType sparkSchema,
-      SerializableConfiguration conf)
+      Map<String, String> storageProperties)
       throws IOException {
     ReadBuilder<Record, Void> builder =
         FormatModelRegistry.readBuilder(format, Record.class, inputFile);
     // a format that opens the file itself does not read through the FileIO, so the storage settings
     // this table is read with have to be handed to it
-    builder.setAll(storageProperties(taskConf(conf)));
+    builder.setAll(storageProperties);
     return new RowsWithPosition(builder.project(projection).build(), projection, sparkSchema);
   }
 
@@ -1430,7 +1504,8 @@ public final class IndexEntries {
       Schema projection,
       StructType sparkSchema,
       Collection<Long> positions,
-      SerializableConfiguration conf)
+      SerializableConfiguration conf,
+      Map<String, String> storageProperties)
       throws IOException {
     long tStart = System.nanoTime();
     InputFile input = HadoopInputFile.fromLocation(location, taskConf(conf));
@@ -1439,7 +1514,7 @@ public final class IndexEntries {
         FormatModelRegistry.readBuilder(format, Record.class, input);
     // a format that opens the file itself does not read through the Hadoop file system, so the
     // storage settings this table is read with have to be handed to it
-    builder.setAll(storageProperties(taskConf(conf)));
+    builder.setAll(storageProperties);
     long tBuilder = System.nanoTime();
     boolean timings = Boolean.getBoolean("iceberg.index.fetch-back.timings");
 
@@ -2009,7 +2084,7 @@ public final class IndexEntries {
     InputFile inputFile = io.newInputFile(deleteFile.location());
     return FormatModelRegistry.readBuilder(deleteFile.format(), Record.class, inputFile)
         .project(projection)
-        .setAll(storageProperties(io))
+        .setAll(StorageProperties.fromFileIO(io))
         .reuseContainers()
         .build();
   }
@@ -2019,28 +2094,12 @@ public final class IndexEntries {
    * already carried them in.
    */
   static Map<String, String> storageProperties(FileIO io) {
-    try {
-      return io.properties();
-    } catch (UnsupportedOperationException e) {
-      return ImmutableMap.of();
-    }
+    return StorageProperties.fromFileIO(io);
   }
 
   /** The same, for a path that only has the Hadoop configuration. */
   static Map<String, String> storageProperties(org.apache.hadoop.conf.Configuration conf) {
-    Map<String, String> properties = Maps.newHashMap();
-    for (Map.Entry<String, String> entry : conf) {
-      String key = entry.getKey();
-      if (key.startsWith("fs.s3a.")
-          || key.startsWith("fs.s3.")
-          || key.startsWith("fs.gs.")
-          || key.startsWith("fs.azure.")
-          || key.startsWith("s3.")) {
-        properties.put(key, entry.getValue());
-      }
-    }
-
-    return properties;
+    return StorageProperties.fromConf(conf);
   }
 
   /** The table columns of one equality key set, in field id order; null where a column is gone. */

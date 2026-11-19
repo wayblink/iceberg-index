@@ -18,10 +18,13 @@
  */
 package org.apache.iceberg.spark.source;
 
+import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.when;
 
 import org.apache.iceberg.io.FileIO;
+import org.apache.iceberg.relocated.com.google.common.collect.ImmutableMap;
 import org.junit.jupiter.api.Test;
 
 class TestSerializableFileIOWithSize {
@@ -47,5 +50,38 @@ class TestSerializableFileIOWithSize {
     serializableFileIO.newInputFile(path);
 
     verify(mockFileIO).newInputFile(path);
+  }
+
+  @Test
+  void carriesTheEnginesStorageSettingsToTheExecutors() {
+    FileIO mockFileIO = mock(FileIO.class);
+    when(mockFileIO.properties()).thenReturn(ImmutableMap.of("fs.s3a.access.key", "catalog-key"));
+
+    FileIO serializableFileIO =
+        SerializableFileIOWithSize.wrap(
+            mockFileIO,
+            ImmutableMap.of(
+                "fs.s3a.endpoint", "http://oss.internal:8080",
+                "fs.s3a.access.key", "conf-key"));
+
+    // a format that opens files itself reads the map, so the Hadoop configuration's settings have
+    // to be in it; the FileIO's own settings are more specific and win where they overlap
+    assertThat(serializableFileIO.properties())
+        .containsEntry("fs.s3a.endpoint", "http://oss.internal:8080")
+        .containsEntry("fs.s3a.access.key", "catalog-key");
+  }
+
+  @Test
+  void carriesItsSettingsForAFileIoThatExposesNone() {
+    FileIO mockFileIO = mock(FileIO.class);
+    when(mockFileIO.properties())
+        .thenThrow(new UnsupportedOperationException("this FileIO does not expose its config"));
+
+    FileIO serializableFileIO =
+        SerializableFileIOWithSize.wrap(
+            mockFileIO, ImmutableMap.of("fs.s3a.endpoint", "http://oss.internal:8080"));
+
+    assertThat(serializableFileIO.properties())
+        .containsEntry("fs.s3a.endpoint", "http://oss.internal:8080");
   }
 }

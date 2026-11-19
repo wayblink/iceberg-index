@@ -30,6 +30,7 @@ import org.apache.iceberg.Schema;
 import org.apache.iceberg.SchemaParser;
 import org.apache.iceberg.Table;
 import org.apache.iceberg.io.FileIO;
+import org.apache.iceberg.io.StorageProperties;
 import org.apache.iceberg.spark.ImmutableOrcBatchReadConf;
 import org.apache.iceberg.spark.ImmutableParquetBatchReadConf;
 import org.apache.iceberg.spark.OrcBatchReadConf;
@@ -89,7 +90,9 @@ class SparkBatch implements Batch {
     Broadcast<Table> tableBroadcast =
         sparkContext.broadcast(SerializableTableWithSize.copyOf(table));
     Broadcast<FileIO> fileIOBroadcast =
-        sparkContext.broadcast(SerializableFileIOWithSize.wrap(fileIO.get()));
+        sparkContext.broadcast(
+            SerializableFileIOWithSize.wrap(
+                fileIO.get(), StorageProperties.fromConf(sparkContext.hadoopConfiguration())));
     String expectedSchemaString = SchemaParser.toJson(expectedSchema);
     String[][] locations = computePreferredLocations();
 

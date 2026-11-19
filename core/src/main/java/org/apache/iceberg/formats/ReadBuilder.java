@@ -98,6 +98,13 @@ public interface ReadBuilder<D, S> {
    * Sets multiple reader configuration properties that affect the reader behavior. Reader builders
    * should ignore configuration keys not known for them.
    *
+   * <p>Every entry is applied in the map's iteration order. The order is kept rather than treated
+   * as unordered: a format that accepts more than one spelling for the same setting applies them in
+   * this order, so a caller merging several sources can hand them over least specific first and
+   * have the more specific value win. A plain {@code HashMap} in between therefore makes settings
+   * that share a setting but not a name — an endpoint in {@code s3.endpoint} and in {@code
+   * fs.s3a.endpoint}, say — resolve arbitrarily.
+   *
    * @param properties reader config properties to set
    * @return this for method chaining
    */

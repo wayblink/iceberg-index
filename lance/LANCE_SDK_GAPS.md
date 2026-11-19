@@ -207,23 +207,36 @@ falls back to the process environment.
 Write side works: `RegistryBasedFileWriterFactory` passes `table.properties()` through
 `ModelWriteBuilder.set`, and `LanceStorageOptions` translates them.
 
-Read side does not: `FormatModel.readBuilder(InputFile)` takes no configuration, `ReadBuilder.set`
-exists but no Spark, Flink, MR, Arrow or index read path calls it, so the storage options map is
-always empty. The consequence is asymmetric and surprising — the same table reads its parquet files
-with the catalog's `s3.*` settings and its Lance files with the process environment only.
+Read side used to be the same: `FormatModel.readBuilder(InputFile)` takes no configuration and no
+read path called `ReadBuilder.set`, so the storage options map was always empty. It is now filled
+from three sources in a fixed order, resolved by `org.apache.iceberg.io.StorageProperties`:
+the table's properties (most specific), the catalog's `FileIO.properties()`, and the engine's
+Hadoop configuration (`fs.s3a.*` / `spark.hadoop.*`). The process environment is deliberately left
+out of the map: it stays the object-store client's own last resort, and a read that resolves no
+endpoint now says so instead of only relaying `Bucket ... not found`.
+
+The order is applied, not just merged: `ReadBuilder.setAll` walks the map in iteration order and the
+Lance model keeps that order, so when two spellings of one setting are present the later one wins.
+The merging callers therefore have to use an order-preserving map; a `HashMap` in between makes the
+precedence arbitrary, which is exactly how a Hadoop default `fs.s3a.endpoint` once shadowed a
+catalog `s3.endpoint`.
 
 **Fix (partly done):** `ReadBuilder.setAll(Map)` already exists upstream and nothing called it.
 The engine readers now pass `FileIO.properties()` (with `UnsupportedOperationException` handled —
 the `FileIO` default throws) merged with the table properties, and the format model picks the keys it
 understands:
 
-- done: Spark 3.5 / 4.0 / 4.1 `BaseReader` (feeds `BaseBatchReader` and `BaseRowReader`), `data`
-  `GenericReader`, `index-spark` `IndexEntries` (data files, and delete files through
-  `FileIO.properties()`)
+- done: Spark 3.5 / 4.0 / 4.1 read paths — the driver lifts the storage keys out of
+  `sparkContext.hadoopConfiguration()` and carries them to the executors on the broadcast `FileIO`
+  (`SerializableFileIOWithSize`), so a `HadoopFileIO` — whose `properties()` only exposes the
+  catalog properties it was initialized with — no longer loses them; `BaseReader` then merges them
+  with the `FileIO` properties and the table properties
+- done: `index-spark` resolves the same three sources once for search, fetch-back and text filters
 - not done: Flink `RowDataFileScanTaskReader` — its constructor has no `FileIO`, so passing the
   settings means changing the constructor and the callers above it; MR `IcebergInputFormat`;
   `data` `BaseDeleteLoader` — it only holds `Function<DeleteFile, InputFile>` and the public
-  constructor cannot carry a configuration source without an API change
+  constructor cannot carry a configuration source without an API change; `index-spark`'s
+  delete-file reads still see only `FileIO.properties()`
 
 A second asymmetry is worth recording: the write side has no `FileIO` channel either.
 `RegistryBasedFileWriterFactory` only passes `table.properties()` through `ModelWriteBuilder.set`, so a
@@ -231,10 +244,13 @@ table written to a non-AWS endpoint must carry endpoint / path-style / allow-htt
 properties** (credentials can still come from the environment or an instance profile).
 
 Evidence: `TestLanceS3StorageOptions` writes and reads through MinIO with both the Iceberg spelling
-and `lance.storage.*`, and names an unreachable endpoint in the failure; `TestGenericReaderStorageProperties`
+and `lance.storage.*`, and names an unreachable endpoint in the failure; `TestStorageProperties`
+pins the source order and the Hadoop-configuration filter; `TestGenericReaderStorageProperties`
 registers a stub model and asserts the table properties reach the `ReadBuilder`;
 `TestLanceSparkS3StorageSmoke` writes a Lance table to MinIO through Spark, strips the storage
-properties from the table, and reads it back using only the catalog's `FileIO` properties.
+properties from the table, and reads it back using only the catalog's `FileIO` properties;
+`TestLanceSparkHadoopStorageConfSmoke` does the same with a catalog FileIO that exposes no storage
+settings (the `HadoopFileIO` shape) and with the store configured only in `spark.hadoop.fs.s3a.*`.
 
 **Upstream gap:** `readBuilder(InputFile)` has no config parameter, so every format that owns its
 storage hits this. Worth raising with the File Format API owners rather than fixing per engine.

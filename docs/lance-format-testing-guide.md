@@ -65,9 +65,24 @@ ALTER TABLE hms.sparkann.sift10m_lance SET TBLPROPERTIES (
 
 **凭据不要写进表属性**：表属性会进元数据和每一个快照的历史，等于把 AK/SK 永久留档。凭据走 catalog 配置、instance profile 或环境变量；表属性里只放 endpoint / region / path-style / 是否明文这几项。
 
-**来源不对称，这点要记住**：写侧由 `ModelWriteBuilder.set` 从**表属性**拿到配置，它没有 `FileIO` 通道，所以写一张非 AWS 上的 Lance 表时，endpoint / path-style / 是否明文都只能写在表属性里（凭据则可以留给 instance profile 或环境变量，免得进元数据与快照历史）。读侧两条来源都有：Spark 3.5/4.0/4.1 的批式与行式读取器、`data` 的 `GenericReader`、以及 `index-spark` 的检索回表把 `FileIO.properties()` 与表属性一起交给 `ReadBuilder`（表属性优先），Lance 再从收到的键里挑它认识的。
+**来源不对称，这点要记住**：写侧由 `ModelWriteBuilder.set` 从**表属性**拿到配置，它没有 `FileIO` 通道，所以写一张非 AWS 上的 Lance 表时，endpoint / path-style / 是否明文都只能写在表属性里（凭据则可以留给 instance profile 或环境变量，免得进元数据与快照历史）。
 
-证据分三层：`TestLanceS3StorageOptions` 在 MinIO 上验证了两套写法都能写能读，且把 endpoint 换成不存在的主机名时错误信息里会点名该主机，说明它真的被用了；`TestGenericReaderStorageProperties` 用一个记录配置的替身 format model 验证读取器确实把表属性交给了 `ReadBuilder`；`TestLanceSparkS3StorageSmoke` 走完整链路——在 Spark 里建一张数据文件落在 MinIO 的 Lance 表，写入后把表上的存储属性全部撤掉，再靠 catalog 的 `FileIO` 配置读回 `max(id)`，跑完自己删表删文件。三个测试在没有 MinIO 时跳过。还**没接**的入口是 Flink 的 `RowDataFileScanTaskReader`（它的构造函数里没有 `FileIO`，要改签名波及上层）、MR 的 `IcebergInputFormat`、以及 `data` 的 `BaseDeleteLoader`（只有 `Function<DeleteFile, InputFile>`，没有配置来源）——这些入口上的 Lance 文件目前仍然只认环境变量。
+**读侧的来源顺序**（`#3108` 起固定为这条链，实现在 `org.apache.iceberg.io.StorageProperties`）：
+
+1. 表属性（最具体）；
+2. catalog 的 `FileIO.properties()`；
+3. 引擎的 Hadoop 配置（`spark.hadoop.fs.s3a.*` / core-site.xml 里的 `fs.s3a.*`）；
+4. 进程环境：**不由 Iceberg 读取**，它仍然是 Lance/object_store 自己的最后兜底；所以第 1–3 条都没给值时，客户端会去打公网 AWS。
+
+Spark 3.5/4.0/4.1 的批式、行式读取器（`BaseBatchReader` / `BaseRowReader`）与 `data` 的 `GenericReader` 都会把上面第 1–3 条合并后交给 `ReadBuilder`。其中第 3 条是这样接上的：Spark 在 driver 侧把 `sparkContext.hadoopConfiguration()` 里的存储键挑出来（只挑 `s3.*` / `fs.s3a.*` / `gs.*` / `azure.*` / `lance.storage.*`，不会把整个 Hadoop 配置塞进广播），随 executor 的 `FileIO` 一起带过去——因为 `HadoopFileIO.properties()` 只返回 catalog 初始化时给它的那几项，**不含**它实际读取用的 Hadoop 配置。`index-spark` 的检索与回表也在 driver 侧解析一次，把同一份合并结果带进任务。
+
+**优先级是按"应用顺序"实现的**：`ReadBuilder.setAll` 按 map 的迭代顺序逐项应用，Lance 模型内部用 `LinkedHashMap` 保存，因此同一个设置的不同写法（比如 `s3.endpoint` 与 `fs.s3a.endpoint`）后出现的赢。合并方必须用保序的 map（`LinkedHashMap`/`ImmutableMap`），**不要用 `HashMap`**——它会把这个优先级变成随机的。同理，`spark.hadoop.fs.s3a.endpoint` 这类 Hadoop 默认值可能已经在配置里（值指向公网 AWS），只要表或 catalog 给了更具体的值，保序后就能正确覆盖。
+
+**失败时的信息**：第 1–3 条都没解析出 endpoint 时，`LanceFileReader.open` 的失败信息会点名"没有解析到 endpoint"，并列出 `s3.endpoint` / `fs.s3a.endpoint` / `lance.storage.endpoint` 三种写法，而不是只留下 object_store 的 `Bucket ... not found`。
+
+证据分四层：`TestLanceS3StorageOptions` 在 MinIO 上验证了两套写法都能写能读，且把 endpoint 换成不存在的主机名时错误信息里会点名该主机，说明它真的被用了；`TestLanceStorageOptions` 钉住 `s3.*` / `fs.s3a.*` / `lance.storage.*` 的翻译；`TestStorageProperties` 钉住三类来源的优先顺序与 Hadoop 配置的过滤；`TestGenericReaderStorageProperties` 用一个记录配置的替身 format model 验证读取器把表属性交给了 `ReadBuilder`；`TestLanceSparkS3StorageSmoke` 走完整链路——在 Spark 里建一张数据文件落在 MinIO 的 Lance 表，写入后把表上的存储属性全部撤掉，再靠 catalog 的 `FileIO` 配置读回 `max(id)`；`TestLanceSparkHadoopStorageConfSmoke` 是 `#3108` 的验收形状：catalog 的 `FileIO` 不暴露存储设置（与 `HadoopFileIO` 相同），存储只配在 `spark.hadoop.fs.s3a.*` 里，撤掉表属性后仍能读回 `max(id)`。后两个在没有 MinIO 时跳过。
+
+还**没接**的入口：Flink 的 `RowDataFileScanTaskReader`（构造函数里没有 `FileIO`，要改签名波及上层）、MR 的 `IcebergInputFormat`、`data` 的 `BaseDeleteLoader`（只有 `Function<DeleteFile, InputFile>`，没有配置来源）——这些入口上的 Lance 文件仍然只认环境变量；`index-spark` 里按文件序/位置回表的那两处已经带上了表属性 + `FileIO` + Hadoop 配置，而 delete 文件那一处仍只有 `FileIO.properties()`。
 
 ## 4. 还缺的（属 Lance Java SDK，不在本仓）
 
