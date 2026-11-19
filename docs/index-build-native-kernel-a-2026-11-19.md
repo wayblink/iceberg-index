@@ -93,6 +93,27 @@ train 的样本数被 `nlist × 39` 封顶（22,230），与行数无关；assig
 
 用 #3142 预算（8 样本/质心、3 轮）：native 单元 ≈ **27 s**。
 
+## 集群实测（10M，33 个 340k 行单元）
+
+上面的外推在集群上验证过了：镜像 `sparkann-e2e:oss-bench-20261119-071617711d-native`（digest
+`sha256:72b33532…1eb227`，`index@071617711d`，native 库由该提交源码编译进 runtime jar），
+`local.smoke.mm_lance` 的 10,784,907 行 × 2560 维、33 个 340k 行单元、12 executor × 4c × 24g + 12g、
+task_cpus 4、definition 带 `ivf-build-kernel: native`：`build_ms` **236,687 ms**，`Built 33 of 33` 用时
+232,953 ms，0 failed；33 个索引文件的 structure 全是 `build-kernel-native=1`（无回退），索引共
+17,890,137,090 B。
+
+| 版本（同表、同 33 文件口径、同资源） | build_ms | 相对本轮 |
+|---|---|---|
+| `071617711d` native（本轮） | **236,687** | — |
+| `97dbce8eec` native（已含 A 线） | 246,084 | 慢 3.8% |
+| `b3a081bb1e` native（A 线之前） | 420,483 | 慢 1.78× |
+| `97dbce8eec` 镜像的 java 臂 | 1,097,833 | 慢 4.64× |
+| `13397de974` java（历史） | 740,691 | 慢 3.13× |
+
+每单元中位 **74.1 s**，高于 60 s/单元的目标。按同一形态的分阶段（train 18.1、assign 9.7、encode 1.6、
+read 5.1 s，合计约 34.5 s）推算，剩下约 40 s 是每个单元约 542 MB 索引文件写 S3 与发布段——**瓶颈
+已经从算术挪到写路径**，继续优化内核对这个形态的收益有限。
+
 ## 测试
 
 | 套件 | 结果 |
@@ -110,7 +131,7 @@ train 的样本数被 `nlist × 39` 封顶（22,230），与行数无关；assig
 2. **encode 的串行地板**：约 12.7 µs/向量（norm+correction 两条串行链，JVM 顺序和的要求）；批量化是剩余最大杠杆，需改 `build.rs`/JNI 调用形态（新卡）。
 3. **A3 的容忍性**：`buildFromEntries` 要求 entry payload 长度恰好 `8+4dim`，否则 native 异常→回退 Java（产物不变，但该次记 `build-kernel-native=0`）；`IndexEntry.payload()` 仍返回 clone，raw 桥每条仍有瞬时复制（32.9 MB 的一部分），彻底消除需 core 加包内访问器。
 4. **跨 run 的 payload 字节不同**是读取顺序造成的既有现象（Java 自比也会如此），不是内核差异；本卡用"同 entries 下逐字节相同"与集群 size/recall 判定。
-5. **集群 A/B 未完成**：本卡所有数字是单元级/单机外推；#3150 正在用同一镜像做 java vs native 构建与召回，最终 build_ms/recall 以它为准。
+5. **集群实测已完成构建段，召回未测**：10M 上 native 全量构建 236,687 ms、33/33 无回退（见上一节）；recall@10 的两臂对照与 317 单元 ex103m 形态没有跑（集群节点 `gpu-ixv150s-0156` 曾因 ephemeral-storage 反复驱逐驱动 pod，java 臂两次失败、第三次才成功）。切默认内核（#3151）之前应先补这两项。
 6. #3142 的"8 样本/3 轮"提速作用在 A1 后基本消失（64 s→1 s），文档里"主要提速手段"的口径需要改。
 
 ## 复现
