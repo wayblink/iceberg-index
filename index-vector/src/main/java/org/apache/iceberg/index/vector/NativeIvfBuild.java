@@ -23,15 +23,21 @@ import java.io.ByteArrayOutputStream;
 import java.io.DataInputStream;
 import java.io.DataOutputStream;
 import java.io.IOException;
+import java.io.InputStream;
 import java.io.UncheckedIOException;
 import java.nio.ByteBuffer;
+import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.StandardCopyOption;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.concurrent.atomic.AtomicBoolean;
 import org.apache.iceberg.index.IndexEntry;
 import org.apache.iceberg.relocated.com.google.common.base.Preconditions;
 import org.apache.iceberg.relocated.com.google.common.collect.Maps;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 /**
  * The bridge from a vector index definition to the native IVF build kernel.
@@ -41,10 +47,21 @@ import org.apache.iceberg.relocated.com.google.common.collect.Maps;
  * entries as the native side asks for them, and the payload back. The frames are big-endian and
  * versioned by {@link #ABI_VERSION}; none of their fields is a user-facing option.
  *
- * <p>This is an N0 prototype: nothing outside this package calls it, and a test loads the library
- * itself before building anything. It is not wired into a {@link VectorKernel}.
+ * <p>A definition that asks for the native kernel reaches it through {@link #ensureLoaded} and
+ * {@link #buildFromVectors}: the vectors the Java kernel decoded are what the native one is handed,
+ * and the payload it returns is the payload the Java kernel would have written. The library is
+ * optional, so a build falls back to the Java kernel when it cannot be loaded; nothing here is a
+ * requirement for a build to succeed.
  */
 final class NativeIvfBuild {
+
+  private static final Logger LOG = LoggerFactory.getLogger(NativeIvfBuild.class);
+
+  /** The library name, without the prefix and suffix the platform gives it. */
+  static final String LIBRARY_NAME = "iceberg_ivf_native";
+
+  /** Where a jar keeps the per-platform library, relative to this class. */
+  private static final String LIBRARY_RESOURCE_PREFIX = "/org/apache/iceberg/index/vector/native/";
 
   /** The magic of the parameters frame, "NIVP". */
   private static final int PARAMS_MAGIC = 0x4E495650;
@@ -62,6 +79,9 @@ final class NativeIvfBuild {
   private static final int METRIC_DOT = 2;
 
   private static final AtomicBoolean LOADED = new AtomicBoolean(false);
+
+  /** Keeps a JVM that cannot load the library from warning once per build. */
+  private static final AtomicBoolean LOAD_FAILURE_REPORTED = new AtomicBoolean(false);
 
   private NativeIvfBuild() {}
 
@@ -175,6 +195,129 @@ final class NativeIvfBuild {
     LOADED.set(true);
   }
 
+  /**
+   * Loads the library a build uses, and reports whether a native build can run in this JVM.
+   *
+   * <p>The library is taken from the JVM's library path first, then from the resource this build
+   * ships for the platform, so an installation that only has the jar still finds it. A JVM with
+   * neither keeps building with the Java kernel: the native kernel is optional, and a build that
+   * asked for it must not fail because it is missing.
+   */
+  static boolean ensureLoaded() {
+    if (LOADED.get()) {
+      return true;
+    }
+
+    synchronized (LOADED) {
+      if (LOADED.get()) {
+        return true;
+      }
+
+      String libraryPathFailure = loadFromLibraryPath();
+      if (libraryPathFailure == null) {
+        LOADED.set(true);
+        return true;
+      }
+
+      String resourceFailure = loadFromResource();
+      if (resourceFailure == null) {
+        LOADED.set(true);
+        return true;
+      }
+
+      if (LOAD_FAILURE_REPORTED.compareAndSet(false, true)) {
+        LOG.warn(
+            "The native IVF build kernel is not available ({}; {}); builds that ask for it fall"
+                + " back to the Java kernel. It needs a loadable {} on java.library.path, or one"
+                + " packaged under {}<platform>/",
+            libraryPathFailure,
+            resourceFailure,
+            System.mapLibraryName(LIBRARY_NAME),
+            LIBRARY_RESOURCE_PREFIX);
+      }
+
+      return false;
+    }
+  }
+
+  /** Loads the library from the library path, answering null on success. */
+  private static String loadFromLibraryPath() {
+    try {
+      System.loadLibrary(LIBRARY_NAME);
+      return null;
+    } catch (UnsatisfiedLinkError | SecurityException e) {
+      return "no "
+          + System.mapLibraryName(LIBRARY_NAME)
+          + " on the library path: "
+          + e.getMessage();
+    }
+  }
+
+  /** Loads the library from the resource this build ships, answering null on success. */
+  private static String loadFromResource() {
+    String platform = platformName();
+    if (platform == null) {
+      return "no packaged library for "
+          + System.getProperty("os.name")
+          + "/"
+          + System.getProperty("os.arch");
+    }
+
+    String resource =
+        LIBRARY_RESOURCE_PREFIX + platform + "/" + System.mapLibraryName(LIBRARY_NAME);
+    try (InputStream in = NativeIvfBuild.class.getResourceAsStream(resource)) {
+      if (in == null) {
+        return "the resource " + resource + " is not in this build";
+      }
+
+      Path extracted = Files.createTempFile("iceberg-ivf-native-", librarySuffix());
+      extracted.toFile().deleteOnExit();
+      Files.copy(in, extracted, StandardCopyOption.REPLACE_EXISTING);
+      System.load(extracted.toAbsolutePath().toString());
+      return null;
+    } catch (IOException e) {
+      return "cannot extract " + resource + ": " + e.getMessage();
+    } catch (UnsatisfiedLinkError | SecurityException e) {
+      return "cannot load " + resource + ": " + e.getMessage();
+    }
+  }
+
+  /** The resource directory of this platform, or null when this build ships no library for it. */
+  private static String platformName() {
+    String os = operatingSystem();
+    String arch = architecture();
+    return os == null || arch == null ? null : os + "-" + arch;
+  }
+
+  private static String operatingSystem() {
+    String name = System.getProperty("os.name", "").toLowerCase(Locale.ROOT);
+    if (name.contains("linux")) {
+      return "linux";
+    } else if (name.contains("mac") || name.contains("darwin")) {
+      return "macos";
+    } else if (name.contains("windows")) {
+      return "windows";
+    }
+
+    return null;
+  }
+
+  private static String architecture() {
+    String arch = System.getProperty("os.arch", "").toLowerCase(Locale.ROOT);
+    return switch (arch) {
+      case "amd64", "x86_64" -> "x86_64";
+      case "aarch64", "arm64" -> "aarch64";
+      case "x86", "i386", "i686" -> "x86";
+      default -> null;
+    };
+  }
+
+  private static String librarySuffix() {
+    String name = System.mapLibraryName(LIBRARY_NAME);
+    int dot = name.lastIndexOf('.');
+    return dot < 0 ? "" : name.substring(dot);
+  }
+
   static Built build(VectorIndexAdapter adapter, List<IndexEntry> entries, int parallelism) {
     return build(adapter, entries, parallelism, "");
   }
@@ -198,7 +341,7 @@ final class NativeIvfBuild {
 
     int dimension = ivf.dimension();
     int entryCount = entries.size();
-    int threads = Math.max(1, Math.min(parallelism, Math.max(1, entryCount)));
+    int threads = threadsFor(parallelism, entryCount);
     IvfOptions options = ivf.options();
     int listCount = options.nlistFor(entryCount);
     int sampleCount = options.samplesFor(entryCount, listCount);
@@ -217,10 +360,93 @@ final class NativeIvfBuild {
             ivf.scoring().metric(),
             threads);
 
+    return openAndBuild(params, new EntrySource(entries, fileIndexes, dimension));
+  }
+
+  /**
+   * Builds the payload of vectors that are already decoded.
+   *
+   * <p>This is the path a production build takes: the Java kernel decodes the entries once, and the
+   * native kernel reads those vectors instead of decoding the entries a second time. The data file
+   * indexes are the positions of the entries' files in {@code dataFiles}, so the dictionary the
+   * payload writes is the one the Java kernel writes.
+   */
+  static Built buildFromVectors(
+      IvfKernel kernel,
+      List<String> dataFiles,
+      int[] fileIndexes,
+      long[] rowPositions,
+      float[][] vectors,
+      int parallelism) {
+    Preconditions.checkNotNull(kernel, "IVF kernel is null");
+    Preconditions.checkNotNull(dataFiles, "Data files are null");
+    Preconditions.checkNotNull(fileIndexes, "Data file indexes are null");
+    Preconditions.checkNotNull(rowPositions, "Row positions are null");
+    Preconditions.checkNotNull(vectors, "Decoded vectors are null");
+    Preconditions.checkArgument(vectors.length > 0, "A native IVF build needs at least one entry");
+    Preconditions.checkArgument(
+        fileIndexes.length == vectors.length,
+        "A native IVF build needs one data file index per vector: %s indexes for %s vectors",
+        fileIndexes.length,
+        vectors.length);
+    Preconditions.checkArgument(
+        rowPositions.length == vectors.length,
+        "A native IVF build needs one row position per vector: %s positions for %s vectors",
+        rowPositions.length,
+        vectors.length);
+    Preconditions.checkArgument(
+        kernel.scoring().metric() == VectorIndexDefinition.Metric.L2,
+        "The native IVF build kernel supports the L2 metric only: %s",
+        kernel.scoring().metric());
+
+    int dimension = kernel.dimension();
+    for (int i = 0; i < vectors.length; i++) {
+      Preconditions.checkArgument(
+          vectors[i] != null && vectors[i].length == dimension,
+          "Native IVF vector %s has %s dimensions, the index has %s",
+          i,
+          vectors[i] == null ? "no" : Integer.toString(vectors[i].length),
+          dimension);
+      Preconditions.checkArgument(
+          fileIndexes[i] >= 0 && fileIndexes[i] < dataFiles.size(),
+          "Native IVF vector %s refers to data file index %s, the unit has %s",
+          i,
+          fileIndexes[i],
+          dataFiles.size());
+    }
+
+    int entryCount = vectors.length;
+    int threads = threadsFor(parallelism, entryCount);
+    IvfOptions options = kernel.options();
+    int listCount = options.nlistFor(entryCount);
+    int sampleCount = options.samplesFor(entryCount, listCount);
+    byte[] params =
+        encodeParams(
+            "",
+            dimension,
+            entryCount,
+            dataFiles,
+            listCount,
+            sampleCount,
+            options,
+            kernel.quantizer(),
+            kernel.scoring().metric(),
+            threads);
+
+    return openAndBuild(params, new VectorSource(vectors, fileIndexes, rowPositions, dimension));
+  }
+
+  /** How many threads a build of {@code entryCount} entries may use. */
+  private static int threadsFor(int parallelism, int entryCount) {
+    return Math.max(1, Math.min(parallelism, Math.max(1, entryCount)));
+  }
+
+  /** Opens one build, reads its rows through {@code source}, and decodes the payload it returns. */
+  private static Built openAndBuild(byte[] params, VectorChunkSource source) {
     long handle = 0L;
     byte[] frame;
     try {
-      handle = nativeOpen(params, new EntrySource(entries, fileIndexes, dimension));
+      handle = nativeOpen(params, source);
       Preconditions.checkState(handle != 0L, "The native IVF build kernel opened no handle");
       frame = nativeBuild(handle);
     } finally {
@@ -368,17 +594,8 @@ final class NativeIvfBuild {
 
     @Override
     public void fetch(int start, int count, ByteBuffer out) {
-      Preconditions.checkNotNull(out, "Native IVF vector buffer is null");
-      Preconditions.checkArgument(out.isDirect(), "Native IVF vector buffer is not direct");
-      int recordBytes = Integer.BYTES + Long.BYTES + dimension * Float.BYTES;
-      long needed = (long) count * recordBytes;
-      Preconditions.checkArgument(
-          out.capacity() >= needed,
-          "Native IVF vector buffer holds %s bytes, %s records need %s",
-          out.capacity(),
-          count,
-          needed);
-
+      checkFetchBuffer(out, count, dimension);
+      int recordBytes = recordBytes(dimension);
       for (int i = 0; i < count; i++) {
         int row = start + i;
         int offset = i * recordBytes;
@@ -391,5 +608,58 @@ final class NativeIvfBuild {
         }
       }
     }
+  }
+
+  /** Decoded vectors, served to the native kernel a block at a time. */
+  private static final class VectorSource implements VectorChunkSource {
+    private final float[][] vectors;
+    private final int[] fileIndexes;
+    private final long[] rowPositions;
+    private final int dimension;
+
+    private VectorSource(float[][] vectors, int[] fileIndexes, long[] rowPositions, int dimension) {
+      this.vectors = vectors;
+      this.fileIndexes = fileIndexes;
+      this.rowPositions = rowPositions;
+      this.dimension = dimension;
+    }
+
+    @Override
+    public int count() {
+      return vectors.length;
+    }
+
+    @Override
+    public void fetch(int start, int count, ByteBuffer out) {
+      checkFetchBuffer(out, count, dimension);
+      int recordBytes = recordBytes(dimension);
+      for (int i = 0; i < count; i++) {
+        int row = start + i;
+        int offset = i * recordBytes;
+        out.putInt(offset, fileIndexes[row]);
+        out.putLong(offset + Integer.BYTES, rowPositions[row]);
+        float[] vector = vectors[row];
+        for (int d = 0; d < dimension; d++) {
+          out.putFloat(offset + Integer.BYTES + Long.BYTES + d * Float.BYTES, vector[d]);
+        }
+      }
+    }
+  }
+
+  /** Refuses a buffer the native side could not fill with {@code count} records. */
+  private static void checkFetchBuffer(ByteBuffer out, int count, int dimension) {
+    Preconditions.checkNotNull(out, "Native IVF vector buffer is null");
+    Preconditions.checkArgument(out.isDirect(), "Native IVF vector buffer is not direct");
+    long needed = (long) count * recordBytes(dimension);
+    Preconditions.checkArgument(
+        out.capacity() >= needed,
+        "Native IVF vector buffer holds %s bytes, %s records need %s",
+        out.capacity(),
+        count,
+        needed);
+  }
+
+  private static int recordBytes(int dimension) {
+    return Integer.BYTES + Long.BYTES + dimension * Float.BYTES;
   }
 }

@@ -23,6 +23,8 @@
 //! JVM's: `f32` coordinates widened to `f64`, four accumulators over a block of four dimensions,
 //! a square root per comparison and ties kept by the earlier list.
 
+use crate::simd;
+
 /// The centroids a round of training produced, and what it spent.
 pub struct Training {
     pub centroids: Vec<Vec<f32>>,
@@ -81,7 +83,7 @@ pub fn train(
     let mut iterations = 0;
     for iteration in 0..max_iterations {
         iterations = iteration + 1;
-        let assignment = nearest(&sample, &centroids, threads);
+        let assignment = simd::nearest(&sample, &centroids, threads);
         let mut sums = vec![vec![0.0f32; dimension]; list_count];
         let mut sizes = vec![0usize; list_count];
         for (index, row) in sample.iter().enumerate() {
@@ -141,7 +143,7 @@ pub fn train(
 /// Puts every vector under its nearest centroid.
 pub fn assign(vectors: &[Vec<f32>], centroids: &[Vec<f32>], threads: usize) -> Vec<usize> {
     let rows: Vec<&[f32]> = vectors.iter().map(|vector| vector.as_slice()).collect();
-    nearest(&rows, centroids, threads)
+    simd::nearest(&rows, centroids, threads)
 }
 
 /// The vectors of every list, in entry order, lists that nothing landed in included.
@@ -154,54 +156,14 @@ pub fn members(assignment: &[usize], list_count: usize) -> Vec<Vec<usize>> {
     members
 }
 
-/// The nearest centroid of every row, ties kept by the earlier list.
-fn nearest(rows: &[&[f32]], centroids: &[Vec<f32>], threads: usize) -> Vec<usize> {
-    let mut assignment = vec![0usize; rows.len()];
-    if rows.is_empty() || centroids.is_empty() {
-        return assignment;
-    }
-
-    let threads = threads.max(1).min(rows.len().max(1));
-    if threads == 1 {
-        assign_range(rows, centroids, &mut assignment);
-        return assignment;
-    }
-
-    let chunk = rows.len().div_ceil(threads);
-    std::thread::scope(|scope| {
-        for (chunk_index, out) in assignment.chunks_mut(chunk).enumerate() {
-            let start = chunk_index * chunk;
-            let rows = &rows[start..start + out.len()];
-            scope.spawn(move || assign_range(rows, centroids, out));
-        }
-    });
-
-    assignment
-}
-
-fn assign_range(rows: &[&[f32]], centroids: &[Vec<f32>], out: &mut [usize]) {
-    for (offset, row) in rows.iter().enumerate() {
-        let mut best = distance(row, &centroids[0]);
-        let mut nearest = 0usize;
-        for (list, centroid) in centroids.iter().enumerate().skip(1) {
-            let distance = distance(row, centroid);
-            if distance < best {
-                best = distance;
-                nearest = list;
-            }
-        }
-
-        out[offset] = nearest;
-    }
-}
-
 /// The L2 distance of a row from a centroid, summed the way the JVM sums it.
 ///
 /// The sum is one accumulator in dimension order. The JVM's blocked kernel used to split it into
 /// four accumulators for a shorter dependency chain, but that rounds the total differently and a
 /// near-tied row can then choose another list, so a rebuild would not reproduce its partitions;
 /// the JVM keeps the dimension order and this has to keep it too.
-fn distance(row: &[f32], centroid: &[f32]) -> f64 {
+#[cfg(test)]
+pub(crate) fn distance(row: &[f32], centroid: &[f32]) -> f64 {
     let dimension = centroid.len();
     let mut squared = 0.0f64;
     for coordinate in 0..dimension {

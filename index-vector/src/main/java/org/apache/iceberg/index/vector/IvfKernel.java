@@ -24,6 +24,7 @@ import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.nio.ByteBuffer;
 import java.util.Arrays;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CountDownLatch;
@@ -193,6 +194,17 @@ public final class IvfKernel implements VectorKernel, RetainedBytes {
     float[][] vectors = decodeAll(materialized, threads);
     long decodedNanos = System.nanoTime();
 
+    // The native kernel writes the same payload the Java one does, from the vectors just decoded.
+    // It answers null when it cannot run, and the build then stays on the Java path; a build of no
+    // entries has nothing a native build could train, so it always stays here.
+    if (count > 0 && options.nativeBuildKernel()) {
+      IndexBuildResult nativeResult =
+          buildWithNativeKernel(materialized, dataFiles, vectors, threads);
+      if (nativeResult != null) {
+        return nativeResult;
+      }
+    }
+
     int listCount = options.nlistFor(count);
     Trained trained = listCount == 0 ? Trained.none() : train(vectors, listCount, threads);
     float[][] centroids = trained.centroids;
@@ -281,6 +293,115 @@ public final class IvfKernel implements VectorKernel, RetainedBytes {
         millis(assignedNanos - trainedNanos),
         millis(encodedNanos - assignedNanos));
 
+    return buildResult(
+        count,
+        dataFiles,
+        encoded,
+        centroids.length,
+        trained.samples,
+        trained.iterations,
+        assigned.simd,
+        false);
+  }
+
+  /**
+   * Builds the payload with the native kernel, or answers null when the build has to stay in Java.
+   *
+   * <p>The native kernel is optional: it does not implement every metric, its library may not be
+   * built for this platform, and it may fail at run time. None of those may fail an index build, so
+   * each of them is reported and the caller runs the Java kernel instead. The payload is the same
+   * either way, which is what lets a silent fallback be visible in the structure rather than in the
+   * bytes: the structure records which kernel actually ran.
+   */
+  private IndexBuildResult buildWithNativeKernel(
+      List<IndexEntry> entries, List<String> dataFiles, float[][] vectors, int threads) {
+    int count = entries.size();
+    if (scoring.metric() != VectorIndexDefinition.Metric.L2) {
+      LOG.warn(
+          "The native IVF build kernel builds L2 payloads only; building the {} metric with the Java"
+              + " kernel",
+          scoring.metric());
+      return null;
+    }
+
+    if (!NativeIvfBuild.ensureLoaded()) {
+      LOG.warn(
+          "The native IVF build kernel is not loaded; building with the Java kernel. A native build"
+              + " needs a loadable {} library",
+          NativeIvfBuild.LIBRARY_NAME);
+      return null;
+    }
+
+    try {
+      int[] fileIndexes = fileIndexes(entries, dataFiles);
+      long[] rowPositions = new long[count];
+      for (int i = 0; i < count; i++) {
+        rowPositions[i] = entries.get(i).rowPosition();
+      }
+
+      NativeIvfBuild.Built built =
+          NativeIvfBuild.buildFromVectors(
+              this, dataFiles, fileIndexes, rowPositions, vectors, threads);
+      LOG.info(
+          "Built an IVF payload of {} entries in {} lists with the native kernel: train {} ms over {}"
+              + " rounds and {} samples, assign {} ms, encode {} ms, read {} ms",
+          count,
+          built.listCount(),
+          millis(built.nanosTrain()),
+          built.iterations(),
+          built.sampleCount(),
+          millis(built.nanosAssign()),
+          millis(built.nanosEncode()),
+          millis(built.nanosRead()));
+      return buildResult(
+          count,
+          dataFiles,
+          built.payload(),
+          built.listCount(),
+          built.sampleCount(),
+          built.iterations(),
+          false,
+          true);
+    } catch (RuntimeException e) {
+      LOG.warn(
+          "The native IVF build kernel failed on {} entries; building with the Java kernel",
+          count,
+          e);
+      return null;
+    }
+  }
+
+  /** The position of each entry's data file in the unit's dictionary, in entry order. */
+  private static int[] fileIndexes(List<IndexEntry> entries, List<String> dataFiles) {
+    Map<String, Integer> positions = new HashMap<>();
+    for (int i = 0; i < dataFiles.size(); i++) {
+      positions.put(dataFiles.get(i), i);
+    }
+
+    int[] indexes = new int[entries.size()];
+    for (int i = 0; i < entries.size(); i++) {
+      indexes[i] = positions.get(entries.get(i).dataFile());
+    }
+
+    return indexes;
+  }
+
+  /**
+   * The result of one build: its payload, what that payload costs to keep prepared, and the counts
+   * that describe it.
+   *
+   * <p>Both kernels assemble the result here so the two cannot drift apart: the keys and the values
+   * are the same whoever wrote the bytes, and only what each kernel actually spent differs.
+   */
+  private IndexBuildResult buildResult(
+      int entryCount,
+      List<String> dataFiles,
+      byte[] encoded,
+      int listCount,
+      int samples,
+      int iterations,
+      boolean simdAssign,
+      boolean nativeBuild) {
     long dictionaryBytes = VectorMemoryEstimates.dictionaryBytes(dataFiles);
     long quantizerBytes =
         isQuantized() ? RaBitQQuantizer.estimatedListBytes(dimension, listCount) : 0L;
@@ -289,7 +410,7 @@ public final class IvfKernel implements VectorKernel, RetainedBytes {
         ByteBuffer.wrap(encoded),
         preparedBytes(
             encoded.length,
-            centroids.length,
+            listCount,
             dataFiles.size(),
             dictionaryBytes,
             dimension,
@@ -297,23 +418,23 @@ public final class IvfKernel implements VectorKernel, RetainedBytes {
             quantizerBytes),
         Runtime.getRuntime().availableProcessors(),
         Map.ofEntries(
-            Map.entry("entry-count", (long) count),
+            Map.entry("entry-count", (long) entryCount),
             Map.entry("dimension", (long) dimension),
-            Map.entry("list-count", (long) centroids.length),
+            Map.entry("list-count", (long) listCount),
             Map.entry("data-file-count", (long) dataFiles.size()),
             Map.entry("data-file-string-bytes", dictionaryBytes),
             Map.entry("payload-bytes", (long) encoded.length),
-            Map.entry("list-directory-bytes", 2L * PreparedStructureSize.ints(centroids.length)),
+            Map.entry("list-directory-bytes", 2L * PreparedStructureSize.ints(listCount)),
             Map.entry("quantizer-bytes", quantizerBytes),
             Map.entry("quantizer-bits", isQuantized() ? (long) quantizer.bits() : 0L),
             Map.entry("code-bytes", isQuantized() ? (long) quantizer.codeBytes() : 0L),
-            Map.entry("train-samples", (long) trained.samples),
-            Map.entry("train-iterations", (long) trained.iterations),
+            Map.entry("train-samples", (long) samples),
+            Map.entry("train-iterations", (long) iterations),
             // the build-time knobs that trade quality against time; zero is what a definition that
             // sets none of them runs, and a definition that set a tolerance records it here
             Map.entry("train-tolerance-ppm", options.tolerancePartsPerMillion()),
-            Map.entry("assign-kernel-simd", assigned.simd ? 1L : 0L),
-            Map.entry("build-kernel-native", 0L)));
+            Map.entry("assign-kernel-simd", simdAssign ? 1L : 0L),
+            Map.entry("build-kernel-native", nativeBuild ? 1L : 0L)));
   }
 
   /** The vectors of the entries, checked against what this index can store. */

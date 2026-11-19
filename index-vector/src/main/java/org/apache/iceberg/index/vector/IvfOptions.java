@@ -87,6 +87,22 @@ public final class IvfOptions implements java.io.Serializable {
     SIMD
   }
 
+  /**
+   * How a build turns the vectors into a payload: {@code java} or {@code native}.
+   *
+   * <p>The native kernel is an optional implementation. It runs only when its library loads on this
+   * platform and the metric is L2; in every other case the build falls back to the Java kernel. The
+   * two kernels write the same payload byte for byte, so the choice does not change what the index
+   * contains, only the path that wrote it and the structure the build records.
+   */
+  static final String BUILD_KERNEL = "ivf-build-kernel";
+
+  /** The kernels {@link #BUILD_KERNEL} names. */
+  enum BuildKernel {
+    JAVA,
+    NATIVE
+  }
+
   private static final ImmutableSet<String> KEYS =
       ImmutableSet.of(
           NLIST,
@@ -94,7 +110,8 @@ public final class IvfOptions implements java.io.Serializable {
           TRAIN_SAMPLES_PER_LIST,
           TRAIN_MAX_ITERATIONS,
           TRAIN_CONVERGENCE_TOLERANCE,
-          ASSIGN_KERNEL);
+          ASSIGN_KERNEL,
+          BUILD_KERNEL);
 
   private final int nlist;
   private final boolean listBlocks;
@@ -102,6 +119,7 @@ public final class IvfOptions implements java.io.Serializable {
   private final int trainMaxIterations;
   private final double trainConvergenceTolerance;
   private final AssignKernelKind assignKernel;
+  private final BuildKernel buildKernel;
 
   private IvfOptions(
       int nlist,
@@ -109,7 +127,8 @@ public final class IvfOptions implements java.io.Serializable {
       int trainSamplesPerList,
       int trainMaxIterations,
       double trainConvergenceTolerance,
-      AssignKernelKind assignKernel) {
+      AssignKernelKind assignKernel,
+      BuildKernel buildKernel) {
     Preconditions.checkArgument(nlist >= 0, "Invalid IVF %s: %s", NLIST, nlist);
     Preconditions.checkArgument(
         trainSamplesPerList >= 1,
@@ -135,6 +154,7 @@ public final class IvfOptions implements java.io.Serializable {
     this.trainMaxIterations = trainMaxIterations;
     this.trainConvergenceTolerance = trainConvergenceTolerance;
     this.assignKernel = assignKernel;
+    this.buildKernel = buildKernel;
   }
 
   /** The property keys this structure reads, for a caller that has to report what it supports. */
@@ -182,7 +202,8 @@ public final class IvfOptions implements java.io.Serializable {
         intOption(properties, TRAIN_SAMPLES_PER_LIST, DEFAULT_TRAIN_SAMPLES_PER_LIST),
         intOption(properties, TRAIN_MAX_ITERATIONS, DEFAULT_TRAIN_MAX_ITERATIONS),
         doubleOption(properties, TRAIN_CONVERGENCE_TOLERANCE, DEFAULT_TRAIN_CONVERGENCE_TOLERANCE),
-        assignKernelOption(properties));
+        assignKernelOption(properties),
+        buildKernelOption(properties));
   }
 
   boolean listBlocks() {
@@ -197,6 +218,11 @@ public final class IvfOptions implements java.io.Serializable {
    */
   boolean simdAssignKernel() {
     return assignKernel == AssignKernelKind.SIMD;
+  }
+
+  /** Whether the definition asked for the native build kernel. */
+  boolean nativeBuildKernel() {
+    return buildKernel == BuildKernel.NATIVE;
   }
 
   int trainSamplesPerList() {
@@ -282,6 +308,21 @@ public final class IvfOptions implements java.io.Serializable {
                   Locale.ROOT,
                   "Invalid IVF %s: %s (expected exact or simd)",
                   ASSIGN_KERNEL,
+                  value));
+    };
+  }
+
+  private static BuildKernel buildKernelOption(Map<String, String> properties) {
+    String value = properties.getOrDefault(BUILD_KERNEL, BuildKernel.JAVA.name());
+    return switch (value.trim().toLowerCase(Locale.ROOT)) {
+      case "java" -> BuildKernel.JAVA;
+      case "native" -> BuildKernel.NATIVE;
+      default ->
+          throw new IllegalArgumentException(
+              String.format(
+                  Locale.ROOT,
+                  "Invalid IVF %s: %s (expected java or native)",
+                  BUILD_KERNEL,
                   value));
     };
   }

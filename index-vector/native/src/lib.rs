@@ -27,6 +27,7 @@ mod jni_bridge;
 pub mod kmeans;
 pub mod payload;
 pub mod quantizer;
+pub mod simd;
 
 pub use build::{build, BuildOutcome, BuildRequest, EntrySource};
 

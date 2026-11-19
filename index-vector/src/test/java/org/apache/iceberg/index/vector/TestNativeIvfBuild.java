@@ -109,7 +109,9 @@ class TestNativeIvfBuild {
     List<Arguments> cases = new ArrayList<>();
     for (int dimension : List.of(17, 100)) {
       for (int nlist : List.of(7, 23, 0)) {
-        for (int bits : List.of(1, 2)) {
+        // 1 and 2 are the defaults and the common settings; 3 and 5 make a level cross a byte
+        // boundary, and 4 is what the product tables are built with
+        for (int bits : List.of(1, 2, 3, 4, 5)) {
           for (boolean listBlocks : List.of(false, true)) {
             cases.add(Arguments.of(dimension, nlist, bits, listBlocks));
           }
