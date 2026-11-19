@@ -386,6 +386,22 @@ class TestIvfKernel {
   }
 
   @Test
+  public void parallelEncodingWritesTheSameBytesAsASingleThread() {
+    List<IndexEntry> entries = entries(VectorIndexDefinition.Metric.L2);
+    for (int nlist : new int[] {0, 1}) {
+      VectorIndexAdapter ivf = quantizedAdapter(VectorIndexDefinition.Metric.L2, nlist, 8);
+      ByteBuffer serial = ivf.encodeAuxiliaryPayload(entries, 1);
+
+      for (int threads : new int[] {2, 4}) {
+        ByteBuffer parallel = ivf.encodeAuxiliaryPayload(entries, threads);
+        assertThat(parallel)
+            .as("nlist=%s, %s threads writes the payload of one thread", nlist, threads)
+            .isEqualTo(serial);
+      }
+    }
+  }
+
+  @Test
   public void aBuildRecordsWhatItSpentOnTheCentroids() {
     List<IndexEntry> entries = entries(VectorIndexDefinition.Metric.L2);
     VectorIndexAdapter ivf = quantizedAdapter(VectorIndexDefinition.Metric.L2, 0, 8);

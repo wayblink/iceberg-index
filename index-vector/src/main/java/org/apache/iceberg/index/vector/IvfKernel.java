@@ -157,6 +157,10 @@ public final class IvfKernel implements VectorKernel, RetainedBytes {
     long trainedNanos = System.nanoTime();
     int[][] assignments = assign(vectors, centroids, threads);
     long assignedNanos = System.nanoTime();
+    // every list is encoded on its own: the quantizer of a list is trained on that list's vectors,
+    // and the data file dictionary is only read, so the lists can be encoded in parallel and then
+    // written in order
+    byte[][] encodedLists = encodeLists(materialized, vectors, assignments, dataFiles, threads);
     ByteArrayOutputStream payload = new ByteArrayOutputStream();
     boolean blocks = options.listBlocks();
     int directory = 0;
@@ -202,19 +206,10 @@ public final class IvfKernel implements VectorKernel, RetainedBytes {
           starts[list] = payload.size();
         }
 
-        int[] members = assignments[list];
-        if (isQuantized()) {
-          writeQuantizedList(out, dataFiles, materialized, vectors, members);
-        } else {
-          out.writeInt(members.length);
-          for (int member : members) {
-            out.writeInt(dataFiles.indexOf(materialized.get(member).dataFile()));
-            out.writeLong(materialized.get(member).rowPosition());
-            for (float value : vectors[member]) {
-              out.writeFloat(value);
-            }
-          }
-        }
+        out.write(encodedLists[list]);
+        // the bytes are held only until they are written: a payload of hundreds of megabytes must
+        // not keep a second copy of itself alive for the rest of the build
+        encodedLists[list] = null;
       }
     } catch (IOException e) {
       throw new UncheckedIOException("Failed to encode the IVF index payload", e);
@@ -315,13 +310,30 @@ public final class IvfKernel implements VectorKernel, RetainedBytes {
    * when the residuals it codes are small, and the residuals of a partition are smaller than those
    * of the file it came from.
    */
-  private void writeQuantizedList(
-      DataOutputStream out,
-      List<String> dataFiles,
+  /** Encodes the bytes of every list, in list order, on up to {@code threads} threads. */
+  private byte[][] encodeLists(
       List<IndexEntry> entries,
       float[][] vectors,
-      int[] members)
-      throws IOException {
+      int[][] assignments,
+      List<String> dataFiles,
+      int threads) {
+    byte[][] encoded = new byte[assignments.length][];
+    runInParallel(
+        threads,
+        assignments.length,
+        range -> {
+          for (int list = range[0]; list < range[1]; list++) {
+            encoded[list] =
+                isQuantized()
+                    ? encodeQuantizedList(dataFiles, entries, vectors, assignments[list])
+                    : encodeFullList(dataFiles, entries, vectors, assignments[list]);
+          }
+        });
+    return encoded;
+  }
+
+  private byte[] encodeQuantizedList(
+      List<String> dataFiles, List<IndexEntry> entries, float[][] vectors, int[] members) {
     float[][] selected = new float[members.length][];
     for (int i = 0; i < members.length; i++) {
       selected[i] = vectors[members[i]];
@@ -331,23 +343,50 @@ public final class IvfKernel implements VectorKernel, RetainedBytes {
     // residuals it codes are small, and the residuals of a partition are smaller than the file's
     RaBitQQuantizer listQuantizer =
         RaBitQQuantizer.train(selected, dimension, quantizer.seed(), quantizer.bits());
-    for (float value : listQuantizer.centerValues()) {
-      out.writeFloat(value);
-    }
-    out.writeInt(members.length);
 
-    byte[] code = new byte[listQuantizer.codeBytes()];
-    float[] factors = new float[RaBitQQuantizer.FACTORS];
-    for (int member : members) {
-      out.writeInt(dataFiles.indexOf(entries.get(member).dataFile()));
-      out.writeLong(entries.get(member).rowPosition());
-      // the quantizer centres and rotates what it is given, so it takes the vector as it is
-      listQuantizer.encode(vectors[member], code, 0, factors);
-      out.write(code);
-      for (float factor : factors) {
-        out.writeFloat(factor);
+    ByteArrayOutputStream bytes = new ByteArrayOutputStream();
+    try (DataOutputStream out = new DataOutputStream(bytes)) {
+      for (float value : listQuantizer.centerValues()) {
+        out.writeFloat(value);
       }
+      out.writeInt(members.length);
+
+      byte[] code = new byte[listQuantizer.codeBytes()];
+      float[] factors = new float[RaBitQQuantizer.FACTORS];
+      for (int member : members) {
+        out.writeInt(dataFiles.indexOf(entries.get(member).dataFile()));
+        out.writeLong(entries.get(member).rowPosition());
+        // the quantizer centres and rotates what it is given, so it takes the vector as it is
+        listQuantizer.encode(vectors[member], code, 0, factors);
+        out.write(code);
+        for (float factor : factors) {
+          out.writeFloat(factor);
+        }
+      }
+    } catch (IOException e) {
+      throw new UncheckedIOException("Failed to encode an IVF list", e);
     }
+
+    return bytes.toByteArray();
+  }
+
+  private byte[] encodeFullList(
+      List<String> dataFiles, List<IndexEntry> entries, float[][] vectors, int[] members) {
+    ByteArrayOutputStream bytes = new ByteArrayOutputStream();
+    try (DataOutputStream out = new DataOutputStream(bytes)) {
+      out.writeInt(members.length);
+      for (int member : members) {
+        out.writeInt(dataFiles.indexOf(entries.get(member).dataFile()));
+        out.writeLong(entries.get(member).rowPosition());
+        for (float value : vectors[member]) {
+          out.writeFloat(value);
+        }
+      }
+    } catch (IOException e) {
+      throw new UncheckedIOException("Failed to encode an IVF list", e);
+    }
+
+    return bytes.toByteArray();
   }
 
   @Override
