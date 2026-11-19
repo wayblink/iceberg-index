@@ -32,4 +32,4 @@ pub mod simd;
 pub use build::{build, BuildOutcome, BuildRequest, EntrySource};
 
 /// The version of the wire format between the Java bridge and this library.
-pub const ABI_VERSION: i32 = 1;
+pub const ABI_VERSION: i32 = 2;

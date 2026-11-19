@@ -176,7 +176,8 @@ fn build_native(handle: jlong) -> Result<Vec<u8>, String> {
         .vm
         .attach_current_thread()
         .map_err(|error| format!("Cannot attach the build thread to the JVM: {}", error))?;
-    let record_bytes = crate::build::record_bytes(context.request.dimension);
+    let record_bytes =
+        crate::build::record_bytes(context.request.dimension, context.request.raw_values);
     let mut source = JniSource {
         env: &mut guard,
         source: &context.source,
@@ -282,6 +283,7 @@ fn decode_params(bytes: &[u8]) -> Result<BuildRequest, String> {
     }
 
     let list_blocks = reader.boolean("list blocks")?;
+    let raw_values = reader.boolean("raw entry payloads")?;
     let threads = count(reader.i32("threads")?, "threads")?;
     reader.finished("build request")?;
     Ok(BuildRequest {
@@ -297,6 +299,7 @@ fn decode_params(bytes: &[u8]) -> Result<BuildRequest, String> {
         seed,
         metric,
         list_blocks,
+        raw_values,
         threads,
     })
 }
@@ -373,5 +376,63 @@ fn take_exception(env: &mut JNIEnv) -> String {
 fn clear_pending(env: &mut JNIEnv) {
     if env.exception_check().unwrap_or(false) {
         let _ = take_exception(env);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{decode_params, PARAMS_MAGIC};
+    use crate::abi::Writer;
+    use crate::ABI_VERSION;
+
+    /// The frame `NativeIvfBuild.encodeParams` writes for one small unit.
+    fn params(version: i32, raw_values: bool) -> Vec<u8> {
+        let mut frame = Writer::new();
+        frame.i32(PARAMS_MAGIC);
+        frame.i32(version);
+        frame
+            .modified_utf("unit-0")
+            .expect("the unit id fits writeUTF");
+        frame.i32(17);
+        frame.i32(3);
+        frame.i32(1);
+        frame
+            .modified_utf("data-0.parquet")
+            .expect("the path fits writeUTF");
+        frame.i32(2);
+        frame.i32(3);
+        frame.i32(1);
+        frame.i64(0);
+        frame.i32(0);
+        frame.i64(7);
+        frame.i32(0);
+        frame.boolean(true);
+        frame.boolean(raw_values);
+        frame.i32(2);
+        frame.bytes
+    }
+
+    #[test]
+    fn reads_which_vector_form_a_row_carries() {
+        assert!(
+            decode_params(&params(ABI_VERSION, true))
+                .expect("the raw request decodes")
+                .raw_values,
+            "a request that carries entry payloads says so"
+        );
+        assert!(
+            !decode_params(&params(ABI_VERSION, false))
+                .expect("the decoded request decodes")
+                .raw_values,
+            "the older layout still decodes"
+        );
+    }
+
+    #[test]
+    fn refuses_a_request_of_another_version() {
+        let error = decode_params(&params(ABI_VERSION - 1, false))
+            .expect_err("another request version is not readable");
+        assert!(error.contains("version 1"), "{}", error);
+        assert!(error.contains("version 2"), "{}", error);
     }
 }

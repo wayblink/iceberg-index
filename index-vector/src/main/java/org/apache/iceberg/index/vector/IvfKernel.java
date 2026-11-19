@@ -24,7 +24,6 @@ import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.nio.ByteBuffer;
 import java.util.Arrays;
-import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CountDownLatch;
@@ -190,20 +189,21 @@ public final class IvfKernel implements VectorKernel, RetainedBytes {
     // build that does not ask for threads produces the bytes it always did.
     int threads = Math.max(1, Math.min(parallelism, Math.max(1, count)));
 
-    long buildStartNanos = System.nanoTime();
-    float[][] vectors = decodeAll(materialized, threads);
-    long decodedNanos = System.nanoTime();
-
-    // The native kernel writes the same payload the Java one does, from the vectors just decoded.
-    // It answers null when it cannot run, and the build then stays on the Java path; a build of no
-    // entries has nothing a native build could train, so it always stays here.
+    // The native kernel writes the same payload the Java one does, from the entries as they are.
+    // It runs before anything is decoded, so a build that stays native never holds the vectors on
+    // the Java heap. It answers null when it cannot run, and the build then decodes and stays on
+    // the Java path; a build of no entries has nothing a native build could train, so it stays
+    // there from the start.
     if (count > 0 && options.nativeBuildKernel()) {
-      IndexBuildResult nativeResult =
-          buildWithNativeKernel(materialized, dataFiles, vectors, threads);
+      IndexBuildResult nativeResult = buildWithNativeKernel(materialized, dataFiles, threads);
       if (nativeResult != null) {
         return nativeResult;
       }
     }
+
+    long buildStartNanos = System.nanoTime();
+    float[][] vectors = decodeAll(materialized, threads);
+    long decodedNanos = System.nanoTime();
 
     int listCount = options.nlistFor(count);
     Trained trained = listCount == 0 ? Trained.none() : train(vectors, listCount, threads);
@@ -308,13 +308,14 @@ public final class IvfKernel implements VectorKernel, RetainedBytes {
    * Builds the payload with the native kernel, or answers null when the build has to stay in Java.
    *
    * <p>The native kernel is optional: it does not implement every metric, its library may not be
-   * built for this platform, and it may fail at run time. None of those may fail an index build, so
-   * each of them is reported and the caller runs the Java kernel instead. The payload is the same
-   * either way, which is what lets a silent fallback be visible in the structure rather than in the
-   * bytes: the structure records which kernel actually ran.
+   * built for this platform or may speak another ABI version, and it may fail at run time. None of
+   * those may fail an index build, so each of them is reported and the caller decodes the entries
+   * and runs the Java kernel instead. The payload is the same either way, which is what lets a
+   * silent fallback be visible in the structure rather than in the bytes: the structure records
+   * which kernel actually ran.
    */
   private IndexBuildResult buildWithNativeKernel(
-      List<IndexEntry> entries, List<String> dataFiles, float[][] vectors, int threads) {
+      List<IndexEntry> entries, List<String> dataFiles, int threads) {
     int count = entries.size();
     if (scoring.metric() != VectorIndexDefinition.Metric.L2) {
       LOG.warn(
@@ -327,21 +328,14 @@ public final class IvfKernel implements VectorKernel, RetainedBytes {
     if (!NativeIvfBuild.ensureLoaded()) {
       LOG.warn(
           "The native IVF build kernel is not loaded; building with the Java kernel. A native build"
-              + " needs a loadable {} library",
-          NativeIvfBuild.LIBRARY_NAME);
+              + " needs a loadable {} library of ABI version {}",
+          NativeIvfBuild.LIBRARY_NAME,
+          NativeIvfBuild.ABI_VERSION);
       return null;
     }
 
     try {
-      int[] fileIndexes = fileIndexes(entries, dataFiles);
-      long[] rowPositions = new long[count];
-      for (int i = 0; i < count; i++) {
-        rowPositions[i] = entries.get(i).rowPosition();
-      }
-
-      NativeIvfBuild.Built built =
-          NativeIvfBuild.buildFromVectors(
-              this, dataFiles, fileIndexes, rowPositions, vectors, threads);
+      NativeIvfBuild.Built built = NativeIvfBuild.buildFromEntries(this, entries, threads);
       LOG.info(
           "Built an IVF payload of {} entries in {} lists with the native kernel: train {} ms over {}"
               + " rounds and {} samples, assign {} ms, encode {} ms, read {} ms",
@@ -369,21 +363,6 @@ public final class IvfKernel implements VectorKernel, RetainedBytes {
           e);
       return null;
     }
-  }
-
-  /** The position of each entry's data file in the unit's dictionary, in entry order. */
-  private static int[] fileIndexes(List<IndexEntry> entries, List<String> dataFiles) {
-    Map<String, Integer> positions = new HashMap<>();
-    for (int i = 0; i < dataFiles.size(); i++) {
-      positions.put(dataFiles.get(i), i);
-    }
-
-    int[] indexes = new int[entries.size()];
-    for (int i = 0; i < entries.size(); i++) {
-      indexes[i] = positions.get(entries.get(i).dataFile());
-    }
-
-    return indexes;
   }
 
   /**

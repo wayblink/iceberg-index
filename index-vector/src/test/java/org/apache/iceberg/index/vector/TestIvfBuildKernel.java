@@ -40,6 +40,7 @@ import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.Arguments;
+import org.junit.jupiter.params.provider.EnumSource;
 import org.junit.jupiter.params.provider.MethodSource;
 
 /**
@@ -208,6 +209,61 @@ class TestIvfBuildKernel {
     assertThat(bytes(nativeBuilt.payload()))
         .as("switching the property does not change what the index contains")
         .isEqualTo(bytes(javaBuilt.payload()));
+  }
+
+  @ParameterizedTest(name = "quantizer={0}")
+  @EnumSource(VectorQuantizer.class)
+  void theNativeKernelReadsTheEntryPayloadsAsTheyAre(VectorQuantizer quantizer) {
+    VectorIndexAdapter adapter = adapter(64, quantizer, Metric.L2, Map.of(IvfOptions.NLIST, "7"));
+    List<IndexEntry> entries = entries(adapter, 64, 200);
+
+    NativeIvfBuild.Built built =
+        NativeIvfBuild.buildFromEntries((IvfKernel) adapter.kernel(), entries, 2);
+    byte[] javaBytes = bytes(adapter.encodeAuxiliaryPayloadWithMemory(entries, 1).payload());
+
+    assertThat(built.entryCount())
+        .as("the entries the native build read")
+        .isEqualTo(entries.size());
+    assertThat(bytes(ByteBuffer.wrap(built.payload())))
+        .as("%s: the payload built from the entry payloads as they are", quantizer)
+        .isEqualTo(javaBytes);
+  }
+
+  @Test
+  void nativeKernelWritesTheJavaPayloadAtTheProductDimension() {
+    // 2,560 is the dimension of the tables in use, and a directory with 4-bit codes is what a
+    // product unit sets: this runs the production native path over the payloads those entries hold
+    Map<String, String> properties = new LinkedHashMap<>();
+    properties.put(IvfOptions.LIST_BLOCKS, "true");
+    properties.put(RaBitQQuantizer.BITS, "4");
+    VectorIndexAdapter javaAdapter = adapter(2560, VectorQuantizer.RABITQ, Metric.L2, properties);
+
+    Map<String, String> nativeProperties = new LinkedHashMap<>(properties);
+    nativeProperties.put(IvfOptions.BUILD_KERNEL, "native");
+    VectorIndexAdapter nativeAdapter =
+        adapter(2560, VectorQuantizer.RABITQ, Metric.L2, nativeProperties);
+
+    List<IndexEntry> entries = entries(javaAdapter, 2560, 300);
+    IndexBuildResult javaBuilt = build(javaAdapter, entries);
+    IndexBuildResult nativeBuilt = build(nativeAdapter, entries);
+
+    assertThat(structure(nativeBuilt))
+        .as("the production native path wrote the payload")
+        .containsEntry(NATIVE_FLAG, 1L);
+    assertThat(bytes(nativeBuilt.payload()))
+        .as("the native kernel writes the Java payload from the entry payloads")
+        .isEqualTo(bytes(javaBuilt.payload()));
+  }
+
+  @Test
+  void treatsALibraryOfAnotherAbiVersionAsUnusable() {
+    assertThat(NativeIvfBuild.versionMismatch(NativeIvfBuild.ABI_VERSION, "the library"))
+        .as("a library that speaks this bridge's ABI version")
+        .isNull();
+    assertThat(NativeIvfBuild.versionMismatch(NativeIvfBuild.ABI_VERSION - 1, "the library"))
+        .as("an old library is reported instead of being handed a frame it cannot read")
+        .contains("speaks native IVF ABI version " + (NativeIvfBuild.ABI_VERSION - 1))
+        .contains("this bridge reads " + NativeIvfBuild.ABI_VERSION);
   }
 
   private static IndexBuildResult build(VectorIndexAdapter adapter, List<IndexEntry> entries) {

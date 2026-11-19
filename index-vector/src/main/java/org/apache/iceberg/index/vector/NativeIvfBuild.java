@@ -48,10 +48,11 @@ import org.slf4j.LoggerFactory;
  * versioned by {@link #ABI_VERSION}; none of their fields is a user-facing option.
  *
  * <p>A definition that asks for the native kernel reaches it through {@link #ensureLoaded} and
- * {@link #buildFromVectors}: the vectors the Java kernel decoded are what the native one is handed,
- * and the payload it returns is the payload the Java kernel would have written. The library is
- * optional, so a build falls back to the Java kernel when it cannot be loaded; nothing here is a
- * requirement for a build to succeed.
+ * {@link #buildFromEntries}: each entry's payload travels to the native kernel as it was written,
+ * so the Java side never holds the decoded vectors. {@link #buildFromVectors} takes vectors the
+ * caller already decoded, which is what the bridge's own tests use. The library is optional, so a
+ * build falls back to the Java kernel when it cannot be loaded or does not speak this bridge's ABI
+ * version; nothing here is a requirement for a build to succeed.
  */
 final class NativeIvfBuild {
 
@@ -70,7 +71,10 @@ final class NativeIvfBuild {
   private static final int RESULT_MAGIC = 0x4E495652;
 
   /** The version of the frames this bridge writes and reads. */
-  static final int ABI_VERSION = 1;
+  static final int ABI_VERSION = 2;
+
+  /** The bytes an entry payload spends on its value format version and its dimension. */
+  private static final int ENTRY_PAYLOAD_HEADER_BYTES = 2 * Integer.BYTES;
 
   private static final int METRIC_L2 = 0;
 
@@ -95,7 +99,9 @@ final class NativeIvfBuild {
      * Writes {@code count} records starting at {@code start} from the buffer's index zero.
      *
      * <p>Each record is the data file index, the row position and the vector, all big-endian. The
-     * native side reads the buffer from zero to its capacity, so the position is left alone.
+     * vector is the entry's payload as written, version and dimension included, or its decoded
+     * coordinates, as the parameters frame says. The native side reads the buffer from zero to its
+     * capacity, so the position is left alone.
      */
     void fetch(int start, int count, ByteBuffer out);
   }
@@ -192,6 +198,8 @@ final class NativeIvfBuild {
   static void load(Path library) {
     Preconditions.checkNotNull(library, "Native IVF library path is null");
     System.load(library.toAbsolutePath().toString());
+    String failure = versionFailure("The native IVF library at " + library.toAbsolutePath());
+    Preconditions.checkState(failure == null, "%s", failure);
     LOADED.set(true);
   }
 
@@ -199,9 +207,10 @@ final class NativeIvfBuild {
    * Loads the library a build uses, and reports whether a native build can run in this JVM.
    *
    * <p>The library is taken from the JVM's library path first, then from the resource this build
-   * ships for the platform, so an installation that only has the jar still finds it. A JVM with
-   * neither keeps building with the Java kernel: the native kernel is optional, and a build that
-   * asked for it must not fail because it is missing.
+   * ships for the platform, so an installation that only has the jar still finds it. A library that
+   * speaks another ABI version is treated as missing: a bridge and a kernel that disagree about a
+   * frame must not run together. A JVM with neither keeps building with the Java kernel: the native
+   * kernel is optional, and a build that asked for it must not fail because it is missing.
    */
   static boolean ensureLoaded() {
     if (LOADED.get()) {
@@ -229,11 +238,12 @@ final class NativeIvfBuild {
         LOG.warn(
             "The native IVF build kernel is not available ({}; {}); builds that ask for it fall"
                 + " back to the Java kernel. It needs a loadable {} on java.library.path, or one"
-                + " packaged under {}<platform>/",
+                + " packaged under {}<platform>/, both speaking ABI version {}",
             libraryPathFailure,
             resourceFailure,
             System.mapLibraryName(LIBRARY_NAME),
-            LIBRARY_RESOURCE_PREFIX);
+            LIBRARY_RESOURCE_PREFIX,
+            ABI_VERSION);
       }
 
       return false;
@@ -244,13 +254,14 @@ final class NativeIvfBuild {
   private static String loadFromLibraryPath() {
     try {
       System.loadLibrary(LIBRARY_NAME);
-      return null;
     } catch (UnsatisfiedLinkError | SecurityException e) {
       return "no "
           + System.mapLibraryName(LIBRARY_NAME)
           + " on the library path: "
           + e.getMessage();
     }
+
+    return versionFailure("The " + System.mapLibraryName(LIBRARY_NAME) + " on the library path");
   }
 
   /** Loads the library from the resource this build ships, answering null on success. */
@@ -274,12 +285,42 @@ final class NativeIvfBuild {
       extracted.toFile().deleteOnExit();
       Files.copy(in, extracted, StandardCopyOption.REPLACE_EXISTING);
       System.load(extracted.toAbsolutePath().toString());
-      return null;
+      return versionFailure("The packaged " + resource);
     } catch (IOException e) {
       return "cannot extract " + resource + ": " + e.getMessage();
     } catch (UnsatisfiedLinkError | SecurityException e) {
       return "cannot load " + resource + ": " + e.getMessage();
     }
+  }
+
+  /**
+   * The reason a loaded library cannot serve this bridge, or null when its ABI version matches.
+   *
+   * <p>An old library answers its own version, which is not the one this bridge writes and reads:
+   * building with it would fail on the first frame rather than fall back, so it is reported here.
+   */
+  private static String versionFailure(String library) {
+    int reported;
+    try {
+      reported = nativeVersion();
+    } catch (UnsatisfiedLinkError e) {
+      return library + " cannot report its native IVF ABI version: " + e.getMessage();
+    }
+
+    return versionMismatch(reported, library);
+  }
+
+  /** The reason a library reporting {@code reported} cannot serve this bridge, or null. */
+  static String versionMismatch(int reported, String library) {
+    if (reported == ABI_VERSION) {
+      return null;
+    }
+
+    return library
+        + " speaks native IVF ABI version "
+        + reported
+        + "; this bridge reads "
+        + ABI_VERSION;
   }
 
   /** The resource directory of this platform, or null when this build ships no library for it. */
@@ -358,18 +399,19 @@ final class NativeIvfBuild {
             options,
             ivf.quantizer(),
             ivf.scoring().metric(),
+            false,
             threads);
 
     return openAndBuild(params, new EntrySource(entries, fileIndexes, dimension));
   }
 
   /**
-   * Builds the payload of vectors that are already decoded.
+   * Builds the payload of vectors that the caller has already decoded.
    *
-   * <p>This is the path a production build takes: the Java kernel decodes the entries once, and the
-   * native kernel reads those vectors instead of decoding the entries a second time. The data file
-   * indexes are the positions of the entries' files in {@code dataFiles}, so the dictionary the
-   * payload writes is the one the Java kernel writes.
+   * <p>The Java kernel hands over the vectors it decoded, and the native kernel reads those instead
+   * of decoding the payloads a second time. The data file indexes are the positions of the entries'
+   * files in {@code dataFiles}, so the dictionary the payload writes is the one the Java kernel
+   * writes. A production build takes {@link #buildFromEntries} instead, which never decodes.
    */
   static Built buildFromVectors(
       IvfKernel kernel,
@@ -431,9 +473,59 @@ final class NativeIvfBuild {
             options,
             kernel.quantizer(),
             kernel.scoring().metric(),
+            false,
             threads);
 
     return openAndBuild(params, new VectorSource(vectors, fileIndexes, rowPositions, dimension));
+  }
+
+  /**
+   * Builds the payload of entries whose vectors are still encoded, which is what a build takes.
+   *
+   * <p>Each entry's payload travels to the native kernel as it was written, so the vectors are
+   * never decoded on the Java side and its heap does not hold them. The native side checks the
+   * version and dimension of every payload it reads. The data file indexes are the positions of the
+   * entries' files in the unit's dictionary, so the dictionary the payload writes is the one the
+   * Java kernel writes.
+   */
+  static Built buildFromEntries(IvfKernel kernel, List<IndexEntry> entries, int parallelism) {
+    Preconditions.checkNotNull(kernel, "IVF kernel is null");
+    Preconditions.checkNotNull(entries, "Index entries are null");
+    Preconditions.checkArgument(!entries.isEmpty(), "A native IVF build needs at least one entry");
+    Preconditions.checkArgument(
+        kernel.scoring().metric() == VectorIndexDefinition.Metric.L2,
+        "The native IVF build kernel supports the L2 metric only: %s",
+        kernel.scoring().metric());
+
+    int dimension = kernel.dimension();
+    int entryCount = entries.size();
+    List<String> dataFiles = VectorPayloads.dataFilesOf(entries);
+    int[] fileIndexes = fileIndexes(entries, dataFiles);
+
+    int threads = threadsFor(parallelism, entryCount);
+    IvfOptions options = kernel.options();
+    int listCount = options.nlistFor(entryCount);
+    int sampleCount = options.samplesFor(entryCount, listCount);
+    byte[] params =
+        encodeParams(
+            "",
+            dimension,
+            entryCount,
+            dataFiles,
+            listCount,
+            sampleCount,
+            options,
+            kernel.quantizer(),
+            kernel.scoring().metric(),
+            true,
+            threads);
+
+    return openAndBuild(params, new EntryPayloadSource(entries, fileIndexes, dimension));
+  }
+
+  /** The bytes one entry payload takes: its version and dimension, then the coordinates. */
+  private static int entryPayloadBytes(int dimension) {
+    return ENTRY_PAYLOAD_HEADER_BYTES + dimension * Float.BYTES;
   }
 
   /** How many threads a build of {@code entryCount} entries may use. */
@@ -482,6 +574,7 @@ final class NativeIvfBuild {
       IvfOptions options,
       RaBitQQuantizer quantizer,
       VectorIndexDefinition.Metric metric,
+      boolean rawEntryPayloads,
       int threads) {
     ByteArrayOutputStream bytes = new ByteArrayOutputStream();
     try (DataOutputStream out = new DataOutputStream(bytes)) {
@@ -503,6 +596,7 @@ final class NativeIvfBuild {
       out.writeLong(quantizer == null ? 0L : quantizer.seed());
       out.writeInt(metricCode(metric));
       out.writeBoolean(options.listBlocks());
+      out.writeBoolean(rawEntryPayloads);
       out.writeInt(threads);
     } catch (IOException e) {
       throw new UncheckedIOException("Failed to encode the native IVF build parameters", e);
@@ -528,11 +622,8 @@ final class NativeIvfBuild {
           Integer.toHexString(magic));
 
       int version = in.readInt();
-      Preconditions.checkState(
-          version == ABI_VERSION,
-          "The native IVF build returned result frame version %s; this bridge reads %s",
-          version,
-          ABI_VERSION);
+      String mismatch = versionMismatch(version, "The native IVF build result frame");
+      Preconditions.checkState(mismatch == null, "%s", mismatch);
 
       int status = in.readInt();
       String message = in.readUTF();
@@ -594,8 +685,8 @@ final class NativeIvfBuild {
 
     @Override
     public void fetch(int start, int count, ByteBuffer out) {
-      checkFetchBuffer(out, count, dimension);
-      int recordBytes = recordBytes(dimension);
+      checkFetchBuffer(out, count, dimension, false);
+      int recordBytes = recordBytes(dimension, false);
       for (int i = 0; i < count; i++) {
         int row = start + i;
         int offset = i * recordBytes;
@@ -606,6 +697,48 @@ final class NativeIvfBuild {
         for (int d = 0; d < vector.length; d++) {
           out.putFloat(offset + Integer.BYTES + Long.BYTES + d * Float.BYTES, vector[d]);
         }
+      }
+    }
+  }
+
+  /** Encoded entry payloads, served to the native kernel a block at a time. */
+  private static final class EntryPayloadSource implements VectorChunkSource {
+    private final List<IndexEntry> entries;
+    private final int[] fileIndexes;
+    private final int dimension;
+
+    private EntryPayloadSource(List<IndexEntry> entries, int[] fileIndexes, int dimension) {
+      this.entries = entries;
+      this.fileIndexes = fileIndexes;
+      this.dimension = dimension;
+    }
+
+    @Override
+    public int count() {
+      return entries.size();
+    }
+
+    @Override
+    public void fetch(int start, int count, ByteBuffer out) {
+      checkFetchBuffer(out, count, dimension, true);
+      int recordBytes = recordBytes(dimension, true);
+      int payloadBytes = entryPayloadBytes(dimension);
+      for (int i = 0; i < count; i++) {
+        int row = start + i;
+        int offset = i * recordBytes;
+        // the payload carries its own version and dimension, which the native side checks; only
+        // its length is checked here, where a record is copied as a whole
+        byte[] payload = entries.get(row).payload();
+        Preconditions.checkArgument(
+            payload.length == payloadBytes,
+            "Native IVF entry %s carries a %s-byte payload; %s dimensions need %s bytes",
+            row,
+            payload.length,
+            dimension,
+            payloadBytes);
+        out.putInt(offset, fileIndexes[row]);
+        out.putLong(offset + Integer.BYTES, entries.get(row).rowPosition());
+        out.put(offset + Integer.BYTES + Long.BYTES, payload, 0, payload.length);
       }
     }
   }
@@ -631,8 +764,8 @@ final class NativeIvfBuild {
 
     @Override
     public void fetch(int start, int count, ByteBuffer out) {
-      checkFetchBuffer(out, count, dimension);
-      int recordBytes = recordBytes(dimension);
+      checkFetchBuffer(out, count, dimension, false);
+      int recordBytes = recordBytes(dimension, false);
       for (int i = 0; i < count; i++) {
         int row = start + i;
         int offset = i * recordBytes;
@@ -647,10 +780,11 @@ final class NativeIvfBuild {
   }
 
   /** Refuses a buffer the native side could not fill with {@code count} records. */
-  private static void checkFetchBuffer(ByteBuffer out, int count, int dimension) {
+  private static void checkFetchBuffer(
+      ByteBuffer out, int count, int dimension, boolean rawEntryPayloads) {
     Preconditions.checkNotNull(out, "Native IVF vector buffer is null");
     Preconditions.checkArgument(out.isDirect(), "Native IVF vector buffer is not direct");
-    long needed = (long) count * recordBytes(dimension);
+    long needed = (long) count * recordBytes(dimension, rawEntryPayloads);
     Preconditions.checkArgument(
         out.capacity() >= needed,
         "Native IVF vector buffer holds %s bytes, %s records need %s",
@@ -659,7 +793,14 @@ final class NativeIvfBuild {
         needed);
   }
 
-  private static int recordBytes(int dimension) {
-    return Integer.BYTES + Long.BYTES + dimension * Float.BYTES;
+  /**
+   * The bytes one record takes: the data file index, the row position and the vector, which is the
+   * entry payload when the parameters frame asks for raw values.
+   */
+  private static int recordBytes(int dimension, boolean rawEntryPayloads) {
+    return Integer.BYTES
+        + Long.BYTES
+        + (rawEntryPayloads ? ENTRY_PAYLOAD_HEADER_BYTES : 0)
+        + dimension * Float.BYTES;
   }
 }
