@@ -224,6 +224,36 @@ class TestVectorSearchPlanning {
         .isNull();
   }
 
+  /**
+   * The two index views report what the index itself holds, so they read its latest snapshot even
+   * when the read is pinned to an older table snapshot. A new hit that only the current index ranks
+   * is what a caller reading the index sees; reading the index snapshot of the pinned table
+   * snapshot instead would show an answer the index has moved past.
+   */
+  @Test
+  void anIndexViewReadsTheLatestIndexSnapshot() throws Exception {
+    Table table = tableWithIndex("planning_latest_index");
+    long first = table.currentSnapshot().snapshotId();
+    spark.sql("INSERT INTO local.db.planning_latest_index VALUES (3, array(0.5d, 0.5d))");
+    table.refresh();
+    spark.sql(
+        "CALL local.system.refresh_vector_index("
+            + "table => 'db.planning_latest_index', column => 'embedding')");
+    table.refresh();
+    long latest =
+        VectorIndexes.findIndex(table, "embedding", "vector")
+            .latestSnapshot()
+            .sourceTableSnapshotId();
+    assertThat(latest).isNotEqualTo(first);
+
+    for (String contract : new String[] {"INDEX_HITS", "INDEX_POSITIONS"}) {
+      VectorSearchContext context = bind(table, first, contract).context();
+      assertThat(context.inputs().indexSnapshot().sourceTableSnapshotId())
+          .as("%s reads what the index now ranks", contract)
+          .isEqualTo(latest);
+    }
+  }
+
   @Test
   void queryInputIsCopiedBeforeBinding() throws Exception {
     Table table = tableWithIndex("planning_copied_query");

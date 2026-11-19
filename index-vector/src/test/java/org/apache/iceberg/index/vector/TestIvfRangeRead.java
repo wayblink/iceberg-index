@@ -25,6 +25,8 @@ import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import org.apache.iceberg.index.IndexAdapter;
@@ -106,6 +108,7 @@ class TestIvfRangeRead {
         assertThat(ranges.read(list).readInt()).isEqualTo(list);
       }
 
+      assertThat(ranges.listsRead()).as("one consumed block per selected list").isEqualTo(3);
       assertThat(file.reads).isEqualTo(2);
       assertThat(file.bytes).isEqualTo(3 * Integer.BYTES);
     }
@@ -213,17 +216,64 @@ class TestIvfRangeRead {
       // the first search reads its lists and leaves them in the shared cache
       assertThat(blocks.stats().loads()).isPositive();
       assertThat(first.blockCacheStats().hits()).isZero();
+      assertThat(first.listBlocksRead()).as("one list block consumed").isEqualTo(1);
+      assertThat(first.listReadMetrics().bytes()).isPositive();
     }
 
     try (VectorIndexAdapter.RangeSearch second = vector.prepareRange(counted, 0L, blocks)) {
       assertThat(second.search(query, 5)).isEqualTo(full.search(query, 5));
       // the open still reads the container footer and the description; the lists come from the
       // shared cache, which is what the list metrics and the hit counter say
-      assertThat(second.blockCacheStats().hits()).isPositive();
+      assertThat(second.blockCacheStats().hits()).isEqualTo(1);
+      assertThat(second.listBlocksRead()).as("a cached list block is still consumed").isEqualTo(1);
       assertThat(second.listReadMetrics().bytes())
           .as("the second search read no list bytes")
           .isZero();
       assertThat(second.listReadMetrics().requests()).isZero();
+    }
+  }
+
+  @Test
+  void aFullyCachedDenseProbeReadsNoStorageAndDoesNotFallBack() {
+    int blockSize = 1024;
+    int listCount = 8;
+    byte[] payload = new byte[listCount * blockSize];
+    ByteBuffer buffer = ByteBuffer.wrap(payload);
+    int[] starts = new int[listCount];
+    for (int list = 0; list < listCount; list++) {
+      starts[list] = list * blockSize;
+      buffer.putInt(starts[list], list);
+    }
+
+    // the blocks are the bytes a previous search of this file would have kept
+    CountingFile file = new CountingFile(payload);
+    InMemoryListBlocks blocks = new InMemoryListBlocks();
+    for (int list = 0; list < listCount; list++) {
+      blocks.put(
+          file.location(),
+          starts[list],
+          Arrays.copyOfRange(payload, starts[list], starts[list] + blockSize));
+    }
+
+    IvfRangeInput input = new IvfRangeInput(file.newStream(), 0, payload.length, file.location());
+    try (IvfListRanges ranges = new IvfListRanges(input, starts, 0, blocks)) {
+      int[] dense = {0, 1, 2, 3, 4, 5, 6, 7};
+      ranges.planInReadOrder(dense, null);
+
+      assertThat(ranges.wholeListAreaReads())
+          .as("a probe whose lists are all cached has no missing bytes to widen")
+          .isZero();
+      assertThat(blocks.containsCalls)
+          .as("the planner asks the shared cache before falling back")
+          .isEqualTo(listCount);
+      assertThat(file.reads).as("planning a warm probe reads nothing").isZero();
+
+      for (int list : dense) {
+        assertThat(ranges.read(list).readInt()).isEqualTo(list);
+      }
+
+      assertThat(ranges.listsRead()).isEqualTo(listCount);
+      assertThat(file.reads).as("a warm list block is not read from storage").isZero();
     }
   }
 
@@ -238,9 +288,15 @@ class TestIvfRangeRead {
 
     for (int search = 0; search < 2; search++) {
       try (VectorIndexAdapter.RangeSearch opened = vector.prepareRange(counted)) {
+        int readsBefore = counted.reads;
         assertThat(opened.search(query, 5))
             .isEqualTo(vector.prepareAuxiliary(payload).search(query, 5));
         assertThat(opened.blockCacheStats().hits()).isZero();
+        // with no cache there is no hit to rely on: the list block really comes from storage
+        assertThat(opened.listBlocksRead()).isEqualTo(1);
+        assertThat(opened.listReadMetrics().requests()).isPositive();
+        assertThat(opened.listReadMetrics().bytes()).isPositive();
+        assertThat(counted.reads - readsBefore).isPositive();
       }
     }
   }
@@ -356,10 +412,11 @@ class TestIvfRangeRead {
 
   /** A shared block cache with no budget: a block put stays there for the next search. */
   private static final class InMemoryListBlocks implements ListBlockCache {
-    private final Map<String, byte[]> blocks = new java.util.HashMap<>();
+    private final Map<String, byte[]> blocks = new HashMap<>();
     private long hits;
     private long misses;
     private long loads;
+    private int containsCalls;
 
     private static String key(String location, int offset, int size) {
       return location + "@" + offset + "+" + size;
@@ -375,6 +432,13 @@ class TestIvfRangeRead {
 
       hits++;
       return block;
+    }
+
+    @Override
+    public boolean contains(String location, int offset, int size) {
+      // a planner's question must not change the counters a search reports
+      containsCalls++;
+      return blocks.containsKey(key(location, offset, size));
     }
 
     @Override

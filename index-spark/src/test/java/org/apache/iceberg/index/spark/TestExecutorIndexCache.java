@@ -22,6 +22,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 
 import java.nio.ByteBuffer;
 import java.util.List;
+import java.util.Set;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -104,12 +105,200 @@ class TestExecutorIndexCache {
   }
 
   @Test
+  void aListBlockCannotSpendAnOutstandingLoadReservation() {
+    int budget = 16_384;
+    ExecutorIndexCache.Config enabled = config(budget);
+    ListBlockCache blocks = cache.listBlocks(enabled);
+    cache.file(
+        "s3://bucket/whole.puffin",
+        enabled,
+        "adapter",
+        12_000L,
+        () -> {
+          blocks.put("s3://bucket/blocks.puffin", 0, new byte[8_000]);
+          assertThat(blocks.contains("s3://bucket/blocks.puffin", 0, 8_000)).isFalse();
+          return load(new AtomicInteger(), 12_000);
+        });
+  }
+
+  @Test
+  void offloadClearsBlocksCachedByQueriesWithoutAManagedCopy() {
+    ExecutorIndexCache.Config enabled = config(1 << 20);
+    String location = "s3://bucket/query.puffin";
+    ListBlockCache first = cache.listBlocks(enabled, "first");
+    ListBlockCache second = cache.listBlocks(enabled, "second");
+    first.put(location, 0, new byte[16]);
+    second.put(location, 0, new byte[16]);
+
+    assertThat(cache.releaseIndex("first", 1)).isTrue();
+    first.put(location, 0, new byte[16]);
+    assertThat(first.contains(location, 0, 16)).isFalse();
+    assertThat(second.contains(location, 0, 16)).isTrue();
+
+    ListBlockCache later = cache.listBlocks(enabled, "first");
+    later.put(location, 0, new byte[16]);
+    assertThat(later.contains(location, 0, 16)).isTrue();
+  }
+
+  @Test
   void aDisabledCacheKeepsNoBlocks() {
     ListBlockCache blocks = cache.listBlocks(ExecutorIndexCache.Config.of(false, 1024));
     blocks.put("s3://bucket/index-a.puffin", 0, new byte[16]);
 
     assertThat(blocks.get("s3://bucket/index-a.puffin", 0, 16)).isNull();
     assertThat(blocks.stats().loads()).isZero();
+  }
+
+  @Test
+  void aWholeFileReclaimsListBlocksToFit() {
+    AtomicInteger loads = new AtomicInteger();
+    ExecutorIndexCache.Config enabled = config(16_384);
+    ListBlockCache blocks = cache.listBlocks(enabled);
+    blocks.put("s3://bucket/a.puffin", 0, new byte[7_500]);
+    blocks.put("s3://bucket/a.puffin", 7_500, new byte[7_500]);
+
+    cache.file("s3://bucket/whole.puffin", enabled, "adapter", () -> load(loads, 1_500));
+
+    assertThat(cache.stats().entries()).as("the whole file is cached").isEqualTo(1);
+    assertThat(blocks.contains("s3://bucket/a.puffin", 0, 7_500))
+        .as("the least recently used block made room for the whole file")
+        .isFalse();
+    assertThat(blocks.contains("s3://bucket/a.puffin", 7_500, 7_500))
+        .as("the blocks the file did not need keep their room")
+        .isTrue();
+    assertThat(cache.stats().bytes())
+        .as("files and blocks together stay within the budget")
+        .isLessThanOrEqualTo(16_384L);
+    assertThat(blocks.stats().evictions())
+        .as("the whole file's reclaim is not the search's own block eviction")
+        .isZero();
+  }
+
+  @Test
+  void blocksAndFilesTogetherStayWithinTheBudget() {
+    AtomicInteger loads = new AtomicInteger();
+    ExecutorIndexCache.Config enabled = config(16_384);
+    ListBlockCache blocks = cache.listBlocks(enabled);
+    blocks.put("s3://bucket/a.puffin", 0, new byte[5_000]);
+    blocks.put("s3://bucket/a.puffin", 5_000, new byte[5_000]);
+
+    cache.file("s3://bucket/one.puffin", enabled, "adapter", () -> load(loads, 1_000));
+    cache.file("s3://bucket/two.puffin", enabled, "adapter", () -> load(loads, 1_000));
+
+    assertThat(cache.stats().entries()).as("both files fit beside the blocks").isEqualTo(2);
+    assertThat(blocks.contains("s3://bucket/a.puffin", 0, 5_000)).isTrue();
+    assertThat(blocks.contains("s3://bucket/a.puffin", 5_000, 5_000)).isTrue();
+    assertThat(cache.stats().bytes())
+        .as("resident files and blocks share one budget")
+        .isLessThanOrEqualTo(16_384L);
+  }
+
+  @Test
+  void reportedBytesIncludeListBlocks() {
+    ExecutorIndexCache.Config enabled = config(1 << 20);
+    ListBlockCache blocks = cache.listBlocks(enabled);
+
+    blocks.put("s3://bucket/a.puffin", 0, new byte[16]);
+    assertThat(cache.stats().entries()).as("a block is not a whole-file entry").isZero();
+    assertThat(cache.stats().bytes()).isEqualTo(16L);
+
+    blocks.put("s3://bucket/a.puffin", 16, new byte[20]);
+    assertThat(cache.stats().bytes()).isEqualTo(36L);
+  }
+
+  @Test
+  void releasingAnIndexClearsItsListBlocks() {
+    ExecutorIndexCache.Config enabled = config(1 << 20);
+    String first = cacheKey("table", "adapter", "s3://bucket/a.puffin");
+    String second = cacheKey("table", "adapter", "s3://bucket/b.puffin");
+    ListBlockCache blocks = cache.listBlocks(enabled);
+
+    cache.applyTarget("index-1", 1, Set.of(first, second));
+    blocks.put("s3://bucket/a.puffin", 0, new byte[16]);
+    blocks.put("s3://bucket/b.puffin", 0, new byte[16]);
+
+    cache.applyTarget("index-1", 2, Set.of(first));
+    assertThat(blocks.contains("s3://bucket/b.puffin", 0, 16))
+        .as("a file the new target no longer names gives up its blocks")
+        .isFalse();
+    assertThat(blocks.contains("s3://bucket/a.puffin", 0, 16))
+        .as("a file the target keeps keeps its blocks")
+        .isTrue();
+
+    assertThat(cache.releaseCopy("index-1", first)).isTrue();
+    assertThat(blocks.contains("s3://bucket/a.puffin", 0, 16)).isFalse();
+    assertThat(cache.stats().bytes()).isZero();
+
+    cache.applyTarget("index-1", 3, Set.of(second));
+    blocks.put("s3://bucket/b.puffin", 0, new byte[16]);
+    assertThat(cache.releaseIndex("index-1", 3)).isTrue();
+    assertThat(blocks.contains("s3://bucket/b.puffin", 0, 16)).isFalse();
+    assertThat(cache.stats().bytes()).isZero();
+  }
+
+  @Test
+  void theIdleSweepDropsBlocksNoSearchRead() throws Exception {
+    ExecutorIndexCache.Config ttl =
+        ExecutorIndexCache.Config.of(true, 1 << 20, ExecutorIndexCache.Mode.PIN_ALL, 1);
+    ExecutorIndexCache.sweepIntervalForTests(0);
+    ListBlockCache blocks = cache.listBlocks(ttl);
+    blocks.put("s3://bucket/a.puffin", 0, new byte[16]);
+    assertThat(blocks.contains("s3://bucket/a.puffin", 0, 16)).isTrue();
+
+    Thread.sleep(30);
+    // another load makes the sweep due
+    cache.file("s3://bucket/b.puffin", ttl, "adapter", () -> load(new AtomicInteger(), 10));
+
+    assertThat(blocks.get("s3://bucket/a.puffin", 0, 16))
+        .as("a block no search has read within the idle window is dropped")
+        .isNull();
+    assertThat(blocks.stats().evictions()).as("an idle block is not a budget eviction").isZero();
+    assertThat(cache.stats().evictions()).as("nor a whole-file eviction").isZero();
+  }
+
+  @Test
+  void aViewReportsOnlyItsOwnSearch() {
+    ExecutorIndexCache.Config enabled = config(1024);
+    ListBlockCache first = cache.listBlocks(enabled);
+    first.put("s3://bucket/a.puffin", 0, new byte[500]);
+    first.put("s3://bucket/a.puffin", 500, new byte[600]);
+    assertThat(first.get("s3://bucket/a.puffin", 500, 600)).isNotNull();
+    assertThat(first.get("s3://bucket/a.puffin", 0, 500)).isNull();
+    assertThat(first.stats().hits()).isEqualTo(1);
+    assertThat(first.stats().misses()).isEqualTo(1);
+    assertThat(first.stats().loads()).isEqualTo(2);
+    assertThat(first.stats().evictions()).isEqualTo(1);
+    assertThat(first.stats().bytes()).isEqualTo(1_100);
+
+    ListBlockCache second = cache.listBlocks(enabled);
+    assertThat(second.contains("s3://bucket/a.puffin", 500, 600)).isTrue();
+    assertThat(second.stats().hits()).isZero();
+    assertThat(second.stats().misses()).as("contains does not count as a lookup").isZero();
+    assertThat(second.stats().loads()).as("another view's puts are not this search's").isZero();
+    assertThat(second.stats().evictions()).isZero();
+    assertThat(second.stats().bytes()).isZero();
+
+    assertThat(second.get("s3://bucket/a.puffin", 500, 600)).isNotNull();
+    assertThat(second.stats().hits()).isEqualTo(1);
+    assertThat(first.stats().hits()).as("this view's counters did not move").isEqualTo(1);
+  }
+
+  @Test
+  void aViewDoesNotReportTheExecutorLifetimeCounters() {
+    AtomicInteger loads = new AtomicInteger();
+    ExecutorIndexCache.Config pinHot = mode(ExecutorIndexCache.Mode.PIN_HOT, 25_000);
+    for (String name : List.of("a", "b", "c")) {
+      cache.file("s3://bucket/" + name + ".puffin", pinHot, "adapter", () -> load(loads, 10_000));
+      cache.file("s3://bucket/" + name + ".puffin", pinHot, "adapter", () -> load(loads, 10_000));
+    }
+    assertThat(cache.stats().evictions()).as("the executor evicted a whole file").isPositive();
+
+    ListBlockCache view = cache.listBlocks(pinHot);
+    assertThat(view.stats().hits()).isZero();
+    assertThat(view.stats().misses()).isZero();
+    assertThat(view.stats().loads()).isZero();
+    assertThat(view.stats().evictions()).isZero();
+    assertThat(view.stats().bytes()).isZero();
   }
 
   @Test
@@ -472,6 +661,11 @@ class TestExecutorIndexCache {
 
   private static ExecutorIndexCache.Config config(long maxBytes) {
     return ExecutorIndexCache.Config.of(true, maxBytes);
+  }
+
+  /** The key shape {@code DistributedIndexSearch.cacheKey} builds for a managed index file. */
+  private static String cacheKey(String owner, String adapter, String location) {
+    return owner + "|" + adapter + "|" + location;
   }
 
   /** A PIN_HOT cache admits a file on its second ask, so asking twice is what plants an entry. */

@@ -60,6 +60,7 @@ public class TestVectorIndexSearchBatch extends ExtensionsTestBase {
     sql("DROP TABLE IF EXISTS %s", tableName("vectors_batch_override_" + catalogName));
     sql("DROP TABLE IF EXISTS %s", tableName("vectors_batch_schema_" + catalogName));
     sql("DROP TABLE IF EXISTS %s", tableName("vectors_batch_jobs_" + catalogName));
+    sql("DROP TABLE IF EXISTS %s", tableName("vectors_batch_address_" + catalogName));
   }
 
   @TestTemplate
@@ -296,6 +297,60 @@ public class TestVectorIndexSearchBatch extends ExtensionsTestBase {
           .isEqualTo(java.util.Arrays.copyOfRange(hits.get(i), 0, 4));
       assertThat(positions.get(i)[4]).as("no row is resolved").isNull();
     }
+  }
+
+  /**
+   * The address table function answers with the index's own hits. A hit whose row was deleted after
+   * the build is still reported, with a null row, so the answer is the {@code index_hits} mode of a
+   * procedure rather than the complete-table one; and the index reads its latest snapshot, so the
+   * deleted rows do not have to be removed from the index for the answer to be the index's own.
+   */
+  @TestTemplate
+  public void addressTableFunctionAnswersTheIndexHits() {
+    String tableName = tableName("vectors_batch_address_" + catalogName);
+    sql("CREATE TABLE %s (id bigint, embedding array<double>) USING iceberg", tableName);
+    sql(
+        "INSERT INTO %s SELECT id, array(CAST(id AS double), CAST(10 - id AS double)) "
+            + "FROM range(0, 20)",
+        tableName);
+    sql(
+        "CALL %s.system.build_vector_index("
+            + "table => '%s', column => 'embedding', dimension => 2, metric => 'l2')",
+        catalogName, tableName);
+    // the index is not refreshed after the delete, so the deleted rows are still what it ranks
+    sql("DELETE FROM %s WHERE id IN (0, 1, 10)", tableName);
+
+    List<Object[]> fromFunction =
+        sql(
+            "SELECT * FROM vector_index_search('%s', 'embedding', array(0.0d, 10.0d), 5)",
+            tableName);
+    List<Object[]> fromIndexHits =
+        sql(
+            "CALL %s.system.vector_search(table => '%s', column => 'embedding', "
+                + "query => array(0.0d, 10.0d), k => 5, coverage => 'index_hits')",
+            catalogName, tableName);
+    List<Object[]> fromTable =
+        sql(
+            "CALL %s.system.vector_search(table => '%s', column => 'embedding', "
+                + "query => array(0.0d, 10.0d), k => 5, coverage => 'table')",
+            catalogName, tableName);
+
+    // the function and the procedure's index-hits mode ask the same question
+    assertThat(fromIndexHits).hasSize(5);
+    assertThat(fromTable).hasSize(5);
+    for (int i = 0; i < fromIndexHits.size(); i += 1) {
+      assertThat(java.util.Arrays.asList(fromFunction.get(i)))
+          .as("row %s", i)
+          .isEqualTo(java.util.Arrays.asList(fromIndexHits.get(i)));
+    }
+
+    // the deleted rows are still hits of the index, kept without a row
+    assertThat(fromFunction.stream().filter(row -> row[3] == null)).isNotEmpty();
+    // while the complete-table mode answers with live rows only, which is a different answer
+    assertThat(fromTable.stream().filter(row -> row[3] == null)).isEmpty();
+    assertThat(fromFunction.stream().map(row -> row[3]).collect(Collectors.toList()))
+        .as("the address function does not answer for the whole table")
+        .isNotEqualTo(fromTable.stream().map(row -> row[3]).collect(Collectors.toList()));
   }
 
   /**

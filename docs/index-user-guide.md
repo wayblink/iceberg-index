@@ -184,14 +184,14 @@ DDL 必须给名字；`CALL` 在列上还没有索引时可以不命名。**`dim
 | 入口 | 写法 | 返回什么 | 是否精确 top-k | 索引落后时 |
 |---|---|---|---|---|
 | **ORDER BY 改写** | `SELECT … ORDER BY vec_distance(col, q) LIMIT k` | 表的列 | **是**（候选放宽后按真实距离重排） | 残差扫描补全，结果完整 |
-| 过程 | `CALL … vector_search(…)` | `data_file, pos, score, row` | 否，索引自己的分与序 | 只取索引快照，不补残差 |
+| 过程 | `CALL … vector_search(…)` | `data_file, pos, score, row` | 否（候选来自索引；`table`/`indexed` 返回活行并按精确距离给分，`index_hits`/`positions` 是索引自己的分与序） | 由 `coverage` 决定：默认 `table` 会扫未覆盖文件；`index_hits` 只取索引快照、不补残差 |
 | 表函数（业务行） | `SELECT * FROM vector_search(…)` | 表的列 + `_distance` | **是**（metric 与索引不一致时退扫描，仍是精确值） | 见下 |
-| 表函数（地址） | `SELECT * FROM vector_index_search(…)` | `data_file, pos, score, row` | 否 | 用索引**最新**快照，不按源表对齐 |
+| 表函数（地址） | `SELECT * FROM vector_index_search(…)` | `data_file, pos, score, row` | 否 | 用索引**最新**快照，不补未覆盖文件；删除行保留 `row = NULL` |
 | 表函数（批量地址） | `SELECT * FROM vector_index_search_batch(…)` | 同上 + `query_id` | 否 | 同上 |
 
 **要结果正确就用改写写法或 `FROM vector_search(...)`**；要"拿到索引自己的排序"或"批量取行引用"才用过程和地址类表函数。
 
-过程和地址类表函数还有一个 `coverage` 参数，决定"命中之后要不要回表、要不要判活行"：
+`coverage` 参数**只存在于过程**（`vector_search` / `vector_search_batch`），决定"命中之后要不要回表、要不要判活行"：
 
 | `coverage` | 返回什么 | 回表 | 快照/删除判定 | 分数 |
 |---|---|---|---|---|
@@ -202,6 +202,8 @@ DDL 必须给名字；`CALL` 在列上还没有索引时可以不命名。**`dim
 
 `positions` 是给大批量准备的（见 4.8）：不读数据文件、不算 JSON，代价是分数是索引估计，且建索引后被删除的行仍会出现。要精确值或要行内容，就用 `table` / `FROM vector_search(...)`。
 
+**地址类表函数没有 `coverage` 参数**，固定是 `index_hits` 语义：用索引**最新**快照、不扫未覆盖文件、被删除的行保留为 `row = NULL`、分数是索引估计、顺序是索引自己的顺序。`CALL` 里那种"要活行 / 按覆盖范围收紧 / 只要位置"的选择只属于过程。
+
 三个表函数的参数（全部必须是常量，不能是列或子查询）：
 
 ```sql
@@ -211,7 +213,7 @@ SELECT * FROM vector_index_search_batch('local.db.docs', 'embedding', array('0.9
 -- 位置参数之后可以写命名选项，三个函数共用同一套
 SELECT * FROM vector_index_search(
   'local.db.docs', 'embedding', array(0.95d, 0.05d), 3,
-  nprobe => 32, over_sample => 10, filter_mode => 'pre');
+  nprobe => 32, over_sample => 10);
 ```
 
 注意批查的 queries 是**字符串数组**，每个字符串是逗号分隔的数字，不是二维数组。
@@ -225,13 +227,16 @@ SELECT id, title, _distance FROM vector_search(
   k => 3,
   -- 查询期参数，可选项：不写就跟随会话配置
   nprobe => 32,
-  over_sample => 10,
-  filter_mode => 'pre');
+  over_sample => 10);
 ```
 
-`nprobe` / `over_sample` / `filter_mode`（以及多索引时的 `index`）都是**逐语句**参数：优先级是
-**语句里写的 > 会话配置（`SET`）> 索引定义里记录的默认值**（这三项目前都不记录默认，所以
-实际是前两层）。写错值会直接报错，不会回退到会话值；`nprobe` 对非 IVF 索引不允许指定。
+`nprobe` / `over_sample`（以及多索引时的 `index`）是**逐语句**参数：优先级是
+**语句里写的 > 会话配置（`SET`）**（索引定义目前不记录这三项的默认值）。写错值会直接报错，
+不会回退到会话值。`nprobe` 以调用值为准；只写 session 时，session 值只对 IVF 索引生效，
+非 IVF 索引上**显式**传 `nprobe` 是错误（不会静默忽略）。
+
+`filter_mode` **不是**调用参数：`CALL` 和表函数都不接受它，只有会话配置
+`spark.iceberg.index.vector.filter-mode`（见 4.6）。
 
 `vector_search` 表函数的 `distance_type` 可以显式指定 `l2` / `cosine` / `dot`（早期的 `euclidean`、`dot_product` 等写法仍接受）；**不写它就跟随索引的 metric**（索引是 `l2`，返回的就是 L2 距离）；写了但与索引不一致时，改写会退让并做全表扫描，但**答案仍是你要的那个 metric 的精确值**。
 
@@ -245,7 +250,7 @@ SELECT id, title, _distance FROM vector_search(
 
 反过来，`DESC`、多个排序键、`OFFSET`、join、聚合、窗口、无法转换成索引侧表达式的过滤（子查询、UDF、跨表列）、非 identity 分区、`LIMIT` 不是字面量——都会让规则退让，退回全表扫描。
 
-标量过滤（`WHERE year = 2020`、`WHERE price < 100`）**不再导致退让**：它会被带进检索，在 task 内按 `filter-mode` 决定先于打分还是后于打分生效（4.6）。这也意味着**带过滤的查询结果是近似的**（与不带过滤时同为索引本身的近似程度），而不再是全表扫描的精确值；过滤后符合条件的行不足 k 时，返回找到的那些行而不是补齐。
+标量过滤（`WHERE year = 2020`、`WHERE price < 100`）**不再导致退让**：它会被带进检索，在 task 内按会话配置 `spark.iceberg.index.vector.filter-mode` 决定先于打分还是后于打分生效（4.6）。这也意味着**带过滤的查询结果是近似的**（与不带过滤时同为索引本身的近似程度），而不再是全表扫描的精确值；过滤后符合条件的行不足 k 时，返回找到的那些行而不是补齐。
 
 一个容易忽略的细节：改写后排序键会被绑定成**索引的 metric**。所以不带第三参数的 `ORDER BY vec_distance(col, q)` 是按索引的 metric 计算的，与"没有索引时全扫描默认 l2"可能不是同一个量。
 
@@ -265,7 +270,7 @@ SET `spark.iceberg.index.vector.over-sample`=10;
 
 放宽不是免费的，倍数直接乘在回表行数上。无量化 `IVF` 与 `FLAT` 设不设这个倍数，答案都一样（只是多读一些行回来重排）。
 
-这个参数只存在于 conf 里，没有对应的 `CALL` 参数；表函数也只能通过它影响。
+也可以逐语句指定：`CALL … over_sample => 10`、`SELECT … FROM vector_search(…, over_sample => 10)` 或地址类表函数的同名命名选项；不写就跟随会话配置。
 
 `EXPLAIN` 会标出来：计划里的 `VectorSearchSource` 带 `result=exact` 或 `result=approximate`。只有 `FLAT` 且无量化才是 `exact`；看到 `approximate` 说明候选集仍可能漏掉真正的最近邻（分数和顺序是精确的，被粗筛漏掉的行不会回来）。没走索引的计划里两者都没有。
 
@@ -290,7 +295,9 @@ CALL local.system.drop_vector_index(table => 'db.docs', column => 'embedding', i
 
 ### 4.6 过滤落在检索的哪一侧：`filter-mode`
 
-带标量过滤的向量查询有两种走法，由 `spark.iceberg.index.vector.filter-mode` 指定。它是**每个 task 内部的策略**：task 拿到的是自己那份索引分片和它覆盖的数据文件，取值决定它怎么处理这一份局部数据，而不是"全局先算一遍再检索"。
+带标量过滤的向量查询有两种走法，由会话配置 `spark.iceberg.index.vector.filter-mode` 指定。它是**每个 task 内部的策略**：task 拿到的是自己那份索引分片和它覆盖的数据文件，取值决定它怎么处理这一份局部数据，而不是"全局先算一遍再检索"。
+
+这个配置**只在 `ORDER BY vec_distance(...)` 改写、且查询的过滤被带进检索时**才有可观察差别；`CALL` 的两个过程与三个表函数都不接受 `filter_mode` 调用参数，也没有把标量过滤带进检索的入口，因此不受它影响。（本节下面描述的都是改写路径。）
 
 | 值 | task 做什么 | 代价 |
 |---|---|---|
@@ -309,7 +316,7 @@ CALL local.system.drop_vector_index(table => 'db.docs', column => 'embedding', i
 
 融合查询（`SELECT … FROM vector_search(…)`）的每个 task 会上报四段墙钟——读索引 `indexReadTimeNs`、探测打分 `probeScoreTimeNs`、回表 `fetchBackTimeNs`、合并 `mergeTimeNs`——外加对账用的 `taskTimeNs` 和索引读取的字节 / 请求数。它们默认开启、无需配置，Spark UI 的 SQL 页和 `spark.eventLog` 里都能读到。
 
-四段之和应当等于 `taskTimeNs`（误差 <5%），所以看到"慢"时可以先定位到段，再决定是读多了、算慢了还是回表贵了。
+四段之和覆盖 `taskTimeNs` 的绝大部分（验收容差 <5%），但**不要把它当严格等式**：回表之后的过滤/去重计入 merge，块缓存的锁等待计入 probe-score，这两段因此都比字面含义宽。看到"慢"时可以先定位到段，再决定是读多了、算慢了还是回表贵了。
 
 候选侧还有几个累计计数（每个索引文件的任务各加一份）：
 
@@ -321,7 +328,7 @@ CALL local.system.drop_vector_index(table => 'db.docs', column => 'embedding', i
 | `numIndexUnderfilled` | 最后一轮仍凑不满 k 的索引文件数 | 只描述索引分支，残差扫描可能已补齐 |
 | `numCandidateRounds` | 每个索引文件跑了几轮扩探 | 轮次多说明窗口被删除/过滤吃掉了 |
 
-整列表区回退（一次读整个 list 区而不是选读）由 `numIndexWholeListAreaReads` 计数，用它区分"稀疏选读"和"整区读"。range=on 的查询会复用 executor 的 **list 块缓存**（`numIndexBlockCacheHits` / `numIndexBlockCacheMisses` / `numIndexBlockLoads` / `numIndexBlockEvictions`）：块缓存与整文件缓存共用 `spark.iceberg.index.cache.*` 的开关和预算，命中时不再重复访问对象存储。完整的指标口径、event log 读法、与 Lance 侧指标的对应关系，以及已知边界（回表字节未覆盖等）见 `docs/index-query-metrics.md`。
+整列表区回退（一次读整个 list 区而不是选读）由 `numIndexWholeListAreaReads` 计数；条件是选中的范围**密集**（未读部分已占 list 区的大部分，逐段读并不比整区读省）或**散扩**（范围分散成多段、待读字节已接近整个 list 区）。range=on 的查询会复用 executor 的 **list 块缓存**（`numIndexBlockCacheHits` / `numIndexBlockCacheMisses` / `numIndexBlockLoads` / `numIndexBlockEvictions`，都是 **per-search** 的计数）：块与整文件缓存共用 `spark.iceberg.index.cache.*` 的开关和同一份预算——块从整文件占用后的剩余预算里装入，整文件装入需要空间时也会回收块；块计入 `index_cache_status` 上报的常驻字节，空闲 TTL 淘汰与 `offload_index` 会清掉对应的块。回退前会先查共享缓存（全热的探测不读存储），但回退本身不回填。命中块时不再重复访问对象存储。完整的指标口径、event log 读法、与 Lance 侧指标的对应关系，以及已知边界（回表字节未覆盖等）见 `docs/index-query-metrics.md`。
 
 ### 4.8 批量查询：块、输出模式与内存
 
@@ -333,13 +340,13 @@ CALL local.system.vector_search_batch(
   table => 'db.docs', column => 'embedding',
   queries => array('0.95,0.05', '0.1,0.9'), k => 10);
 
--- 也可以从表读查询；query_id 用行序，或 query_id_column 指定的列
+-- 也可以从表读查询；query_id 始终是查询的行序，query_id_column 只决定读表的顺序
 CALL local.system.vector_search_batch(
   table => 'db.docs', column => 'embedding',
   query_table => 'db.queries', query_id_column => 'id',
   vector_column => 'vector', k => 10);
 
--- 表函数：在 Spark 里消费，逐块产出，不在 driver 攒整批
+-- 表函数：在 Spark 里消费；按块转换后各成一个分区
 SELECT * FROM vector_index_search_batch(
   'local.db.docs', 'embedding', array('0.95,0.05', '0.1,0.9'), 10);
 ```
@@ -347,11 +354,11 @@ SELECT * FROM vector_index_search_batch(
 **执行是分块的。** 每次取一块查询，共享一次索引文件加载、一次回表与（`table` 模式）一次未覆盖文件扫描；没凑够 k 的查询才进入下一轮扩探，最多 10 轮。块大小由三个预算里最紧的一个决定（块内广播 8 MiB、driver 行+JSON 8 MiB、shuffle 128 MiB），上限 128：
 
 - 2560 维、k=10、带行 JSON 时约 **9–11 条/块**（每行约 `20 B/dim` 的 JSON 把 driver 预算吃掉了）；
-- 用 `positions` 时不持有行与 JSON，块可到 **128**，且每块只跑搜索一个作业（其它模式还要回表与 JSON 两个作业）。
+- 用 `positions` 时不持有行与 JSON，块可到 **128**，且省掉了回表与行 JSON 两段工作（实测总作业数从 27 降到 7）。
 
-**内存的口径。** 查询向量在 driver 上按 4 B/dim 常驻（10k×2560 ≈ 102 MB）；读查询表用逐行迭代，但仍持有全部向量，没有按块流式。真正的大头是输出：带行 JSON 时每行约 51 KB（2560 维），10k×k=10 约 5 GB；`positions` 下每行约 30 B，同样规模约 3 MB。
+**内存的口径。** 查询向量在 driver 上按 4 B/dim 常驻（10k×2560 ≈ 102 MB）；读查询表用逐行迭代，但仍持有全部向量，没有按块流式。输出侧：带行 JSON 时每行约 51 KB（2560 维），按行宽常量推算 10k×k=10 约 5 GB 量级；`positions` 下每行约 30 B，同规模约 3 MB 量级（两组总量都是推算，不是实测）。
 
-**表函数和过程的差别就在输出侧**：表函数逐块把结果转成一个分区、最后 `union`（driver 峰值是一块）；过程是 Spark 的结果集 API，driver 必须收全。10k 级批量优先用表函数，或把过程的 `coverage` 设为 `positions`。块是串行执行的，块内任何一条查询失败都会让整块失败（重试整个 stage），没有逐查询隔离。
+**表函数和过程的差别在输出侧，但表函数不是流式**：表函数按块把结果转成 `UnsafeRow`、每块 `.coalesce(1)` 成一个分区、最后 `union`；driver 在 `union` 执行前仍持有整批的 `UnsafeRow`，峰值是 **O(整批)** 而不是 O(一块)，真实收益是每块的 `Row`+JSON 在转换后即释放、分区数等于块数。过程是 Spark 的结果集 API，driver 必须收全。10k 级批量优先用表函数，或把过程的 `coverage` 设为 `positions`。块是串行执行的，块内任何一条查询失败都会让整块失败（重试整个 stage），没有逐查询隔离。
 
 ## 5. 全文索引
 
@@ -510,7 +517,7 @@ CALL local.system.cleanup_index_files(table => 'db.docs');
 
 ## 7. 缓存与性能
 
-缓存把索引文件常驻在 executor 堆里，索引侧从"每次查询重读几 GB"降到几十毫秒。默认**关闭**。
+缓存把索引文件（以及 range 路径用到的 list 块）常驻在 executor 堆里，索引侧从"每次查询重读几 GB"降到几十毫秒。默认**关闭**。
 
 | 配置 | 默认 | 说明 |
 |---|---|---|
@@ -518,7 +525,7 @@ CALL local.system.cleanup_index_files(table => 'db.docs');
 | `spark.iceberg.index.cache.bytes` | 自动（按工作集推导，下限 512MB） | 每 executor 预算 |
 | `spark.iceberg.index.cache.heap-fraction` | `0.25` | 自动预算的堆占比上限 |
 | `spark.iceberg.index.cache.mode` | `auto` | `PIN_ALL` / `PIN_HOT` / `STREAM` |
-| `spark.iceberg.index.cache.idle-ttl` | `30m` | 条目空闲淘汰 |
+| `spark.iceberg.index.cache.idle-ttl` | `30m` | 整文件条目与 list 块的空闲淘汰 |
 | `spark.iceberg.index.schedule.locality` | `true` | 把 task 派到已持有该索引文件的 executor |
 
 自动预算按**整个工作集**（所有索引文件 prepare 后的常驻内存）× 1.2 估算，再被 `堆大小 × heap-fraction` 截住。不是"每个 executor 分 1/N"——任何一个 task 都可能被派到任何 executor。
@@ -536,6 +543,8 @@ CALL local.system.offload_index(table => 'db.docs', index => '<uuid>');
 
 BM25 和向量索引共用 executor 的容量预算、LRU 和状态入口。用文本索引的 UUID 调用同一个 `load_index`。启用调度局部性时，查询优先调度到已确认持有分片的 executor。分布式 BM25 查询命中驻留时直接从内存读取分片，未命中时按范围读取且不自动回填。查看合计占用使用 `CALL local.system.index_cache_status(refresh => true)`。
 
+**range=on 的查询还会用到 list 块缓存，它与整文件条目共享同一份预算。** 块只从整文件占用后的剩余预算里装入，整文件装入需要空间时也会回收块；块计入 `index_cache_status` 的 `bytes`（常驻字节，与整文件条目合计），空闲 TTL 淘汰与 `offload_index` 会清掉对应的块。因此缓存预算要按"最大索引 ÷ 执行器数"给时，看到的是整文件与 list 块合计的占用。
+
 当前版本的行为（不是建议）：
 
 - executor 被杀后，driver 只有在**收到下一次上报**时才把它标记为丢失；在那之前它仍在账上，但已超过 10 秒没上报的节点不再是放置目标。
@@ -551,24 +560,25 @@ BM25 和向量索引共用 executor 的容量预算、LRU 和状态入口。用�
 | 键 | 默认 | 作用 |
 |---|---|---|
 | `spark.iceberg.index.vector.ivf.range-read.enabled` | `false` | 整索引缓存未命中时，按字节范围读取分块 IVF 索引。 |
-| `spark.iceberg.index.vector.ivf.nprobe` | `8` | 每次查询在每个 IVF 索引文件中初始探测的列表数。使用正整数。 |
+| `spark.iceberg.index.vector.ivf.nprobe` | `8` | 每次查询在每个 IVF 索引文件中初始探测的列表数。使用正整数；调用里显式写的值优先，本项 session 值只对 IVF 生效（非 IVF 索引上显式传 `nprobe` 报错）。 |
 | `spark.iceberg.index.vector.over-sample` | `0` | 基础候选预算为 K。显式正值按 K 乘倍数计算。 |
 | `spark.iceberg.index.vector.name` | 不设 | 同列多索引时选哪个 |
-| `spark.iceberg.index.vector.filter-mode` | `pre` | task 内过滤落在打分前（`pre`）还是后（`post`）：`pre` 只给放行行打分，`post` 打分后逐行判定再扩样；见 4.6，非法值直接失败 |
+| `spark.iceberg.index.vector.filter-mode` | `pre` | task 内过滤落在打分前（`pre`）还是后（`post`）：`pre` 只给放行行打分，`post` 打分后逐行判定再扩样；只在 `ORDER BY vec_distance` 改写带过滤时生效，不是调用参数（见 4.6），非法值直接失败 |
 | `spark.iceberg.index.cache.enabled` | `false` | 缓存开关；关掉时 `load_index` 报 `CACHE_DISABLED` |
 | `spark.iceberg.index.cache.bytes` | 自动 | 每 executor 预算 |
 | `spark.iceberg.index.cache.heap-fraction` | `0.25` | 自动预算的堆占比 |
 | `spark.iceberg.index.cache.mode` | `auto` | 缓存档位 |
-| `spark.iceberg.index.cache.idle-ttl` | `30m` | 条目空闲淘汰 |
+| `spark.iceberg.index.cache.idle-ttl` | `30m` | 整文件条目与 list 块的空闲淘汰 |
 | `spark.iceberg.index.schedule.locality` | `true` | 按持有情况派 task |
 
-查询期参数有三层，优先级从高到低：
+查询期参数分两层，优先级从高到低：
 
-1. **语句里写的**：`CALL … vector_search(..., nprobe => 32, over_sample => 10, filter_mode => 'pre', index => 'name')`；表函数同理（位置参数之后写 `nprobe => 32` 等命名选项）。非法值直接失败，不会回退。
+1. **语句里写的**：`CALL … vector_search(..., nprobe => 32, over_sample => 10, index => 'name')`；表函数同理（位置参数之后写 `nprobe => 32` 等命名选项）。非法值直接失败，不会回退。
 2. **会话配置**：下面表里的 `SET spark.iceberg.index.vector.*`（以及 `spark-submit --conf`）。
-3. **索引定义里的默认值**：目前这三项都不在索引里记录，所以实际是前两层；`nprobe` 的历史索引期选项已退役，会被忽略。
 
-`over_sample`、`filter_mode`、`nprobe`、`index` 都适用这条链；`index` 的语句级写法在过程和表函数里都支持。
+索引定义目前不记录 `nprobe` / `over_sample` 的默认值，所以实际就是上面两层；`nprobe` 的历史索引期选项已退役，会被忽略。`nprobe` 以调用值为准，只写 session 时该值只对 IVF 索引生效；非 IVF 索引上显式传 `nprobe` 是错误。`over_sample`、`index` 也适用这条链；`index` 的语句级写法在过程和表函数里都支持。
+
+`filter_mode` 不在这条链里：它不是调用参数，只有会话配置 `spark.iceberg.index.vector.filter-mode`，而且只作用于 `ORDER BY vec_distance` 改写带过滤的查询（4.6）。
 
 ### 8.2 executor 侧的调优键（有陷阱）
 
@@ -586,7 +596,7 @@ BM25 和向量索引共用 executor 的容量预算、LRU 和状态入口。用�
 
 `metric`、`structure`、`quantizer`、`max-m`、`ef-construction`、`ef-search`、`nlist`、`rabitq-bits`、`max-entries-per-index-file`，以及文本侧的 `k1`、`b`（入参名 `length_norm`）、`min-token-length`、`lowercase`、`stopwords`。
 
-`ef-search` 的值来自索引定义，调整它需要重建。IVF 的 `nprobe` 由 Spark 查询会话设置，历史定义中的值会被忽略。旧脚本须从构建选项移除 `nprobe`，并在查询会话设置原值。
+`ef-search` 的值来自索引定义，调整它需要重建。IVF 的 `nprobe` 是查询期参数（调用参数优先，否则读 session 设置），历史定义中的值会被忽略。旧脚本须从构建选项移除 `nprobe`，并在查询会话设置原值。
 
 ---
 
@@ -616,7 +626,7 @@ BM25 和向量索引共用 executor 的容量预算、LRU 和状态入口。用�
 
 **9.6 中文不可用。** 见 5.1。
 
-**9.7 过程按 `coverage` 决定“给命中还是给活行”。** `vector_search` 的 `coverage` 有四个值，默认 `table`：
+**9.7 过程按 `coverage` 决定“给命中还是给活行”。** 两个过程（`vector_search` / `vector_search_batch`）的 `coverage` 都有四个值，默认 `table`：
 
 | `coverage` | 返回什么 | 被删行怎么处理 |
 |---|---|---|
@@ -629,7 +639,7 @@ BM25 和向量索引共用 executor 的容量预算、LRU 和状态入口。用�
 
 `positions` 与 `index_hits` 的差别只在"要不要行"：`index_hits` 会回表取 `row`（取不到就是 NULL），`positions` 完全不读数据文件，所以分数是索引估计、建索引后被删除的行也会出现——这是它为大批量省掉回表与 JSON 的代价。
 
-**9.8 地址类表函数用索引最新快照**，不按源表快照对齐，删除后的行仍可能返回命中。
+**9.8 地址类表函数固定 `index_hits` 语义，没有 `coverage` 参数。** `vector_index_search` / `vector_index_search_batch` 用索引**最新**快照、不补未覆盖文件、不按源表快照对齐；被删除的行保留为 `row = NULL`，分数是索引估计、顺序是索引自己的顺序。要活行、要 `table`/`indexed`/`positions` 的差别，只能走过程或改写。
 
 **9.9 大索引的跨节点放置。** 装不进单节点缓存的规模（如 100M HNSW），目前只能"装得下多少装多少"，没有分片放置与均衡调度。
 
@@ -637,7 +647,7 @@ BM25 和向量索引共用 executor 的容量预算、LRU 和状态入口。用�
 
 **9.11 构建部分失败仍报成功，是设计而不是缺陷。** `state = SUCCEEDED` 说的是“这次构建跑完并发布了”，不是“每个数据文件都被索引”。默认语义下，某些索引文件构建失败时任务不抛异常、已成功的那部分照常发布，失败组的数据文件由查询时的残差扫描兜住——**结果仍然正确，只是那些文件每次都要扫**。判断完整性看 `index_build_status` 的 `files_failed`，以及 `check_indexes` 的 `uncovered_data_files`（未覆盖数据文件数）与 `suggestion`（会给 `refresh_vector_index` 的补齐语句；漏掉的文件从没被覆盖过，刷新只是补段，成本低）。构建日志里也会有一条 WARN 报出失败文件数。注意“刷新很便宜”只对**补段**成立：如果表里出现了删除或被重写的数据文件，刷新会重建它所在的组，成本按组算，不是按新增文件算。
 
-**9.12 批量过程没有逐块输出。** `CALL … vector_search_batch` 是 Spark 的结果集 API，driver 必须收全结果才能返回；表函数 `FROM vector_index_search_batch(…)` 才逐块产出（driver 峰值是一块）。大批量优先用表函数，或把 `coverage` 设为 `positions`（每行约 30 B，10k×k=10 约 3 MB；带行 JSON 时约 5 GB）。
+**9.12 批量过程没有逐块输出，表函数也不是流式。** `CALL … vector_search_batch` 是 Spark 的结果集 API，driver 必须收全结果才能返回；表函数 `FROM vector_index_search_batch(…)` 按块转换成 `UnsafeRow`、每块 `.coalesce(1)` 成一个分区、最后 `union`，但 driver 在 `union` 执行前仍持有整批的 `UnsafeRow`（峰值 O(整批)，不是 O(一块)），真实收益是每块的 `Row`+JSON 转换后即释放。大批量优先用表函数，或把过程的 `coverage` 设为 `positions`（每行约 30 B；带行 JSON 时约 `20 B/dim`，10k×k=10 的总量按常量推算约 5 GB 量级，未实测）。
 
 **9.13 批量块是串行的，失败不隔离。** 块内任何一条查询失败都会让整块失败并重试整个 stage；块大小由内部预算推导（2560 维、带行的 `table`/`index_hits` 约 9–11 条，`positions` 最多 128），只可用内部 JVM 属性覆盖，不是用户参数。
 
@@ -680,8 +690,8 @@ BM25 和向量索引共用 executor 的容量预算、LRU 和状态入口。用�
 | `check_indexes` | `table` | — |
 | `index_build_status` | `table` | — |
 | `index_cache_status` | — | `refresh` |
-| `vector_search`（过程） | `table, column, query, k` | `index` |
-| `vector_search_batch` | `table, column, k` | `queries, query_table, query_id_column, vector_column, index` |
+| `vector_search`（过程） | `table, column, query, k` | `index, coverage, nprobe, over_sample` |
+| `vector_search_batch` | `table, column, k` | `queries, query_table, query_id_column, vector_column, index, coverage, nprobe, over_sample` |
 | `text_search` | `table, column, query, k` | — |
 | `text_search_batch` | `table, column, queries, k` | — |
 | `load_index` | `table, index` | `retain_for` |
@@ -692,9 +702,9 @@ BM25 和向量索引共用 executor 的容量预算、LRU 和状态入口。用�
 
 | 函数 | 参数 | 返回 |
 |---|---|---|
-| `vector_search` | `table, query_vector, k, vector_column`（位置序）＋ `nprobe` / `over_sample` / `filter_mode` / `index` / `distance_type` / `columns` 命名选项 | 业务行 + `_distance` |
-| `vector_index_search` | `table, column, query(array\<double\>), k`（位置序）＋ 同一组命名选项 | `data_file, pos, score, row` |
-| `vector_index_search_batch` | `table, column, queries(array\<string\>，逗号分隔), k`（位置序）＋ 同一组命名选项 | 同上 + `query_id` |
+| `vector_search` | `table, query_vector, k, vector_column`（位置序）＋ `nprobe` / `over_sample` / `index` / `distance_type` / `columns` 命名选项；没有 `coverage` | 业务行 + `_distance` |
+| `vector_index_search` | `table, column, query(array\<double\>), k`（位置序）＋ 同一组命名选项；没有 `coverage` | `data_file, pos, score, row`（固定 `index_hits` 语义） |
+| `vector_index_search_batch` | `table, column, queries(array\<string\>，逗号分隔), k`（位置序）＋ 同一组命名选项；没有 `coverage` | 同上 + `query_id`（固定 `index_hits` 语义） |
 | `search` | `table, query, search_columns(array\<string\>，恰好 1 列), k` | 业务行 + `_score` |
 | `text_index_search` | `table, column, query(string), k` | `data_file, pos, score, row` |
 

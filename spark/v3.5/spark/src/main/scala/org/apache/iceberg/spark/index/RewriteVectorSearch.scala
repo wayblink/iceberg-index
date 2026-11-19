@@ -157,8 +157,7 @@ case class RewriteVectorSearch(spark: SparkSession) extends Rule[LogicalPlan] {
         arguments.indexArgument,
         batch = false,
         arguments.nprobeArgument,
-        arguments.overSampleArgument,
-        arguments.filterModeArgument) match {
+        arguments.overSampleArgument) match {
       case request =>
         BindVectorSearch.bind(spark, request) match {
           case BoundVectorSearch(context) =>

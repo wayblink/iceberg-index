@@ -37,6 +37,7 @@ import org.apache.iceberg.index.IndexSearchResult;
 import org.apache.iceberg.index.PuffinIndexFileContainer;
 import org.apache.iceberg.relocated.com.google.common.collect.Lists;
 import org.apache.iceberg.relocated.com.google.common.collect.Sets;
+import org.junit.jupiter.api.Assumptions;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
@@ -100,9 +101,18 @@ class TestIvfKernel {
 
   @Test
   void loadAllocatesThePayloadOnce(@TempDir Path tempDir) throws Exception {
-    VectorIndexAdapter ivf = adapterLegacy(VectorIndexDefinition.Metric.L2, 0, 20_000);
+    ThreadMXBean bean =
+        ManagementFactory.getThreadMXBean() instanceof ThreadMXBean allocated ? allocated : null;
+    Assumptions.assumeTrue(
+        bean != null && bean.isThreadAllocatedMemorySupported(),
+        "thread-allocated memory is not available on this JVM");
+
+    // one payload of about a megabyte is enough to see a second copy if there is one, and keeps
+    // the test from building a payload far larger than a load needs
+    int entryCount = 2_000;
+    VectorIndexAdapter ivf = adapterLegacy(VectorIndexDefinition.Metric.L2, 0, entryCount);
     ByteBuffer encoded =
-        ivf.encodeAuxiliaryPayload(entries(VectorIndexDefinition.Metric.L2, 20_000), 1);
+        ivf.encodeAuxiliaryPayload(entries(VectorIndexDefinition.Metric.L2, entryCount), 1);
     byte[] payload = new byte[encoded.remaining()];
     encoded.duplicate().get(payload);
 
@@ -112,26 +122,24 @@ class TestIvfKernel {
             localOutput(file.toFile()),
             List.of(IndexBlob.uncompressed(ivf.auxiliaryBlobType(), payload)));
 
-    ThreadMXBean bean =
-        ManagementFactory.getThreadMXBean() instanceof ThreadMXBean allocated ? allocated : null;
-    if (bean == null || !bean.isThreadAllocatedMemorySupported()) {
-      return;
-    }
-
+    boolean wasEnabled = bean.isThreadAllocatedMemoryEnabled();
     bean.setThreadAllocatedMemoryEnabled(true);
+    try {
+      long threadId = Thread.currentThread().getId();
+      long before = bean.getThreadAllocatedBytes(threadId);
+      byte[] taken =
+          new PuffinIndexFileContainer().read(localInput(file.toFile())).get(0).takePayload();
+      IndexAdapter.PreparedSearch prepared = ivf.prepareAuxiliaryOwned(taken);
+      long allocated = bean.getThreadAllocatedBytes(threadId) - before;
 
-    long threadId = Thread.currentThread().getId();
-    long before = bean.getThreadAllocatedBytes(threadId);
-    byte[] taken =
-        new PuffinIndexFileContainer().read(localInput(file.toFile())).get(0).takePayload();
-    IndexAdapter.PreparedSearch prepared = ivf.prepareAuxiliaryOwned(taken);
-    long allocated = bean.getThreadAllocatedBytes(threadId) - before;
-
-    assertThat(prepared).isNotNull();
-    assertThat(allocated)
-        .as("a load keeps one payload array instead of copying it twice")
-        .isGreaterThan(0L)
-        .isLessThan(2L * payload.length);
+      assertThat(prepared).isNotNull();
+      assertThat(allocated)
+          .as("a load keeps one payload array instead of copying it twice")
+          .isGreaterThan(0L)
+          .isLessThan(2L * payload.length);
+    } finally {
+      bean.setThreadAllocatedMemoryEnabled(wasEnabled);
+    }
   }
 
   private static Object field(Object target, String name) throws Exception {

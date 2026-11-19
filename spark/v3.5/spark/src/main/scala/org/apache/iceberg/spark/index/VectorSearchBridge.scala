@@ -42,8 +42,9 @@ import scala.collection.JavaConverters._
 import scala.collection.mutable
 
 /**
- * The shared entry point for a vector search whose result keeps the index's own hits: {@code CALL
- * vector_search} and the vector table functions.
+ * The shared entry point for a vector search that keeps the index's own hits: {@code CALL
+ * vector_search} and the vector table functions. A table function always answers with this contract;
+ * a procedure can ask for another one through its {@code coverage} argument.
  *
  * <p>Planning a request does what the ordinary SQL path does: it binds the table and the index,
  * freezes both snapshots, and decides only the parameters the caller left unset. Execution then
@@ -131,26 +132,27 @@ private[spark] object VectorSearchBridge {
   }
 
   /**
+   * The probe count the encoder is given for this search, or null when it reads the session's own.
+   *
+   * <p>Only a count the call named is passed explicitly: a configured count is the session setting
+   * the encoder reads, which is what keeps an index that does not probe lists ignoring it. The
+   * parameters are decided once per call, so every query of the call is encoded with the same count.
+   * A query planned by the rewrite names none, so it keeps the session's setting.
+   */
+  private[spark] def nprobeOf(context: VectorSearchContext): Integer = {
+    if (context.parameters == null || !context.parameters.nprobeLocked) {
+      null
+    } else {
+      Integer.valueOf(Math.toIntExact(context.parameters.nprobe))
+    }
+  }
+
+  /**
    * How many queries one shared execution answers.
    *
    * <p>Estimates the broadcast, driver and shuffle costs of a block. At least one query is
    * processed at a time, even if its estimated cost exceeds one of the budgets.
    */
-  /**
-   * The probe count the call resolved, or null when it named none and the encoder reads the
-   * session's.
-   *
-   * <p>The parameters are decided once per call, so the encoding of every query of the call uses
-   * the same count. A query planned by the rewrite names none, so it keeps the session's setting.
-   */
-  private def nprobeOf(context: VectorSearchContext): Integer = {
-    if (context.parameters == null || context.parameters.nprobe <= 0L) {
-      null
-    } else {
-      Integer.valueOf(context.parameters.nprobe.toInt)
-    }
-  }
-
   private def queriesPerBlock(context: VectorSearchContext): Int = {
     val configured = System.getProperty(QueriesPerBlockProperty, null)
     if (configured != null && configured.trim.nonEmpty) {
@@ -236,7 +238,7 @@ private[spark] object VectorSearchBridge {
       k: Int,
       batch: Boolean,
       coverage: String): VectorBindingResult =
-    plan(spark, table, column, indexArgument, queries, k, batch, coverage, null, null, null)
+    plan(spark, table, column, indexArgument, queries, k, batch, coverage, null, null)
 
   def plan(
       spark: SparkSession,
@@ -248,8 +250,7 @@ private[spark] object VectorSearchBridge {
       batch: Boolean,
       coverage: String,
       nprobeArgument: String,
-      overSampleArgument: String = null,
-      filterModeArgument: String = null): VectorBindingResult = {
+      overSampleArgument: String = null): VectorBindingResult = {
     val contract = VectorResultContract.forCoverage(coverage)
     val request = VectorSearchRequest.forTable(
       table,
@@ -263,8 +264,7 @@ private[spark] object VectorSearchBridge {
       indexArgument,
       batch,
       nprobeArgument,
-      overSampleArgument,
-      filterModeArgument)
+      overSampleArgument)
     BindVectorSearch.bind(spark, request) match {
       case BoundVectorSearch(context) =>
         // a request that asks for nothing is answered with nothing: its parameters are not judged
@@ -319,9 +319,10 @@ private[spark] object VectorSearchBridge {
    * The index's own hits of a request, one block at a time.
    *
    * <p>Each block is searched, resolved and serialised when the iterator's next element is asked
-   * for, so a caller that consumes the blocks as they arrive holds one block's rows rather than the
-   * whole batch's. The procedure collects them because its answer is a result set; the table
-   * function's operator turns each block into a partition instead.
+   * for, so the iterator holds one block's rows rather than the whole batch's. That is a bound on
+   * the iterator, not on its caller: a caller may retain every block it pulls, and the table
+   * function's operator does, so the rows of the batch are what its driver holds. The procedure
+   * collects the blocks because its answer is a result set.
    */
   private[spark] def hitBlocks(
       spark: SparkSession,
@@ -969,6 +970,10 @@ private[spark] object VectorSearchBridge {
  * The request a table function returns: the names, the vectors and the contract form, and nothing
  * that has been bound or read yet.
  *
+ * <p>A table function has no coverage argument, so its request is planned with the index's own hits
+ * contract: what it returns is what the index ranked, resolved against the table snapshot the
+ * execution read.
+ *
  * <p>It is a serializable description rather than a frozen plan, because a physical node travels to
  * the driver that runs it and a snapshot, a manifest list or a scan task is not what should travel
  * with it. Binding still happens once, at the start of execution, and fixes both snapshots before
@@ -982,8 +987,7 @@ private[spark] case class VectorSearchHitsRequest(
     topK: Int,
     batch: Boolean,
     nprobeArgument: String,
-    overSampleArgument: String,
-    filterModeArgument: String)(
+    overSampleArgument: String)(
     override val output: Seq[org.apache.spark.sql.catalyst.expressions.Attribute])
     extends LeafNode {
 
@@ -1014,7 +1018,7 @@ private[spark] case class VectorSearchHitsRequest(
   }
 
   override def simpleString(maxFields: Int): String =
-    s"VectorSearchHits[contract=INDEX_HITS (table functions answer for the whole table), " +
+    s"VectorSearchHits[contract=INDEX_HITS, " +
       s"batch=$batch, table=$tableName, column=$column, k=$topK, queries=${queries.size}, " +
       s"driverMaterialization=true]"
 }

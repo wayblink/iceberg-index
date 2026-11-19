@@ -174,6 +174,16 @@ public final class VectorIndexAdapter implements IndexAdapter, java.io.Serializa
       return 0L;
     }
 
+    /**
+     * How many list blocks this search consumed, whether the cache held them or they were read.
+     *
+     * <p>One list block is consumed per list the search visits; a list whose block the cache
+     * already held counts, because the search consumed it instead of reading it from storage.
+     */
+    default long listBlocksRead() {
+      return 0L;
+    }
+
     /** What a shared block cache did for this search, or empty when no cache was given. */
     default ListBlockCache.Stats blockCacheStats() {
       return ListBlockCache.Stats.EMPTY;
@@ -495,19 +505,18 @@ public final class VectorIndexAdapter implements IndexAdapter, java.io.Serializa
    * not support positional reads. The file length locates the tail, so the read is a seek and a
    * full read rather than an unsupported operation.
    *
-   * @return the number of bytes read, which is {@code length}
+   * @return the number of bytes read, which is {@code length} clamped to the file length
    */
   static int readTail(
       SeekableInputStream stream, long fileLength, byte[] buffer, int offset, int length)
       throws IOException {
-    Preconditions.checkArgument(
-        length >= 0 && length <= fileLength,
-        "Invalid tail read of %s bytes from a file of %s",
-        length,
-        fileLength);
-    stream.seek(fileLength - length);
-    IOUtil.readFully(stream, buffer, offset, length);
-    return length;
+    Preconditions.checkArgument(length >= 0, "Invalid tail read of %s bytes", length);
+    // a tail read of more bytes than the file holds reads the whole file, which is what the
+    // RangeReadable contract returns rather than rejecting
+    int toRead = (int) Math.min((long) length, fileLength);
+    stream.seek(fileLength - toRead);
+    IOUtil.readFully(stream, buffer, offset, toRead);
+    return toRead;
   }
 
   /** A seekable stream that reports what it reads to the input file it came from. */

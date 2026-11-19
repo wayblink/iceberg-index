@@ -153,6 +153,21 @@ class TestIndexCachePlugin {
   }
 
   @Test
+  void aRemovalBeforeTheFirstReportDropsTheLateReportOfThatIncarnationOnly() {
+    // Spark can remove an executor before the driver has seen any report from it, so the removed
+    // incarnation is unknown: the first report that follows may be the one that was in flight.
+    control.executorRemoved(EXECUTOR);
+    control.receive(report(1));
+    assertThat(control.nodeReports()).as("the late first report is ignored").isEmpty();
+
+    // the incarnation after the dropped one is a new executor and is accepted again
+    control.receive(report(2, INCARNATION + "-2"));
+    assertThat(control.nodeReports())
+        .singleElement()
+        .satisfies(node -> assertThat(node.incarnation()).isEqualTo(INCARNATION + "-2"));
+  }
+
+  @Test
   void driverAppliesAcknowledgements() {
     control.receive(report(1));
     String plan = coordinator.acceptLoad(target("f1"), IndexResidencyPolicy.parse("forever"), now);

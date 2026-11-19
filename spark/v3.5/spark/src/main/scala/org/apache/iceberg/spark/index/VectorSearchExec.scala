@@ -111,8 +111,12 @@ private[spark] object VectorSearchExec {
         null
       }
     val adapter = new VectorIndexAdapter(inputs.definition)
+    // a probe count the call named is the one the encoder is given, so a rewritten call honours it;
+    // a query that named none keeps the session's setting, which is what lets an index that does not
+    // probe lists ignore it
+    val nprobe = VectorSearchBridge.nprobeOf(context)
     val payloads =
-      queries.map(query => VectorIndexSearch.encodeQuery(spark, adapter, query)).asJava
+      queries.map(query => VectorIndexSearch.encodeQuery(spark, adapter, query, nprobe)).asJava
     val opening =
       if (context.budget == null) {
         VectorCandidateBudget.derive(k, context.parameters.overSample, inputs.entryUpperBound)

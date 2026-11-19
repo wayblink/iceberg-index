@@ -478,6 +478,10 @@ public final class DistributedIndexSearch {
     // identifies this search, so its tasks report this executor's cache once instead of once each
     String queryRun = java.util.UUID.randomUUID().toString();
     boolean rangeRead = rangeReadEnabled(spark, adapter);
+    String indexUuid = metadata.indexUuid();
+    if (rangeRead && cacheRef.getValue().caching()) {
+      IndexCacheControl.recordRangeAccess(spark, indexUuid);
+    }
     RowCounters tally = counters;
 
     int topK = query.topK();
@@ -539,7 +543,8 @@ public final class DistributedIndexSearch {
                             cacheConfig,
                             cacheKey,
                             rangeRead,
-                            indexFile.fileLength());
+                            indexFile.fileLength(),
+                            indexUuid);
                     long readNanos = System.nanoTime() - readStart;
                     if (stageTally != null) {
                       stageTally.indexReadNanos += readNanos;
@@ -560,7 +565,6 @@ public final class DistributedIndexSearch {
                               open.footerRequests()
                                   + open.descriptionRequests()
                                   + open.listRequests();
-                          stageTally.listBlocksRead += open.listRequests();
                         }
                       }
                     }
@@ -616,6 +620,7 @@ public final class DistributedIndexSearch {
                     }
 
                     if (stageTally != null && opened.rangeSearch() != null) {
+                      stageTally.listBlocksRead += opened.rangeSearch().listBlocksRead();
                       stageTally.wholeListAreaReads += opened.rangeSearch().wholeListAreaReads();
                       ListBlockCache.Stats blocks = opened.blockCacheStats();
                       stageTally.blockCacheHits += blocks.hits();
@@ -764,7 +769,6 @@ public final class DistributedIndexSearch {
           stageTally.probeScoreNanos += Math.max(0L, searchNanos - listNanos);
           stageTally.rangeBytesRead += Math.max(0L, listBytes);
           stageTally.rangeReadRequests += Math.max(0L, listRequests);
-          stageTally.listBlocksRead += Math.max(0L, listRequests);
         }
 
         // a kernel that returned the whole window may hold more; one that returned less has nothing
@@ -781,6 +785,9 @@ public final class DistributedIndexSearch {
         unresolved += read.unresolved;
         outside += read.outsideSnapshot;
         filesRead.addAll(read.dataFiles);
+        // admitting the fetched rows and judging their columns builds the answer rather than
+        // reading it back, so it is charged to the merge stage
+        long admissionStart = System.nanoTime();
         for (FetchedRow row : read.rows) {
           if (candidates != null && !candidates.contains(row.dataFile, row.position)) {
             // a hit the search was not allowed to score: it is not part of the answer this task may
@@ -797,6 +804,10 @@ public final class DistributedIndexSearch {
           found.putIfAbsent(
               row.dataFile + "#" + row.position,
               new FetchedRow(row.dataFile, row.position, plan.narrow(row.row), row.score));
+        }
+
+        if (stageTally != null) {
+          stageTally.mergeNanos += System.nanoTime() - admissionStart;
         }
       }
 
@@ -1206,6 +1217,10 @@ public final class DistributedIndexSearch {
     // identifies this search, so its tasks report this executor's cache once instead of once each
     String queryRun = java.util.UUID.randomUUID().toString();
     boolean rangeRead = rangeReadEnabled(spark, adapter);
+    String indexUuid = metadata.indexUuid();
+    if (rangeRead && cacheRef.getValue().caching()) {
+      IndexCacheControl.recordRangeAccess(spark, indexUuid);
+    }
 
     // the limit is captured as a primitive: the query itself is not serializable. One more than the
     // query asks for is kept, because that is what says whether there is another round to ask for.
@@ -1237,7 +1252,8 @@ public final class DistributedIndexSearch {
                                 cacheConfig,
                                 cacheKey,
                                 rangeRead,
-                                indexFile.fileLength());
+                                indexFile.fileLength(),
+                                indexUuid);
                         long readNanos = System.nanoTime() - readStart;
                         long searchStart = System.nanoTime();
                         try (opened) {
@@ -1436,6 +1452,10 @@ public final class DistributedIndexSearch {
     // identifies this search, so its tasks report this executor's cache once instead of once each
     String queryRun = java.util.UUID.randomUUID().toString();
     boolean rangeRead = rangeReadEnabled(spark, adapter);
+    String indexUuid = metadata.indexUuid();
+    if (rangeRead && cacheRef.getValue().caching()) {
+      IndexCacheControl.recordRangeAccess(spark, indexUuid);
+    }
 
     // one more than the widest query asks for is kept per query, because that is what says whether
     // there is another round to ask for
@@ -1465,7 +1485,8 @@ public final class DistributedIndexSearch {
                                 cacheConfig,
                                 cacheKey,
                                 rangeRead,
-                                indexFile.fileLength());
+                                indexFile.fileLength(),
+                                indexUuid);
                         long readNanos = System.nanoTime() - readStart;
 
                         long searchStart = System.nanoTime();
@@ -2262,6 +2283,18 @@ public final class DistributedIndexSearch {
       String readerKey,
       boolean rangeRead,
       long knownLength) {
+    return openSearch(io, location, adapter, config, readerKey, rangeRead, knownLength, "");
+  }
+
+  private static OpenedSearch openSearch(
+      FileIO io,
+      String location,
+      IndexAdapter adapter,
+      ExecutorIndexCache.Config config,
+      String readerKey,
+      boolean rangeRead,
+      long knownLength,
+      String indexUuid) {
     ExecutorIndexCache cache = ExecutorIndexCache.get();
     String key = cacheKey(config.owner(), readerKey, location);
     // the switch is read by the load side and by the query side or by neither: a resident copy
@@ -2281,7 +2314,7 @@ public final class DistributedIndexSearch {
       // a range search reads lists rather than the whole file, so the blocks it read are what a
       // later query of the same file can reuse; the switch and budget that govern whole files
       // govern these blocks
-      ListBlockCache blocks = config.enabled() ? cache.listBlocks(config) : null;
+      ListBlockCache blocks = config.enabled() ? cache.listBlocks(config, indexUuid) : null;
       VectorIndexAdapter.RangeSearch search =
           vector.prepareRange(inputFile(io, location, knownLength), knownLength, blocks);
       if (search != null) {

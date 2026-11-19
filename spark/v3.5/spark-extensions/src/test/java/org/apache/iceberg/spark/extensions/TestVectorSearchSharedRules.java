@@ -216,10 +216,7 @@ class TestVectorSearchSharedRules {
 
       // the settings a call names are accepted, and the answer stays the same
       assertThat(spark.sql(call + ")").collectAsList())
-          .hasSameSizeAs(
-              spark
-                  .sql(call + ", nprobe => 2, over_sample => 0, filter_mode => 'pre')")
-                  .collectAsList());
+          .hasSameSizeAs(spark.sql(call + ", nprobe => 2, over_sample => 0)").collectAsList());
     } finally {
       spark.conf().unset("spark.iceberg.index.vector.ivf.nprobe");
     }
@@ -248,18 +245,16 @@ class TestVectorSearchSharedRules {
       // though the session names a usable one
       assertThatThrownBy(() -> spark.sql(call + ", nprobe => 0)"))
           .hasMessageContaining("spark.iceberg.index.vector.ivf.nprobe");
-      assertThatThrownBy(() -> spark.sql(call + ", filter_mode => 'sometimes')"))
-          .hasMessageContaining("spark.iceberg.index.vector.filter-mode");
+      // the filter link is a session setting of the rewrite, not an argument a call can name
+      assertThatThrownBy(() -> spark.sql(call + ", filter_mode => 'pre'"))
+          .as("the procedure does not take a filter link")
+          .isInstanceOf(org.apache.spark.sql.AnalysisException.class);
       assertThatThrownBy(() -> spark.sql(call + ", over_sample => -1)"))
           .hasMessageContaining("spark.iceberg.index.vector.over-sample");
 
       // a count the call names is accepted while the session disagrees
       assertThat(spark.sql(call + ", nprobe => 1)").collectAsList()).isNotEmpty();
-      assertThat(
-              spark
-                  .sql(call + ", nprobe => 2, over_sample => 0, filter_mode => 'pre')")
-                  .collectAsList())
-          .isNotEmpty();
+      assertThat(spark.sql(call + ", nprobe => 2, over_sample => 0)").collectAsList()).isNotEmpty();
     } finally {
       spark.conf().unset("spark.iceberg.index.vector.ivf.nprobe");
     }

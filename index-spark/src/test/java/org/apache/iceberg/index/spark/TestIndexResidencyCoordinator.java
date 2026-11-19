@@ -419,6 +419,22 @@ class TestIndexResidencyCoordinator {
   }
 
   @Test
+  void offloadReachesExecutorsThatOnlyCachedQueryBlocks() {
+    coordinator.report(node("a", "a-1", 1, 100));
+    coordinator.recordRangeAccess("A");
+
+    String offload = coordinator.acceptOffload("A", clock.now());
+    assertThat(coordinator.result(offload).status()).isEqualTo(IndexCacheProtocol.Status.RELEASING);
+    IndexCacheProtocol.Command release =
+        coordinator.report(node("a", "a-1", 2, 100)).commands().get(0);
+    assertThat(release.indexUuid()).isEqualTo("A");
+    assertThat(release.mode()).isEqualTo(IndexCacheProtocol.OFFLOAD_MODE);
+
+    coordinator.ack(ack(offload, "a", "a-1", release, IndexCacheProtocol.AckStatus.RELEASED));
+    assertThat(coordinator.result(offload).status()).isEqualTo(IndexCacheProtocol.Status.OFFLOADED);
+  }
+
+  @Test
   void offloadFencesInFlightLoadSoALateAckCannotPublish() {
     coordinator.report(node("a", "a-1", 1, 100));
     String load =

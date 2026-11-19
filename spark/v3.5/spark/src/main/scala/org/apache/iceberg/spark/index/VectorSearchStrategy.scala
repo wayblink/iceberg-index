@@ -70,21 +70,24 @@ private[spark] case class VectorSearchHitsRequestExec(
       } else {
         org.apache.iceberg.index.spark.IndexSearch.SINGLE_RESULT_SCHEMA
       }
-    // the search answers a block at a time, so this converts each block to one partition as it
-    // arrives and never holds the whole batch's rows: a 10,000-query batch of row JSON would
-    // otherwise put gigabytes on the driver before anything downstream saw a row
+    // the search answers a block at a time, and each block is converted as it arrives so the block's
+    // rows and their JSON are released once they are UnsafeRows. The driver does not stream the
+    // batch: the union below holds every block's UnsafeRows until it executes, so the peak is the
+    // batch and not one block. What the block-at-a-time conversion saves is each block's row
+    // wrappers and JSON strings, which are dropped as soon as the block has been converted.
     val sc = spark.sparkContext
     val partitions = mutable.ArrayBuffer.empty[RDD[InternalRow]]
     VectorSearchBridge.hitBlocks(spark, plan.context).foreach { rows =>
       if (rows.nonEmpty) {
         // a partition has to be made of the rows Spark can serialise, which the local frame gives
-        // UnsafeRow copies for; it starts one small job per block, which is the cost of not holding
-        // the whole batch's rows on the driver
+        // UnsafeRow copies for; coalescing keeps one block one partition, which the local scan would
+        // otherwise slice into one per default parallelism
         partitions += spark
           .createDataFrame(rows.asJava, schema)
           .queryExecution
           .toRdd
           .map(row => row.copy())
+          .coalesce(1)
       }
     }
 

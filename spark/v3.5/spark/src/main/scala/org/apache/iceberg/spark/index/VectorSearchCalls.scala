@@ -46,7 +46,7 @@ private[spark] object VectorSearchCalls {
       k: Int,
       batch: Boolean,
       coverage: String): VectorSearchHitsPlan =
-    plan(spark, table, column, indexArgument, queries, k, batch, coverage, null, null, null)
+    plan(spark, table, column, indexArgument, queries, k, batch, coverage, null, null)
 
   def plan(
       spark: SparkSession,
@@ -58,8 +58,7 @@ private[spark] object VectorSearchCalls {
       batch: Boolean,
       coverage: String,
       nprobeArgument: String,
-      overSampleArgument: String,
-      filterModeArgument: String): VectorSearchHitsPlan = {
+      overSampleArgument: String): VectorSearchHitsPlan = {
     VectorSearchBridge.plan(
       spark,
       table,
@@ -70,8 +69,7 @@ private[spark] object VectorSearchCalls {
       batch,
       coverage,
       nprobeArgument,
-      overSampleArgument,
-      filterModeArgument) match {
+      overSampleArgument) match {
       case BoundVectorSearch(context) => VectorSearchHitsPlan(context, batch)
       case NoApplicableVectorIndex =>
         throw new IllegalArgumentException(
@@ -98,8 +96,7 @@ private[spark] object VectorSearchCalls {
       k: Int,
       batch: Boolean,
       nprobeArgument: String = null,
-      overSampleArgument: String = null,
-      filterModeArgument: String = null): LogicalPlan = {
+      overSampleArgument: String = null): LogicalPlan = {
     val copied = queries.asScala.map(query => query.clone()).toSeq
     // the output attributes are created once, here, so a copy the optimizer makes keeps the same
     // expression ids and the callers of the function still refer to them
@@ -121,8 +118,7 @@ private[spark] object VectorSearchCalls {
       k,
       batch,
       nprobeArgument,
-      overSampleArgument,
-      filterModeArgument)(attributes)
+      overSampleArgument)(attributes)
   }
 
   /** Searches a request the caller already planned. */
@@ -140,8 +136,7 @@ private[spark] object VectorSearchCalls {
       batch: Boolean,
       coverage: String,
       nprobeArgument: String = null,
-      overSampleArgument: String = null,
-      filterModeArgument: String = null): JList[Row] =
+      overSampleArgument: String = null): JList[Row] =
     search(
       plan(
         spark,
@@ -153,8 +148,7 @@ private[spark] object VectorSearchCalls {
         batch,
         coverage,
         nprobeArgument,
-        overSampleArgument,
-        filterModeArgument),
+        overSampleArgument),
       spark)
 
   /**
@@ -162,30 +156,22 @@ private[spark] object VectorSearchCalls {
    *
    * <p>This is the table function's planning step: the bound context is what its operator hands to
    * the per-block execution, so the search starts when the plan is executed and one block at a time.
+   *
+   * <p>The request is planned as an index-hit search. A table function has no coverage argument, so
+   * what it answers with is what the index ranked: a hit whose row was removed is kept with a null
+   * row and the files the index does not cover are not scanned. The vectors are already the request's
+   * own copies, and the request they are handed to copies them again at its boundary.
    */
-  def planRequested(spark: SparkSession, request: VectorSearchHitsRequest): VectorSearchHitsPlan = {
-    val queries = new java.util.ArrayList[Array[Float]](request.queries.size)
-    request.queries.foreach(query => queries.add(query.clone()))
+  def planRequested(spark: SparkSession, request: VectorSearchHitsRequest): VectorSearchHitsPlan =
     plan(
       spark,
       Spark3Util.loadIcebergTable(spark, request.tableName),
       request.column,
       request.indexArgument,
-      queries,
+      request.queries.asJava,
       request.topK,
       request.batch,
-      "table",
+      "index_hits",
       request.nprobeArgument,
-      request.overSampleArgument,
-      request.filterModeArgument)
-  }
-
-  /**
-   * Loads the table of a request and searches it; the table function's execution path.
-   *
-   * <p>A table function has no coverage parameter, so it answers for the whole table. Only a caller
-   * that names the mode through a procedure can ask for the index-only answer.
-   */
-  def searchRequested(spark: SparkSession, request: VectorSearchHitsRequest): JList[Row] =
-    search(planRequested(spark, request), spark)
+      request.overSampleArgument)
 }

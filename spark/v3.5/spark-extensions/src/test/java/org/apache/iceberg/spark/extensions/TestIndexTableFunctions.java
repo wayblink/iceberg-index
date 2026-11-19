@@ -91,11 +91,13 @@ class TestIndexTableFunctions {
 
   @Test
   public void vectorIndexSearchMatchesTheProcedure() {
+    // the address function has no coverage argument, so it answers with the index's own hits, which
+    // is the mode a procedure has to name
     List<Row> fromProcedure =
         spark
             .sql(
                 "CALL local.system.vector_search(table => 'db.docs', column => 'embedding', "
-                    + "query => array(0.95d, 0.05d), k => 3)")
+                    + "query => array(0.95d, 0.05d), k => 3, coverage => 'index_hits')")
             .collectAsList();
 
     List<Row> fromFunction =
@@ -114,7 +116,7 @@ class TestIndexTableFunctions {
         spark
             .sql(
                 "CALL local.system.vector_search_batch(table => 'db.docs', column => 'embedding', "
-                    + "queries => array('0.95,0.05', '0.1,0.9'), k => 2)")
+                    + "queries => array('0.95,0.05', '0.1,0.9'), k => 2, coverage => 'index_hits')")
             .collectAsList();
 
     List<Row> fromFunction =

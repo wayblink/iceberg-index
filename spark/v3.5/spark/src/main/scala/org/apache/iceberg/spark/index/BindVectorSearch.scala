@@ -74,8 +74,7 @@ private[spark] object BindVectorSearch {
         submit,
         input.indexArgument,
         input.nprobeArgument,
-        input.overSampleArgument,
-        input.filterModeArgument)
+        input.overSampleArgument)
     val metadata = if (raw.indexName != null) {
       require(
         raw.indexName.value != null && raw.indexName.value.trim.nonEmpty,
@@ -91,11 +90,20 @@ private[spark] object BindVectorSearch {
       }
       indexes.get(0)
     }
-    val indexSnapshot = if (input.contract == VectorResultContract.IndexHits) {
-      metadata.latestSnapshot()
-    } else {
-      snapshotAtOrBefore(frozen, snapshot, metadata)
-    }
+    // the two index views answer with what the index itself holds, so they read its latest snapshot:
+    // a hit of a row that was deleted after the build is still one of the index's hits, and a caller
+    // who reindexed the table does not have to read an older index to see what it now ranks. A
+    // coverage mode answers for a table snapshot, so it reads the index snapshot written for that
+    // snapshot or one of its ancestors.
+    val indexView =
+      input.contract == VectorResultContract.IndexHits ||
+        input.contract == VectorResultContract.IndexPositions
+    val indexSnapshot =
+      if (indexView) {
+        metadata.latestSnapshot()
+      } else {
+        snapshotAtOrBefore(frozen, snapshot, metadata)
+      }
     if (indexSnapshot == null) {
       return NoApplicableVectorIndex
     }

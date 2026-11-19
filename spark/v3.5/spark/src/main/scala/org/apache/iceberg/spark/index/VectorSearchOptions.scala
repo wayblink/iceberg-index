@@ -34,6 +34,9 @@ import org.apache.spark.sql.catalyst.plans.logical.UnaryNode
  * <p>Each field is the argument as the call wrote it, or null when the call named none. They are
  * parsed where every other layer of the same setting is parsed, so a value the call wrote and a
  * value the session set go through one decision.
+ *
+ * <p>The filter link is not one of them: it decides how a query's own filter meets the search, so it
+ * stays a session setting of the rewrite rather than an argument a call can name.
  */
 private[spark] case class VectorSearchOptions(arguments: VectorSearchArguments, child: LogicalPlan)
     extends UnaryNode {
@@ -48,11 +51,10 @@ private[spark] case class VectorSearchOptions(arguments: VectorSearchArguments, 
 private[spark] case class VectorSearchArguments(
     nprobeArgument: String,
     overSampleArgument: String,
-    filterModeArgument: String,
     indexArgument: String)
 
 private[spark] object VectorSearchArguments {
 
   /** A query that names none of the settings, which is a query the rewrite planned. */
-  val none: VectorSearchArguments = VectorSearchArguments(null, null, null, null)
+  val none: VectorSearchArguments = VectorSearchArguments(null, null, null)
 }

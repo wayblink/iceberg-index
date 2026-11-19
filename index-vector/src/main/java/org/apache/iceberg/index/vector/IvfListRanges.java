@@ -52,9 +52,7 @@ final class IvfListRanges implements AutoCloseable {
   private final LinkedHashMap<Integer, byte[]> lru = new LinkedHashMap<>(16, 0.75f, true);
   private int cachedBytes;
   private int wholeListAreaReads;
-  private long blockHits;
-  private long blockMisses;
-  private long blockLoads;
+  private long listsRead;
   private byte[] wholeLists;
 
   IvfListRanges(IvfRangeInput input, int[] starts) {
@@ -90,7 +88,7 @@ final class IvfListRanges implements AutoCloseable {
       int start = starts[list];
       int end = endOf(list);
       selectedBytes += end - start;
-      if ((scored != null && scored[list]) || find(start, end) != null) {
+      if ((scored != null && scored[list]) || find(start, end) != null || resident(start, end)) {
         continue;
       }
 
@@ -114,14 +112,15 @@ final class IvfListRanges implements AutoCloseable {
     }
 
     // Reuse the loaded metadata when a dense probe can read the list area in one request.
-    // During expansion, require substantial remaining I/O before re-reading scored ranges.
+    // During expansion, require substantial remaining I/O before re-reading scored ranges. A probe
+    // whose lists the shared cache already holds reads no storage, so there is nothing to widen.
     int listAreaBytes = input.length() - starts[0];
     boolean mostlyUnread = 4 * missingBytes >= 3L * listAreaBytes;
     boolean scatteredExpansion =
         4 * selectedBytes >= 3L * listAreaBytes
             && 2 * missingBytes >= listAreaBytes
             && planned.size() >= MIN_SCATTERED_RANGES;
-    if (mostlyUnread || scatteredExpansion) {
+    if (missingBytes > 0 && (mostlyUnread || scatteredExpansion)) {
       planned.clear();
       lru.clear();
       cachedByOffset.clear();
@@ -132,6 +131,8 @@ final class IvfListRanges implements AutoCloseable {
   }
 
   VectorPayloadReader read(int list) {
+    // every list the searcher consumes is one block, whether the shared cache held it or not
+    listsRead++;
     int start = starts[list];
     int end = endOf(list);
     if (wholeLists != null) {
@@ -149,11 +150,8 @@ final class IvfListRanges implements AutoCloseable {
     if (blocks != null) {
       byte[] shared = blocks.get(input.location(), start, end - start);
       if (shared != null) {
-        blockHits++;
         return window(shared, start, start, end);
       }
-
-      blockMisses++;
     }
 
     Map.Entry<Integer, Integer> plan = planned.floorEntry(start);
@@ -207,7 +205,6 @@ final class IvfListRanges implements AutoCloseable {
                 ? bytes
                 : java.util.Arrays.copyOfRange(bytes, from, from + length);
         blocks.put(input.location(), start, block);
-        blockLoads++;
       }
 
       list++;
@@ -217,6 +214,11 @@ final class IvfListRanges implements AutoCloseable {
   private int listAtOrAfter(int offset) {
     int found = java.util.Arrays.binarySearch(starts, offset);
     return found >= 0 ? found : -(found + 1);
+  }
+
+  /** Whether the shared cache holds this list, without counting a lookup for the searcher. */
+  private boolean resident(int start, int end) {
+    return blocks != null && blocks.contains(input.location(), start, end - start);
   }
 
   private Map.Entry<Integer, byte[]> find(int start, int end) {
@@ -248,16 +250,18 @@ final class IvfListRanges implements AutoCloseable {
   }
 
   /**
-   * What the shared cache did for this searcher, and what it holds, or empty when there is none.
+   * How many list blocks this searcher consumed, which is one per list it read.
+   *
+   * <p>A block the shared cache held counts: the searcher consumed it whether it came from memory
+   * or from storage.
    */
-  ListBlockCache.Stats blockStats() {
-    if (blocks == null) {
-      return ListBlockCache.Stats.EMPTY;
-    }
+  long listsRead() {
+    return listsRead;
+  }
 
-    ListBlockCache.Stats cache = blocks.stats();
-    return new ListBlockCache.Stats(
-        blockHits, blockMisses, blockLoads, cache.evictions(), cache.bytes());
+  /** What the shared cache did for this searcher, or empty when there is none. */
+  ListBlockCache.Stats blockStats() {
+    return blocks == null ? ListBlockCache.Stats.EMPTY : blocks.stats();
   }
 
   @Override

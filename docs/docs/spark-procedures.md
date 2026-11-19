@@ -1254,18 +1254,19 @@ ascending: smaller is closer, whatever the metric.
 | `query`       | ✔️        | array<double> | Query vector (same dimension)                |
 | `k`           | ✔️        | int           | Number of results to return                  |
 | `coverage`    |           | string        | `table` (default), `indexed`, `index_hits` or `positions` |
-| `nprobe`      |           | int           | IVF probe count for this call; overrides `spark.iceberg.index.vector.ivf.nprobe` |
+| `nprobe`      |           | int           | IVF probe count for this call; wins over `spark.iceberg.index.vector.ivf.nprobe`. A call-named value on a non-IVF index is an error. |
 | `over_sample` |           | int           | Candidate multiplier for this call; overrides `spark.iceberg.index.vector.over-sample` |
-| `filter_mode` |           | string        | `pre` or `post`; overrides `spark.iceberg.index.vector.filter-mode` |
 
-A query setting is read from the call first, then from the session, then from the value the index
-definition records (none of these three records one today, so the session is the default):
+A query setting is read from the call first, then from the session:
 
 | Layer | Example | Notes |
 |---|---|---|
 | the call's argument | `nprobe => 64` | what the query asked for; it wins, and an invalid value fails the call rather than falling back |
-| session configuration | `SET spark.iceberg.index.vector.ivf.nprobe=32` | the default for every query of the session |
-| index definition | — | a default recorded when the index was built; `nprobe` is not recorded, it is a query setting |
+| session configuration | `SET spark.iceberg.index.vector.ivf.nprobe=32` | the default for every query of the session; a session `nprobe` is used by IVF indexes only, and a value named on the call against a non-IVF index is an error |
+
+`filter_mode` is not a call argument. The session setting `spark.iceberg.index.vector.filter-mode`
+governs the `ORDER BY vec_distance(...)` rewrite when a filter is carried into the search; it is
+described with the rewrite, below.
 
 `coverage` decides what is searched when the index is behind the table:
 
@@ -1276,11 +1277,12 @@ definition records (none of these three records one today, so the session is the
 | `index_hits` | The index's own hits, as the index produced them (diagnostic view)                 | No                       |
 | `positions`  | The same hits as `index_hits` with the `row` left null: nothing is read at the data files and no hit is judged against the snapshot | No |
 
-In every mode a hit is resolved against the queried snapshot first: a hit whose data file the
-snapshot no longer has, or whose position no longer holds a live row, is not an answer. `table` and
-`indexed` drop such a hit and keep searching; `index_hits` reports it with a null `row`, because what
-it reports is the index, not a result. `score` is the distance the query asks for, so it is the number
-`ORDER BY vec_distance(...)` sorts by; in `index_hits` it is the index's own estimate.
+In `table` and `indexed`, a hit is resolved against the queried snapshot first: a hit whose data file
+the snapshot no longer has, or whose position no longer holds a live row, is not an answer, so such a
+hit is dropped and the search continues. `index_hits` reports it with a null `row` instead, because
+what it reports is the index, not a result; `positions` reports the same hits without reading a data
+file at all. In `table` and `indexed`, `score` is the distance the query asks for, the number
+`ORDER BY vec_distance(...)` sorts by; in `index_hits` and `positions` it is the index's own estimate.
 
 !!! note
     `indexed` is exact about the rows it could have found, and says nothing about the rows it could
@@ -1339,23 +1341,23 @@ read from a table with `query_table`. How the matched rows are resolved depends 
 | `k`           | ✔️        | int           | Number of results per query                  |
 | `queries`     | ✔️*       | array<string> | Query vectors, each a comma-separated list   |
 | `query_table` | ✔️*       | string        | Table of query vectors, one row per query    |
-| `query_id_column` |        | string        | Column that orders `query_table`, so `query_id` lines up with the table's own ids |
+| `query_id_column` |        | string        | Column that orders `query_table`; `query_id` always stays the row's position in that order |
 | `vector_column` |          | string        | Vector column of `query_table` (default `vector`) |
 | `index`       |           | string        | Name of the index, when several indexes share the column |
-| `coverage`    |           | string        | `table` (default), `indexed` or `index_hits` |
-| `nprobe`      |           | int           | IVF probe count for this call; overrides the session setting |
+| `coverage`    |           | string        | `table` (default), `indexed`, `index_hits` or `positions` |
+| `nprobe`      |           | int           | IVF probe count for this call; wins over the session setting. A call-named value on a non-IVF index is an error. |
 | `over_sample` |           | int           | Candidate multiplier for this call; overrides the session setting |
-| `filter_mode` |           | string        | `pre` or `post`; overrides the session setting |
 
 \* Pass either `queries` or `query_table`. With `query_table`, the table is read once a row at a
-time and each row's vector column is one query; `query_id` is the row's position in that order, or
-the value of `query_id_column` when one is given.
+time and each row's vector column is one query. `query_id` is the row's position in that order
+(`0, 1, 2, ...`); `query_id_column` only orders the rows read from `query_table`, it does not
+change or substitute the `query_id` value.
 
 #### Output
 
 | Output Name | Type   | Description                                    |
 |-------------|--------|------------------------------------------------|
-| `query_id`  | int    | Index of the query, in `queries` order or `query_table` order |
+| `query_id`  | int    | Position of the query in `queries` order or in the `query_table` order chosen by `query_id_column` |
 | `data_file` | string | Data file of the matched row                   |
 | `pos`       | long   | Row position within the data file (`_pos`)     |
 | `score`     | double | Distance from the query                        |
@@ -1589,10 +1591,15 @@ their arguments positionally and can be used in a `FROM` clause like any other t
 | `vector_index_search_batch` | `(table, column, queries array<string>, k int)` | `query_id, data_file, pos, score, row` |
 | `text_index_search` | `(table, column, query string, k int)` | `data_file, pos, score, row` |
 
-Each function returns exactly what the corresponding procedure returns, and the rows are computed on
-the driver while the query is planned, so the arguments have to be constants. The table name is
-resolved from the session's current catalog, so qualify it (`catalog.db.table`) when the current
-catalog is not an Iceberg catalog.
+Each function returns the shape of the corresponding procedure, but the address functions have a
+fixed answer: `vector_index_search` and `vector_index_search_batch` have no `coverage` argument and
+are **index-hit queries** — they report what `coverage => 'index_hits'` reports from the procedure:
+the index's own hits, in the index's own order, against the **latest** index snapshot, with no scan
+of the files the index does not cover, a deleted hit kept with a null `row`, and the index's estimate
+as the score. (`vector_search` as a table function returns business rows; it is documented with the
+query paths in the user guide.) The arguments have to be constants. The table name is resolved from
+the session's current catalog, so qualify it (`catalog.db.table`) when the current catalog is not an
+Iceberg catalog.
 
 #### Examples
 
@@ -1656,27 +1663,34 @@ place.
 
 If none of these holds, the plan is left exactly as it was, and the query still returns correct
 results, just by scanning. Shape matters as well: a join, an aggregate, a window, an `OFFSET`, more
-than one sort key, or a filter other than `IS NOT NULL` on the vector column keeps the plan as it is.
-A warning is logged when the matched rows cannot be read back, and when the type of an index is not
+than one sort key, or a filter that cannot be expressed as an index-side predicate (a subquery, a
+UDF, a column of another relation) keeps the plan as it is. A scalar filter on ordinary columns is
+carried into the search instead, and the task applies it before or after scoring according to the
+session setting `spark.iceberg.index.vector.filter-mode`; a filtered query is therefore answered
+from the index rather than by scanning the table, and its answer is as approximate as the index
+itself — the filter selects among the rows the index ranks, it does not make the query exact. A
+warning is logged when the matched rows cannot be read back, and when the type of an index is not
 registered in the session.
 
-Every structure is available to the rewrite, but an approximate one (`HNSW`, `IVF`, or any quantized
-index) is used only when the caller says how many candidates to ask for: such a kernel ranks
-candidates by an estimate, so asking it for `k` of them returns whichever rows the estimate
-preferred, and the true nearest rows may never be listed. With `spark.iceberg.index.vector.over-sample`
-unset the query is left as it is and answered by a scan — exact, and slower — with a warning that
-names the column, the structure of the index and the setting to configure. Setting it to a positive
-integer lets the index answer, with its candidates widened and then re-scored exactly against the
-rows; a value that is not a positive integer is an error rather than a silent 1. An exact index
-(`FLAT` over unquantized vectors) needs no such setting, because it enumerates every candidate.
+Every structure is available to the rewrite. An approximate one (`HNSW`, `IVF`, or any quantized
+index) ranks candidates by an estimate, so the answer is the index's approximation: asking it for
+`k` candidates returns whichever rows the estimate preferred, and the true nearest rows may never be
+listed. `spark.iceberg.index.vector.over-sample` widens the candidate window before the exact
+re-scoring, so a positive value trades memory and fetch-back cost for recall; whether to set it is
+not what decides whether the rewrite happens. An exact index (`FLAT` over unquantized vectors)
+enumerates every candidate and needs no widening. The multiplier must be a non-negative integer; an
+invalid value is an error rather than a silent default.
+
 This paragraph describes the `ORDER BY` rewrite. `CALL system.vector_search` answers the same
 question and names the scope through `coverage`: `table` (the default) answers for the whole table,
 scanning the files the index does not cover and re-scoring every answer to the distance the query
 asks for — the same rows the rewrite returns; `indexed` stays inside the covered files; and
 `index_hits` is the diagnostic view that reports the index's own hits in the index's own order, with
-its estimate as the score and a null `row` for a row the table no longer has. The vector table
-functions have no parameter for this and always answer `table`. `EXPLAIN` shows whether the rewrite
-happened, by the presence of the vector source:
+its estimate as the score and a null `row` for a row the table no longer has. `positions` reports
+the same hits with the row always null and reads no data file. The rewrite is parameterized by
+`spark.iceberg.index.vector.filter-mode`, which decides whether a filter carried into the search is
+applied before or after scoring; it is a session setting, not a call argument. `EXPLAIN` shows
+whether the rewrite happened, by the presence of the vector source:
 
 ```sql
 EXPLAIN SELECT id FROM local.db.docs

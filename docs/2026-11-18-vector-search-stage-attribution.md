@@ -23,9 +23,13 @@
 | 计数 | `numCandidates=330`、`numFetchedRows=363`、`numRowsAtFiles=266–277`、`numLiveCandidates=330` |
 | 对账 | 四段之和 vs `taskTimeNs`：0.001%–0.039%（#3119 验收 <5%） |
 
+对账差异只说明这一轮测量里四段覆盖了 task 墙钟，**不是“四段严格互斥”的承诺**：回表之后的
+过滤/去重会计入 merge，块缓存的锁等待会计入 probe-score，两段因此都比字面含义宽；换一个
+数据形状，差异可能落在容差内但不会恒等于 0。
+
 运行与证据目录：`/Users/jyxc-dz-0101035/workspace/iceberg-reviews/3119-stages/`（SUMMARY.md、原始 event log、attribution、results、plan、report）。该 run 的 p50 是 range=off 12,236 ms / range=on 7,514 ms，但只有 2 条查询且与他人作业并发，只作方向。
 
-## 阶段表（33 tasks 的墙钟占比，四段互斥）
+## 阶段表（33 tasks 的墙钟占比）
 
 | 执行 | 臂 | duration ms | taskTime s | index-read | probe-score | fetch-back | merge |
 |---|---|---|---|---|---|---|---|
@@ -36,11 +40,12 @@
 | 12 | range=on | 13,074 | 324.0 | 5.7% | 2.3% | 92.0% | 0.00% |
 | 13 | range=on | 7,148 | 147.5 | 6.0% | 6.0% | 88.0% | 0.00% |
 
-IO 计数（同一执行）：range=off 每查询 `numIndexFileBytesRead = 22,731,539,822`（22.7 GB）；range=on 为 `numIndexRangeBytesRead = 559,868,394 / 632,189,482`、`numIndexRangeReadRequests = 392`、`numIndexListBlocksRead = 260`、整文件字节为 0。cache 关闭时 `numIndexCacheMisses = 33`（range 臂也计 miss，因为 range 不回填整文件缓存，见 #3121）。
+IO 计数（同一执行）：range=off 每查询 `numIndexFileBytesRead = 22,731,539,822`（22.7 GB）；range=on 为 `numIndexRangeBytesRead = 559,868,394 / 632,189,482`、`numIndexRangeReadRequests = 392`、`numIndexListBlocksRead = 260`、整文件字节为 0。注意这一轮的 `numIndexListBlocksRead = 260` 是**当时的计数口径**（list 读的 range 请求数）；现在的口径是搜索**消费**的 list 块数（缓存命中或从存储读，每次 `IvfListRanges.read` 计 1），I/O 请求数统一看 `numIndexRangeReadRequests`，两者不要混用。cache 关闭时 `numIndexCacheMisses = 33`（range 臂也计 miss，因为 range 不回填整文件缓存，见 #3121）。
 
 ## 代码路径
 
 - 阶段计时都在 `index-spark` 的 `DistributedIndexSearch.searchWithRows`：task 内 `openSearch`（index-read）、`CachedFile.searching`（probe-score，range 路径扣掉 list 读）、`RowReadPlan.candidatesOf` + `rowsOf`（fetch-back）、排序/refine/组装（merge）。
+- 四段的边界有两处**已知小缺口**：回表之后的过滤/去重（以及 `rowsOfIndexFile` 里候选准入、`putIfAbsent` 那段）计入 merge 而不是 fetch-back；块缓存的锁等待计入 probe-score 而不是 index-read。因此四段能覆盖 task 墙钟，但不要把段名当成严格的语义抽屉。
 - 回表链路：`RowReadPlan.rowsOf` → 按数据文件分组 → `IndexEntries.liveRowsAt` → `readFileWithFormat`。后者对**每个命中的数据文件**新建 `ReadBuilder`、`setAll(storageProperties)`、`positions(wanted)`、`build()`，再流式读记录；文件打开、footer、storage 属性设置都发生在每次调用里。
 - `IndexEntries.readFileWithFormat` 里已经有一个只在 `-Diceberg.index.fetch-back.timings=true` 时打印的分段点（`conf+input / builder / open / read`，以及行数），它正是这次要补的证据，不需要新代码。
 
@@ -53,6 +58,7 @@ IO 计数（同一执行）：range=off 每查询 `numIndexFileBytesRead = 22,73
 
 ## 已知边界
 
-- 这份 run 每个臂只有 2 条查询 + 1 warmup，且与他人作业并发；**占比结论比延迟数字更可信**（占比来自同一应用内的四段互斥计时，不是跨应用比较）。
+- 这份 run 每个臂只有 2 条查询 + 1 warmup，且与他人作业并发；**占比结论比延迟数字更可信**（占比来自同一应用内的四段墙钟计时，不是跨应用比较）。
+- 四段计时覆盖 task 墙钟，但有已知小缺口（回表后过滤/去重进 merge、缓存锁等待进 probe-score）；不要用这些指标断言“merge 只包含排序”或“probe-score 只包含打分”。
 - `numIndexCacheHits` / `numIndexWholeListAreaReads` 为 0 时 Spark 不写 accumulable，event log 里缺失即 0。
 - 本轮没有 JFR/profile 证据，fetch-back 的内部拆分是推断；第 1 步的 timings 与第 3 步的 profile 是它的验证。

@@ -113,6 +113,7 @@ final class IndexResidencyCoordinator {
     private IndexCacheProtocol.Protection protection;
     private long snapshotId;
     private boolean hasAccess;
+    private boolean rangeAccess;
     private long accessAgeNanos = Long.MAX_VALUE;
     private long accessObservedAtNanos;
     private Set<String> targetCacheKeys = new LinkedHashSet<>();
@@ -528,10 +529,15 @@ final class IndexResidencyCoordinator {
   private final IndexPlacementPlanner planner = new IndexPlacementPlanner();
   private final Map<String, NodeState> nodes = new LinkedHashMap<>();
   // A removed executor is remembered with the incarnation that was removed, so a report still in
-  // flight cannot restore it while a later incarnation of the same ID starts from scratch. The
-  // map is bounded: executor IDs come and go with dynamic allocation, and a long-lived driver
-  // would otherwise hold every one it ever saw.
+  // flight cannot restore it while a later incarnation of the same ID starts from scratch. A
+  // removal that arrives before the executor's first report leaves the incarnation unknown; the
+  // first report that follows is then dropped as the one that may have been in flight, and the
+  // next report is a new executor. The map is bounded: executor IDs come and go with dynamic
+  // allocation, and a long-lived driver would otherwise hold every one it ever saw.
   private static final int MAX_REMOVED_EXECUTORS = 4096;
+
+  /** The removal of an executor this coordinator had not seen a report from yet. */
+  private static final String UNKNOWN_INCARNATION = "<unknown>";
 
   private final Map<String, String> removedExecutors =
       new LinkedHashMap<>(16, 0.75f, true) {
@@ -644,6 +650,7 @@ final class IndexResidencyCoordinator {
       PlanFile dispatched = node.dispatchedLoads.get(indexUuid);
       if (dispatched != null && !coveredExecutors.contains(dispatched.executorId)) {
         toRelease.put(replicaKey(dispatched.cacheKey, dispatched.executorId), dispatched);
+        coveredExecutors.add(dispatched.executorId);
       }
     }
 
@@ -677,6 +684,31 @@ final class IndexResidencyCoordinator {
           copy.commandId);
     }
 
+    if (index.rangeAccess) {
+      // Queries can cache blocks on executors that have no managed copy of this index.
+      IndexCacheProtocol.File marker =
+          IndexCacheProtocol.File.builder()
+              .location(indexUuid)
+              .cacheKey(indexUuid)
+              .owner(indexUuid)
+              .build();
+      for (NodeState node : nodes.values()) {
+        if (!coveredExecutors.contains(node.report.executorId())) {
+          enqueue(
+              plan,
+              node,
+              "RELEASE_BLOCKS",
+              IndexCacheProtocol.CommandType.RELEASE,
+              indexUuid,
+              IndexCacheProtocol.OFFLOAD_MODE,
+              marker,
+              0L,
+              plan.epoch,
+              null);
+        }
+      }
+    }
+
     return plan.planId;
   }
 
@@ -684,6 +716,10 @@ final class IndexResidencyCoordinator {
    * Records that a query used this index. The driver sees every search of the application, so this
    * is the access record the index LRU orders by; a status read never calls it.
    */
+  void recordRangeAccess(String indexUuid) {
+    indexes.computeIfAbsent(indexUuid, IndexState::new).rangeAccess = true;
+  }
+
   void recordAccess(String indexUuid, long nowNanos) {
     IndexState index = indexes.get(indexUuid);
     if (index == null) {
@@ -829,11 +865,16 @@ final class IndexResidencyCoordinator {
     NodeState node = nodes.remove(executorId);
     if (node != null) {
       // A report already in flight for this incarnation must not restore a Spark executor that has
-      // been removed. Only an executor this coordinator has seen is remembered: with no state to
-      // restore, a later report is a new executor that happens to carry the same ID.
+      // been removed. Only an executor this coordinator has seen is remembered with its
+      // incarnation: a later report from another incarnation is a new executor with the same ID.
       removedExecutors.put(
           executorId, incarnationKey(node.report.session(), node.report.incarnation()));
       forgetIncarnation(executorId, node.report.incarnation());
+    } else if (!removedExecutors.containsKey(executorId)) {
+      // The removal can arrive before the executor's first report. The incarnation that was removed
+      // is unknown, so the first report that follows may be the one that was in flight: it is
+      // dropped, and the report after it is a new executor with the same ID.
+      removedExecutors.put(executorId, UNKNOWN_INCARNATION);
     }
   }
 
@@ -842,19 +883,30 @@ final class IndexResidencyCoordinator {
     return session + '\u0000' + incarnation;
   }
 
+  /** The empty reply a report gets when its executor must not be answered with work. */
+  private static IndexCacheProtocol.Reply ignored(IndexCacheProtocol.NodeReport report) {
+    return IndexCacheProtocol.Reply.builder()
+        .commands(List.of())
+        .nextSequence(report.sequence())
+        .build();
+  }
+
   IndexCacheProtocol.Reply report(IndexCacheProtocol.NodeReport report) {
     Objects.requireNonNull(report, "Executor report is null");
     String removed = removedExecutors.get(report.executorId());
     if (removed != null) {
       if (removed.equals(incarnationKey(report.session(), report.incarnation()))) {
-        return IndexCacheProtocol.Reply.builder()
-            .commands(List.of())
-            .nextSequence(report.sequence())
-            .build();
+        // This is the incarnation that was removed: it never comes back, so the report is dropped.
+        return ignored(report);
       }
 
       // the removed incarnation never comes back: this is another executor reusing the ID
       removedExecutors.remove(report.executorId());
+      if (UNKNOWN_INCARNATION.equals(removed)) {
+        // The removal arrived before this executor's first report, so this report may be the one
+        // that was in flight. It is dropped once; a later report is a new executor.
+        return ignored(report);
+      }
     }
 
     NodeState node = nodes.get(report.executorId());
@@ -955,7 +1007,10 @@ final class IndexResidencyCoordinator {
     }
 
     IndexCacheProtocol.File file = plan.planned(command.cacheKey);
-    if (file == null) {
+    // Query-only blocks have no planned managed file to associate with a release.
+    if (file == null
+        && (command.type != IndexCacheProtocol.CommandType.RELEASE
+            || ack.status() != IndexCacheProtocol.AckStatus.RELEASED)) {
       return;
     }
 

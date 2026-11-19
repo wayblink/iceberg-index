@@ -92,23 +92,24 @@ object IndexTableFunctions {
         new FunctionIdentifier(VECTOR_SEARCH),
         new ExpressionInfo(
           VECTOR_SEARCH,
-          "vector_search(table, query_vector, k, vector_column, distance_type, columns): the "
-            + "nearest rows of a table"),
+          "vector_search(table, query_vector, k, vector_column, distance_type, columns, nprobe, "
+            + "over_sample, index): the nearest rows of a table"),
         vectorSearch))
     extensions.injectTableFunction(
       (
         new FunctionIdentifier(VECTOR_INDEX_SEARCH),
         new ExpressionInfo(
           VECTOR_INDEX_SEARCH,
-          "vector_index_search(table, column, query, k): searches a vector index"),
+          "vector_index_search(table, column, query, k[, nprobe, over_sample, index]): the index's "
+            + "own hits"),
         vectorIndexSearch))
     extensions.injectTableFunction(
       (
         new FunctionIdentifier(VECTOR_INDEX_SEARCH_BATCH),
         new ExpressionInfo(
           VECTOR_INDEX_SEARCH_BATCH,
-          "vector_index_search_batch(table, column, queries, k): searches a vector index for many "
-            + "queries at once"),
+          "vector_index_search_batch(table, column, queries, k[, nprobe, over_sample, index]): the "
+            + "index's own hits for many queries at once"),
         vectorIndexSearchBatch))
     extensions.injectTableFunction(
       (
@@ -230,7 +231,6 @@ object IndexTableFunctions {
         // the query settings: a call may name them, and then they win over the session's
         "nprobe",
         "over_sample",
-        "filter_mode",
         "index"))
 
     val tableName = arguments.string("table")
@@ -248,7 +248,6 @@ object IndexTableFunctions {
     val columns = arguments.strings("columns")
     val nprobe = arguments.int("nprobe")
     val overSample = arguments.int("over_sample")
-    val filterMode = arguments.stringOption("filter_mode")
     val index = arguments.stringOption("index")
 
     Preconditions.checkArgument(
@@ -304,7 +303,6 @@ object IndexTableFunctions {
       VectorSearchArguments(
         nprobe.map(value => Integer.toString(value)).orNull,
         overSample.map(value => Integer.toString(value)).orNull,
-        filterMode.orNull,
         index.orNull),
       GlobalLimit(Literal(k), ordered))
   }
@@ -440,8 +438,9 @@ object IndexTableFunctions {
     val queries = new java.util.ArrayList[Array[Float]]()
     queries.add(query.map(_.toFloat))
     val options = queryOptions(VECTOR_INDEX_SEARCH, args)
-    // a table function has no parameter for the coverage mode, so it answers for the whole table:
-    // the mode that can be short is the one a caller has to ask for by name
+    // a table function has no coverage argument, so it answers with the index's own hits: a hit
+    // whose row was removed is kept with a null row, and the files the index does not cover are not
+    // scanned. A caller who wants the whole table asks a procedure for the table coverage mode.
     VectorSearchCalls.planOf(
       tableName,
       column,
@@ -450,8 +449,7 @@ object IndexTableFunctions {
       topK,
       batch = false,
       options.nprobe.map(value => Integer.toString(value)).orNull,
-      options.overSample.map(value => Integer.toString(value)).orNull,
-      options.filterMode.orNull)
+      options.overSample.map(value => Integer.toString(value)).orNull)
   }
 
   private def vectorIndexSearchBatch(args: Seq[Expression]): LogicalPlan = {
@@ -479,8 +477,7 @@ object IndexTableFunctions {
       topK,
       batch = true,
       options.nprobe.map(value => Integer.toString(value)).orNull,
-      options.overSample.map(value => Integer.toString(value)).orNull,
-      options.filterMode.orNull)
+      options.overSample.map(value => Integer.toString(value)).orNull)
   }
 
   private def textIndexSearch(args: Seq[Expression]): LogicalPlan = {
@@ -521,7 +518,6 @@ object IndexTableFunctions {
   private case class QueryOptions(
       nprobe: Option[Int],
       overSample: Option[Int],
-      filterMode: Option[String],
       index: Option[String])
 
   /**
@@ -540,13 +536,10 @@ object IndexTableFunctions {
     }
 
     val arguments = new TableFunctionArguments(name, extras, Seq.empty)
-    arguments.requireOnly(
-      required = Seq.empty,
-      optional = Seq("nprobe", "over_sample", "filter_mode", "index"))
+    arguments.requireOnly(required = Seq.empty, optional = Seq("nprobe", "over_sample", "index"))
     QueryOptions(
       arguments.int("nprobe"),
       arguments.int("over_sample"),
-      arguments.stringOption("filter_mode"),
       arguments.stringOption("index"))
   }
 

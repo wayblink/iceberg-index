@@ -122,12 +122,17 @@ class TestVectorSearchTableFunction {
             table);
     List<Row> whole = spark.sql(sql).collectAsList();
     assertThat(whole).isNotEmpty();
+    // five queries fit one block, and one block is one partition
+    assertThat(spark.sql(sql).queryExecution().toRdd().getNumPartitions()).isEqualTo(1);
 
     // the operator turns each block into a partition, so a block size that splits the batch must
-    // produce the same rows in the same order
+    // produce the same rows in the same order, and the batch must arrive as one partition per block
     System.setProperty("iceberg.index.batch.queries-per-block", "2");
     try {
       List<Row> blocks = spark.sql(sql).collectAsList();
+      assertThat(spark.sql(sql).queryExecution().toRdd().getNumPartitions())
+          .as("five queries answered two at a time")
+          .isEqualTo(3);
       assertThat(blocks).hasSameSizeAs(whole);
       for (int i = 0; i < whole.size(); i += 1) {
         Row expected = whole.get(i);
@@ -380,13 +385,95 @@ class TestVectorSearchTableFunction {
                       "SELECT id, _distance FROM vector_search(table => 'local.%s',"
                           + " query_vector => array(1.0d, 0.0d),"
                           + " vector_column => 'embedding', k => 2, nprobe => 2,"
-                          + " over_sample => 0, filter_mode => 'pre')",
+                          + " over_sample => 0)",
                       table))
               .collectAsList();
       assertThat(hits).hasSize(2);
       assertThat(hits.get(0).getDouble(1)).isLessThan(hits.get(1).getDouble(1));
     } finally {
       spark.conf().unset("spark.iceberg.index.vector.ivf.nprobe");
+    }
+  }
+
+  /**
+   * A probe count names the lists an IVF search visits. The rewrite that lowers a call has to hand
+   * it to the encoder, so an index that does not probe lists refuses it instead of quietly ignoring
+   * an argument the caller wrote.
+   */
+  @Test
+  public void refusesAProbeCountOnANonIvfIndex() {
+    String table = tableWithIndex("vs_nprobe_hnsw", "hnsw");
+
+    assertThatThrownBy(
+            () ->
+                spark
+                    .sql(
+                        String.format(
+                            "SELECT id FROM vector_search(table => 'local.%s', "
+                                + "query_vector => array(1.0d, 0.0d), vector_column => 'embedding', "
+                                + "k => 2, nprobe => 2)",
+                            table))
+                    .collectAsList())
+        .hasStackTraceContaining("probe count applies to an IVF index only");
+  }
+
+  /** The session's probe count is the encoder's default, so a graph index still ignores it. */
+  @Test
+  public void aSessionProbeCountIsReadByAnIvfIndexOnly() {
+    String table = tableWithIndex("vs_session_nprobe", "hnsw");
+    String key = "spark.iceberg.index.vector.ivf.nprobe";
+    try {
+      spark.conf().set(key, "8");
+
+      // the rewrite, a procedure call and the address function all encode through the same decision
+      String ordered =
+          String.format(
+              "SELECT id FROM local.%s ORDER BY vec_distance(embedding, array(1.0d, 0.0d)) LIMIT 2",
+              table);
+      assertThat(planOf(ordered)).contains("VectorSearchSource");
+      assertThat(spark.sql(ordered).collectAsList()).hasSize(2);
+      assertThat(
+              spark
+                  .sql(
+                      String.format(
+                          "CALL local.system.vector_search(table => 'local.%s', "
+                              + "column => 'embedding', query => array(1.0d, 0.0d), k => 2)",
+                          table))
+                  .collectAsList())
+          .hasSize(2);
+      assertThat(
+              spark
+                  .sql(
+                      String.format(
+                          "SELECT * FROM vector_index_search('local.%s', 'embedding', "
+                              + "array(1.0d, 0.0d), 2)",
+                          table))
+                  .collectAsList())
+          .hasSize(2);
+    } finally {
+      spark.conf().unset(key);
+    }
+  }
+
+  /** A probe count is a long on its way in, and a count the encoder cannot hold is refused. */
+  @Test
+  public void refusesASessionProbeCountThatDoesNotFitAnInt() {
+    String table = tableWithIndex("vs_session_nprobe_bad", "hnsw");
+    String key = "spark.iceberg.index.vector.ivf.nprobe";
+    try {
+      spark.conf().set(key, "2147483648");
+      assertThatThrownBy(
+              () ->
+                  spark
+                      .sql(
+                          String.format(
+                              "SELECT id FROM local.%s ORDER BY vec_distance(embedding, "
+                                  + "array(1.0d, 0.0d)) LIMIT 2",
+                              table))
+                      .collectAsList())
+          .hasStackTraceContaining(key);
+    } finally {
+      spark.conf().unset(key);
     }
   }
 

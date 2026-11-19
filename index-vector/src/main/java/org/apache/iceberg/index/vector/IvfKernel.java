@@ -916,6 +916,11 @@ public final class IvfKernel implements VectorKernel, RetainedBytes {
     }
 
     @Override
+    public long listBlocksRead() {
+      return ranges == null ? 0L : ranges.lists().listsRead();
+    }
+
+    @Override
     public ListBlockCache.Stats blockCacheStats() {
       return ranges == null ? ListBlockCache.Stats.EMPTY : ranges.lists().blockStats();
     }

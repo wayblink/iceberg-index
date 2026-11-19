@@ -63,9 +63,6 @@ class VectorSearchProcedure extends BaseProcedure {
   private static final ProcedureParameter OVER_SAMPLE_PARAM =
       optionalInParameter("over_sample", DataTypes.IntegerType);
 
-  private static final ProcedureParameter FILTER_MODE_PARAM =
-      optionalInParameter("filter_mode", DataTypes.StringType);
-
   private static final ProcedureParameter[] PARAMETERS =
       new ProcedureParameter[] {
         TABLE_PARAM,
@@ -75,8 +72,7 @@ class VectorSearchProcedure extends BaseProcedure {
         INDEX_PARAM,
         COVERAGE_PARAM,
         NPROBE_PARAM,
-        OVER_SAMPLE_PARAM,
-        FILTER_MODE_PARAM
+        OVER_SAMPLE_PARAM
       };
 
   private static final StructType OUTPUT_TYPE =
@@ -139,8 +135,6 @@ class VectorSearchProcedure extends BaseProcedure {
               input.isProvided(OVER_SAMPLE_PARAM)
                   ? Integer.toString(input.asInt(OVER_SAMPLE_PARAM))
                   : null;
-          String filterModeArgument =
-              input.isProvided(FILTER_MODE_PARAM) ? input.asString(FILTER_MODE_PARAM) : null;
           org.apache.iceberg.spark.index.VectorSearchHitsPlan plan =
               org.apache.iceberg.spark.index.VectorSearchCalls.plan(
                   spark(),
@@ -152,8 +146,7 @@ class VectorSearchProcedure extends BaseProcedure {
                   false,
                   coverage,
                   nprobeArgument,
-                  overSampleArgument,
-                  filterModeArgument);
+                  overSampleArgument);
           List<org.apache.spark.sql.Row> hits =
               org.apache.iceberg.spark.index.VectorSearchCalls.search(plan, spark());
 

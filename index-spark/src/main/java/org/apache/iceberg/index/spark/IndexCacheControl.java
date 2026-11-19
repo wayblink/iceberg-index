@@ -68,6 +68,13 @@ public final class IndexCacheControl {
     }
   }
 
+  static void recordRangeAccess(SparkSession spark, String indexUuid) {
+    IndexCacheDriverControl control = IndexCacheDriverRegistry.find(spark.sparkContext());
+    if (control != null) {
+      control.recordRangeAccess(indexUuid);
+    }
+  }
+
   /**
    * What each executor last reported about residency.
    *

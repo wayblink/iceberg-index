@@ -143,8 +143,7 @@ private[spark] case class VectorRequestInput(
     // what the call named, so a value it passes wins over the session configuration; a query planned
     // by the rewrite names none of them
     nprobeArgument: String = null,
-    overSampleArgument: String = null,
-    filterModeArgument: String = null)
+    overSampleArgument: String = null)
 
 private[spark] case class VectorSearchRequest(
     input: VectorRequestInput,
@@ -174,7 +173,6 @@ private[spark] object VectorSearchRequest {
       indexArgument,
       batch,
       null,
-      null,
       null)
 
   def forTable(
@@ -187,8 +185,7 @@ private[spark] object VectorSearchRequest {
       indexArgument: String,
       batch: Boolean,
       nprobeArgument: String,
-      overSampleArgument: String = null,
-      filterModeArgument: String = null): VectorSearchRequest = {
+      overSampleArgument: String = null): VectorSearchRequest = {
     require(table != null, "Vector source table cannot be null")
     val contract = VectorResultContract.fromName(contractName)
     // the rewritten source answers with table rows; the coverage modes and the hit view answer with
@@ -211,8 +208,7 @@ private[spark] object VectorSearchRequest {
       contract,
       batch,
       nprobeArgument,
-      overSampleArgument,
-      filterModeArgument)
+      overSampleArgument)
     val output = schema.fields.map { field =>
       AttributeReference(field.name, field.dataType, field.nullable, field.metadata)()
     }.toSeq

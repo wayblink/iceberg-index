@@ -1468,105 +1468,260 @@ final class ExecutorIndexCache {
    * so a repeated query can score them from memory instead of asking the object store again. The
    * blocks live beside the whole-file entries rather than inside them: a file that is read whole
    * does not need them, and a file that is read by range never fills the whole-file entry. They are
-   * admitted from what the whole files leave spare, so a range search cannot evict the files a
-   * later search may ask for.
+   * admitted from what the whole files leave spare, and a whole file reclaims them when it needs
+   * that room: one budget, bounded in both directions.
    */
-  private final java.util.LinkedHashMap<ListBlockKey, byte[]> listBlocks =
-      new java.util.LinkedHashMap<>(16, 0.75f, true);
+  private final LinkedHashMap<ListBlockKey, ListBlock> listBlocks =
+      new LinkedHashMap<>(16, 0.75f, true);
 
   private long listBlockBytes;
-  private long listBlockHits;
-  private long listBlockMisses;
-  private long listBlockLoads;
-  private long listBlockEvictions;
+
+  /** One kept list block, with the time of its last use so the idle sweep can drop it. */
+  private static final class ListBlock {
+    private final byte[] bytes;
+    private long lastAccessNanos;
+
+    private ListBlock(byte[] bytes, long lastAccessNanos) {
+      this.bytes = bytes;
+      this.lastAccessNanos = lastAccessNanos;
+    }
+
+    private void touch() {
+      lastAccessNanos = System.nanoTime();
+    }
+  }
+
+  /** What one view's put did, so the view counts only the blocks it stored and evicted. */
+  private record ListBlockPutResult(boolean kept, int evictions) {
+    private static final ListBlockPutResult NOT_KEPT = new ListBlockPutResult(false, 0);
+  }
 
   /** A view of the blocks this executor keeps, as one search reports what it reused. */
   ListBlockCache listBlocks(Config config) {
-    return new SharedListBlocks(this, config);
+    return listBlocks(config, "");
   }
 
-  private byte[] listBlock(Config config, String location, int offset, int size) {
+  ListBlockCache listBlocks(Config config, String indexUuid) {
+    synchronized (mapLock) {
+      return new SharedListBlocks(this, config, indexUuid, ownership.epoch(indexUuid));
+    }
+  }
+
+  private byte[] listBlock(Config config, String indexUuid, String location, int offset, int size) {
     if (!config.caching()) {
       return null;
     }
 
     synchronized (mapLock) {
-      byte[] block = listBlocks.get(new ListBlockKey(location, offset, size));
-      if (block != null) {
-        listBlockHits++;
-      } else {
-        listBlockMisses++;
+      ListBlock block = listBlocks.get(new ListBlockKey(indexUuid, location, offset, size));
+      if (block == null) {
+        return null;
       }
 
-      return block;
+      block.touch();
+      return block.bytes;
     }
   }
 
-  private void keepListBlock(Config config, String location, int offset, byte[] bytes) {
-    if (!config.caching() || bytes.length == 0) {
-      return;
+  private boolean hasListBlock(
+      Config config, String indexUuid, String location, int offset, int size) {
+    if (!config.caching()) {
+      return false;
     }
 
     synchronized (mapLock) {
-      ListBlockKey key = new ListBlockKey(location, offset, bytes.length);
+      return listBlocks.containsKey(new ListBlockKey(indexUuid, location, offset, size));
+    }
+  }
+
+  private ListBlockPutResult keepListBlock(
+      Config config, String indexUuid, long epoch, String location, int offset, byte[] bytes) {
+    if (!config.caching() || bytes.length == 0) {
+      return ListBlockPutResult.NOT_KEPT;
+    }
+
+    synchronized (mapLock) {
+      if (ownership.epoch(indexUuid) != epoch) {
+        return ListBlockPutResult.NOT_KEPT;
+      }
+
+      ListBlockKey key = new ListBlockKey(indexUuid, location, offset, bytes.length);
       if (listBlocks.containsKey(key)) {
-        return;
+        return ListBlockPutResult.NOT_KEPT;
       }
 
       long capacity = budget(config.maxBytes());
-      long spare = capacity - bytes() - listBlockBytes;
+      long spare = capacity - usedBytes() - reservedBytes - listBlockBytes;
+      int evicted = 0;
       while (spare < bytes.length && !listBlocks.isEmpty()) {
-        java.util.Iterator<java.util.Map.Entry<ListBlockKey, byte[]>> eldest =
-            listBlocks.entrySet().iterator();
-        listBlockBytes -= eldest.next().getValue().length;
-        eldest.remove();
-        listBlockEvictions++;
-        spare = capacity - bytes() - listBlockBytes;
+        evictOldestListBlock();
+        evicted += 1;
+        spare = capacity - usedBytes() - reservedBytes - listBlockBytes;
       }
 
-      if (spare >= bytes.length) {
-        listBlocks.put(key, bytes);
-        listBlockBytes += bytes.length;
-        listBlockLoads++;
+      if (spare < bytes.length) {
+        return new ListBlockPutResult(false, evicted);
+      }
+
+      listBlocks.put(key, new ListBlock(bytes, System.nanoTime()));
+      listBlockBytes += bytes.length;
+      return new ListBlockPutResult(true, evicted);
+    }
+  }
+
+  /** Drops the least recently used block; the map iteration order is the access order. */
+  private void evictOldestListBlock() {
+    Iterator<Map.Entry<ListBlockKey, ListBlock>> oldest = listBlocks.entrySet().iterator();
+    Map.Entry<ListBlockKey, ListBlock> eldest = oldest.next();
+    listBlockBytes -= eldest.getValue().bytes.length;
+    oldest.remove();
+  }
+
+  /**
+   * Drops list blocks, least recently used first, when a whole file does not fit beside them.
+   *
+   * <p>Blocks and whole files share one budget in both directions: the blocks are admitted from the
+   * room a file leaves spare, and a file that no longer fits reclaims the blocks instead of
+   * evicting another whole file. The blocks are only reclaimed when that can make the file fit;
+   * when it cannot, the whole-file side evicts the way it always has.
+   *
+   * <p>The caller holds {@code mapLock} and retries admission when this reports a change.
+   *
+   * @param capacity the bytes the whole-file side and the blocks may occupy together
+   * @param wholeFileBytes the bytes the whole-file side is about to add
+   * @return whether a block was dropped
+   */
+  private boolean reclaimListBlocks(long capacity, long wholeFileBytes) {
+    long spare = capacity - bytes() - listBlockBytes;
+    if (spare >= wholeFileBytes || listBlocks.isEmpty()) {
+      return false;
+    }
+
+    if (wholeFileBytes > capacity - bytes()) {
+      // even an empty block cache leaves no room, so another whole file has to go instead
+      return false;
+    }
+
+    do {
+      evictOldestListBlock();
+      spare = capacity - bytes() - listBlockBytes;
+    } while (spare < wholeFileBytes);
+
+    return true;
+  }
+
+  /**
+   * Drops the blocks of the given index files.
+   *
+   * <p>Called when an index target releases or replaces a file: the blocks of a file no query can
+   * be sent to any more would otherwise stay charged until the idle sweep. A file another target
+   * still holds keeps its blocks, which the caller checks before collecting the locations.
+   */
+  private void clearListBlocks(Set<String> locations) {
+    if (locations.isEmpty()) {
+      return;
+    }
+
+    Iterator<Map.Entry<ListBlockKey, ListBlock>> blocks = listBlocks.entrySet().iterator();
+    while (blocks.hasNext()) {
+      Map.Entry<ListBlockKey, ListBlock> entry = blocks.next();
+      if (locations.contains(entry.getKey().location())) {
+        listBlockBytes -= entry.getValue().bytes.length;
+        blocks.remove();
       }
     }
   }
 
-  private ListBlockCache.Stats listBlockStats() {
-    synchronized (mapLock) {
-      return new ListBlockCache.Stats(
-          listBlockHits, listBlockMisses, listBlockLoads, listBlockEvictions, listBlockBytes);
+  /**
+   * Drops the blocks of the candidate keys this cache no longer targets.
+   *
+   * <p>A block is kept under the file location, not under the cache key, so the location of a
+   * released key is only cleared when no target owns that key any more. Callers hold {@code
+   * mapLock} and pass the keys a target is releasing.
+   */
+  private void clearReleasedListBlocks(Set<String> keys) {
+    Set<String> locations = new LinkedHashSet<>();
+    for (String key : keys) {
+      if (!ownership.isOwned(key)) {
+        locations.add(locationOf(key));
+      }
     }
+
+    clearListBlocks(locations);
+  }
+
+  /** The index file a cache key names, which is the location its list blocks are kept under. */
+  private static String locationOf(String cacheKey) {
+    String[] parts = cacheKey.split("\\|", 3);
+    return parts.length == 3 ? parts[2] : cacheKey;
   }
 
   private long bytes() {
     return bytes;
   }
 
-  private record ListBlockKey(String location, int offset, int size) {}
+  private record ListBlockKey(String indexUuid, String location, int offset, int size) {}
 
+  /**
+   * One search's view of the shared blocks.
+   *
+   * <p>A view belongs to one search, so its counters describe that search: what it looked up, what
+   * it stored, and the blocks its own puts evicted. Reporting the executor's lifetime counters
+   * instead would count another task's activity, and an executor-wide view cannot say which search
+   * a hit was worth to.
+   */
   private static final class SharedListBlocks implements ListBlockCache {
     private final ExecutorIndexCache cache;
     private final Config config;
+    private final AtomicLong hits = new AtomicLong();
+    private final AtomicLong misses = new AtomicLong();
+    private final AtomicLong loads = new AtomicLong();
+    private final AtomicLong evictions = new AtomicLong();
+    private final AtomicLong bytes = new AtomicLong();
 
-    private SharedListBlocks(ExecutorIndexCache cache, Config config) {
+    private final String indexUuid;
+    private final long epoch;
+
+    private SharedListBlocks(
+        ExecutorIndexCache cache, Config config, String indexUuid, long epoch) {
       this.cache = cache;
       this.config = config;
+      this.indexUuid = indexUuid;
+      this.epoch = epoch;
     }
 
     @Override
     public byte[] get(String location, int offset, int size) {
-      return cache.listBlock(config, location, offset, size);
+      byte[] block = cache.listBlock(config, indexUuid, location, offset, size);
+      if (block != null) {
+        hits.incrementAndGet();
+      } else {
+        misses.incrementAndGet();
+      }
+
+      return block;
     }
 
     @Override
-    public void put(String location, int offset, byte[] bytes) {
-      cache.keepListBlock(config, location, offset, bytes);
+    public boolean contains(String location, int offset, int size) {
+      return cache.hasListBlock(config, indexUuid, location, offset, size);
+    }
+
+    @Override
+    public void put(String location, int offset, byte[] block) {
+      ListBlockPutResult result =
+          cache.keepListBlock(config, indexUuid, epoch, location, offset, block);
+      if (result.kept()) {
+        loads.incrementAndGet();
+        bytes.addAndGet(block.length);
+      }
+
+      evictions.addAndGet(result.evictions());
     }
 
     @Override
     public Stats stats() {
-      return cache.listBlockStats();
+      return new Stats(hits.get(), misses.get(), loads.get(), evictions.get(), bytes.get());
     }
   }
 
@@ -1583,10 +1738,13 @@ final class ExecutorIndexCache {
     synchronized (mapLock) {
       Preconditions.checkState(executorBudget == null, "Executor cache budget is already bound");
       Preconditions.checkState(
-          bytes <= budgetBytes && reservedBytes <= budgetBytes - bytes,
-          "Cannot bind executor cache budget %s: %s bytes resident and %s reserved",
+          Math.addExact(bytes, listBlockBytes) <= budgetBytes
+              && reservedBytes <= budgetBytes - bytes - listBlockBytes,
+          "Cannot bind executor cache budget %s: %s bytes resident, %s bytes in list blocks, "
+              + "and %s reserved",
           budgetBytes,
           bytes,
+          listBlockBytes,
           reservedBytes);
       executorBudget = new ExecutorBudget(budgetBytes);
       return executorBudget;
@@ -1794,6 +1952,8 @@ final class ExecutorIndexCache {
       for (String key : previous) {
         releaseIfUnowned(key);
       }
+      // a file the new target no longer names keeps its blocks only while another target owns it
+      clearReleasedListBlocks(previous);
       mapLock.notifyAll();
     }
   }
@@ -1952,6 +2112,10 @@ final class ExecutorIndexCache {
     synchronized (mapLock) {
       boolean released = ownership.releaseKey(indexUuid, cacheKey);
       releaseIfUnowned(cacheKey);
+      if (released) {
+        // the blocks of a file no target names any more are charged until something clears them
+        clearReleasedListBlocks(Set.of(cacheKey));
+      }
       mapLock.notifyAll();
       return released;
     }
@@ -1980,6 +2144,15 @@ final class ExecutorIndexCache {
       ownership.release(indexUuid, epoch);
       for (String key : keys) {
         releaseIfUnowned(key);
+      }
+      clearReleasedListBlocks(keys);
+      Iterator<Map.Entry<ListBlockKey, ListBlock>> blocks = listBlocks.entrySet().iterator();
+      while (blocks.hasNext()) {
+        Map.Entry<ListBlockKey, ListBlock> entry = blocks.next();
+        if (indexUuid.equals(entry.getKey().indexUuid())) {
+          listBlockBytes -= entry.getValue().bytes.length;
+          blocks.remove();
+        }
       }
       mapLock.notifyAll();
       return true;
@@ -2171,24 +2344,33 @@ final class ExecutorIndexCache {
       CachedFile stamped = file.withOwner(config.owner());
       stamped.pinned = config.mode() == Mode.PIN_ALL;
       AdmissionDelta[] projected = new AdmissionDelta[1];
-      while (!admit(
-          capacity,
-          () -> {
-            releaseReservation(reservation);
-            String ownedKey = texts.own(cacheKey);
-            CachedFile retained = stamped.withOwner(texts.own(config.owner()));
-            retained.pinned = stamped.pinned;
-            if (retained.pinned) {
-              protectedFiles.put(ownedKey, retained);
-            } else {
-              probation.put(ownedKey, retained);
-            }
-            bytes += retained.bytes();
-            bytesByOwner.merge(retained.owner(), retained.bytes(), Long::sum);
-            entriesByOwner.merge(retained.owner(), 1, Integer::sum);
-          },
-          false,
-          delta -> projected[0] = delta)) {
+      while (true) {
+        // the blocks share the budget with the files, so a file that does not fit reclaims them
+        // before it displaces another whole file
+        if (reclaimListBlocks(capacity, file.bytes())) {
+          continue;
+        }
+
+        if (admit(
+            capacity - listBlockBytes,
+            () -> {
+              releaseReservation(reservation);
+              String ownedKey = texts.own(cacheKey);
+              CachedFile retained = stamped.withOwner(texts.own(config.owner()));
+              retained.pinned = stamped.pinned;
+              if (retained.pinned) {
+                protectedFiles.put(ownedKey, retained);
+              } else {
+                probation.put(ownedKey, retained);
+              }
+              bytes += retained.bytes();
+              bytesByOwner.merge(retained.owner(), retained.bytes(), Long::sum);
+              entriesByOwner.merge(retained.owner(), 1, Integer::sum);
+            },
+            false,
+            delta -> projected[0] = delta)) {
+          break;
+        }
         if (projected[0] == null) {
           return file;
         }
@@ -2285,7 +2467,9 @@ final class ExecutorIndexCache {
         }
         drainPendingReleases();
         long capacity = budget(config.maxBytes());
-        long spare = Math.max(0L, capacity - usedBytes() - reservedBytes);
+        // the blocks occupy the same budget, so what is spare for a whole-file load is what the
+        // resident files, the loads in flight and the blocks leave
+        long spare = Math.max(0L, capacity - usedBytes() - reservedBytes - listBlockBytes);
         if (spare >= requested || reservations.isEmpty()) {
           Reservation reservation =
               new Reservation(
@@ -2297,14 +2481,15 @@ final class ExecutorIndexCache {
           AdmissionDelta[] projected = new AdmissionDelta[1];
           boolean accepted =
               admit(
-                  capacity,
+                  capacity - listBlockBytes,
                   () -> {
                     String owner = texts.own(config.owner());
                     reservation.owner = owner;
                     reservation.cacheKey = texts.own(cacheKey);
                     reservations.add(reservation);
                     reservedByOwner.merge(owner, 0L, Long::sum);
-                    long available = Math.max(0L, capacity - usedBytes() - reservedBytes);
+                    long available =
+                        Math.max(0L, capacity - usedBytes() - reservedBytes - listBlockBytes);
                     reservation.bytes = Math.min(requested, available);
                     reservedBytes += reservation.bytes;
                     reservedByOwner.merge(owner, reservation.bytes, Long::sum);
@@ -2315,8 +2500,14 @@ final class ExecutorIndexCache {
             return reservation;
           }
 
-          // The reservation itself costs control bytes. When resident entries can make room for
-          // it, reclaim them here so the caller can load and then be admitted normally.
+          // The reservation itself costs control bytes. When resident blocks hold room the load
+          // can use, reclaim them before evicting a whole file so the caller can load and then be
+          // admitted normally.
+          if (reclaimListBlocks(capacity, requested)) {
+            continue;
+          }
+
+          // When resident entries can make room for the reservation, reclaim them here.
           Map.Entry<String, CachedFile> victim = mostOverQuota(capacity, projected[0]);
           if (victim == null) {
             victim = oldestEvictable(probation, false);
@@ -2332,6 +2523,12 @@ final class ExecutorIndexCache {
           protectedFiles.remove(victim.getKey());
           probation.remove(victim.getKey());
           evictions.incrementAndGet();
+          continue;
+        }
+
+        // A load waits for another load's reservation, not for the blocks: when the blocks are
+        // what the room is short of, reclaim them so this load can proceed.
+        if (reclaimListBlocks(capacity, requested)) {
           continue;
         }
 
@@ -2415,7 +2612,7 @@ final class ExecutorIndexCache {
     return null;
   }
 
-  /** Unloads entries that no query has asked for within the idle window. */
+  /** Unloads entries and blocks that no query has asked for within the idle window. */
   private void sweepIfDue(Config config) {
     long now = System.nanoTime();
     long ttlNanos =
@@ -2430,8 +2627,14 @@ final class ExecutorIndexCache {
     synchronized (mapLock) {
       int unloaded =
           evictIdle(probation, now - ttlNanos) + evictIdle(protectedFiles, now - ttlNanos);
-      if (unloaded > 0) {
-        LOG.debug("Unloaded {} idle index cache entries ({} bytes left)", unloaded, bytes);
+      // an idle block is unloaded like an idle file: it is not a budget eviction
+      int unloadedBlocks = evictIdleListBlocks(now - ttlNanos);
+      if (unloaded > 0 || unloadedBlocks > 0) {
+        LOG.debug(
+            "Unloaded {} idle index cache entries and {} idle list blocks ({} bytes left)",
+            unloaded,
+            unloadedBlocks,
+            bytes);
       }
     }
   }
@@ -2451,6 +2654,24 @@ final class ExecutorIndexCache {
       release(file);
       attribution.remove(entry.getKey());
       entries.remove();
+      unloaded += 1;
+    }
+
+    return unloaded;
+  }
+
+  /** Drops the blocks no search has read within the idle window; the map order is LRU order. */
+  private int evictIdleListBlocks(long deadlineNanos) {
+    int unloaded = 0;
+    Iterator<Map.Entry<ListBlockKey, ListBlock>> blocks = listBlocks.entrySet().iterator();
+    while (blocks.hasNext()) {
+      Map.Entry<ListBlockKey, ListBlock> entry = blocks.next();
+      if (entry.getValue().lastAccessNanos > deadlineNanos) {
+        continue;
+      }
+
+      listBlockBytes -= entry.getValue().bytes.length;
+      blocks.remove();
       unloaded += 1;
     }
 
@@ -2595,12 +2816,14 @@ final class ExecutorIndexCache {
   Stats stats() {
     synchronized (mapLock) {
       drainPendingReleases();
+      // the blocks are part of the resident bytes the executor reports; the entry count stays the
+      // number of whole files, since a block is not an entry a query is covered by
       return new Stats(
           hits.get(),
           misses.get(),
           loads.get(),
           evictions.get(),
-          chargeSnapshot().residentBytes(),
+          Math.addExact(chargeSnapshot().residentBytes(), listBlockBytes),
           probation.size() + protectedFiles.size());
     }
   }
@@ -2703,10 +2926,6 @@ final class ExecutorIndexCache {
       evictions.set(0);
       listBlocks.clear();
       listBlockBytes = 0L;
-      listBlockHits = 0L;
-      listBlockMisses = 0L;
-      listBlockLoads = 0L;
-      listBlockEvictions = 0L;
       lastSweepNanos = System.nanoTime();
       mapLock.notifyAll();
     }

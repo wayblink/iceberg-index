@@ -60,7 +60,7 @@ CALL prod.system.build_vector_index(
 
 `4bit` 在四张实测表上没有一处优于 3bit（recall 不需要它、体积最大），**不建议作为默认**。
 
-`rabitq-bits` 随索引持久化。要比较不同量化位数，在同一列上用不同名称建索引。要比较不同探测数，对同一索引切换查询会话的 `spark.iceberg.index.vector.ivf.nprobe`（默认 `8`）。从旧脚本的建索引选项移除 `nprobe`，把原值设到查询会话。
+`rabitq-bits` 随索引持久化。要比较不同量化位数，在同一列上用不同名称建索引。要比较不同探测数，用调用参数 `CALL ... nprobe => …` / 表函数命名选项 `nprobe => …`，或对同一索引切换查询会话的 `spark.iceberg.index.vector.ivf.nprobe`（默认 `8`）：调用值优先，session 值只对 IVF 生效，非 IVF 索引上显式传 `nprobe` 报错。从旧脚本的建索引选项移除 `nprobe`，把原值设到查询会话。
 
 ### 2.1.1 索引 DDL
 
@@ -113,7 +113,7 @@ SET `spark.iceberg.index.vector.ivf.nprobe` = 32;
 SET `spark.iceberg.index.vector.over-sample` = 100;
 ```
 
-`over-sample` 的含义是"向索引要 k×over 个候选，再取前 k"。对 `ORDER BY` 的自动改写，取前 k 之前会**精确重排**，所以放大倍数提高的是**召回**；对 `CALL vector_search` / 两个向量 TVF，结果合同是"索引自己的原始分数、按索引顺序取前 k、删掉的行以 `row = null` 保留"，**不精确重排、不扫未覆盖文件**，因此放大倍数只扩大候选范围、不会让结果变成"精确 Top-K"（近似 kernel 扩大范围后候选集本身可能变，但不保证与旧 `C=k` 逐条一致）。
+`over-sample` 的含义是"向索引要 k×over 个候选，再取前 k"。对 `ORDER BY` 的自动改写，取前 k 之前会**精确重排**，所以放大倍数提高的是**召回**。对 `CALL vector_search`，结果合同由 `coverage` 决定：默认 `table` 会回表、判删除、并按查询要求的距离精确重排（与改写同一答案），`indexed` / `index_hits` / `positions` 才是不补未覆盖文件的索引侧视图；对两个地址类 TVF（`vector_index_search` / `vector_index_search_batch`），合同固定是"索引自己的原始分数、按索引顺序取前 k、删掉的行以 `row = null` 保留"，**不精确重排、不扫未覆盖文件、没有 `coverage` 参数**。因此在索引侧视图上，放大倍数只扩大候选范围、不会让结果变成"精确 Top-K"（近似 kernel 扩大范围后候选集本身可能变，但不保证与旧 `C=k` 逐条一致）。
 
 `over-sample` 默认 `0`，基础候选预算为 K，计划显示 `overSample=0 [DEFAULT]`。显式正整数按 K 乘倍数计算。IVF 的 `nprobe` 控制初始探测的列表数，和候选预算分别设置。
 
@@ -241,13 +241,15 @@ docker push hub.i.basemind.com/spark/sparkann-e2e:<tag>
 
 `spark.iceberg.index.cache.enabled`（**默认 false**，必须显式打开；只设 `bytes` 不会启用）、`spark.iceberg.index.cache.bytes`（每个执行器的预算，默认按工作集与堆推导）、`spark.iceberg.index.cache.mode`。开关是两侧共读的：关掉时执行器不广告预算，`load_index` 会以 `CACHE_DISABLED` 失败，查询也不会使用缓存——不会出现"加载报 COMPLETE、查询却看不到缓存"的分裂。缓存关闭时 `index_cache_status()` **返回 0 行**（它不会报"未启用"），2026-10-30 在 A 集群实测：只设 `bytes` 时 0 行，加上 `enabled=true` 后每个执行器与 driver 各一行（`mode=PIN_ALL`、`entries`、`bytes`、`coverage`）。经验：**索引装不进缓存时会退化成"每次查询读自己的索引文件"**，100M 的 HNSW（23.7 GB / 6 执行器）就是这样废掉的——它的延迟等于全表扫描。所以缓存预算要按"最大索引 ÷ 执行器数"给，宁多勿少。
 
+**list 块缓存与整文件条目共享同一份预算。** `range-read.enabled=true` 的查询把探测到的 list 块放进 executor 缓存，块只从整文件占用后的剩余预算里装入；整文件装入需要空间时，会先按 LRU 回收块，再走原有的整文件逐出。块计入 `index_cache_status` 上报的常驻字节（`bytes`），空闲 TTL 淘汰与 `offload_index` / 释放索引会清掉对应的块。所以判断"缓存有没有生效"时，`bytes` 是整文件条目与 list 块的合计，不能只看 `entries`。
+
 ### 5.3 驻留与放置
 
-`load_index` / `offload_index` 用于手动固定/卸载某个索引的驻留，`spark.iceberg.index.schedule.locality` 影响放置。**这套能力仍在收口**（`#2391`，7/9 子卡完成），当前可用的稳定部分是"自动缓存 + 查询时按需加载"；把 `load_index` 用于生产前，请先按 §7 的缺口确认。
+`load_index` / `offload_index` 用于手动固定/卸载某个索引的驻留，`spark.iceberg.index.schedule.locality` 影响放置。`offload_index` 释放某个索引时会一并清掉它的 list 块，常驻字节随之回落。**这套能力仍在收口**（`#2391`，7/9 子卡完成），当前可用的稳定部分是"自动缓存 + 查询时按需加载"；把 `load_index` 用于生产前，请先按 §7 的缺口确认。
 
 ### 5.4 监控与日志
 
-- `CALL system.index_cache_status()`：每执行器占用/命中；建议采集为指标。
+- `CALL system.index_cache_status()`：每执行器占用/命中；`bytes` 是整文件条目与 list 块的合计常驻字节，建议采集为指标。
 - `CALL system.index_build_status(...)`：构建进度与失败原因。
 - 日志关键字：`INDEX_CACHE`（每次查询的缓存摘要）、`TIMING search+resolve` / `TIMING merge`（改写路径的分段耗时）。
 - 告警建议：`list_indexes` 连续失败（§6 第一行）；查询 P99 突增且 `index_cache_status` 显示占用远小于索引体积（缓存没生效）；`check_indexes` 报 needs_rebuild。
@@ -278,7 +280,10 @@ docker push hub.i.basemind.com/spark/sparkann-e2e:<tag>
 
 查询期的正常调参走**语句参数**（`CALL ... nprobe => ...`、`SELECT ... FROM vector_search(..., nprobe => ...)`）
 或 **session conf**（`SET spark.iceberg.index.vector.ivf.nprobe=...`），优先级是
-**语句 > session > 索引定义默认**，见 `docs/docs/spark-procedures.md` 与 `docs/index-user-guide.md`。
+**语句 > session**：`nprobe` 以调用值为准，session 值只对 IVF 生效，非 IVF 索引上显式传 `nprobe`
+报错。`filter_mode` 不是调用参数，只有 session 配置 `spark.iceberg.index.vector.filter-mode`，
+且只在 `ORDER BY vec_distance` 改写带过滤时生效。见 `docs/docs/spark-procedures.md` 与
+`docs/index-user-guide.md`。
 
 ## 6. 安全与权限
 

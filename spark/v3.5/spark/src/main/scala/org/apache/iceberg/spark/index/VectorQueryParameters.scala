@@ -21,6 +21,14 @@ package org.apache.iceberg.spark.index
 import java.lang.{Long => JLong}
 import java.util.{Map => JMap}
 import org.apache.iceberg.index.vector.VectorIndexDefinition
+
+/**
+ * One setting as the layer that supplied it reported it.
+ *
+ * <p>{@code locked} says whether the value is passed on as the query's own instruction instead of
+ * staying a default: a call's argument is, and so is a configured multiple or index name, while a
+ * configured probe count is not, because the encoder reads that setting itself.
+ */
 private[spark] case class VectorParameter(
     value: String,
     origin: String,
@@ -52,12 +60,13 @@ private[spark] object VectorQueryParameters {
   val IndexNameConf = "spark.iceberg.index.vector.name"
 
   /**
-   * How a query's filter is applied: before the search, after it, or by the rule that decides which
+   * How a filter that a rewrite carries into the search is applied: before the search, or after it.
    *
-   * <p>The link an operator is not told about is the one that cannot surprise it, so this is the
-   * query's own decision rather than a property of the table, and it is a choice between two links
-   * rather than a rule that picks one: a query that was not asked how to filter is answered the way
-   * it always was, not the way a threshold guessed.
+   * <p>The link an operator is not told about is the one that cannot surprise it, so this is a
+   * session setting rather than a property of the table, and it is a choice between two links rather
+   * than a rule that picks one: a query that was not asked how to filter is answered the way it
+   * always was, not the way a threshold guessed. It is not an argument a call can name, because it
+   * describes the rewrite that carries the filter, not the search a call asks for.
    */
   val FilterModeConf = "spark.iceberg.index.vector.filter-mode"
 
@@ -65,7 +74,9 @@ private[spark] object VectorQueryParameters {
    * The probe count a query uses when it names none.
    *
    * <p>It is read from the same setting the encoder reads, so a count the session sets and a count
-   * the call passes cannot disagree about which one is in force.
+   * the call passes cannot disagree about which one is in force. Only a count the call names is
+   * handed to the encoder explicitly; a configured one is read by the encoder itself, which is what
+   * keeps an index that does not probe lists ignoring it.
    */
   val NprobeConf: String = org.apache.iceberg.index.spark.VectorIndexSearch.IVF_NPROBE
 
@@ -88,21 +99,20 @@ private[spark] object VectorQueryParameters {
       session: JMap[String, String],
       submit: JMap[String, String],
       indexArgument: String): RawVectorParameters =
-    capture(session, submit, indexArgument, null, null, null)
+    capture(session, submit, indexArgument, null, null)
 
   def capture(
       session: JMap[String, String],
       submit: JMap[String, String],
       indexArgument: String,
       nprobeArgument: String,
-      overSampleArgument: String = null,
-      filterModeArgument: String = null): RawVectorParameters = {
+      overSampleArgument: String = null): RawVectorParameters = {
     require(session != null, "Session configuration cannot be null")
     require(submit != null, "Submit configuration cannot be null")
     val overSample = argued(overSampleArgument, configured(session, submit, OverSampleConf))
     val index = argued(indexArgument, configured(session, submit, IndexNameConf))
-    val filterMode = argued(filterModeArgument, configured(session, submit, FilterModeConf))
-    val nprobe = argued(nprobeArgument, configured(session, submit, NprobeConf))
+    val filterMode = configured(session, submit, FilterModeConf)
+    val nprobe = namedProbe(nprobeArgument, configured(session, submit, NprobeConf))
     RawVectorParameters(overSample, index, filterMode, nprobe)
   }
 
@@ -127,6 +137,25 @@ private[spark] object VectorQueryParameters {
       configured.origin
     } else {
       s"${configured.origin},${configured.shadowedOrigin}"
+    }
+  }
+
+  /**
+   * The probe count the encoder is told to use, or null when the encoder reads the session's itself.
+   *
+   * <p>Only a count the call named travels with the query. A configured one is the setting the
+   * encoder reads at the same point it always did, so it stays a default rather than an instruction:
+   * a value that is not passed cannot be mistaken for one the call asked for, and an index that does
+   * not probe lists keeps ignoring the session. The origin of the configured value is kept, so a log
+   * still says which layer supplied it.
+   */
+  private def namedProbe(argument: String, configuredValue: VectorParameter): VectorParameter = {
+    if (argument != null) {
+      VectorParameter(argument, "CALL_ARGUMENT", true, shadowedBy(configuredValue))
+    } else if (configuredValue == null) {
+      null
+    } else {
+      configuredValue.copy(locked = false)
     }
   }
 
@@ -211,8 +240,9 @@ private[spark] object VectorQueryParameters {
   /**
    * The probe count the query asks for, or zero when it asks for the encoder's default.
    *
-   * <p>A count that is not a positive integer fails the query: probing a different number of lists
-   * than the caller asked for would answer a different question.
+   * <p>A count that is not a positive integer that fits an int fails the query: probing a different
+   * number of lists than the caller asked for would answer a different question, and a count the
+   * encoder cannot represent cannot be trimmed to fit without asking one.
    */
   private def nprobeOf(parameter: VectorParameter): (Long, String, Boolean, String) = {
     if (parameter == null) {
@@ -228,6 +258,7 @@ private[spark] object VectorQueryParameters {
         case cause: NumberFormatException => throw new IllegalArgumentException(message, cause)
       }
     require(value > 0L, message)
+    require(value <= Integer.MAX_VALUE.toLong, message)
     (value, parameter.origin, parameter.locked, parameter.shadowedOrigin)
   }
 

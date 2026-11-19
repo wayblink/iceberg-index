@@ -24,6 +24,7 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
 import java.util.Map;
 import org.apache.iceberg.index.IndexAdapter;
@@ -129,11 +130,19 @@ class TestIvfRangeOpenReads {
     SeekableInputStream stream = new InMemoryInputFile(contents).newStream();
     byte[] tail = new byte[8];
     assertThat(VectorIndexAdapter.readTail(stream, contents.length, tail, 0, tail.length))
+        .as("a tail read reports the bytes it read")
         .isEqualTo(tail.length);
     assertThat(tail)
         .containsExactly(
             (byte) 56, (byte) 57, (byte) 58, (byte) 59, (byte) 60, (byte) 61, (byte) 62, (byte) 63);
-    assertThatThrownBy(() -> VectorIndexAdapter.readTail(stream, contents.length, tail, 0, 65))
+
+    // a tail read longer than the file reads the whole file and reports the actual byte count
+    byte[] whole = new byte[65];
+    assertThat(VectorIndexAdapter.readTail(stream, contents.length, whole, 0, whole.length))
+        .isEqualTo(contents.length);
+    assertThat(Arrays.copyOf(whole, contents.length)).containsExactly(contents);
+
+    assertThatThrownBy(() -> VectorIndexAdapter.readTail(stream, contents.length, tail, 0, -1))
         .isInstanceOf(IllegalArgumentException.class)
         .hasMessageContaining("Invalid tail read");
   }

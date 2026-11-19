@@ -88,6 +88,10 @@ final class IndexCacheDriverControl {
     return coordinator.result(planId);
   }
 
+  synchronized void recordRangeAccess(String indexUuid) {
+    coordinator.recordRangeAccess(indexUuid);
+  }
+
   synchronized void recordAccess(String indexUuid, long nowNanos) {
     coordinator.recordAccess(indexUuid, nowNanos);
   }

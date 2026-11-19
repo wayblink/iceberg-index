@@ -34,7 +34,14 @@ package org.apache.iceberg.index.vector;
  */
 public interface ListBlockCache {
 
-  /** What a cache has done since it was created. */
+  /**
+   * What one search's view of a cache did since the view was created.
+   *
+   * <p>A view belongs to one search, so the counters describe that search rather than the
+   * executor-wide cache. An implementation that shares one cache between searches must still keep
+   * the counters of each view apart: a caller that sums counters per task would otherwise count
+   * another task's activity, and the executor's lifetime counters more than once.
+   */
   record Stats(long hits, long misses, long loads, long evictions, long bytes) {
     public static final Stats EMPTY = new Stats(0L, 0L, 0L, 0L, 0L);
   }
@@ -49,15 +56,33 @@ public interface ListBlockCache {
   byte[] get(String location, int offset, int size);
 
   /**
-   * Keeps a copy of the block of one list.
+   * Keeps the block of one list, or as much of it as the cache's budget allows.
+   *
+   * <p>The cache keeps the array it is given rather than copying it: the bytes of a list block are
+   * immutable for the life of the index file, and a copy would double the memory a block costs. The
+   * cache must not modify the array, and a caller that hands one over must not modify it either.
    *
    * @param location the index file the block belongs to
    * @param offset the byte offset of the list's block in the file payload
-   * @param bytes the block, which the cache must not modify
+   * @param bytes the block, which neither side may modify after the call
    */
   void put(String location, int offset, byte[] bytes);
 
-  /** What the cache has done, for the search that reads it. */
+  /**
+   * Whether the cache holds the block of one list, without recording a lookup.
+   *
+   * <p>A planner asks this before it decides whether to read a range at all, so the question must
+   * not change the hit and miss counters a search reports.
+   *
+   * @param location the index file the block belongs to
+   * @param offset the byte offset of the list's block in the file payload
+   * @param size the length of the block
+   */
+  default boolean contains(String location, int offset, int size) {
+    return get(location, offset, size) != null;
+  }
+
+  /** What this search's view of the cache did, for the search that reads it. */
   default Stats stats() {
     return Stats.EMPTY;
   }

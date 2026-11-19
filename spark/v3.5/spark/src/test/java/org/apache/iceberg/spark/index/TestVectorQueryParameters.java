@@ -62,7 +62,7 @@ class TestVectorQueryParameters {
   void aProbeCountTheCallNamesWinsOverTheSession() {
     RawVectorParameters raw =
         VectorQueryParameters.capture(
-            Map.of(VectorQueryParameters.NprobeConf(), "8"), Map.of(), null, "64", null, null);
+            Map.of(VectorQueryParameters.NprobeConf(), "8"), Map.of(), null, "64", null);
 
     ResolvedVectorParameters chosen = VectorQueryParameters.decide(raw, FLAT);
     assertThat(chosen.nprobe())
@@ -78,8 +78,7 @@ class TestVectorQueryParameters {
   @Test
   void aProbeCountThatIsNotPositiveIsRefused() {
     for (String bad : new String[] {"0", "-1", "many", " "}) {
-      RawVectorParameters raw =
-          VectorQueryParameters.capture(Map.of(), Map.of(), null, bad, null, null);
+      RawVectorParameters raw = VectorQueryParameters.capture(Map.of(), Map.of(), null, bad, null);
       assertThatThrownBy(() -> VectorQueryParameters.decide(raw, FLAT))
           .as("%s is refused rather than answered with another probe count", bad)
           .isInstanceOf(IllegalArgumentException.class)
@@ -88,23 +87,49 @@ class TestVectorQueryParameters {
   }
 
   @Test
+  void aProbeCountThatDoesNotFitAnIntIsRefused() {
+    for (String bad : new String[] {"2147483648", "9223372036854775807"}) {
+      RawVectorParameters raw = VectorQueryParameters.capture(Map.of(), Map.of(), null, bad, null);
+      assertThatThrownBy(() -> VectorQueryParameters.decide(raw, FLAT))
+          .as("%s is refused rather than truncated to another count", bad)
+          .isInstanceOf(IllegalArgumentException.class)
+          .hasMessageContaining(VectorQueryParameters.NprobeConf());
+    }
+  }
+
+  @Test
+  void onlyAProbeCountTheCallNamesIsLocked() {
+    RawVectorParameters raw =
+        VectorQueryParameters.capture(
+            Map.of(VectorQueryParameters.NprobeConf(), "8"), Map.of(), null);
+
+    ResolvedVectorParameters chosen = VectorQueryParameters.decide(raw, FLAT);
+    assertThat(chosen.nprobe()).as("the session's count is resolved and reported").isEqualTo(8L);
+    assertThat(chosen.nprobeOrigin()).isEqualTo("SESSION_CONF");
+    assertThat(chosen.nprobeLocked())
+        .as("only a count the call named is handed to the encoder explicitly")
+        .isFalse();
+  }
+
+  @Test
   void theOtherKnobsCanComeFromTheCallToo() {
     RawVectorParameters raw =
         VectorQueryParameters.capture(
-            Map.of(VectorQueryParameters.OverSampleConf(), "5"), Map.of(), null, null, "0", "post");
+            Map.of(VectorQueryParameters.OverSampleConf(), "5"), Map.of(), null, null, "0");
 
     ResolvedVectorParameters chosen = VectorQueryParameters.decide(raw, FLAT);
     assertThat(chosen.overSample()).isZero();
     assertThat(chosen.overSampleOrigin()).isEqualTo("CALL_ARGUMENT");
     assertThat(chosen.overSampleShadowedOrigin()).isEqualTo("SESSION_CONF");
-    assertThat(chosen.filterMode()).isEqualTo(VectorQueryParameters.FilterModePost());
-    assertThat(chosen.filterModeOrigin()).isEqualTo("CALL_ARGUMENT");
+    assertThat(chosen.filterMode())
+        .as("the filter link is not one of the settings a call can name")
+        .isEqualTo(VectorQueryParameters.FilterModePre());
+    assertThat(chosen.filterModeOrigin()).isEqualTo("DEFAULT");
   }
 
   @Test
   void aCallValueThatIsNotANumberIsRefused() {
-    RawVectorParameters raw =
-        VectorQueryParameters.capture(Map.of(), Map.of(), null, null, "two", null);
+    RawVectorParameters raw = VectorQueryParameters.capture(Map.of(), Map.of(), null, null, "two");
     assertThatThrownBy(() -> VectorQueryParameters.decide(raw, FLAT))
         .isInstanceOf(IllegalArgumentException.class)
         .hasMessageContaining(VectorQueryParameters.OverSampleConf());
