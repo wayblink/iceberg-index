@@ -22,16 +22,23 @@ import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.nio.charset.StandardCharsets;
 import java.util.List;
+import java.util.Locale;
 import java.util.Set;
 import java.util.UUID;
+import java.util.function.Consumer;
 import org.apache.iceberg.io.FileIO;
 import org.apache.iceberg.io.OutputFile;
 import org.apache.iceberg.io.PositionOutputStream;
+import org.apache.iceberg.io.SeekableInputStream;
 import org.apache.iceberg.relocated.com.google.common.base.Preconditions;
+import org.apache.iceberg.relocated.com.google.common.base.Splitter;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableList;
 import org.apache.iceberg.relocated.com.google.common.collect.Lists;
 import org.apache.iceberg.relocated.com.google.common.collect.Sets;
+import org.apache.iceberg.relocated.com.google.common.io.ByteStreams;
 import org.apache.iceberg.util.ByteBuffers;
+import org.apache.iceberg.util.Tasks;
+import org.apache.iceberg.util.ThreadPools;
 
 /**
  * Writes the files of an index snapshot: entry-bearing index files, the index manifest that lists
@@ -69,6 +76,8 @@ public final class IndexSnapshotWriter {
   private static final String MANIFEST_LIST_MARKER = "ml";
   private static final String STATISTICS_MARKER = "statistics";
   private static final String MANIFEST_LIST_PREFIX = "index-manifest-list-";
+  private static final String FILE_COUNT = "files=";
+  private static final String MANIFEST_COUNT = "manifests=";
   private static final String ATTEMPT_SEPARATOR = "-attempt-";
 
   private final FileIO fileIO;
@@ -77,6 +86,8 @@ public final class IndexSnapshotWriter {
   private final int filesPerManifest;
   private final String attemptId;
   private final List<String> declaredPaths = Lists.newArrayList();
+  private int fileMarkers = 0;
+  private int manifestMarkers = 0;
 
   public IndexSnapshotWriter(FileIO fileIO) {
     this(fileIO, new PuffinIndexFileContainer(), DEFAULT_ENTRIES_PER_FILE);
@@ -122,7 +133,11 @@ public final class IndexSnapshotWriter {
    * cleanup finds that the attempt has stopped making progress.
    */
   public void completeAttempt(String indexLocation) {
-    writeMarker(indexLocation, COMPLETE_MARKER, "");
+    writeMarker(
+        indexLocation,
+        COMPLETE_MARKER,
+        String.format(
+            Locale.ROOT, "%s%d %s%d", FILE_COUNT, fileMarkers, MANIFEST_COUNT, manifestMarkers));
   }
 
   /**
@@ -158,9 +173,7 @@ public final class IndexSnapshotWriter {
    * after a partial write, and safe to call more than once.
    */
   public void abortAttempt(String indexLocation) {
-    for (String path : declaredPaths) {
-      deleteIfExists(path);
-    }
+    runInParallel(declaredPaths, this::deleteIfExists);
     deleteLedger(indexLocation);
   }
 
@@ -331,6 +344,11 @@ public final class IndexSnapshotWriter {
   public void record(String indexLocation, String marker, String location) {
     writeMarker(indexLocation, marker, location);
     declaredPaths.add(location);
+    if (marker.startsWith(FILE_MARKER_PREFIX)) {
+      fileMarkers += 1;
+    } else if (marker.startsWith(MANIFEST_MARKER_PREFIX) && !MANIFEST_LIST_MARKER.equals(marker)) {
+      manifestMarkers += 1;
+    }
   }
 
   /** Records the location of the snapshot statistics before writing it. */
@@ -352,28 +370,141 @@ public final class IndexSnapshotWriter {
     return indexLocation + "/" + STAGING_DIR + "/" + attemptId + "/" + marker;
   }
 
-  /** Deletes the ledger markers, keeping the paths they named. */
+  /**
+   * Deletes the ledger markers, keeping the paths they named.
+   *
+   * <p>The completion marker names how many markers the attempt wrote, so the markers are deleted
+   * directly instead of probing for the end of each sequence first: an attempt of 33 index files
+   * has 38 markers, and every probe is another round trip to the file store. An attempt that died
+   * before completing has no counts to read, and probing is the fallback that still cleans it.
+   */
   private void deleteLedger(String indexLocation) {
-    for (int seq = 0; markerExists(indexLocation, FILE_MARKER_PREFIX + seq); seq++) {
-      deleteIfExists(stagingPath(indexLocation, FILE_MARKER_PREFIX + seq));
+    int[] counts = ledgerCounts(indexLocation);
+    List<String> present = Lists.newArrayList();
+    if (counts != null) {
+      for (int seq = 0; seq < counts[0]; seq += 1) {
+        present.add(stagingPath(indexLocation, FILE_MARKER_PREFIX + seq));
+      }
+      for (int seq = 0; seq < counts[1]; seq += 1) {
+        present.add(stagingPath(indexLocation, MANIFEST_MARKER_PREFIX + seq));
+      }
     }
-    for (int seq = 0; markerExists(indexLocation, MANIFEST_MARKER_PREFIX + seq); seq++) {
-      deleteIfExists(stagingPath(indexLocation, MANIFEST_MARKER_PREFIX + seq));
+
+    // a marker written by an attempt that named no counts is only found by probing where its
+    // sequence ends, which also covers a sequence longer than the counts claim
+    addRemainingMarkers(indexLocation, FILE_MARKER_PREFIX, counts == null ? 0 : counts[0], present);
+    addRemainingMarkers(
+        indexLocation, MANIFEST_MARKER_PREFIX, counts == null ? 0 : counts[1], present);
+
+    // the completion marker is written after the manifest list, so its counts mean both exist
+    List<String> presentFixed = Lists.newArrayList();
+    if (counts != null) {
+      presentFixed.add(stagingPath(indexLocation, MANIFEST_LIST_MARKER));
+      presentFixed.add(stagingPath(indexLocation, COMPLETE_MARKER));
     }
-    deleteIfExists(stagingPath(indexLocation, MANIFEST_LIST_MARKER));
-    deleteIfExists(stagingPath(indexLocation, STATISTICS_MARKER));
-    deleteIfExists(stagingPath(indexLocation, COMPLETE_MARKER));
-    deleteIfExists(stagingPath(indexLocation, STARTED_MARKER));
+
+    runInParallel(present, this::deleteMarker);
+    runInParallel(presentFixed, this::deleteMarker);
+    List<String> optional =
+        counts == null
+            ? List.of(
+                stagingPath(indexLocation, MANIFEST_LIST_MARKER),
+                stagingPath(indexLocation, STATISTICS_MARKER),
+                stagingPath(indexLocation, COMPLETE_MARKER),
+                stagingPath(indexLocation, STARTED_MARKER))
+            : List.of(
+                stagingPath(indexLocation, STATISTICS_MARKER),
+                stagingPath(indexLocation, STARTED_MARKER));
+    runInParallel(optional, this::deleteIfExists);
+  }
+
+  /** Adds the markers of a sequence that the completion counts did not name, by probing its end. */
+  private void addRemainingMarkers(
+      String indexLocation, String prefix, int from, List<String> markers) {
+    for (int seq = from; markerExists(indexLocation, prefix + seq); seq += 1) {
+      markers.add(stagingPath(indexLocation, prefix + seq));
+    }
+  }
+
+  /** The marker counts an attempt recorded when it completed, or null when it never did. */
+  private int[] ledgerCounts(String indexLocation) {
+    String content = readMarker(indexLocation, COMPLETE_MARKER);
+    if (content == null) {
+      return null;
+    }
+
+    int files = -1;
+    int manifests = -1;
+    for (String part : Splitter.on(' ').omitEmptyStrings().trimResults().split(content)) {
+      if (part.startsWith(FILE_COUNT)) {
+        files = parseCount(part.substring(FILE_COUNT.length()));
+      } else if (part.startsWith(MANIFEST_COUNT)) {
+        manifests = parseCount(part.substring(MANIFEST_COUNT.length()));
+      }
+    }
+
+    return files < 0 || manifests < 0 ? null : new int[] {files, manifests};
+  }
+
+  private static int parseCount(String value) {
+    try {
+      return Integer.parseInt(value);
+    } catch (NumberFormatException e) {
+      return -1;
+    }
+  }
+
+  private String readMarker(String indexLocation, String marker) {
+    String path = stagingPath(indexLocation, marker);
+    try (SeekableInputStream in = fileIO.newInputFile(path).newStream()) {
+      return new String(ByteStreams.toByteArray(in), StandardCharsets.UTF_8);
+    } catch (RuntimeException e) {
+      if (!exists(path)) {
+        return null;
+      }
+      throw e;
+    } catch (IOException e) {
+      throw new UncheckedIOException("Failed to read " + path, e);
+    }
   }
 
   private boolean markerExists(String indexLocation, String marker) {
-    return fileIO.newInputFile(stagingPath(indexLocation, marker)).exists();
+    return exists(stagingPath(indexLocation, marker));
+  }
+
+  private boolean exists(String path) {
+    return fileIO.newInputFile(path).exists();
   }
 
   private void deleteIfExists(String path) {
-    if (fileIO.newInputFile(path).exists()) {
-      fileIO.deleteFile(path);
+    if (exists(path)) {
+      deleteMarker(path);
     }
+  }
+
+  private void deleteMarker(String path) {
+    try {
+      fileIO.deleteFile(path);
+    } catch (RuntimeException e) {
+      // the marker is gone already: a sweep or a retry removed it, which is what was being asked
+      if (!exists(path)) {
+        return;
+      }
+      throw e;
+    }
+  }
+
+  private void runInParallel(List<String> paths, Consumer<String> delete) {
+    if (paths.isEmpty()) {
+      return;
+    }
+
+    Tasks.foreach(paths)
+        .executeWith(ThreadPools.getDeleteWorkerPool())
+        .run(
+            path -> {
+              delete.accept(path);
+            });
   }
 
   private void write(String location, ThrowingWrite write) {

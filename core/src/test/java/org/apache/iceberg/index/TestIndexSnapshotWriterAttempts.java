@@ -27,9 +27,14 @@ import java.nio.ByteBuffer;
 import java.nio.file.Path;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.stream.Collectors;
 import org.apache.iceberg.TestTables.LocalFileIO;
 import org.apache.iceberg.index.IndexManifestList.ManifestRef;
+import org.apache.iceberg.io.FileIO;
+import org.apache.iceberg.io.InputFile;
+import org.apache.iceberg.io.OutputFile;
+import org.apache.iceberg.io.SeekableInputStream;
 import org.apache.iceberg.relocated.com.google.common.collect.Lists;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
@@ -430,6 +435,92 @@ class TestIndexSnapshotWriterAttempts {
     }
   }
 
+  @Test
+  public void cleanupDeletesEachMarkerOnce(@TempDir Path tempDir) throws IOException {
+    CountingFileIO fileIO = new CountingFileIO(new LocalFileIO());
+    IndexSnapshotWriter writer =
+        new IndexSnapshotWriter(
+            fileIO,
+            new PuffinIndexFileContainer(),
+            2,
+            IndexSnapshotWriter.DEFAULT_FILES_PER_MANIFEST,
+            "attempt-1");
+    String indexLocation = tempDir.resolve("indexes/index-uuid").toString();
+
+    writer.startAttempt(indexLocation);
+    List<IndexFile> indexFiles = writeManyFiles(writer, indexLocation, 33);
+    writer.writeManifestList(indexLocation, 1, indexFiles);
+    writer.completeAttempt(indexLocation);
+    assertThat(indexFiles).hasSize(33);
+
+    fileIO.resetCounts();
+    writer.finishAttempt(indexLocation);
+
+    // one delete per marker: 33 index files, 1 manifest, 1 manifest list, the completion marker and
+    // the start marker = 37; only the statistics marker is absent and is probed instead
+    assertThat(fileIO.deletes()).isEqualTo(37);
+    // only the end of a sequence is probed (two), plus the four markers that can be absent
+    assertThat(fileIO.existsProbes()).isLessThanOrEqualTo(7);
+    // the marker count comes from the completion marker, not from probing every marker
+    assertThat(fileIO.reads()).isEqualTo(1);
+    assertThat(fileIO.operations()).isLessThanOrEqualTo(45);
+    assertThat(new File(markerPath(indexLocation, "attempt-1", "f0"))).doesNotExist();
+    assertThat(new File(markerPath(indexLocation, "attempt-1", "complete"))).doesNotExist();
+    // the index files themselves survive: they belong to the snapshot now
+    assertThat(new File(indexFiles.get(0).location())).exists();
+  }
+
+  @Test
+  public void cleanupWorksWithoutACompletionMarker(@TempDir Path tempDir) throws IOException {
+    CountingFileIO fileIO = new CountingFileIO(new LocalFileIO());
+    IndexSnapshotWriter writer =
+        new IndexSnapshotWriter(
+            fileIO,
+            new PuffinIndexFileContainer(),
+            2,
+            IndexSnapshotWriter.DEFAULT_FILES_PER_MANIFEST,
+            "attempt-1");
+    String indexLocation = tempDir.resolve("indexes/index-uuid").toString();
+
+    List<IndexFile> indexFiles = writeFiles(writer, indexLocation);
+    writer.writeManifestList(indexLocation, 1, indexFiles);
+    fileIO.resetCounts();
+
+    // an attempt that never wrote its completion marker has no counts to read, so the cleanup falls
+    // back to probing where each marker sequence ends
+    writer.finishAttempt(indexLocation);
+
+    assertThat(new File(markerPath(indexLocation, "attempt-1", "f0"))).doesNotExist();
+    assertThat(new File(markerPath(indexLocation, "attempt-1", "m0"))).doesNotExist();
+    assertThat(new File(markerPath(indexLocation, "attempt-1", "ml"))).doesNotExist();
+    assertThat(fileIO.deletes()).isEqualTo(4);
+  }
+
+  @Test
+  public void cleanupToleratesAMarkerThatIsAlreadyGone(@TempDir Path tempDir) throws IOException {
+    CountingFileIO fileIO = new CountingFileIO(new LocalFileIO());
+    IndexSnapshotWriter writer =
+        new IndexSnapshotWriter(
+            fileIO,
+            new PuffinIndexFileContainer(),
+            2,
+            IndexSnapshotWriter.DEFAULT_FILES_PER_MANIFEST,
+            "attempt-1");
+    String indexLocation = tempDir.resolve("indexes/index-uuid").toString();
+
+    List<IndexFile> indexFiles = writeFiles(writer, indexLocation);
+    writer.writeManifestList(indexLocation, 1, indexFiles);
+    writer.completeAttempt(indexLocation);
+    // a sweep (or a retry) removed one marker before the cleanup got to it
+    assertThat(new File(markerPath(indexLocation, "attempt-1", "f0")).delete()).isTrue();
+
+    writer.finishAttempt(indexLocation);
+
+    assertThat(new File(markerPath(indexLocation, "attempt-1", "f1"))).doesNotExist();
+    assertThat(new File(markerPath(indexLocation, "attempt-1", "m0"))).doesNotExist();
+    assertThat(new File(markerPath(indexLocation, "attempt-1", "complete"))).doesNotExist();
+  }
+
   private static List<IndexFile> writeFiles(IndexSnapshotWriter writer, String indexLocation)
       throws IOException {
     TestingIndexAdapter adapter = new TestingIndexAdapter(TestingIndexDefinition.of(4));
@@ -443,6 +534,20 @@ class TestIndexSnapshotWriterAttempts {
                 IndexEntry.of("data-1.parquet", 1, TestingIndexAdapter.valuePayload(20)),
                 IndexEntry.of("data-2.parquet", 2, TestingIndexAdapter.valuePayload(15))));
     return indexFiles;
+  }
+
+  private static List<IndexFile> writeManyFiles(
+      IndexSnapshotWriter writer, String indexLocation, int files) throws IOException {
+    List<IndexEntry> entries = Lists.newArrayList();
+    for (int index = 0; index < files * 2; index += 1) {
+      entries.add(
+          IndexEntry.of(
+              "data-" + (index / 10) + ".parquet",
+              index,
+              TestingIndexAdapter.valuePayload((index + 1) * 10)));
+    }
+    return writer.writeIndexFiles(
+        indexLocation, 1, new TestingIndexAdapter(TestingIndexDefinition.of(4)), entries);
   }
 
   private static String markerPath(String indexLocation, String attemptId, String marker) {
@@ -466,6 +571,91 @@ class TestIndexSnapshotWriterAttempts {
         .location(tempDir.resolve(indexLocation).toString())
         .definition(TestingIndexDefinition.of(4))
         .build();
+  }
+
+  /** Counts the FileIO calls a cleanup makes, so an operation budget can be pinned. */
+  private static class CountingFileIO implements FileIO {
+    private final FileIO delegate;
+    private final AtomicInteger reads = new AtomicInteger();
+    private final AtomicInteger probes = new AtomicInteger();
+    private final AtomicInteger deletes = new AtomicInteger();
+
+    CountingFileIO(FileIO delegate) {
+      this.delegate = delegate;
+    }
+
+    void resetCounts() {
+      reads.set(0);
+      probes.set(0);
+      deletes.set(0);
+    }
+
+    int reads() {
+      return reads.get();
+    }
+
+    int existsProbes() {
+      return probes.get();
+    }
+
+    int deletes() {
+      return deletes.get();
+    }
+
+    int operations() {
+      return reads.get() + probes.get() + deletes.get();
+    }
+
+    @Override
+    public InputFile newInputFile(String path) {
+      return new CountingInputFile(delegate.newInputFile(path));
+    }
+
+    @Override
+    public InputFile newInputFile(String path, long length) {
+      return newInputFile(path);
+    }
+
+    @Override
+    public OutputFile newOutputFile(String path) {
+      return delegate.newOutputFile(path);
+    }
+
+    @Override
+    public void deleteFile(String path) {
+      deletes.incrementAndGet();
+      delegate.deleteFile(path);
+    }
+
+    private class CountingInputFile implements InputFile {
+      private final InputFile inputFile;
+
+      CountingInputFile(InputFile inputFile) {
+        this.inputFile = inputFile;
+      }
+
+      @Override
+      public long getLength() {
+        return inputFile.getLength();
+      }
+
+      @Override
+      public SeekableInputStream newStream() {
+        reads.incrementAndGet();
+        return inputFile.newStream();
+      }
+
+      @Override
+      public String location() {
+        return inputFile.location();
+      }
+
+      @Override
+      public boolean exists() {
+        probes.incrementAndGet();
+        return inputFile.exists();
+      }
+    }
   }
 
   /** An index file container that fails while writing, to model a build that dies mid-way. */
