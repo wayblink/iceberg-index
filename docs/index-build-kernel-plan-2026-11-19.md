@@ -68,10 +68,10 @@ CALL local.system.build_vector_index(
 校验与兼容：
 
 - 解析、范围校验放在 `IvfOptions`（和 `nlist` 一起），非法值在构建时直接失败并点名字段。
-- 查询侧同样通过 `IvfOptions.from(properties, quantizer)` 读定义：**新键必须先在一个版本里被“接受并忽略”，下个版本才允许写入**。否则旧版本节点遇到带新键的索引会在打开时抛 “Unknown IVF option”。滚动升级期间不要用新参数构建，这一条写进升级说明。
+- 查询侧同样通过 `IvfOptions.from(properties, quantizer)` 读定义：实现是**同版本接受并写入**，没有“先接受并忽略”的过渡版本。因此带新键的索引需要**同版本或更新版本**的节点读取；旧版本节点遇到带新键的索引会在打开时抛 “Unknown IVF option”。滚动升级窗口内不要用新参数构建，这一条写进升级说明（用户指南 §4.2 同口径）。
 - `ivf-build-kernel` 属阶段二，引入时另行确认（本文只占位，不实现）。
 
-运行事实的记录：`IndexFileMemory.structure` 里增加 `train-samples`、`train-iterations`、`train-tolerance`、`assign-kernel`、`build-kernel` 五个键（该 map 已有 `entry-count`、`list-count` 等，读者按需取键，新增不影响内存估算），`list_indexes` 能看到每个索引文件实际用了什么参数、跑了多少轮。
+运行事实的记录：`IndexFileMemory.structure` 里增加 `train-samples`、`train-iterations`、`train-tolerance-ppm`、`assign-kernel-simd`、`build-kernel-native` 五个键（该 map 已有 `entry-count`、`list-count` 等，读者按需取键，新增不影响内存估算）。`assign-kernel-simd` 记录归属内核实际跑成了哪一个（JVM 没开 incubator 模块时为 0），`train-tolerance-ppm` 是生效的收敛阈值（百万分之一），`build-kernel-native` 在阶段二之前恒为 0。`list_indexes` 的输出没有 `structure` 列，这些实际值目前只能从构建日志读到（每写一个索引文件一条 `Encoded an IVF payload … over N rounds and M samples`）。
 
 ## 4. 阶段一：Java 能力项
 
@@ -197,9 +197,27 @@ CALL local.system.build_vector_index(
 
 ## 9. 风险与未决
 
-1. **参数的前向兼容**：带新键的索引旧版本读不了。必须先发“接受并忽略”的版本，再允许写入；滚动升级窗口内禁用新参数。
+1. **参数的前向兼容**：带新键的索引旧版本读不了。实现是同版本接受并写入，没有“接受并忽略”的过渡版本，所以滚动升级窗口内禁用新参数，等所有节点都升到同一版本后再使用。
 2. **P2b 的质量与可移植性**：float32 归属在近等距处的差异要靠 recall 门限兜底；Vector API 是 incubator，JDK 版本变化可能改代码生成，需要按 JDK 版本记录基准。
-3. **P4 的收益未验证**：并发读能否到 100 MB/s 以上、会不会与 delete 语义打架，都是 spike 要回答的；拿不到就不做，别硬上。
+3. **P4 的收益**：spike 与真机 A/B 已完成，实现保留（本机 4 流 122.7 MiB/s 对串行 54.5 MiB/s；集群按 build stage 口径验收，见 #3143 卡面与 §10）；并发读把秒级长尾重叠掉，delete 语义由新增测试覆盖。
 4. **阶段二的格式双实现**：Java 与 Rust 两套 writer 是长期腐烂点，必须用 golden + recall 双层测试钉住；`ivf-build-kernel` 的灰度与回退要真的可用。
 5. **训练参数的推荐值需要真实召回数据**：本方案只给方法（A/B + 门限）和候选值（8/3/0.001），最终值由 oss32 与 ex103m 的实测决定，且默认值不改。
 6. **构建耗时不等于查询性能**：所有优化都只对构建生效；查询侧的 4.2× 差距（#3131 的 nlist=1 对照）是另一个课题，不在本文范围。
+
+## 10. 实现状态（2026-11-19）
+
+阶段一的六项均已实现并合入 `index` 分支：
+
+| 项 | 内容 | 卡 | 提交 | 状态 |
+|---|---|---|---|---|
+| P0 | IVF 构建分阶段计时，参数与实际轮数写进 `structure` | #3138 | `7899b86e2a` | 已合入 |
+| P1 | 一个 payload 的 list 并行编码 | #3139 | `3fb696e459` | 已合入 |
+| P2a | 向量块 × 质心的精确归属内核（默认路径） | #3140 | `13397de974` | 已合入 |
+| P2b | Vector API 归属内核（`ivf-assign-kernel=simd`） | #3141 | `1a92ea349c` | 已合入，默认休眠 |
+| P3 | 训练预算三参数 + 收敛判据 | #3142 | `97f9cff329` | 已合入 |
+| P4 | 索引组的数据文件四流并发读 | #3143 | `fb26db225a` | 已合入 |
+| 阶段二 | native 构建内核（N0–N3） | — | — | 未开始 |
+
+- P2b 默认休眠：只有定义里显式写 `ivf-assign-kernel=simd` 才走 SIMD 内核，且执行器 JVM 要带 `--add-modules jdk.incubator.vector`；没开模块时自动回退 P2a 并留一条 WARN，`structure` 的 `assign-kernel-simd` 为 0。
+- P0/P1/P2a/P4 不动默认产物；P3 三个键不写时产物与旧版本逐字节一致。
+- 阶段二（`ivf-build-kernel=native`）尚未开始，§5 仍是方案而非实现。

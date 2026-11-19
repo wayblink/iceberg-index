@@ -33,6 +33,12 @@ subprojects {
       task sourceJar(type: Jar, dependsOn: classes) {
         archiveClassifier.set('sources')
         from sourceSets.main.allSource
+        if (project.name == 'iceberg-index-vector') {
+          // the vector API kernel is a separate source set that ships in this module's main jar,
+          // so its sources belong in the sources jar of the module that ships its classes; its
+          // files are added one by one because adding the source set itself copies each twice
+          from(sourceSets.simd.allSource.files)
+        }
         group 'build'
       }
 
