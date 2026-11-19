@@ -173,7 +173,7 @@ DDL 必须给名字；`CALL` 在列上还没有索引时可以不命名。**`dim
 | `options['ivf-train-max-iterations']` | `'25'` | Lloyd 迭代轮数上限，1–100。调小能省训练时间，质心更粗。 |
 | `options['ivf-train-convergence-tolerance']` | `'0.0'` | 相邻两轮质心相对位移小于该值即提前停止，取值 0–0.1；`0` 表示默认的“质心逐位相等”判据。调大通常能早停，质量影响需用 recall 验证。 |
 | `options['ivf-assign-kernel']` | `'exact'` | 归属（最近质心）内核：`exact` 是标量 double 路径，`simd` 用 float32 + Vector API 加速。**只对 `l2` 生效**，`cosine` / `dot` 仍走各自的原路径。`simd` 需要执行器 JVM 带 `--add-modules jdk.incubator.vector`；不带时自动回退 `exact` 并在日志里留一条 WARN，索引文件 `structure` 的 `assign-kernel-simd` 记录实际是否跑成。 |
-| `options['ivf-build-kernel']` | `'java'` | IVF 构建内核：`java` 是默认实现，`native` 用 Rust 内核（**只对 `l2` 生效**，payload 与 `java` 逐字节相同）。native 需要执行器 JVM 能加载 `libiceberg_ivf_native`；加载失败、非 L2 或运行异常时自动回退 `java` 并告警，索引文件 `structure` 的 `build-kernel-native` 记录实际路径（1/0）。 |
+| `options['ivf-build-kernel']` | `'java'` | IVF 构建内核：`java` 是默认实现，`native` 用 Rust 内核（**只对 `l2` 生效**，payload 与 `java` 逐字节相同）。native 需要执行器 JVM 能加载 `libiceberg_ivf_native`（先在 `java.library.path` 找，再找 jar 内 `/org/apache/iceberg/index/vector/native/<os>-<arch>/` 下的副本），且库与本桥的 ABI 版本一致；库缺失、ABI 不符、非 L2 或运行异常都会自动回退 `java` 并告警，索引文件 `structure` 的 `build-kernel-native` 记录实际路径（1/0）。 |
 | `max_entries_per_index_file` | 1,000,000 | 索引文件的条目预算，决定如何分组；不拆单个数据文件 |
 | `name` | 无 | 同列多索引时必须给 |
 | `mode` | 无 | 旧名，`EXACT`→`FLAT`、`HNSW`→`HNSW`；与 `structure` 同时给会报错 |
@@ -186,24 +186,33 @@ DDL 必须给名字；`CALL` 在列上还没有索引时可以不命名。**`dim
 
 ### 4.2.1 用 native 内核构建（实验，默认关闭）
 
-IVF 的构建默认由 JVM 完成（`ivf-build-kernel=java`）。把它设为 `native` 时，训练、归属与量化改由 Rust 内核执行：Java 侧仍然解码一次向量并按块交给 native，写出的 payload 与 Java 内核逐字节相同，`structure` 里只有 `build-kernel-native` 一项不同（1 表示 native 真的跑了，0 表示回退）。native 只实现 `l2`，`cosine` / `dot` 会忽略该键并回退 Java。
+IVF 的构建默认由 JVM 完成（`ivf-build-kernel=java`）。把它设为 `native`，训练、归属与量化三段的算术改由 Rust 内核执行：Java 侧只负责规划、把每条 entry 的 payload 原样按块送过去、接收回传的索引 payload，**不再在 Java 侧解码整单元向量**（早期版本会先解成 `float[][]`，那条路径现在只留给桥接层自己的测试）。写出的 payload 与 Java 内核逐字节相同，`structure` 里只有 `build-kernel-native` 一项不同（1 表示 native 真的跑了，0 表示回退）。native 只实现 `l2`，`cosine` / `dot` 会忽略该键并回退 Java。
 
-**部署前提（当前版本）**：native 库还没有打进 jar，必须由部署侧放到 driver 与每个执行器的 JVM 库路径上。
+#### 部署：库从哪来
+
+加载顺序是固定的：先试 `java.library.path` 上的 `libiceberg_ivf_native`，失败再找 runtime jar 里按平台放的副本（`/org/apache/iceberg/index/vector/native/<os>-<arch>/libiceberg_ivf_native.so`，`<os>` 取 `linux` / `macos` / `windows`，`<arch>` 取 `x86_64` / `aarch64`）。两条都不成、或库能加载但 ABI 版本对不上（桥当前读 ABI 2），该次构建打一条 WARN 说明原因并回退 Java——**产物照样正确，只是丢掉性能收益**。
+
+实际部署有两种做法，选一种即可：
+
+1. **打进 jar（推荐，也是我们镜像的做法）**：把 release 库放到 `index-vector/src/main/resources/org/apache/iceberg/index/vector/native/linux-x86_64/`，再构建 runtime jar；shaded jar 会把它带上，执行器不需要任何额外配置。
+2. **放节点目录 + JVM 参数**：库放在所有节点都能读到的路径，再给 driver 与 executor 加参数。
 
 ```bash
-# 仓库自带的 gradle 任务只构建 dev 档（opt-level=1，给测试用），性能对比必须自己建 release
+# 仓库自带的 gradle 任务只构建 dev 档（opt-level=1，供测试用），性能对比必须自己建 release
 cd index-vector/native && cargo build --release
 # 产物：target/release/libiceberg_ivf_native.{so,dylib}（Windows 为 .dll）
 ```
-
-把库文件放到所有节点都能读到的目录，再给 Spark 加 JVM 参数：
 
 ```text
 spark.driver.extraJavaOptions    -Djava.library.path=/opt/iceberg/native
 spark.executor.extraJavaOptions  -Djava.library.path=/opt/iceberg/native
 ```
 
-**启用方式**（建索引时写进定义，建完不可改）：
+**平台与工具链**：linux x86_64 与 linux aarch64 是一等目标（x86_64 运行时按 AVX-512 → AVX2 → 标量分派，aarch64 走 NEON），macOS 只作开发用。x86_64 上的编码器用了 AVX-512 intrinsics，需要 Rust ≥ 1.89 才能编出那条路径；在没有 AVX-512 的机器上库照常工作，但编码退回自动向量化的标量路径，实测约 63.7 µs/向量（仍有约 1.7×，AVX-512 上约 22 µs）。
+
+#### 启用方式
+
+建索引时写进定义，建完不可改：
 
 ```sql
 ALTER TABLE db.t ALTER COLUMN embedding CREATE INDEX idx
@@ -214,11 +223,21 @@ ALTER TABLE db.t ALTER COLUMN embedding CREATE INDEX idx
 
 `CALL system.build_vector_index(...)` 的 `options` 参数同样接受这个键。
 
-**怎么确认跑成**：构建日志里每条索引文件会有一条 `Built an IVF payload … with the native kernel`；否则有一条 WARN 说明回退原因。索引文件 `structure` 的 `build-kernel-native` 为 1 才算真的 native；`list_indexes` 看不到 structure，只能从 `definition` 读到请求的值。
+#### 怎么确认跑成
 
-**性能**：x86 单机、40,000 行 × 2560 维、nlist=570、4-bit、4 线程、release 构建下，整单元 209,616 ms → 32,082 ms（6.53×；train 6.65×、assign 7.33×、encode 约 10×），两边 payload 长度与 SHA-256 相同。那是单元级、单机、共享负载（load≈4.7）下的背靠背测量，不是集群 `build_ms`，集群 A/B（N2）还在做；也不要拿 dev 档的库去对比。按同口径外推到 326k 行的真实单元约 348 s → 55 s，外推不是实测。
+构建日志里每条索引文件会有一条 `Built an IVF payload … with the native kernel`（native 路径没有 decode 段；Java 路径才有 `decode N ms`）；失败时有一条 WARN 说明回退原因，例如库缺失、`java.library.path` 上没有、jar 里缺该平台副本、ABI 版本不符。索引文件 `structure` 的 `build-kernel-native` 为 1 才算真的 native；`list_indexes` 看不到 structure，只能从 `definition` 读到请求的值。
 
-**边界**：这是实验能力，默认关闭；库缺失、版本不匹配、非 L2、运行时异常都会静默回退 Java（日志留 WARN），一致性由测试保证，但回退会丢掉性能收益。带 `ivf-build-kernel` 的定义旧版本读不了，滚动升级窗口内不要用。
+#### 性能
+
+单元级（x86 单机、40,000 行 × 2560 维、nlist=570、4-bit、4 线程、release 库、同一 JVM 背靠背）：整单元 209,616 ms → 32,082 ms（6.53×；train 6.65×、assign 7.33×、encode 约 10×），两边 payload 长度与 SHA-256 相同。
+
+集群（10,784,907 行 × 2560 维、33 个 340k 行单元、12 executor × 4c × 24g + 12g、`task_cpus` 4、同一镜像只差 `ivf-build-kernel`）：native `build_ms` **236,687 ms**，33/33 索引文件 `build-kernel-native=1`、无回退，索引共 17,890,137,090 B；同镜像的 java 臂 `1,097,833 ms`（**4.64×**）。每单元中位 74.1 s，其中约 34.5 s 是 train/assign/encode/read，其余约 40 s 是每个单元约 542 MB 索引文件写对象存储与发布段——**这时候瓶颈已经不在算术**，再压内核收益有限。
+
+读这几个数时注意口径：单元级是单机共享负载（load≈4.7）下的背靠背测量，集群是同一窗口串行两臂；跨 run 的 payload 字节会因数据文件分组不同而不同（总字节差约 0.001%），同一次构建内 java 与 native 才保证逐字节一致。也不要用 dev 档的库去对比性能。
+
+#### 边界
+
+实验能力，**默认仍是 java**，逐表切 native。回退是静默的（日志留 WARN）：库缺失、ABI 不符、非 L2、运行时异常都会退回 Java，一致性由测试保证（golden 逐字节对比 + 真实数据 SHA-256），但回退会丢掉性能收益。带 `ivf-build-kernel` 的定义旧版本读不了，滚动升级窗口内不要用。
 
 ### 4.3 查询：五种入口，先分清再用
 
