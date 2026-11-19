@@ -851,6 +851,10 @@ project(':iceberg-index-vector') {
 
   test {
     useJUnitPlatform()
+    // The vector API is an incubator module: without --add-modules the kernel cannot be loaded,
+    // and the tests that exercise it would be skipped instead of proving it works. CI runs this
+    // module on JDK 17 and 21, both of which carry the module.
+    jvmArgs '--add-modules', 'jdk.incubator.vector'
   }
 
   dependencies {

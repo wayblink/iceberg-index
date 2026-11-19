@@ -38,8 +38,10 @@ import org.junit.jupiter.params.provider.ValueSource;
  *
  * <p>Decoding, the k-means assignment and the final assignment each decide one row at a time, so a
  * build that splits those rows across threads must land on the same centroids and the same lists as
- * a build that does not. Anything that reorders the float sums of k-means would break this, which
- * is why the accumulation stays on one thread.
+ * a build that does not. What would break this is a thread-local change to the arithmetic, such as
+ * splitting a row's squared distance into several accumulators: the sums would round differently
+ * and a row near a tie could choose another list. The blocked assignment kernel therefore keeps the
+ * dimension-order sum and only changes which rows a thread walks.
  */
 class TestIvfBuildThreads {
   private static final int DIMENSION = 32;

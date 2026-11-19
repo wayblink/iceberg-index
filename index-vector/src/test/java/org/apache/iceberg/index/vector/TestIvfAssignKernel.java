@@ -202,6 +202,53 @@ class TestIvfAssignKernel {
   }
 
   @Test
+  void aKernelThatCannotBeLoadedLeavesTheBuildOnTheExactKernel() {
+    ClassLoader failingLoader =
+        new ClassLoader(IvfKernel.class.getClassLoader()) {
+          @Override
+          protected Class<?> loadClass(String name, boolean resolve) throws ClassNotFoundException {
+            if (name.equals("org.apache.iceberg.index.vector.SimdAssignKernel")) {
+              throw new ClassNotFoundException(name);
+            }
+
+            return super.loadClass(name, resolve);
+          }
+        };
+
+    assertThat(IvfKernel.loadKernel(failingLoader))
+        .as("a loader that cannot produce the kernel yields no kernel")
+        .isNull();
+
+    float[][] vectors = randomVectors(new Random(3141L), 300, 64);
+    float[][] centroids = randomVectors(new Random(3142L), 64, 64);
+    assertThat(IvfKernel.nearestCentroidL2Simd(vectors, centroids, 2, null))
+        .as("without a kernel the caller is told to keep the exact one")
+        .isNull();
+  }
+
+  @Test
+  void theVectorizedKernelKeepsTheEarlierListOnAnExactTie() {
+    Assumptions.assumeTrue(
+        vectorApiAvailable(), "the vector API is not on this JVM's module graph");
+
+    // dimension 64 is four full lanes of the preferred species, so the tie is decided by the
+    // vector path rather than by the tail loop that a 4-dimension test would reach
+    float[][] vectors = {new float[64]};
+    float[] first = new float[64];
+    first[0] = 1.0f;
+    first[8] = 1.0f;
+    float[] second = new float[64];
+    second[1] = 1.0f;
+    second[9] = 1.0f;
+    float[][] centroids = {first, second};
+
+    AssignKernel kernel = IvfKernel.loadKernel(IvfKernel.class.getClassLoader());
+    assertThat(IvfKernel.nearestCentroidL2Simd(vectors, centroids, 1, kernel))
+        .as("both centroids are exactly as far away, so the earlier list keeps the row")
+        .containsExactly(IvfKernel.nearestCentroidL2(vectors, centroids, 1));
+  }
+
+  @Test
   void theSimdKernelOnlyReplacesTheL2Assignment() {
     Assumptions.assumeTrue(
         vectorApiAvailable(), "the vector API is not on this JVM's module graph");

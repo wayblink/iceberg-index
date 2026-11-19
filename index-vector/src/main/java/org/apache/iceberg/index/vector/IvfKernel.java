@@ -124,8 +124,6 @@ public final class IvfKernel implements VectorKernel, RetainedBytes {
    * <p>It is reset when a build starts and read when the build records what it spent, so a
    * definition that asked for the kernel but ran on a JVM that could not load it says zero.
    */
-  private boolean simdAssignUsed;
-
   private IvfKernel(
       int dimension, IvfOptions options, VectorScoring scoring, RaBitQQuantizer quantizer) {
     this.dimension = dimension;
@@ -169,7 +167,6 @@ public final class IvfKernel implements VectorKernel, RetainedBytes {
     Preconditions.checkNotNull(entries, "Index entries are null");
     List<IndexEntry> materialized = Lists.newArrayList(entries);
     int count = materialized.size();
-    simdAssignUsed = false;
 
     List<String> dataFiles = VectorPayloads.dataFilesOf(materialized);
     // How many threads this build may use. One keeps every loop on the path it always took, so a
@@ -184,7 +181,8 @@ public final class IvfKernel implements VectorKernel, RetainedBytes {
     Trained trained = listCount == 0 ? Trained.none() : train(vectors, listCount, threads);
     float[][] centroids = trained.centroids;
     long trainedNanos = System.nanoTime();
-    int[][] assignments = assign(vectors, centroids, threads);
+    Assigned assigned = assign(vectors, centroids, threads);
+    int[][] assignments = assigned.members;
     long assignedNanos = System.nanoTime();
     // every list is encoded on its own: the quantizer of a list is trained on that list's vectors,
     // and the data file dictionary is only read, so the lists can be encoded in parallel and then
@@ -298,7 +296,7 @@ public final class IvfKernel implements VectorKernel, RetainedBytes {
             // the build-time knobs that trade quality against time; zero is what a definition that
             // sets none of them runs, and a definition that set a tolerance records it here
             Map.entry("train-tolerance-ppm", options.tolerancePartsPerMillion()),
-            Map.entry("assign-kernel-simd", simdAssignUsed ? 1L : 0L),
+            Map.entry("assign-kernel-simd", assigned.simd ? 1L : 0L),
             Map.entry("build-kernel-native", 0L)));
   }
 
@@ -1364,7 +1362,7 @@ public final class IvfKernel implements VectorKernel, RetainedBytes {
       // float32 assignment there would move every list rather than the rows near a tie. The
       // option accelerates the pass that places the vectors of the file, which is the measured
       // one, and a build that sets it still trains the centres the exact kernel trains.
-      int[] assignment = nearestCentroid(sample, centroids, threads, false);
+      int[] assignment = nearestCentroid(sample, centroids, threads, false).assignment;
       float[][] sums = new float[listCount][dimension];
       int[] sizes = new int[listCount];
       for (int i = 0; i < sample.length; i++) {
@@ -1465,12 +1463,13 @@ public final class IvfKernel implements VectorKernel, RetainedBytes {
    * <p>A dropped list is a centroid no vector is closest to; keeping it would only add a partition
    * that a search might visit and find empty.
    */
-  private int[][] assign(float[][] vectors, float[][] centroids, int threads) {
+  private Assigned assign(float[][] vectors, float[][] centroids, int threads) {
     if (centroids.length == 0) {
-      return new int[0][];
+      return new Assigned(new int[0][], false);
     }
 
-    int[] assignment = nearestCentroid(vectors, centroids, threads, options.simdAssignKernel());
+    Nearest nearest = nearestCentroid(vectors, centroids, threads, options.simdAssignKernel());
+    int[] assignment = nearest.assignment;
     int[][] members = new int[centroids.length][];
     int[] sizes = new int[centroids.length];
     for (int list : assignment) {
@@ -1487,7 +1486,29 @@ public final class IvfKernel implements VectorKernel, RetainedBytes {
       members[list][filled[list]++] = i;
     }
 
-    return members;
+    return new Assigned(members, nearest.simd);
+  }
+
+  /** The lists one build assigned, and whether the vectorized kernel produced them. */
+  private static final class Assigned {
+    private final int[][] members;
+    private final boolean simd;
+
+    private Assigned(int[][] members, boolean simd) {
+      this.members = members;
+      this.simd = simd;
+    }
+  }
+
+  /** The list each vector chose, and whether the vectorized kernel chose them. */
+  private static final class Nearest {
+    private final int[] assignment;
+    private final boolean simd;
+
+    private Nearest(int[] assignment, boolean simd) {
+      this.assignment = assignment;
+      this.simd = simd;
+    }
   }
 
   /**
@@ -1497,18 +1518,17 @@ public final class IvfKernel implements VectorKernel, RetainedBytes {
    * writes only its own slots: the assignment is the one a single thread would have produced, in
    * the same order and to the same list.
    */
-  private int[] nearestCentroid(
+  private Nearest nearestCentroid(
       float[][] vectors, float[][] centroids, int threads, boolean simdKernel) {
     if (scoring.metric() == VectorIndexDefinition.Metric.L2) {
       if (simdKernel) {
         int[] vectorized = nearestCentroidL2Simd(vectors, centroids, threads);
         if (vectorized != null) {
-          simdAssignUsed = true;
-          return vectorized;
+          return new Nearest(vectorized, true);
         }
       }
 
-      return nearestCentroidL2(vectors, centroids, threads);
+      return new Nearest(nearestCentroidL2(vectors, centroids, threads), false);
     }
 
     // a cosine or dot-product assignment keeps walking one vector at a time: the blocked kernel
@@ -1523,7 +1543,7 @@ public final class IvfKernel implements VectorKernel, RetainedBytes {
             assignment[i] = nearestCentroidOf(vectors[i], centroids);
           }
         });
-    return assignment;
+    return new Nearest(assignment, false);
   }
 
   /**
@@ -1562,14 +1582,22 @@ public final class IvfKernel implements VectorKernel, RetainedBytes {
    * same vectors and centroids.
    */
   static int[] nearestCentroidL2Simd(float[][] vectors, float[][] centroids, int threads) {
+    return nearestCentroidL2Simd(vectors, centroids, threads, SimdAssignHolder.kernel());
+  }
+
+  /**
+   * The same assignment with the kernel given, or {@code null} for none: a caller that has to prove
+   * the fallback path uses it without depending on whether the JVM opened the incubator module.
+   */
+  static int[] nearestCentroidL2Simd(
+      float[][] vectors, float[][] centroids, int threads, AssignKernel kernel) {
+    if (kernel == null) {
+      return null;
+    }
+
     int[] assignment = new int[vectors.length];
     if (vectors.length == 0 || centroids.length == 0) {
       return assignment;
-    }
-
-    AssignKernel kernel = SimdAssignHolder.kernel();
-    if (kernel == null) {
-      return null;
     }
 
     int dimension = centroids[0].length;
@@ -1590,32 +1618,36 @@ public final class IvfKernel implements VectorKernel, RetainedBytes {
    * inside a worker, and the build then falls back to the exact kernel.
    */
   private static final class SimdAssignHolder {
-    private static final AssignKernel KERNEL = load();
-
-    private static AssignKernel load() {
-      try {
-        Class<?> type =
-            Class.forName(SIMD_ASSIGN_KERNEL_CLASS, true, IvfKernel.class.getClassLoader());
-        AssignKernel kernel = (AssignKernel) type.getDeclaredConstructor().newInstance();
-        // running it once links the classes of the incubator module here, where a failure is
-        // caught, instead of leaving it to the first worker that calls the kernel; the probe is a
-        // full block of rows against two centroids, so both kernel paths run
-        float[][] vectors = {new float[16], new float[16], new float[16], new float[16]};
-        float[][] centroids = {new float[16], new float[16]};
-        kernel.assignRange(vectors, centroids, 16, new int[] {0, 4}, new int[4]);
-        return kernel;
-      } catch (ReflectiveOperationException | LinkageError e) {
-        LOG.warn(
-            "Cannot run the vector API assignment kernel, so builds that ask for it fall back to"
-                + " the exact kernel. Start the JVM with --add-modules jdk.incubator.vector to use"
-                + " it.",
-            e);
-        return null;
-      }
-    }
+    private static final AssignKernel KERNEL = loadKernel(IvfKernel.class.getClassLoader());
 
     private static AssignKernel kernel() {
       return KERNEL;
+    }
+  }
+
+  /**
+   * Loads the optional kernel with the given class loader, or returns {@code null} when it cannot
+   * be loaded or run. The probe runs here, on the calling thread, so a missing incubator module
+   * fails before a worker thread ever reaches the kernel.
+   */
+  static AssignKernel loadKernel(ClassLoader loader) {
+    try {
+      Class<?> type = Class.forName(SIMD_ASSIGN_KERNEL_CLASS, true, loader);
+      AssignKernel kernel = (AssignKernel) type.getDeclaredConstructor().newInstance();
+      // running it once links the classes of the incubator module here, where a failure is
+      // caught, instead of leaving it to the first worker that calls the kernel; the probe is a
+      // full block of rows against two centroids, so both kernel paths run
+      float[][] vectors = {new float[16], new float[16], new float[16], new float[16]};
+      float[][] centroids = {new float[16], new float[16]};
+      kernel.assignRange(vectors, centroids, 16, new int[] {0, 4}, new int[4]);
+      return kernel;
+    } catch (ReflectiveOperationException | LinkageError e) {
+      LOG.warn(
+          "Cannot run the vector API assignment kernel, so builds that ask for it fall back to"
+              + " the exact kernel. Start the JVM with --add-modules jdk.incubator.vector to use"
+              + " it.",
+          e);
+      return null;
     }
   }
 
@@ -1687,28 +1719,17 @@ public final class IvfKernel implements VectorKernel, RetainedBytes {
   }
 
   /**
-   * The L2 distance of one row from a centroid, with the sum split into four accumulators to
-   * shorten the dependency chain.
+   * The L2 distance of one row from a centroid.
+   *
+   * <p>The sum is accumulated in the order the sequential kernel accumulated it, one dimension at a
+   * time. Splitting it into several accumulators shortens the dependency chain, but it also rounds
+   * the total differently, and a total that differs in its last bits can put a near-tied row under
+   * another centroid: the payload of a rebuild would then not be the one the previous build wrote.
+   * The block layout is what makes this loop fast without changing the sum.
    */
   private static double l2Distance(double[] rows, int base, double[] centroid, int dimension) {
-    double accumulator0 = 0.0;
-    double accumulator1 = 0.0;
-    double accumulator2 = 0.0;
-    double accumulator3 = 0.0;
-    int d = 0;
-    for (; d + 3 < dimension; d += 4) {
-      double difference0 = rows[base + d] - centroid[d];
-      double difference1 = rows[base + d + 1] - centroid[d + 1];
-      double difference2 = rows[base + d + 2] - centroid[d + 2];
-      double difference3 = rows[base + d + 3] - centroid[d + 3];
-      accumulator0 += difference0 * difference0;
-      accumulator1 += difference1 * difference1;
-      accumulator2 += difference2 * difference2;
-      accumulator3 += difference3 * difference3;
-    }
-
-    double squared = accumulator0 + accumulator1 + accumulator2 + accumulator3;
-    for (; d < dimension; d++) {
+    double squared = 0.0;
+    for (int d = 0; d < dimension; d++) {
       double difference = rows[base + d] - centroid[d];
       squared += difference * difference;
     }
@@ -1719,8 +1740,8 @@ public final class IvfKernel implements VectorKernel, RetainedBytes {
   /**
    * The L2 distance of two rows from one centroid, loading each centroid value once for both.
    *
-   * <p>Each row keeps its own four accumulators, so both distances are the ones {@link #l2Distance}
-   * would compute; sharing only the loads changes nothing about the sums.
+   * <p>Each row accumulates in dimension order, exactly as {@link #l2Distance} does; sharing the
+   * loads changes nothing about either sum, and the two rows give the loop two independent chains.
    */
   private static void l2DistancePair(
       double[] rows,
@@ -1729,43 +1750,9 @@ public final class IvfKernel implements VectorKernel, RetainedBytes {
       double[] centroid,
       int dimension,
       double[] distances) {
-    double first0 = 0.0;
-    double first1 = 0.0;
-    double first2 = 0.0;
-    double first3 = 0.0;
-    double second0 = 0.0;
-    double second1 = 0.0;
-    double second2 = 0.0;
-    double second3 = 0.0;
-    int d = 0;
-    for (; d + 3 < dimension; d += 4) {
-      double centroid0 = centroid[d];
-      double centroid1 = centroid[d + 1];
-      double centroid2 = centroid[d + 2];
-      double centroid3 = centroid[d + 3];
-
-      double firstDifference0 = rows[firstBase + d] - centroid0;
-      double firstDifference1 = rows[firstBase + d + 1] - centroid1;
-      double firstDifference2 = rows[firstBase + d + 2] - centroid2;
-      double firstDifference3 = rows[firstBase + d + 3] - centroid3;
-      first0 += firstDifference0 * firstDifference0;
-      first1 += firstDifference1 * firstDifference1;
-      first2 += firstDifference2 * firstDifference2;
-      first3 += firstDifference3 * firstDifference3;
-
-      double secondDifference0 = rows[secondBase + d] - centroid0;
-      double secondDifference1 = rows[secondBase + d + 1] - centroid1;
-      double secondDifference2 = rows[secondBase + d + 2] - centroid2;
-      double secondDifference3 = rows[secondBase + d + 3] - centroid3;
-      second0 += secondDifference0 * secondDifference0;
-      second1 += secondDifference1 * secondDifference1;
-      second2 += secondDifference2 * secondDifference2;
-      second3 += secondDifference3 * secondDifference3;
-    }
-
-    double firstSquared = first0 + first1 + first2 + first3;
-    double secondSquared = second0 + second1 + second2 + second3;
-    for (; d < dimension; d++) {
+    double firstSquared = 0.0;
+    double secondSquared = 0.0;
+    for (int d = 0; d < dimension; d++) {
       double centroidValue = centroid[d];
       double firstDifference = rows[firstBase + d] - centroidValue;
       firstSquared += firstDifference * firstDifference;
@@ -1807,7 +1794,7 @@ public final class IvfKernel implements VectorKernel, RetainedBytes {
 
     int parts = Math.min(threads, count);
     ExecutorService pool = Executors.newFixedThreadPool(parts);
-    AtomicReference<RuntimeException> failure = new AtomicReference<>();
+    AtomicReference<Throwable> failure = new AtomicReference<>();
     CountDownLatch finished = new CountDownLatch(parts);
     try {
       for (int part = 0; part < parts; part++) {
@@ -1818,8 +1805,10 @@ public final class IvfKernel implements VectorKernel, RetainedBytes {
             () -> {
               try {
                 body.accept(range);
-              } catch (RuntimeException e) {
-                failure.compareAndSet(null, e);
+              } catch (Throwable t) {
+                // an Error in a worker would otherwise end that thread with nothing recorded, and
+                // the build would continue on whatever slots the worker did not fill
+                failure.compareAndSet(null, t);
               } finally {
                 finished.countDown();
               }
@@ -1834,8 +1823,13 @@ public final class IvfKernel implements VectorKernel, RetainedBytes {
       pool.shutdownNow();
     }
 
-    if (failure.get() != null) {
-      throw failure.get();
+    Throwable failed = failure.get();
+    if (failed instanceof RuntimeException runtimeException) {
+      throw runtimeException;
+    }
+
+    if (failed instanceof Error error) {
+      throw error;
     }
   }
 

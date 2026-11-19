@@ -275,6 +275,27 @@ class TestIvfKernel {
   }
 
   @Test
+  void aNearTieIsDecidedTheWayTheSequentialKernelDecidedIt() {
+    // the sum is accumulated one dimension after another, so its last bits are the sequential
+    // kernel's. With the sum split over four accumulators these two distances would differ and
+    // the row would move to the second list, while a rebuild of the same file is expected to
+    // reproduce the same partitions.
+    float[][] vectors = {new float[8]};
+    float[][] centroids = {
+      {1e8f, 1f, 1f, 1f, 1f, 1f, 1f, 1f},
+      {1e8f, 0f, 0f, 0f, 0f, 0f, 0f, 0f}
+    };
+    int[] expected = referenceAssign(vectors, centroids);
+
+    assertThat(IvfKernel.nearestCentroidL2(vectors, centroids, 1))
+        .as("a blocked kernel decides a near tie the way the sequential one did")
+        .containsExactly(expected);
+    assertThat(IvfKernel.nearestCentroidL2(vectors, centroids, 4))
+        .as("threads split the rows, not the sum")
+        .containsExactly(expected);
+  }
+
+  @Test
   void theBlockedKernelWritesTheBytesTheSequentialKernelWrote() {
     // digests of the payloads the sequential kernel wrote at index@3fb696e459, taken before the
     // blocking change: the block order and the four accumulators must not move a single byte of
