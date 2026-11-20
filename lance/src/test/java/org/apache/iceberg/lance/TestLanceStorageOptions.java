@@ -20,8 +20,10 @@ package org.apache.iceberg.lance;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
+import java.util.List;
 import java.util.Map;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableMap;
+import org.apache.iceberg.relocated.com.google.common.collect.Maps;
 import org.junit.jupiter.api.Test;
 
 /**
@@ -105,6 +107,23 @@ class TestLanceStorageOptions {
 
   @Test
   void theLanceStoragePrefixWinsOverAnIcebergEquivalent() {
+    // either insertion order, and a map that does not keep one: the escape hatch is applied in a
+    // pass of its own, so it cannot be overtaken by the translated spelling beside it
+    Map<String, String> hdfsFirst = Maps.newLinkedHashMap();
+    hdfsFirst.put("fs.s3a.endpoint", "http://from-hadoop:9000");
+    hdfsFirst.put("lance.storage.endpoint", "http://explicit:8080");
+
+    Map<String, String> lanceFirst = Maps.newLinkedHashMap();
+    lanceFirst.put("lance.storage.endpoint", "http://explicit:8080");
+    lanceFirst.put("fs.s3a.endpoint", "http://from-hadoop:9000");
+
+    Map<String, String> unordered = Maps.newHashMap(hdfsFirst);
+
+    for (Map<String, String> properties : List.of(hdfsFirst, lanceFirst, unordered)) {
+      assertThat(LanceStorageOptions.from(properties))
+          .isEqualTo(ImmutableMap.of("endpoint", "http://explicit:8080"));
+    }
+
     assertThat(
             LanceStorageOptions.from(
                 ImmutableMap.of(

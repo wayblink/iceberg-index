@@ -83,6 +83,8 @@ final class LanceStorageOptions {
     Map<String, String> options = Maps.newHashMap();
     List<String> unmapped = Lists.newArrayList();
 
+    // Two passes, not one: the explicit escape hatch is applied after every translation, so a
+    // setting spelled both ways resolves to the explicit one whatever order the map iterates in.
     for (Map.Entry<String, String> entry : properties.entrySet()) {
       String key = entry.getKey();
       String value = entry.getValue();
@@ -109,14 +111,21 @@ final class LanceStorageOptions {
         if (sslEnabled != null) {
           options.put("allow_http", Boolean.toString(!sslEnabled));
         }
-      } else if (key.startsWith(LANCE_PREFIX)) {
-        // explicit Lance escape hatch, applied last so it wins over a translated equivalent
-        String lanceKey = key.substring(LANCE_PREFIX.length());
-        if (!lanceKey.isEmpty()) {
-          options.put(lanceKey, value);
-        }
-      } else if (looksLikeStorageConfig(key)) {
+      } else if (!key.startsWith(LANCE_PREFIX) && looksLikeStorageConfig(key)) {
         unmapped.add(key);
+      }
+    }
+
+    for (Map.Entry<String, String> entry : properties.entrySet()) {
+      String key = entry.getKey();
+      String value = entry.getValue();
+      if (value == null || !key.startsWith(LANCE_PREFIX)) {
+        continue;
+      }
+
+      String lanceKey = key.substring(LANCE_PREFIX.length());
+      if (!lanceKey.isEmpty()) {
+        options.put(lanceKey, value);
       }
     }
 
