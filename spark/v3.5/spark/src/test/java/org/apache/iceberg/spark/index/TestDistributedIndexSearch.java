@@ -207,7 +207,7 @@ class TestDistributedIndexSearch {
     assertThat(reader.indexFiles(query))
         .hasSize(2)
         .allSatisfy(
-            file -> assertThat(file.blobType()).isEqualTo(TextIndexAdapter.AUXILIARY_BLOB_TYPE_V2));
+            file -> assertThat(file.blobType()).isEqualTo("iceberg-text-bm25-v2"));
     String statistics = built.latestSnapshot().properties().get("snapshot-statistics-location");
     assertThat(statistics).isNotBlank();
     assertThat(table.io().newInputFile(statistics).exists()).isTrue();
