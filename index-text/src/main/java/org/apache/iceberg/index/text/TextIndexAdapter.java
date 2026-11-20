@@ -656,7 +656,7 @@ public final class TextIndexAdapter implements IndexAdapter, java.io.Serializabl
         out.writeInt(tokens.size());
         for (String token : tokens) {
           byte[] tokenBytes = token.getBytes(StandardCharsets.UTF_8);
-          out.writeShort(tokenBytes.length);
+          out.writeInt(tokenBytes.length);
           out.write(tokenBytes);
         }
       }
@@ -672,10 +672,22 @@ public final class TextIndexAdapter implements IndexAdapter, java.io.Serializabl
       buffer.duplicate().get(bytes);
       try (DataInputStream in = new DataInputStream(new ByteArrayInputStream(bytes))) {
         int count = in.readInt();
+        int remaining = bytes.length - Integer.BYTES;
+        if (count < 0 || count > remaining) {
+          throw new IOException("Invalid token count: " + count);
+        }
+
         List<String> tokens = Lists.newArrayListWithCapacity(count);
         for (int i = 0; i < count; i++) {
-          byte[] tokenBytes = new byte[in.readUnsignedShort()];
+          int length = in.readInt();
+          remaining -= Integer.BYTES;
+          if (length < 0 || length > remaining) {
+            throw new IOException("Invalid token length: " + length);
+          }
+
+          byte[] tokenBytes = new byte[length];
           in.readFully(tokenBytes);
+          remaining -= length;
           tokens.add(new String(tokenBytes, StandardCharsets.UTF_8));
         }
         return tokens;
