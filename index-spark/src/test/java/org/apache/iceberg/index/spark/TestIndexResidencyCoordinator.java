@@ -435,6 +435,25 @@ class TestIndexResidencyCoordinator {
   }
 
   @Test
+  void anAnswerToTheBlockMarkerEndsTheCommand() {
+    coordinator.report(node("a", "a-1", 1, 100));
+    coordinator.recordRangeAccess("A");
+
+    String offload = coordinator.acceptOffload("A", clock.now());
+    IndexCacheProtocol.Command marker =
+        coordinator.report(node("a", "a-1", 2, 100)).commands().get(0);
+
+    // the marker names the index rather than a managed file, so no planned file records its answer:
+    // a refusal has to end the command too, or every later report re-sends it and the plan never
+    // reaches a terminal status
+    coordinator.ack(ack(offload, "a", "a-1", marker, IndexCacheProtocol.AckStatus.REJECTED));
+    assertThat(coordinator.result(offload).status()).isEqualTo(IndexCacheProtocol.Status.OFFLOADED);
+    assertThat(coordinator.commands("a", "a-1"))
+        .filteredOn(command -> command.type() == IndexCacheProtocol.CommandType.RELEASE)
+        .isEmpty();
+  }
+
+  @Test
   void offloadFencesInFlightLoadSoALateAckCannotPublish() {
     coordinator.report(node("a", "a-1", 1, 100));
     String load =

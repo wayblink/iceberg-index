@@ -666,7 +666,7 @@ final class IndexResidencyCoordinator {
           IndexCacheProtocol.File.builder()
               .location(copy.location)
               .cacheKey(copy.cacheKey)
-              .owner(modeFor(copy.cacheKey))
+              .owner(ownerOf(copy.cacheKey))
               .build();
       if (plan.planned(copy.cacheKey) == null) {
         plan.addFile(file);
@@ -1007,10 +1007,18 @@ final class IndexResidencyCoordinator {
     }
 
     IndexCacheProtocol.File file = plan.planned(command.cacheKey);
-    // Query-only blocks have no planned managed file to associate with a release.
-    if (file == null
-        && (command.type != IndexCacheProtocol.CommandType.RELEASE
-            || ack.status() != IndexCacheProtocol.AckStatus.RELEASED)) {
+    if (file == null && command.type == IndexCacheProtocol.CommandType.RELEASE) {
+      // A release with no planned file is the marker that drops the blocks a query warmed on an
+      // executor that holds no managed copy of the index. Whatever the executor answers, the
+      // command is over: it is not recorded against a planned file, so leaving it queued would
+      // re-send it on every report and keep the offload plan in RELEASING for good.
+      node.delivered(ack.commandId());
+      plan.released.add(replicaKey(command.cacheKey, command.executorId));
+      node.settle(ack.commandId());
+      return;
+    }
+
+    if (file == null) {
       return;
     }
 
@@ -1492,7 +1500,7 @@ final class IndexResidencyCoordinator {
             "LOAD",
             IndexCacheProtocol.CommandType.LOAD,
             target.indexUuid(),
-            modeFor(file.cacheKey()),
+            ownerOf(file.cacheKey()),
             file,
             file.estimatedBytes(),
             plan.epoch,
@@ -1521,7 +1529,7 @@ final class IndexResidencyCoordinator {
               IndexCacheProtocol.File.builder()
                   .location(holder.location())
                   .cacheKey(holder.cacheKey())
-                  .owner(modeFor(holder.cacheKey()))
+                  .owner(ownerOf(holder.cacheKey()))
                   .build(),
               holder.bytes(),
               holder.epoch(),
@@ -1596,7 +1604,7 @@ final class IndexResidencyCoordinator {
           "MIGRATE",
           IndexCacheProtocol.CommandType.LOAD,
           index.indexUuid,
-          modeFor(file.cacheKey()),
+          ownerOf(file.cacheKey()),
           file,
           file.estimatedBytes(),
           plan.epoch,
@@ -1686,7 +1694,7 @@ final class IndexResidencyCoordinator {
         IndexCacheProtocol.File.builder()
             .location(migrated.location)
             .cacheKey(migrated.cacheKey)
-            .owner(modeFor(migrated.cacheKey))
+            .owner(ownerOf(migrated.cacheKey))
             .build(),
         migrated.bytes,
         source.epoch(),
@@ -1752,7 +1760,7 @@ final class IndexResidencyCoordinator {
             IndexCacheProtocol.File.builder()
                 .location(holder.location())
                 .cacheKey(holder.cacheKey())
-                .owner(modeFor(holder.cacheKey()))
+                .owner(ownerOf(holder.cacheKey()))
                 .build(),
             holder.bytes(),
             victim.epoch,
@@ -2274,7 +2282,7 @@ final class IndexResidencyCoordinator {
         IndexCacheProtocol.File.builder()
             .location(orphan.location)
             .cacheKey(orphan.cacheKey)
-            .owner(modeFor(orphan.cacheKey))
+            .owner(ownerOf(orphan.cacheKey))
             .build(),
         orphan.bytes,
         orphan.epoch,
@@ -2335,9 +2343,10 @@ final class IndexResidencyCoordinator {
     return cacheKey + "@" + executorId;
   }
 
-  private static String modeFor(String cacheKey) {
-    String[] parts = cacheKey.split("\\|", 3);
-    return parts.length == 3 ? parts[0] : "OTHER";
+  /** The owner segment of a cache key, which is the table location it was built for. */
+  private static String ownerOf(String cacheKey) {
+    int separator = cacheKey.indexOf('|');
+    return separator < 0 ? cacheKey : cacheKey.substring(0, separator);
   }
 
   private static IndexCacheProtocol.File file(IndexCacheProtocol.Target target, String location) {
