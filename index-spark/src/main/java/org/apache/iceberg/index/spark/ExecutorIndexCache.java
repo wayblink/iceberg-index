@@ -1652,8 +1652,11 @@ final class ExecutorIndexCache {
 
   /** The index file a cache key names, which is the location its list blocks are kept under. */
   private static String locationOf(String cacheKey) {
-    String[] parts = cacheKey.split("\\|", 3);
-    return parts.length == 3 ? parts[2] : cacheKey;
+    // the key is owner|adapterClass|blobType:readerKey|location, so the location is the last
+    // segment: splitting from the left stops at the adapter segment, which itself carries the blob
+    // type and the reader key and so already accounts for one of the separators
+    int separator = cacheKey.lastIndexOf('|');
+    return separator < 0 ? cacheKey : cacheKey.substring(separator + 1);
   }
 
   private long bytes() {
@@ -1783,7 +1786,13 @@ final class ExecutorIndexCache {
       Map<String, Long> reservedByPlan,
       Map<String, Long> reservedByCommand) {}
 
-  /** One coherent snapshot of all retained files and reservations, including lazy queries. */
+  /**
+   * One coherent snapshot of all retained files and reservations, including lazy queries.
+   *
+   * <p>{@code usedBytes} counts the whole files only: the list blocks are charged where they are
+   * admitted but are deliberately outside the retained-state model, which is what the reported
+   * bytes come from. See {@link #chargeSnapshot()} for why they cannot be folded into it.
+   */
   MemoryUsage memoryUsage() {
     synchronized (mapLock) {
       drainPendingReleases();
@@ -2766,6 +2775,16 @@ final class ExecutorIndexCache {
         reservedBytes);
   }
 
+  /**
+   * The retained state of this cache as the memory model states it.
+   *
+   * <p>List blocks are outside the model on purpose. A charge drives admission, where the bytes
+   * promised to an outstanding load are the peak the publication adds over {@code usedBytes}; block
+   * bytes that no planned file owns would make that difference meaningless, and an admission could
+   * then reserve a negative amount. The blocks are instead charged where they are admitted, from
+   * the room the whole files leave spare, so they cannot overrun the budget either; only the
+   * reported whole-file bytes leave them out.
+   */
   ChargeSnapshot chargeSnapshot() {
     synchronized (mapLock) {
       drainPendingReleases();

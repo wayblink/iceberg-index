@@ -194,7 +194,7 @@ class TestExecutorIndexCache {
   }
 
   @Test
-  void reportedBytesIncludeListBlocks() {
+  void theCacheCountsTheBytesOfItsListBlocks() {
     ExecutorIndexCache.Config enabled = config(1 << 20);
     ListBlockCache blocks = cache.listBlocks(enabled);
 
@@ -663,9 +663,15 @@ class TestExecutorIndexCache {
     return ExecutorIndexCache.Config.of(true, maxBytes);
   }
 
-  /** The key shape {@code DistributedIndexSearch.cacheKey} builds for a managed index file. */
+  /**
+   * The key shape {@code DistributedIndexSearch.cacheKey} builds for a managed index file.
+   *
+   * <p>The adapter segment carries the blob type and the reader key, so the key has four segments
+   * and the file location is the last of them. A key with the location as the third segment would
+   * hide a parser that stops before the adapter's own separator.
+   */
   private static String cacheKey(String owner, String adapter, String location) {
-    return owner + "|" + adapter + "|" + location;
+    return owner + "|" + adapter + "|" + adapter + ":reader|" + location;
   }
 
   /** A PIN_HOT cache admits a file on its second ask, so asking twice is what plants an entry. */
