@@ -22,6 +22,7 @@ import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.util.HashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
@@ -79,7 +80,9 @@ public final class SparkIndexBuilder {
   private static final Logger LOG = LoggerFactory.getLogger(SparkIndexBuilder.class);
 
   private static final String DATA_DIR = "data";
-  private static final String FILE_MARKER_PREFIX = "f";
+
+  /** How many failed data files a report names; the reason and the count cover the rest. */
+  private static final int FAILED_FILES_IN_SUMMARY = 5;
 
   static {
     // the vector and text adapters live in their own modules; register them with the core registry
@@ -90,7 +93,45 @@ public final class SparkIndexBuilder {
   private SparkIndexBuilder() {}
 
   /**
-   * Builds a full index snapshot for the given source table snapshot.
+   * The outcome of a build: the metadata it produced, and the data files it could not index.
+   *
+   * <p>A build that loses a group to an error publishes what the other groups wrote instead of
+   * discarding hours of work: the index answers for the files it covers, and a query scans the
+   * rest. The outcome is how the caller learns that what it published is not everything, so that
+   * the report says {@code PARTIAL} rather than claiming a coverage the index does not have.
+   */
+  public static final class BuildOutcome {
+    private final IndexMetadata metadata;
+    private final IndexFileBatch batch;
+
+    private BuildOutcome(IndexMetadata metadata, IndexFileBatch batch) {
+      this.metadata = metadata;
+      this.batch = batch;
+    }
+
+    /** The metadata with the new snapshot appended, not yet published. */
+    public IndexMetadata metadata() {
+      return metadata;
+    }
+
+    /** The data files the build could not index; empty when it covered every one of them. */
+    public Set<String> failedDataFiles() {
+      return batch.failedDataFiles();
+    }
+
+    /** Whether the build indexed every data file it was asked to. */
+    public boolean complete() {
+      return batch.complete();
+    }
+
+    /** What went wrong with the files that were not indexed, for the report and the log. */
+    public String summary() {
+      return batch.summary();
+    }
+  }
+
+  /**
+   * Builds a full index snapshot for the given source table snapshot, or fails.
    *
    * @param spark the Spark session
    * @param table the Iceberg table to index
@@ -99,6 +140,9 @@ public final class SparkIndexBuilder {
    * @param vectorColumn the name of the numeric array column to index
    * @param timestampMillis the publication timestamp of the new snapshot
    * @return updated metadata with the new snapshot appended, not yet published
+   * @throws RuntimeException the failure of the group that could not be indexed, since an index
+   *     that silently skips data is worse than one that was not built. A caller that would rather
+   *     publish the rest asks for {@link #buildAllowingPartial}.
    */
   public static IndexMetadata build(
       SparkSession spark,
@@ -107,6 +151,51 @@ public final class SparkIndexBuilder {
       long sourceTableSnapshotId,
       String vectorColumn,
       long timestampMillis) {
+    return build(
+            spark,
+            table,
+            currentMetadata,
+            sourceTableSnapshotId,
+            vectorColumn,
+            timestampMillis,
+            false)
+        .metadata();
+  }
+
+  /**
+   * Builds a full index snapshot, publishing what it could write when a data file cannot be
+   * indexed.
+   *
+   * <p>Only a build that wrote at least one index file is published: a build that lost every group
+   * has nothing to answer from, so it fails instead of publishing an empty index.
+   *
+   * @param spark the Spark session
+   * @param table the Iceberg table to index
+   * @param currentMetadata the index metadata to extend
+   * @param sourceTableSnapshotId the source table snapshot to build from
+   * @param vectorColumn the name of the numeric array column to index
+   * @param timestampMillis the publication timestamp of the new snapshot
+   * @return the metadata and the data files the build could not index
+   */
+  public static BuildOutcome buildAllowingPartial(
+      SparkSession spark,
+      Table table,
+      IndexMetadata currentMetadata,
+      long sourceTableSnapshotId,
+      String vectorColumn,
+      long timestampMillis) {
+    return build(
+        spark, table, currentMetadata, sourceTableSnapshotId, vectorColumn, timestampMillis, true);
+  }
+
+  private static BuildOutcome build(
+      SparkSession spark,
+      Table table,
+      IndexMetadata currentMetadata,
+      long sourceTableSnapshotId,
+      String vectorColumn,
+      long timestampMillis,
+      boolean allowPartial) {
     validateSourceExists(table, sourceTableSnapshotId);
 
     IndexAdapter adapter = adapterFor(currentMetadata);
@@ -115,12 +204,12 @@ public final class SparkIndexBuilder {
     FileIO fileIO = table.io();
 
     IndexSnapshotWriter writer = new IndexSnapshotWriter(fileIO);
-    List<IndexFile> indexFiles;
+    IndexFileBatch batch;
     String manifestList;
     Map<String, String> snapshotProperties;
     try {
       writer.startAttempt(indexLocation);
-      indexFiles =
+      batch =
           buildIndexFiles(
               spark,
               table,
@@ -132,10 +221,18 @@ public final class SparkIndexBuilder {
               adapter,
               null,
               currentMetadata.maxEntriesPerIndexFile(),
-              writer);
+              writer,
+              allowPartial);
+      if (!batch.complete() && batch.indexFiles().isEmpty()) {
+        // nothing was written: an empty snapshot would look like an index that answers nothing
+        writer.abortAttempt(indexLocation);
+        throw new IllegalStateException(batch.summary());
+      }
+
       snapshotProperties =
-          writeTextStatistics(spark, table, adapter, indexLocation, snapshotId, indexFiles, writer);
-      manifestList = writer.writeManifestList(indexLocation, snapshotId, indexFiles);
+          writeTextStatistics(
+              spark, table, adapter, indexLocation, snapshotId, batch.indexFiles(), writer);
+      manifestList = writer.writeManifestList(indexLocation, snapshotId, batch.indexFiles());
     } catch (Exception | Error e) {
       writer.abortAttempt(indexLocation);
       throw e;
@@ -151,7 +248,7 @@ public final class SparkIndexBuilder {
             .indexManifestList(manifestList)
             .properties(snapshotProperties)
             .build();
-    return currentMetadata.withSnapshot(snapshot);
+    return new BuildOutcome(currentMetadata.withSnapshot(snapshot), batch);
   }
 
   /**
@@ -162,6 +259,11 @@ public final class SparkIndexBuilder {
    * contents changed since the index was built: a delete file appeared for it, or a rewrite
    * replaced it. An index file covers whole data files, so a change to one of them rebuilds every
    * data file it covers. If nothing changed, the metadata is returned unchanged.
+   *
+   * <p>A refresh against the snapshot the index already answers for is not a no-op when the index
+   * does not cover every data file of that snapshot: the files it does not cover are built and the
+   * result replaces the previous build, which is how a build that could only finish part of a table
+   * is completed without rebuilding the part it did finish.
    *
    * @param spark the Spark session
    * @param table the Iceberg table to index
@@ -185,19 +287,27 @@ public final class SparkIndexBuilder {
           "Cannot refresh an index without an index snapshot; build it first");
     }
 
-    if (currentMetadata.snapshotForSourceTableSnapshot(sourceTableSnapshotId) != null) {
-      return currentMetadata;
+    FileIO fileIO = table.io();
+    Set<String> currentFiles =
+        Sets.newHashSet(IndexEntries.dataFiles(table, sourceTableSnapshotId));
+    IndexSnapshot already = currentMetadata.snapshotForSourceTableSnapshot(sourceTableSnapshotId);
+    if (already != null) {
+      Set<String> uncovered = Sets.difference(currentFiles, coveredDataFiles(fileIO, already));
+      if (uncovered.isEmpty()) {
+        return currentMetadata;
+      }
+
+      // the snapshot that answers for this source does not cover every data file: rebuild the gap
+      // on top of it and replace it, rather than appending a second build of the same source
+      previous = already;
     }
 
     validateSourceLineage(table, currentMetadata, sourceTableSnapshotId);
 
     IndexAdapter adapter = adapterFor(currentMetadata);
     String indexLocation = currentMetadata.location();
-    long snapshotId = previous.snapshotId() + 1;
-    FileIO fileIO = table.io();
+    long snapshotId = nextSnapshotId(currentMetadata);
 
-    Set<String> currentFiles =
-        Sets.newHashSet(IndexEntries.dataFiles(table, sourceTableSnapshotId));
     Set<String> previouslyCovered = coveredDataFiles(fileIO, previous);
     Set<String> removedFiles = Sets.difference(previouslyCovered, currentFiles);
     Set<String> newFiles = Sets.difference(currentFiles, previouslyCovered);
@@ -210,7 +320,7 @@ public final class SparkIndexBuilder {
             sourceTableSnapshotId,
             Sets.intersection(currentFiles, previouslyCovered));
     if (removedFiles.isEmpty() && newFiles.isEmpty() && deleteChangedFiles.isEmpty()) {
-      return currentMetadata.withSnapshot(
+      return currentMetadata.replaceSnapshot(
           previous.toBuilder()
               .snapshotId(snapshotId)
               .sourceTableSnapshotId(sourceTableSnapshotId)
@@ -259,17 +369,19 @@ public final class SparkIndexBuilder {
           rebuildFiles.isEmpty()
               ? Lists.newArrayList()
               : buildIndexFiles(
-                  spark,
-                  table,
-                  indexLocation,
-                  currentMetadata.indexUuid(),
-                  snapshotId,
-                  sourceTableSnapshotId,
-                  vectorColumn,
-                  adapter,
-                  rebuildFiles,
-                  currentMetadata.maxEntriesPerIndexFile(),
-                  writer);
+                      spark,
+                      table,
+                      indexLocation,
+                      currentMetadata.indexUuid(),
+                      snapshotId,
+                      sourceTableSnapshotId,
+                      vectorColumn,
+                      adapter,
+                      rebuildFiles,
+                      currentMetadata.maxEntriesPerIndexFile(),
+                      writer,
+                      false)
+                  .indexFiles();
       indexFiles = Lists.newArrayList(carried);
       indexFiles.addAll(newIndexFiles);
       snapshotProperties =
@@ -291,7 +403,7 @@ public final class SparkIndexBuilder {
             .indexManifestList(manifestList)
             .properties(snapshotProperties)
             .build();
-    return currentMetadata.withSnapshot(snapshot);
+    return currentMetadata.replaceSnapshot(snapshot);
   }
 
   /**
@@ -301,7 +413,7 @@ public final class SparkIndexBuilder {
    * one still builds, and the counters keep being published until the attempt ends, which is what
    * makes a build that stopped rather than finished visible afterwards.
    */
-  private static List<IndexFile> buildIndexFiles(
+  private static IndexFileBatch buildIndexFiles(
       SparkSession spark,
       Table table,
       String indexLocation,
@@ -312,7 +424,8 @@ public final class SparkIndexBuilder {
       IndexAdapter adapter,
       Set<String> onlyFiles,
       long maxEntriesPerIndexFile,
-      IndexSnapshotWriter writer) {
+      IndexSnapshotWriter writer,
+      boolean allowPartial) {
     // the counters are driver-side accumulators, which the reporter can read at any moment; how
     // many index files this attempt will write is only known once the data files are grouped, so
     // the total is filled in from inside
@@ -330,7 +443,7 @@ public final class SparkIndexBuilder {
             progress::rows);
 
     try {
-      List<IndexFile> indexFiles =
+      IndexFileBatch batch =
           buildIndexFilesUnreported(
               spark,
               table,
@@ -343,21 +456,29 @@ public final class SparkIndexBuilder {
               maxEntriesPerIndexFile,
               writer,
               progress,
-              reporter);
-      long failedFiles = progress.failed.value();
-      if (failedFiles > 0) {
-        // the build published what it could: the files that failed are not covered, and a query
-        // scans them instead of searching them. Saying so here is the only place the operator is
-        // guaranteed to look; the status report keeps the count, and check_indexes reports the gap.
-        LOG.warn(
-            "Index build for table {} finished with {} data files not indexed; the index covers the"
-                + " rest and queries scan the uncovered files until a refresh covers them",
-            table.name(),
-            failedFiles);
+              reporter,
+              allowPartial);
+      if (batch.complete()) {
+        reporter.succeeded();
+        return batch;
       }
 
-      reporter.succeeded();
-      return indexFiles;
+      // An incomplete batch only exists when a group was isolated, and a group is only isolated
+      // when the caller asked for it: the strict path rethrows the group's own failure instead,
+      // which fails the task and makes the collect above throw. So this is a partial build.
+      //
+      // The build published what it could: the files that failed are not covered, and a query
+      // scans them instead of searching them. Saying so here is the only place the operator is
+      // guaranteed to look; the status report keeps the count, and check_indexes reports the gap.
+      LOG.warn(
+          "Index build for table {} finished with {} data files not indexed; the index covers the"
+              + " rest and queries scan the uncovered files until a refresh covers them: {}",
+          table.name(),
+          batch.failedDataFiles().size(),
+          batch.summary());
+      reporter.partial(batch.summary());
+      return batch;
+
     } catch (Exception | Error e) {
       // Spark's Java APIs can throw checked exceptions without declaring them.
       reporter.failed(e);
@@ -368,10 +489,74 @@ public final class SparkIndexBuilder {
   }
 
   /**
+   * Whether a group's failure is about the data, which is what makes it a gap worth keeping.
+   *
+   * <p>Only a failure the same rows would produce again is one: a vector of the wrong width, a
+   * payload past the limit. A read that failed, an executor killed for its memory, or a bug in the
+   * engine may succeed when retried, so it fails the task instead of being recorded as a gap that a
+   * later refresh has to guess was never real.
+   */
+  static boolean isDataFailure(Throwable failure) {
+    return failure instanceof IllegalArgumentException;
+  }
+
+  /**
+   * The description of a partial build: how many data files are missing, which ones, and the reason
+   * the first group gave.
+   *
+   * <p>The names matter beyond the count: the driver log is where an operator looks, and the reason
+   * alone does not say which files to fix.
+   */
+  private static String summarizeFailure(Set<String> failedDataFiles, String firstFailure) {
+    int named = Math.min(FAILED_FILES_IN_SUMMARY, failedDataFiles.size());
+    String locations = String.join(", ", Lists.newArrayList(failedDataFiles).subList(0, named));
+    if (failedDataFiles.size() > named) {
+      locations += String.format(Locale.ROOT, " (and %d more)", failedDataFiles.size() - named);
+    }
+
+    return String.format(
+        Locale.ROOT,
+        "%s; %d data files could not be indexed and are not covered by this build: %s",
+        firstFailure,
+        failedDataFiles.size(),
+        locations);
+  }
+
+  /** What one attempt wrote, and what it could not index. */
+  private static final class IndexFileBatch {
+    private final List<IndexFile> indexFiles;
+    private final Set<String> failedDataFiles;
+    private final String summary;
+
+    private IndexFileBatch(
+        List<IndexFile> indexFiles, Set<String> failedDataFiles, String summary) {
+      this.indexFiles = indexFiles;
+      this.failedDataFiles = failedDataFiles;
+      this.summary = summary;
+    }
+
+    private List<IndexFile> indexFiles() {
+      return indexFiles;
+    }
+
+    private Set<String> failedDataFiles() {
+      return failedDataFiles;
+    }
+
+    private boolean complete() {
+      return failedDataFiles.isEmpty();
+    }
+
+    private String summary() {
+      return summary;
+    }
+  }
+
+  /**
    * Writes one index file per data file (restricted to {@code onlyFiles} when non-null) and returns
    * the index files without writing a manifest or snapshot.
    */
-  private static List<IndexFile> buildIndexFilesUnreported(
+  private static IndexFileBatch buildIndexFilesUnreported(
       SparkSession spark,
       Table table,
       String indexLocation,
@@ -383,9 +568,10 @@ public final class SparkIndexBuilder {
       long maxEntriesPerIndexFile,
       IndexSnapshotWriter writer,
       BuildProgress progress,
-      IndexBuildReporter reporter) {
+      IndexBuildReporter reporter,
+      boolean allowPartial) {
     if (onlyFiles != null && onlyFiles.isEmpty()) {
-      return Lists.newArrayList();
+      return new IndexFileBatch(Lists.newArrayList(), Sets.newHashSet(), "");
     }
 
     boolean writesAuxiliary = adapter.writesAuxiliaryFiles();
@@ -415,6 +601,9 @@ public final class SparkIndexBuilder {
     // task is deserialized before it runs
     JavaRDD<Row> allRows = null;
     List<JavaRDD<Row>> groups = Lists.newArrayList();
+    // the data files of each partition, by partition rather than by group id: a restricted build
+    // keeps the ids it was assigned, which are not the positions of the groups in this job
+    List<List<String>> dataFilesByPartition = Lists.newArrayList();
     for (List<FileScanTask> groupTasks : tasksByIndexFile.values()) {
       JavaRDD<Row> rows =
           IndexEntries.entryRows(spark, table, groupTasks, vectorColumn, adapter, progress.skipped);
@@ -422,6 +611,12 @@ public final class SparkIndexBuilder {
         // a group is one index file, so its rows have to reach one task; merging the partitions of
         // its data files is a narrow transformation, which is the point of reading this way
         groups.add(rows.coalesce(1));
+        List<String> groupFiles = Lists.newArrayListWithCapacity(groupTasks.size());
+        for (FileScanTask task : groupTasks) {
+          groupFiles.add(task.file().location().toString());
+        }
+
+        dataFilesByPartition.add(groupFiles);
       }
     }
 
@@ -441,7 +636,7 @@ public final class SparkIndexBuilder {
     }
 
     if (allRows == null) {
-      return Lists.newArrayList();
+      return new IndexFileBatch(Lists.newArrayList(), Sets.newHashSet(), "");
     }
 
     // how many cores the task writing an index file was given, which is what it may use to build
@@ -463,92 +658,129 @@ public final class SparkIndexBuilder {
     reporter.publishProgress();
     long buildStartedMillis = System.currentTimeMillis();
 
+    String tableName = table.name();
+    boolean groupIsolation = allowPartial;
     List<Row> indexFileRows =
         allRows
             .mapPartitionsWithIndex(
                 (index, iterator) -> {
                   int seq = index;
-                  List<IndexEntry> groupEntries = Lists.newArrayList();
-                  Set<String> covered = Sets.newLinkedHashSet();
-                  while (iterator.hasNext()) {
-                    Row row = iterator.next();
-                    covered.add(row.getString(0));
-                    groupEntries.add(IndexEntry.of(row.getString(0), row.getLong(1), row.getAs(2)));
-                  }
-
-                  String location =
-                      indexLocation
-                          + "/"
-                          + DATA_DIR
-                          + "/index-file-"
-                          + snapshotId
-                          + "-"
-                          + seq
-                          + "-"
-                          + UUID.randomUUID();
-                  String blobType;
-                  IndexBuildResult built;
-                  IndexFile.Kind kind;
-                  if (writesAuxiliary) {
-                    blobType = adapter.auxiliaryBlobType();
-                    built = adapter.encodeAuxiliaryPayloadWithMemory(groupEntries, buildThreads);
-                    kind = IndexFile.Kind.AUXILIARY;
-                  } else {
-                    blobType = adapter.entryBlobType();
-                    built = adapter.encodeEntriesWithMemory(groupEntries);
-                    kind = IndexFile.Kind.ENTRY_BEARING;
-                  }
-                  IndexFileMemory memory = built.memory();
-                  // Checked before the payload becomes one array: a file past the limit could be
-                  // written, published, and then rejected by every query that reads it.
-                  IndexPayloadLimits.checkFits(
-                      built.payload().remaining(), groupEntries.size(), location);
+                  List<String> groupFiles = dataFilesByPartition.get(index);
                   try {
+                    List<IndexEntry> groupEntries = Lists.newArrayList();
+                    Set<String> covered = Sets.newLinkedHashSet();
+                    while (iterator.hasNext()) {
+                      Row row = iterator.next();
+                      covered.add(row.getString(0));
+                      groupEntries.add(
+                          IndexEntry.of(row.getString(0), row.getLong(1), row.getAs(2)));
+                    }
+
+                    String location =
+                        indexLocation
+                            + "/"
+                            + DATA_DIR
+                            + "/index-file-"
+                            + snapshotId
+                            + "-"
+                            + seq
+                            + "-"
+                            + UUID.randomUUID();
+                    String blobType;
+                    IndexBuildResult built;
+                    IndexFile.Kind kind;
+                    if (writesAuxiliary) {
+                      blobType = adapter.auxiliaryBlobType();
+                      built = adapter.encodeAuxiliaryPayloadWithMemory(groupEntries, buildThreads);
+                      kind = IndexFile.Kind.AUXILIARY;
+                    } else {
+                      blobType = adapter.entryBlobType();
+                      built = adapter.encodeEntriesWithMemory(groupEntries);
+                      kind = IndexFile.Kind.ENTRY_BEARING;
+                    }
+                    IndexFileMemory memory = built.memory();
+                    // Checked before the payload becomes one array: a file past the limit could be
+                    // written, published, and then rejected by every query that reads it.
+                    IndexPayloadLimits.checkFits(
+                        built.payload().remaining(), groupEntries.size(), location);
                     writeIndexPayload(fileIO, location, adapter, kind, blobType, built);
                     if (memory != null) {
                       long fileBytes = fileIO.newInputFile(location).getLength();
                       IndexPayloadLimits.checkFits(fileBytes, groupEntries.size(), location);
                       memory = memory.toBuilder().fileBytes(fileBytes).build();
                     }
-                  } catch (RuntimeException | Error e) {
+
+                    filesBuilt.add(1);
+                    rowsWritten.add(groupEntries.size());
+                    LOG.info(
+                        "Wrote index file {} of {}, {} of {} data files covered, {} rows, {} ms into "
+                            + "the build",
+                        filesBuilt.value(),
+                        totalGroups,
+                        covered.size(),
+                        groupFiles.size(),
+                        groupEntries.size(),
+                        System.currentTimeMillis() - buildStartedMillis);
+                    return List.of(
+                            RowFactory.create(
+                                location,
+                                (long) groupEntries.size(),
+                                Lists.newArrayList(covered),
+                                kind.name(),
+                                blobType,
+                                memoryRow(memory),
+                                null))
+                        .iterator();
+                  } catch (RuntimeException e) {
+                    filesFailed.add(1);
+                    // Retrying the same rows would fail the same way only when the data itself is
+                    // what cannot be indexed. A transient read error, a task killed for its
+                    // executor, or a bug in the engine is rethrown: failing the task is what lets
+                    // Spark retry it, and what keeps a broken build from looking like a table that
+                    // simply cannot be indexed.
+                    if (!isDataFailure(e) || !groupIsolation) {
+                      throw e;
+                    }
+
+                    String failure = IndexBuildStatus.describeFailure(e);
+                    LOG.warn(
+                        "Cannot index the data files {} of {}; the build continues without them",
+                        groupFiles,
+                        tableName,
+                        e);
+                    return List.of(
+                            RowFactory.create(null, 0L, groupFiles, null, null, null, failure))
+                        .iterator();
+                  } catch (Error e) {
                     filesFailed.add(1);
                     throw e;
                   }
-
-                  filesBuilt.add(1);
-                  rowsWritten.add(groupEntries.size());
-                  LOG.info(
-                      "Wrote index file {} of {}, {} of {} data files covered, {} rows, {} ms into "
-                          + "the build",
-                      filesBuilt.value(),
-                      totalGroups,
-                      covered.size(),
-                      groupEntries.isEmpty() ? 0 : dataFileCount(tasksByIndexFile, index),
-                      groupEntries.size(),
-                      System.currentTimeMillis() - buildStartedMillis);
-                  return List.of(
-                          RowFactory.create(
-                              location,
-                              (long) groupEntries.size(),
-                              Lists.newArrayList(covered),
-                              kind.name(),
-                              blobType,
-                              memoryRow(memory)))
-                      .iterator();
                 },
                 true)
             .collect();
 
-    // the index files were written by the executors, so record them in this attempt's ledger now
-    // that the driver knows every path: a failure from here on can then be aborted precisely
-    int seq = 0;
+    // the rows of the groups that failed name their data files and the reason instead of an index
+    // file; the ones that succeeded are the files this attempt wrote
+    List<Row> writtenRows = Lists.newArrayListWithCapacity(indexFileRows.size());
+    Set<String> failedDataFiles = Sets.newLinkedHashSet();
+    List<String> failures = Lists.newArrayList();
     for (Row row : indexFileRows) {
-      writer.record(indexLocation, FILE_MARKER_PREFIX + seq, row.getString(0));
-      seq += 1;
+      if (row.getString(6) == null) {
+        writtenRows.add(row);
+      } else {
+        failedDataFiles.addAll(coveredDataFiles(row));
+        failures.add(row.getString(6));
+      }
     }
 
-    List<IndexFile> indexFiles = Lists.newArrayListWithCapacity(indexFileRows.size());
-    for (Row row : indexFileRows) {
+    // the index files were written by the executors, so record them in this attempt's ledger now
+    // that the driver knows every path: a failure from here on can then be aborted precisely
+    for (Row row : writtenRows) {
+      writer.recordFile(indexLocation, row.getString(0));
+    }
+
+    List<IndexFile> indexFiles = Lists.newArrayListWithCapacity(writtenRows.size());
+    for (Row row : writtenRows) {
       indexFiles.add(
           IndexFile.builder()
               .location(row.getString(0))
@@ -563,11 +795,14 @@ public final class SparkIndexBuilder {
     // A data file whose rows are all deleted, or whose rows carry no indexable value, produces no
     // entries, but it is still a data file of the snapshot. An index that does not name it leaves a
     // reader unable to tell "nothing to find here" from "this file was never indexed", and the text
-    // rewrite refuses to bind such an index to the snapshot at all.
+    // rewrite refuses to bind such an index to the snapshot at all. A data file of a group that
+    // failed is the opposite case: naming it as covered would claim an index that holds none of its
+    // rows, so it stays out and the gap is reported.
     Set<String> expected =
         onlyFiles != null
             ? Sets.newHashSet(onlyFiles)
             : Sets.newHashSet(IndexEntries.dataFiles(table, sourceTableSnapshotId));
+    expected.removeAll(failedDataFiles);
     Set<String> covered = Sets.newHashSet();
     for (IndexFile indexFile : indexFiles) {
       covered.addAll(indexFile.coveredDataFiles());
@@ -585,7 +820,6 @@ public final class SparkIndexBuilder {
               buildThreads,
               coveredByNothing,
               writer,
-              indexFileRows.size(),
               filesBuilt));
     }
 
@@ -609,7 +843,9 @@ public final class SparkIndexBuilder {
         filesFailed.value(),
         System.currentTimeMillis() - buildStartedMillis);
 
-    return indexFiles;
+    String summary =
+        failedDataFiles.isEmpty() ? "" : summarizeFailure(failedDataFiles, failures.get(0));
+    return new IndexFileBatch(indexFiles, failedDataFiles, summary);
   }
 
   private static Row memoryRow(IndexFileMemory memory) {
@@ -686,7 +922,6 @@ public final class SparkIndexBuilder {
   private static final String ENTRIES_ACCUMULATOR = "iceberg.index.build.rows";
   private static final String SKIPPED_ACCUMULATOR = "iceberg.index.build.skipped-null-vectors";
 
-  /** How many data files the group at this partition index was assigned. */
   /**
    * Records data files that need no entries as covered, in one index file of their own.
    *
@@ -702,7 +937,6 @@ public final class SparkIndexBuilder {
       int buildThreads,
       Set<String> coveredDataFiles,
       IndexSnapshotWriter writer,
-      int sequence,
       LongAccumulator filesBuilt) {
     FileIO fileIO = table.io();
     String location =
@@ -711,9 +945,7 @@ public final class SparkIndexBuilder {
             + DATA_DIR
             + "/index-file-"
             + snapshotId
-            + "-"
-            + sequence
-            + "-"
+            + "-empty-"
             + UUID.randomUUID();
     List<IndexEntry> noEntries = Lists.newArrayList();
     String blobType;
@@ -743,7 +975,7 @@ public final class SparkIndexBuilder {
     }
 
     filesBuilt.add(1);
-    writer.record(indexLocation, FILE_MARKER_PREFIX + sequence, location);
+    writer.recordFile(indexLocation, location);
     LOG.info(
         "Wrote {} covering {} data files that carry no entries for {}",
         location,
@@ -808,11 +1040,6 @@ public final class SparkIndexBuilder {
     }
 
     return Map.of(IndexSnapshot.STATISTICS_LOCATION_PROPERTY, location);
-  }
-
-  private static int dataFileCount(Map<Integer, List<FileScanTask>> tasksByIndexFile, int index) {
-    List<FileScanTask> tasks = tasksByIndexFile.get(index);
-    return tasks == null ? 0 : tasks.size();
   }
 
   /**

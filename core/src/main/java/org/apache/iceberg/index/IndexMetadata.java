@@ -258,6 +258,73 @@ public final class IndexMetadata {
 
   /** Returns a builder pre-populated with this metadata's fields. */
   public Builder toBuilder() {
+    Builder builder = builderWithoutSnapshots();
+    for (IndexSnapshot snapshot : snapshots) {
+      builder.addSnapshot(snapshot);
+    }
+    return builder;
+  }
+
+  /**
+   * Returns a copy of this metadata with the given snapshot replacing the snapshot of the same
+   * source table snapshot, or appended when this metadata holds no snapshot of that source.
+   *
+   * <p>A build that covers data files the previous build did not can replace that build instead of
+   * appending to it: both answer for the same table snapshot, and the newer one covers more.
+   * Keeping one snapshot per source table snapshot is what spares readers from choosing between two
+   * builds of the same data.
+   *
+   * <p>The replacement takes the position of the snapshot it replaces. So that the result is still
+   * a history, the lineage is repaired with it: a replacement that named the snapshot it replaces
+   * as its parent takes that snapshot's parent, and a snapshot whose parent is the replaced one
+   * names the replacement instead. Snapshots of other sources keep their position and their parent.
+   *
+   * <p>The snapshot must satisfy the same preconditions as {@link Builder#addSnapshot}: its ID must
+   * not collide with a snapshot other than the one it replaces, and its parent must be part of the
+   * result. Publishing the result is a separate, explicit step through the {@link IndexCatalog}.
+   */
+  public IndexMetadata replaceSnapshot(IndexSnapshot snapshot) {
+    Preconditions.checkNotNull(snapshot, "Index snapshot is null");
+    IndexSnapshot replaced = null;
+    for (IndexSnapshot existing : snapshots) {
+      if (existing.sourceTableSnapshotId() == snapshot.sourceTableSnapshotId()) {
+        replaced = existing;
+        break;
+      }
+    }
+
+    IndexSnapshot replacement = snapshot;
+    if (replaced != null
+        && Objects.equals(snapshot.parentIndexSnapshotId(), replaced.snapshotId())) {
+      // the new build was derived from the one it replaces, which is about to leave the history
+      replacement =
+          snapshot.toBuilder().parentIndexSnapshotId(replaced.parentIndexSnapshotId()).build();
+    }
+
+    Builder builder = builderWithoutSnapshots();
+    boolean replacedInPlace = false;
+    for (IndexSnapshot existing : snapshots) {
+      if (existing.sourceTableSnapshotId() == replacement.sourceTableSnapshotId()) {
+        builder.addSnapshot(replacement);
+        replacedInPlace = true;
+      } else if (replaced != null
+          && Objects.equals(existing.parentIndexSnapshotId(), replaced.snapshotId())) {
+        builder.addSnapshot(
+            existing.toBuilder().parentIndexSnapshotId(replacement.snapshotId()).build());
+      } else {
+        builder.addSnapshot(existing);
+      }
+    }
+
+    if (!replacedInPlace) {
+      builder.addSnapshot(replacement);
+    }
+
+    return builder.build();
+  }
+
+  /** Returns a builder with this metadata's fields and no snapshots. */
+  private Builder builderWithoutSnapshots() {
     Builder builder =
         builder()
             .indexUuid(indexUuid)
@@ -272,9 +339,6 @@ public final class IndexMetadata {
     }
     if (lastUpdatedMillis != null) {
       builder.lastUpdatedMillis(lastUpdatedMillis);
-    }
-    for (IndexSnapshot snapshot : snapshots) {
-      builder.addSnapshot(snapshot);
     }
     return builder;
   }

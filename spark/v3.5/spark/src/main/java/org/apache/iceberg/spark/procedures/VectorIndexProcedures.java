@@ -64,24 +64,59 @@ final class VectorIndexProcedures {
    * refresh and a rebuild, or two refreshes) would otherwise each write a document containing only
    * their own snapshot, and the one that landed first would be lost without anyone noticing.
    *
-   * <p>If another publisher covered the same source snapshot, keep its result. Distinct refreshes
-   * can have the same provisional index snapshot ID, so the published ID is assigned from the
-   * current metadata while preserving the parent used to build the snapshot. An older refresh that
-   * finishes after its descendant is skipped so it cannot become the latest index.
+   * <p>If another publisher published a build of the same source snapshot, this build replaces it
+   * when it is the newer one: both answer for the same table snapshot, and the newer build covers
+   * at least what it covers, so keeping both would make readers choose between two builds of the
+   * same data. The replacement takes the ID after the current latest and the lineage of the build
+   * it replaces. A build of a source snapshot that a newer build has already superseded is dropped,
+   * an older refresh that finishes after its descendant is skipped so it cannot become the latest
+   * index.
    */
   static IndexSnapshot publishSnapshot(
       SidecarIndexCatalog catalog, Table table, String indexUuid, IndexSnapshot snapshot) {
+    return publishSnapshot(catalog, table, indexUuid, snapshot, true);
+  }
+
+  /**
+   * Publishes a built snapshot, telling whether it covered every data file it was asked to.
+   *
+   * <p>A build that could only index part of the table may publish an index where there was none,
+   * but it never replaces one that is already published for the same source snapshot: the published
+   * build covers at least as much, and replacing it would take coverage away from every query until
+   * a refresh put it back. A complete build replaces a partial one, which is how a retried build
+   * repairs what an earlier attempt could not index.
+   */
+  static IndexSnapshot publishSnapshot(
+      SidecarIndexCatalog catalog,
+      Table table,
+      String indexUuid,
+      IndexSnapshot snapshot,
+      boolean complete) {
     long source = snapshot.sourceTableSnapshotId();
     IndexMetadata result =
         catalog.updateIndex(
             table.location(),
             indexUuid,
             current -> {
-              if (current.snapshotForSourceTableSnapshot(source) != null) {
-                return current;
+              IndexSnapshot latest = current.latestSnapshot();
+              IndexSnapshot existing = current.snapshotForSourceTableSnapshot(source);
+              if (existing != null) {
+                if (!complete) {
+                  return current;
+                }
+
+                if (latest == null || latest.snapshotId() != existing.snapshotId()) {
+                  // a newer build already answers for a descendant of this source snapshot
+                  return current;
+                }
+
+                return current.replaceSnapshot(
+                    snapshot.toBuilder()
+                        .snapshotId(Math.addExact(latest.snapshotId(), 1L))
+                        .parentIndexSnapshotId(existing.parentIndexSnapshotId())
+                        .build());
               }
 
-              IndexSnapshot latest = current.latestSnapshot();
               table.refresh();
               if (latest != null
                   && SnapshotUtil.isAncestorOf(table, latest.sourceTableSnapshotId(), source)) {
@@ -89,7 +124,10 @@ final class VectorIndexProcedures {
               }
 
               long nextId = latest == null ? 1L : Math.addExact(latest.snapshotId(), 1L);
-              return current.withSnapshot(snapshot.toBuilder().snapshotId(nextId).build());
+              return current.withSnapshot(
+                  existingParentOrLatest(current, snapshot, latest).toBuilder()
+                      .snapshotId(nextId)
+                      .build());
             });
     try {
       IndexSnapshotWriter.finishPublication(
@@ -99,6 +137,33 @@ final class VectorIndexProcedures {
     }
 
     return result.snapshotForSourceTableSnapshot(source);
+  }
+
+  /**
+   * The snapshot with a parent the current metadata actually holds.
+   *
+   * <p>A build is derived from the metadata its caller read, and a concurrent publisher can replace
+   * that snapshot while the build runs. Appending the build unchanged would then name a parent the
+   * index no longer holds, which the metadata invariants reject only after every file is written.
+   * The build stays its own answer for its source snapshot, so it points at the newest snapshot
+   * instead of failing.
+   */
+  private static IndexSnapshot existingParentOrLatest(
+      IndexMetadata current, IndexSnapshot snapshot, IndexSnapshot latest) {
+    Long parent = snapshot.parentIndexSnapshotId();
+    if (parent == null) {
+      return snapshot;
+    }
+
+    for (IndexSnapshot candidate : current.snapshots()) {
+      if (candidate.snapshotId() == parent) {
+        return snapshot;
+      }
+    }
+
+    return snapshot.toBuilder()
+        .parentIndexSnapshotId(latest == null ? null : latest.snapshotId())
+        .build();
   }
 
   /** Resolves the field ID of the vector column, failing if the column does not exist. */
