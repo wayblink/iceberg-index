@@ -143,6 +143,8 @@ private[spark] object VectorSearchExec {
     // search fetches the per-file top-k of every index file, which is many more rows than the
     // query's own window. The operator above this source re-scores and sorts exactly, so a global
     // window is enough candidates for it; a postfilter is applied to the fetched rows as before.
+    // The window it asks for is the shared candidate budget, so this branch costs the same
+    // multiple of k that the batch entry point starts from instead of a multiple of its own.
     if (queries.size == 1 && candidateFilter == null
       && inputs.dataFiles.size > 64
       && !java.lang.Boolean.getBoolean("iceberg.index.vector.refine")) {

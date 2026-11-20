@@ -133,6 +133,49 @@ class TestVectorSearchExecution {
     assertThat(rows.get(0).getLong(0)).isEqualTo(0L);
   }
 
+  /**
+   * The global window is the shared candidate budget, not a private multiple of it.
+   *
+   * <p>One query over many files is answered from the index's own global hits, and the window it
+   * asks for is what the sort above re-scores. A hardcoded multiple here would both swallow the
+   * multiples a caller sets between one and it, and make the same question cost more than it does
+   * through the batch entry point.
+   */
+  @Test
+  void aSingleQueryOverManyFilesAsksForTheSharedWindow() throws Exception {
+    String table = "exec_global_window";
+    spark.sql("CREATE NAMESPACE IF NOT EXISTS local.db");
+    spark.sql(String.format("CREATE TABLE local.db.%s %s", table, COLUMNS));
+    for (int i = 0; i < 65; i++) {
+      spark.sql(
+          String.format(
+              "INSERT INTO local.db.%s VALUES (%d, array(%.2fd, 0.0d))",
+              table, i, 1.0d - i * 0.01d));
+    }
+    spark.sql(
+        String.format(
+            "CALL local.system.build_vector_index(table => 'db.%s', column => 'embedding', "
+                + "dimension => 2, structure => 'flat')",
+            table));
+    assertThat(dataFileCount(table)).isGreaterThan(64L);
+
+    int k = 3;
+    try {
+      for (String overSample : new String[] {"0", "1", "2", "4"}) {
+        spark.conf().set("spark.iceberg.index.vector.over-sample", overSample);
+        Dataset<Row> frame = spark.sql(nearest(table, k));
+        assertThat(frame.collectAsList()).hasSize(k);
+        assertThat(metric(sourceExec(frame), "numCandidates"))
+            .as(
+                "the window of over-sample %s is k times the multiple, as the batch starts",
+                overSample)
+            .isEqualTo((long) k * Math.max(1, Integer.parseInt(overSample)));
+      }
+    } finally {
+      spark.conf().unset("spark.iceberg.index.vector.over-sample");
+    }
+  }
+
   @Test
   void aSingleQueryOverManyFilesResolvesDeletes() throws Exception {
     String table = "exec_global_fetch_deletes";
@@ -276,7 +319,7 @@ class TestVectorSearchExecution {
     assertThat(text).contains("driverMaterialization=true");
     // the number the query ran with, and where it came from, are part of the plan
     // a flat index stores every vector, so the width cannot matter and the default is one
-    assertThat(text).contains("overSample=0 [DEFAULT]");
+    assertThat(text).contains("overSample=1 [DEFAULT]");
     assertThat(text).contains("metric=L2");
     // the request and the budget it was shrunk to are both visible
     assertThat(text).contains("requestedCandidates=");

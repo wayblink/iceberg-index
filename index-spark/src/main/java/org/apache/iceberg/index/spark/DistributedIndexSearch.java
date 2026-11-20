@@ -656,6 +656,12 @@ public final class DistributedIndexSearch {
    * caller has one query and no filter, the global search already returns the best hits of the
    * whole index; this fetches only those hits' rows and returns their order. The win is the number
    * of rows read: the query's window instead of the window of every index file.
+   *
+   * <p>The window is {@code opening}, the candidate budget the batch entry point also starts from,
+   * so the same query with the same multiple asks both entry points for the same candidates. It is
+   * a window of the estimate and not of the answer: every row it holds is returned, in the index's
+   * order, for the sort above to re-score, while {@code resultK} only says when a short round is
+   * worth widening.
    */
   public static List<Row> searchRowsFromHits(
       SparkSession spark,
@@ -694,10 +700,13 @@ public final class DistributedIndexSearch {
             StorageProperties.resolve(
                 table.io(), table.properties(), spark.sessionState().newHadoopConf()));
 
-    // the source's operator re-scores and sorts exactly, so the window it gets can be wider than
-    // the answer; the window is the query's top-k times a small factor, not every index file's
-    int target = Math.max(resultK * 4, Math.max(opening, resultK + 1));
-    int window = target;
+    // The two entry points ask the index for the same window: the candidate budget, which is the
+    // query's top-k times its multiple, truncated by the index's own entry count. The window is the
+    // candidates the sort above re-scores, so a multiple widens it and buys recall the same way in
+    // both entry points; only the rows the caller keeps (target) decide when asking for more is
+    // unnecessary, so a window wider than the answer is handed on entire rather than trimmed here.
+    int target = resultK;
+    int window = opening;
     List<Row> rows = Lists.newArrayList();
     for (int round = 0; round < MAX_ROUNDS && rows.size() < target; round++) {
       IndexQuery widened =
@@ -780,10 +789,9 @@ public final class DistributedIndexSearch {
           continue;
         }
 
+        // the whole window is the answer here: the sort above re-scores it, so trimming it to the
+        // rows the caller keeps would take back the candidates the multiple paid for
         rows.add(plan.narrow(row.row));
-        if (rows.size() >= target) {
-          break;
-        }
       }
 
       if (rows.size() >= target || !outcome.moreHits()) {

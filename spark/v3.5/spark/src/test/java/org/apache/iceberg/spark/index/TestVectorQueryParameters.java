@@ -203,7 +203,9 @@ class TestVectorQueryParameters {
     RawVectorParameters raw = VectorQueryParameters.capture(Map.of(), Map.of(), null);
     assertThat(raw.overSample()).isNull();
     ResolvedVectorParameters chosen = VectorQueryParameters.decide(raw, FLAT);
-    assertThat(chosen.overSample()).isZero();
+    // the decision names the base width rather than the absence of one: one is not a compatible
+    // fallback but the multiple that means "do not widen", which is also what an explicit 0 means
+    assertThat(chosen.overSample()).isEqualTo(1L);
     assertThat(chosen.overSampleLocked()).isFalse();
     assertThat(chosen.overSampleOrigin()).isEqualTo("DEFAULT");
     assertThat(chosen.overSampleReason()).isNull();
@@ -305,10 +307,10 @@ class TestVectorQueryParameters {
   }
 
   @Test
-  void anUnsetMultipleIsZeroAcrossStructures() {
+  void anUnsetMultipleIsOneAcrossStructures() {
     RawVectorParameters unset = VectorQueryParameters.capture(Map.of(), Map.of(), null);
 
-    assertThat(VectorQueryParameters.decide(unset, FLAT).overSample()).isZero();
+    assertThat(VectorQueryParameters.decide(unset, FLAT).overSample()).isEqualTo(1L);
     assertThat(
             VectorQueryParameters.decide(
                     unset,
@@ -317,12 +319,12 @@ class TestVectorQueryParameters {
                         VectorIndexDefinition.VectorQuantizer.NONE,
                         0))
                 .overSample())
-        .isZero();
+        .isEqualTo(1L);
 
-    assertThat(defaultFor(VectorIndexDefinition.VectorStructure.IVF, 1)).isZero();
-    assertThat(defaultFor(VectorIndexDefinition.VectorStructure.IVF, 2)).isZero();
-    assertThat(defaultFor(VectorIndexDefinition.VectorStructure.IVF, 3)).isZero();
-    assertThat(defaultFor(VectorIndexDefinition.VectorStructure.IVF, 4)).isZero();
+    assertThat(defaultFor(VectorIndexDefinition.VectorStructure.IVF, 1)).isEqualTo(1L);
+    assertThat(defaultFor(VectorIndexDefinition.VectorStructure.IVF, 2)).isEqualTo(1L);
+    assertThat(defaultFor(VectorIndexDefinition.VectorStructure.IVF, 3)).isEqualTo(1L);
+    assertThat(defaultFor(VectorIndexDefinition.VectorStructure.IVF, 4)).isEqualTo(1L);
 
     assertThat(
             VectorQueryParameters.decide(
@@ -332,7 +334,14 @@ class TestVectorQueryParameters {
                         VectorIndexDefinition.VectorQuantizer.NONE,
                         0))
                 .overSample())
-        .isZero();
+        .isEqualTo(1L);
+
+    // zero stays legal and means the same width as one: the base budget is k either way
+    RawVectorParameters zero =
+        VectorQueryParameters.capture(Map.of(OVER_SAMPLE, "0"), Map.of(), null);
+    assertThat(VectorQueryParameters.decide(zero, FLAT).overSample()).isZero();
+    assertThat(VectorCandidateBudget.derive(10, 0L, null))
+        .isEqualTo(VectorCandidateBudget.derive(10, 1L, null));
   }
 
   private static long defaultFor(VectorIndexDefinition.VectorStructure structure, int bits) {

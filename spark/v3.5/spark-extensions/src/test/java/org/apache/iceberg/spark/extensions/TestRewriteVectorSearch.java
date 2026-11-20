@@ -330,7 +330,7 @@ class TestRewriteVectorSearch {
           .contains("VectorSearchSource");
       assertThat(plan)
           .as("the width and where it came from are part of the plan")
-          .contains("overSample=0 [DEFAULT");
+          .contains("overSample=1 [DEFAULT");
       assertThat(plan).contains("result=approximate");
       assertThat(plan).contains("requestedCandidates=2");
 

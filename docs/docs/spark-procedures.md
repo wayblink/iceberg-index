@@ -1676,8 +1676,9 @@ Every structure is available to the rewrite. An approximate one (`HNSW`, `IVF`, 
 index) ranks candidates by an estimate, so the answer is the index's approximation: asking it for
 `k` candidates returns whichever rows the estimate preferred, and the true nearest rows may never be
 listed. `spark.iceberg.index.vector.over-sample` widens the candidate window before the exact
-re-scoring, so a positive value trades memory and fetch-back cost for recall; whether to set it is
-not what decides whether the rewrite happens. An exact index (`FLAT` over unquantized vectors)
+re-scoring, so a value above one trades memory and fetch-back cost for recall; the default is one
+and zero means the same base window. Whether to set it is not what decides whether the rewrite
+happens. An exact index (`FLAT` over unquantized vectors)
 enumerates every candidate and needs no widening. The multiplier must be a non-negative integer; an
 invalid value is an error rather than a silent default.
 

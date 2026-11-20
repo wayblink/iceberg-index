@@ -315,7 +315,7 @@ class TestVectorSearchPlanning {
         .contains("VectorSearchSource")
         .contains("result=approximate")
         .as("and the width it used is stated with its source")
-        .contains("overSample=0 [DEFAULT]");
+        .contains("overSample=1 [DEFAULT]");
 
     try {
       // a caller who knows what they want still decides: the configured value replaces the default

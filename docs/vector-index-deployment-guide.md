@@ -115,7 +115,7 @@ SET `spark.iceberg.index.vector.over-sample` = 100;
 
 `over-sample` 的含义是"向索引要 k×over 个候选，再取前 k"。对 `ORDER BY` 的自动改写，取前 k 之前会**精确重排**，所以放大倍数提高的是**召回**。对 `CALL vector_search`，结果合同由 `coverage` 决定：默认 `table` 会回表、判删除、并按查询要求的距离精确重排（与改写同一答案），`indexed` / `index_hits` / `positions` 才是不补未覆盖文件的索引侧视图；对两个地址类 TVF（`vector_index_search` / `vector_index_search_batch`），合同固定是"索引自己的原始分数、按索引顺序取前 k、删掉的行以 `row = null` 保留"，**不精确重排、不扫未覆盖文件、没有 `coverage` 参数**。因此在索引侧视图上，放大倍数只扩大候选范围、不会让结果变成"精确 Top-K"（近似 kernel 扩大范围后候选集本身可能变，但不保证与旧 `C=k` 逐条一致）。
 
-`over-sample` 默认 `0`，基础候选预算为 K，计划显示 `overSample=0 [DEFAULT]`。显式正整数按 K 乘倍数计算。IVF 的 `nprobe` 控制初始探测的列表数，和候选预算分别设置。
+`over-sample` 默认 `1`，基础候选预算为 K，计划显示 `overSample=1 [DEFAULT]`。`0` 与 `1` 等价，都表示不放大。正整数按 K 乘倍数计算；SQL 改写与批量 `CALL` 用同一个窗口，同一个倍数在两条入口取到同样多的候选。IVF 的 `nprobe` 控制初始探测的列表数，和候选预算分别设置。
 
 **近似 kernel 要拿到与精确扫描一致的结果，必须放大 over-sample。** 集群验收实测：200k 行、16 维、IVF+RaBitQ 4bit、`nprobe=1024`、`nlist=256` 时，`over-sample` 的实验值为 1 时，Top-10 与 L2 真值**不同**（召回不满）；把 `spark.iceberg.index.vector.over-sample` 设成 4000 后，Top-10 与 L2 真值逐行一致。也就是说"索引结果 = 精确结果"不是默认行为，而是候选预算足够的产物。
 

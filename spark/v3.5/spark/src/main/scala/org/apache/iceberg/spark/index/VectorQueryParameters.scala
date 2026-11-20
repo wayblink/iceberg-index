@@ -176,8 +176,11 @@ private[spark] object VectorQueryParameters {
     val mode = filterModeOf(raw.filterMode)
     val probes = nprobeOf(raw.nprobe)
     if (parameter == null) {
+      // The multiple a query gets when it names none: one, the multiple that means "do not widen".
+      // It is stated rather than left as zero so the width a plan reports is the width it uses; an
+      // explicit zero stays legal and resolves to the same base budget, k times max(1, multiple).
       ResolvedVectorParameters(
-        0L,
+        1L,
         "DEFAULT",
         false,
         null,

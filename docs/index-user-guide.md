@@ -334,7 +334,7 @@ SELECT id, title, _distance FROM vector_search(
 
 计划里标 `exact` 还是 `approximate` 由另一件事决定——**候选集是否完整**：只有 `FLAT` 且无量化才枚举全部条目（`exact`）；`IVF` 只访问 `nprobe` 个分区，`HNSW` 只走图的一部分，两者都是表的一个样本（`approximate`）。近似与否是索引形态的属性，不是参数设置的属性。
 
-默认值为 `0`，基础候选预算为 `K`，执行计划显示 `overSample=0 [DEFAULT]`。业务行查询仍按原始向量精排，过滤或删除导致活行不足时可以扩窗。显式正整数按 `K × over-sample` 计算候选预算。使用量化索引时，扩大候选窗口可能提高召回率，也可能增加回表成本。可以为会话显式设置倍数。
+默认值为 `1`，基础候选预算为 `K`，执行计划显示 `overSample=1 [DEFAULT]`。`0` 与 `1` 等价，都表示不放大：两者算出的候选预算都是 `K`。业务行查询仍按原始向量精排，过滤或删除导致活行不足时可以扩窗。显式正整数按 `K × over-sample` 计算候选预算。SQL 改写与批量 `CALL` 两条入口取的是同一个窗口，同一个倍数在两边取到同样多的候选（这也是同一问题在两个入口给出同一答案的前提）。使用量化索引时，扩大候选窗口可能提高召回率，也可能增加回表成本。可以为会话显式设置倍数。
 
 ```sql
 SET `spark.iceberg.index.vector.over-sample`=10;
@@ -635,7 +635,7 @@ BM25 和向量索引共用 executor 的容量预算、LRU 和状态入口。用�
 |---|---|---|
 | `spark.iceberg.index.vector.ivf.range-read.enabled` | `false` | 整索引缓存未命中时，按字节范围读取分块 IVF 索引。 |
 | `spark.iceberg.index.vector.ivf.nprobe` | `8` | 每次查询在每个 IVF 索引文件中初始探测的列表数。使用正整数；调用里显式写的值优先，本项 session 值只对 IVF 生效（非 IVF 索引上显式传 `nprobe` 报错）。 |
-| `spark.iceberg.index.vector.over-sample` | `0` | 基础候选预算为 K。显式正值按 K 乘倍数计算。 |
+| `spark.iceberg.index.vector.over-sample` | `1` | 基础候选预算为 K。正整数按 K 乘倍数计算；`0` 与 `1` 等价，都是 K。SQL 改写与批量 `CALL` 用同一个窗口。 |
 | `spark.iceberg.index.vector.name` | 不设 | 同列多索引时选哪个 |
 | `spark.iceberg.index.vector.filter-mode` | `pre` | task 内过滤落在打分前（`pre`）还是后（`post`）：`pre` 只给放行行打分，`post` 打分后逐行判定再扩样；只在 `ORDER BY vec_distance` 改写带过滤时生效，不是调用参数（见 4.6），非法值直接失败 |
 | `spark.iceberg.index.cache.enabled` | `false` | 缓存开关；关掉时 `load_index` 报 `CACHE_DISABLED` |

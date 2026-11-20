@@ -81,8 +81,8 @@ class TestVectorSearchSharedRules {
       VectorSearchContext sql = plan(table, "TABLE_LIVE_TOPK");
       VectorSearchContext call = plan(table, "INDEX_HITS");
       // neither entry point scans because a multiple was left unset: both decide the same width
-      assertThat(sql.parameters().overSample()).isZero();
-      assertThat(call.parameters().overSample()).isZero();
+      assertThat(sql.parameters().overSample()).isEqualTo(1L);
+      assertThat(call.parameters().overSample()).isEqualTo(1L);
       assertThat(call.parameters().overSampleOrigin()).isEqualTo("DEFAULT");
       assertThat(sql.parameters().overSampleOrigin()).isEqualTo("DEFAULT");
 
@@ -93,6 +93,22 @@ class TestVectorSearchSharedRules {
       assertThat(callSet.parameters().overSample()).isEqualTo(7L);
       assertThat(sqlSet.parameters().overSampleOrigin()).isEqualTo("SESSION_CONF");
       assertThat(callSet.parameters().overSampleOrigin()).isEqualTo("SESSION_CONF");
+
+      // the same multiple produces the same candidate window in both entry points: the requested
+      // width is the base top-k times the multiple, and both are truncated by the same entry
+      // bound, so neither entry point can ask for a different window for the same question
+      for (String overSample : new String[] {"0", "1", "2", "3", "4"}) {
+        spark.conf().set(OVER_SAMPLE, overSample);
+        VectorSearchContext sqlWidth = plan(table, "TABLE_LIVE_TOPK");
+        VectorSearchContext callWidth = plan(table, "INDEX_HITS");
+        assertThat(sqlWidth.budget().requested())
+            .as("the requested width for over-sample %s", overSample)
+            .isEqualTo(2L * Math.max(1L, Long.parseLong(overSample)));
+        assertThat(callWidth.budget().requested()).isEqualTo(sqlWidth.budget().requested());
+        assertThat(callWidth.budget().initial())
+            .as("both entry points start from the same window for over-sample %s", overSample)
+            .isEqualTo(sqlWidth.budget().initial());
+      }
     } finally {
       spark.conf().unset(OVER_SAMPLE);
     }
@@ -119,8 +135,8 @@ class TestVectorSearchSharedRules {
       spark.conf().unset(OVER_SAMPLE);
       VectorSearchContext sql = plan(table, "TABLE_LIVE_TOPK");
       VectorSearchContext call = plan(table, "INDEX_HITS");
-      assertThat(sql.parameters().overSample()).isZero();
-      assertThat(call.parameters().overSample()).isZero();
+      assertThat(sql.parameters().overSample()).isEqualTo(1L);
+      assertThat(call.parameters().overSample()).isEqualTo(1L);
       assertThat(sql.parameters().overSampleOrigin()).isEqualTo("DEFAULT");
       assertThat(call.parameters().overSampleOrigin()).isEqualTo("DEFAULT");
 
@@ -136,7 +152,7 @@ class TestVectorSearchSharedRules {
               .toString();
       assertThat(planText).contains("VectorSearchSource");
       assertThat(planText).contains("result=approximate");
-      assertThat(planText).contains("overSample=0 [DEFAULT");
+      assertThat(planText).contains("overSample=1 [DEFAULT");
 
       // the procedure really answers, rather than resolving a width for a search it never runs
       assertThat(
