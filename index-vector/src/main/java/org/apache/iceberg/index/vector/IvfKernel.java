@@ -433,7 +433,7 @@ public final class IvfKernel implements VectorKernel, RetainedBytes {
   /** Decodes one entry, and refuses a vector the metric cannot use. */
   private void decodeInto(List<IndexEntry> entries, float[][] vectors, int i) {
     {
-      vectors[i] = VectorPayloads.decodeVector(entries.get(i).payload(), dimension, "Entry");
+      vectors[i] = VectorPayloads.decodeVector(entries.get(i).payloadView(), dimension, "Entry");
       if (scoring.metric() == VectorIndexDefinition.Metric.COSINE) {
         // a vector with no direction cannot be assigned to a partition: every centroid is equally
         // (dis)similar to it, and the score of anything stored under it would be meaningless

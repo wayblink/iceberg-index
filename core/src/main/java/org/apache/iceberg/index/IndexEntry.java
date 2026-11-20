@@ -18,6 +18,7 @@
  */
 package org.apache.iceberg.index;
 
+import java.nio.ByteBuffer;
 import java.util.Arrays;
 import org.apache.iceberg.relocated.com.google.common.base.MoreObjects;
 import org.apache.iceberg.relocated.com.google.common.base.Preconditions;
@@ -61,6 +62,16 @@ public final class IndexEntry {
   /** Returns a copy so callers cannot mutate the indexed payload. */
   public byte[] payload() {
     return payload.clone();
+  }
+
+  /**
+   * Returns a read-only view of the payload, without copying it.
+   *
+   * <p>A build reads every entry's payload once, and a copy per entry is most of the garbage of a
+   * large unit: the view is what a reader that only decodes uses.
+   */
+  public ByteBuffer payloadView() {
+    return ByteBuffer.wrap(payload).asReadOnlyBuffer();
   }
 
   @Override

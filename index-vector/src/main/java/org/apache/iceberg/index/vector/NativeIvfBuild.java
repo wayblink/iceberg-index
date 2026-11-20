@@ -731,17 +731,18 @@ final class NativeIvfBuild {
         int offset = i * recordBytes;
         // the payload carries its own version and dimension, which the native side checks; only
         // its length is checked here, where a record is copied as a whole
-        byte[] payload = entries.get(row).payload();
+        ByteBuffer payload = entries.get(row).payloadView();
         Preconditions.checkArgument(
-            payload.length == payloadBytes,
+            payload.remaining() == payloadBytes,
             "Native IVF entry %s carries a %s-byte payload; %s dimensions need %s bytes",
             row,
-            payload.length,
+            payload.remaining(),
             dimension,
             payloadBytes);
         out.putInt(offset, fileIndexes[row]);
         out.putLong(offset + Integer.BYTES, entries.get(row).rowPosition());
-        out.put(offset + Integer.BYTES + Long.BYTES, payload, 0, payload.length);
+        out.position(offset + Integer.BYTES + Long.BYTES);
+        out.put(payload);
       }
     }
   }
