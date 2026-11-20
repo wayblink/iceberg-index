@@ -163,4 +163,123 @@ class TestIndexPublicationLifecycle {
     assertThat(table.io().newInputFile(previous.indexManifestList()).exists()).isFalse();
     assertThat(table.io().newInputFile(previous.statisticsLocation()).exists()).isFalse();
   }
+
+  @Test
+  void aNewerBuildOfTheSameSourceReplacesThePublishedOne() {
+    spark.sql("CREATE TABLE local.db.same_source (id bigint, body string) USING iceberg");
+    spark.sql("INSERT INTO local.db.same_source VALUES (1, 'ice')");
+    Table table = table("same_source");
+    SidecarIndexCatalog catalog = new SidecarIndexCatalog(table.io(), table);
+    IndexMetadata initial =
+        catalog.createIndex(
+            CreateIndexRequest.builder()
+                .tableLocation(table.location())
+                .tableUuid(table.uuid().toString())
+                .indexUuid("same-source")
+                .definition(TextIndexDefinition.builder().fieldId(2).build())
+                .build());
+    long source = table.currentSnapshot().snapshotId();
+
+    VectorIndexProcedures.publishSnapshot(
+        catalog, table, initial.indexUuid(), snapshot(source, "/index/manifest-list-1"));
+    VectorIndexProcedures.publishSnapshot(
+        catalog, table, initial.indexUuid(), snapshot(source, "/index/manifest-list-2"));
+
+    IndexMetadata published = catalog.loadIndex(table.location(), initial.indexUuid());
+    assertThat(published.snapshots())
+        .as("the newer build replaces the build of the same source snapshot")
+        .hasSize(1);
+    assertThat(published.latestSnapshot().snapshotId()).isEqualTo(2L);
+    assertThat(published.latestSnapshot().indexManifestList()).isEqualTo("/index/manifest-list-2");
+    assertThat(published.latestSnapshot().parentIndexSnapshotId()).isNull();
+  }
+
+  @Test
+  void aPartialBuildDoesNotReplaceAPublishedBuildOfTheSameSource() {
+    spark.sql("CREATE TABLE local.db.partial_guard (id bigint, body string) USING iceberg");
+    spark.sql("INSERT INTO local.db.partial_guard VALUES (1, 'ice')");
+    Table table = table("partial_guard");
+    SidecarIndexCatalog catalog = new SidecarIndexCatalog(table.io(), table);
+    IndexMetadata initial =
+        catalog.createIndex(
+            CreateIndexRequest.builder()
+                .tableLocation(table.location())
+                .tableUuid(table.uuid().toString())
+                .indexUuid("partial-guard")
+                .definition(TextIndexDefinition.builder().fieldId(2).build())
+                .build());
+    long source = table.currentSnapshot().snapshotId();
+
+    VectorIndexProcedures.publishSnapshot(
+        catalog,
+        table,
+        initial.indexUuid(),
+        snapshot(source, "/index/complete-manifest-list"),
+        true);
+    VectorIndexProcedures.publishSnapshot(
+        catalog,
+        table,
+        initial.indexUuid(),
+        snapshot(source, "/index/partial-manifest-list"),
+        false);
+
+    IndexMetadata published = catalog.loadIndex(table.location(), initial.indexUuid());
+    assertThat(published.latestSnapshot().indexManifestList())
+        .as("a build that covers less never replaces one that is already published")
+        .isEqualTo("/index/complete-manifest-list");
+
+    // and a part that publishes after the only build is published still shows up
+    long otherSource = source + 1;
+    VectorIndexProcedures.publishSnapshot(
+        catalog,
+        table,
+        initial.indexUuid(),
+        snapshot(otherSource, "/index/partial-only-manifest-list"),
+        false);
+    assertThat(catalog.loadIndex(table.location(), initial.indexUuid()).snapshots()).hasSize(2);
+  }
+
+  @Test
+  void aBuildWhoseParentWasReplacedIsStillPublishable() {
+    spark.sql("CREATE TABLE local.db.stale_parent (id bigint, body string) USING iceberg");
+    spark.sql("INSERT INTO local.db.stale_parent VALUES (1, 'ice')");
+    Table table = table("stale_parent");
+    SidecarIndexCatalog catalog = new SidecarIndexCatalog(table.io(), table);
+    IndexMetadata initial =
+        catalog.createIndex(
+            CreateIndexRequest.builder()
+                .tableLocation(table.location())
+                .tableUuid(table.uuid().toString())
+                .indexUuid("stale-parent")
+                .definition(TextIndexDefinition.builder().fieldId(2).build())
+                .build());
+
+    // the first build of an index derived from a snapshot a concurrent publisher replaced: the
+    // parent it names is not in the metadata, and appending it unchanged would break the
+    // invariants after every file it wrote is already in place
+    IndexSnapshot derived =
+        IndexSnapshot.builder()
+            .snapshotId(9L)
+            .sourceTableSnapshotId(table.currentSnapshot().snapshotId())
+            .parentIndexSnapshotId(7L)
+            .timestampMillis(11L)
+            .indexManifestList("/index/derived-manifest-list")
+            .build();
+    IndexSnapshot published =
+        VectorIndexProcedures.publishSnapshot(catalog, table, initial.indexUuid(), derived, true);
+
+    assertThat(published).as("the build is published instead of failing").isNotNull();
+    assertThat(published.parentIndexSnapshotId())
+        .as("the parent it named is gone and there is no build to point at")
+        .isNull();
+  }
+
+  private static IndexSnapshot snapshot(long sourceSnapshotId, String manifestList) {
+    return IndexSnapshot.builder()
+        .snapshotId(1L)
+        .sourceTableSnapshotId(sourceSnapshotId)
+        .timestampMillis(10L)
+        .indexManifestList(manifestList)
+        .build();
+  }
 }
