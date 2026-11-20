@@ -185,6 +185,16 @@ public final class IndexBuildReporter implements Closeable {
     finishWith(IndexBuildStatus.State.SUCCEEDED, null);
   }
 
+  /**
+   * Writes the final report of a build that published what it could and stopped reporting.
+   *
+   * <p>The reason stays in the report: a partial build is the one state whose "why" a later reader
+   * cannot reconstruct from the index alone.
+   */
+  public void partial(String reason) {
+    finishWith(IndexBuildStatus.State.PARTIAL, reason);
+  }
+
   /** Writes the final report of a build that failed, and stops reporting. */
   public void failed(Throwable failure) {
     finishWith(IndexBuildStatus.State.FAILED, IndexBuildStatus.describeFailure(failure));

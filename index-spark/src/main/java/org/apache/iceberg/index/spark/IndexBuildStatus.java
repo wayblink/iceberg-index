@@ -55,10 +55,19 @@ import org.apache.iceberg.util.JsonUtil;
  */
 public final class IndexBuildStatus {
 
-  /** Where the report of a build stands. Only the first three are ever written. */
+  /** Where the report of a build stands. Only the first four are ever written. */
   public enum State {
     RUNNING,
     SUCCEEDED,
+
+    /**
+     * Published, but without some of the data files it was asked to index.
+     *
+     * <p>Neither of the other two says this: {@link #SUCCEEDED} would claim a coverage the index
+     * does not have, and {@link #FAILED} would suggest the index is unusable when in fact it
+     * answers for what it built and a query scans the rest.
+     */
+    PARTIAL,
     FAILED,
 
     /** A build that stopped reporting, derived at read time from the age of the report. */
@@ -579,6 +588,12 @@ public final class IndexBuildStatus {
     public IndexBuildStatus build() {
       if (updatedAtMillis == 0L) {
         updatedAtMillis = startedAtMillis;
+      }
+
+      if (error != null && error.length() > MAX_ERROR_LENGTH) {
+        // the reason is written into the status sidecar document, which a reader loads whole: the
+        // bound belongs to the document, so it is enforced here rather than at one of the writers
+        error = error.substring(0, MAX_ERROR_LENGTH);
       }
 
       Preconditions.checkArgument(

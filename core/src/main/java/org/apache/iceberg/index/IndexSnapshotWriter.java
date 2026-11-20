@@ -351,6 +351,20 @@ public final class IndexSnapshotWriter {
     }
   }
 
+  /**
+   * Records a file written outside this writer, numbering its marker after the ones already
+   * recorded.
+   *
+   * <p>The markers have to be numbered from here rather than by the caller: aborting an attempt
+   * probes the ledger as the run {@code 0..count-1}, so a caller that numbered by its own row index
+   * would leave a hole wherever a group wrote nothing, and the files past the hole would never be
+   * deleted. Taking the next number from this writer is what keeps the run unbroken however many
+   * steps the files were written in.
+   */
+  public void recordFile(String indexLocation, String location) {
+    record(indexLocation, FILE_MARKER_PREFIX + fileMarkers, location);
+  }
+
   /** Records the location of the snapshot statistics before writing it. */
   public void recordStatistics(String indexLocation, String location) {
     record(indexLocation, STATISTICS_MARKER, location);
