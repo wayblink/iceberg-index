@@ -170,7 +170,7 @@ final class TextIndexPayload {
     }
   }
 
-  static final class Reader {
+  static final class Reader implements TextIndexShard {
     private final Source source;
     private final int size;
     private final long documents;
@@ -185,14 +185,16 @@ final class TextIndexPayload {
       this.offsets = offsets;
     }
 
-    CorpusCounts counts(Set<String> terms) throws IOException {
+    @Override
+    public CorpusCounts counts(Set<String> terms) throws IOException {
       Map<String, Long> frequencies = new HashMap<>();
       directory(terms).forEach((term, entry) -> frequencies.put(term, entry.frequency()));
       return new CorpusCounts(documents, tokens, frequencies);
     }
 
-    FileIndex shard(Set<String> terms, boolean statisticsOnly) throws IOException {
-      check(documents <= Integer.MAX_VALUE, "Invalid BM25 v1 shard document count");
+    @Override
+    public FileIndex shard(Set<String> terms, boolean statisticsOnly) throws IOException {
+      check(documents <= Integer.MAX_VALUE, "Invalid BM25 shard document count");
       int localDocuments = Math.toIntExact(documents);
       if (statisticsOnly) {
         CorpusCounts counts = counts(terms);

@@ -116,7 +116,7 @@ class TestTextIndexAdapter {
             () -> adapter.searchAuxiliaryAll(List.of(payload), adapter.encodeQuery("ice"), 1))
         .isInstanceOf(UncheckedIOException.class)
         .hasCauseInstanceOf(IOException.class)
-        .hasRootCauseMessage("Invalid BM25 v1 shard document count");
+        .hasRootCauseMessage("Invalid BM25 shard document count");
   }
 
   @Test
@@ -131,11 +131,13 @@ class TestTextIndexAdapter {
     }
     ByteBuffer payload = adapter.encodeAuxiliaryPayload(entries);
     RangeOnlyStream stream = new RangeOnlyStream(payload);
-    TextIndexPayload.Reader rangeReader =
-        TextIndexPayload.open(TextIndexPayload.source(stream, 0), payload.remaining());
+    TextIndexPayloadV2.Reader rangeReader =
+        TextIndexPayloadV2.open(TextIndexPayloadV2.source(stream, 0), payload.remaining());
     TextIndexAdapter.FileIndex selected = rangeReader.shard(Set.of("ice", "glacier"), false);
     assertThat(selected.postingsByTerm).containsOnlyKeys("ice", "glacier");
-    assertThat(stream.bytesRead).isLessThan(payload.remaining() / 10L);
+    // only the signatures, the requested buckets, their posting ranges and the matched document
+    // chunk are read, never the whole payload
+    assertThat(stream.bytesRead).isLessThan(payload.remaining() / 2L);
   }
 
   private static final class RangeOnlyStream extends SeekableInputStream implements RangeReadable {
