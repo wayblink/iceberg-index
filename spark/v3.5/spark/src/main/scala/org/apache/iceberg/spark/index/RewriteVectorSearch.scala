@@ -157,7 +157,7 @@ case class RewriteVectorSearch(spark: SparkSession) extends Rule[LogicalPlan] {
         arguments.indexArgument,
         batch = false,
         arguments.nprobeArgument,
-        arguments.overSampleArgument) match {
+        arguments.refineFactorArgument) match {
       case request =>
         BindVectorSearch.bind(spark, request) match {
           case BoundVectorSearch(context) =>
@@ -196,12 +196,12 @@ case class RewriteVectorSearch(spark: SparkSession) extends Rule[LogicalPlan] {
                     node.order.map(order => order.copy(child = distance.copy(metric = metric))))
               }
               logger.info(
-                "vector search plan: bind={}ms overSample={}[{}] uncoveredFiles={} filter={} "
+                "vector search plan: bind={}ms refineFactor={}[{}] uncoveredFiles={} filter={} "
                   + "filterColumns={}",
                 Array[Object](
                   JLong.valueOf(bindMillis),
-                  JLong.valueOf(filtered.parameters.overSample),
-                  filtered.parameters.overSampleOrigin,
+                  JLong.valueOf(filtered.parameters.refineFactor),
+                  filtered.parameters.refineFactorOrigin,
                   Integer.valueOf(filtered.inputs.uncoveredDataFiles.size),
                   Option(filtered.filter).map(_.toString).getOrElse("none"),
                   filtered.filterColumns.mkString(",")): _*)
@@ -222,7 +222,7 @@ case class RewriteVectorSearch(spark: SparkSession) extends Rule[LogicalPlan] {
   private def bindDecisions(context: VectorSearchContext, k: Int): VectorSearchContext = {
     val parameters = VectorQueryParameters.decide(context.rawParameters, context.inputs.definition)
     val budget =
-      VectorCandidateBudget.derive(k, parameters.overSample, context.inputs.entryUpperBound)
+      VectorCandidateBudget.derive(k, parameters.refineFactor, context.inputs.entryUpperBound)
     context.copy(parameters = parameters, budget = budget)
   }
 

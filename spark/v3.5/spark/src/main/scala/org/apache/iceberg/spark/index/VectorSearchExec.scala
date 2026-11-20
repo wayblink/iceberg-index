@@ -119,7 +119,7 @@ private[spark] object VectorSearchExec {
       queries.map(query => VectorIndexSearch.encodeQuery(spark, adapter, query, nprobe)).asJava
     val opening =
       if (context.budget == null) {
-        VectorCandidateBudget.derive(k, context.parameters.overSample, inputs.entryUpperBound)
+        VectorCandidateBudget.derive(k, context.parameters.refineFactor, inputs.entryUpperBound)
       } else {
         context.budget
       }
@@ -210,19 +210,19 @@ private[spark] object VectorSearchExec {
     // the parameters are decided before a source is ever built, but the candidate loop treats them
     // as possibly absent, so the log reads them the same way instead of failing where that guard
     // would have returned an empty request
-    val overSample =
+    val refineFactor =
       if (context.parameters == null) {
         "unset[unset]"
       } else {
-        s"${context.parameters.overSample}[${context.parameters.overSampleOrigin}]"
+        s"${context.parameters.refineFactor}[${context.parameters.refineFactorOrigin}]"
       }
     logger.info(
-      "vector search contract={} k={} overSample={} filterMode={} residualFiles={} "
+      "vector search contract={} k={} refineFactor={} filterMode={} residualFiles={} "
         + "driverMaterialization=false",
       Array[Object](
         context.request.input.contract.name,
         Integer.valueOf(context.request.input.topK),
-        overSample,
+        refineFactor,
         if (context.parameters == null) "unset" else context.parameters.filterMode,
         Integer.valueOf(residualFiles)): _*)
     val rows =

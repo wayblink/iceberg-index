@@ -1255,7 +1255,7 @@ ascending: smaller is closer, whatever the metric.
 | `k`           | ✔️        | int           | Number of results to return                  |
 | `coverage`    |           | string        | `table` (default), `indexed`, `index_hits` or `positions` |
 | `nprobe`      |           | int           | IVF probe count for this call; wins over `spark.iceberg.index.vector.ivf.nprobe`. A call-named value on a non-IVF index is an error. |
-| `over_sample` |           | int           | Candidate multiplier for this call; overrides `spark.iceberg.index.vector.over-sample` |
+| `refine_factor` |           | int           | Candidate multiplier for this call; overrides `spark.iceberg.index.vector.refine-factor` |
 
 A query setting is read from the call first, then from the session:
 
@@ -1346,7 +1346,7 @@ read from a table with `query_table`. How the matched rows are resolved depends 
 | `index`       |           | string        | Name of the index, when several indexes share the column |
 | `coverage`    |           | string        | `table` (default), `indexed`, `index_hits` or `positions` |
 | `nprobe`      |           | int           | IVF probe count for this call; wins over the session setting. A call-named value on a non-IVF index is an error. |
-| `over_sample` |           | int           | Candidate multiplier for this call; overrides the session setting |
+| `refine_factor` |           | int           | Candidate multiplier for this call; overrides the session setting |
 
 \* Pass either `queries` or `query_table`. With `query_table`, the table is read once a row at a
 time and each row's vector column is one query. `query_id` is the row's position in that order
@@ -1675,12 +1675,17 @@ registered in the session.
 Every structure is available to the rewrite. An approximate one (`HNSW`, `IVF`, or any quantized
 index) ranks candidates by an estimate, so the answer is the index's approximation: asking it for
 `k` candidates returns whichever rows the estimate preferred, and the true nearest rows may never be
-listed. `spark.iceberg.index.vector.over-sample` widens the candidate window before the exact
+listed. `spark.iceberg.index.vector.refine-factor` widens the candidate window before the exact
 re-scoring, so a value above one trades memory and fetch-back cost for recall; the default is one
 and zero means the same base window. Whether to set it is not what decides whether the rewrite
 happens. An exact index (`FLAT` over unquantized vectors)
 enumerates every candidate and needs no widening. The multiplier must be a non-negative integer; an
 invalid value is an error rather than a silent default.
+
+The setting was renamed from `spark.iceberg.index.vector.over-sample`; a session that still sets the
+old key fails with a message naming the new one instead of silently applying the default. The call
+argument is `refine_factor`: a procedure call that still writes `over_sample` is rejected by Spark as
+an unknown argument, and a table function says which name replaced it.
 
 This paragraph describes the `ORDER BY` rewrite. `CALL system.vector_search` answers the same
 question and names the scope through `coverage`: `table` (the default) answers for the whole table,

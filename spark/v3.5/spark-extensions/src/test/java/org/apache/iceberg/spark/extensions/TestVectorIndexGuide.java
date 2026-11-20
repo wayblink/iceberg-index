@@ -77,7 +77,7 @@ class TestVectorIndexGuide {
 
   @BeforeEach
   void resetSettings() {
-    spark.conf().unset("spark.iceberg.index.vector.over-sample");
+    spark.conf().unset("spark.iceberg.index.vector.refine-factor");
     spark.conf().unset("spark.iceberg.index.vector.name");
   }
 
@@ -236,13 +236,13 @@ class TestVectorIndexGuide {
         .contains("[DEFAULT]");
 
     try {
-      spark.sql("SET `spark.iceberg.index.vector.over-sample`=10");
+      spark.sql("SET `spark.iceberg.index.vector.refine-factor`=10");
       assertThat(planOf("db.ivf_idx"))
           .as("a stated multiplier replaces the derived one")
           .contains("VectorSearchSource")
-          .contains("overSample=10 [SESSION_CONF");
+          .contains("refineFactor=10 [SESSION_CONF");
     } finally {
-      spark.conf().unset("spark.iceberg.index.vector.over-sample");
+      spark.conf().unset("spark.iceberg.index.vector.refine-factor");
     }
   }
 
@@ -302,7 +302,7 @@ class TestVectorIndexGuide {
 
   /** §4.1 · widening the candidates is what makes an approximate index find the true neighbour. */
   @Test
-  void overSampleIsASessionSetting() {
+  void refineFactorIsASessionSetting() {
     createTable("over", 32);
     spark.sql(
         "CALL local.system.build_vector_index("
@@ -320,7 +320,7 @@ class TestVectorIndexGuide {
 
     // a kernel that scores approximately cannot be given one candidate per hit: the widened set is
     // what puts the true neighbours in it
-    spark.sql("SET `spark.iceberg.index.vector.over-sample`=10");
+    spark.sql("SET `spark.iceberg.index.vector.refine-factor`=10");
     List<Row> widened = spark.sql(nearest("db.over", 5)).collectAsList();
 
     assertThat(widened.get(0).getLong(0))
@@ -375,7 +375,7 @@ class TestVectorIndexGuide {
     // be scanned, and a plain scan needs no widening at all
     List<Row> rewritten;
     try {
-      spark.sql("SET `spark.iceberg.index.vector.over-sample`=10");
+      spark.sql("SET `spark.iceberg.index.vector.refine-factor`=10");
       rewritten =
           spark
               .sql(
@@ -383,7 +383,7 @@ class TestVectorIndexGuide {
                       + "ORDER BY vec_distance(embedding, array(1.0d, 0.0d)) LIMIT 3")
               .collectAsList();
     } finally {
-      spark.conf().unset("spark.iceberg.index.vector.over-sample");
+      spark.conf().unset("spark.iceberg.index.vector.refine-factor");
     }
     assertThat(rewritten).hasSize(3);
     assertThat(rewritten).noneMatch(row -> row.getLong(0) == 1L);

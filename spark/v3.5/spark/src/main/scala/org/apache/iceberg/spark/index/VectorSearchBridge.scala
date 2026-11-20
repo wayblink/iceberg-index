@@ -199,7 +199,7 @@ private[spark] object VectorSearchBridge {
       uncoveredFileCount: Int): Int = {
     val topK = math.max(1, k).toLong
     // the width a query starts with, which is k times the multiplier: sizing a block by k alone
-    // would let a caller with over-sample raise the real per-block memory behind the bound
+    // would let a caller with a refine factor raise the real per-block memory behind the bound
     val window = math.max(1, initialWindow).toLong
     val dimension = math.max(1, vectorDimension).toLong
     // a block of positions holds neither rows nor their JSON: the answer is the index's own hits
@@ -250,7 +250,7 @@ private[spark] object VectorSearchBridge {
       batch: Boolean,
       coverage: String,
       nprobeArgument: String,
-      overSampleArgument: String = null): VectorBindingResult = {
+      refineFactorArgument: String = null): VectorBindingResult = {
     val contract = VectorResultContract.forCoverage(coverage)
     val request = VectorSearchRequest.forTable(
       table,
@@ -264,7 +264,7 @@ private[spark] object VectorSearchBridge {
       indexArgument,
       batch,
       nprobeArgument,
-      overSampleArgument)
+      refineFactorArgument)
     BindVectorSearch.bind(spark, request) match {
       case BoundVectorSearch(context) =>
         // a request that asks for nothing is answered with nothing: its parameters are not judged
@@ -281,7 +281,7 @@ private[spark] object VectorSearchBridge {
           context.copy(
             parameters = parameters,
             budget = VectorCandidateBudget
-              .derive(k, parameters.overSample, context.inputs.entryUpperBound)))
+              .derive(k, parameters.refineFactor, context.inputs.entryUpperBound)))
       case other => other
     }
   }
@@ -987,7 +987,7 @@ private[spark] case class VectorSearchHitsRequest(
     topK: Int,
     batch: Boolean,
     nprobeArgument: String,
-    overSampleArgument: String)(
+    refineFactorArgument: String)(
     override val output: Seq[org.apache.spark.sql.catalyst.expressions.Attribute])
     extends LeafNode {
 

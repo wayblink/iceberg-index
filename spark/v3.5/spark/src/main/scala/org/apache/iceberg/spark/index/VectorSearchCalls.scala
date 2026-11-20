@@ -58,7 +58,7 @@ private[spark] object VectorSearchCalls {
       batch: Boolean,
       coverage: String,
       nprobeArgument: String,
-      overSampleArgument: String): VectorSearchHitsPlan = {
+      refineFactorArgument: String): VectorSearchHitsPlan = {
     VectorSearchBridge.plan(
       spark,
       table,
@@ -69,7 +69,7 @@ private[spark] object VectorSearchCalls {
       batch,
       coverage,
       nprobeArgument,
-      overSampleArgument) match {
+      refineFactorArgument) match {
       case BoundVectorSearch(context) => VectorSearchHitsPlan(context, batch)
       case NoApplicableVectorIndex =>
         throw new IllegalArgumentException(
@@ -96,7 +96,7 @@ private[spark] object VectorSearchCalls {
       k: Int,
       batch: Boolean,
       nprobeArgument: String = null,
-      overSampleArgument: String = null): LogicalPlan = {
+      refineFactorArgument: String = null): LogicalPlan = {
     val copied = queries.asScala.map(query => query.clone()).toSeq
     // the output attributes are created once, here, so a copy the optimizer makes keeps the same
     // expression ids and the callers of the function still refer to them
@@ -118,7 +118,7 @@ private[spark] object VectorSearchCalls {
       k,
       batch,
       nprobeArgument,
-      overSampleArgument)(attributes)
+      refineFactorArgument)(attributes)
   }
 
   /** Searches a request the caller already planned. */
@@ -136,7 +136,7 @@ private[spark] object VectorSearchCalls {
       batch: Boolean,
       coverage: String,
       nprobeArgument: String = null,
-      overSampleArgument: String = null): JList[Row] =
+      refineFactorArgument: String = null): JList[Row] =
     search(
       plan(
         spark,
@@ -148,7 +148,7 @@ private[spark] object VectorSearchCalls {
         batch,
         coverage,
         nprobeArgument,
-        overSampleArgument),
+        refineFactorArgument),
       spark)
 
   /**
@@ -173,5 +173,5 @@ private[spark] object VectorSearchCalls {
       request.batch,
       "index_hits",
       request.nprobeArgument,
-      request.overSampleArgument)
+      request.refineFactorArgument)
 }

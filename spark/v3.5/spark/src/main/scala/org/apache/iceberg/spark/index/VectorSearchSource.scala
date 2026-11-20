@@ -63,21 +63,21 @@ private[spark] case class VectorSearchSource(context: VectorSearchContext)(
 
   override protected def stringArgs: Iterator[Any] = {
     val parameters = context.parameters
-    val overSample =
+    val refineFactor =
       if (parameters == null) {
-        "overSample=unset"
+        "refineFactor=unset"
       } else {
-        val details = new StringBuilder(parameters.overSampleOrigin)
-        if (parameters.overSampleLocked) {
+        val details = new StringBuilder(parameters.refineFactorOrigin)
+        if (parameters.refineFactorLocked) {
           details.append(", locked")
         }
-        if (parameters.overSampleReason != null) {
-          details.append(", ").append(parameters.overSampleReason)
+        if (parameters.refineFactorReason != null) {
+          details.append(", ").append(parameters.refineFactorReason)
         }
-        if (parameters.overSampleShadowedOrigin != null) {
-          details.append(", overrides ").append(parameters.overSampleShadowedOrigin)
+        if (parameters.refineFactorShadowedOrigin != null) {
+          details.append(", overrides ").append(parameters.refineFactorShadowedOrigin)
         }
-        s"overSample=${parameters.overSample} [$details]"
+        s"refineFactor=${parameters.refineFactor} [$details]"
       }
     val budget =
       if (context.budget == null) {
@@ -92,7 +92,7 @@ private[spark] case class VectorSearchSource(context: VectorSearchContext)(
       s"k=${context.request.input.topK}",
       s"metric=${context.inputs.definition.metric()}",
       s"result=${resultContract}",
-      overSample,
+      refineFactor,
       budget,
       s"index=${context.inputs.indexMetadata.indexUuid()}",
       s"tableSnapshot=${context.inputs.tableSnapshot.snapshotId()}",

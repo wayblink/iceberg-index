@@ -36,17 +36,17 @@ private[spark] case class VectorParameter(
     shadowedOrigin: String)
 
 private[spark] case class RawVectorParameters(
-    overSample: VectorParameter,
+    refineFactor: VectorParameter,
     indexName: VectorParameter,
     filterMode: VectorParameter,
     nprobe: VectorParameter)
 
 private[spark] case class ResolvedVectorParameters(
-    overSample: Long,
-    overSampleOrigin: String,
-    overSampleLocked: Boolean,
-    overSampleShadowedOrigin: String,
-    overSampleReason: String,
+    refineFactor: Long,
+    refineFactorOrigin: String,
+    refineFactorLocked: Boolean,
+    refineFactorShadowedOrigin: String,
+    refineFactorReason: String,
     indexName: VectorParameter,
     filterMode: String = VectorQueryParameters.DefaultFilterMode,
     filterModeOrigin: String = "DEFAULT",
@@ -56,7 +56,17 @@ private[spark] case class ResolvedVectorParameters(
     nprobeShadowedOrigin: String = null)
 
 private[spark] object VectorQueryParameters {
-  val OverSampleConf = "spark.iceberg.index.vector.over-sample"
+  val RefineFactorConf = "spark.iceberg.index.vector.refine-factor"
+
+  /**
+   * The name this setting carried before the rename; kept only so it can be refused by name.
+   *
+   * <p>Spark ignores a configuration key it does not know, so a session still carrying the old name
+   * would answer with the default multiple — a narrower candidate window, and fewer of the rows the
+   * caller asked for — rather than fail.
+   */
+  val RenamedOverSampleConf = "spark.iceberg.index.vector.over-sample"
+
   val IndexNameConf = "spark.iceberg.index.vector.name"
 
   /**
@@ -106,14 +116,15 @@ private[spark] object VectorQueryParameters {
       submit: JMap[String, String],
       indexArgument: String,
       nprobeArgument: String,
-      overSampleArgument: String = null): RawVectorParameters = {
+      refineFactorArgument: String = null): RawVectorParameters = {
     require(session != null, "Session configuration cannot be null")
     require(submit != null, "Submit configuration cannot be null")
-    val overSample = argued(overSampleArgument, configured(session, submit, OverSampleConf))
+    refuseRenamed(session, submit)
+    val refineFactor = argued(refineFactorArgument, configured(session, submit, RefineFactorConf))
     val index = argued(indexArgument, configured(session, submit, IndexNameConf))
     val filterMode = configured(session, submit, FilterModeConf)
     val nprobe = namedProbe(nprobeArgument, configured(session, submit, NprobeConf))
-    RawVectorParameters(overSample, index, filterMode, nprobe)
+    RawVectorParameters(refineFactor, index, filterMode, nprobe)
   }
 
   /**
@@ -164,7 +175,7 @@ private[spark] object VectorQueryParameters {
       definition: VectorIndexDefinition): ResolvedVectorParameters = {
     require(raw != null, "Vector parameters cannot be null")
     require(definition != null, "Vector index definition cannot be null")
-    val parameter = raw.overSample
+    val parameter = raw.refineFactor
     val index = if (raw.indexName == null) {
       null
     } else {
@@ -194,7 +205,7 @@ private[spark] object VectorQueryParameters {
         probes._4)
     } else {
       val message =
-        s"Invalid $OverSampleConf: '${parameter.value}'; expected a non-negative integer"
+        s"Invalid $RefineFactorConf: '${parameter.value}'; expected a non-negative integer"
       require(parameter.value != null, message)
       val value =
         try {
@@ -263,6 +274,19 @@ private[spark] object VectorQueryParameters {
     require(value > 0L, message)
     require(value <= Integer.MAX_VALUE.toLong, message)
     (value, parameter.origin, parameter.locked, parameter.shadowedOrigin)
+  }
+
+  /**
+   * Refuses the setting's former name instead of letting Spark ignore it.
+   *
+   * <p>The two names never mean different things: the old one is only here to be reported, so a
+   * configuration written before the rename fails with the name to use now. A key neither layer
+   * sets is not a problem and passes.
+   */
+  private def refuseRenamed(session: JMap[String, String], submit: JMap[String, String]): Unit = {
+    require(
+      !session.containsKey(RenamedOverSampleConf) && !submit.containsKey(RenamedOverSampleConf),
+      s"$RenamedOverSampleConf was renamed to $RefineFactorConf; update the setting")
   }
 
   private def configured(

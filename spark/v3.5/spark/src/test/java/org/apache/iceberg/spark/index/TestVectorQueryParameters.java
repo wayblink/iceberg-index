@@ -29,7 +29,7 @@ import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
 
 class TestVectorQueryParameters {
-  private static final String OVER_SAMPLE = "spark.iceberg.index.vector.over-sample";
+  private static final String REFINE_FACTOR = "spark.iceberg.index.vector.refine-factor";
   private static final String INDEX_NAME = "spark.iceberg.index.vector.name";
 
   private static final VectorIndexDefinition FLAT =
@@ -115,12 +115,12 @@ class TestVectorQueryParameters {
   void theOtherKnobsCanComeFromTheCallToo() {
     RawVectorParameters raw =
         VectorQueryParameters.capture(
-            Map.of(VectorQueryParameters.OverSampleConf(), "5"), Map.of(), null, null, "0");
+            Map.of(VectorQueryParameters.RefineFactorConf(), "5"), Map.of(), null, null, "0");
 
     ResolvedVectorParameters chosen = VectorQueryParameters.decide(raw, FLAT);
-    assertThat(chosen.overSample()).isZero();
-    assertThat(chosen.overSampleOrigin()).isEqualTo("CALL_ARGUMENT");
-    assertThat(chosen.overSampleShadowedOrigin()).isEqualTo("SESSION_CONF");
+    assertThat(chosen.refineFactor()).isZero();
+    assertThat(chosen.refineFactorOrigin()).isEqualTo("CALL_ARGUMENT");
+    assertThat(chosen.refineFactorShadowedOrigin()).isEqualTo("SESSION_CONF");
     assertThat(chosen.filterMode())
         .as("the filter link is not one of the settings a call can name")
         .isEqualTo(VectorQueryParameters.FilterModePre());
@@ -132,7 +132,25 @@ class TestVectorQueryParameters {
     RawVectorParameters raw = VectorQueryParameters.capture(Map.of(), Map.of(), null, null, "two");
     assertThatThrownBy(() -> VectorQueryParameters.decide(raw, FLAT))
         .isInstanceOf(IllegalArgumentException.class)
-        .hasMessageContaining(VectorQueryParameters.OverSampleConf());
+        .hasMessageContaining(VectorQueryParameters.RefineFactorConf());
+  }
+
+  @Test
+  void theRenamedSettingIsRefusedByName() {
+    // Spark ignores a configuration it does not know, so a setting left under the old name would
+    // answer with the default multiple instead of failing: the whole query would quietly come back
+    // narrower than the session asked for. Naming the replacement is the point of this check.
+    String renamed = "spark.iceberg.index.vector.over-sample";
+    assertThatThrownBy(() -> VectorQueryParameters.capture(Map.of(renamed, "10"), Map.of(), null))
+        .as("a renamed session setting")
+        .isInstanceOf(IllegalArgumentException.class)
+        .hasMessageContaining(renamed)
+        .hasMessageContaining(VectorQueryParameters.RefineFactorConf());
+    assertThatThrownBy(() -> VectorQueryParameters.capture(Map.of(), Map.of(renamed, "10"), null))
+        .as("a renamed submit setting")
+        .isInstanceOf(IllegalArgumentException.class)
+        .hasMessageContaining(renamed)
+        .hasMessageContaining(VectorQueryParameters.RefineFactorConf());
   }
 
   @Test
@@ -191,55 +209,57 @@ class TestVectorQueryParameters {
   @Test
   void explicitDefaultIsLocked() {
     RawVectorParameters raw =
-        VectorQueryParameters.capture(Map.of(OVER_SAMPLE, "0"), Map.of(), null);
+        VectorQueryParameters.capture(Map.of(REFINE_FACTOR, "0"), Map.of(), null);
     ResolvedVectorParameters chosen = VectorQueryParameters.decide(raw, FLAT);
-    assertThat(chosen.overSample()).isZero();
-    assertThat(chosen.overSampleLocked()).isTrue();
-    assertThat(chosen.overSampleOrigin()).isEqualTo("SESSION_CONF");
+    assertThat(chosen.refineFactor()).isZero();
+    assertThat(chosen.refineFactorLocked()).isTrue();
+    assertThat(chosen.refineFactorOrigin()).isEqualTo("SESSION_CONF");
   }
 
   @Test
   void absenceIsNotDefaultBeforeDecision() {
     RawVectorParameters raw = VectorQueryParameters.capture(Map.of(), Map.of(), null);
-    assertThat(raw.overSample()).isNull();
+    assertThat(raw.refineFactor()).isNull();
     ResolvedVectorParameters chosen = VectorQueryParameters.decide(raw, FLAT);
     // the decision names the base width rather than the absence of one: one is not a compatible
     // fallback but the multiple that means "do not widen", which is also what an explicit 0 means
-    assertThat(chosen.overSample()).isEqualTo(1L);
-    assertThat(chosen.overSampleLocked()).isFalse();
-    assertThat(chosen.overSampleOrigin()).isEqualTo("DEFAULT");
-    assertThat(chosen.overSampleReason()).isNull();
+    assertThat(chosen.refineFactor()).isEqualTo(1L);
+    assertThat(chosen.refineFactorLocked()).isFalse();
+    assertThat(chosen.refineFactorOrigin()).isEqualTo("DEFAULT");
+    assertThat(chosen.refineFactorReason()).isNull();
   }
 
   @Test
   void sessionWinsSubmit() {
     RawVectorParameters raw =
-        VectorQueryParameters.capture(Map.of(OVER_SAMPLE, "100"), Map.of(OVER_SAMPLE, "2"), null);
+        VectorQueryParameters.capture(
+            Map.of(REFINE_FACTOR, "100"), Map.of(REFINE_FACTOR, "2"), null);
     ResolvedVectorParameters chosen = VectorQueryParameters.decide(raw, FLAT);
-    assertThat(chosen.overSample()).isEqualTo(100L);
-    assertThat(chosen.overSampleOrigin()).isEqualTo("SESSION_CONF");
-    assertThat(chosen.overSampleShadowedOrigin()).isEqualTo("SUBMIT_CONF");
+    assertThat(chosen.refineFactor()).isEqualTo(100L);
+    assertThat(chosen.refineFactorOrigin()).isEqualTo("SESSION_CONF");
+    assertThat(chosen.refineFactorShadowedOrigin()).isEqualTo("SUBMIT_CONF");
   }
 
   @Test
   void submitOnlyIsLocked() {
     ResolvedVectorParameters chosen =
         VectorQueryParameters.decide(
-            VectorQueryParameters.capture(Map.of(), Map.of(OVER_SAMPLE, "8"), null), FLAT);
-    assertThat(chosen.overSample()).isEqualTo(8L);
-    assertThat(chosen.overSampleOrigin()).isEqualTo("SUBMIT_CONF");
-    assertThat(chosen.overSampleLocked()).isTrue();
+            VectorQueryParameters.capture(Map.of(), Map.of(REFINE_FACTOR, "8"), null), FLAT);
+    assertThat(chosen.refineFactor()).isEqualTo(8L);
+    assertThat(chosen.refineFactorOrigin()).isEqualTo("SUBMIT_CONF");
+    assertThat(chosen.refineFactorLocked()).isTrue();
   }
 
   @Test
   void copiedSubmitOriginIsAmbiguous() {
     ResolvedVectorParameters chosen =
         VectorQueryParameters.decide(
-            VectorQueryParameters.capture(Map.of(OVER_SAMPLE, "1"), Map.of(OVER_SAMPLE, "1"), null),
+            VectorQueryParameters.capture(
+                Map.of(REFINE_FACTOR, "1"), Map.of(REFINE_FACTOR, "1"), null),
             FLAT);
-    assertThat(chosen.overSample()).isEqualTo(1L);
-    assertThat(chosen.overSampleOrigin()).isEqualTo("USER_CONF(session-or-submit)");
-    assertThat(chosen.overSampleLocked()).isTrue();
+    assertThat(chosen.refineFactor()).isEqualTo(1L);
+    assertThat(chosen.refineFactorOrigin()).isEqualTo("USER_CONF(session-or-submit)");
+    assertThat(chosen.refineFactorLocked()).isTrue();
   }
 
   @Test
@@ -270,47 +290,47 @@ class TestVectorQueryParameters {
 
   @ParameterizedTest
   @ValueSource(strings = {"", " ", "abc", "-1", "9223372036854775808"})
-  void invalidExplicitOverSampleFails(String configured) {
+  void invalidExplicitRefineFactorFails(String configured) {
     RawVectorParameters raw =
-        VectorQueryParameters.capture(Map.of(OVER_SAMPLE, configured), Map.of(), null);
+        VectorQueryParameters.capture(Map.of(REFINE_FACTOR, configured), Map.of(), null);
     assertThatThrownBy(() -> VectorQueryParameters.decide(raw, FLAT))
         .isInstanceOf(IllegalArgumentException.class)
-        .hasMessageContaining(OVER_SAMPLE)
+        .hasMessageContaining(REFINE_FACTOR)
         .hasMessageContaining(configured);
   }
 
   @Test
   void invalidSessionIsNotReplacedByValidSubmit() {
     RawVectorParameters raw =
-        VectorQueryParameters.capture(Map.of(OVER_SAMPLE, ""), Map.of(OVER_SAMPLE, "10"), null);
+        VectorQueryParameters.capture(Map.of(REFINE_FACTOR, ""), Map.of(REFINE_FACTOR, "10"), null);
     assertThatThrownBy(() -> VectorQueryParameters.decide(raw, FLAT))
         .isInstanceOf(IllegalArgumentException.class)
-        .hasMessageContaining(OVER_SAMPLE);
+        .hasMessageContaining(REFINE_FACTOR);
   }
 
   @Test
   void captureDoesNotRetainMutableConfiguration() {
     Map<String, String> session = new HashMap<>();
-    session.put(OVER_SAMPLE, "100");
+    session.put(REFINE_FACTOR, "100");
     RawVectorParameters raw = VectorQueryParameters.capture(session, Map.of(), null);
-    session.put(OVER_SAMPLE, "2");
-    assertThat(VectorQueryParameters.decide(raw, FLAT).overSample()).isEqualTo(100L);
+    session.put(REFINE_FACTOR, "2");
+    assertThat(VectorQueryParameters.decide(raw, FLAT).refineFactor()).isEqualTo(100L);
   }
 
   @Test
   void repeatDecisionDoesNotChangeLockedValues() {
     RawVectorParameters raw =
-        VectorQueryParameters.capture(Map.of(OVER_SAMPLE, "100"), Map.of(), null);
+        VectorQueryParameters.capture(Map.of(REFINE_FACTOR, "100"), Map.of(), null);
     assertThat(VectorQueryParameters.decide(raw, FLAT))
         .isEqualTo(VectorQueryParameters.decide(raw, FLAT));
-    assertThat(raw.overSample().value()).isEqualTo("100");
+    assertThat(raw.refineFactor().value()).isEqualTo("100");
   }
 
   @Test
   void anUnsetMultipleIsOneAcrossStructures() {
     RawVectorParameters unset = VectorQueryParameters.capture(Map.of(), Map.of(), null);
 
-    assertThat(VectorQueryParameters.decide(unset, FLAT).overSample()).isEqualTo(1L);
+    assertThat(VectorQueryParameters.decide(unset, FLAT).refineFactor()).isEqualTo(1L);
     assertThat(
             VectorQueryParameters.decide(
                     unset,
@@ -318,7 +338,7 @@ class TestVectorQueryParameters {
                         VectorIndexDefinition.VectorStructure.IVF,
                         VectorIndexDefinition.VectorQuantizer.NONE,
                         0))
-                .overSample())
+                .refineFactor())
         .isEqualTo(1L);
 
     assertThat(defaultFor(VectorIndexDefinition.VectorStructure.IVF, 1)).isEqualTo(1L);
@@ -333,13 +353,13 @@ class TestVectorQueryParameters {
                         VectorIndexDefinition.VectorStructure.HNSW,
                         VectorIndexDefinition.VectorQuantizer.NONE,
                         0))
-                .overSample())
+                .refineFactor())
         .isEqualTo(1L);
 
     // zero stays legal and means the same width as one: the base budget is k either way
     RawVectorParameters zero =
-        VectorQueryParameters.capture(Map.of(OVER_SAMPLE, "0"), Map.of(), null);
-    assertThat(VectorQueryParameters.decide(zero, FLAT).overSample()).isZero();
+        VectorQueryParameters.capture(Map.of(REFINE_FACTOR, "0"), Map.of(), null);
+    assertThat(VectorQueryParameters.decide(zero, FLAT).refineFactor()).isZero();
     assertThat(VectorCandidateBudget.derive(10, 0L, null))
         .isEqualTo(VectorCandidateBudget.derive(10, 1L, null));
   }
@@ -348,15 +368,15 @@ class TestVectorQueryParameters {
     return VectorQueryParameters.decide(
             VectorQueryParameters.capture(Map.of(), Map.of(), null),
             shaped(structure, VectorIndexDefinition.VectorQuantizer.RABITQ, bits))
-        .overSample();
+        .refineFactor();
   }
 
   @Test
   void whitespaceIsAcceptedWithoutLosingSource() {
     ResolvedVectorParameters chosen =
         VectorQueryParameters.decide(
-            VectorQueryParameters.capture(Map.of(OVER_SAMPLE, " 100 "), Map.of(), null), FLAT);
-    assertThat(chosen.overSample()).isEqualTo(100L);
-    assertThat(chosen.overSampleOrigin()).isEqualTo("SESSION_CONF");
+            VectorQueryParameters.capture(Map.of(REFINE_FACTOR, " 100 "), Map.of(), null), FLAT);
+    assertThat(chosen.refineFactor()).isEqualTo(100L);
+    assertThat(chosen.refineFactorOrigin()).isEqualTo("SESSION_CONF");
   }
 }

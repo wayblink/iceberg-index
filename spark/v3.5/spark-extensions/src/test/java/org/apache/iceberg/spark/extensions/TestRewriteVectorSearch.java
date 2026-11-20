@@ -60,7 +60,7 @@ import org.junit.jupiter.api.io.TempDir;
  */
 class TestRewriteVectorSearch {
 
-  private static final String OVER_SAMPLE = "spark.iceberg.index.vector.over-sample";
+  private static final String REFINE_FACTOR = "spark.iceberg.index.vector.refine-factor";
 
   private static final String COLUMNS =
       "(id bigint, body string, embedding array<double>) USING iceberg";
@@ -99,12 +99,12 @@ class TestRewriteVectorSearch {
 
   @BeforeEach
   void configureTheCandidateBudget() {
-    spark.conf().set(OVER_SAMPLE, "10");
+    spark.conf().set(REFINE_FACTOR, "10");
   }
 
   @AfterEach
   void clearTheCandidateBudget() {
-    spark.conf().unset(OVER_SAMPLE);
+    spark.conf().unset(REFINE_FACTOR);
   }
 
   @Test
@@ -173,7 +173,7 @@ class TestRewriteVectorSearch {
   }
 
   @Test
-  public void overSamplingReachesTheReScoringInsteadOfBeingTruncated() {
+  public void theRefineFactorReachesTheReScoringInsteadOfBeingTruncated() {
     // an approximate kernel ranks its candidates by an estimate, so the query asks for more of them
     // than it needs and an exact re-scoring picks the nearest. That only works when every candidate
     // reaches the re-scoring: keeping the kernel's own best `limit` throws the rest away, and the
@@ -192,7 +192,7 @@ class TestRewriteVectorSearch {
       data.add(RowFactory.create((long) id, "row" + id, values));
     }
 
-    String table = "docs_oversample_reaches";
+    String table = "docs_refine_factor_reaches";
     spark
         .createDataFrame(
             data,
@@ -225,7 +225,7 @@ class TestRewriteVectorSearch {
     // the whole table is asked for as candidates (200 x 10 rows), so the re-scoring has every row
     // to choose from and its answer is the exact one
     try {
-      spark.conf().set("spark.iceberg.index.vector.over-sample", "200");
+      spark.conf().set("spark.iceberg.index.vector.refine-factor", "200");
       spark.conf().set("spark.iceberg.index.vector.ivf.nprobe", "20");
       List<Long> returned =
           spark
@@ -242,39 +242,39 @@ class TestRewriteVectorSearch {
           .as("the exact ten nearest, out of the whole table as candidates")
           .containsExactlyElementsOf(exactNearest(vectors, query, 10));
     } finally {
-      spark.conf().unset("spark.iceberg.index.vector.over-sample");
+      spark.conf().unset("spark.iceberg.index.vector.refine-factor");
       spark.conf().unset("spark.iceberg.index.vector.ivf.nprobe");
     }
   }
 
   @Test
-  public void overSamplingDoesNotChangeTheAnswerOnATableSmallerThanTheCandidateSet() {
+  public void theRefineFactorDoesNotChangeTheAnswerOnATableSmallerThanTheCandidateSet() {
     String query =
         "SELECT id FROM local.%s ORDER BY vec_distance(embedding, array(0.0d, 0.95d)) LIMIT 3";
-    String indexed = tableWithIndex("docs_oversample", "hnsw");
+    String indexed = tableWithIndex("docs_refine_factor", "hnsw");
 
     List<Row> widenedOnce;
     try {
-      // this table is four rows, so every over-sample already holds the whole table and there is
+      // this table is four rows, so every refine factor already holds the whole table and there is
       // nothing for a wider candidate set to add: the answer cannot change
-      spark.conf().set("spark.iceberg.index.vector.over-sample", "1");
+      spark.conf().set("spark.iceberg.index.vector.refine-factor", "1");
       widenedOnce = spark.sql(String.format(query, indexed)).collectAsList();
 
-      for (String overSample : new String[] {"0", "5", "50"}) {
-        spark.conf().set("spark.iceberg.index.vector.over-sample", overSample);
+      for (String refineFactor : new String[] {"0", "5", "50"}) {
+        spark.conf().set("spark.iceberg.index.vector.refine-factor", refineFactor);
         assertThat(spark.sql(String.format(query, indexed)).collectAsList())
-            .as("the same rows in the same order, over-sampling by %s", overSample)
+            .as("the same rows in the same order, over-sampling by %s", refineFactor)
             .containsExactlyElementsOf(widenedOnce);
       }
 
       for (String nonsense : new String[] {"-3", "abc"}) {
-        spark.conf().set("spark.iceberg.index.vector.over-sample", nonsense);
+        spark.conf().set("spark.iceberg.index.vector.refine-factor", nonsense);
         assertThatThrownBy(() -> spark.sql(String.format(query, indexed)).collectAsList())
             .as("the configured value %s is rejected", nonsense)
-            .hasMessageContaining("spark.iceberg.index.vector.over-sample");
+            .hasMessageContaining("spark.iceberg.index.vector.refine-factor");
       }
     } finally {
-      spark.conf().unset("spark.iceberg.index.vector.over-sample");
+      spark.conf().unset("spark.iceberg.index.vector.refine-factor");
     }
   }
 
@@ -295,7 +295,7 @@ class TestRewriteVectorSearch {
             table));
 
     try {
-      spark.conf().unset("spark.iceberg.index.vector.over-sample");
+      spark.conf().unset("spark.iceberg.index.vector.refine-factor");
       assertThat(planOf(table, nearestNeighbour(table, 2)))
           .as("an exact-scoring index answers without the caller setting a budget")
           .contains("VectorSearchSource");
@@ -304,10 +304,10 @@ class TestRewriteVectorSearch {
       assertThat(search(table, 2)).containsExactlyElementsOf(fullScan(table, 2));
 
       // the same answer with a budget, because the budget cannot change which rows are nearest
-      spark.conf().set("spark.iceberg.index.vector.over-sample", "10");
+      spark.conf().set("spark.iceberg.index.vector.refine-factor", "10");
       assertThat(search(table, 2)).containsExactlyElementsOf(fullScan(table, 2));
     } finally {
-      spark.conf().unset("spark.iceberg.index.vector.over-sample");
+      spark.conf().unset("spark.iceberg.index.vector.refine-factor");
     }
   }
 
@@ -323,14 +323,14 @@ class TestRewriteVectorSearch {
             table));
 
     try {
-      spark.conf().unset("spark.iceberg.index.vector.over-sample");
+      spark.conf().unset("spark.iceberg.index.vector.refine-factor");
       String plan = planOf(table, nearestNeighbour(table, 2));
       assertThat(plan)
           .as("an unset multiple is a default width, not a reason to scan")
           .contains("VectorSearchSource");
       assertThat(plan)
           .as("the width and where it came from are part of the plan")
-          .contains("overSample=1 [DEFAULT");
+          .contains("refineFactor=1 [DEFAULT");
       assertThat(plan).contains("result=approximate");
       assertThat(plan).contains("requestedCandidates=2");
 
@@ -338,16 +338,16 @@ class TestRewriteVectorSearch {
       // re-scoring above the source produces
       assertThat(search(table, 2)).hasSize(2);
     } finally {
-      spark.conf().unset("spark.iceberg.index.vector.over-sample");
+      spark.conf().unset("spark.iceberg.index.vector.refine-factor");
     }
   }
 
   @Test
-  public void overSamplingKeepsTheNearestCandidatesRatherThanTheFarthest() {
+  public void theRefineFactorKeepsTheNearestCandidatesRatherThanTheFarthest() {
     // an approximate index is asked for more candidates than the query wants, and the re-scoring
     // that follows has to keep the nearest of them: keeping the farthest answers with rows that are
     // nowhere near the query, which is invisible on a table small enough to be one candidate set
-    String table = "db.docs_oversample_order";
+    String table = "db.docs_refine_factor_order";
     spark.sql(String.format("CREATE TABLE local.%s %s", table, COLUMNS));
     StringBuilder values = new StringBuilder();
     for (int id = 0; id < 400; id++) {
@@ -376,7 +376,7 @@ class TestRewriteVectorSearch {
             table);
 
     try {
-      spark.conf().set("spark.iceberg.index.vector.over-sample", "10");
+      spark.conf().set("spark.iceberg.index.vector.refine-factor", "10");
       List<Row> hits = spark.sql(query).collectAsList();
       // the vectors are 1.0, 2.0, ... 400.0 on a line and the query is 1.1, so the ten nearest
       // are rows 0 to 9
@@ -384,7 +384,7 @@ class TestRewriteVectorSearch {
           .as("the ten rows closest to the query")
           .containsExactly(0L, 1L, 2L, 3L, 4L, 5L, 6L, 7L, 8L, 9L);
     } finally {
-      spark.conf().unset("spark.iceberg.index.vector.over-sample");
+      spark.conf().unset("spark.iceberg.index.vector.refine-factor");
     }
   }
 

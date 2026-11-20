@@ -80,18 +80,18 @@ class TestVectorCandidateBudget {
     ResolvedVectorParameters parameters =
         VectorQueryParameters.decide(
             VectorQueryParameters.capture(
-                Map.of("spark.iceberg.index.vector.over-sample", "100"), Map.of(), null),
+                Map.of("spark.iceberg.index.vector.refine-factor", "100"), Map.of(), null),
             VectorIndexDefinition.builder()
                 .fieldId(1)
                 .dimension(2)
                 .metric(VectorIndexDefinition.Metric.L2)
                 .structure(VectorIndexDefinition.VectorStructure.FLAT)
                 .build());
-    VectorCandidateBudget budget = VectorCandidateBudget.derive(10, parameters.overSample(), 20L);
+    VectorCandidateBudget budget = VectorCandidateBudget.derive(10, parameters.refineFactor(), 20L);
     assertThat(budget.requested()).isEqualTo(1000L);
     assertThat(budget.initial()).isEqualTo(20);
-    assertThat(parameters.overSample()).isEqualTo(100L);
-    assertThat(parameters.overSampleLocked()).isTrue();
+    assertThat(parameters.refineFactor()).isEqualTo(100L);
+    assertThat(parameters.refineFactorLocked()).isTrue();
   }
 
   @Test

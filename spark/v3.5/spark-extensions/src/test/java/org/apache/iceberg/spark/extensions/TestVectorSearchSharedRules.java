@@ -44,7 +44,7 @@ import org.junit.jupiter.api.io.TempDir;
  * is never replaced.
  */
 class TestVectorSearchSharedRules {
-  private static final String OVER_SAMPLE = "spark.iceberg.index.vector.over-sample";
+  private static final String REFINE_FACTOR = "spark.iceberg.index.vector.refine-factor";
   private static final String COLUMNS =
       "(id bigint, embedding array<double> NOT NULL) USING iceberg";
   private static SparkSession spark;
@@ -81,36 +81,36 @@ class TestVectorSearchSharedRules {
       VectorSearchContext sql = plan(table, "TABLE_LIVE_TOPK");
       VectorSearchContext call = plan(table, "INDEX_HITS");
       // neither entry point scans because a multiple was left unset: both decide the same width
-      assertThat(sql.parameters().overSample()).isEqualTo(1L);
-      assertThat(call.parameters().overSample()).isEqualTo(1L);
-      assertThat(call.parameters().overSampleOrigin()).isEqualTo("DEFAULT");
-      assertThat(sql.parameters().overSampleOrigin()).isEqualTo("DEFAULT");
+      assertThat(sql.parameters().refineFactor()).isEqualTo(1L);
+      assertThat(call.parameters().refineFactor()).isEqualTo(1L);
+      assertThat(call.parameters().refineFactorOrigin()).isEqualTo("DEFAULT");
+      assertThat(sql.parameters().refineFactorOrigin()).isEqualTo("DEFAULT");
 
-      spark.conf().set(OVER_SAMPLE, "7");
+      spark.conf().set(REFINE_FACTOR, "7");
       VectorSearchContext sqlSet = plan(table, "TABLE_LIVE_TOPK");
       VectorSearchContext callSet = plan(table, "INDEX_HITS");
-      assertThat(sqlSet.parameters().overSample()).isEqualTo(7L);
-      assertThat(callSet.parameters().overSample()).isEqualTo(7L);
-      assertThat(sqlSet.parameters().overSampleOrigin()).isEqualTo("SESSION_CONF");
-      assertThat(callSet.parameters().overSampleOrigin()).isEqualTo("SESSION_CONF");
+      assertThat(sqlSet.parameters().refineFactor()).isEqualTo(7L);
+      assertThat(callSet.parameters().refineFactor()).isEqualTo(7L);
+      assertThat(sqlSet.parameters().refineFactorOrigin()).isEqualTo("SESSION_CONF");
+      assertThat(callSet.parameters().refineFactorOrigin()).isEqualTo("SESSION_CONF");
 
       // the same multiple produces the same candidate window in both entry points: the requested
       // width is the base top-k times the multiple, and both are truncated by the same entry
       // bound, so neither entry point can ask for a different window for the same question
-      for (String overSample : new String[] {"0", "1", "2", "3", "4"}) {
-        spark.conf().set(OVER_SAMPLE, overSample);
+      for (String refineFactor : new String[] {"0", "1", "2", "3", "4"}) {
+        spark.conf().set(REFINE_FACTOR, refineFactor);
         VectorSearchContext sqlWidth = plan(table, "TABLE_LIVE_TOPK");
         VectorSearchContext callWidth = plan(table, "INDEX_HITS");
         assertThat(sqlWidth.budget().requested())
-            .as("the requested width for over-sample %s", overSample)
-            .isEqualTo(2L * Math.max(1L, Long.parseLong(overSample)));
+            .as("the requested width for refine factor %s", refineFactor)
+            .isEqualTo(2L * Math.max(1L, Long.parseLong(refineFactor)));
         assertThat(callWidth.budget().requested()).isEqualTo(sqlWidth.budget().requested());
         assertThat(callWidth.budget().initial())
-            .as("both entry points start from the same window for over-sample %s", overSample)
+            .as("both entry points start from the same window for refine factor %s", refineFactor)
             .isEqualTo(sqlWidth.budget().initial());
       }
     } finally {
-      spark.conf().unset(OVER_SAMPLE);
+      spark.conf().unset(REFINE_FACTOR);
     }
   }
 
@@ -132,13 +132,13 @@ class TestVectorSearchSharedRules {
     Table table = Spark3Util.loadIcebergTable(spark, "local.db.shared_rabitq");
 
     try {
-      spark.conf().unset(OVER_SAMPLE);
+      spark.conf().unset(REFINE_FACTOR);
       VectorSearchContext sql = plan(table, "TABLE_LIVE_TOPK");
       VectorSearchContext call = plan(table, "INDEX_HITS");
-      assertThat(sql.parameters().overSample()).isEqualTo(1L);
-      assertThat(call.parameters().overSample()).isEqualTo(1L);
-      assertThat(sql.parameters().overSampleOrigin()).isEqualTo("DEFAULT");
-      assertThat(call.parameters().overSampleOrigin()).isEqualTo("DEFAULT");
+      assertThat(sql.parameters().refineFactor()).isEqualTo(1L);
+      assertThat(call.parameters().refineFactor()).isEqualTo(1L);
+      assertThat(sql.parameters().refineFactorOrigin()).isEqualTo("DEFAULT");
+      assertThat(call.parameters().refineFactorOrigin()).isEqualTo("DEFAULT");
 
       // and the rewrite actually uses the index, rather than deciding the width for a plan it then
       // abandons
@@ -152,7 +152,7 @@ class TestVectorSearchSharedRules {
               .toString();
       assertThat(planText).contains("VectorSearchSource");
       assertThat(planText).contains("result=approximate");
-      assertThat(planText).contains("overSample=1 [DEFAULT");
+      assertThat(planText).contains("refineFactor=1 [DEFAULT");
 
       // the procedure really answers, rather than resolving a width for a search it never runs
       assertThat(
@@ -164,11 +164,11 @@ class TestVectorSearchSharedRules {
           .hasSize(2);
 
       // a caller who states a width still wins, on both entry points
-      spark.conf().set(OVER_SAMPLE, "7");
-      assertThat(plan(table, "TABLE_LIVE_TOPK").parameters().overSample()).isEqualTo(7L);
-      assertThat(plan(table, "INDEX_HITS").parameters().overSample()).isEqualTo(7L);
+      spark.conf().set(REFINE_FACTOR, "7");
+      assertThat(plan(table, "TABLE_LIVE_TOPK").parameters().refineFactor()).isEqualTo(7L);
+      assertThat(plan(table, "INDEX_HITS").parameters().refineFactor()).isEqualTo(7L);
     } finally {
-      spark.conf().unset(OVER_SAMPLE);
+      spark.conf().unset(REFINE_FACTOR);
     }
   }
 
@@ -176,16 +176,16 @@ class TestVectorSearchSharedRules {
   void aValueThatCannotBeAMultiplierIsReportedByEveryEntryPoint() throws Exception {
     Table table = tableWithIndex("shared_invalid");
     try {
-      spark.conf().set(OVER_SAMPLE, "-1");
-      assertThatThrownBy(() -> plan(table, "TABLE_LIVE_TOPK")).hasMessageContaining(OVER_SAMPLE);
-      assertThatThrownBy(() -> plan(table, "INDEX_HITS")).hasMessageContaining(OVER_SAMPLE);
+      spark.conf().set(REFINE_FACTOR, "-1");
+      assertThatThrownBy(() -> plan(table, "TABLE_LIVE_TOPK")).hasMessageContaining(REFINE_FACTOR);
+      assertThatThrownBy(() -> plan(table, "INDEX_HITS")).hasMessageContaining(REFINE_FACTOR);
       assertThatThrownBy(
               () ->
                   spark.sql(
                       "CALL local.system.vector_search("
                           + "table => 'db.shared_invalid', column => 'embedding', "
                           + "query => array(1.0d, 0.0d), k => 2)"))
-          .hasMessageContaining(OVER_SAMPLE);
+          .hasMessageContaining(REFINE_FACTOR);
       assertThatThrownBy(
               () ->
                   spark
@@ -193,9 +193,9 @@ class TestVectorSearchSharedRules {
                           "SELECT * FROM vector_index_search("
                               + "'local.db.shared_invalid', 'embedding', array(1.0d, 0.0d), 2)")
                       .collectAsList())
-          .hasMessageContaining(OVER_SAMPLE);
+          .hasMessageContaining(REFINE_FACTOR);
     } finally {
-      spark.conf().unset(OVER_SAMPLE);
+      spark.conf().unset(REFINE_FACTOR);
     }
   }
 
@@ -232,7 +232,14 @@ class TestVectorSearchSharedRules {
 
       // the settings a call names are accepted, and the answer stays the same
       assertThat(spark.sql(call + ")").collectAsList())
-          .hasSameSizeAs(spark.sql(call + ", nprobe => 2, over_sample => 0)").collectAsList());
+          .hasSameSizeAs(spark.sql(call + ", nprobe => 2, refine_factor => 0)").collectAsList());
+      // the multiple was renamed: the old argument fails by name instead of as an unknown one
+      assertThatThrownBy(() -> spark.sql(call + ", over_sample => 0)"))
+          .as("a renamed table function argument fails by name")
+          .isInstanceOf(org.apache.spark.sql.AnalysisException.class)
+          .hasMessageContaining("renamed")
+          .hasMessageContaining("over_sample")
+          .hasMessageContaining("refine_factor");
     } finally {
       spark.conf().unset("spark.iceberg.index.vector.ivf.nprobe");
     }
@@ -265,12 +272,21 @@ class TestVectorSearchSharedRules {
       assertThatThrownBy(() -> spark.sql(call + ", filter_mode => 'pre'"))
           .as("the procedure does not take a filter link")
           .isInstanceOf(org.apache.spark.sql.AnalysisException.class);
-      assertThatThrownBy(() -> spark.sql(call + ", over_sample => -1)"))
-          .hasMessageContaining("spark.iceberg.index.vector.over-sample");
+      assertThatThrownBy(() -> spark.sql(call + ", refine_factor => -1)"))
+          .hasMessageContaining("spark.iceberg.index.vector.refine-factor");
 
       // a count the call names is accepted while the session disagrees
       assertThat(spark.sql(call + ", nprobe => 1)").collectAsList()).isNotEmpty();
-      assertThat(spark.sql(call + ", nprobe => 2, over_sample => 0)").collectAsList()).isNotEmpty();
+      assertThat(spark.sql(call + ", nprobe => 2, refine_factor => 0)").collectAsList())
+          .isNotEmpty();
+      // the multiple was renamed: Spark refuses an argument the procedure does not declare before
+      // the procedure runs, so the old spelling fails instead of being ignored. Only the table
+      // functions can name the replacement, because a procedure argument cannot be intercepted
+      // without declaring the old name again.
+      assertThatThrownBy(() -> spark.sql(call + ", over_sample => 0)"))
+          .as("a renamed procedure argument is refused rather than ignored")
+          .isInstanceOf(org.apache.spark.sql.AnalysisException.class)
+          .hasMessageContaining("Unknown argument: over_sample");
     } finally {
       spark.conf().unset("spark.iceberg.index.vector.ivf.nprobe");
     }
@@ -351,7 +367,7 @@ class TestVectorSearchSharedRules {
   void aCallStillReturnsAtMostKPerQueryWhenTheMultiplierIsLarger() throws Exception {
     Table table = tableWithFourRows("shared_topk");
     try {
-      spark.conf().set(OVER_SAMPLE, "10");
+      spark.conf().set(REFINE_FACTOR, "10");
       List<Row> single =
           spark
               .sql(
@@ -379,7 +395,7 @@ class TestVectorSearchSharedRules {
               .collectAsList();
       assertThat(tvf).hasSize(2);
     } finally {
-      spark.conf().unset(OVER_SAMPLE);
+      spark.conf().unset(REFINE_FACTOR);
       assertThat(table.name()).isNotEmpty();
     }
   }
@@ -503,7 +519,7 @@ class TestVectorSearchSharedRules {
   void anEmptyRequestIsAnsweredWithoutJudgingTheParameters() throws Exception {
     tableWithIndex("shared_empty");
     try {
-      spark.conf().set(OVER_SAMPLE, "-1");
+      spark.conf().set(REFINE_FACTOR, "-1");
       assertThat(
               spark
                   .sql(
@@ -519,7 +535,7 @@ class TestVectorSearchSharedRules {
                   .collectAsList())
           .isEmpty();
     } finally {
-      spark.conf().unset(OVER_SAMPLE);
+      spark.conf().unset(REFINE_FACTOR);
     }
   }
 

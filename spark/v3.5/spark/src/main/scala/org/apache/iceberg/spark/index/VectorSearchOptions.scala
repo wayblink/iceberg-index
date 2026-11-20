@@ -50,7 +50,7 @@ private[spark] case class VectorSearchOptions(arguments: VectorSearchArguments, 
 /** The query settings a vector search call may name, each null when the call named none. */
 private[spark] case class VectorSearchArguments(
     nprobeArgument: String,
-    overSampleArgument: String,
+    refineFactorArgument: String,
     indexArgument: String)
 
 private[spark] object VectorSearchArguments {

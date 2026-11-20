@@ -93,22 +93,21 @@ object IndexTableFunctions {
         new ExpressionInfo(
           VECTOR_SEARCH,
           "vector_search(table, query_vector, k, vector_column, distance_type, columns, nprobe, "
-            + "over_sample, index): the nearest rows of a table"),
+            + "refine_factor, index): the nearest rows of a table"),
         vectorSearch))
-    extensions.injectTableFunction(
-      (
-        new FunctionIdentifier(VECTOR_INDEX_SEARCH),
-        new ExpressionInfo(
-          VECTOR_INDEX_SEARCH,
-          "vector_index_search(table, column, query, k[, nprobe, over_sample, index]): the index's "
-            + "own hits"),
-        vectorIndexSearch))
+    extensions.injectTableFunction((
+      new FunctionIdentifier(VECTOR_INDEX_SEARCH),
+      new ExpressionInfo(
+        VECTOR_INDEX_SEARCH,
+        "vector_index_search(table, column, query, k[, nprobe, refine_factor, index]): the index's "
+          + "own hits"),
+      vectorIndexSearch))
     extensions.injectTableFunction(
       (
         new FunctionIdentifier(VECTOR_INDEX_SEARCH_BATCH),
         new ExpressionInfo(
           VECTOR_INDEX_SEARCH_BATCH,
-          "vector_index_search_batch(table, column, queries, k[, nprobe, over_sample, index]): the "
+          "vector_index_search_batch(table, column, queries, k[, nprobe, refine_factor, index]): the "
             + "index's own hits for many queries at once"),
         vectorIndexSearchBatch))
     extensions.injectTableFunction(
@@ -219,6 +218,7 @@ object IndexTableFunctions {
       "vector_search",
       args,
       Seq("table", "query_vector", "k", VECTOR_COLUMN))
+    arguments.refuseRenamed(Map("over_sample" -> "refine_factor"))
     arguments.requireOnly(
       required = Seq("table", "query_vector"),
       optional = Seq(
@@ -230,7 +230,7 @@ object IndexTableFunctions {
         "columns",
         // the query settings: a call may name them, and then they win over the session's
         "nprobe",
-        "over_sample",
+        "refine_factor",
         "index"))
 
     val tableName = arguments.string("table")
@@ -247,7 +247,7 @@ object IndexTableFunctions {
     val named = arguments.metric("distance_type")
     val columns = arguments.strings("columns")
     val nprobe = arguments.int("nprobe")
-    val overSample = arguments.int("over_sample")
+    val refineFactor = arguments.int("refine_factor")
     val index = arguments.stringOption("index")
 
     Preconditions.checkArgument(
@@ -302,7 +302,7 @@ object IndexTableFunctions {
     VectorSearchOptions(
       VectorSearchArguments(
         nprobe.map(value => Integer.toString(value)).orNull,
-        overSample.map(value => Integer.toString(value)).orNull,
+        refineFactor.map(value => Integer.toString(value)).orNull,
         index.orNull),
       GlobalLimit(Literal(k), ordered))
   }
@@ -348,6 +348,18 @@ object IndexTableFunctions {
 
       required.find(key => !named.contains(key)).foreach { missing =>
         analysisError(s"$name needs $missing")
+      }
+    }
+
+    /**
+     * Refuses an argument under the name it used before being renamed.
+     *
+     * <p>The old spelling is not an alias: saying so is better than the unknown-argument message,
+     * which reads like a typo and leaves the caller to guess which name replaced it.
+     */
+    def refuseRenamed(renamed: Map[String, String]): Unit = {
+      named.keys.find(key => renamed.contains(key)).foreach { old =>
+        analysisError(s"$name's $old argument was renamed to ${renamed(old)}")
       }
     }
 
@@ -449,7 +461,7 @@ object IndexTableFunctions {
       topK,
       batch = false,
       options.nprobe.map(value => Integer.toString(value)).orNull,
-      options.overSample.map(value => Integer.toString(value)).orNull)
+      options.refineFactor.map(value => Integer.toString(value)).orNull)
   }
 
   private def vectorIndexSearchBatch(args: Seq[Expression]): LogicalPlan = {
@@ -477,7 +489,7 @@ object IndexTableFunctions {
       topK,
       batch = true,
       options.nprobe.map(value => Integer.toString(value)).orNull,
-      options.overSample.map(value => Integer.toString(value)).orNull)
+      options.refineFactor.map(value => Integer.toString(value)).orNull)
   }
 
   private def textIndexSearch(args: Seq[Expression]): LogicalPlan = {
@@ -517,7 +529,7 @@ object IndexTableFunctions {
   /** The query settings a call may name after its positional arguments. */
   private case class QueryOptions(
       nprobe: Option[Int],
-      overSample: Option[Int],
+      refineFactor: Option[Int],
       index: Option[String])
 
   /**
@@ -536,10 +548,11 @@ object IndexTableFunctions {
     }
 
     val arguments = new TableFunctionArguments(name, extras, Seq.empty)
-    arguments.requireOnly(required = Seq.empty, optional = Seq("nprobe", "over_sample", "index"))
+    arguments.refuseRenamed(Map("over_sample" -> "refine_factor"))
+    arguments.requireOnly(required = Seq.empty, optional = Seq("nprobe", "refine_factor", "index"))
     QueryOptions(
       arguments.int("nprobe"),
-      arguments.int("over_sample"),
+      arguments.int("refine_factor"),
       arguments.stringOption("index"))
   }
 

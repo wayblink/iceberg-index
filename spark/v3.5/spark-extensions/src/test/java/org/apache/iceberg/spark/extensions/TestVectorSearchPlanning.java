@@ -48,7 +48,7 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
 class TestVectorSearchPlanning {
-  private static final String OVER_SAMPLE = "spark.iceberg.index.vector.over-sample";
+  private static final String REFINE_FACTOR = "spark.iceberg.index.vector.refine-factor";
 
   private static SparkSession spark;
 
@@ -292,10 +292,10 @@ class TestVectorSearchPlanning {
     // because one candidate per hit is not a candidate set the nearest rows are in
     createApproximateTable("planning_approximate");
     try {
-      spark.conf().set(OVER_SAMPLE, "10");
+      spark.conf().set(REFINE_FACTOR, "10");
       assertThat(planOf("planning_approximate")).contains("result=approximate");
     } finally {
-      spark.conf().unset(OVER_SAMPLE);
+      spark.conf().unset(REFINE_FACTOR);
     }
   }
 
@@ -307,7 +307,7 @@ class TestVectorSearchPlanning {
    * re-scoring. The plan shows when the base budget was selected by default.
    */
   @Test
-  void anApproximateIndexIsUsedWithoutAnExplicitOverSample() {
+  void anApproximateIndexIsUsedWithoutAnExplicitRefineFactor() {
     createApproximateTable("planning_approx_default");
 
     assertThat(plan(nearestOf("planning_approx_default")))
@@ -315,17 +315,17 @@ class TestVectorSearchPlanning {
         .contains("VectorSearchSource")
         .contains("result=approximate")
         .as("and the width it used is stated with its source")
-        .contains("overSample=1 [DEFAULT]");
+        .contains("refineFactor=1 [DEFAULT]");
 
     try {
       // a caller who knows what they want still decides: the configured value replaces the default
-      spark.conf().set(OVER_SAMPLE, "10");
+      spark.conf().set(REFINE_FACTOR, "10");
       assertThat(plan(nearestOf("planning_approx_default")))
           .contains("VectorSearchSource")
           .contains("result=approximate")
-          .contains("overSample=10 [SESSION_CONF");
+          .contains("refineFactor=10 [SESSION_CONF");
     } finally {
-      spark.conf().unset(OVER_SAMPLE);
+      spark.conf().unset(REFINE_FACTOR);
     }
   }
 
@@ -337,14 +337,14 @@ class TestVectorSearchPlanning {
     List<Row> base = spark.sql(nearest).collectAsList();
 
     try {
-      spark.conf().set(OVER_SAMPLE, "0");
+      spark.conf().set(REFINE_FACTOR, "0");
       assertThat(spark.sql(nearest).collectAsList()).isEqualTo(base);
       assertThat(base).isNotEqualTo(scanned);
 
-      spark.conf().set(OVER_SAMPLE, "50");
+      spark.conf().set(REFINE_FACTOR, "50");
       assertThat(spark.sql(nearest).collectAsList()).isEqualTo(scanned);
     } finally {
-      spark.conf().unset(OVER_SAMPLE);
+      spark.conf().unset(REFINE_FACTOR);
     }
   }
 

@@ -125,7 +125,7 @@ SELECT id FROM local.db.papers WHERE match(body, 'parquet statistics') AND year 
 |---|---|---|---|
 | `FLAT` | 精确，逐条比 | 小规模对拍、要求绝对精确 | 搜索量等同全扫，省不了时间 |
 | `HNSW` | 近似，图 | 追求高召回、内存装得下 | 索引最大（10M/128 维约 2.2 GB） |
-| `IVF` | 近似，倒排 + 质心 | 大表、要控制索引体积 | 召回靠 `nprobe`；**带量化时**还要靠查询期 over-sample 补 |
+| `IVF` | 近似，倒排 + 质心 | 大表、要控制索引体积 | 召回靠 `nprobe`；**带量化时**还要靠查询期 refine-factor 补 |
 
 `quantizer => 'RABITQ'` 只对 `IVF` 有意义：每维压到 1–8 bit，体积降一个数量级，分数变成估计值，召回靠候选放宽补。
 
@@ -285,7 +285,7 @@ SELECT * FROM vector_index_search_batch('local.db.docs', 'embedding', array('0.9
 -- 位置参数之后可以写命名选项，三个函数共用同一套
 SELECT * FROM vector_index_search(
   'local.db.docs', 'embedding', array(0.95d, 0.05d), 3,
-  nprobe => 32, over_sample => 10);
+  nprobe => 32, refine_factor => 10);
 ```
 
 注意批查的 queries 是**字符串数组**，每个字符串是逗号分隔的数字，不是二维数组。
@@ -299,10 +299,10 @@ SELECT id, title, _distance FROM vector_search(
   k => 3,
   -- 查询期参数，可选项：不写就跟随会话配置
   nprobe => 32,
-  over_sample => 10);
+  refine_factor => 10);
 ```
 
-`nprobe` / `over_sample`（以及多索引时的 `index`）是**逐语句**参数：优先级是
+`nprobe` / `refine_factor`（以及多索引时的 `index`）是**逐语句**参数：优先级是
 **语句里写的 > 会话配置（`SET`）**（索引定义目前不记录这三项的默认值）。写错值会直接报错，
 不会回退到会话值。`nprobe` 以调用值为准；只写 session 时，session 值只对 IVF 索引生效，
 非 IVF 索引上**显式**传 `nprobe` 是错误（不会静默忽略）。
@@ -320,7 +320,7 @@ SELECT id, title, _distance FROM vector_search(
 2. 表只有 identity 分区；
 3. 形态是"单表 + 唯一一个升序距离排序 + 可折叠的正数 `LIMIT`"，中间只有投影、子查询别名，以及能被转换成索引侧表达式的过滤条件（向量列上的 `IS NOT NULL` 是其中最简单的一种）；
 4. 显式 `metric`（如果写了第三参数）与索引的 metric 一致，否则只 WARN 并退扫描；
-5. 索引存在、覆盖当前快照，就参与改写——**是否设置 `over-sample` 不影响走不走索引**，只影响候选宽度（4.4）。
+5. 索引存在、覆盖当前快照，就参与改写——**是否设置 `refine-factor` 不影响走不走索引**，只影响候选宽度（4.4）。
 
 反过来，`DESC`、多个排序键、`OFFSET`、join、聚合、窗口、无法转换成索引侧表达式的过滤（子查询、UDF、跨表列）、非 identity 分区、`LIMIT` 不是字面量——都会让规则退让，退回全表扫描。
 
@@ -330,21 +330,23 @@ SELECT id, title, _distance FROM vector_search(
 
 ### 4.4 候选宽度：默认值从哪里来，什么时候要自己调
 
-**索引总是被使用**（前提是它存在、覆盖当前快照、形态匹配）。`over-sample` 不是"允许近似"的开关，它是**候选宽度**：向索引多要一些候选，交给上面的精确重排去挑。因此它决定的是召回与延迟的折中，不是走不走索引。
+**索引总是被使用**（前提是它存在、覆盖当前快照、形态匹配）。`refine-factor` 不是"允许近似"的开关，它是**候选宽度**：向索引多要一些候选，交给上面的精确重排去挑。因此它决定的是召回与延迟的折中，不是走不走索引。
 
 计划里标 `exact` 还是 `approximate` 由另一件事决定——**候选集是否完整**：只有 `FLAT` 且无量化才枚举全部条目（`exact`）；`IVF` 只访问 `nprobe` 个分区，`HNSW` 只走图的一部分，两者都是表的一个样本（`approximate`）。近似与否是索引形态的属性，不是参数设置的属性。
 
-默认值为 `1`，基础候选预算为 `K`，执行计划显示 `overSample=1 [DEFAULT]`。`0` 与 `1` 等价，都表示不放大：两者算出的候选预算都是 `K`。业务行查询仍按原始向量精排，过滤或删除导致活行不足时可以扩窗。显式正整数按 `K × over-sample` 计算候选预算。SQL 改写与批量 `CALL` 两条入口取的是同一个窗口，同一个倍数在两边取到同样多的候选（这也是同一问题在两个入口给出同一答案的前提）。使用量化索引时，扩大候选窗口可能提高召回率，也可能增加回表成本。可以为会话显式设置倍数。
+默认值为 `1`，基础候选预算为 `K`，执行计划显示 `refineFactor=1 [DEFAULT]`。`0` 与 `1` 等价，都表示不放大：两者算出的候选预算都是 `K`。业务行查询仍按原始向量精排，过滤或删除导致活行不足时可以扩窗。显式正整数按 `K × refine-factor` 计算候选预算。SQL 改写与批量 `CALL` 两条入口取的是同一个窗口，同一个倍数在两边取到同样多的候选（这也是同一问题在两个入口给出同一答案的前提）。使用量化索引时，扩大候选窗口可能提高召回率，也可能增加回表成本。可以为会话显式设置倍数。
+
+这个参数此前叫 `over-sample`（配置键 `spark.iceberg.index.vector.over-sample`），现已统一改名为 `refine_factor`（配置键 `spark.iceberg.index.vector.refine-factor`）。旧配置键不再读取：会话或提交参数里还留着旧键时，查询会直接报错并指出新名字，而不是静默退回默认值。`CALL` 过程和表函数里的旧参数 `over_sample` 也不再被接受：表函数会直接提示改叫 `refine_factor`，过程则由 Spark 报 `Unknown argument: over_sample`，新名字见 `SHOW PROCEDURES` 和本文档。
 
 ```sql
-SET `spark.iceberg.index.vector.over-sample`=10;
+SET `spark.iceberg.index.vector.refine-factor`=10;
 ```
 
 配置名里有点和短横，`SET` 必须用反引号包起来，否则解析器报语法错误。
 
 放宽不是免费的，倍数直接乘在回表行数上。无量化 `IVF` 与 `FLAT` 设不设这个倍数，答案都一样（只是多读一些行回来重排）。
 
-也可以逐语句指定：`CALL … over_sample => 10`、`SELECT … FROM vector_search(…, over_sample => 10)` 或地址类表函数的同名命名选项；不写就跟随会话配置。
+也可以逐语句指定：`CALL … refine_factor => 10`、`SELECT … FROM vector_search(…, refine_factor => 10)` 或地址类表函数的同名命名选项；不写就跟随会话配置。
 
 `EXPLAIN` 会标出来：计划里的 `VectorSearchSource` 带 `result=exact` 或 `result=approximate`。只有 `FLAT` 且无量化才是 `exact`；看到 `approximate` 说明候选集仍可能漏掉真正的最近邻（分数和顺序是精确的，被粗筛漏掉的行不会回来）。没走索引的计划里两者都没有。
 
@@ -396,7 +398,7 @@ CALL local.system.drop_vector_index(table => 'db.docs', column => 'embedding', i
 
 | 指标 | 含义 | 容易误读的点 |
 |---|---|---|
-| `numCandidates` / `numCandidateRequests` | 本轮请求的候选窗口 / 最后一轮的窗口 | 被 `over_sample` 放大，不等于 k |
+| `numCandidates` / `numCandidateRequests` | 本轮请求的候选窗口 / 最后一轮的窗口 | 被 `refine_factor` 放大，不等于 k |
 | `numLiveCandidates` | 任务**保留**的活行（至多 k） | 不是"回表读到的行数"；打开精排后窗口是 8k、它仍然只是 k |
 | `numFetchedRows` | 任务**回表读取**的行数（按轮次累计） | 这才是回表成本的度量，用来折算回表字节 / 行数 |
 | `numIndexUnderfilled` | 最后一轮仍凑不满 k 的索引文件数 | 只描述索引分支，残差扫描可能已补齐 |
@@ -635,7 +637,7 @@ BM25 和向量索引共用 executor 的容量预算、LRU 和状态入口。用�
 |---|---|---|
 | `spark.iceberg.index.vector.ivf.range-read.enabled` | `false` | 整索引缓存未命中时，按字节范围读取分块 IVF 索引。 |
 | `spark.iceberg.index.vector.ivf.nprobe` | `8` | 每次查询在每个 IVF 索引文件中初始探测的列表数。使用正整数；调用里显式写的值优先，本项 session 值只对 IVF 生效（非 IVF 索引上显式传 `nprobe` 报错）。 |
-| `spark.iceberg.index.vector.over-sample` | `1` | 基础候选预算为 K。正整数按 K 乘倍数计算；`0` 与 `1` 等价，都是 K。SQL 改写与批量 `CALL` 用同一个窗口。 |
+| `spark.iceberg.index.vector.refine-factor` | `1` | 基础候选预算为 K。正整数按 K 乘倍数计算；`0` 与 `1` 等价，都是 K。SQL 改写与批量 `CALL` 用同一个窗口。 |
 | `spark.iceberg.index.vector.name` | 不设 | 同列多索引时选哪个 |
 | `spark.iceberg.index.vector.filter-mode` | `pre` | task 内过滤落在打分前（`pre`）还是后（`post`）：`pre` 只给放行行打分，`post` 打分后逐行判定再扩样；只在 `ORDER BY vec_distance` 改写带过滤时生效，不是调用参数（见 4.6），非法值直接失败 |
 | `spark.iceberg.index.cache.enabled` | `false` | 缓存开关；关掉时 `load_index` 报 `CACHE_DISABLED` |
@@ -647,10 +649,10 @@ BM25 和向量索引共用 executor 的容量预算、LRU 和状态入口。用�
 
 查询期参数分两层，优先级从高到低：
 
-1. **语句里写的**：`CALL … vector_search(..., nprobe => 32, over_sample => 10, index => 'name')`；表函数同理（位置参数之后写 `nprobe => 32` 等命名选项）。非法值直接失败，不会回退。
+1. **语句里写的**：`CALL … vector_search(..., nprobe => 32, refine_factor => 10, index => 'name')`；表函数同理（位置参数之后写 `nprobe => 32` 等命名选项）。非法值直接失败，不会回退。
 2. **会话配置**：下面表里的 `SET spark.iceberg.index.vector.*`（以及 `spark-submit --conf`）。
 
-索引定义目前不记录 `nprobe` / `over_sample` 的默认值，所以实际就是上面两层；`nprobe` 的历史索引期选项已退役，会被忽略。`nprobe` 以调用值为准，只写 session 时该值只对 IVF 索引生效；非 IVF 索引上显式传 `nprobe` 是错误。`over_sample`、`index` 也适用这条链；`index` 的语句级写法在过程和表函数里都支持。
+索引定义目前不记录 `nprobe` / `refine_factor` 的默认值，所以实际就是上面两层；`nprobe` 的历史索引期选项已退役，会被忽略。`nprobe` 以调用值为准，只写 session 时该值只对 IVF 索引生效；非 IVF 索引上显式传 `nprobe` 是错误。`refine_factor`、`index` 也适用这条链；`index` 的语句级写法在过程和表函数里都支持。
 
 `filter_mode` 不在这条链里：它不是调用参数，只有会话配置 `spark.iceberg.index.vector.filter-mode`，而且只作用于 `ORDER BY vec_distance` 改写带过滤的查询（4.6）。
 
@@ -764,8 +766,8 @@ BM25 和向量索引共用 executor 的容量预算、LRU 和状态入口。用�
 | `check_indexes` | `table` | — |
 | `index_build_status` | `table` | — |
 | `index_cache_status` | — | `refresh` |
-| `vector_search`（过程） | `table, column, query, k` | `index, coverage, nprobe, over_sample` |
-| `vector_search_batch` | `table, column, k` | `queries, query_table, query_id_column, vector_column, index, coverage, nprobe, over_sample` |
+| `vector_search`（过程） | `table, column, query, k` | `index, coverage, nprobe, refine_factor` |
+| `vector_search_batch` | `table, column, k` | `queries, query_table, query_id_column, vector_column, index, coverage, nprobe, refine_factor` |
 | `text_search` | `table, column, query, k` | — |
 | `text_search_batch` | `table, column, queries, k` | — |
 | `load_index` | `table, index` | `retain_for` |
@@ -776,7 +778,7 @@ BM25 和向量索引共用 executor 的容量预算、LRU 和状态入口。用�
 
 | 函数 | 参数 | 返回 |
 |---|---|---|
-| `vector_search` | `table, query_vector, k, vector_column`（位置序）＋ `nprobe` / `over_sample` / `index` / `distance_type` / `columns` 命名选项；没有 `coverage` | 业务行 + `_distance` |
+| `vector_search` | `table, query_vector, k, vector_column`（位置序）＋ `nprobe` / `refine_factor` / `index` / `distance_type` / `columns` 命名选项；没有 `coverage` | 业务行 + `_distance` |
 | `vector_index_search` | `table, column, query(array\<double\>), k`（位置序）＋ 同一组命名选项；没有 `coverage` | `data_file, pos, score, row`（固定 `index_hits` 语义） |
 | `vector_index_search_batch` | `table, column, queries(array\<string\>，逗号分隔), k`（位置序）＋ 同一组命名选项；没有 `coverage` | 同上 + `query_id`（固定 `index_hits` 语义） |
 | `search` | `table, query, search_columns(array\<string\>，恰好 1 列), k` | 业务行 + `_score` |

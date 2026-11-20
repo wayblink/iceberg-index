@@ -217,10 +217,10 @@ class TestVectorSearchTableFunction {
                 + "vector_column => 'embedding', k => 1, distance_type => 'cosine')",
             table);
     try {
-      spark.conf().set("spark.iceberg.index.vector.over-sample", "10");
+      spark.conf().set("spark.iceberg.index.vector.refine-factor", "10");
       assertThat(planOf(cosine)).contains("VectorSearchSource");
     } finally {
-      spark.conf().unset("spark.iceberg.index.vector.over-sample");
+      spark.conf().unset("spark.iceberg.index.vector.refine-factor");
     }
     assertThat(planOf(query)).doesNotContain("VectorSearchSource");
   }
@@ -385,11 +385,29 @@ class TestVectorSearchTableFunction {
                       "SELECT id, _distance FROM vector_search(table => 'local.%s',"
                           + " query_vector => array(1.0d, 0.0d),"
                           + " vector_column => 'embedding', k => 2, nprobe => 2,"
-                          + " over_sample => 0)",
+                          + " refine_factor => 0)",
                       table))
               .collectAsList();
       assertThat(hits).hasSize(2);
       assertThat(hits.get(0).getDouble(1)).isLessThan(hits.get(1).getDouble(1));
+
+      // the multiple was renamed to refine-factor; a call that still writes the old argument is
+      // told which name to use instead of being answered with the default
+      assertThatThrownBy(
+              () ->
+                  spark
+                      .sql(
+                          String.format(
+                              "SELECT * FROM vector_search(table => 'local.%s',"
+                                  + " query_vector => array(1.0d, 0.0d),"
+                                  + " vector_column => 'embedding', k => 2, over_sample => 0)",
+                              table))
+                      .collectAsList())
+          .as("the renamed argument fails by name instead of as an unknown one")
+          .isInstanceOf(org.apache.spark.sql.AnalysisException.class)
+          .hasMessageContaining("renamed")
+          .hasMessageContaining("over_sample")
+          .hasMessageContaining("refine_factor");
     } finally {
       spark.conf().unset("spark.iceberg.index.vector.ivf.nprobe");
     }

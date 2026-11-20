@@ -60,10 +60,13 @@ private[spark] object BindVectorSearch {
       return NoApplicableVectorIndex
     }
     val keys = Set(
-      VectorQueryParameters.OverSampleConf,
+      VectorQueryParameters.RefineFactorConf,
       VectorQueryParameters.IndexNameConf,
       VectorQueryParameters.FilterModeConf,
-      VectorQueryParameters.NprobeConf)
+      VectorQueryParameters.NprobeConf,
+      // the name this setting used to have: kept in the view so the capture can refuse it by name
+      // instead of Spark ignoring a key nobody reads
+      VectorQueryParameters.RenamedOverSampleConf)
     val session = spark.conf.getAll.filter { case (key, _) => keys.contains(key) }.asJava
     val submit = spark.sparkContext.getConf.getAll.toMap.filter { case (key, _) =>
       keys.contains(key)
@@ -74,7 +77,7 @@ private[spark] object BindVectorSearch {
         submit,
         input.indexArgument,
         input.nprobeArgument,
-        input.overSampleArgument)
+        input.refineFactorArgument)
     val metadata = if (raw.indexName != null) {
       require(
         raw.indexName.value != null && raw.indexName.value.trim.nonEmpty,

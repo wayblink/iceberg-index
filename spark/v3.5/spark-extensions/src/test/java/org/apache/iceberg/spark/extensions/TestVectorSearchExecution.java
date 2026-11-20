@@ -161,18 +161,18 @@ class TestVectorSearchExecution {
 
     int k = 3;
     try {
-      for (String overSample : new String[] {"0", "1", "2", "4"}) {
-        spark.conf().set("spark.iceberg.index.vector.over-sample", overSample);
+      for (String refineFactor : new String[] {"0", "1", "2", "4"}) {
+        spark.conf().set("spark.iceberg.index.vector.refine-factor", refineFactor);
         Dataset<Row> frame = spark.sql(nearest(table, k));
         assertThat(frame.collectAsList()).hasSize(k);
         assertThat(metric(sourceExec(frame), "numCandidates"))
             .as(
-                "the window of over-sample %s is k times the multiple, as the batch starts",
-                overSample)
-            .isEqualTo((long) k * Math.max(1, Integer.parseInt(overSample)));
+                "the window of refine factor %s is k times the multiple, as the batch starts",
+                refineFactor)
+            .isEqualTo((long) k * Math.max(1, Integer.parseInt(refineFactor)));
       }
     } finally {
-      spark.conf().unset("spark.iceberg.index.vector.over-sample");
+      spark.conf().unset("spark.iceberg.index.vector.refine-factor");
     }
   }
 
@@ -233,9 +233,9 @@ class TestVectorSearchExecution {
 
   @Test
   void sourceStatisticsDoNotApplyTheLimitBeforeOversampling() {
-    String table = tableWithIndex("exec_stats_oversampled");
+    String table = tableWithIndex("exec_stats_refineFactored");
     long tableRows = spark.table("local.db." + table).count();
-    String parameter = "spark.iceberg.index.vector.over-sample";
+    String parameter = "spark.iceberg.index.vector.refine-factor";
     scala.Option<String> previous = spark.conf().getOption(parameter);
     spark.conf().set(parameter, "3");
     try {
@@ -319,7 +319,7 @@ class TestVectorSearchExecution {
     assertThat(text).contains("driverMaterialization=true");
     // the number the query ran with, and where it came from, are part of the plan
     // a flat index stores every vector, so the width cannot matter and the default is one
-    assertThat(text).contains("overSample=1 [DEFAULT]");
+    assertThat(text).contains("refineFactor=1 [DEFAULT]");
     assertThat(text).contains("metric=L2");
     // the request and the budget it was shrunk to are both visible
     assertThat(text).contains("requestedCandidates=");
@@ -434,7 +434,7 @@ class TestVectorSearchExecution {
             table));
     spark.sql(String.format("DELETE FROM local.db.%s WHERE id IN (1, 2, 3)", table));
 
-    String parameter = "spark.iceberg.index.vector.over-sample";
+    String parameter = "spark.iceberg.index.vector.refine-factor";
     scala.Option<String> previous = spark.conf().getOption(parameter);
     // the tightest window the caller can ask for, so the deleted rows are not covered by the spare
     // candidates a wider budget would have asked for anyway

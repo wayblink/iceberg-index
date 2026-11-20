@@ -80,7 +80,7 @@ CALL local.system.build_vector_index(
 |---|---|---|---|
 | `FLAT` | 精确，逐条比 | 只用 `vector_search` 做小规模验证/对拍 | 搜索量等同全扫，**自动改写在规划时直接跳过它**（注释里写明"改写只会更慢"） |
 | `HNSW` | 近似，图 | 追求高召回、内存装得下 | 索引最大（10M/128 维约 2.2 GB），100M 规模装不进单节点缓存 |
-| `IVF` | 近似，倒排+质心 | 大表、需要控制索引体积 | 需要调 `nprobe` 和查询期 over-sample，召回不是白给的 |
+| `IVF` | 近似，倒排+质心 | 大表、需要控制索引体积 | 需要调 `nprobe` 和查询期 refine-factor，召回不是白给的 |
 
 `quantizer => 'RABITQ'` 只对 `IVF` 有意义：把每个向量压成每个维度 1–8 bit 的量化码，体积降一个数量级，打分变成 popcount。代价是召回要靠**候选放宽**补回来。
 
@@ -131,11 +131,11 @@ LIMIT 10;
 
 `FLAT`（精确索引）也参与改写。早先的规则因为"`FLAT` 每个条目都要打分、代价等同扫描"把它排除在外，现在这条成本判断已移除——能不能用索引只看正确性，不看代价。所以 `FLAT` 也会走到索引路径，只是省不了多少开销：候选就是全部条目，重排后仍然是全量打分。做"不走索引"的对照时，用改写认不出来的写法（如距离后加 `+ 0.0d`）。
 
-近似结构按估计分数选出候选，排序节点再用原始向量精排。默认 `over-sample=0` 时基础候选预算为 K，精排仍会执行。可以分别设置 IVF 的探测数和候选倍率。
+近似结构按估计分数选出候选，排序节点再用原始向量精排。默认 `refine-factor=0` 时基础候选预算为 K，精排仍会执行。可以分别设置 IVF 的探测数和候选倍率。
 
 ```sql
 SET `spark.iceberg.index.vector.ivf.nprobe`=32;
-SET `spark.iceberg.index.vector.over-sample`=10;
+SET `spark.iceberg.index.vector.refine-factor`=10;
 ```
 
 配置名里带点和短横，`SET` 必须用反引号把它包起来，否则解析器直接报语法错误（`SET key=value` 的 key 只接受标识符）。第一节里列的其它配置同理。
@@ -247,7 +247,9 @@ CALL local.system.refresh_vector_index(table => 'db.docs', column => 'embedding'
 | `spark.iceberg.index.cache.idle-ttl` | `30m` | 空闲多久后报告视为过期 |
 | `spark.iceberg.index.schedule.locality` | `true` | 把 task 派到已持有该索引文件的 executor |
 | `spark.iceberg.index.vector.ivf.nprobe` | `8` | 每个 IVF 索引文件初始探测的列表数。旧构建脚本应把该值移到查询会话。 |
-| `spark.iceberg.index.vector.over-sample` | `0` | 基础候选预算为 K，显式正整数作为倍数。 |
+| `spark.iceberg.index.vector.refine-factor` | `0` | 基础候选预算为 K，显式正整数作为倍数。 |
+
+这个参数此前叫 `over-sample`／`spark.iceberg.index.vector.over-sample`，2026-11 起统一叫 `refine-factor`；旧键会被拒绝并报出新名字，而不是被静默忽略退回默认值。
 
 自动预算的口径值得记住：它按**整个工作集**（所有索引文件 prepare 之后占的内存）× 1.2 算，再被 `堆大小 × heap-fraction` 截住。不是"每个 executor 分 1/N"——因为任何一个 task 都可能被派到任何 executor。10M（39 个索引文件、prepared 约 2.4 GB）在 4 × 16g 上因此能装下全部文件，coverage 实测 1.00；而这个策略在 100M HNSW（prepared 远超 4 GB 上限）上**不成立**，那时只会加载装得下的部分。
 
@@ -292,10 +294,10 @@ CALL local.system.cleanup_index_files(table => 'db.docs');
 | `No vector index exists` | 列上没有向量索引 | `build_vector_index` |
 | `does not match index dimension` | 查询向量长度与索引维度不符 | 对齐长度 |
 | 查询没走索引（`EXPLAIN` 里没有 `VectorSearchSource`） | 分区不是 identity、索引没覆盖任何文件、类型未注册 | 按第 4.1 节逐条排查；确认会话加载了 `spark.sql.extensions` |
-| 召回明显偏低 | 近似结构下 over-sample 太小 | `SET spark.iceberg.index.vector.over-sample=10`（1bit 需要 50–100） |
+| 召回明显偏低 | 近似结构下 refine-factor 太小 | `SET spark.iceberg.index.vector.refine-factor=10`（1bit 需要 50–100） |
 | 查询很慢、`index_cache_status` 显示 `coverage` 低 | 缓存没开或预算不足 | 开 `cache.enabled`，别把 `cache.bytes` 设得比工作集小 |
 | `index_cache_status()` 返回 0 行 | 缓存没开，或配置用 `--conf` 传但版本较旧 | 用会话 `SET` 或新版镜像 |
-| `SET spark.iceberg...` 报 `INVALID_SET_SYNTAX` | 配置名里有 `.` 和 `-` | 用反引号：``SET `spark.iceberg.index.vector.over-sample`=10`` |
+| `SET spark.iceberg...` 报 `INVALID_SET_SYNTAX` | 配置名里有 `.` 和 `-` | 用反引号：``SET `spark.iceberg.index.vector.refine-factor`=10`` |
 | 过程/表函数的 top-1 与改写结果不同 | 默认档与改写应当一致；先确认是不是用了 `coverage => 'index_hits'`（那是 kernel 排序） | 查询结果用默认档；`index_hits` 只用于诊断 |
 
 ## 11. 速查
@@ -319,4 +321,4 @@ CALL local.system.cleanup_index_files(table => 'db.docs');
 
 SQL 表达式：`vec_distance(vector, query)`（越小越近，可直接 `ORDER BY`）。
 
-会话配置：`spark.iceberg.index.vector.over-sample`、`spark.iceberg.index.vector.name`、`spark.iceberg.index.cache.*`、`spark.iceberg.index.schedule.locality`。
+会话配置：`spark.iceberg.index.vector.refine-factor`、`spark.iceberg.index.vector.name`、`spark.iceberg.index.cache.*`、`spark.iceberg.index.schedule.locality`。

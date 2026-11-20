@@ -25,15 +25,17 @@ private[spark] case class VectorCandidateBudget(
     entryUpperBound: JLong)
 
 private[spark] object VectorCandidateBudget {
-  def derive(k: Int, overSample: Long, entryUpperBound: JLong): VectorCandidateBudget = {
+  def derive(k: Int, refineFactor: Long, entryUpperBound: JLong): VectorCandidateBudget = {
     require(k > 0, s"Invalid vector top-k: $k")
-    require(overSample >= 0, s"Invalid vector over-sample: $overSample")
+    require(refineFactor >= 0, s"Invalid vector refine factor: $refineFactor")
     val requested =
       try {
-        Math.multiplyExact(k.toLong, math.max(1L, overSample))
+        Math.multiplyExact(k.toLong, math.max(1L, refineFactor))
       } catch {
         case cause: ArithmeticException =>
-          throw new IllegalArgumentException(s"Candidate budget overflow: $k * $overSample", cause)
+          throw new IllegalArgumentException(
+            s"Candidate budget overflow: $k * $refineFactor",
+            cause)
       }
     VectorCandidateBudget(requested, bounded(requested, entryUpperBound), entryUpperBound)
   }

@@ -60,8 +60,8 @@ class VectorSearchProcedure extends BaseProcedure {
   private static final ProcedureParameter NPROBE_PARAM =
       optionalInParameter("nprobe", DataTypes.IntegerType);
 
-  private static final ProcedureParameter OVER_SAMPLE_PARAM =
-      optionalInParameter("over_sample", DataTypes.IntegerType);
+  private static final ProcedureParameter REFINE_FACTOR_PARAM =
+      optionalInParameter("refine_factor", DataTypes.IntegerType);
 
   private static final ProcedureParameter[] PARAMETERS =
       new ProcedureParameter[] {
@@ -72,7 +72,7 @@ class VectorSearchProcedure extends BaseProcedure {
         INDEX_PARAM,
         COVERAGE_PARAM,
         NPROBE_PARAM,
-        OVER_SAMPLE_PARAM
+        REFINE_FACTOR_PARAM
       };
 
   private static final StructType OUTPUT_TYPE =
@@ -131,9 +131,9 @@ class VectorSearchProcedure extends BaseProcedure {
           // a value the call names is the query's own question and wins over the session
           String nprobeArgument =
               input.isProvided(NPROBE_PARAM) ? Integer.toString(input.asInt(NPROBE_PARAM)) : null;
-          String overSampleArgument =
-              input.isProvided(OVER_SAMPLE_PARAM)
-                  ? Integer.toString(input.asInt(OVER_SAMPLE_PARAM))
+          String refineFactorArgument =
+              input.isProvided(REFINE_FACTOR_PARAM)
+                  ? Integer.toString(input.asInt(REFINE_FACTOR_PARAM))
                   : null;
           org.apache.iceberg.spark.index.VectorSearchHitsPlan plan =
               org.apache.iceberg.spark.index.VectorSearchCalls.plan(
@@ -146,7 +146,7 @@ class VectorSearchProcedure extends BaseProcedure {
                   false,
                   coverage,
                   nprobeArgument,
-                  overSampleArgument);
+                  refineFactorArgument);
           List<org.apache.spark.sql.Row> hits =
               org.apache.iceberg.spark.index.VectorSearchCalls.search(plan, spark());
 
