@@ -1693,19 +1693,15 @@ public final class DistributedIndexSearch {
 
     // the per-query top-k is merged with a bounded accumulator, so the shuffle carries at most one
     // entry per (query, index file) instead of every hit
-    Comparator<Tuple3<String, Long, Double>> order = hitOrder(adapter);
-    int mergeLimit = localTopK;
-    Map<Integer, List<Tuple3<String, Long, Double>>> topByQuery =
-        aggregateHits(fileHits, order, mergeLimit);
+    Map<Integer, HitTopK> topByQuery =
+        aggregateHits(fileHits, ranksLargerScoreFirst(adapter), localTopK);
     mergeCacheReports(cacheReports, locationsTable, cacheKeys, cacheRef.getValue(), workingSet);
 
     for (int queryId = 0; queryId < queries.size(); queryId++) {
       int limit = queries.get(queryId).topK();
-      List<Tuple3<String, Long, Double>> candidates =
-          topByQuery.getOrDefault(queryId, Lists.newArrayList());
       // the merge keeps one more than the widest window, so a query whose merged candidates fit its
       // own window is the only case where the index has nothing more to offer it
-      perQuery.add(new SearchOutcome(hitsOf(candidates, limit, order), candidates.size() > limit));
+      perQuery.add(outcome(topByQuery.get(queryId), limit));
     }
 
     return perQuery;
@@ -1822,9 +1818,9 @@ public final class DistributedIndexSearch {
       }
     }
 
-    Comparator<Tuple3<String, Long, Double>> order = hitOrder(adapter);
+    boolean higherScoreFirst = ranksLargerScoreFirst(adapter);
     if (files.isEmpty() || terms.isEmpty()) {
-      return orderedHits(Map.of(), limits, order);
+      return orderedHits(Map.of(), limits);
     }
 
     List<IndexFileTask> searchShards = Lists.newArrayListWithCapacity(files.size());
@@ -1847,7 +1843,7 @@ public final class DistributedIndexSearch {
     }
 
     if (searchShards.isEmpty()) {
-      return orderedHits(Map.of(), limits, order);
+      return orderedHits(Map.of(), limits);
     }
 
     JavaSparkContext context = JavaSparkContext.fromSparkContext(spark.sparkContext());
@@ -1944,9 +1940,9 @@ public final class DistributedIndexSearch {
                     });
 
         int widest = Arrays.stream(limits).max().orElseThrow();
-        Map<Integer, List<Tuple3<String, Long, Double>>> top = aggregateHits(hits, order, widest);
+        Map<Integer, HitTopK> top = aggregateHits(hits, higherScoreFirst, widest);
         mergeCacheReports(cacheReports, locationsTable, keys, config, workingSet);
-        return orderedHits(top, limits, order);
+        return orderedHits(top, limits);
       } finally {
         encodedQueries.destroy();
         statistics.destroy();
@@ -2003,59 +1999,53 @@ public final class DistributedIndexSearch {
     }
   }
 
-  private static Map<Integer, List<Tuple3<String, Long, Double>>> aggregateHits(
+  /**
+   * Merges the hits of each query with a bounded heap, so a partition keeps its best hits instead
+   * of every hit it produced.
+   *
+   * <p>The accumulator is the heap itself: a candidate costs one comparison when it is not better
+   * than the worst hit held, and a path down the heap when it is. Merging two accumulators offers
+   * one to the other, which keeps the best of both, so the same limit bounds the merge at every
+   * level of the stage.
+   */
+  private static Map<Integer, HitTopK> aggregateHits(
       JavaPairRDD<Integer, Tuple3<String, Long, Double>> fileHits,
-      Comparator<Tuple3<String, Long, Double>> order,
+      boolean higherScoreFirst,
       int mergeLimit) {
-    Function2<
-            List<Tuple3<String, Long, Double>>,
-            Tuple3<String, Long, Double>,
-            List<Tuple3<String, Long, Double>>>
-        mergeHit =
-            (hits, hit) -> {
-              hits.add(hit);
-              return bounded(hits, order, mergeLimit);
-            };
-    Function2<
-            List<Tuple3<String, Long, Double>>,
-            List<Tuple3<String, Long, Double>>,
-            List<Tuple3<String, Long, Double>>>
-        mergeHits =
-            (left, right) -> {
-              left.addAll(right);
-              return bounded(left, order, mergeLimit);
-            };
+    Function2<HitTopK, Tuple3<String, Long, Double>, HitTopK> mergeHit =
+        (hits, hit) -> {
+          hits.add(hit._1(), hit._2(), hit._3());
+          return hits;
+        };
+    Function2<HitTopK, HitTopK, HitTopK> mergeHits =
+        (left, right) -> {
+          left.addAll(right);
+          return left;
+        };
     return fileHits
-        .aggregateByKey(Lists.<Tuple3<String, Long, Double>>newArrayList(), mergeHit, mergeHits)
+        .aggregateByKey(new HitTopK(higherScoreFirst, mergeLimit), mergeHit, mergeHits)
         .collectAsMap();
   }
 
   private static List<List<IndexSearchResult>> orderedHits(
-      Map<Integer, List<Tuple3<String, Long, Double>>> topByQuery,
-      int[] limits,
-      Comparator<Tuple3<String, Long, Double>> order) {
+      Map<Integer, HitTopK> topByQuery, int[] limits) {
     List<List<IndexSearchResult>> perQuery = Lists.newArrayListWithCapacity(limits.length);
     for (int queryId = 0; queryId < limits.length; queryId++) {
-      List<Tuple3<String, Long, Double>> top =
-          topByQuery.getOrDefault(queryId, Lists.newArrayList());
-      perQuery.add(hitsOf(top, limits[queryId], order));
+      HitTopK top = topByQuery.get(queryId);
+      perQuery.add(
+          top == null ? ImmutableList.<IndexSearchResult>of() : top.results(limits[queryId]));
     }
 
     return perQuery;
   }
 
-  /** The best hits of a query, at most {@code limit} of them, in the order of the merge. */
-  private static List<IndexSearchResult> hitsOf(
-      List<Tuple3<String, Long, Double>> candidates,
-      int limit,
-      Comparator<Tuple3<String, Long, Double>> order) {
-    List<Tuple3<String, Long, Double>> top = bounded(candidates, order, limit);
-    List<IndexSearchResult> hits = Lists.newArrayListWithCapacity(top.size());
-    for (Tuple3<String, Long, Double> hit : top) {
-      hits.add(IndexSearchResult.of(hit._1(), hit._2(), hit._3()));
+  /** A query's answer: its best hits, and whether the merge kept more than its own window. */
+  private static SearchOutcome outcome(HitTopK candidates, int limit) {
+    if (candidates == null) {
+      return new SearchOutcome(ImmutableList.of(), false);
     }
 
-    return ImmutableList.copyOf(hits);
+    return new SearchOutcome(candidates.results(limit), candidates.size() > limit);
   }
 
   /** Wraps the hits of a search that only ever sees its own top-k, so it cannot report more. */
@@ -2069,23 +2059,6 @@ public final class DistributedIndexSearch {
   }
 
   /**
-   * Keeps the best {@code limit} hits of a query and drops the rest.
-   *
-   * <p>The result is ordered even when nothing is dropped: a list shorter than the limit arrives in
-   * whatever order the merge produced, and two hits with the same score would then reach the caller
-   * in an order that depends on how the tasks were scheduled. The order of a merge is a function of
-   * the scores and of the data file and position that break ties, so a query has one answer.
-   */
-  private static List<Tuple3<String, Long, Double>> bounded(
-      List<Tuple3<String, Long, Double>> hits,
-      Comparator<Tuple3<String, Long, Double>> order,
-      int limit) {
-    List<Tuple3<String, Long, Double>> sorted = Lists.newArrayList(hits);
-    sorted.sort(order);
-    return Lists.newArrayList(sorted.subList(0, Math.min(limit, sorted.size())));
-  }
-
-  /**
    * Orders hits the way the adapter orders its results, for the merge of the per-file results.
    *
    * <p>The order of an adapter is a function of the score and of the data file and row position
@@ -2094,24 +2067,28 @@ public final class DistributedIndexSearch {
    * largest.
    */
   private static Comparator<Tuple3<String, Long, Double>> hitOrder(IndexAdapter adapter) {
+    boolean higherScoreFirst = ranksLargerScoreFirst(adapter);
+    return (Comparator<Tuple3<String, Long, Double>> & Serializable)
+        (left, right) ->
+            HitTopK.compare(
+                higherScoreFirst,
+                left._3(),
+                left._1(),
+                left._2(),
+                right._3(),
+                right._1(),
+                right._2());
+  }
+
+  /**
+   * Whether the adapter ranks a larger score first: true for a similarity, false for a distance.
+   */
+  private static boolean ranksLargerScoreFirst(IndexAdapter adapter) {
     // two results that differ only in their score, so the tie breaker has nothing to say and
-    // the comparator can only order them by the direction of the score
+    // the direction can only come from the score
     IndexSearchResult higher = IndexSearchResult.of("a", 0L, 1.0);
     IndexSearchResult lower = IndexSearchResult.of("a", 0L, 0.0);
-    boolean higherScoreFirst = adapter.resultComparator().compare(higher, lower) < 0;
-    return (Comparator<Tuple3<String, Long, Double>> & Serializable)
-        (left, right) -> {
-          int byScore = Double.compare(left._3(), right._3());
-          int primary = higherScoreFirst ? -byScore : byScore;
-          if (primary != 0) {
-            return primary;
-          }
-          int byFile = left._1().compareTo(right._1());
-          if (byFile != 0) {
-            return byFile;
-          }
-          return Long.compare(left._2(), right._2());
-        };
+    return adapter.resultComparator().compare(higher, lower) < 0;
   }
 
   private static byte[] toBytes(ByteBuffer buffer) {
