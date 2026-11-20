@@ -4,8 +4,17 @@ The Rust side of the native IVF build kernel: it takes one unit's vectors, train
 assigns the vectors, quantizes them (RaBitQ) and writes the payload the Java reader loads. The
 crate is both the JNI library the JVM loads and a library its own tests run against.
 
-This is the N0 prototype of #3144. It is not wired into a `VectorKernel` and has no user-facing
-option; the only caller is `NativeIvfBuild` in `index-vector`, which the golden test drives.
+This is the native build kernel of #3144/#3149, wired into `IvfKernel` and enabled per index
+definition by `options['ivf-build-kernel']='native'` (default `java`). The Java side reaches it
+through `NativeIvfBuild` in `index-vector`; the payload it writes is byte-identical to the Java
+kernel's, which the golden tests compare.
+
+A build loads every vector of the unit into this process before it trains: plan for
+`4 * entries * dimension` bytes of native heap, plus one copy of the encoded list bodies and one of
+the payload. That memory is outside the JVM heap, so it is not covered by `-Xmx` — size the
+container above it, and remember that several units may build on one executor at once. An
+allocation the machine cannot serve is reported as a build error (the Java side then falls back to
+its own kernel) rather than aborting the process.
 
 ## Layout
 
@@ -23,9 +32,14 @@ option; the only caller is `NativeIvfBuild` in `index-vector`, which the golden 
 
 ```bash
 cd index-vector/native
-cargo test          # the unit tests, including the JVM's random sequence and writeUTF bytes
-cargo build         # target/debug/libiceberg_ivf_native.{so,dylib}
+cargo test             # the unit tests, including the JVM's random sequence and writeUTF bytes
+cargo build            # target/debug/libiceberg_ivf_native.{so,dylib}, what the tests load
+cargo build --release  # the profile to measure or deploy: the debug build is not comparable
 ```
+
+The jar does not carry a prebuilt library: packaging a release build under
+`index-vector/src/main/resources/org/apache/iceberg/index/vector/native/<os>-<arch>/` is a
+deployment step (see the user guide, §4.2.1), not something the build does for you.
 
 Gradle builds the library before the module's tests (`:iceberg-index-vector:cargoBuildNativeIvf`)
 and skips it, with the native tests, when `cargo` is not on `PATH`:

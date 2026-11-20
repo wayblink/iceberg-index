@@ -69,9 +69,9 @@ CALL local.system.build_vector_index(
 
 - 解析、范围校验放在 `IvfOptions`（和 `nlist` 一起），非法值在构建时直接失败并点名字段。
 - 查询侧同样通过 `IvfOptions.from(properties, quantizer)` 读定义：实现是**同版本接受并写入**，没有“先接受并忽略”的过渡版本。因此带新键的索引需要**同版本或更新版本**的节点读取；旧版本节点遇到带新键的索引会在打开时抛 “Unknown IVF option”。滚动升级窗口内不要用新参数构建，这一条写进升级说明（用户指南 §4.2 同口径）。
-- `ivf-build-kernel` 属阶段二，引入时另行确认（本文只占位，不实现）。
+- `ivf-build-kernel` 原计划属阶段二、引入时另行确认；N1 已按“默认 java、显式 opt-in”引入（`fae5292459`），切默认仍需另行确认，见 §10 的落地状态。
 
-运行事实的记录：`IndexFileMemory.structure` 里增加 `train-samples`、`train-iterations`、`train-tolerance-ppm`、`assign-kernel-simd`、`build-kernel-native` 五个键（该 map 已有 `entry-count`、`list-count` 等，读者按需取键，新增不影响内存估算）。`assign-kernel-simd` 记录归属内核实际跑成了哪一个（JVM 没开 incubator 模块时为 0），`train-tolerance-ppm` 是生效的收敛阈值（百万分之一），`build-kernel-native` 在阶段二之前恒为 0。`list_indexes` 的输出没有 `structure` 列，这些实际值目前只能从构建日志读到（每写一个索引文件一条 `Encoded an IVF payload … over N rounds and M samples`）。
+运行事实的记录：`IndexFileMemory.structure` 里增加 `train-samples`、`train-iterations`、`train-tolerance-ppm`、`assign-kernel-simd`、`build-kernel-native` 五个键（该 map 已有 `entry-count`、`list-count` 等，读者按需取键，新增不影响内存估算）。`assign-kernel-simd` 记录归属内核实际跑成了哪一个（JVM 没开 incubator 模块时为 0），`train-tolerance-ppm` 是生效的收敛阈值（百万分之一），`build-kernel-native` 记录本次是否真的跑成 native（N1 之前恒为 0）。`list_indexes` 的输出没有 `structure` 列，这些实际值目前只能从构建日志读到（每写一个索引文件一条 `Encoded an IVF payload … over N rounds and M samples`）。
 
 ## 4. 阶段一：Java 能力项
 
@@ -220,8 +220,8 @@ CALL local.system.build_vector_index(
 | N0 | 单文件 native IVF 内核原型 + Java JNI 桥，golden 逐字节一致 | #3148 | `5a6fe35aa2` | 已合入 |
 | N1 首版 | native 接入构建路径，新增 `ivf-build-kernel`（默认 java），双路径逐字节一致 | #3149 | `fae5292459` | 已合入 |
 | A 线 | tiled 质心、RaBitQ encode 向量化、native 直读 entry payload（ABI v2） | #3149 | `f524d24001`、`ac1bf1692f`、`543deb87af` | 已合入；单元 209,616→32,082 ms（6.53×），外推 326k 单元 ≈348→55 s |
-| 阶段二 | native 构建内核（N0–N3） | — | — | 未开始 |
+| 阶段二 | native 构建内核（N0–N3） | #3148 #3149 | `5a6fe35aa2`、`fae5292459`、`f524d24001`、`ac1bf1692f`、`543deb87af` | N0/N1/A 已合入，默认 java；N2 集群构建已验证（10M：每单元中位 74.1 s，未达 60 s 目标）；N3 切默认未做（#3151 按“不切”关闭） |
 
 - P2b 默认休眠：只有定义里显式写 `ivf-assign-kernel=simd` 才走 SIMD 内核，且执行器 JVM 要带 `--add-modules jdk.incubator.vector`；没开模块时自动回退 P2a 并留一条 WARN，`structure` 的 `assign-kernel-simd` 为 0。
-- P0/P1/P2a/P4 不动默认产物；P3 三个键不写时产物与旧版本逐字节一致。
-- 阶段二（`ivf-build-kernel=native`）尚未开始，§5 仍是方案而非实现。
+- P0/P1/P2a/P4 不动默认产物；P3 三个键不写时，同一批 entries 在同一版本内的产物与旧内核逐字节一致（跨版本重建受 §10 的读序修复影响，字节不必相同）。
+- 阶段二（`ivf-build-kernel=native`）已完成 N0/N1/A 并合入 `index`，默认值仍是 `java`；§5 描述的 native 读数据文件（N2 余下部分）与切默认（N3）仍未做。

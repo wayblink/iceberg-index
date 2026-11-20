@@ -6,7 +6,7 @@
 - **A2（RaBitQ encode 向量化）**：encode 从 107.3 µs/向量降到 **22.2 µs**（shai AVX-512，4.8×；M4 21.0→9.4 µs，2.2×；1 bit 默认高到 6.6–7.5×）；三合一实测里 encode 阶段 2,948 ms → **270 ms（10.9×）**（40k 行、4 线程）。
 - **A3（native 直解码 entry payload，ABI v2）**：native 路径不再在 Java 侧 `decodeAll`，分配探针显示 132 MB vs 旧路径 173.6 MB；ABI v1/v2 双向不匹配都会 WARN 并回退 Java，payload 始终与 Java 内核逐字节一致。
 - **三合一（shai，40k 真实行 × 2560 维、nlist=570、4-bit、4 线程、load≈4.7）**：Java **209,616 ms** vs native **32,082 ms**，**6.53×**；两边 payload 都是 94,560,556 B、SHA-256 均 `66d622…`，`structure` 除 `build-kernel-native` 外逐项相同。
-- **外推到 326k 行的真实索引单元**（nlist≈570、13 文件、默认训练预算）：Java ≈348 s vs native **≈55 s**，**60 s/单元的目标在默认预算下达到**；用 #3142 的 8 样本/3 轮预算则 ≈27 s。这是外推，最终以 #3150 的集群同镜像 A/B 为准（进行中）。
+- **外推到 326k 行的真实索引单元**（nlist≈570、13 文件、默认训练预算）：Java ≈348 s vs native **≈55 s**；用 #3142 的 8 样本/3 轮预算则 ≈27 s。**这是外推，集群实测没有达到它**：#3150 的 10M 构建每单元中位 **74.1 s**（见下节），高于 60 s/单元的目标——外推少算了写对象存储与发布段，瓶颈已经转到那里。
 - 附带结论：A1 之后，#3142 的"8 样本/3 轮"对构建时间的贡献从约 64 s 缩到约 1 s，**"拿质量换时间"的权衡基本消失**；文档口径应随之更新（默认值仍不改）。
 
 ## 口径
@@ -150,4 +150,4 @@ java -Xmx3g -cp "classes-main:classes-test:lib/*" \
 # 日志：/data/wanganyang/a1a3-bench/bench-a1a2a3.log
 ```
 
-提交：A1 `c01f706d02`、A3 `29a4fe4244`、A2 `1cf1879830`，合并 `c64ab79fe5`、`97dbce8eec`（分支 `card/3149-a`，未合并、未 push）。
+提交：分支 `card/3149-a` 上的 A1 `c01f706d02`、A3 `29a4fe4244`、A2 `1cf1879830`，合并 `c64ab79fe5`、`97dbce8eec`；这些在合入时被 rebase 成 `index` 上的 `f524d24001`（A1）、`ac1bf1692f`（A3）、`543deb87af`（A2），复现请用后者。

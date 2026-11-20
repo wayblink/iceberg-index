@@ -172,7 +172,7 @@ DDL 必须给名字；`CALL` 在列上还没有索引时可以不命名。**`dim
 | `options['ivf-train-samples-per-list']` | `'39'` | 训练每个 list 使用的样本数（样本总数 = `nlist × 该值`，不超过文件条目数）。调小能省训练时间，质心更粗。 |
 | `options['ivf-train-max-iterations']` | `'25'` | Lloyd 迭代轮数上限，1–100。调小能省训练时间，质心更粗。 |
 | `options['ivf-train-convergence-tolerance']` | `'0.0'` | 相邻两轮质心相对位移小于该值即提前停止，取值 0–0.1；`0` 表示默认的“质心逐位相等”判据。调大通常能早停，质量影响需用 recall 验证。 |
-| `options['ivf-assign-kernel']` | `'exact'` | 归属（最近质心）内核：`exact` 是标量 double 路径，`simd` 用 float32 + Vector API 加速。**只对 `l2` 生效**，`cosine` / `dot` 仍走各自的原路径。`simd` 需要执行器 JVM 带 `--add-modules jdk.incubator.vector`；不带时自动回退 `exact` 并在日志里留一条 WARN，索引文件 `structure` 的 `assign-kernel-simd` 记录实际是否跑成。 |
+| `options['ivf-assign-kernel']` | `'exact'` | 归属（最近质心）内核：`exact` 是标量 double 路径，`simd` 用 float32 + Vector API 加速。**只对 `l2` 生效**，`cosine` / `dot` 仍走各自的原路径。`simd` 需要执行器 JVM 带 `--add-modules jdk.incubator.vector`；不带时自动回退 `exact` 并在日志里留一条 WARN，索引文件 `structure` 的 `assign-kernel-simd` 记录实际是否跑成。**`simd` 不保证跨 CPU 架构逐字节可复现**：它按 float32 分 lane 累加再水平归约，加法结合顺序随 AVX-512 / AVX2 / NEON 的 lane 数变化，近等距的行可能落到不同 list；要跨机型复现同一份 payload 就用 `exact`。 |
 | `options['ivf-build-kernel']` | `'java'` | IVF 构建内核：`java` 是默认实现，`native` 用 Rust 内核（**只对 `l2` 生效**，payload 与 `java` 逐字节相同）。native 需要执行器 JVM 能加载 `libiceberg_ivf_native`（先在 `java.library.path` 找，再找 jar 内 `/org/apache/iceberg/index/vector/native/<os>-<arch>/` 下的副本），且库与本桥的 ABI 版本一致；库缺失、ABI 不符、非 L2 或运行异常都会自动回退 `java` 并告警，索引文件 `structure` 的 `build-kernel-native` 记录实际路径（1/0）。 |
 | `max_entries_per_index_file` | 1,000,000 | 索引文件的条目预算，决定如何分组；不拆单个数据文件 |
 | `name` | 无 | 同列多索引时必须给 |
@@ -180,7 +180,7 @@ DDL 必须给名字；`CALL` 在列上还没有索引时可以不命名。**`dim
 
 输出四列：`index_uuid`、`source_snapshot_id`、`index_files`、`entries`。
 
-三个 `ivf-train-*` 参数与 `ivf-assign-kernel` 只影响构建（训练预算、收敛判据与归属内核），不改 payload 格式；不设置时产物与旧版本逐字节相同。实际生效的样本数、轮数、收敛阈值与 SIMD 归属是否跑成记录在索引文件的内存结构里（`train-samples`、`train-iterations`、`train-tolerance-ppm`、`assign-kernel-simd`）；`list_indexes` 的输出没有 `structure` 列，这些值当前没有查询入口——构建日志里有实际轮数与样本数（每写一个 IVF 文件一条 `Encoded an IVF payload … over N rounds and M samples`），SIMD 是否跑成与收敛阈值只在 `structure` 里。要查某个索引用了什么参数，读 `definition` 里**请求的**值即可。带新键的定义旧版本读不了，滚动升级窗口内不要用新参数构建。候选推荐值 `8` / `3` / `0.001` 已在 oss32（10,784,907 行、33 个索引文件）上实测：`build_ms` 506,546 对默认 740,691，`recall@10` 0.98 对默认 0.97（100 个答案的分辨率是 1 个百分点，因此只能表述为“该分辨率下无可见质量损失”）。换数据集仍要用 `build_ms` 与 `recall@10` 复核，掉点超过 0.5 个百分点的组合不要上生产；延迟对比需要独占集群窗口，共享负载下不可归因。
+三个 `ivf-train-*` 参数与 `ivf-assign-kernel` 只影响构建（训练预算、收敛判据与归属内核），不改 payload 格式；不设置时同一批 entries 交给内核会写出与旧版本相同的字节。实际生效的样本数、轮数、收敛阈值与 SIMD 归属是否跑成记录在索引文件的内存结构里（`train-samples`、`train-iterations`、`train-tolerance-ppm`、`assign-kernel-simd`）；`list_indexes` 的输出没有 `structure` 列，这些值当前没有查询入口——构建日志里有实际轮数与样本数（每写一个 IVF 文件一条 `Encoded an IVF payload … over N rounds and M samples`），SIMD 是否跑成与收敛阈值只在 `structure` 里。要查某个索引用了什么参数，读 `definition` 里**请求的**值即可。带新键的定义旧版本读不了，滚动升级窗口内不要用新参数构建。注意还有一条跨版本口径：`#3153` 之后同一索引组的数据文件按路径排序后读取，所以**升级后用同样的定义重建同一张表，payload 可能不同于升级前那份**（内容等价、字节不必相同）；同一个版本内重跑才是逐字节可复现的。候选推荐值 `8` / `3` / `0.001` 已在 oss32（10,784,907 行、33 个索引文件）上实测：`build_ms` 506,546 对默认 740,691，`recall@10` 0.98 对默认 0.97（100 个答案的分辨率是 1 个百分点，因此只能表述为“该分辨率下无可见质量损失”）。换数据集仍要用 `build_ms` 与 `recall@10` 复核，掉点超过 0.5 个百分点的组合不要上生产；延迟对比需要独占集群窗口，共享负载下不可归因。
 
 同列多索引时，查询用 `index => '…'` 指定，或在会话里设 `spark.iceberg.index.vector.name`。
 
@@ -231,13 +231,23 @@ ALTER TABLE db.t ALTER COLUMN embedding CREATE INDEX idx
 
 单元级（x86 单机、40,000 行 × 2560 维、nlist=570、4-bit、4 线程、release 库、同一 JVM 背靠背）：整单元 209,616 ms → 32,082 ms（6.53×；train 6.65×、assign 7.33×、encode 约 10×），两边 payload 长度与 SHA-256 相同。
 
-集群（10,784,907 行 × 2560 维、33 个 340k 行单元、12 executor × 4c × 24g + 12g、`task_cpus` 4、同一镜像只差 `ivf-build-kernel`）：native `build_ms` **236,687 ms**，33/33 索引文件 `build-kernel-native=1`、无回退，索引共 17,890,137,090 B；同镜像的 java 臂 `1,097,833 ms`（**4.64×**）。每单元中位 74.1 s，其中约 34.5 s 是 train/assign/encode/read，其余约 40 s 是每个单元约 542 MB 索引文件写对象存储与发布段——**这时候瓶颈已经不在算术**，再压内核收益有限。
+集群（10,784,907 行 × 2560 维、33 个 340k 行单元、12 executor × 4c × 24g + 12g、`task_cpus` 4）：
+
+| 运行 | build_ms | 说明 |
+|---|---|---|
+| `97dbce8eec` 镜像 native（同镜像 A/B 的 native 臂） | 246,084 | 与下一行的 java 臂同一镜像、同一窗口 |
+| `97dbce8eec` 镜像 java（同镜像 A/B 的 java 臂） | 1,097,833 | **4.46×** |
+| `071617711d` 镜像 native（A 线合入后复测） | **236,687** | 单臂复测，比上一行 native 快 3.8%；跨 run，不与 java 臂算倍数 |
+
+`071617711d` 那轮 33/33 索引文件 `build-kernel-native=1`、无回退，索引共 17,890,137,090 B；每单元中位 74.1 s，其中约 34.5 s 是 train/assign/encode/read，其余约 40 s 是每个单元约 542 MB 索引文件写对象存储与发布段——**这时候瓶颈已经不在算术**，再压内核收益有限；74.1 s 也说明 60 s/单元的目标在集群上尚未达到。
 
 读这几个数时注意口径：单元级是单机共享负载（load≈4.7）下的背靠背测量，集群是同一窗口串行两臂；跨 run 的 payload 字节会因数据文件分组不同而不同（总字节差约 0.001%），同一次构建内 java 与 native 才保证逐字节一致。也不要用 dev 档的库去对比性能。
 
 #### 边界
 
-实验能力，**默认仍是 java**，逐表切 native。回退是静默的（日志留 WARN）：库缺失、ABI 不符、非 L2、运行时异常都会退回 Java，一致性由测试保证（golden 逐字节对比 + 真实数据 SHA-256），但回退会丢掉性能收益。带 `ivf-build-kernel` 的定义旧版本读不了，滚动升级窗口内不要用。
+实验能力，**默认仍是 java**，逐表切 native。回退是静默的（日志留 WARN）：库缺失、ABI 不符、非 L2、运行时异常（含内存分配不出来）都会退回 Java，一致性由测试保证（golden 逐字节对比 + 真实数据 SHA-256），但回退会丢掉性能收益，并且一次运行期失败会让该单元在建 Java 路径之前先白跑一遍 native。带 `ivf-build-kernel` 的定义旧版本读不了，滚动升级窗口内不要用。
+
+**内存**：native 构建会把整个单元的向量读进本进程的 native 堆，峰值约 `4 × entries × dimension` 字节，再加一份编码后的 list body 与一份 payload；这部分**不在 `-Xmx` 里**，容器内存上限要按它留余量，且同一 executor 上可能同时有多个单元。分配不出来时内核返回错误并由 Java 内核接手，不会 abort 进程。
 
 ### 4.3 查询：五种入口，先分清再用
 
@@ -299,6 +309,8 @@ SELECT id, title, _distance FROM vector_search(
 
 `filter_mode` **不是**调用参数：`CALL` 和表函数都不接受它，只有会话配置
 `spark.iceberg.index.vector.filter-mode`（见 4.6）。
+
+> **升级提醒（本轮两处 SQL 表面变更）**：① `filter_mode => ...` 作为调用参数已移除，旧语句会直接报“无此参数”，改用会话配置 `SET spark.iceberg.index.vector.filter-mode=pre|post`；② 三个地址类表函数（`vector_index_search` / `vector_index_search_batch`）固定为 `index_hits` 语义——用索引最新快照、不补未覆盖文件、被删行保留 `row = NULL`、分数是索引估计，**不再**按整表覆盖回答。要活行或精确分数用 `CALL ... coverage => 'table'|'indexed'` 或 `FROM vector_search(...)`。
 
 `vector_search` 表函数的 `distance_type` 可以显式指定 `l2` / `cosine` / `dot`（早期的 `euclidean`、`dot_product` 等写法仍接受）；**不写它就跟随索引的 metric**（索引是 `l2`，返回的就是 L2 距离）；写了但与索引不一致时，改写会退让并做全表扫描，但**答案仍是你要的那个 metric 的精确值**。
 

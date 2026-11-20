@@ -21,7 +21,7 @@
 | 索引定义 | IVF + RaBitQ 4-bit，`nlist=0`（round(sqrt(entries))≈570），`max_entries_per_index_file=340000` → 33 个索引文件 |
 | 资源 | 12 executors × 4 core × 24 g heap + 12 g overhead，driver 4c/12 g，`task_cpus=4` |
 | 历史运行 | `oss32-ab-kd-1119-1312`（before 镜像）、`oss32-ab-km/kt-1119-1312`、`oss32-p4-default-1119-1351`（after 镜像） |
-| 今天的分段计时运行 | `oss32-3146-phase-1119-1428`，14:28:50–14:48:48；镜像 `hub.i.basemind.com/wanganyang/sparkann-e2e:oss-bench-20261119-3146-phase@sha256:6ad2dfbb15bd06f801a7b98810e260d95c88cfb4ea80f4964bfa711b504f3ce8`，由 `card/3146`（`1a92ea349c` + 只加计时）构建，runtime jar sha256 `e27c9296fae4e948c872d8f5f3f0458132cd8d1c94a0e7867c8793e454456092` |
+| 今天的分段计时运行 | `oss32-3146-phase-1119-1428`，14:28:50–14:48:48；镜像 `hub.i.basemind.com/wanganyang/sparkann-e2e:oss-bench-20261119-3146-phase@sha256:6ad2dfbb15bd06f801a7b98810e260d95c88cfb4ea80f4964bfa711b504f3ce8`，由 `measure/3146-phase-timing`（`1a92ea349c` + `IDXPHASE` 日志，不改语义）构建，runtime jar sha256 `e27c9296fae4e948c872d8f5f3f0458132cd8d1c94a0e7867c8793e454456092` |
 | 计时方式 | 在 build procedure、`publishSnapshot`、`SidecarIndexCatalog` 的 registry/CAS/prune、`TableIndexRegistryPointer`、`VectorIndexes.counts`、`ListIndexesProcedure` 上打 `IDXPHASE <phase> <ms>` 日志；不改产品语义，计时代码不打算合入 |
 
 每操作延迟是“该段耗时 ÷ 代码里该段的 FileIO 调用数”的估算，用来做量级归因，不是精确到单次调用的直方图。
@@ -91,15 +91,17 @@ p4 运行没有程序内计时，只能从 CALL 与提交时间推出两段：
 
 **2. 索引数 1→9 的增长曲线？** 不是曲线，是噪声。每索引固定 3 次 GET；实测 5/9/9/9/11 个索引分别 1.90/1.90/9.74/55.65/2.42 s。同一次运行内建前 75.91 s 对建后 2.04 s（索引 9→11）已经排除了“索引数”作为解释变量。两个 585 文件的旧索引确实让 counts 读的 manifest 更大（469 KB，对 33 文件索引的不超过 108 KB），但 manifest 读取今天在 12–66 ms 之间，远小于窗口抖动。
 
-**3. 有没有低风险优化？** 有，按节省的串行操作数排序（详见下节）：台账清理 114→38→约 10 次；`list_indexes` 的 counts 占 2/3 的 GET；`createIndex` 的逐索引 `tableUuid` 复读；prune 从提交路径上挪走。构建后 `counts()` 只有 2 次调用、28 ms，明确不值得改。
+**3. 有没有低风险优化？** 有，按节省的串行操作数排序（详见下节）：台账清理 114→**42** 次（落地值，见下）；`list_indexes` 的 counts 占 2/3 的 GET；`createIndex` 的逐索引 `tableUuid` 复读；prune 从提交路径上挪走。构建后 `counts()` 只有 2 次调用、28 ms，明确不值得改。
 
 **4. 区分“表状态副作用”与“构建本身变慢”？** 是表状态/环境副作用，不是构建变慢。构建 stage 今天 884.51 s（p4 672.04 s）是集群负载造成的，与发布段无关；发布段慢的那次（p4）构建 stage 反而是最快的一次。跨 run 比较构建收益应使用 stage 或产品内部 “Built N of N … in X ms”，不要用 CALL 级 `build_ms`。
 
 ## 优化项（按节省的对象操作数排序，实现另开卡）
 
 1. **台账清理（`IndexSnapshotWriter.deleteLedger` / `SidecarIndexCatalog.deleteIfExists`）**：现状每个标记两次探测再删除；`FileIO.deleteFile` 对缺失文件本身是 no-op（S3 删除幂等、HDFS `delete` 返回 false、本地 `deleteIfExists`），去掉探测可把 114 次调用降到约 38 次；再把“一文件一标记”换成“一个 ledger 文件 + 有界并行删除”可降到约 10 次。按今天 8 ms/op 与 p4 280 ms/op 两端估算：p4 那次 33.9 s → 约 11 s → 约 3 s；今天的 0.89 s → 约 0.3 s。风险：需覆盖 `abortAttempt`（失败清理）与三种 FileIO 的删缺失语义，用现有 publication lifecycle 测试扩用例。
-2. **`list_indexes` 的 counts**：每次调用 2/3 的 GET（11 个索引 35 次里的 22 次）只为算 `index_files`/`entries`。两条路：counts 变成可选（新增用户参数，需单独批准）；或让 manifest list 携带 totals（格式变更，另开卡）。快窗口收益 2.42 s → 约 0.9 s；极慢窗口 55.65 s → 约 20 s。
-3. **`createIndex`/`register` 的 tableUuid 校验**：为了判断“这些索引是不是本表实例的”，逐个 `loadRegistered` 读全部索引 metadata（N 次 GET）。registry v3 已有 `metadata-files` 映射，可把 tableUuid 记进 registry（格式变更），或把校验限制在首次注册。
+
+   **落地（#3152，`04aa7e298e`）**：没有做成“一个 ledger 文件”，而是让完成标记写下本次写了多少个 file/manifest 标记，清理时读一次、逐个删、只在序列末端补探测：33 文件的一次尝试从约 114 次对象操作降到 **42 次**（1 读 + 37 删 + 4 探测；`TestIndexSnapshotWriterAttempts` 钉住“1 次读、≤7 次探测、总操作 ≤45”这三个上界）。实测墙钟在快窗口基本持平（0.89 s 量级，本来就不是瓶颈），收益按每操作延迟线性放大，慢窗口才看得出来。
+2. **`list_indexes` 的 counts**：每次调用 2/3 的 GET（11 个索引 35 次里的 22 次）只为算 `index_files`/`entries`。原来的两条路（把 counts 变成可选的新参数；或让 manifest list 携带 totals）都不需要：manifest list 从 `56d40a3ad1` 起就为每个 manifest 写了 `indexFileCount`/`entryCount`，只是没人用。**已落地（`4d0cb2b537`）**：counts 直接读 manifest list 汇总，每索引 3 读降为 1 读（35 次 → 13 次），无格式变更。快窗口收益 2.42 s → 约 0.9 s；极慢窗口 55.65 s → 约 20 s。
+3. **`createIndex`/`register` 的 tableUuid 校验**：为了判断“这些索引是不是本表实例的”，逐个 `loadRegistered` 读全部索引 metadata（N 次 GET）。**已落地（`6f1d21769f`）**：v3 registry 增加可选的 `table-uuids` 映射，注册时先看 registry 记的表实例、只在缺记录时回读 metadata，不升版本、旧 reader 忽略该字段。
 4. **`pruneOldVersions` 内联在提交路径上**：慢窗口里 18.71 s、约 10 次调用，纯 housekeeping；失败即放弃或延后不影响正确性。
 5. **不推荐改**：构建后的 `counts()`（28 ms、2 次 GET）；表加载（3.3 s，CALL 内 procedure 之外，属于 catalog 读表）与 `refreshSparkCache`/`closeService`（<0.2 s）。
 

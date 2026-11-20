@@ -11,8 +11,8 @@
 | 项 | 值 |
 |---|---|
 | worktree | `/Users/jyxc-dz-0101035/workspace/iceberg-wt/3144` |
-| 分支 | `card/3144`（基线 `index@1a92ea349c`，未合并、未推送） |
-| 提交 | 分支 `card/3144` 的 N0 提交（`Index: Build the IVF payload with a native kernel (#3148)`），未合并、未推送 |
+| 分支 | `index`（N0 原在 `card/3144`，基线 `index@1a92ea349c`；已合入为 `index@5a6fe35aa2`） |
+| 提交 | `5a6fe35aa2`（`Index: Build the IVF payload with a native kernel (#3148)`，已合入 `index`） |
 | Rust crate | `index-vector/native`（cdylib + rlib，`jni 0.21.1` 一个依赖，其余纯 std） |
 | Java 桥 | `index-vector/src/main/java/org/apache/iceberg/index/vector/NativeIvfBuild.java`（包内可见） |
 | golden 测试 | `index-vector/src/test/java/org/apache/iceberg/index/vector/TestNativeIvfBuild.java` |
