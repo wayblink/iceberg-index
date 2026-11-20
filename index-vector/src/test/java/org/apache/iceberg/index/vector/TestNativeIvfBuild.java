@@ -221,7 +221,7 @@ class TestNativeIvfBuild {
     IndexBuildResult java = adapter.encodeAuxiliaryPayloadWithMemory(entries, 1);
     byte[] javaBytes = bytes(java.payload());
     Built nativeBuild = NativeIvfBuild.build(adapter, entries, 1);
-    byte[] nativeBytes = nativeBuild.payload();
+    byte[] nativeBytes = bytes(nativeBuild.payload());
 
     assertThat(java.memory())
         .as("%s: the Java kernel reports what the payload remembers", description)

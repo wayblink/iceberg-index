@@ -23,7 +23,7 @@
 //! they write disjoint slots, so the payload does not depend on the thread count.
 
 use crate::abi::{Reader, Writer};
-use crate::build::{build, BuildOutcome, BuildRequest, EntrySource, METRIC_L2};
+use crate::build::{build_payload, BuildRequest, EntrySource, METRIC_L2};
 use crate::ABI_VERSION;
 use jni::errors::Error as JniError;
 use jni::objects::{GlobalRef, JByteArray, JClass, JObject, JString, JValue};
@@ -183,8 +183,50 @@ fn build_native(handle: jlong) -> Result<Vec<u8>, String> {
         source: &context.source,
         record_bytes,
     };
-    let outcome = build(&context.request, &mut source)?;
-    encode_result(&context.request, &outcome)
+    // The frame is assembled around the payload rather than beside it: the counters are written
+    // first as placeholders, the payload is appended once, and the counters are filled in after.
+    // A unit's payload is hundreds of megabytes, so a separate buffer plus a copy to put it in the
+    // frame is the difference between one live copy and two.
+    let request = &context.request;
+    let mut frame = Writer::new();
+    frame.i32(RESULT_MAGIC);
+    frame.i32(ABI_VERSION);
+    frame.i32(0);
+    frame.modified_utf("")?;
+    frame.i32(request.list_count as i32);
+    let counters_at = frame.bytes.len();
+    frame.i32(0); // sample count, patched below
+    frame.i32(0); // iterations, patched below
+    frame.i64(request.entry_count as i64);
+    frame.i64(0); // read nanos, patched below
+    frame.i64(0); // train nanos, patched below
+    frame.i64(0); // assign nanos, patched below
+    frame.i64(0); // encode nanos, patched below
+    let length_at = frame.bytes.len();
+    frame.i32(0); // payload bytes, patched below
+    let payload_start = frame.bytes.len();
+    let stats = build_payload(request, &mut source, &mut frame)?;
+    let payload_bytes = i32::try_from(frame.bytes.len() - payload_start).map_err(|_| {
+        format!(
+            "A payload of {} bytes is not addressable",
+            frame.bytes.len() - payload_start
+        )
+    })?;
+    frame.bytes[counters_at..counters_at + 4]
+        .copy_from_slice(&(stats.sample_count as i32).to_be_bytes());
+    frame.bytes[counters_at + 4..counters_at + 8]
+        .copy_from_slice(&(stats.iterations as i32).to_be_bytes());
+    // the entry count sits between the iterations and the timings, and the frame wrote it already
+    frame.bytes[counters_at + 16..counters_at + 24]
+        .copy_from_slice(&(stats.nanos_read as i64).to_be_bytes());
+    frame.bytes[counters_at + 24..counters_at + 32]
+        .copy_from_slice(&(stats.nanos_train as i64).to_be_bytes());
+    frame.bytes[counters_at + 32..counters_at + 40]
+        .copy_from_slice(&(stats.nanos_assign as i64).to_be_bytes());
+    frame.bytes[counters_at + 40..counters_at + 48]
+        .copy_from_slice(&(stats.nanos_encode as i64).to_be_bytes());
+    frame.bytes[length_at..length_at + 4].copy_from_slice(&payload_bytes.to_be_bytes());
+    Ok(frame.bytes)
 }
 
 /// Reads the rows of one unit through the Java object's `fetch`.
@@ -302,31 +344,6 @@ fn decode_params(bytes: &[u8]) -> Result<BuildRequest, String> {
         raw_values,
         threads,
     })
-}
-
-fn encode_result(request: &BuildRequest, outcome: &BuildOutcome) -> Result<Vec<u8>, String> {
-    let payload_bytes = i32::try_from(outcome.payload.len()).map_err(|_| {
-        format!(
-            "A payload of {} bytes is not addressable",
-            outcome.payload.len()
-        )
-    })?;
-    let mut frame = Writer::new();
-    frame.i32(RESULT_MAGIC);
-    frame.i32(ABI_VERSION);
-    frame.i32(0);
-    frame.modified_utf("")?;
-    frame.i32(request.list_count as i32);
-    frame.i32(outcome.sample_count as i32);
-    frame.i32(outcome.iterations as i32);
-    frame.i64(request.entry_count as i64);
-    frame.i64(outcome.nanos_read as i64);
-    frame.i64(outcome.nanos_train as i64);
-    frame.i64(outcome.nanos_assign as i64);
-    frame.i64(outcome.nanos_encode as i64);
-    frame.i32(payload_bytes);
-    frame.raw(&outcome.payload);
-    Ok(frame.bytes)
 }
 
 fn count(value: i32, what: &str) -> Result<usize, String> {

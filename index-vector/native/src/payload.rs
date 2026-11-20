@@ -22,7 +22,7 @@
 //! an optional list directory, and the lists themselves in centroid order. The block form puts a
 //! three-int prefix in front and fills the directory with each list's offset and member count.
 
-use crate::abi::Writer;
+use crate::abi::{self, Writer};
 
 /// The kernel name every IVF payload carries.
 pub const KERNEL_NAME: &str = "ivf";
@@ -57,8 +57,12 @@ pub struct PayloadSpec<'a> {
     pub list_sizes: &'a [usize],
 }
 
-/// Writes the payload.
-pub fn write(spec: &PayloadSpec) -> Result<Vec<u8>, String> {
+/// The exact number of bytes [`write_into`] appends.
+///
+/// A payload of a large unit is hundreds of megabytes, and letting the destination grow on its own
+/// makes it hold the old block and the new one at the same time on every reallocation. Reserving
+/// the exact size once is what keeps the write to one block.
+pub fn size(spec: &PayloadSpec) -> Result<usize, String> {
     if spec.lists.len() != spec.centroids.len() || spec.list_sizes.len() != spec.centroids.len() {
         return Err(format!(
             "The payload has {} centroids, {} list bodies and {} sizes",
@@ -68,27 +72,81 @@ pub fn write(spec: &PayloadSpec) -> Result<Vec<u8>, String> {
         ));
     }
 
-    let mut payload = Writer::new();
-    if spec.list_blocks {
-        payload.i32(BLOCK_MAGIC);
-        payload.i32(BLOCK_VERSION);
-        // patched below, once the directory has been written
-        payload.i32(0);
+    let mut total = if spec.list_blocks {
+        BLOCK_PREFIX_BYTES
+    } else {
+        0
+    };
+    let mut add = |value: usize| {
+        total = total
+            .checked_add(value)
+            .ok_or_else(|| format!("A payload of {} bytes is not addressable", total))?;
+        Ok::<(), String>(())
+    };
+
+    add(INTEGER_BYTES + abi::modified_utf_len(KERNEL_NAME)? + 2 * INTEGER_BYTES)?;
+    if spec.quantized.is_some() {
+        // the bits are an int and the seed a long
+        add(3 * INTEGER_BYTES)?;
     }
 
-    payload.i32(PAYLOAD_HEADER);
-    payload.modified_utf(KERNEL_NAME)?;
-    payload.i32(match spec.quantized {
+    let centroid_bytes = spec
+        .centroids
+        .len()
+        .checked_mul(spec.dimension)
+        .and_then(|coordinates| coordinates.checked_mul(INTEGER_BYTES))
+        .ok_or_else(|| "The centroids of this payload overflow".to_string())?;
+    add(INTEGER_BYTES + centroid_bytes)?;
+
+    add(INTEGER_BYTES)?;
+    for data_file in spec.data_files {
+        add(abi::modified_utf_len(data_file)?)?;
+    }
+
+    add(INTEGER_BYTES)?;
+    if spec.list_blocks {
+        add(spec
+            .lists
+            .len()
+            .checked_mul(2 * INTEGER_BYTES)
+            .ok_or_else(|| "The list directory of this payload overflows".to_string())?)?;
+    }
+
+    for list in spec.lists {
+        add(list.len())?;
+    }
+
+    Ok(total)
+}
+
+/// Writes the payload, appending its bytes to `out`.
+pub fn write_into(spec: &PayloadSpec, out: &mut Writer) -> Result<(), String> {
+    let total = size(spec)?;
+    let start = out.bytes.len();
+    out.bytes
+        .try_reserve_exact(total)
+        .map_err(|error| format!("Cannot hold a payload of {} bytes: {}", total, error))?;
+
+    if spec.list_blocks {
+        out.i32(BLOCK_MAGIC);
+        out.i32(BLOCK_VERSION);
+        // patched below, once the directory has been written
+        out.i32(0);
+    }
+
+    out.i32(PAYLOAD_HEADER);
+    out.modified_utf(KERNEL_NAME)?;
+    out.i32(match spec.quantized {
         Some(_) => QUANTIZED_VERSION,
         None => PLAIN_VERSION,
     });
-    payload.i32(spec.dimension as i32);
+    out.i32(spec.dimension as i32);
     if let Some((bits, seed)) = spec.quantized {
-        payload.i32(bits as i32);
-        payload.i64(seed);
+        out.i32(bits as i32);
+        out.i64(seed);
     }
 
-    payload.i32(spec.centroids.len() as i32);
+    out.i32(spec.centroids.len() as i32);
     for centroid in spec.centroids {
         if centroid.len() != spec.dimension {
             return Err(format!(
@@ -99,25 +157,25 @@ pub fn write(spec: &PayloadSpec) -> Result<Vec<u8>, String> {
         }
 
         for value in centroid {
-            payload.f32(*value);
+            out.f32(*value);
         }
     }
 
-    payload.i32(spec.data_files.len() as i32);
+    out.i32(spec.data_files.len() as i32);
     for data_file in spec.data_files {
-        payload.modified_utf(data_file)?;
+        out.modified_utf(data_file)?;
     }
 
-    payload.i32(spec.entry_count as i32);
-    let directory = payload.bytes.len();
+    out.i32(spec.entry_count as i32);
+    let directory = out.bytes.len();
     if spec.list_blocks {
         for _ in 0..spec.lists.len() {
-            payload.i32(0);
-            payload.i32(0);
+            out.i32(0);
+            out.i32(0);
         }
     }
 
-    let metadata_end = payload.bytes.len();
+    let metadata_end = out.bytes.len();
     let mut starts = Vec::new();
     starts
         .try_reserve_exact(spec.lists.len())
@@ -129,42 +187,50 @@ pub fn write(spec: &PayloadSpec) -> Result<Vec<u8>, String> {
             )
         })?;
     for list in spec.lists {
-        payload.bytes.try_reserve(list.len()).map_err(|error| {
-            format!(
-                "Cannot hold a list of {} bytes in the payload: {}",
-                list.len(),
-                error
-            )
-        })?;
-        // a payload longer than an int cannot address its lists, and the frame is int-addressed
-        let start = i32::try_from(payload.bytes.len()).map_err(|_| {
+        // a payload longer than an int cannot address its lists, and the frame is int-addressed;
+        // the directory holds offsets from the start of the payload, which is not the start of the
+        // buffer it is being appended to
+        let offset = i32::try_from(out.bytes.len() - start).map_err(|_| {
             format!(
                 "A payload of {} bytes cannot address its lists",
-                payload.bytes.len()
+                out.bytes.len() - start
             )
         })?;
-        starts.push(start);
-        payload.raw(list);
+        starts.push(offset);
+        out.raw(list);
     }
 
     if spec.list_blocks {
-        if metadata_end > i32::MAX as usize {
+        let metadata_bytes = metadata_end - start;
+        if metadata_bytes > i32::MAX as usize {
             return Err(format!(
                 "A payload whose metadata ends at {} bytes is not addressable",
-                metadata_end
+                metadata_bytes
             ));
         }
 
-        payload.bytes[2 * INTEGER_BYTES..BLOCK_PREFIX_BYTES]
-            .copy_from_slice(&(metadata_end as i32).to_be_bytes());
-        for (index, out) in payload.bytes[directory..metadata_end]
+        out.bytes[start + 2 * INTEGER_BYTES..start + BLOCK_PREFIX_BYTES]
+            .copy_from_slice(&(metadata_bytes as i32).to_be_bytes());
+        for (index, entry) in out.bytes[directory..metadata_end]
             .chunks_mut(2 * INTEGER_BYTES)
             .enumerate()
         {
-            out[..INTEGER_BYTES].copy_from_slice(&starts[index].to_be_bytes());
-            out[INTEGER_BYTES..].copy_from_slice(&(spec.list_sizes[index] as i32).to_be_bytes());
+            entry[..INTEGER_BYTES].copy_from_slice(&starts[index].to_be_bytes());
+            entry[INTEGER_BYTES..].copy_from_slice(&(spec.list_sizes[index] as i32).to_be_bytes());
         }
     }
 
+    debug_assert_eq!(
+        out.bytes.len() - start,
+        total,
+        "the payload size differs from what was reserved"
+    );
+    Ok(())
+}
+
+/// Writes the payload into a new buffer.
+pub fn write(spec: &PayloadSpec) -> Result<Vec<u8>, String> {
+    let mut payload = Writer::new();
+    write_into(spec, &mut payload)?;
     Ok(payload.bytes)
 }

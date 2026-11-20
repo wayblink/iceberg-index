@@ -37,7 +37,7 @@ const DISPLACEMENT_EPSILON: f64 = 1e-12;
 
 /// Trains `list_count` centroids on `sample_count` vectors of the unit.
 pub fn train(
-    vectors: &[Vec<f32>],
+    vectors: &[&[f32]],
     sample_count: usize,
     list_count: usize,
     max_iterations: usize,
@@ -68,7 +68,7 @@ pub fn train(
     let sample: Vec<&[f32]> = (0..sample_count)
         .map(|index| {
             let at = (index * stride).min(vectors.len() - 1);
-            vectors[at].as_slice()
+            vectors[at]
         })
         .collect();
 
@@ -141,9 +141,8 @@ pub fn train(
 }
 
 /// Puts every vector under its nearest centroid.
-pub fn assign(vectors: &[Vec<f32>], centroids: &[Vec<f32>], threads: usize) -> Vec<usize> {
-    let rows: Vec<&[f32]> = vectors.iter().map(|vector| vector.as_slice()).collect();
-    simd::nearest(&rows, centroids, threads)
+pub fn assign(vectors: &[&[f32]], centroids: &[Vec<f32>], threads: usize) -> Vec<usize> {
+    simd::nearest(vectors, centroids, threads)
 }
 
 /// The vectors of every list, in entry order, lists that nothing landed in included.
@@ -191,11 +190,15 @@ fn relative_displacement(updated: &[f32], previous: &[f32]) -> f64 {
 mod tests {
     use super::{assign, members, train};
 
+    fn rows(vectors: &[Vec<f32>]) -> Vec<&[f32]> {
+        vectors.iter().map(|vector| vector.as_slice()).collect()
+    }
+
     #[test]
     fn keeps_the_earlier_list_on_a_tie() {
         let vectors = vec![vec![0.0f32, 0.0]];
         let centroids = vec![vec![1.0f32, 0.0], vec![-1.0, 0.0]];
-        assert_eq!(vec![0], assign(&vectors, &centroids, 1));
+        assert_eq!(vec![0], assign(&rows(&vectors), &centroids, 1));
     }
 
     #[test]
@@ -206,8 +209,8 @@ mod tests {
             vec![10.0, 10.0],
             vec![10.2, 10.0],
         ];
-        let trained = train(&vectors, 4, 2, 25, 0.0, 1).expect("training succeeds");
-        let assignment = assign(&vectors, &trained.centroids, 1);
+        let trained = train(&rows(&vectors), 4, 2, 25, 0.0, 1).expect("training succeeds");
+        let assignment = assign(&rows(&vectors), &trained.centroids, 1);
         let lists = members(&assignment, 2);
         let mut entries: Vec<usize> = lists.iter().flatten().copied().collect();
         entries.sort_unstable();
@@ -221,7 +224,7 @@ mod tests {
     #[test]
     fn stops_after_one_round_when_nothing_moves() {
         let vectors = vec![vec![1.0f32, 2.0], vec![1.0, 2.0], vec![1.0, 2.0]];
-        let trained = train(&vectors, 3, 1, 25, 0.0, 1).expect("training succeeds");
+        let trained = train(&rows(&vectors), 3, 1, 25, 0.0, 1).expect("training succeeds");
         assert_eq!(1, trained.iterations);
         assert_eq!(vec![1.0f32, 2.0], trained.centroids[0]);
     }
@@ -233,8 +236,8 @@ mod tests {
             .collect();
         let centroids = vec![vec![0.0f32, 0.0], vec![3.0, 3.0], vec![5.0, 1.0]];
         assert_eq!(
-            assign(&vectors, &centroids, 1),
-            assign(&vectors, &centroids, 4)
+            assign(&rows(&vectors), &centroids, 1),
+            assign(&rows(&vectors), &centroids, 4)
         );
     }
 }
