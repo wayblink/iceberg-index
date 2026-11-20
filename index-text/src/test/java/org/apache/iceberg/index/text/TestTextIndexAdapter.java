@@ -124,20 +124,36 @@ class TestTextIndexAdapter {
     TextIndexAdapter adapter =
         new TextIndexAdapter(TextIndexDefinition.builder().fieldId(1).build());
     List<IndexEntry> entries = new ArrayList<>();
-    entries.add(entry("first.parquet", 0, "ice iceberg"));
+    // three document table chunks, one document with a rare term at the start and one with a rare
+    // term at the end: a query for either has to read one chunk, not the whole table
+    entries.add(entry("first.parquet", 0, "ice iceberg earliest"));
     entries.add(entry("other.parquet", 1, "ice ice iceberg glacier"));
-    for (int row = 0; row < 4000; row++) {
-      entries.add(entry("many.parquet", row, "other" + row));
+    for (int row = 0; row < 12_300; row++) {
+      entries.add(entry("many.parquet", row, "common"));
     }
+    entries.add(entry("last.parquet", 0, "latest"));
     ByteBuffer payload = adapter.encodeAuxiliaryPayload(entries);
-    RangeOnlyStream stream = new RangeOnlyStream(payload);
-    TextIndexPayloadV2.Reader rangeReader =
-        TextIndexPayloadV2.open(TextIndexPayloadV2.source(stream, 0), payload.remaining());
-    TextIndexAdapter.FileIndex selected = rangeReader.shard(Set.of("ice", "glacier"), false);
+
+    TextIndexAdapter.FileIndex selected =
+        TextIndexPayloadV2.open(
+                TextIndexPayloadV2.source(new RangeOnlyStream(payload), 0), payload.remaining())
+            .shard(Set.of("ice", "glacier"), false);
     assertThat(selected.postingsByTerm).containsOnlyKeys("ice", "glacier");
-    // only the signatures, the requested buckets, their posting ranges and the matched document
-    // chunk are read, never the whole payload
-    assertThat(stream.bytesRead).isLessThan(payload.remaining() / 2L);
+
+    long rare = bytesReadByQuery(payload, "earliest");
+    long common = bytesReadByQuery(payload, "common");
+    // the document table is read by chunk: a term of one document pays for one chunk while a term
+    // in every document may pay for the whole table, and both stay below the payload they look at
+    assertThat(rare).isLessThan(common);
+    assertThat(common).isLessThan(payload.remaining());
+  }
+
+  private static long bytesReadByQuery(ByteBuffer payload, String term) throws IOException {
+    RangeOnlyStream stream = new RangeOnlyStream(payload);
+    TextIndexPayloadV2.Reader reader =
+        TextIndexPayloadV2.open(TextIndexPayloadV2.source(stream, 0), payload.remaining());
+    reader.shard(Set.of(term), false);
+    return stream.bytesRead;
   }
 
   private static final class RangeOnlyStream extends SeekableInputStream implements RangeReadable {

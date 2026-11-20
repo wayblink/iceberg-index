@@ -473,6 +473,44 @@ class TestTextIndexPayloadV2 {
   }
 
   @Test
+  void aSnapshotWithBothLayoutsAnswersEveryDocument() throws IOException {
+    // refresh rewrites only the index files whose data changed, so one snapshot can hold payloads
+    // of both layouts; a reader that dropped one of them would silently answer with fewer rows
+    Corpus older =
+        new Corpus()
+            .document("older-000.parquet", 0, List.of("ice", "ice", "berg"))
+            .document("older-000.parquet", 1, List.of("ice", "vector"));
+    Corpus newer =
+        new Corpus()
+            .document("newer-000.parquet", 0, List.of("ice", "glacier"))
+            .document("newer-000.parquet", 1, List.of("vector", "search", "ice"));
+    ByteBuffer v1 = encodeV1(older);
+    ByteBuffer v2 = encodeV2(newer);
+    TextIndexAdapter adapter =
+        new TextIndexAdapter(TextIndexDefinition.builder().fieldId(1).build());
+
+    for (String query : List.of("ice", "vector", "glacier")) {
+      List<IndexSearchResult> first =
+          adapter.searchAuxiliaryAll(List.of(v1.duplicate()), adapter.encodeQuery(query), 10);
+      List<IndexSearchResult> second =
+          adapter.searchAuxiliaryAll(List.of(v2.duplicate()), adapter.encodeQuery(query), 10);
+      List<IndexSearchResult> mixed =
+          adapter.searchAuxiliaryAll(
+              List.of(v1.duplicate(), v2.duplicate()), adapter.encodeQuery(query), 10);
+
+      // the mixed search merges the corpus statistics of both payloads, so its scores differ from
+      // the single-payload scores; what must not differ is which rows answer the query, once each
+      List<String> expected = Lists.newArrayList();
+      first.forEach(hit -> expected.add(hit.dataFile() + ":" + hit.rowPosition()));
+      second.forEach(hit -> expected.add(hit.dataFile() + ":" + hit.rowPosition()));
+      List<String> found = Lists.newArrayList();
+      mixed.forEach(hit -> found.add(hit.dataFile() + ":" + hit.rowPosition()));
+
+      assertThat(found).hasSameSizeAs(expected).containsExactlyInAnyOrderElementsOf(expected);
+    }
+  }
+
+  @Test
   void v2PayloadIsUnderSixtyPercentOfV1() throws IOException {
     // 2000 documents, 60 distinct terms each, drawn from a 600 term vocabulary so every term has
     // a realistic document frequency instead of being unique to one document

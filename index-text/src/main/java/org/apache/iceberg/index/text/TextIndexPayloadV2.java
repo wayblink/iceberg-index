@@ -90,7 +90,7 @@ import org.apache.iceberg.io.SeekableInputStream;
  * document table chunks               each chunk is a zlib stream of
  *                                     varint fileId, varint rowPosition, varint length
  * dictionary                          64 buckets; entries of one bucket are sorted and are
- *                                     (byte sharedPrefixLength, varint suffixLength, suffix bytes,
+ *                                     (varint sharedPrefixLength, varint suffixLength, suffix bytes,
  *                                      varint documentFrequency, varint rangeOffsetDelta,
  *                                      varint rangeLength)
  * postings                            per term a zlib stream of (varint docId delta, varint tf);
@@ -108,6 +108,9 @@ final class TextIndexPayloadV2 {
   static final int MAGIC = 0x424D3200 | FORMAT_VERSION;
 
   private static final int BUCKET_COUNT = 64;
+
+  /** Marks a document a requested term contains whose document table entry is not read yet. */
+  private static final int NEEDED = -2;
 
   /** Documents per independently compressed document table chunk. */
   static final int CHUNK_DOCS = 4096;
@@ -162,35 +165,31 @@ final class TextIndexPayloadV2 {
     terms.sort(String::compareTo);
 
     ByteArrayOutputStream postings = new ByteArrayOutputStream();
-    Map<String, long[]> ranges = new HashMap<>();
-    if (index != null) {
-      for (String term : terms) {
-        int offset = postings.size();
-        encodePostings(postings, index, term);
-        ranges.put(term, new long[] {offset, postings.size() - offset});
-      }
-    }
-
     ByteArrayOutputStream[] dictionaries = new ByteArrayOutputStream[BUCKET_COUNT];
     byte[][] previousTerms = new byte[BUCKET_COUNT][];
     long[] previousRangeOffset = new long[BUCKET_COUNT];
     for (String term : terms) {
+      // a term's range is what its posting stream occupies, known before and after writing it, so
+      // the dictionary entry is written here instead of holding one range entry per term
+      long rangeOffset = postings.size();
+      if (index != null) {
+        encodePostings(postings, index, term);
+      }
+
       int bucket = bucket(term);
       if (dictionaries[bucket] == null) {
         dictionaries[bucket] = new ByteArrayOutputStream();
       }
 
-      long[] range = ranges.getOrDefault(term, new long[] {0L, 0L});
-      long rangeOffset = range[0];
       byte[] termBytes = term.getBytes(StandardCharsets.UTF_8);
       int shared = sharedPrefix(previousTerms[bucket], termBytes);
       ByteArrayOutputStream dictionary = dictionaries[bucket];
-      dictionary.write(shared);
+      writeVarint(dictionary, shared);
       writeVarint(dictionary, termBytes.length - shared);
       dictionary.write(termBytes, shared, termBytes.length - shared);
       writeLongVarint(dictionary, counts.documentFrequency.get(term));
       writeVarint(dictionary, Math.toIntExact(rangeOffset - previousRangeOffset[bucket]));
-      writeVarint(dictionary, Math.toIntExact(range[1]));
+      writeVarint(dictionary, Math.toIntExact(postings.size() - rangeOffset));
       previousRangeOffset[bucket] = rangeOffset;
       previousTerms[bucket] = termBytes;
     }
@@ -273,13 +272,13 @@ final class TextIndexPayloadV2 {
     return TextIndexPayload.source(bytes);
   }
 
-  static Source source(SeekableInputStream stream, long base) {
-    return TextIndexPayload.source(stream, base);
-  }
-
   /** Whether a payload starts with this format, without opening it. */
   static boolean matches(ByteBuffer payload) {
     return payload.remaining() >= Integer.BYTES && payload.getInt(payload.position()) == MAGIC;
+  }
+
+  static Source source(SeekableInputStream stream, long base) {
+    return TextIndexPayload.source(stream, base);
   }
 
   static Reader open(Source source, int size) throws IOException {
@@ -440,7 +439,10 @@ final class TextIndexPayloadV2 {
       check(chunkCount > 0 || localDocuments == 0, "BM25 v2 shard has no document table");
 
       // decode every requested posting list, and remember which documents are referenced
-      boolean[] needed = new boolean[localDocuments];
+      // -1 marks a document no requested term contains, NEEDED one a term contains whose document
+      // table entry is still to be read, and any other value its index in the match arrays
+      int[] slotByDoc = new int[localDocuments];
+      Arrays.fill(slotByDoc, -1);
       boolean[] chunkNeeded = new boolean[chunkCount];
       Map<String, PostingList> lists = new LinkedHashMap<>();
       for (Map.Entry<String, DirectoryEntry> term : directory.entrySet()) {
@@ -448,16 +450,14 @@ final class TextIndexPayloadV2 {
         lists.put(term.getKey(), list);
         for (int docId : list.docIds) {
           check(docId >= 0 && docId < localDocuments, "Invalid BM25 v2 posting");
-          if (!needed[docId]) {
-            needed[docId] = true;
+          if (slotByDoc[docId] < 0) {
+            slotByDoc[docId] = NEEDED;
             chunkNeeded[docId / chunkDocs] = true;
           }
         }
       }
 
       // read only the document table chunks holding a referenced document
-      int[] slotByDoc = new int[localDocuments];
-      Arrays.fill(slotByDoc, -1);
       int[] matchFile = new int[0];
       long[] matchRow = new long[0];
       int[] matchLength = new int[0];
@@ -485,7 +485,7 @@ final class TextIndexPayloadV2 {
             int length = readVarint(in);
             int docId = start + index;
             check(fileId >= 0 && row >= 0 && length >= 0, "Invalid BM25 v2 document table entry");
-            if (needed[docId]) {
+            if (slotByDoc[docId] == NEEDED) {
               slotByDoc[docId] = matches;
               matchFile[matches] = fileId;
               matchRow[matches] = row;
@@ -561,8 +561,12 @@ final class TextIndexPayloadV2 {
     /** The compressed bytes of one document table chunk. */
     private byte[] chunkBytes(int chunk) throws IOException {
       int[] offsets = chunkOffsets();
+      int length = chunksLength();
       int start = offsets[chunk];
-      int end = chunk + 1 < offsets.length ? offsets[chunk + 1] : chunksLength();
+      int end = chunk + 1 < offsets.length ? offsets[chunk + 1] : length;
+      check(
+          start >= 0 && start <= length && end >= start && end <= length,
+          "Invalid BM25 v2 document table chunk range");
       return bytes(source.read(chunksStart() + start, end - start));
     }
 
@@ -653,7 +657,7 @@ final class TextIndexPayloadV2 {
       try (DataInputStream in =
           new DataInputStream(new ByteArrayInputStream(bytes(source.read(start, end - start))))) {
         while (in.available() > 0) {
-          int shared = in.readUnsignedByte();
+          int shared = readVarint(in);
           check(shared <= previous.length, "Invalid BM25 v2 dictionary prefix");
           int suffix = readVarint(in);
           byte[] termBytes = new byte[shared + suffix];
@@ -733,7 +737,7 @@ final class TextIndexPayloadV2 {
       }
 
       shift += 7;
-      check(shift <= 28, "Invalid BM25 v2 varint");
+      check(shift <= 28 && (shift < 28 || (next & 0xF0) == 0), "Invalid BM25 v2 varint");
     }
   }
 

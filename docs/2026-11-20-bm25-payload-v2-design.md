@@ -49,7 +49,7 @@ file table        fileCount × (varint 字节长 + UTF-8 路径)
 doc table dir     chunkCount × int（相对 chunk 段起点）
 doc table chunks  每块 = zlib( 逐文档: varint fileId | varint rowPosition | varint length )
 dictionary        64 桶；桶内按 term 排序；每项:
-                    byte   sharedPrefixLength
+                    varint sharedPrefixLength
                     varint suffixLength
                     bytes  suffix
                     varint documentFrequency
@@ -77,6 +77,7 @@ postings          每 term 一条 zlib 流，逐条: varint docIdDelta | varint 
 - 读：`readableAuxiliaryBlobTypes()` 返回 `{iceberg-text-bm25-v1, iceberg-text-bm25-v2}`，`IndexReader.readable()` 按这个集合过滤（引擎无需改动）；payload 的 magic 决定用哪个 reader。
 - 因此旧索引继续可回答；同一快照里 v1 与 v2 文件可以共存（refresh 只重写受影响的文件时就会这样）；`CheckIndexesProcedure.readablePayload` 也按 adapter 的集合判断，v1 仍算可读。
 - 统计文件是裸 payload（无 puffin 类型），同样按 magic 分派。
+- 驻留记录的 `readerId` 保持 `text/bm25/1` 不变：同一个 reader 解两种布局，改名会让既有 v1 索引的驻留记录全部失配（升级后静默退回整文件读）。
 
 ## 4. 实测证据（合成语料，确定性）
 
@@ -91,7 +92,7 @@ postings          每 term 一条 zlib 流，逐条: varint docIdDelta | varint 
 
 v2 内部构成：posting ranges 51.6%、**词典 48.0%**、文档表 0.4%、文件表 0.01%。**词典已经是下一轮的最大头**。
 
-正确性：20 条查询（df 从 20,000 递减到 1）的 top-100 在 `(dataFile, rowPosition, score)` 上与 v1 **逐位一致**（score 用 `doubleToLongBits` 比较），顺序一致；分片统计合并后与生成语料的 documents/tokens/逐 term df 全等；7 类损坏 payload（坏 magic、截断、桶偏移越界、range 越界、zlib 损坏、尾随垃圾、非法 varint）全部抛错而不是静默返回。
+正确性：20 条查询（df 从 20,000 递减到 1）的 top-100 在 `(dataFile, rowPosition, score)` 上与 v1 **逐位一致**（score 用 `doubleToLongBits` 比较），顺序一致；分片统计合并后与生成语料的 documents/tokens/逐 term df 全等；损坏 payload 的处理：坏 magic、截断、桶偏移越界、range 越界、chunk 越界、zlib 损坏、非法 varint 都抛 `IOException`；尾随垃圾字节被忽略（见 §5），这是有意的语义。
 
 注意口径：上面的 0.172 是"5 千文档/分片"的小分片数字（分片内本地 df 偏小，v1 每条 posting 被路径放大到 34.4 B）。把探针的各 df 档 v2/v1 比值作用到 #3176 实测的生产各档 v1 字节上，外推生产约 **1.87 GiB（187 B/行，6.3×）**；若 posting 成本比探针差 1.5 倍则 2.68 GiB（4.5×）。区间 **1.9–2.7 GiB**，真实值必须由 10M 集群复测（#3185）钉死。
 
@@ -114,8 +115,9 @@ v2 内部构成：posting ranges 51.6%、**词典 48.0%**、文档表 0.4%、文
 1. **10M 生产 B/行未实测**——外推 1.9–2.7 GiB，只有 #3185 能钉死。
 2. **词典占比 48%**：前端编码已做，但没有按 token id 去重/共享后缀；4M 词表的硬成本仍在。
 3. **分块大小 4096** 是稀疏查询放大与压缩率之间的折中：df=1 的一次查询要读整块（约 3.5 B/文档 × 4096 ≈ 14 KB 解压后更小），换来目录更小、压缩更好。没有做成可调参数（新增用户参数需要单独批准）。
-4. **v1 与 v2 并存的快照**没有专门的集成测试，只由 adapter 的集合契约保证；#3185 的 Spark 层测试要覆盖。
+4. **v1 与 v2 并存的快照**：单测已覆盖"两种 payload 一起查询时答案不丢行"和"`CheckIndexesProcedure` 两种布局都可读"；集群侧的混合快照未构造。
 5. 改格式需要重建旧索引才能拿到空间收益；不重建也可读可查，只是继续占 v1 的体积。
+6. **读分片时的内存**：`shard()` 每次读分配一个 `int[分片文档数]` 的定位数组（每百万文档约 4 MB），用来把命中文档映射到匹配表。稀疏查询在 IO 上是 O(命中块)，在内存上仍是 O(文档数)。后续可用"命中文档升序表 + 双指针"去掉这个数组，已拆为独立卡。
 
 ## 8. 验收口径
 

@@ -32,17 +32,26 @@ import org.junit.jupiter.api.Test;
  */
 class TestCheckIndexesPayloadFormat {
 
-  private static final String TEXT_AUXILIARY_BLOB_TYPE = "iceberg-text-bm25-v1";
+  private static final String TEXT_AUXILIARY_BLOB_TYPE_V1 = "iceberg-text-bm25-v1";
+  private static final String TEXT_AUXILIARY_BLOB_TYPE_V2 = "iceberg-text-bm25-v2";
 
   private static IndexAdapter textAdapter() {
     return new TextIndexAdapter(TextIndexDefinition.builder().fieldId(2).build());
   }
 
   @Test
-  public void aPayloadOfTheVersionThisBuildWritesIsReadable() {
+  public void aPayloadOfTheLayoutThisBuildWritesIsReadable() {
     assertThat(
             CheckIndexesProcedure.readablePayload(
-                textAdapter(), IndexFile.Kind.AUXILIARY, TEXT_AUXILIARY_BLOB_TYPE))
+                textAdapter(), IndexFile.Kind.AUXILIARY, TEXT_AUXILIARY_BLOB_TYPE_V2))
+        .isTrue();
+  }
+
+  @Test
+  public void aPayloadOfTheLayoutItReplacedIsStillReadable() {
+    assertThat(
+            CheckIndexesProcedure.readablePayload(
+                textAdapter(), IndexFile.Kind.AUXILIARY, TEXT_AUXILIARY_BLOB_TYPE_V1))
         .isTrue();
   }
 
@@ -63,7 +72,7 @@ class TestCheckIndexesPayloadFormat {
     // that claims that role carries something this build cannot decode
     assertThat(
             CheckIndexesProcedure.readablePayload(
-                textAdapter(), IndexFile.Kind.ENTRY_BEARING, TEXT_AUXILIARY_BLOB_TYPE))
+                textAdapter(), IndexFile.Kind.ENTRY_BEARING, TEXT_AUXILIARY_BLOB_TYPE_V2))
         .isFalse();
   }
 }
