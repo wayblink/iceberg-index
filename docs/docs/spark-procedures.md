@@ -1684,8 +1684,9 @@ invalid value is an error rather than a silent default.
 
 The setting was renamed from `spark.iceberg.index.vector.over-sample`; a session that still sets the
 old key fails with a message naming the new one instead of silently applying the default. The call
-argument is `refine_factor`: a procedure call that still writes `over_sample` is rejected by Spark as
-an unknown argument, and a table function says which name replaced it.
+argument is `refine_factor`: a procedure or table function call that still writes `over_sample`
+fails with a message naming the replacement, and the old spelling is kept only to give that
+message.
 
 This paragraph describes the `ORDER BY` rewrite. `CALL system.vector_search` answers the same
 question and names the scope through `coverage`: `table` (the default) answers for the whole table,

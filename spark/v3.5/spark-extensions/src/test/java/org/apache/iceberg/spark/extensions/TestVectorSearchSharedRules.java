@@ -279,14 +279,13 @@ class TestVectorSearchSharedRules {
       assertThat(spark.sql(call + ", nprobe => 1)").collectAsList()).isNotEmpty();
       assertThat(spark.sql(call + ", nprobe => 2, refine_factor => 0)").collectAsList())
           .isNotEmpty();
-      // the multiple was renamed: Spark refuses an argument the procedure does not declare before
-      // the procedure runs, so the old spelling fails instead of being ignored. Only the table
-      // functions can name the replacement, because a procedure argument cannot be intercepted
-      // without declaring the old name again.
+      // the multiple was renamed: the procedure keeps the old name only to refuse it, so a call
+      // that
+      // still writes it fails with the name to use instead of being ignored
       assertThatThrownBy(() -> spark.sql(call + ", over_sample => 0)"))
-          .as("a renamed procedure argument is refused rather than ignored")
-          .isInstanceOf(org.apache.spark.sql.AnalysisException.class)
-          .hasMessageContaining("Unknown argument: over_sample");
+          .as("a renamed procedure argument fails with the name to use")
+          .isInstanceOf(IllegalArgumentException.class)
+          .hasMessageContaining("'over_sample' was renamed to 'refine_factor'");
     } finally {
       spark.conf().unset("spark.iceberg.index.vector.ivf.nprobe");
     }

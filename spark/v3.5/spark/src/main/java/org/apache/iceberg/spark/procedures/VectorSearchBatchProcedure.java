@@ -81,6 +81,12 @@ class VectorSearchBatchProcedure extends BaseProcedure {
       optionalInParameter("nprobe", DataTypes.IntegerType);
   private static final ProcedureParameter REFINE_FACTOR_PARAM =
       optionalInParameter("refine_factor", DataTypes.IntegerType);
+
+  // The name this argument carried before the rename. It is declared only so the call can be
+  // refused with the name to use instead: a procedure argument that is not declared is rejected by
+  // Spark before the procedure runs, and that message cannot say what replaced it.
+  private static final ProcedureParameter RENAMED_OVER_SAMPLE_PARAM =
+      optionalInParameter("over_sample", DataTypes.IntegerType);
   private static final ProcedureParameter[] PARAMETERS =
       new ProcedureParameter[] {
         // required parameters first: Spark rejects an optional one before a required one
@@ -94,7 +100,8 @@ class VectorSearchBatchProcedure extends BaseProcedure {
         INDEX_PARAM,
         COVERAGE_PARAM,
         NPROBE_PARAM,
-        REFINE_FACTOR_PARAM
+        REFINE_FACTOR_PARAM,
+        RENAMED_OVER_SAMPLE_PARAM
       };
 
   private static final StructType OUTPUT_TYPE =
@@ -134,6 +141,9 @@ class VectorSearchBatchProcedure extends BaseProcedure {
   public InternalRow[] call(InternalRow args) {
     VectorIndexProcedures.registerVectorIndexType();
     ProcedureInput input = new ProcedureInput(spark(), tableCatalog(), PARAMETERS, args);
+    Preconditions.checkArgument(
+        !input.isProvided(RENAMED_OVER_SAMPLE_PARAM),
+        "'over_sample' was renamed to 'refine_factor'; update the call");
     String column = input.asString(COLUMN_PARAM);
     int topK = input.asInt(K_PARAM);
 

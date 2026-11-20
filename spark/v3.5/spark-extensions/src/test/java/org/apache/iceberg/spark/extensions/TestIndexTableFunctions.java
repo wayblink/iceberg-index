@@ -131,6 +131,20 @@ class TestIndexTableFunctions {
   }
 
   @Test
+  public void aRenamedProcedureArgumentFailsWithTheNameToUse() {
+    // the batch procedure keeps the old spelling only to refuse it, as the single-query one does
+    assertThatThrownBy(
+            () ->
+                spark.sql(
+                    "CALL local.system.vector_search_batch(table => 'db.docs', column =>"
+                        + " 'embedding', queries => array('0.95,0.05'), k => 2,"
+                        + " over_sample => 0)"))
+        .as("a renamed procedure argument fails with the name to use")
+        .isInstanceOf(IllegalArgumentException.class)
+        .hasMessageContaining("'over_sample' was renamed to 'refine_factor'");
+  }
+
+  @Test
   public void textIndexSearchMatchesTheProcedure() {
     List<Row> fromProcedure =
         spark

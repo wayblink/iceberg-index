@@ -336,7 +336,7 @@ SELECT id, title, _distance FROM vector_search(
 
 默认值为 `1`，基础候选预算为 `K`，执行计划显示 `refineFactor=1 [DEFAULT]`。`0` 与 `1` 等价，都表示不放大：两者算出的候选预算都是 `K`。业务行查询仍按原始向量精排，过滤或删除导致活行不足时可以扩窗。显式正整数按 `K × refine-factor` 计算候选预算。SQL 改写与批量 `CALL` 两条入口取的是同一个窗口，同一个倍数在两边取到同样多的候选（这也是同一问题在两个入口给出同一答案的前提）。使用量化索引时，扩大候选窗口可能提高召回率，也可能增加回表成本。可以为会话显式设置倍数。
 
-这个参数此前叫 `over-sample`（配置键 `spark.iceberg.index.vector.over-sample`），现已统一改名为 `refine_factor`（配置键 `spark.iceberg.index.vector.refine-factor`）。旧配置键不再读取：会话或提交参数里还留着旧键时，查询会直接报错并指出新名字，而不是静默退回默认值。`CALL` 过程和表函数里的旧参数 `over_sample` 也不再被接受：表函数会直接提示改叫 `refine_factor`，过程则由 Spark 报 `Unknown argument: over_sample`，新名字见 `SHOW PROCEDURES` 和本文档。
+这个参数此前叫 `over-sample`（配置键 `spark.iceberg.index.vector.over-sample`），现已统一改名为 `refine_factor`（配置键 `spark.iceberg.index.vector.refine-factor`）。旧配置键不再读取：会话或提交参数里还留着旧键时，查询会直接报错并指出新名字，而不是静默退回默认值。`CALL` 过程和表函数里的旧参数 `over_sample` 也不再被接受：两者都会直接报错并提示改叫 `refine_factor`（过程保留旧参数名只为了给出这条报错，它不会生效）。
 
 ```sql
 SET `spark.iceberg.index.vector.refine-factor`=10;
