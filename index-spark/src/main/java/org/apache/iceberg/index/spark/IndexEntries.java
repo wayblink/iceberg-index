@@ -637,12 +637,7 @@ public final class IndexEntries {
       return rowsByFile;
     }
 
-    // a lookup reads a few rows from each hit file, so what the fetch-back pays is opening the
-    // files and starting the tasks rather than moving bytes. Packing the files into fewer tasks
-    // keeps that fixed cost paid a handful of times instead of once per file; the number is a
-    // property so the trade-off against per-file parallelism can be measured.
-    int readTasks = readTaskCount(tasks.size());
-    for (Tuple2<String, Tuple2<Long, Row>> entry : rows.coalesce(readTasks).collect()) {
+    for (Tuple2<String, Tuple2<Long, Row>> entry : rows.collect()) {
       rowsByFile
           .computeIfAbsent(entry._1(), key -> Maps.newLinkedHashMap())
           .put(entry._2()._1(), entry._2()._2());
@@ -679,15 +674,12 @@ public final class IndexEntries {
     // then comes from the schema the read was given, so no column name of the row is resolved by
     // the query parser and none of them collides with the file or the position. The position
     // travels with the row, so nothing depends on the order of the answers.
-    int readTasks = readTaskCount(tasks.size());
     Dataset<Row> json =
         spark
             .createDataFrame(
-                rows.coalesce(readTasks)
-                    .map(
-                        (Function<Tuple2<String, Tuple2<Long, Row>>, Row>)
-                            entry ->
-                                RowFactory.create(entry._1(), entry._2()._1(), entry._2()._2())),
+                rows.map(
+                    (Function<Tuple2<String, Tuple2<Long, Row>>, Row>)
+                        entry -> RowFactory.create(entry._1(), entry._2()._1(), entry._2()._2())),
                 schemaOf(columns, readSchema))
             .select(
                 functions.col(DATA_FILE_COLUMN),
@@ -719,8 +711,15 @@ public final class IndexEntries {
   /**
    * The live rows of the given files, paired with their data file and position, as one RDD. Null
    * when there is nothing to read.
+   *
+   * <p>The files are the data of the RDD rather than one RDD each. A lookup of a large table hits
+   * thousands of data files, and the driver is a single thread: building a partition for every hit
+   * file there and unioning them costs that thread a pass over every file before a single row is
+   * read, and every unioned branch carries its own copy of the settings the read needs. Here the
+   * driver hands over the list of what to read, the settings every file is read with are broadcast
+   * once, and each task reads the files it was given.
    */
-  private static JavaPairRDD<String, Tuple2<Long, Row>> liveRowsRdd(
+  static JavaPairRDD<String, Tuple2<Long, Row>> liveRowsRdd(
       SparkSession spark,
       Table table,
       Map<String, ? extends Collection<Long>> positionsByFile,
@@ -731,39 +730,178 @@ public final class IndexEntries {
       return null;
     }
 
+    JavaSparkContext jsc = JavaSparkContext.fromSparkContext(spark.sparkContext());
+
+    // the configuration, the delete files and the storage settings belong to the fetch-back
+    // rather than to a file: broadcasting them once keeps a task binary from carrying its own copy
+    // of them, which across thousands of tasks is megabytes
+    Broadcast<FetchPlan> plan = jsc.broadcast(fetchPlan(spark, table, tasks, columns, readSchema));
+
+    // a caller may hand over a collection view, such as a map's key set, which Spark cannot ship to
+    // an executor; copying it here keeps that from surfacing as a task serialization failure
+    List<FileFetch> files = Lists.newArrayListWithCapacity(tasks.size());
+    for (FileScanTask task : tasks) {
+      String dataFile = task.file().location().toString();
+      Collection<Long> positions = positionsByFile.get(dataFile);
+      files.add(
+          new FileFetch(
+              dataFile,
+              task.file().format(),
+              positions == null ? null : Lists.newArrayList(positions)));
+    }
+
+    // how many tasks the fetch-back uses packs the files it hit into that many tasks; it does not
+    // decide how often a file is opened, which is once per file that is read
+    return jsc.parallelize(files, readTaskCount(files.size()))
+        .flatMapToPair(
+            (PairFlatMapFunction<FileFetch, String, Tuple2<Long, Row>>)
+                fetch -> {
+                  List<Tuple2<String, Tuple2<Long, Row>>> rows = Lists.newArrayList();
+                  for (Tuple2<Long, Row> row : fetch.liveRows(plan.value())) {
+                    rows.add(new Tuple2<>(fetch.dataFile, row));
+                  }
+
+                  return rows.iterator();
+                });
+  }
+
+  /**
+   * What every file of one fetch-back is read with, built once and broadcast once.
+   *
+   * <p>The Hadoop configuration alone carries tens of thousands of entries, and the delete files
+   * are read before the fetch-back starts: neither is per-file state, so neither travels as part of
+   * a task.
+   */
+  private static final class FetchPlan implements java.io.Serializable {
+    private static final long serialVersionUID = 1L;
+
+    private final Schema projection;
+    private final List<String> readColumns;
+    private final List<String> columns;
+    private final StructType rowSchema;
+    private final SerializableConfiguration conf;
+    private final SnapshotDeletes deletes;
+    private final Map<String, String> storageProperties;
+
+    private FetchPlan(
+        Schema projection,
+        List<String> readColumns,
+        List<String> columns,
+        StructType rowSchema,
+        SerializableConfiguration conf,
+        SnapshotDeletes deletes,
+        Map<String, String> storageProperties) {
+      this.projection = projection;
+      this.readColumns = readColumns;
+      this.columns = columns;
+      this.rowSchema = rowSchema;
+      this.conf = conf;
+      this.deletes = deletes;
+      this.storageProperties = storageProperties;
+    }
+  }
+
+  /** The plan of a fetch-back that reads the given files into the given columns. */
+  private static FetchPlan fetchPlan(
+      SparkSession spark,
+      Table table,
+      List<FileScanTask> tasks,
+      List<String> columns,
+      StructType readSchema) {
     // one serializable configuration for the whole fetch-back: building it copies the session's
     // Hadoop configuration, which is not something to do once per data file
     SerializableConfiguration conf =
         new SerializableConfiguration(spark.sessionState().newHadoopConf());
 
-    // the deletes belong to the fetch-back, not to the file being read: the same set applies to
-    // every file, so reading them inside the loop would read and broadcast them once per hit file
+    // the deletes belong to the fetch-back, not to the file being read: the same delete files apply
+    // to every file of the snapshot
     SnapshotDeletes deletes = deletesFor(spark, tasks, table);
-    Map<String, String> storageProperties =
-        StorageProperties.resolve(table.io(), table.properties(), conf.get());
 
-    JavaPairRDD<String, Tuple2<Long, Row>> rows = null;
-    for (FileScanTask task : tasks) {
-      String dataFile = task.file().location().toString();
-      Collection<Long> positions = positionsByFile.get(dataFile);
-      JavaPairRDD<String, Tuple2<Long, Row>> fileRows =
-          liveRowsOf(
-                  spark,
-                  table.schema(),
-                  task,
-                  columns,
-                  positions,
-                  readSchema,
-                  deletes,
-                  conf,
-                  storageProperties)
-              .mapToPair(
-                  (PairFunction<Tuple2<Long, Row>, String, Tuple2<Long, Row>>)
-                      entry -> new Tuple2<>(dataFile, entry));
-      rows = rows == null ? fileRows : rows.union(fileRows);
+    // the equality keys have to be read to judge a row, and a key the query did not ask for still
+    // has to be read for that judgement to be possible
+    Set<String> readColumns = Sets.newLinkedHashSet();
+    readColumns.addAll(columns);
+    readColumns.addAll(deletes.keyColumns());
+    List<String> read = Lists.newArrayList(readColumns);
+
+    Schema projection = table.schema().select(read.toArray(new String[0]));
+    // the schema the caller made describes its projection; the read also carries the
+    // equality-delete keys, so the row a reader builds has to be described by what was read
+    StructType rowSchema =
+        readSchema == null ? toSparkSchema(projection) : schemaFor(read, readSchema);
+
+    return new FetchPlan(
+        projection,
+        read,
+        columns,
+        rowSchema,
+        conf,
+        deletes,
+        StorageProperties.resolve(table.io(), table.properties(), conf.get()));
+  }
+
+  /**
+   * One data file of a fetch-back: which file to read and which of its rows the lookup asked for.
+   *
+   * <p>It travels as the data of the fetch-back's RDD, so it carries nothing every task also has:
+   * the configuration, the delete files and the storage settings come from the {@link FetchPlan}
+   * the task was handed.
+   */
+  private static final class FileFetch implements java.io.Serializable {
+    private static final long serialVersionUID = 1L;
+
+    private final String dataFile;
+    private final FileFormat format;
+    // null means every row of the file, which is how a caller that has no positions reads it
+    private final List<Long> positions;
+
+    private FileFetch(String dataFile, FileFormat format, List<Long> positions) {
+      this.dataFile = dataFile;
+      this.format = format;
+      this.positions = positions;
     }
 
-    return rows;
+    /** The live rows of this file that the lookup asked for, each paired with its position. */
+    private List<Tuple2<Long, Row>> liveRows(FetchPlan plan) {
+      // the delete files are read on the driver, and every file of the fetch-back asks the same set
+      // for its own rows, so the lookup here is a map read rather than a file read
+      long[] deletedPositions = plan.deletes.deletedPositions(dataFile);
+      List<EqualityKeySet> keySets = plan.deletes.keySets();
+
+      Iterator<Tuple2<Row, Long>> read;
+      try {
+        read =
+            readFileWithFormat(
+                dataFile,
+                format,
+                plan.projection,
+                plan.rowSchema,
+                positions,
+                plan.conf,
+                plan.storageProperties);
+      } catch (IOException e) {
+        throw new UncheckedIOException("Failed to read " + dataFile, e);
+      }
+
+      List<Tuple2<Long, Row>> rows = Lists.newArrayList();
+      while (read.hasNext()) {
+        Tuple2<Row, Long> entry = read.next();
+        // a format that ignored the positions read the whole file, so the rows it returned are
+        // numbered but not narrowed: only the ones that were asked for are part of the answer
+        if (!isLive(entry._2(), entry._1(), positions, deletedPositions, keySets)) {
+          continue;
+        }
+
+        rows.add(
+            new Tuple2<>(
+                entry._2(),
+                new GenericRowWithSchema(
+                    asValues(entry._1(), plan.readColumns, plan.columns),
+                    schemaFor(plan.columns, entry._1().schema()))));
+      }
+
+      return rows;
+    }
   }
 
   /**

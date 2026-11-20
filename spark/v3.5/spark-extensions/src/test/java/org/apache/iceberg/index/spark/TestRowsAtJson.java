@@ -278,6 +278,49 @@ class TestRowsAtJson {
         .isGreaterThan(fetchBackJobs);
   }
 
+  /**
+   * A lookup asks for the positions it found, not for the file: the rows have to come back keyed by
+   * the positions that were asked for, in whatever order they were collected in.
+   *
+   * <p>A read that can seek reads only those rows and answers them in ascending position order, and
+   * the fetch-back relabels them with the positions it asked for. A read that cannot seek answers
+   * the whole file, numbered in file order, and the caller's filter narrows it. Both have to answer
+   * the same rows at the same positions.
+   */
+  @Test
+  void aFetchBackOfARowPerFileKeepsThePositionItAskedFor() throws Exception {
+    spark.sql("DROP TABLE IF EXISTS local.db.sparse_positions");
+    spark.sql("CREATE TABLE local.db.sparse_positions (id bigint) USING iceberg");
+    spark.sql("INSERT INTO local.db.sparse_positions SELECT /*+ COALESCE(1) */ id FROM range(20)");
+
+    Table table = Spark3Util.loadIcebergTable(spark, "local.db.sparse_positions");
+    List<FileScanTask> tasks = IndexEntries.scanTasks(table, table.currentSnapshot().snapshotId());
+    assertThat(tasks).as("the fixture needs one file, so a position is a row of it").hasSize(1);
+    String dataFile = tasks.get(0).file().location().toString();
+    // the id of a row is its position in the file, so a row that comes back at another position is
+    // a row that was numbered rather than labelled
+    Map<String, java.util.Collection<Long>> positions = Map.of(dataFile, List.of(17L, 3L, 11L));
+
+    Map<String, Map<Long, Row>> rows =
+        IndexEntries.rowsAt(
+            spark,
+            table,
+            positions,
+            List.of("id"),
+            SparkSchemaUtil.convert(table.schema().select("id")),
+            tasks);
+
+    assertThat(rows.keySet()).as("the files that answered").containsExactly(dataFile);
+    assertThat(rows.get(dataFile).keySet())
+        .as("the positions the fetch-back answered")
+        .containsExactlyInAnyOrder(3L, 11L, 17L);
+    for (Map.Entry<Long, Row> row : rows.get(dataFile).entrySet()) {
+      assertThat(row.getValue().getLong(0))
+          .as("the row at position %s", row.getKey())
+          .isEqualTo(row.getKey());
+    }
+  }
+
   /** Both conversions of every row of a table, checked to agree. */
   private Map<String, Map<Long, String>> assertSameJsonAsTheRowToJsonConversion(String tableName)
       throws Exception {
