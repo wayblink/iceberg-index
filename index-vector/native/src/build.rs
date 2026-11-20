@@ -101,8 +101,27 @@ fn build_inner(
     validate(request)?;
 
     let read_start = Instant::now();
-    let mut vectors: Vec<Vec<f32>> = Vec::with_capacity(request.entry_count);
-    let mut positions: Vec<(i32, i64)> = Vec::with_capacity(request.entry_count);
+    // The vectors of a unit live in memory for the whole build, so an allocation the machine cannot
+    // serve is reported rather than left to abort the process: the Java side treats it as a failed
+    // native build and runs its own kernel, which fails one task instead of the executor.
+    let mut vectors: Vec<Vec<f32>> = Vec::new();
+    vectors
+        .try_reserve_exact(request.entry_count)
+        .map_err(|error| {
+            format!(
+                "Cannot hold the {} vectors of this unit: {}",
+                request.entry_count, error
+            )
+        })?;
+    let mut positions: Vec<(i32, i64)> = Vec::new();
+    positions
+        .try_reserve_exact(request.entry_count)
+        .map_err(|error| {
+            format!(
+                "Cannot hold the {} row positions of this unit: {}",
+                request.entry_count, error
+            )
+        })?;
     let record_bytes = record_bytes(request.dimension, request.raw_values);
     let mut buffer = Vec::new();
     let mut read = 0;
@@ -239,7 +258,13 @@ fn read_coordinates(
     data_file: i32,
     row_position: i64,
 ) -> Result<Vec<f32>, String> {
-    let mut vector = Vec::with_capacity(dimension);
+    let mut vector = Vec::new();
+    vector.try_reserve_exact(dimension).map_err(|error| {
+        format!(
+            "Cannot hold the {} dimensions of data file {} position {}: {}",
+            dimension, data_file, row_position, error
+        )
+    })?;
     for _ in 0..dimension {
         let value = reader.f32("vector coordinate")?;
         if !value.is_finite() {

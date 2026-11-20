@@ -118,9 +118,32 @@ pub fn write(spec: &PayloadSpec) -> Result<Vec<u8>, String> {
     }
 
     let metadata_end = payload.bytes.len();
-    let mut starts = Vec::with_capacity(spec.lists.len());
+    let mut starts = Vec::new();
+    starts
+        .try_reserve_exact(spec.lists.len())
+        .map_err(|error| {
+            format!(
+                "Cannot hold the directory of {} lists: {}",
+                spec.lists.len(),
+                error
+            )
+        })?;
     for list in spec.lists {
-        starts.push(payload.bytes.len() as i32);
+        payload.bytes.try_reserve(list.len()).map_err(|error| {
+            format!(
+                "Cannot hold a list of {} bytes in the payload: {}",
+                list.len(),
+                error
+            )
+        })?;
+        // a payload longer than an int cannot address its lists, and the frame is int-addressed
+        let start = i32::try_from(payload.bytes.len()).map_err(|_| {
+            format!(
+                "A payload of {} bytes cannot address its lists",
+                payload.bytes.len()
+            )
+        })?;
+        starts.push(start);
         payload.raw(list);
     }
 
