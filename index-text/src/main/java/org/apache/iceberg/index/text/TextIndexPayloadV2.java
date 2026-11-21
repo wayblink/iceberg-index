@@ -109,9 +109,6 @@ final class TextIndexPayloadV2 {
 
   private static final int BUCKET_COUNT = 64;
 
-  /** Marks a document a requested term contains whose document table entry is not read yet. */
-  private static final int NEEDED = -2;
-
   /** Documents per independently compressed document table chunk. */
   static final int CHUNK_DOCS = 4096;
 
@@ -438,65 +435,55 @@ final class TextIndexPayloadV2 {
 
       check(chunkCount > 0 || localDocuments == 0, "BM25 v2 shard has no document table");
 
-      // decode every requested posting list, and remember which documents are referenced
-      // -1 marks a document no requested term contains, NEEDED one a term contains whose document
-      // table entry is still to be read, and any other value its index in the match arrays
-      int[] slotByDoc = new int[localDocuments];
-      Arrays.fill(slotByDoc, -1);
-      boolean[] chunkNeeded = new boolean[chunkCount];
+      // decode every requested posting list, then merge the document ids they name into one
+      // ascending list: what is allocated below grows with the documents the query touches, not
+      // with the documents of the shard
       Map<String, PostingList> lists = new LinkedHashMap<>();
       for (Map.Entry<String, DirectoryEntry> term : directory.entrySet()) {
         PostingList list = postings(term.getValue());
-        lists.put(term.getKey(), list);
         for (int docId : list.docIds) {
           check(docId >= 0 && docId < localDocuments, "Invalid BM25 v2 posting");
-          if (slotByDoc[docId] < 0) {
-            slotByDoc[docId] = NEEDED;
-            chunkNeeded[docId / chunkDocs] = true;
-          }
         }
+
+        lists.put(term.getKey(), list);
       }
 
-      // read only the document table chunks holding a referenced document
-      int[] matchFile = new int[0];
-      long[] matchRow = new long[0];
-      int[] matchLength = new int[0];
-      int matches = 0;
-      for (int chunk = 0; chunk < chunkCount; chunk++) {
-        if (!chunkNeeded[chunk]) {
-          continue;
-        }
+      int[] merged = merge(lists);
+      int[] matchFile = new int[merged.length];
+      long[] matchRow = new long[merged.length];
+      int[] matchLength = new int[merged.length];
 
+      // read only the document table chunks holding a referenced document, in ascending order, and
+      // advance a pointer over the merged ids instead of marking every document of the shard
+      int next = 0;
+      for (int chunk = 0; chunk < chunkCount && next < merged.length; chunk++) {
         int start = chunk * chunkDocs;
-        int count = Math.min(chunkDocs, localDocuments - start);
-        if (matches + count > matchFile.length) {
-          int capacity = Math.max(matches + count, Math.max(16, matchFile.length * 2));
-          matchFile = Arrays.copyOf(matchFile, capacity);
-          matchRow = Arrays.copyOf(matchRow, capacity);
-          matchLength = Arrays.copyOf(matchLength, capacity);
+        int end = Math.min(start + chunkDocs, localDocuments);
+        if (merged[next] >= end) {
+          continue;
         }
 
         try (DataInputStream in =
             new DataInputStream(
                 new InflaterInputStream(new ByteArrayInputStream(chunkBytes(chunk))))) {
-          for (int index = 0; index < count; index++) {
+          for (int docId = start; docId < end; docId++) {
             int fileId = readVarint(in);
             long row = readLongVarint(in);
             int length = readVarint(in);
-            int docId = start + index;
             check(fileId >= 0 && row >= 0 && length >= 0, "Invalid BM25 v2 document table entry");
-            if (slotByDoc[docId] == NEEDED) {
-              slotByDoc[docId] = matches;
-              matchFile[matches] = fileId;
-              matchRow[matches] = row;
-              matchLength[matches] = length;
-              matches += 1;
+            if (next < merged.length && merged[next] == docId) {
+              matchFile[next] = fileId;
+              matchRow[next] = row;
+              matchLength[next] = length;
+              next += 1;
             }
           }
 
           check(in.read() < 0, "Unexpected trailing BM25 v2 document table");
         }
       }
+
+      check(next == merged.length, "Missing BM25 v2 document table entry");
 
       List<String> files = files();
       Map<String, Long> frequencies = new HashMap<>();
@@ -506,15 +493,22 @@ final class TextIndexPayloadV2 {
         PostingList list = term.getValue();
         frequencies.put(term.getKey(), (long) list.docIds.length);
         List<Posting> postings = new ArrayList<>(list.docIds.length);
+        // the ids of one term are a subset of the merged list in the same order, so one pointer
+        // that only moves forward locates each of them
+        int cursor = 0;
         for (int posting = 0; posting < list.docIds.length; posting++) {
-          int slot = slotByDoc[list.docIds[posting]];
-          check(slot >= 0, "Missing BM25 v2 document table entry");
-          check(fileIdsValid(slot, matchFile, files), "Invalid BM25 v2 document file id");
+          int docId = list.docIds[posting];
+          while (cursor < merged.length && merged[cursor] != docId) {
+            cursor += 1;
+          }
+
+          check(cursor < merged.length, "Missing BM25 v2 document table entry");
+          check(fileIdsValid(cursor, matchFile, files), "Invalid BM25 v2 document file id");
           check(
-              list.termFrequencies[posting] <= matchLength[slot],
+              list.termFrequencies[posting] <= matchLength[cursor],
               "Invalid BM25 v2 posting term frequency");
           documentsList.add(
-              new Document(files.get(matchFile[slot]), matchRow[slot], matchLength[slot]));
+              new Document(files.get(matchFile[cursor]), matchRow[cursor], matchLength[cursor]));
           postings.add(new Posting(documentsList.size() - 1, list.termFrequencies[posting]));
         }
 
@@ -522,6 +516,55 @@ final class TextIndexPayloadV2 {
       }
 
       return new FileIndex(localDocuments, tokens, frequencies, byTerm, documentsList);
+    }
+
+    /** The ascending, once-each document ids named by the requested posting lists. */
+    private static int[] merge(Map<String, PostingList> lists) {
+      if (lists.isEmpty()) {
+        return new int[0];
+      }
+
+      if (lists.size() == 1) {
+        return lists.values().iterator().next().docIds;
+      }
+
+      int[][] heads = new int[lists.size()][];
+      int[] cursors = new int[lists.size()];
+      int capacity = 0;
+      int index = 0;
+      for (PostingList list : lists.values()) {
+        heads[index] = list.docIds;
+        capacity = Math.addExact(capacity, list.docIds.length);
+        index += 1;
+      }
+
+      int[] merged = new int[capacity];
+      int size = 0;
+      while (true) {
+        int smallest = -1;
+        boolean found = false;
+        for (int list = 0; list < heads.length; list++) {
+          if (cursors[list] < heads[list].length
+              && (!found || heads[list][cursors[list]] < smallest)) {
+            smallest = heads[list][cursors[list]];
+            found = true;
+          }
+        }
+
+        if (!found) {
+          break;
+        }
+
+        merged[size] = smallest;
+        size += 1;
+        for (int list = 0; list < heads.length; list++) {
+          if (cursors[list] < heads[list].length && heads[list][cursors[list]] == smallest) {
+            cursors[list] += 1;
+          }
+        }
+      }
+
+      return size == merged.length ? merged : Arrays.copyOf(merged, size);
     }
 
     private static boolean fileIdsValid(int slot, int[] matchFile, List<String> files) {

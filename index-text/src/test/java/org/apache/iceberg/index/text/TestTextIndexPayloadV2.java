@@ -22,6 +22,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 import java.io.IOException;
+import java.lang.management.ManagementFactory;
 import java.nio.ByteBuffer;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -34,6 +35,7 @@ import org.apache.iceberg.index.text.TextIndexAdapter.FileIndex;
 import org.apache.iceberg.index.text.TextIndexAdapter.Posting;
 import org.apache.iceberg.relocated.com.google.common.collect.Lists;
 import org.apache.iceberg.relocated.com.google.common.collect.Maps;
+import org.junit.jupiter.api.Assumptions;
 import org.junit.jupiter.api.Test;
 
 /**
@@ -470,6 +472,46 @@ class TestTextIndexPayloadV2 {
     for (String term : cleanShard.postingsByTerm.keySet()) {
       assertThat(postingRefs(paddedShard, term)).isEqualTo(postingRefs(cleanShard, term));
     }
+  }
+
+  @Test
+  void readingOneDocumentDoesNotAllocatePerShardDocument() throws IOException {
+    // the reader used to allocate an int[] of the shard's document count to locate the documents a
+    // query hits; what it allocates now has to follow the documents the query touches, so a term
+    // of one document in a large shard must not pay for the shard
+    com.sun.management.ThreadMXBean bean = allocationBean();
+    Assumptions.assumeTrue(bean != null, "thread allocation counting is unavailable");
+
+    int documents = 200_000;
+    Corpus corpus = new Corpus();
+    for (int document = 0; document < documents; document++) {
+      List<String> documentTokens =
+          document == documents - 1 ? List.of("common", "rare") : List.of("common");
+      corpus.document("many.parquet", document, documentTokens);
+    }
+
+    ByteBuffer payload = encodeV2(corpus);
+    TextIndexPayloadV2.Reader reader =
+        TextIndexPayloadV2.open(
+            TextIndexPayloadV2.source(payload.duplicate()), payload.remaining());
+    long before = bean.getCurrentThreadAllocatedBytes();
+    FileIndex index = reader.shard(Set.of("rare"), false);
+    long allocated = bean.getCurrentThreadAllocatedBytes() - before;
+
+    assertThat(index.postingsByTerm.get("rare")).hasSize(1);
+    // the per-document array of the previous implementation alone was 800 KB at this size
+    // measured 206,352 bytes after the change; the previous locating array alone was 800,000
+    assertThat(allocated).as("allocated %d bytes", allocated).isLessThan(400_000L);
+  }
+
+  private static com.sun.management.ThreadMXBean allocationBean() {
+    if (ManagementFactory.getThreadMXBean() instanceof com.sun.management.ThreadMXBean bean
+        && bean.isThreadAllocatedMemorySupported()) {
+      bean.setThreadAllocatedMemoryEnabled(true);
+      return bean;
+    }
+
+    return null;
   }
 
   @Test
