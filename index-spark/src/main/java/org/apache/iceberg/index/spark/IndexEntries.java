@@ -1657,12 +1657,18 @@ public final class IndexEntries {
     boolean timings = Boolean.getBoolean("iceberg.index.fetch-back.timings");
 
     // a lookup knows the rows it wants: ask the format to read only those, which is what lets a
-    // page-oriented format read a handful of pages instead of the whole file
+    // page-oriented format read a handful of pages instead of the whole file. Only a format that
+    // says it returns exactly those rows is asked: one that reads the file numbers its rows by
+    // where they sit, which is what the caller's position filter expects
     List<Long> wanted = null;
+    boolean positional = false;
     if (positions != null && !positions.isEmpty()) {
       wanted = Lists.newArrayList(positions);
       java.util.Collections.sort(wanted);
-      builder.positions(wanted);
+      positional = builder.supportsPositions();
+      if (positional) {
+        builder.positions(wanted);
+      }
     }
 
     List<Tuple2<Row, Long>> rows = Lists.newArrayList();
@@ -1696,15 +1702,22 @@ public final class IndexEntries {
               + rows.size());
     }
 
-    if (wanted != null && rows.size() == wanted.size()) {
-      // the format honoured the positions: it returned exactly those rows, in ascending order, so
-      // the numbering they streamed with is the order asked for rather than the row's position
+    if (positional) {
+      if (rows.size() != wanted.size()) {
+        // a reader that honours the positions returns exactly the rows asked for. A file that does
+        // not hold one of them cannot be read this way, so it is read whole and the rows are
+        // numbered by where they sit, which is what the caller's position filter expects
+        return readFileWithFormat(
+            location, format, projection, sparkSchema, null, conf, storageProperties);
+      }
+
+      // the numbering the rows streamed with is the order asked for rather than the row's position
       for (int i = 0; i < rows.size(); i++) {
         rows.set(i, new Tuple2<>(rows.get(i)._1(), wanted.get(i)));
       }
     }
 
-    // otherwise the format ignored the positions and read the file, which is allowed: the rows are
+    // a format that does not honour the positions read the file, which is allowed: the rows are
     // numbered in file order, and the caller's position filter picks the ones it asked for
     return rows.iterator();
   }

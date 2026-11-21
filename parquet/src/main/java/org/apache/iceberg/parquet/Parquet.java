@@ -1377,10 +1377,10 @@ public class Parquet {
     /**
      * Reads only the rows at the given positions of the file.
      *
-     * <p>A lookup that already knows the rows it wants reads the pages that hold them instead of
-     * the whole file, which is what makes resolving a handful of hits cost a handful of pages. Rows
-     * are returned in ascending position order whatever order they were given in, and a position
-     * the file does not hold simply names no row.
+     * <p>A lookup that already knows the rows it wants reads the row groups that hold them instead
+     * of the whole file, which is what keeps resolving a handful of hits from costing a file per
+     * hit file. Rows are returned in ascending position order whatever order they were given in,
+     * and a position the file does not hold simply names no row.
      *
      * @param newPositions the file positions to read
      * @return this for method chaining

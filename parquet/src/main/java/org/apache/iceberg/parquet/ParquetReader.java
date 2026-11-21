@@ -36,7 +36,6 @@ import org.apache.parquet.ParquetReadOptions;
 import org.apache.parquet.column.page.PageReadStore;
 import org.apache.parquet.hadoop.ParquetFileReader;
 import org.apache.parquet.hadoop.metadata.BlockMetaData;
-import org.apache.parquet.internal.column.columnindex.OffsetIndex;
 import org.apache.parquet.internal.filter2.columnindex.RowRanges;
 import org.apache.parquet.io.ParquetDecodingException;
 import org.apache.parquet.schema.MessageType;
@@ -293,9 +292,15 @@ public class ParquetReader<T> extends CloseableGroup implements CloseableIterabl
     }
 
     /**
-     * The pages of the next row group that hold wanted rows, or null when no row group left holds
-     * one. A format without an offset index cannot say where a row sits, so its row groups are read
-     * whole.
+     * The row group that holds the next wanted row, or null when none left holds one.
+     *
+     * <p>The group is read whole rather than only the pages that hold wanted rows. A filtered read
+     * decodes the pages that hold a wanted row, and the pages of two columns do not start and end
+     * on the same rows, so a column whose page starts before the first wanted row hands back rows
+     * the other columns do not: the values of a row then come from different rows, and nothing
+     * fails. Reading the group whole keeps every column on the same row. A file without page
+     * indexes is read this way too, and a file whose group holds no wanted row is skipped without
+     * reading it.
      */
     private PageReadStore readPagesHolding(long wanted) {
       List<BlockMetaData> blocks = reader.getRowGroups();
@@ -322,48 +327,11 @@ public class ParquetReader<T> extends CloseableGroup implements CloseableIterabl
             return null;
           }
 
-          if (block.getColumns().get(0).getOffsetIndexReference() == null) {
-            // a file written without page indexes cannot say where a row sits, so the group is read
-            // whole and the rows are filtered as they stream past
-            selectedPages.clear();
-            selectedPages.add(new long[] {start, end});
-            nextRowPosition = start;
-            return reader.readFilteredRowGroup(
-                blockIndex, RowRanges.createSingle(block.getRowCount()));
-          }
-
-          OffsetIndex offsetIndex = reader.readOffsetIndex(block.getColumns().get(0));
-          List<Integer> pages = Lists.newArrayList();
           selectedPages.clear();
-          int cursor = positionsRead;
-          for (int page = 0; page < offsetIndex.getPageCount(); page += 1) {
-            long pageStart = offsetIndex.getFirstRowIndex(page);
-            long pageEnd = offsetIndex.getLastRowIndex(page, block.getRowCount()) + 1;
-            boolean holds = false;
-            while (cursor < positions.size() && start + positions.get(cursor) < pageEnd) {
-              long position = start + positions.get(cursor);
-              holds |= position >= pageStart;
-              cursor += 1;
-            }
-
-            if (holds) {
-              pages.add(page);
-              selectedPages.add(new long[] {start + pageStart, start + pageEnd});
-            }
-          }
-
-          if (pages.isEmpty()) {
-            continue;
-          }
-
-          RowRanges ranges =
-              RowRanges.create(
-                  block.getRowCount(),
-                  pages.stream().mapToInt(Integer::intValue).iterator(),
-                  offsetIndex);
-          PageReadStore pagesRead = reader.readFilteredRowGroup(blockIndex, ranges);
-          nextRowPosition = selectedPages.peekFirst()[0];
-          return pagesRead;
+          selectedPages.add(new long[] {start, end});
+          nextRowPosition = start;
+          return reader.readFilteredRowGroup(
+              blockIndex, RowRanges.createSingle(block.getRowCount()));
         } catch (IOException e) {
           throw new RuntimeIOException(e);
         }

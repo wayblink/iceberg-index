@@ -132,10 +132,10 @@ public interface ReadBuilder<D, S> {
   /**
    * Reads only the rows at the given positions of the file.
    *
-   * <p>A lookup that has already found the rows it wants reads page-sized ranges instead of the
-   * whole file, which is what makes reading a handful of rows cost a handful of pages. A format
-   * that cannot seek to a row ignores this and reads the file, then the caller filters, so the
-   * default is to ignore it.
+   * <p>A lookup that has already found the rows it wants reads the parts of the file that hold them
+   * instead of the whole file: a page-sized range where the format can seek to a row, a row group
+   * where it can only seek to one of those. A format that cannot seek to a row ignores this and
+   * reads the file, then the caller filters, so the default is to ignore it.
    *
    * <p>A builder that honours it returns exactly these rows, in ascending position order.
    *
@@ -144,6 +144,21 @@ public interface ReadBuilder<D, S> {
    */
   default ReadBuilder<D, S> positions(java.util.Collection<Long> positions) {
     return this;
+  }
+
+  /**
+   * Whether this builder returns exactly the rows named by {@link #positions}.
+   *
+   * <p>A caller that has to pair what it reads with the positions it asked for cannot tell from the
+   * rows alone whether the reader honoured the positions or ignored them and read the file: both
+   * return rows. A reader that says so here returns exactly those rows, in ascending position
+   * order, and a reader that does not leaves the default of reading the file, whose rows a caller
+   * numbers by where they sit.
+   *
+   * @return true when {@link #positions} is honoured, false when the format reads the file
+   */
+  default boolean supportsPositions() {
+    return false;
   }
 
   /** Builds the reader. */

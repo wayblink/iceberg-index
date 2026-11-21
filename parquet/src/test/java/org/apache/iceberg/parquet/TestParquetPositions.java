@@ -44,10 +44,16 @@ import org.junit.jupiter.api.io.TempDir;
 /**
  * Reading only the rows a lookup names, by file position.
  *
- * <p>A lookup knows which rows it wants, and a page holds a few thousand of them, so the read has
- * to land on the pages that hold the requested rows and skip the rest of the file. What says it did
- * is how much of the file was read: a reader that answers the requested rows correctly after
- * decoding everything has not made the lookup cheap, which is the problem this exists for.
+ * <p>A lookup knows which rows it wants, and a file holds millions of them, so the read has to land
+ * on the row groups that hold the requested rows and skip the rest of the file. What says it did is
+ * how much of the file was read: a reader that answers the requested rows correctly after decoding
+ * everything has not made the lookup cheap, which is the problem this exists for.
+ *
+ * <p>The rows asked for come back with their own values. A filtered page read decodes the pages
+ * that hold a wanted row, and the pages of two columns do not start and end on the same rows, so
+ * one column's values can come back with another column's rows without anything failing. The reader
+ * therefore reads whole row groups, and the checks here read a table with a narrow column and a
+ * wide one, which is the shape that drifts apart when pages are read in part.
  */
 class TestParquetPositions {
   private static final int ROW_COUNT = 100_000;
@@ -61,10 +67,37 @@ class TestParquetPositions {
   @TempDir private Path temp;
 
   @Test
-  void readsTheRequestedRowsAndNotTheRestOfTheFile() throws IOException {
+  void readsTheRequestedRowsWithTheirOwnValues() throws IOException {
     File file = writeVectors();
 
     List<Long> requested = ImmutableList.of(50_000L, 1L, 99_999L);
+    CountingInputFile counting = new CountingInputFile(Files.localInput(file));
+
+    List<Long> ids = Lists.newArrayList();
+    try (CloseableIterable<Record> rows = reader(counting).positions(requested).build()) {
+      for (Record row : rows) {
+        long id = (Long) row.getField("id");
+        ids.add(id);
+        assertThat(firstValue(row))
+            .as("the first value of the vector of the row at position %d", id)
+            .isEqualTo((float) id);
+        assertThat((List<?>) row.getField("vector"))
+            .as("the vector read with the row at position %d", id)
+            .hasSize(DIMENSION);
+      }
+    }
+
+    assertThat(ids)
+        .as("the rows asked for, in file order, however the request was ordered")
+        .containsExactly(1L, 50_000L, 99_999L);
+  }
+
+  @Test
+  void readsOnlyTheRowGroupsThatHoldTheRows() throws IOException {
+    File file = writeVectors();
+
+    // three rows of the first row group, out of the several groups the file holds
+    List<Long> requested = ImmutableList.of(1L, 100L, 200L);
     CountingInputFile counting = new CountingInputFile(Files.localInput(file));
 
     List<Long> ids = Lists.newArrayList();
@@ -74,12 +107,10 @@ class TestParquetPositions {
       }
     }
 
-    assertThat(ids)
-        .as("the rows asked for, in file order, however the request was ordered")
-        .containsExactly(1L, 50_000L, 99_999L);
+    assertThat(ids).as("the rows asked for").containsExactly(1L, 100L, 200L);
     assertThat(counting.bytesRead())
-        .as("a read of three rows does not decode the whole file")
-        .isLessThan(file.length() / 4);
+        .as("a read of three rows of one row group does not decode the whole file")
+        .isLessThan(file.length() / 2);
   }
 
   @Test
@@ -95,6 +126,10 @@ class TestParquetPositions {
     }
 
     assertThat(ids).as("a position the file does not hold names no row").isEmpty();
+  }
+
+  private static Object firstValue(Record row) {
+    return ((List<?>) row.getField("vector")).get(0);
   }
 
   private Parquet.ReadBuilder reader(InputFile input) {
@@ -126,8 +161,9 @@ class TestParquetPositions {
         Parquet.write(Files.localOutput(file))
             .schema(SCHEMA)
             .createWriterFunc(org.apache.iceberg.data.parquet.GenericParquetWriter::create)
-            // small pages, so the three rows asked for are a small part of the file: the point of a
+            // small row groups, so the rows asked for are a small part of the file: the point of a
             // positional read is what it does not decode
+            .set("write.parquet.row-group-size-bytes", "262144")
             .set("write.parquet.page-size-bytes", "16384")
             .build()) {
       writer.addAll(records);

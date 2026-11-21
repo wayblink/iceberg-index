@@ -394,6 +394,11 @@ public class LanceFormatModel<D, S>
     }
 
     @Override
+    public boolean supportsPositions() {
+      return true;
+    }
+
+    @Override
     public CloseableIterable<D> build() {
       String path = inputFile.location();
 
