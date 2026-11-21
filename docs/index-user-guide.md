@@ -365,6 +365,15 @@ CALL local.system.drop_vector_index(table => 'db.docs', column => 'embedding', i
 
 `purge` 默认 `true`：注销注册并**立即删除**索引文件，不可恢复。`purge => false` 只注销、留文件——但**本分支没有任何入口把索引重新注册回来**，所以留文件的实际用途只是"确认没问题后手工删"。
 
+通用入口是 `drop_index`，它按列解析**任意类型**的索引（文本索引用它，因为 DDL 按名字寻址而文本索引没有名字）：
+
+```sql
+CALL local.system.drop_index(table => 'db.papers', column => 'body');
+CALL local.system.drop_index(table => 'db.papers', column => 'body', index => '<name 或 uuid>', purge => false);
+```
+
+输出三列 `index_uuid, index_type, purged`：`purged` 是**文件是否真的被删**（`purge => false` 时为 `false`），而 `drop_vector_index` 那两列输出里的第二列沿用旧语义。同一列上存在多个索引时必须用 `index =>` 指定一个，错误信息会列出候选（`type:name(uuid)`）。
+
 注意 `ALTER TABLE … DROP INDEX <name>` **没有 `purge` 参数**，它落到默认值 `true`，即直接删文件。
 
 ---
@@ -540,15 +549,17 @@ CALL local.system.refresh_text_index(table => 'db.papers', column => 'body');
 
 按列刷新，没有 `index` 参数（因为文本索引没有名字）。
 
-删除目前**没有任何 SQL 入口**：
+删除文本索引用通用的 `drop_index`（见 §4.5）：
 
-- `CALL system.drop_vector_index(...)` 按类型解析，只认 `vector`；
-- `ALTER TABLE … DROP INDEX` 与 `REFRESH INDEX` 同样按类型分派，文本索引报 `cannot be dropped: unsupported type text`；
-- DDL 按名字寻址，而文本索引没有名字，即使类型支持也无名可写。
+```sql
+CALL local.system.drop_index(table => 'db.papers', column => 'body');
+```
+
+它按列解析任意类型的索引，`purge` 默认 `true`；输出 `index_uuid, index_type, purged`。`CALL system.drop_vector_index(...)` 保留为只认 `vector` 的旧写法；`ALTER TABLE … DROP INDEX` 与 `REFRESH INDEX` 按类型分派，文本索引仍报 `cannot be dropped: unsupported type text`，DDL 又按名字寻址而文本索引没有名字——所以文本索引走 `CALL`。
 
 更麻烦的是**建索引失败也不回滚**：`build_text_index` 没有 try/catch，`createIndex` 先注册、后续构建失败后注册留在 registry 里且没有任何发布快照。结果是 `list_indexes` 会看到一行 `index_type = text`、`status = NULL`、`index_files = 0`，而同列重试会被 "An index already exists for column …" 拒绝。
 
-所以在当前版本上：**建文本索引前请确认这张表可以重建**。真需要清理时只能走 Java API（`SidecarIndexCatalog.dropIndex(tableLocation, indexUuid, true)`）或手工删 `indexes/<uuid>/` 并修 registry。这是已知缺口。
+遇到这种注册残留时用 `drop_index` 清掉（`purge => false` 可以留文件排查，随后手工删 `indexes/<uuid>/`）。
 
 ---
 

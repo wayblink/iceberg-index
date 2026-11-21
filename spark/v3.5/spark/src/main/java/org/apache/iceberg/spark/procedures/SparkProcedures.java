@@ -58,6 +58,7 @@ public class SparkProcedures {
     mapBuilder.put("build_vector_index", BuildVectorIndexProcedure::builder);
     mapBuilder.put("refresh_vector_index", RefreshVectorIndexProcedure::builder);
     mapBuilder.put("drop_vector_index", DropVectorIndexProcedure::builder);
+    mapBuilder.put("drop_index", DropIndexProcedure::builder);
     mapBuilder.put("list_indexes", ListIndexesProcedure::builder);
     mapBuilder.put("check_indexes", CheckIndexesProcedure::builder);
     mapBuilder.put("index_build_status", IndexBuildStatusProcedure::builder);
