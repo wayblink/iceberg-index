@@ -34,6 +34,7 @@ import org.apache.iceberg.index.IndexTypes;
 import org.apache.iceberg.index.PuffinIndexFileContainer;
 import org.apache.iceberg.index.spark.IndexEntries;
 import org.apache.iceberg.index.spark.VectorIndexes;
+import org.apache.iceberg.index.text.TextIndexAdapter;
 import org.apache.iceberg.index.vector.VectorIndexAdapter;
 import org.apache.iceberg.index.vector.VectorPayloadHeader;
 import org.apache.iceberg.inmemory.InMemoryInputFile;
@@ -60,8 +61,10 @@ import org.apache.spark.unsafe.types.UTF8String;
  * learn about it and a worse way to find the others.
  *
  * <p>A table holds indexes of more than one type, so every index is checked by the reader of its
- * own type: what says an index is unreadable is a property of the type, a kernel version in the
- * payload header for vectors and the blob type the manifest declares for text.
+ * own type: what says an index is unreadable is a property of the type. Both types this build knows
+ * write the format version inside the payload, so both are checked by reading the header of the
+ * first payload; a type whose version is part of the blob type instead is checked by the manifest
+ * alone, which is why that check is kept as the fallback.
  */
 class CheckIndexesProcedure extends BaseProcedure {
 
@@ -275,14 +278,20 @@ class CheckIndexesProcedure extends BaseProcedure {
   }
 
   /**
-   * Checks an index type whose payload version is part of the blob type instead of a header inside
-   * the payload, such as the text index.
+   * Checks an index type whose format version is part of the blob type instead of the payload
+   * header, such as the text index, and additionally reads the payload version of a type that does
+   * write one there.
    *
-   * <p>Such a type says in its own adapter which blob types it reads, and the manifest declares the
-   * blob type of every index file, so the manifest alone answers whether the payloads of a snapshot
-   * can be read: no file has to be opened. A payload that declares a version this build does not
-   * read would be skipped by a query rather than fail it, which is why a partly readable snapshot
-   * is reported as needing a rebuild instead of as readable.
+   * <p>A type that names its version in the blob type says in its adapter which blob types it
+   * reads, and the manifest declares the blob type of every index file, so the manifest alone can
+   * answer whether the payloads of a snapshot can be read: no file has to be opened. A type that
+   * writes the version in the payload, as the text index now does, is checked the way the vector
+   * index is: read the header of the first payload and compare its version with the one this build
+   * reads.
+   *
+   * <p>A payload that declares a version this build does not read would be skipped by a query
+   * rather than fail it, which is why a partly readable snapshot is reported as needing a rebuild
+   * instead of as readable.
    */
   private void checkDeclaredPayloads(
       String catalog,
@@ -293,7 +302,8 @@ class CheckIndexesProcedure extends BaseProcedure {
       IndexSnapshot snapshot,
       IndexAdapter adapter,
       Long uncovered,
-      List<InternalRow> rows) {
+      List<InternalRow> rows)
+      throws java.io.IOException {
     String indexType = metadata.indexType();
     Set<String> present = new LinkedHashSet<>();
     Set<String> unreadable = new LinkedHashSet<>();
@@ -322,27 +332,70 @@ class CheckIndexesProcedure extends BaseProcedure {
       return;
     }
 
-    boolean readable = unreadable.isEmpty();
+    TextIndexAdapter text = adapter instanceof TextIndexAdapter ? (TextIndexAdapter) adapter : null;
+    int readerVersion = -1;
+    Integer writerVersion = null;
+    boolean versionReadable = true;
+    boolean missingPayload = false;
+    String headerError = null;
+    if (text != null) {
+      readerVersion = text.payloadFormatVersion();
+      try {
+        byte[] payload = firstPayload(table, metadata, snapshot, text.auxiliaryBlobType());
+        if (payload == null) {
+          missingPayload = true;
+          versionReadable = false;
+        } else {
+          writerVersion = text.payloadVersion(ByteBuffer.wrap(payload));
+          versionReadable = writerVersion == readerVersion;
+        }
+      } catch (RuntimeException e) {
+        // a payload whose header cannot be read at all is exactly what this reports
+        versionReadable = false;
+        headerError = e.getMessage();
+      }
+    }
+
+    boolean readable = unreadable.isEmpty() && versionReadable;
+    String suggestion = null;
+    if (!unreadable.isEmpty()) {
+      suggestion =
+          "payloads were written as "
+              + String.join(", ", unreadable)
+              + ", this build reads "
+              + String.join(", ", readableBlobTypes(adapter))
+              + "; "
+              + refreshSuggestion(catalog, tableName, column, indexType);
+    } else if (!versionReadable) {
+      String reason;
+      if (missingPayload) {
+        reason = "no payload found in the index files";
+      } else if (headerError != null) {
+        reason = "payload header is unreadable (" + headerError + ")";
+      } else {
+        reason =
+            "payload was written by text version "
+                + writerVersion
+                + ", this build reads "
+                + readerVersion;
+      }
+
+      suggestion = reason + "; " + refreshSuggestion(catalog, tableName, column, indexType);
+    }
+
     rows.add(
         row(
             table,
             column,
             metadata,
-            null,
-            -1,
-            -1,
+            text == null ? null : "text",
+            writerVersion == null ? -1 : writerVersion,
+            readerVersion,
             readable,
             snapshot.sourceTableSnapshotId(),
             isStale(table, snapshot),
             uncovered,
-            readable
-                ? null
-                : "payloads were written as "
-                    + String.join(", ", unreadable)
-                    + ", this build reads "
-                    + String.join(", ", readableBlobTypes(adapter))
-                    + "; "
-                    + refreshSuggestion(catalog, tableName, column, indexType)));
+            suggestion));
   }
 
   // package private so a test can pin the decision without staging an index of another version
@@ -376,6 +429,24 @@ class CheckIndexesProcedure extends BaseProcedure {
   private VectorPayloadHeader readHeader(
       Table table, IndexMetadata metadata, IndexSnapshot snapshot, VectorIndexAdapter adapter)
       throws java.io.IOException {
+    byte[] payload =
+        firstPayload(
+            table,
+            metadata,
+            snapshot,
+            adapter.writesAuxiliaryFiles() ? adapter.auxiliaryBlobType() : adapter.entryBlobType());
+    return payload == null ? null : VectorPayloadHeader.of(payload);
+  }
+
+  /**
+   * The payload of the first file of the index, which is where a format version shows up first.
+   *
+   * @return the payload, or null when the index has no file or its first file carries no blob of
+   *     the given type
+   */
+  private byte[] firstPayload(
+      Table table, IndexMetadata metadata, IndexSnapshot snapshot, String blobType)
+      throws java.io.IOException {
     List<IndexFile> files =
         new IndexReader(metadata, table)
             .indexFiles(IndexQuery.of(snapshot.sourceTableSnapshotId(), ByteBuffer.allocate(4), 1));
@@ -383,19 +454,16 @@ class CheckIndexesProcedure extends BaseProcedure {
       return null;
     }
 
-    String blobType =
-        adapter.writesAuxiliaryFiles() ? adapter.auxiliaryBlobType() : adapter.entryBlobType();
     IndexFile file = files.get(0);
-    byte[] content;
     InputFile input = table.io().newInputFile(file.location());
-    content = new byte[(int) input.getLength()];
+    byte[] content = new byte[(int) input.getLength()];
     try (org.apache.iceberg.io.SeekableInputStream in = input.newStream()) {
       IOUtil.readFully(in, content, 0, content.length);
     }
 
     for (IndexBlob blob : new PuffinIndexFileContainer().read(new InMemoryInputFile(content))) {
       if (blobType.equals(blob.type())) {
-        return VectorPayloadHeader.of(blob.payload());
+        return blob.payload();
       }
     }
 

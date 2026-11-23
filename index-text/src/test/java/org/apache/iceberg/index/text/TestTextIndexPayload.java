@@ -35,7 +35,8 @@ import org.apache.iceberg.relocated.com.google.common.collect.Maps;
 import org.junit.jupiter.api.Test;
 
 /**
- * The v3 layout: file table with its row start, one dense length column, postings and dictionary.
+ * The payload layout this build writes: file table with its row start, one dense length column,
+ * postings and dictionary, behind a signature that names the format version.
  */
 class TestTextIndexPayload {
   private static final Set<String> ALL = null;
@@ -230,29 +231,42 @@ class TestTextIndexPayload {
 
   @Test
   void rejectsTruncatedPayload() {
-    assertThatThrownBy(() -> TextIndexPayload.open(source(new byte[8]), 8))
+    // four bytes is the signature, so nothing shorter can even say what it is
+    assertThatThrownBy(() -> TextIndexPayload.open(source(new byte[2]), 2))
         .isInstanceOf(IOException.class)
         .hasMessageContaining("Invalid BM25 payload size");
   }
 
   @Test
-  void asksForARebuildWhenThePayloadWasWrittenByTheEarlierLayout() {
-    ByteBuffer payload = earlierLayoutPayload();
+  void writesTheFormatVersionInTheSignature() throws IOException {
+    ByteBuffer payload = encode(index(false));
+
+    assertThat(payload.getInt(payload.position()))
+        .as("the signature names the version this build writes")
+        .isEqualTo(0x424D3102);
+    assertThat(TextIndexPayload.matches(payload)).isTrue();
+    assertThat(TextIndexPayload.HEADER_SIZE)
+        .isEqualTo(Integer.BYTES + 2 * Long.BYTES + 4 * 7 + (64 + 1) * Integer.BYTES);
+  }
+
+  @Test
+  void asksForARebuildWhenThePayloadWasWrittenByAnotherVersion() {
+    ByteBuffer payload = versionOnePayload();
 
     assertThat(TextIndexPayload.matches(payload))
-        .as("the per-posting layout cannot pass for the layout this reader decodes")
+        .as("a payload of another version is not the payload this reader decodes")
         .isFalse();
     assertThatThrownBy(() -> TextIndexPayload.open(source(bytes(payload)), payload.remaining()))
         .isInstanceOf(IOException.class)
-        .hasMessageContaining("earlier layout")
+        .hasMessageContaining("Unsupported BM25 payload format version: 1 (this build reads 2)")
         .hasMessageContaining("rebuild the index");
   }
 
   /**
-   * The header of the per-posting layout this build replaced: the signature, the two counts and the
-   * sixty-five bucket offsets, 280 bytes in all.
+   * The header a version 1 build wrote: its signature, the two counts and the sixty-five bucket
+   * offsets, 280 bytes in all.
    */
-  private static ByteBuffer earlierLayoutPayload() {
+  private static ByteBuffer versionOnePayload() {
     int headerSize = Integer.BYTES + 2 * Long.BYTES + (64 + 1) * Integer.BYTES;
     ByteBuffer payload = ByteBuffer.allocate(headerSize);
     payload.putInt(0x424D3101);
