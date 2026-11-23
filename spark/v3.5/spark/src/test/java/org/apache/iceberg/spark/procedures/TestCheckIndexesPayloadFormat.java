@@ -32,7 +32,7 @@ import org.junit.jupiter.api.Test;
  */
 class TestCheckIndexesPayloadFormat {
 
-  private static final String TEXT_AUXILIARY_BLOB_TYPE_V1 = "iceberg-text-bm25-v1";
+  private static final String TEXT_AUXILIARY_BLOB_TYPE_V3 = "iceberg-text-bm25-v3";
   private static final String TEXT_AUXILIARY_BLOB_TYPE_V2 = "iceberg-text-bm25-v2";
 
   private static IndexAdapter textAdapter() {
@@ -48,11 +48,20 @@ class TestCheckIndexesPayloadFormat {
   }
 
   @Test
-  public void aPayloadOfTheLayoutItReplacedIsStillReadable() {
+  public void aPayloadOfTheOtherLayoutThisBuildReadsIsReadable() {
     assertThat(
             CheckIndexesProcedure.readablePayload(
-                textAdapter(), IndexFile.Kind.AUXILIARY, TEXT_AUXILIARY_BLOB_TYPE_V1))
+                textAdapter(), IndexFile.Kind.AUXILIARY, TEXT_AUXILIARY_BLOB_TYPE_V3))
         .isTrue();
+  }
+
+  @Test
+  public void aPayloadOfALayoutThisBuildDroppedIsNotReadable() {
+    // the layouts it no longer reads must be reported, not silently skipped
+    assertThat(
+            CheckIndexesProcedure.readablePayload(
+                textAdapter(), IndexFile.Kind.AUXILIARY, "iceberg-text-bm25-v1"))
+        .isFalse();
   }
 
   @Test

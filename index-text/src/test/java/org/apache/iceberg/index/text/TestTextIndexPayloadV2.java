@@ -108,7 +108,7 @@ class TestTextIndexPayloadV2 {
   }
 
   @Test
-  void adapterAnswersTheSameForV1AndV2Payloads() throws IOException {
+  void adapterAnswersTheSameForV2AndV3Payloads() throws IOException {
     TextIndexAdapter adapter =
         new TextIndexAdapter(TextIndexDefinition.builder().fieldId(1).build());
     // a corpus small enough to rank by hand: the first two documents are identical, so they tie
@@ -120,22 +120,22 @@ class TestTextIndexPayloadV2 {
             .document("data-1.parquet", 2, List.of("ice", "ice", "iceberg"))
             .document("data-2.parquet", 0, List.of("vector", "search"));
 
-    List<IndexSearchResult> v1 =
-        adapter.searchAuxiliaryAll(List.of(encodeV1(corpus)), adapter.encodeQuery("ice"), 5);
     List<IndexSearchResult> v2 =
         adapter.searchAuxiliaryAll(List.of(encodeV2(corpus)), adapter.encodeQuery("ice"), 5);
+    List<IndexSearchResult> v3 =
+        adapter.searchAuxiliaryAll(List.of(encodeV3(corpus)), adapter.encodeQuery("ice"), 5);
 
     // term frequency decides first, then the tie, and both layouts have to produce that order
-    assertThat(v2).hasSize(3);
-    assertThat(v2.stream().map(IndexSearchResult::rowPosition)).containsExactly(2L, 0L, 1L);
-    assertThat(v2).hasSameSizeAs(v1);
-    for (int hit = 0; hit < v1.size(); hit++) {
-      assertThat(v2.get(hit).dataFile()).isEqualTo(v1.get(hit).dataFile());
-      assertThat(v2.get(hit).rowPosition()).isEqualTo(v1.get(hit).rowPosition());
-      assertThat(v2.get(hit).score()).as("score of hit %d", hit).isEqualTo(v1.get(hit).score());
+    assertThat(v3).hasSize(3);
+    assertThat(v3.stream().map(IndexSearchResult::rowPosition)).containsExactly(2L, 0L, 1L);
+    assertThat(v3).hasSameSizeAs(v2);
+    for (int hit = 0; hit < v2.size(); hit++) {
+      assertThat(v3.get(hit).dataFile()).isEqualTo(v2.get(hit).dataFile());
+      assertThat(v3.get(hit).rowPosition()).isEqualTo(v2.get(hit).rowPosition());
+      assertThat(v3.get(hit).score()).as("score of hit %d", hit).isEqualTo(v2.get(hit).score());
     }
 
-    assertThat(v2.get(1).score()).isEqualTo(v2.get(2).score());
+    assertThat(v3.get(1).score()).isEqualTo(v3.get(2).score());
   }
 
   @Test
@@ -515,7 +515,7 @@ class TestTextIndexPayloadV2 {
   }
 
   @Test
-  void aSnapshotWithBothLayoutsAnswersEveryDocument() throws IOException {
+  void aSnapshotWithBothDocumentTablesAnswersEveryDocument() throws IOException {
     // refresh rewrites only the index files whose data changed, so one snapshot can hold payloads
     // of both layouts; a reader that dropped one of them would silently answer with fewer rows
     Corpus older =
@@ -526,19 +526,19 @@ class TestTextIndexPayloadV2 {
         new Corpus()
             .document("newer-000.parquet", 0, List.of("ice", "glacier"))
             .document("newer-000.parquet", 1, List.of("vector", "search", "ice"));
-    ByteBuffer v1 = encodeV1(older);
+    ByteBuffer v3 = encodeV3(older);
     ByteBuffer v2 = encodeV2(newer);
     TextIndexAdapter adapter =
         new TextIndexAdapter(TextIndexDefinition.builder().fieldId(1).build());
 
     for (String query : List.of("ice", "vector", "glacier")) {
       List<IndexSearchResult> first =
-          adapter.searchAuxiliaryAll(List.of(v1.duplicate()), adapter.encodeQuery(query), 10);
+          adapter.searchAuxiliaryAll(List.of(v3.duplicate()), adapter.encodeQuery(query), 10);
       List<IndexSearchResult> second =
           adapter.searchAuxiliaryAll(List.of(v2.duplicate()), adapter.encodeQuery(query), 10);
       List<IndexSearchResult> mixed =
           adapter.searchAuxiliaryAll(
-              List.of(v1.duplicate(), v2.duplicate()), adapter.encodeQuery(query), 10);
+              List.of(v3.duplicate(), v2.duplicate()), adapter.encodeQuery(query), 10);
 
       // the mixed search merges the corpus statistics of both payloads, so its scores differ from
       // the single-payload scores; what must not differ is which rows answer the query, once each
@@ -646,6 +646,10 @@ class TestTextIndexPayloadV2 {
     return TextIndexPayloadV2.encode(corpus.counts(), corpus.index());
   }
 
+  private static ByteBuffer encodeV3(Corpus corpus) throws IOException {
+    return TextIndexPayloadV3.encode(corpus.counts(), corpus.index());
+  }
+
   private static FileIndex shardV1(ByteBuffer payload, Set<String> terms) throws IOException {
     return TextIndexPayload.open(TextIndexPayload.source(payload), payload.remaining())
         .shard(terms, false);
@@ -681,7 +685,7 @@ class TestTextIndexPayloadV2 {
     return TextIndexPayloadV2.open(sourceOf(payload), size);
   }
 
-  private static TextIndexPayload.Source sourceOf(byte[] payload) {
+  private static TextIndexSource.Source sourceOf(byte[] payload) {
     return TextIndexPayloadV2.source(ByteBuffer.wrap(payload));
   }
 

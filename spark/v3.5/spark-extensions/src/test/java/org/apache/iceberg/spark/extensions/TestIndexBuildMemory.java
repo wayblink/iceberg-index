@@ -90,7 +90,7 @@ public class TestIndexBuildMemory extends ExtensionsTestBase {
       for (IndexFile file : files) {
         IndexFileMemory memory = file.memory();
         assertThat(memory).isNotNull();
-        assertThat(memory.readerId()).isEqualTo("text/bm25/1");
+        assertThat(memory.readerId()).isEqualTo("text/bm25/3");
         var input = table.io().newInputFile(file.location());
         assertThat(memory.fileBytes()).isEqualTo(input.getLength());
         IndexBlob blob = new PuffinIndexFileContainer().read(input).get(0);

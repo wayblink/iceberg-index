@@ -284,19 +284,19 @@ final class TextIndexPayloadV3 {
     compressed.writeTo(bytes);
   }
 
-  static TextIndexPayload.Source source(ByteBuffer bytes) {
-    return TextIndexPayload.source(bytes);
+  static TextIndexSource.Source source(ByteBuffer bytes) {
+    return TextIndexSource.source(bytes);
   }
 
   static boolean matches(ByteBuffer payload) {
     return payload.remaining() >= Integer.BYTES && payload.getInt(payload.position()) == MAGIC;
   }
 
-  static TextIndexPayload.Source source(SeekableInputStream stream, long base) {
-    return TextIndexPayload.source(stream, base);
+  static TextIndexSource.Source source(SeekableInputStream stream, long base) {
+    return TextIndexSource.source(stream, base);
   }
 
-  static Reader open(TextIndexPayload.Source source, int size) throws IOException {
+  static Reader open(TextIndexSource.Source source, int size) throws IOException {
     check(size >= HEADER_SIZE, "Invalid BM25 v3 payload size");
     ByteBuffer header = source.read(0, HEADER_SIZE);
     check(header.getInt() == MAGIC, "Not a BM25 v3 payload");
@@ -403,7 +403,7 @@ final class TextIndexPayloadV3 {
   }
 
   static final class Reader implements TextIndexShard {
-    private final TextIndexPayload.Source source;
+    private final TextIndexSource.Source source;
     private final int size;
     private final long documents;
     private final long tokens;
@@ -423,7 +423,7 @@ final class TextIndexPayloadV3 {
     private Map<Integer, Long> exceptions;
 
     private Reader(
-        TextIndexPayload.Source source,
+        TextIndexSource.Source source,
         int size,
         long documents,
         long tokens,

@@ -157,7 +157,7 @@ class TestTextIndexPayloadV3 {
     ByteBuffer payload = encode(index);
     byte[] bytes = bytes(payload);
     int[] reads = new int[1];
-    TextIndexPayload.Source counting =
+    TextIndexSource.Source counting =
         (offset, length) -> {
           reads[0] += 1;
           return ByteBuffer.wrap(bytes, offset, length).slice();
@@ -278,7 +278,7 @@ class TestTextIndexPayloadV3 {
     return TextIndexPayloadV2.open(source(bytes), bytes.length).shard(ALL, false);
   }
 
-  private static TextIndexPayload.Source source(byte[] payload) {
+  private static TextIndexSource.Source source(byte[] payload) {
     return (offset, length) -> ByteBuffer.wrap(payload, offset, length).slice();
   }
 

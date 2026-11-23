@@ -180,6 +180,42 @@ class TestDistributedIndexSearch {
   }
 
   @Test
+  void publishesTextShardsOfTheLengthColumnLayout() throws Exception {
+    TextIndexTypes.register();
+    spark.sql("CREATE TABLE local.db.text_v3 (id bigint, body string) USING iceberg");
+    spark.sql("INSERT INTO local.db.text_v3 VALUES (1, 'ice ice glacier')");
+    spark.sql("INSERT INTO local.db.text_v3 VALUES (2, 'ice cold')");
+    Table table =
+        new HadoopTables(spark.sessionState().newHadoopConf())
+            .load(warehouseDir.resolve("db/text_v3").toUri().toString());
+    long snapshotId = table.currentSnapshot().snapshotId();
+    TextIndexDefinition definition =
+        TextIndexDefinition.builder().fieldId(2).property("payload-version", "3").build();
+    IndexCatalog catalog = new SidecarIndexCatalog(table.io(), table);
+    IndexMetadata created =
+        catalog.createIndex(
+            CreateIndexRequest.builder()
+                .tableLocation(table.location())
+                .tableUuid(table.uuid().toString())
+                .indexUuid("text-v3")
+                .definition(definition)
+                .build());
+    IndexMetadata built = SparkIndexBuilder.build(spark, table, created, snapshotId, "body", 1L);
+    catalog.updateIndex(built);
+
+    TextIndexAdapter adapter = new TextIndexAdapter(definition);
+    IndexQuery query = IndexQuery.of(snapshotId, adapter.encodeQuery("ice glacier ice"), 2);
+    IndexReader reader = new IndexReader(built, table);
+    assertThat(reader.indexFiles(query))
+        .isNotEmpty()
+        .allSatisfy(file -> assertThat(file.blobType()).isEqualTo("iceberg-text-bm25-v3"));
+
+    String statistics = built.latestSnapshot().properties().get("snapshot-statistics-location");
+    assertThat(statistics).isNotBlank();
+    assertThat(table.io().newInputFile(statistics).exists()).isTrue();
+  }
+
+  @Test
   void publishesRangeReadableTextShardsAndSnapshotStatistics() throws Exception {
     TextIndexTypes.register();
     spark.sql("CREATE TABLE local.db.text_ranges (id bigint, body string) USING iceberg");

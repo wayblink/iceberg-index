@@ -72,11 +72,14 @@ public final class TextIndexAdapter implements IndexAdapter, java.io.Serializabl
 
   static final String ENTRY_BLOB_TYPE = "iceberg-text-entries-v1";
 
-  /** The payload layout v1 wrote; still readable, so an index built before v2 keeps answering. */
-  static final String AUXILIARY_BLOB_TYPE_V1 = "iceberg-text-bm25-v1";
-
-  /** The payload layout this build writes. */
+  /** The payload layout of the document table that stores one chunk of records. */
   static final String AUXILIARY_BLOB_TYPE_V2 = "iceberg-text-bm25-v2";
+
+  /** The payload layout of the document table that stores one length column. */
+  static final String AUXILIARY_BLOB_TYPE_V3 = "iceberg-text-bm25-v3";
+
+  /** The definition property that selects the layout a build writes. */
+  static final String PAYLOAD_VERSION_PROPERTY = "payload-version";
 
   private final TextIndexDefinition definition;
 
@@ -96,16 +99,35 @@ public final class TextIndexAdapter implements IndexAdapter, java.io.Serializabl
 
   @Override
   public String auxiliaryBlobType() {
-    return AUXILIARY_BLOB_TYPE_V2;
+    return payloadVersion() == TextIndexPayloadV3.FORMAT_VERSION
+        ? AUXILIARY_BLOB_TYPE_V3
+        : AUXILIARY_BLOB_TYPE_V2;
   }
 
   /**
-   * Both layouts are readable: the one this build writes, and the one an index built before it
-   * carries. The payload signature decides which reader decodes a file.
+   * Both layouts are readable: the one this build writes and the one it replaced. The payload
+   * signature decides which reader decodes a file.
    */
   @Override
   public Set<String> readableAuxiliaryBlobTypes() {
-    return Set.of(AUXILIARY_BLOB_TYPE_V1, AUXILIARY_BLOB_TYPE_V2);
+    return Set.of(AUXILIARY_BLOB_TYPE_V2, AUXILIARY_BLOB_TYPE_V3);
+  }
+
+  /** The layout this build writes: v3 while the two layouts are compared, v2 otherwise. */
+  private int payloadVersion() {
+    String version =
+        definition
+            .properties()
+            .getOrDefault(
+                PAYLOAD_VERSION_PROPERTY, Integer.toString(TextIndexPayloadV2.FORMAT_VERSION));
+    try {
+      int parsed = Integer.parseInt(version);
+      return parsed == TextIndexPayloadV3.FORMAT_VERSION
+          ? TextIndexPayloadV3.FORMAT_VERSION
+          : TextIndexPayloadV2.FORMAT_VERSION;
+    } catch (NumberFormatException e) {
+      return TextIndexPayloadV2.FORMAT_VERSION;
+    }
   }
 
   @Override
@@ -195,9 +217,11 @@ public final class TextIndexAdapter implements IndexAdapter, java.io.Serializabl
   public ByteBuffer encodeAuxiliaryPayload(List<IndexEntry> entries) {
     FileIndex index = indexEntries(entries);
     try {
-      return TextIndexPayloadV2.encode(counts(index), index);
+      return payloadVersion() == TextIndexPayloadV3.FORMAT_VERSION
+          ? TextIndexPayloadV3.encode(counts(index), index)
+          : TextIndexPayloadV2.encode(counts(index), index);
     } catch (IOException e) {
-      throw new UncheckedIOException("Failed to write BM25 v2 shard", e);
+      throw new UncheckedIOException("Failed to write BM25 shard", e);
     }
   }
 
@@ -246,7 +270,9 @@ public final class TextIndexAdapter implements IndexAdapter, java.io.Serializabl
   /** Encodes the merged counts for a snapshot's term dictionary. */
   public ByteBuffer encodeSnapshotStatistics(CorpusCounts counts) {
     try {
-      return TextIndexPayloadV2.encode(counts, null);
+      return payloadVersion() == TextIndexPayloadV3.FORMAT_VERSION
+          ? TextIndexPayloadV3.encode(counts, null)
+          : TextIndexPayloadV2.encode(counts, null);
     } catch (IOException e) {
       throw new UncheckedIOException("Failed to write BM25 snapshot statistics", e);
     }
@@ -288,7 +314,7 @@ public final class TextIndexAdapter implements IndexAdapter, java.io.Serializabl
   /** Opens a snapshot dictionary and reads statistics only for the supplied query terms. */
   public CorpusStatistics snapshotStatistics(InputFile file, Set<String> terms) {
     try (SeekableInputStream stream = file.newStream()) {
-      return decode(TextIndexPayload.source(stream, 0), Math.toIntExact(file.getLength()))
+      return decode(TextIndexSource.source(stream, 0), Math.toIntExact(file.getLength()))
           .counts(terms)
           .corpus();
     } catch (IOException e) {
@@ -336,7 +362,7 @@ public final class TextIndexAdapter implements IndexAdapter, java.io.Serializabl
     }
 
     private TextIndexShard open() throws IOException {
-      return decode(TextIndexPayload.source(ByteBuffer.wrap(payload)), payload.length);
+      return decode(TextIndexSource.source(ByteBuffer.wrap(payload)), payload.length);
     }
 
     @Override
@@ -354,18 +380,18 @@ public final class TextIndexAdapter implements IndexAdapter, java.io.Serializabl
   private static BlobMetadata rangeBlob(InputFile file) {
     try (PuffinReader reader = Puffin.read(file).build()) {
       for (BlobMetadata blob : reader.fileMetadata().blobs()) {
-        if (AUXILIARY_BLOB_TYPE_V1.equals(blob.type())
-            || AUXILIARY_BLOB_TYPE_V2.equals(blob.type())) {
+        if (AUXILIARY_BLOB_TYPE_V2.equals(blob.type())
+            || AUXILIARY_BLOB_TYPE_V3.equals(blob.type())) {
           if (blob.compressionCodec() != null
               || blob.offset() < 0
               || blob.length() < 0
               || blob.length() > file.getLength() - blob.offset()) {
-            throw new IOException("Invalid BM25 v1 blob range");
+            throw new IOException("Invalid BM25 blob range");
           }
           return blob;
         }
       }
-      throw new IOException("Missing BM25 v1 blob");
+      throw new IOException("Missing BM25 blob");
     } catch (IOException e) {
       throw new UncheckedIOException("Failed to open BM25 shard " + file.location(), e);
     }
@@ -373,18 +399,23 @@ public final class TextIndexAdapter implements IndexAdapter, java.io.Serializabl
 
   private static TextIndexShard openRange(SeekableInputStream stream, BlobMetadata blob)
       throws IOException {
-    return decode(TextIndexPayload.source(stream, blob.offset()), Math.toIntExact(blob.length()));
+    return decode(TextIndexSource.source(stream, blob.offset()), Math.toIntExact(blob.length()));
   }
 
   /** Opens the payload layout its signature names. */
-  private static TextIndexShard decode(TextIndexPayload.Source source, int size)
-      throws IOException {
-    if (size >= Integer.BYTES
-        && source.read(0, Integer.BYTES).getInt() == TextIndexPayloadV2.MAGIC) {
-      return TextIndexPayloadV2.open(source, size);
+  private static TextIndexShard decode(TextIndexSource.Source source, int size) throws IOException {
+    if (size >= Integer.BYTES) {
+      int magic = source.read(0, Integer.BYTES).getInt();
+      if (magic == TextIndexPayloadV3.MAGIC) {
+        return TextIndexPayloadV3.open(source, size);
+      }
+
+      if (magic == TextIndexPayloadV2.MAGIC) {
+        return TextIndexPayloadV2.open(source, size);
+      }
     }
 
-    return TextIndexPayload.open(source, size);
+    throw new IllegalArgumentException("Not a text index payload");
   }
 
   @Override
@@ -642,7 +673,7 @@ public final class TextIndexAdapter implements IndexAdapter, java.io.Serializabl
 
   private FileIndex readPayload(ByteBuffer buffer, Set<String> terms, boolean statisticsOnly) {
     try {
-      return decode(TextIndexPayload.source(buffer), buffer.remaining())
+      return decode(TextIndexSource.source(buffer), buffer.remaining())
           .shard(terms, statisticsOnly);
     } catch (IOException e) {
       throw new UncheckedIOException("Failed to read the text index payload", e);

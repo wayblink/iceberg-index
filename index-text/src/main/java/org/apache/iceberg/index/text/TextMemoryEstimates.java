@@ -42,7 +42,7 @@ final class TextMemoryEstimates {
                 .modelVersion(MODEL_VERSION)
                 .payloadBytes(size)
                 .preparedBytes(preparedBytes(size))
-                .readerId("text/bm25/" + TextIndexPayloadV2.FORMAT_VERSION)
+                .readerId("text/bm25/" + TextIndexPayloadV3.FORMAT_VERSION)
                 .runtimeProfile(profile)
                 .structure(Map.of(PAYLOAD_BYTES, (long) size))
                 .build());

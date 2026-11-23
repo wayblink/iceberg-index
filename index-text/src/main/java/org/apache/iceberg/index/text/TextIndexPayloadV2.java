@@ -39,7 +39,7 @@ import org.apache.iceberg.index.text.TextIndexAdapter.CorpusCounts;
 import org.apache.iceberg.index.text.TextIndexAdapter.Document;
 import org.apache.iceberg.index.text.TextIndexAdapter.FileIndex;
 import org.apache.iceberg.index.text.TextIndexAdapter.Posting;
-import org.apache.iceberg.index.text.TextIndexPayload.Source;
+import org.apache.iceberg.index.text.TextIndexSource.Source;
 import org.apache.iceberg.io.SeekableInputStream;
 
 /**
@@ -266,7 +266,7 @@ final class TextIndexPayloadV2 {
   }
 
   static Source source(ByteBuffer bytes) {
-    return TextIndexPayload.source(bytes);
+    return TextIndexSource.source(bytes);
   }
 
   /** Whether a payload starts with this format, without opening it. */
@@ -275,7 +275,7 @@ final class TextIndexPayloadV2 {
   }
 
   static Source source(SeekableInputStream stream, long base) {
-    return TextIndexPayload.source(stream, base);
+    return TextIndexSource.source(stream, base);
   }
 
   static Reader open(Source source, int size) throws IOException {
