@@ -158,8 +158,14 @@ public final class IndexSearch {
     for (ByteBuffer query : queries) {
       indexQueries.add(IndexQuery.of(snapshot.sourceTableSnapshotId(), query.duplicate(), topK));
     }
+    long scoreStart = System.nanoTime();
     List<List<IndexSearchResult>> hitsPerQuery =
         DistributedIndexSearch.searchBatch(spark, metadata, table, indexQueries, stages);
+    if (stages != null) {
+      DistributedIndexSearch.Stages scoreTally = new DistributedIndexSearch.Stages();
+      scoreTally.probeScoreNanos = System.nanoTime() - scoreStart;
+      stages.report(scoreTally);
+    }
 
     // the hits are positions in the files the index was built from, but the rows are read from the
     // table as it is now: a row deleted since the index was built must not be returned, and a file

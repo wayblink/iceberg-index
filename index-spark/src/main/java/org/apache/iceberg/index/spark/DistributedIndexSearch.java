@@ -303,11 +303,7 @@ public final class DistributedIndexSearch {
     public static SearchStages create(SparkContext sparkContext) {
       Map<String, SQLMetric> metrics = new java.util.LinkedHashMap<>();
       for (Map.Entry<String, String> entry : DESCRIPTIONS.entrySet()) {
-        SQLMetric metric = SQLMetrics.createMetric(sparkContext, entry.getValue());
-        // a metric a task updates has to be registered on the driver, or the update never comes
-        // back: the copy a task adds to is only merged into a registered accumulator
-        sparkContext.register(metric, entry.getValue());
-        metrics.put(entry.getKey(), metric);
+        metrics.put(entry.getKey(), SQLMetrics.createMetric(sparkContext, entry.getValue()));
       }
 
       return new SearchStages(metrics);
@@ -1959,9 +1955,6 @@ public final class DistributedIndexSearch {
                       TextIndexAdapter text = scorer.value();
                       List<byte[]> queriesForShard = encodedQueries.value();
                       CorpusStatistics corpusForShard = statistics.value();
-                      Stages tally = stages == null ? null : new Stages();
-                      long taskStart = System.nanoTime();
-                      long shardStart = System.nanoTime();
                       List<List<IndexSearchResult>> results;
                       try (ExecutorIndexCache.Lease lease =
                           useResidentCache
@@ -1987,14 +1980,6 @@ public final class DistributedIndexSearch {
                                                 corpusForShard,
                                                 candidates));
                       }
-                      if (tally != null) {
-                        // reading a shard and scoring it are one call: the payload is read only
-                        // when the executor does not hold it, so the two are reported together
-                        tally.probeScoreNanos += System.nanoTime() - shardStart;
-                        tally.taskNanos = System.nanoTime() - taskStart;
-                        stages.report(tally);
-                      }
-
                       reportCache(cacheReports, queryRun);
                       for (int queryId = 0; queryId < results.size(); queryId++) {
                         for (IndexSearchResult hit : results.get(queryId)) {
