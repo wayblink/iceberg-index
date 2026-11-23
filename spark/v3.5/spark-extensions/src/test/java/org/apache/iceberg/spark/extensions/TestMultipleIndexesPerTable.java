@@ -149,13 +149,25 @@ public class TestMultipleIndexesPerTable extends ExtensionsTestBase {
             catalogName, tableName);
     assertThat(hitIds(textHitsAfterRefresh)).containsExactly(4L);
 
-    // an index on a different column is not affected by the new row
+    // the title_vec index still covers only rows 1-3: refreshing the text index left it alone,
+    // which the unchanged source snapshot above proves. The query answer is a different question.
+    // With the default table coverage the rows the index does not cover are scanned as a
+    // residual, so row 4, appended after the build and at distance zero from the query, is
+    // answered even though the index never saw it.
     List<Object[]> titleHitsAfterRefresh =
         sql(
             "CALL %s.system.vector_search(table => '%s', column => 'title_vec', "
                 + "query => array(1.0d, 1.0d), k => 1)",
             catalogName, tableName);
-    assertThat(hitIds(titleHitsAfterRefresh)).containsExactly(3L);
+    assertThat(hitIds(titleHitsAfterRefresh)).containsExactly(4L);
+
+    // searching only the covered rows shows the index itself is unchanged: row 4 is not in it
+    List<Object[]> indexedTitleHits =
+        sql(
+            "CALL %s.system.vector_search(table => '%s', column => 'title_vec', "
+                + "query => array(1.0d, 1.0d), k => 1, coverage => 'indexed')",
+            catalogName, tableName);
+    assertThat(hitIds(indexedTitleHits)).containsExactly(3L);
   }
 
   @TestTemplate
