@@ -72,6 +72,9 @@ public final class TextIndexAdapter implements IndexAdapter, java.io.Serializabl
 
   static final String ENTRY_BLOB_TYPE = "iceberg-text-entries-v1";
 
+  /** The pre-v2 layout: one record per posting, kept while the layouts are compared. */
+  static final String AUXILIARY_BLOB_TYPE_V1 = "iceberg-text-bm25-v1";
+
   /** The payload layout of the document table that stores one chunk of records. */
   static final String AUXILIARY_BLOB_TYPE_V2 = "iceberg-text-bm25-v2";
 
@@ -86,6 +89,9 @@ public final class TextIndexAdapter implements IndexAdapter, java.io.Serializabl
 
   /** The property value that selects the v3 layout. */
   static final String PAYLOAD_VERSION_V3 = "3";
+
+  /** The pre-v2 layout, readable again while v1 and v3 are measured against each other. */
+  static final String PAYLOAD_VERSION_V1 = "1";
 
   private final TextIndexDefinition definition;
 
@@ -105,9 +111,14 @@ public final class TextIndexAdapter implements IndexAdapter, java.io.Serializabl
 
   @Override
   public String auxiliaryBlobType() {
-    return payloadVersion() == TextIndexPayloadV3.FORMAT_VERSION
-        ? AUXILIARY_BLOB_TYPE_V3
-        : AUXILIARY_BLOB_TYPE_V2;
+    switch (payloadVersion()) {
+      case TextIndexPayloadV3.FORMAT_VERSION:
+        return AUXILIARY_BLOB_TYPE_V3;
+      case TextIndexPayload.FORMAT_VERSION:
+        return AUXILIARY_BLOB_TYPE_V1;
+      default:
+        return AUXILIARY_BLOB_TYPE_V2;
+    }
   }
 
   /**
@@ -116,7 +127,7 @@ public final class TextIndexAdapter implements IndexAdapter, java.io.Serializabl
    */
   @Override
   public Set<String> readableAuxiliaryBlobTypes() {
-    return Set.of(AUXILIARY_BLOB_TYPE_V2, AUXILIARY_BLOB_TYPE_V3);
+    return Set.of(AUXILIARY_BLOB_TYPE_V1, AUXILIARY_BLOB_TYPE_V2, AUXILIARY_BLOB_TYPE_V3);
   }
 
   /** The layout this build writes: v3 while the two layouts are compared, v2 otherwise. */
@@ -130,6 +141,8 @@ public final class TextIndexAdapter implements IndexAdapter, java.io.Serializabl
         return TextIndexPayloadV2.FORMAT_VERSION;
       case PAYLOAD_VERSION_V3:
         return TextIndexPayloadV3.FORMAT_VERSION;
+      case PAYLOAD_VERSION_V1:
+        return TextIndexPayload.FORMAT_VERSION;
       default:
         // a value this build does not know is refused rather than taken as one of the layouts: a
         // comparison that silently wrote v2 twice would report that the layouts behave the same
@@ -138,7 +151,7 @@ public final class TextIndexAdapter implements IndexAdapter, java.io.Serializabl
                 + version
                 + " for column "
                 + definition.fieldId()
-                + ": expected 2 or 3");
+                + ": expected 1, 2 or 3");
     }
   }
 
@@ -229,9 +242,14 @@ public final class TextIndexAdapter implements IndexAdapter, java.io.Serializabl
   public ByteBuffer encodeAuxiliaryPayload(List<IndexEntry> entries) {
     FileIndex index = indexEntries(entries);
     try {
-      return payloadVersion() == TextIndexPayloadV3.FORMAT_VERSION
-          ? TextIndexPayloadV3.encode(counts(index), index)
-          : TextIndexPayloadV2.encode(counts(index), index);
+      switch (payloadVersion()) {
+        case TextIndexPayloadV3.FORMAT_VERSION:
+          return TextIndexPayloadV3.encode(counts(index), index);
+        case TextIndexPayload.FORMAT_VERSION:
+          return TextIndexPayload.encode(counts(index), index);
+        default:
+          return TextIndexPayloadV2.encode(counts(index), index);
+      }
     } catch (IOException e) {
       throw new UncheckedIOException("Failed to write BM25 shard", e);
     }
@@ -294,9 +312,14 @@ public final class TextIndexAdapter implements IndexAdapter, java.io.Serializabl
   /** Encodes the merged counts for a snapshot's term dictionary. */
   public ByteBuffer encodeSnapshotStatistics(CorpusCounts counts) {
     try {
-      return payloadVersion() == TextIndexPayloadV3.FORMAT_VERSION
-          ? TextIndexPayloadV3.encode(counts, null)
-          : TextIndexPayloadV2.encode(counts, null);
+      switch (payloadVersion()) {
+        case TextIndexPayloadV3.FORMAT_VERSION:
+          return TextIndexPayloadV3.encode(counts, null);
+        case TextIndexPayload.FORMAT_VERSION:
+          return TextIndexPayload.encode(counts, null);
+        default:
+          return TextIndexPayloadV2.encode(counts, null);
+      }
     } catch (IOException e) {
       throw new UncheckedIOException("Failed to write BM25 snapshot statistics", e);
     }
@@ -404,7 +427,8 @@ public final class TextIndexAdapter implements IndexAdapter, java.io.Serializabl
   private static BlobMetadata rangeBlob(InputFile file) {
     try (PuffinReader reader = Puffin.read(file).build()) {
       for (BlobMetadata blob : reader.fileMetadata().blobs()) {
-        if (AUXILIARY_BLOB_TYPE_V2.equals(blob.type())
+        if (AUXILIARY_BLOB_TYPE_V1.equals(blob.type())
+            || AUXILIARY_BLOB_TYPE_V2.equals(blob.type())
             || AUXILIARY_BLOB_TYPE_V3.equals(blob.type())) {
           if (blob.compressionCodec() != null
               || blob.offset() < 0
@@ -436,6 +460,10 @@ public final class TextIndexAdapter implements IndexAdapter, java.io.Serializabl
 
       if (magic == TextIndexPayloadV2.MAGIC) {
         return TextIndexPayloadV2.open(source, size);
+      }
+
+      if (magic == TextIndexPayload.MAGIC) {
+        return TextIndexPayload.open(source, size);
       }
     }
 

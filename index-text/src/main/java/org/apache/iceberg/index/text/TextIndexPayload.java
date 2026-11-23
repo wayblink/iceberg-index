@@ -23,6 +23,7 @@ import java.io.ByteArrayOutputStream;
 import java.io.DataInputStream;
 import java.io.DataOutputStream;
 import java.io.IOException;
+import java.nio.charset.StandardCharsets;
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
 import java.util.HashMap;
@@ -35,14 +36,12 @@ import org.apache.iceberg.index.text.TextIndexAdapter.CorpusCounts;
 import org.apache.iceberg.index.text.TextIndexAdapter.Document;
 import org.apache.iceberg.index.text.TextIndexAdapter.FileIndex;
 import org.apache.iceberg.index.text.TextIndexAdapter.Posting;
-import org.apache.iceberg.io.IOUtil;
-import org.apache.iceberg.io.RangeReadable;
 import org.apache.iceberg.io.SeekableInputStream;
 
 /** Sorted bucket directories followed by independently compressed term postings. */
 final class TextIndexPayload {
   static final int FORMAT_VERSION = 1;
-  private static final int MAGIC = 0x424D3100 | FORMAT_VERSION;
+  static final int MAGIC = 0x424D3100 | FORMAT_VERSION;
   private static final int BUCKET_COUNT = 64;
   private static final int HEADER_SIZE =
       Integer.BYTES + 2 * Long.BYTES + (BUCKET_COUNT + 1) * Integer.BYTES;
@@ -78,7 +77,7 @@ final class TextIndexPayload {
       }
 
       DataOutputStream dictionary = new DataOutputStream(dictionaries[bucket]);
-      dictionary.writeUTF(term);
+      writeString(dictionary, term);
       dictionary.writeLong(counts.documentFrequency.get(term));
       dictionary.writeInt(offset);
       dictionary.writeInt(postings.size() - offset);
@@ -115,29 +114,7 @@ final class TextIndexPayload {
     return ByteBuffer.wrap(bytes.toByteArray());
   }
 
-  static Source source(ByteBuffer bytes) {
-    return (offset, length) -> bytes.slice(bytes.position() + offset, length);
-  }
-
-  static Source source(SeekableInputStream stream, long base) {
-    return (offset, length) -> {
-      byte[] bytes = new byte[length];
-      if (stream instanceof RangeReadable range) {
-        range.readFully(base + offset, bytes);
-      } else {
-        stream.seek(base + offset);
-        IOUtil.readFully(stream, bytes, 0, length);
-      }
-      return ByteBuffer.wrap(bytes);
-    };
-  }
-
-  @FunctionalInterface
-  interface Source {
-    ByteBuffer read(int offset, int length) throws IOException;
-  }
-
-  static Reader open(Source source, int size) throws IOException {
+  static Reader open(TextIndexSource.Source source, int size) throws IOException {
     check(size >= Integer.BYTES, "Truncated BM25 v1 signature");
     ByteBuffer header = source.read(0, Math.min(size, HEADER_SIZE));
     if (header.getInt() != MAGIC) {
@@ -164,6 +141,23 @@ final class TextIndexPayload {
     return term.hashCode() & (BUCKET_COUNT - 1);
   }
 
+  private static void writeString(DataOutputStream out, String value) throws IOException {
+    byte[] bytes = value.getBytes(StandardCharsets.UTF_8);
+    out.writeInt(bytes.length);
+    out.write(bytes);
+  }
+
+  private static String readString(DataInputStream in) throws IOException {
+    int length = in.readInt();
+    if (length < 0) {
+      throw new IOException("Invalid BM25 v1 string length: " + length);
+    }
+
+    byte[] bytes = new byte[length];
+    in.readFully(bytes);
+    return new String(bytes, StandardCharsets.UTF_8);
+  }
+
   private static void check(boolean condition, String message) throws IOException {
     if (!condition) {
       throw new IOException(message);
@@ -171,13 +165,13 @@ final class TextIndexPayload {
   }
 
   static final class Reader implements TextIndexShard {
-    private final Source source;
+    private final TextIndexSource.Source source;
     private final int size;
     private final long documents;
     private final long tokens;
     private final int[] offsets;
 
-    private Reader(Source source, int size, long documents, long tokens, int[] offsets) {
+    private Reader(TextIndexSource.Source source, int size, long documents, long tokens, int[] offsets) {
       this.source = source;
       this.size = size;
       this.documents = documents;
@@ -257,7 +251,7 @@ final class TextIndexPayload {
       try (DataInputStream in =
           new DataInputStream(new ByteArrayInputStream(bytes(source.read(start, end - start))))) {
         while (in.available() > 0) {
-          String term = in.readUTF();
+          String term = readString(in);
           long frequency = in.readLong();
           int offset = in.readInt();
           int postingLength = in.readInt();
