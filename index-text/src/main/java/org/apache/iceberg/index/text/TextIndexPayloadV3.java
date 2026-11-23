@@ -144,9 +144,30 @@ final class TextIndexPayloadV3 {
     byte[] column = new byte[Math.multiplyExact(count, Short.BYTES)];
     List<long[]> overflow = Lists.newArrayList();
     List<long[]> exceptions = Lists.newArrayList();
+    // the decoder maps a document to its file by the first docId of each file, so a file that
+    // appears again after another one would be read back as belonging to that other file. The
+    // writer sorts documents by file today, but the payload is a long-lived format that must not
+    // depend on a caller doing so.
+    boolean[] closed = new boolean[fileIds.size()];
+    int currentFile = -1;
     for (int doc = 0; doc < count; doc++) {
       Document document = index.documents.get(doc);
       int file = fileIds.get(document.dataFile);
+      if (file != currentFile) {
+        if (currentFile >= 0) {
+          closed[currentFile] = true;
+        }
+
+        if (closed[file]) {
+          throw new IOException(
+              "Invalid BM25 v3 document order: data file "
+                  + document.dataFile
+                  + " appears again after another file, so its documents are not contiguous");
+        }
+
+        currentFile = file;
+      }
+
       if (fileStart[file] < 0) {
         fileStart[file] = doc;
         fileRow[file] = document.rowPosition;
@@ -466,8 +487,10 @@ final class TextIndexPayloadV3 {
       }
 
       check(lengthsLength > 0 || localDocuments == 0, "BM25 v3 shard has no document table");
-      byte[] decoded = column();
-      files();
+      // a term this shard does not hold must not pay for the document table or the file table:
+      // both are read when a hit first needs one, not before the term loop
+      byte[] decoded = null;
+      List<String> fileNames = null;
       Map<String, Long> frequencies = Maps.newHashMap();
       Map<String, List<Posting>> byTerm = Maps.newHashMap();
       List<Document> documentsList = Lists.newArrayList();
@@ -478,8 +501,16 @@ final class TextIndexPayloadV3 {
         for (int posting = 0; posting < list.docIds.length; posting++) {
           int docId = list.docIds[posting];
           check(docId >= 0 && docId < localDocuments, "Invalid BM25 v3 posting");
+          if (fileNames == null) {
+            fileNames = files();
+          }
+
           while (file + 1 < fileStart.length && docId >= fileStart[file + 1]) {
             file += 1;
+          }
+
+          if (decoded == null) {
+            decoded = column();
           }
 
           int length = length(docId, decoded);
@@ -490,7 +521,7 @@ final class TextIndexPayloadV3 {
             row = exception;
           }
 
-          documentsList.add(new Document(files.get(file), row, length));
+          documentsList.add(new Document(fileNames.get(file), row, length));
           postings.add(new Posting(documentsList.size() - 1, list.termFrequencies[posting]));
         }
 

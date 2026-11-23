@@ -27,8 +27,11 @@ import org.apache.iceberg.ParameterizedTestExtension;
 import org.apache.iceberg.Table;
 import org.apache.iceberg.index.IndexMetadata;
 import org.apache.iceberg.index.IndexReader;
+import org.apache.iceberg.index.SidecarIndexCatalog;
 import org.apache.iceberg.index.spark.IndexEntries;
 import org.apache.iceberg.index.spark.VectorIndexes;
+import org.apache.iceberg.index.text.TextIndexAdapter;
+import org.apache.iceberg.index.text.TextIndexDefinition;
 import org.apache.iceberg.index.text.TextIndexTypes;
 import org.apache.iceberg.spark.Spark3Util;
 import org.junit.jupiter.api.AfterEach;
@@ -347,6 +350,64 @@ public class TestTextIndexProcedures extends ExtensionsTestBase {
                 + "query => 'zzzznotpresent', k => 5)",
             catalogName, tableName);
     assertThat(searchOutput).isEmpty();
+  }
+
+  @TestTemplate
+  public void buildWritesThePayloadLayoutTheSessionSelects() throws Exception {
+    String tableName = tableName("text_payload_select_" + catalogName);
+    String conf = "spark.iceberg.index.text.payload-version";
+    String indexUuid = null;
+    try {
+      sql("CREATE TABLE %s (id bigint, body string) USING iceberg", tableName);
+      sql("INSERT INTO %s VALUES (1, 'iceberg table format')", tableName);
+      // the procedure reads the session's configuration, which is where a comparison sets it
+      spark.conf().set(conf, "3");
+      List<Object[]> built =
+          sql(
+              "CALL %s.system.build_text_index(table => '%s', column => 'body')",
+              catalogName, tableName);
+      indexUuid = built.get(0)[0].toString();
+
+      Table table = Spark3Util.loadIcebergTable(spark, tableName);
+      IndexMetadata metadata =
+          new SidecarIndexCatalog(table.io(), table).loadIndex(table.location(), indexUuid);
+      TextIndexAdapter adapter = new TextIndexAdapter((TextIndexDefinition) metadata.definition());
+      assertThat(adapter.auxiliaryBlobType()).isEqualTo("iceberg-text-bm25-v3");
+    } finally {
+      spark.conf().unset(conf);
+      try {
+        if (indexUuid != null) {
+          Table table = Spark3Util.loadIcebergTable(spark, tableName);
+          new SidecarIndexCatalog(table.io(), table).dropIndex(table.location(), indexUuid, true);
+        }
+      } finally {
+        sql("DROP TABLE IF EXISTS %s PURGE", tableName);
+      }
+    }
+  }
+
+  @TestTemplate
+  public void buildRefusesAnUnknownPayloadVersion() {
+    String tableName = tableName("text_payload_invalid_" + catalogName);
+    String conf = "spark.iceberg.index.text.payload-version";
+    try {
+      sql("CREATE TABLE %s (id bigint, body string) USING iceberg", tableName);
+      sql("INSERT INTO %s VALUES (1, 'iceberg table format')", tableName);
+      spark.conf().set(conf, "4");
+
+      assertThatThrownBy(
+              () ->
+                  sql(
+                      "CALL %s.system.build_text_index(table => '%s', column => 'body')",
+                      catalogName, tableName))
+          .hasMessageContaining("expected 2 or 3");
+      // the value is refused before the index is registered, so nothing is left behind
+      assertThat(sql("CALL %s.system.list_indexes(table => '%s')", catalogName, tableName))
+          .isEmpty();
+    } finally {
+      spark.conf().unset(conf);
+      sql("DROP TABLE IF EXISTS %s PURGE", tableName);
+    }
   }
 
   private static List<Long> searchIds(List<Object[]> output) {

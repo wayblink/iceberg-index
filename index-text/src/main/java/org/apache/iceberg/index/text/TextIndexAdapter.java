@@ -81,6 +81,12 @@ public final class TextIndexAdapter implements IndexAdapter, java.io.Serializabl
   /** The definition property that selects the layout a build writes. */
   static final String PAYLOAD_VERSION_PROPERTY = "payload-version";
 
+  /** The property value that selects the v2 layout, which is also what an unset property means. */
+  static final String PAYLOAD_VERSION_V2 = "2";
+
+  /** The property value that selects the v3 layout. */
+  static final String PAYLOAD_VERSION_V3 = "3";
+
   private final TextIndexDefinition definition;
 
   public TextIndexAdapter(TextIndexDefinition definition) {
@@ -115,18 +121,24 @@ public final class TextIndexAdapter implements IndexAdapter, java.io.Serializabl
 
   /** The layout this build writes: v3 while the two layouts are compared, v2 otherwise. */
   private int payloadVersion() {
+    // the property names the layout, not the payload's magic version: v2's magic is version 1, but
+    // a build that selects the second layout writes "2"
     String version =
-        definition
-            .properties()
-            .getOrDefault(
-                PAYLOAD_VERSION_PROPERTY, Integer.toString(TextIndexPayloadV2.FORMAT_VERSION));
-    try {
-      int parsed = Integer.parseInt(version);
-      return parsed == TextIndexPayloadV3.FORMAT_VERSION
-          ? TextIndexPayloadV3.FORMAT_VERSION
-          : TextIndexPayloadV2.FORMAT_VERSION;
-    } catch (NumberFormatException e) {
-      return TextIndexPayloadV2.FORMAT_VERSION;
+        definition.properties().getOrDefault(PAYLOAD_VERSION_PROPERTY, PAYLOAD_VERSION_V2);
+    switch (version) {
+      case PAYLOAD_VERSION_V2:
+        return TextIndexPayloadV2.FORMAT_VERSION;
+      case PAYLOAD_VERSION_V3:
+        return TextIndexPayloadV3.FORMAT_VERSION;
+      default:
+        // a value this build does not know is refused rather than taken as one of the layouts: a
+        // comparison that silently wrote v2 twice would report that the layouts behave the same
+        throw new IllegalArgumentException(
+            "Unsupported BM25 payload version "
+                + version
+                + " for column "
+                + definition.fieldId()
+                + ": expected 2 or 3");
     }
   }
 
@@ -228,7 +240,19 @@ public final class TextIndexAdapter implements IndexAdapter, java.io.Serializabl
   @Override
   public IndexBuildResult encodeAuxiliaryPayloadWithMemory(
       List<IndexEntry> entries, int parallelism) {
-    return TextMemoryEstimates.result(encodeAuxiliaryPayload(entries), parallelism);
+    return TextMemoryEstimates.result(encodeAuxiliaryPayload(entries), parallelism, readerId());
+  }
+
+  /**
+   * The reader that measures a payload of the layout this definition selects.
+   *
+   * <p>The v2 layout replaced v1 in place, so a v2 payload keeps the {@code text/bm25/1} reader
+   * identity its residency records already carry; a v3 payload is measured by its own reader.
+   */
+  private String readerId() {
+    return payloadVersion() == TextIndexPayloadV3.FORMAT_VERSION
+        ? "text/bm25/" + TextIndexPayloadV3.FORMAT_VERSION
+        : "text/bm25/1";
   }
 
   @Override

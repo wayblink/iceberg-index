@@ -135,6 +135,17 @@ class BuildTextIndexProcedure extends BaseProcedure {
           // property disappears once one layout is chosen
           String payloadVersion = spark().conf().get(PAYLOAD_VERSION_CONF, null);
           if (payloadVersion != null && !payloadVersion.isEmpty()) {
+            if (!"2".equals(payloadVersion) && !"3".equals(payloadVersion)) {
+              // refuse an unknown value here, before the index is registered: a build that fell
+              // back to a layout the caller did not ask for would be recorded as that layout
+              throw new IllegalArgumentException(
+                  "Unsupported "
+                      + PAYLOAD_VERSION_CONF
+                      + ": "
+                      + payloadVersion
+                      + "; expected 2 or 3");
+            }
+
             definition.property(PAYLOAD_VERSION_PROPERTY, payloadVersion);
           }
           if (input.isProvided(K1_PARAM)) {

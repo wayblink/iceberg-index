@@ -29,6 +29,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import org.apache.iceberg.index.IndexBuildResult;
 import org.apache.iceberg.index.IndexEntry;
 import org.apache.iceberg.index.IndexMetadata;
 import org.apache.iceberg.index.IndexMetadataParser;
@@ -364,6 +365,36 @@ class TestTextIndexAdapter {
         entry("data-1.parquet", 0, "ice iceberg"),
         entry("data-1.parquet", 1, "ice ice iceberg"),
         entry("data-2.parquet", 0, "vector search"));
+  }
+
+  @Test
+  void refusesAnUnknownPayloadVersion() {
+    TextIndexDefinition definition =
+        TextIndexDefinition.builder().fieldId(1).property("payload-version", "4").build();
+    TextIndexAdapter adapter = new TextIndexAdapter(definition);
+
+    assertThatThrownBy(
+            () -> adapter.encodeAuxiliaryPayload(List.of(entry("ice.parquet", 0, "ice"))))
+        .isInstanceOf(IllegalArgumentException.class)
+        .hasMessageContaining("Unsupported BM25 payload version 4");
+  }
+
+  @Test
+  void aPayloadNamesTheReaderOfItsOwnLayout() {
+    List<IndexEntry> entries =
+        List.of(entry("ice.parquet", 0, "ice"), entry("ice.parquet", 1, "berg"));
+    TextIndexDefinition v2 = TextIndexDefinition.builder().fieldId(1).build();
+    TextIndexDefinition v3 =
+        TextIndexDefinition.builder().fieldId(1).property("payload-version", "3").build();
+
+    IndexBuildResult v2Build =
+        new TextIndexAdapter(v2).encodeAuxiliaryPayloadWithMemory(entries, 1);
+    IndexBuildResult v3Build =
+        new TextIndexAdapter(v3).encodeAuxiliaryPayloadWithMemory(entries, 1);
+    assertThat(v2Build.memory()).isNotNull();
+    assertThat(v2Build.memory().readerId()).isEqualTo("text/bm25/1");
+    assertThat(v3Build.memory()).isNotNull();
+    assertThat(v3Build.memory().readerId()).isEqualTo("text/bm25/3");
   }
 
   private static IndexEntry entry(String dataFile, long position, String text) {

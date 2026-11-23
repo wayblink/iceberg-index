@@ -171,6 +171,51 @@ class TestTextIndexPayloadV3 {
   }
 
   @Test
+  void refusesADocumentThatComesBackToAFileAfterAnother() {
+    FileIndex index =
+        index(
+            List.of(
+                new Document("a.parquet", 0, 3),
+                new Document("b.parquet", 0, 3),
+                new Document("a.parquet", 1, 3)),
+            Map.of("ice", List.of(0, 1, 2)));
+
+    assertThatThrownBy(() -> encode(index))
+        .isInstanceOf(IOException.class)
+        .hasMessageContaining("not contiguous");
+  }
+
+  @Test
+  void aTermTheShardDoesNotHoldReadsNoDocumentTable() throws IOException {
+    int documents = 20_000;
+    List<Document> list = Lists.newArrayList();
+    for (int document = 0; document < documents; document++) {
+      list.add(new Document("a.parquet", document, 5));
+    }
+
+    ByteBuffer payload = encode(index(list, Map.of("ice", List.of(0))));
+    byte[] bytes = bytes(payload);
+    // the dictionary starts after the file table, the length column, the overflow table and the
+    // row exceptions: a term the shard does not hold needs none of those
+    int dictionaryStart = ByteBuffer.wrap(bytes).getInt(40);
+    List<long[]> reads = Lists.newArrayList();
+    TextIndexSource.Source counting =
+        (offset, length) -> {
+          reads.add(new long[] {offset, length});
+          return ByteBuffer.wrap(bytes, offset, length).slice();
+        };
+
+    FileIndex decoded =
+        TextIndexPayloadV3.open(counting, bytes.length).shard(Set.of("missing"), false);
+    assertThat(decoded.documents).isEmpty();
+    for (long[] read : reads) {
+      assertThat(read[0] == 0 || read[0] >= dictionaryStart)
+          .as("read of %s bytes at offset %s", read[1], read[0])
+          .isTrue();
+    }
+  }
+
+  @Test
   void fullReadMatchesScopedRead() throws IOException {
     FileIndex index = index(false);
     ByteBuffer payload = encode(index);

@@ -31,7 +31,7 @@ final class TextMemoryEstimates {
 
   private TextMemoryEstimates() {}
 
-  static IndexBuildResult result(ByteBuffer payload, int parallelism) {
+  static IndexBuildResult result(ByteBuffer payload, int parallelism, String readerId) {
     String profile = IndexMemoryLayout.profile(parallelism);
     int size = payload.remaining();
     return IndexBuildResult.of(
@@ -42,7 +42,7 @@ final class TextMemoryEstimates {
                 .modelVersion(MODEL_VERSION)
                 .payloadBytes(size)
                 .preparedBytes(preparedBytes(size))
-                .readerId("text/bm25/" + TextIndexPayloadV3.FORMAT_VERSION)
+                .readerId(readerId)
                 .runtimeProfile(profile)
                 .structure(Map.of(PAYLOAD_BYTES, (long) size))
                 .build());
