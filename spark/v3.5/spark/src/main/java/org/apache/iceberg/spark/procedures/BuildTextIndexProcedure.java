@@ -23,6 +23,7 @@ import org.apache.iceberg.index.CreateIndexRequest;
 import org.apache.iceberg.index.IndexMetadata;
 import org.apache.iceberg.index.IndexSnapshot;
 import org.apache.iceberg.index.SidecarIndexCatalog;
+import org.apache.iceberg.index.spark.IndexBuildStatus;
 import org.apache.iceberg.index.spark.SparkIndexBuilder;
 import org.apache.iceberg.index.text.TextIndexDefinition;
 import org.apache.iceberg.spark.procedures.SparkProcedures.ProcedureBuilder;
@@ -161,9 +162,26 @@ class BuildTextIndexProcedure extends BaseProcedure {
                           Long.toString(maxEntriesPerIndexFile))
                       .build());
 
-          IndexMetadata updated =
-              SparkIndexBuilder.build(
-                  spark(), table, created, sourceSnapshotId, column, System.currentTimeMillis());
+          IndexMetadata updated;
+          try {
+            updated =
+                SparkIndexBuilder.build(
+                    spark(), table, created, sourceSnapshotId, column, System.currentTimeMillis());
+          } catch (Exception e) {
+            // a build that fails must not leave a registration behind: an index with no snapshot
+            // looks like an index that exists, and the column then refuses a retry that does not
+            // name it, so the registration and whatever it wrote are removed before the failure is
+            // reported. The failure is caught as an Exception because a Spark job reports its
+            // failure as a SparkException, which a RuntimeException catch does not see.
+            IndexBuildStatus report =
+                IndexBuildStatus.read(
+                    table.io(), IndexBuildStatus.statusDirFor(created.location()));
+            catalog.dropIndex(table.location(), indexUuid, true);
+            IndexProcedures.keepFailedAttempt(table, fieldId, column, indexUuid, report, e);
+            throw e instanceof RuntimeException ? (RuntimeException) e : new RuntimeException(e);
+          }
+
+          IndexProcedures.forgetFailedAttempt(table, fieldId);
           VectorIndexProcedures.publishSnapshot(
               catalog, table, indexUuid, updated.latestSnapshot());
 

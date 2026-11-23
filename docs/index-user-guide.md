@@ -577,9 +577,7 @@ CALL local.system.drop_index(table => 'db.papers', column => 'body');
 
 它按列解析任意类型的索引，`purge` 默认 `true`；输出 `index_uuid, index_type, purged`。`CALL system.drop_vector_index(...)` 保留为只认 `vector` 的旧写法；`ALTER TABLE … DROP INDEX` 与 `REFRESH INDEX` 按类型分派，文本索引仍报 `cannot be dropped: unsupported type text`，DDL 又按名字寻址而文本索引没有名字——所以文本索引走 `CALL`。
 
-更麻烦的是**建索引失败也不回滚**：`build_text_index` 没有 try/catch，`createIndex` 先注册、后续构建失败后注册留在 registry 里且没有任何发布快照。结果是 `list_indexes` 会看到一行 `index_type = text`、`status = NULL`、`index_files = 0`，而同列重试会被 "An index already exists for column …" 拒绝。
-
-遇到这种注册残留时用 `drop_index` 清掉（`purge => false` 可以留文件排查，随后手工删 `indexes/<uuid>/`）。
+`build_text_index` 中途失败（payload 写失败、task 失败、OOM 等）会像向量索引一样回滚：注销注册并 `purge` 掉本次写出的索引树，失败报告写到 `<table>/indexes/build-status/<column-field-id>/` 供 `index_build_status` 读取；同列重试不会再被残留注册拒绝，下一次成功构建会清掉失败报告。更早版本留下的注册残留（`list_indexes` 里一行 `index_type = text`、`status = NULL`、`index_files = 0`）仍可能出现在旧表上，用 `drop_index` 清掉即可（`purge => false` 可以留文件排查，随后手工删 `indexes/<uuid>/`）。
 
 ---
 
@@ -608,7 +606,7 @@ SHOW INDEXES FROM local.db.docs;   -- 只有 FROM，没有 IN
 
 `index_build_status.state` 五种：`RUNNING`、`SUCCEEDED`、`FAILED`、`ABANDONED`（报告停止更新超过 5 分钟，通常是 driver 被杀）、`UNKNOWN`（没有报告，比如更早版本建的）。构建期间约每 30 秒一次心跳，可以反复 `CALL` 观察。
 
-失败报告的位置：向量索引失败会回滚并留下报告在 `<table>/indexes/build-status/<column-field-id>/`；同列下次构建成功时清掉。文本索引失败既不留可读报告也不回滚（5.5）。
+失败报告的位置：向量或文本索引失败都会回滚并留下报告在 `<table>/indexes/build-status/<column-field-id>/`；同列下次构建成功时清掉（5.5）。
 
 ### 清理
 
@@ -731,7 +729,7 @@ BM25 和向量索引共用 executor 的容量预算、LRU 和状态入口。用�
 
 **9.4 索引不自动维护。** 见 3.4。
 
-**9.5 文本索引的 DDL 仍不完整，且建索引失败不回滚。** `CALL build_text_index / refresh_text_index / drop_index` 都支持按名或 uuid 选定同列索引，但 `ALTER TABLE … DROP INDEX` / `REFRESH INDEX` 对文本索引仍报 `cannot be dropped: unsupported type text`，`CREATE INDEX USING fts` 也不能带名字。另外文本索引构建失败不回滚，见 5.5。
+**9.5 文本索引的 DDL 仍不完整。** `CALL build_text_index / refresh_text_index / drop_index` 都支持按名或 uuid 选定同列索引，但 `ALTER TABLE … DROP INDEX` / `REFRESH INDEX` 对文本索引仍报 `cannot be dropped: unsupported type text`，`CREATE INDEX USING fts` 也不能带名字。构建失败现在与向量索引一样回滚并在 `indexes/build-status/<field-id>/` 留下报告，见 5.5。
 
 **9.6 中文不可用。** 见 5.1。
 
@@ -777,7 +775,7 @@ BM25 和向量索引共用 executor 的容量预算、LRU 和状态入口。用�
 | `SET` 报 `INVALID_SET_SYNTAX` | 键名有 `.` 和 `-` | 用反引号包键名 |
 | `text_score needs a text index … none was found`（但索引存在） | 索引落后，或 `match` 与别的谓词并列，或零命中 | 先 `refresh_text_index`；把 `match` 单独用（5.4） |
 | 文本查询搜不到中文 | 分词不支持 | 见 5.1 |
-| 文本建索引失败后无法重试 | 注册未回滚且无删除入口 | 见 5.5，需手工清理 |
+| 文本建索引失败后无法重试（旧版本残留） | 注册未回滚且无删除入口 | 升级后由 5.5 的回滚处理；旧表用 `drop_index` 清残留 |
 | `cleanup_index_files` 返回 `in_flight_builds > 0` | 有构建或刷新正在写入或等待发布 | 等发布完成后重跑 |
 | `index_cache_status()` 返回 0 行 | 缓存没开 | 先开缓存 |
 | 过程与改写结果不同 | 过程不做候选放宽也不做精确重排 | 要精确用改写或 `FROM vector_search(...)` |
