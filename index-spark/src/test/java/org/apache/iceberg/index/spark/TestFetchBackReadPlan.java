@@ -20,12 +20,14 @@ package org.apache.iceberg.index.spark;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
+import java.io.IOException;
 import java.net.InetAddress;
 import java.nio.file.Path;
 import java.util.ArrayDeque;
 import java.util.Deque;
 import java.util.List;
 import java.util.Map;
+import java.util.NoSuchElementException;
 import java.util.Set;
 import java.util.concurrent.atomic.AtomicInteger;
 import org.apache.iceberg.DataFiles;
@@ -35,6 +37,10 @@ import org.apache.iceberg.PartitionSpec;
 import org.apache.iceberg.Schema;
 import org.apache.iceberg.SortOrder;
 import org.apache.iceberg.TestTables;
+import org.apache.iceberg.data.GenericRecord;
+import org.apache.iceberg.data.Record;
+import org.apache.iceberg.io.CloseableIterable;
+import org.apache.iceberg.io.CloseableIterator;
 import org.apache.iceberg.relocated.com.google.common.collect.Lists;
 import org.apache.iceberg.relocated.com.google.common.collect.Maps;
 import org.apache.iceberg.relocated.com.google.common.collect.Sets;
@@ -44,6 +50,7 @@ import org.apache.spark.api.java.JavaPairRDD;
 import org.apache.spark.rdd.RDD;
 import org.apache.spark.sql.Row;
 import org.apache.spark.sql.SparkSession;
+import org.apache.spark.sql.types.DataTypes;
 import org.apache.spark.sql.types.StructType;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
@@ -138,6 +145,41 @@ class TestFetchBackReadPlan {
     assertThat(fetchBack(fixture).getNumPartitions()).isEqualTo(1);
   }
 
+  /**
+   * A whole-file scan pulls one row at a time rather than collecting the file first.
+   *
+   * <p>A fetch-back of a file whose positions are not known reads every row of it, and the index
+   * build does that for every data file an index does not cover yet. A read that collected the file
+   * would hold a whole data file per task; the rows have to come from the reader as the consumer of
+   * the fetch-back asks for them.
+   */
+  @Test
+  void aWholeFileScanPullsOneRowAtATime() throws IOException {
+    PacedRecords records = new PacedRecords(1_000);
+
+    try (CloseableIterator<Tuple2<Long, Row>> rows =
+        new IndexEntries.RowsWithPosition(records, SCHEMA, toSparkSchema())) {
+      assertThat(rows.next()._1())
+          .as("the position of the first row of a file read from the start")
+          .isEqualTo(0L);
+      assertThat(records.pulled()).as("rows read to answer one row").isEqualTo(1);
+
+      assertThat(rows.next()._1())
+          .as("the position of the second row of a file read from the start")
+          .isEqualTo(1L);
+      assertThat(records.pulled()).as("rows read to answer two rows").isEqualTo(2);
+      assertThat(records.closed()).as("the file still open while rows are left in it").isFalse();
+    }
+
+    assertThat(records.closed())
+        .as("the file is closed with the iterator, before the file is read to its end")
+        .isTrue();
+  }
+
+  private static StructType toSparkSchema() {
+    return new StructType().add("id", DataTypes.LongType);
+  }
+
   private JavaPairRDD<String, Tuple2<Long, Row>> fetchBack(Fixture fixture) {
     StructType readSchema = IndexEntries.sparkSchema(fixture.table, COLUMNS);
     return IndexEntries.liveRowsRdd(
@@ -214,6 +256,57 @@ class TestFetchBackReadPlan {
   }
 
   private record Shape(int largestParentCount, int rddCount) {}
+
+  /** A source of records that counts how many of them a reader has pulled. */
+  private static final class PacedRecords implements CloseableIterable<Record> {
+    private final long count;
+    private int pulled;
+    private boolean closed;
+
+    private PacedRecords(long count) {
+      this.count = count;
+    }
+
+    @Override
+    public CloseableIterator<Record> iterator() {
+      return new CloseableIterator<Record>() {
+        @Override
+        public boolean hasNext() {
+          return pulled < count;
+        }
+
+        @Override
+        public Record next() {
+          if (!hasNext()) {
+            throw new NoSuchElementException("No more records to read");
+          }
+
+          GenericRecord record = GenericRecord.create(SCHEMA);
+          record.setField("id", (long) pulled);
+          pulled++;
+          return record;
+        }
+
+        @Override
+        public void close() {
+          closed = true;
+        }
+      };
+    }
+
+    @Override
+    public void close() {
+      this.closed = true;
+    }
+
+    private int pulled() {
+      return pulled;
+    }
+
+    private boolean closed() {
+      return closed;
+    }
+  }
 
   private static final class Fixture {
     private final TestTables.TestTable table;

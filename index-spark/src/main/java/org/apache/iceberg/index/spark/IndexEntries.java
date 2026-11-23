@@ -51,6 +51,7 @@ import org.apache.iceberg.io.CloseableIterable;
 import org.apache.iceberg.io.CloseableIterator;
 import org.apache.iceberg.io.DeleteSchemaUtil;
 import org.apache.iceberg.io.FileIO;
+import org.apache.iceberg.io.FilterIterator;
 import org.apache.iceberg.io.InputFile;
 import org.apache.iceberg.io.StorageProperties;
 import org.apache.iceberg.mapping.NameMappingParser;
@@ -756,12 +757,21 @@ public final class IndexEntries {
         .flatMapToPair(
             (PairFlatMapFunction<FileFetch, String, Tuple2<Long, Row>>)
                 fetch -> {
-                  List<Tuple2<String, Tuple2<Long, Row>>> rows = Lists.newArrayList();
-                  for (Tuple2<Long, Row> row : fetch.liveRows(plan.value())) {
-                    rows.add(new Tuple2<>(fetch.dataFile, row));
+                  CloseableIterator<Tuple2<Long, Row>> rows = fetch.liveRows(plan.value());
+                  // a task that is cancelled or that fails stops consuming the rows before the read
+                  // reaches its end, and the reader it opened would then be left open. The listener
+                  // runs when the task ends, however it ends, so the read is closed even though the
+                  // caller never saw the end of the rows; a read that does reach its end has
+                  // already
+                  // closed itself.
+                  TaskContext taskContext = TaskContext.get();
+                  if (taskContext != null) {
+                    taskContext.addTaskCompletionListener(
+                        (TaskCompletionListener) context -> closeQuietly(rows));
                   }
 
-                  return rows.iterator();
+                  return CloseableIterator.transform(
+                      rows, row -> new Tuple2<>(fetch.dataFile, row));
                 });
   }
 
@@ -824,11 +834,15 @@ public final class IndexEntries {
     readColumns.addAll(deletes.keyColumns());
     List<String> read = Lists.newArrayList(readColumns);
 
-    Schema projection = table.schema().select(read.toArray(new String[0]));
+    // a reader fills the values of a row in the order of the projection it is given, so the
+    // projection has to be in the order the columns are read in: the table's own order would pair a
+    // value with the name of whichever column the table declares there instead
+    Schema projection = projectionOf(table.schema(), read);
     // the schema the caller made describes its projection; the read also carries the
-    // equality-delete keys, so the row a reader builds has to be described by what was read
+    // equality-delete keys, so the row a reader builds has to be described by what was read, and a
+    // key the caller did not name is described from the projection
     StructType rowSchema =
-        readSchema == null ? toSparkSchema(projection) : schemaFor(read, readSchema);
+        readSchema == null ? toSparkSchema(projection) : schemaFor(read, readSchema, projection);
 
     return new FetchPlan(
         projection,
@@ -861,14 +875,20 @@ public final class IndexEntries {
       this.positions = positions;
     }
 
-    /** The live rows of this file that the lookup asked for, each paired with its position. */
-    private List<Tuple2<Long, Row>> liveRows(FetchPlan plan) {
+    /**
+     * The live rows of this file that the lookup asked for, each paired with its position.
+     *
+     * <p>The rows are pulled as the consumer asks for them: a file is never read past the point the
+     * consumer stopped, and a whole-file read holds the file's reader rather than the file. The
+     * consumer closes the iterator, which closes the read.
+     */
+    private CloseableIterator<Tuple2<Long, Row>> liveRows(FetchPlan plan) {
       // the delete files are read on the driver, and every file of the fetch-back asks the same set
       // for its own rows, so the lookup here is a map read rather than a file read
       long[] deletedPositions = plan.deletes.deletedPositions(dataFile);
       List<EqualityKeySet> keySets = plan.deletes.keySets();
 
-      Iterator<Tuple2<Row, Long>> read;
+      CloseableIterator<Tuple2<Row, Long>> read;
       try {
         read =
             readFileWithFormat(
@@ -883,24 +903,25 @@ public final class IndexEntries {
         throw new UncheckedIOException("Failed to read " + dataFile, e);
       }
 
-      List<Tuple2<Long, Row>> rows = Lists.newArrayList();
-      while (read.hasNext()) {
-        Tuple2<Row, Long> entry = read.next();
-        // a format that ignored the positions read the whole file, so the rows it returned are
-        // numbered but not narrowed: only the ones that were asked for are part of the answer
-        if (!isLive(entry._2(), entry._1(), positions, deletedPositions, keySets)) {
-          continue;
-        }
+      CloseableIterator<Tuple2<Row, Long>> live =
+          new FilterIterator<Tuple2<Row, Long>>(read) {
+            @Override
+            protected boolean shouldKeep(Tuple2<Row, Long> entry) {
+              // a format that ignored the positions read the whole file, so the rows it returned
+              // are
+              // numbered but not narrowed: only the ones that were asked for are part of the answer
+              return isLive(entry._2(), entry._1(), positions, deletedPositions, keySets);
+            }
+          };
 
-        rows.add(
-            new Tuple2<>(
-                entry._2(),
-                new GenericRowWithSchema(
-                    asValues(entry._1(), plan.readColumns, plan.columns),
-                    schemaFor(plan.columns, entry._1().schema()))));
-      }
-
-      return rows;
+      return CloseableIterator.transform(
+          live,
+          entry ->
+              new Tuple2<>(
+                  entry._2(),
+                  new GenericRowWithSchema(
+                      asValues(entry._1(), plan.readColumns, plan.columns),
+                      schemaFor(plan.columns, entry._1().schema()))));
     }
   }
 
@@ -1027,17 +1048,24 @@ public final class IndexEntries {
     List<String> readColumns = Lists.newArrayList(columnsToRead);
 
     StructType readWith = readSchema == null ? null : schemaFor(readColumns, readSchema);
+    // a caller may hand over a collection view, such as a map's key set, which Spark cannot ship to
+    // an executor; copying it here keeps that from surfacing as a task serialization failure
+    Collection<Long> wantedPositions = positions == null ? null : Lists.newArrayList(positions);
     // the projection to the requested columns happens below, by name, so the read itself can take
     // every column the file has
     JavaPairRDD<Row, Long> data =
         positionedRows(
-            spark, tableSchema, task, readColumns, positions, readWith, conf, storageProperties);
+            spark,
+            tableSchema,
+            task,
+            readColumns,
+            wantedPositions,
+            readWith,
+            conf,
+            storageProperties);
 
     List<String> capturedReadColumns = readColumns;
     List<String> capturedColumns = columns;
-    // a caller may hand over a collection view, such as a map's key set, which Spark cannot ship to
-    // an executor; copying it here keeps that from surfacing as a task serialization failure
-    Collection<Long> wantedPositions = positions == null ? null : Lists.newArrayList(positions);
     return data.filter(
             (Function<Tuple2<Row, Long>, Boolean>)
                 tuple -> isLive(tuple, wantedPositions, deletedPositions, keySets))
@@ -1127,15 +1155,26 @@ public final class IndexEntries {
         .parallelize(Collections.singletonList(dataFile), 1)
         .flatMapToPair(
             (PairFlatMapFunction<String, Row, Long>)
-                file ->
-                    readFileWithFormat(
-                        file,
-                        format,
-                        projection,
-                        sparkSchema,
-                        positions,
-                        readConf,
-                        storageProperties));
+                file -> {
+                  CloseableIterator<Tuple2<Row, Long>> rows =
+                      readFileWithFormat(
+                          file,
+                          format,
+                          projection,
+                          sparkSchema,
+                          positions,
+                          readConf,
+                          storageProperties);
+                  // a task that is cancelled or that fails stops consuming the rows before the read
+                  // reaches its end, and the reader it opened would then be left open
+                  TaskContext taskContext = TaskContext.get();
+                  if (taskContext != null) {
+                    taskContext.addTaskCompletionListener(
+                        (TaskCompletionListener) context -> closeQuietly(rows));
+                  }
+
+                  return rows;
+                });
   }
 
   /**
@@ -1370,7 +1409,7 @@ public final class IndexEntries {
         expected != null && expected.size() == readSchema.columns().size()
             ? expected
             : toSparkSchema(readSchema);
-    java.util.Iterator<Tuple2<Row, Long>> read;
+    CloseableIterator<Tuple2<Row, Long>> read;
     try {
       read =
           readFileWithFormat(
@@ -1386,19 +1425,23 @@ public final class IndexEntries {
     }
 
     List<Tuple2<Row, Long>> rows = Lists.newArrayListWithCapacity(wanted.size());
-    while (read.hasNext()) {
-      Tuple2<Row, Long> entry = read.next();
-      // a format that ignored the positions read the whole file, so the rows it returned are
-      // numbered but not narrowed: only the ones that were asked for are part of the answer
-      if (java.util.Collections.binarySearch(wanted, entry._2()) < 0) {
-        continue;
-      }
+    try {
+      while (read.hasNext()) {
+        Tuple2<Row, Long> entry = read.next();
+        // a format that ignored the positions read the whole file, so the rows it returned are
+        // numbered but not narrowed: only the ones that were asked for are part of the answer
+        if (java.util.Collections.binarySearch(wanted, entry._2()) < 0) {
+          continue;
+        }
 
-      if (!survivesEqualityDeletes(entry._1(), keySets)) {
-        continue;
-      }
+        if (!survivesEqualityDeletes(entry._1(), keySets)) {
+          continue;
+        }
 
-      rows.add(new Tuple2<>(projectTo(entry._1(), readColumns, projection), entry._2()));
+        rows.add(new Tuple2<>(projectTo(entry._1(), readColumns, projection), entry._2()));
+      }
+    } finally {
+      closeQuietly(read);
     }
 
     return rows;
@@ -1449,7 +1492,7 @@ public final class IndexEntries {
 
     Schema readSchema = tableSchema.select(readColumns.toArray(new String[0]));
     Schema filterSchema = tableSchema.select(filterColumns.toArray(new String[0]));
-    java.util.Iterator<Tuple2<Row, Long>> read;
+    CloseableIterator<Tuple2<Row, Long>> read;
     try {
       // no positions: every row of the file is read in file order, which is what makes the filter
       // see the rows it has to judge rather than the rows a search happened to find
@@ -1466,25 +1509,29 @@ public final class IndexEntries {
 
     long[] admitted = new long[64];
     int count = 0;
-    while (read.hasNext()) {
-      Tuple2<Row, Long> entry = read.next();
-      if (java.util.Arrays.binarySearch(deleted, entry._2()) >= 0) {
-        continue;
-      }
+    try {
+      while (read.hasNext()) {
+        Tuple2<Row, Long> entry = read.next();
+        if (java.util.Arrays.binarySearch(deleted, entry._2()) >= 0) {
+          continue;
+        }
 
-      if (!survivesEqualityDeletes(entry._1(), keySets)) {
-        continue;
-      }
+        if (!survivesEqualityDeletes(entry._1(), keySets)) {
+          continue;
+        }
 
-      if (!filter.matches(projectTo(entry._1(), readColumns, filterSchema))) {
-        continue;
-      }
+        if (!filter.matches(projectTo(entry._1(), readColumns, filterSchema))) {
+          continue;
+        }
 
-      if (count == admitted.length) {
-        admitted = java.util.Arrays.copyOf(admitted, admitted.length * 2);
-      }
+        if (count == admitted.length) {
+          admitted = java.util.Arrays.copyOf(admitted, admitted.length * 2);
+        }
 
-      admitted[count++] = entry._2();
+        admitted[count++] = entry._2();
+      }
+    } finally {
+      closeQuietly(read);
     }
 
     return java.util.Arrays.copyOf(admitted, count);
@@ -1572,9 +1619,9 @@ public final class IndexEntries {
   /**
    * Reads every row of one data file in file order, one at a time.
    *
-   * <p>Unlike {@link #readFileWithFormat} this does not collect the file before returning: a group
-   * whose files are read at once would otherwise hold every file it is reading as rows, which is
-   * both more memory and more work than holding the chunk of each that is being consumed.
+   * <p>The rows are pulled as the caller asks for them, so a read holds the chunk of the file it is
+   * consuming rather than the file itself. This is the read every other one here pulls from: a
+   * whole-file scan, a group read and a fetch-back all stream their files through it.
    */
   private static CloseableIterator<Tuple2<Long, Row>> openRowsWithFormat(
       InputFile inputFile,
@@ -1583,24 +1630,44 @@ public final class IndexEntries {
       StructType sparkSchema,
       Map<String, String> storageProperties)
       throws IOException {
+    return new RowsWithPosition(
+        readBuilder(format, inputFile, storageProperties).project(projection).build(),
+        projection,
+        sparkSchema);
+  }
+
+  /**
+   * The builder every read of a data file goes through.
+   *
+   * <p>The storage settings and the name mapping a table carries belong to the table rather than to
+   * a file, and a format that opens the file itself does not read through the table's FileIO: both
+   * have to be handed to the format here rather than being repeated by each read.
+   */
+  private static ReadBuilder<Record, Void> readBuilder(
+      FileFormat format, InputFile inputFile, Map<String, String> storageProperties) {
     ReadBuilder<Record, Void> builder =
         FormatModelRegistry.readBuilder(format, Record.class, inputFile);
-    // a format that opens the file itself does not read through the FileIO, so the storage settings
-    // this table is read with have to be handed to it
     builder.setAll(storageProperties);
-    return new RowsWithPosition(builder.project(projection).build(), projection, sparkSchema);
+    // a file a table imported rather than wrote itself carries no field ids, so its columns are
+    // found through the name mapping the table keeps: reading one without it answers null for every
+    // column, or fails on a column it cannot find
+    String mapping = storageProperties.get(TableProperties.DEFAULT_NAME_MAPPING);
+    if (mapping != null) {
+      builder.withNameMapping(NameMappingParser.fromJson(mapping));
+    }
+
+    return builder;
   }
 
   /** The rows of one data file, each numbered by its position in the file. */
-  private static final class RowsWithPosition implements CloseableIterator<Tuple2<Long, Row>> {
+  static final class RowsWithPosition implements CloseableIterator<Tuple2<Long, Row>> {
     private final CloseableIterable<Record> records;
     private final CloseableIterator<Record> rows;
     private final Schema projection;
     private final StructType sparkSchema;
     private long position = 0;
 
-    private RowsWithPosition(
-        CloseableIterable<Record> records, Schema projection, StructType sparkSchema) {
+    RowsWithPosition(CloseableIterable<Record> records, Schema projection, StructType sparkSchema) {
       this.records = records;
       this.rows = records.iterator();
       this.projection = projection;
@@ -1635,8 +1702,20 @@ public final class IndexEntries {
     return new GenericRowWithSchema(values, sparkSchema);
   }
 
-  /** Reads every row of one data file with the format model for its format, in file order. */
-  private static Iterator<Tuple2<Row, Long>> readFileWithFormat(
+  /**
+   * Reads one data file, one row at a time, as (row, position) pairs in file order.
+   *
+   * <p>A lookup knows the rows it wants: the format is asked for those positions, which is what
+   * lets a page-oriented format read a handful of pages instead of the whole file. Only a format
+   * that returns exactly the rows asked for is trusted with that; a file that does not hold one of
+   * them is read whole instead, so the caller's position filter still sees the rows numbered by
+   * where they sit.
+   *
+   * <p>Neither case collects the file: the caller pulls one row at a time. A positional read holds
+   * the rows it asked for, which is the answer for that file, while a whole-file read holds only
+   * what the format needs to produce the next row.
+   */
+  private static CloseableIterator<Tuple2<Row, Long>> readFileWithFormat(
       String location,
       FileFormat format,
       Schema projection,
@@ -1648,40 +1727,37 @@ public final class IndexEntries {
     long tStart = System.nanoTime();
     InputFile input = HadoopInputFile.fromLocation(location, taskConf(conf));
     long tInput = System.nanoTime();
-    ReadBuilder<Record, Void> builder =
-        FormatModelRegistry.readBuilder(format, Record.class, input);
-    // a format that opens the file itself does not read through the Hadoop file system, so the
-    // storage settings this table is read with have to be handed to it
-    builder.setAll(storageProperties);
+
+    if (positions == null || positions.isEmpty()) {
+      // every row of the file is wanted, and the caller's position filter has nothing to narrow
+      return rowsFirst(
+          openRowsWithFormat(input, format, projection, sparkSchema, storageProperties));
+    }
+
+    ReadBuilder<Record, Void> builder = readBuilder(format, input, storageProperties);
     long tBuilder = System.nanoTime();
     boolean timings = Boolean.getBoolean("iceberg.index.fetch-back.timings");
 
-    // a lookup knows the rows it wants: ask the format to read only those, which is what lets a
-    // page-oriented format read a handful of pages instead of the whole file. Only a format that
-    // says it returns exactly those rows is asked: one that reads the file numbers its rows by
-    // where they sit, which is what the caller's position filter expects
-    List<Long> wanted = null;
-    boolean positional = false;
-    if (positions != null && !positions.isEmpty()) {
-      wanted = Lists.newArrayList(positions);
-      java.util.Collections.sort(wanted);
-      positional = builder.supportsPositions();
-      if (positional) {
-        builder.positions(wanted);
-      }
+    // a format that reads whole files numbers the rows by where they sit, which is what the
+    // caller's position filter expects
+    if (!builder.supportsPositions()) {
+      return rowsFirst(
+          openRowsWithFormat(input, format, projection, sparkSchema, storageProperties));
     }
 
-    List<Tuple2<Row, Long>> rows = Lists.newArrayList();
-    long nextPosition = 0;
+    List<Long> wanted = Lists.newArrayList(positions);
+    Collections.sort(wanted);
+
+    // the rows asked for are held until the read ends: a reader that ignored the positions returns
+    // the file, and only its end tells that apart from the answer. The list then holds the answer
+    // for this file, not the file
+    List<Tuple2<Row, Long>> rows = Lists.newArrayListWithCapacity(wanted.size());
     long tOpen;
-    try (CloseableIterable<Record> records = builder.project(projection).build()) {
+    try (CloseableIterable<Record> records =
+        builder.project(projection).positions(wanted).build()) {
       tOpen = System.nanoTime();
       for (Record record : records) {
-        // the row is numbered as it streams past, which is its position in the file. A format that
-        // honoured the positions returned exactly the rows asked for, and those are relabelled
-        // below; until the read ends there is no way to tell the two cases apart
-        rows.add(new Tuple2<>(rowOf(record, projection, sparkSchema), nextPosition));
-        nextPosition++;
+        rows.add(new Tuple2<>(rowOf(record, projection, sparkSchema), (long) rows.size()));
       }
     }
 
@@ -1702,24 +1778,27 @@ public final class IndexEntries {
               + rows.size());
     }
 
-    if (positional) {
-      if (rows.size() != wanted.size()) {
-        // a reader that honours the positions returns exactly the rows asked for. A file that does
-        // not hold one of them cannot be read this way, so it is read whole and the rows are
-        // numbered by where they sit, which is what the caller's position filter expects
-        return readFileWithFormat(
-            location, format, projection, sparkSchema, null, conf, storageProperties);
-      }
-
-      // the numbering the rows streamed with is the order asked for rather than the row's position
-      for (int i = 0; i < rows.size(); i++) {
-        rows.set(i, new Tuple2<>(rows.get(i)._1(), wanted.get(i)));
-      }
+    if (rows.size() != wanted.size()) {
+      // a reader that honours the positions returns exactly the rows asked for. A file that does
+      // not
+      // hold one of them cannot be read this way, so it is read whole and the rows are numbered by
+      // where they sit, which is what the caller's position filter expects
+      return rowsFirst(
+          openRowsWithFormat(input, format, projection, sparkSchema, storageProperties));
     }
 
-    // a format that does not honour the positions read the file, which is allowed: the rows are
-    // numbered in file order, and the caller's position filter picks the ones it asked for
-    return rows.iterator();
+    // the numbering the rows streamed with is the order asked for rather than the row's position
+    for (int i = 0; i < rows.size(); i++) {
+      rows.set(i, new Tuple2<>(rows.get(i)._1(), wanted.get(i)));
+    }
+
+    return CloseableIterator.withClose(rows.iterator());
+  }
+
+  /** The same read, with the row and its position in the other order. */
+  private static CloseableIterator<Tuple2<Row, Long>> rowsFirst(
+      CloseableIterator<Tuple2<Long, Row>> rows) {
+    return CloseableIterator.transform(rows, entry -> new Tuple2<>(entry._2(), entry._1()));
   }
 
   /** The Spark schema of an Iceberg projection, for the rows the format model returns. */
@@ -1910,13 +1989,40 @@ public final class IndexEntries {
 
   /** The schema of the given columns, taken from the schema they are read with. */
   private static StructType schemaFor(List<String> columns, StructType readSchema) {
+    return schemaFor(columns, readSchema, null);
+  }
+
+  /**
+   * The schema of the given columns, taken from the schema the caller made for them and, for a
+   * column the caller did not name, from the projection the file is read with: a read carries the
+   * equality-delete keys as well, and the caller has no schema field for those.
+   */
+  private static StructType schemaFor(
+      List<String> columns, StructType readSchema, Schema projection) {
     StructField[] fields = new StructField[columns.size()];
     for (int i = 0; i < fields.length; i++) {
-      StructField field = readSchema.apply(columns.get(i));
+      StructField field = fieldFor(columns.get(i), readSchema, projection);
       fields[i] =
           new StructField(field.name(), field.dataType(), field.nullable(), field.metadata());
     }
     return new StructType(fields);
+  }
+
+  /**
+   * One column of a read: described by the caller's schema when it names the column, and by the
+   * read's own projection when the read carries it for its own reasons.
+   */
+  private static StructField fieldFor(String column, StructType readSchema, Schema projection) {
+    if (projection == null || !readSchema.getFieldIndex(column).isEmpty()) {
+      // no projection to fall back on: a column the caller's schema does not have is the failure
+      // it has always been
+      return readSchema.apply(column);
+    }
+
+    Types.NestedField field = projection.findField(column);
+    Preconditions.checkArgument(field != null, "Column is not in the read projection: %s", column);
+    return new StructField(
+        field.name(), toSparkType(field.type()), field.isOptional(), Metadata.empty());
   }
 
   /**

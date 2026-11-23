@@ -20,16 +20,28 @@ package org.apache.iceberg.spark.extensions;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
+import java.io.IOException;
 import java.nio.file.Path;
 import java.util.Collection;
 import java.util.List;
 import java.util.Map;
+import org.apache.iceberg.DeleteFile;
+import org.apache.iceberg.FileFormat;
 import org.apache.iceberg.FileScanTask;
+import org.apache.iceberg.PartitionSpec;
+import org.apache.iceberg.Schema;
 import org.apache.iceberg.Table;
+import org.apache.iceberg.data.GenericRecord;
+import org.apache.iceberg.data.Record;
+import org.apache.iceberg.deletes.EqualityDeleteWriter;
+import org.apache.iceberg.encryption.EncryptedFiles;
+import org.apache.iceberg.encryption.EncryptedOutputFile;
+import org.apache.iceberg.formats.FormatModelRegistry;
 import org.apache.iceberg.index.spark.IndexEntries;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableList;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableMap;
 import org.apache.iceberg.spark.Spark3Util;
+import org.apache.iceberg.types.Types;
 import org.apache.spark.sql.Dataset;
 import org.apache.spark.sql.Row;
 import org.apache.spark.sql.SparkSession;
@@ -141,5 +153,121 @@ class TestFetchBackPositions {
     }
 
     return vector;
+  }
+
+  /**
+   * A lookup that names its columns in another order gets them under those names.
+   *
+   * <p>The two columns hold values a swap cannot be caught by: they have the same type, and the
+   * numbers are different, so a row that answers one column with the other's value reads back as a
+   * plain wrong number rather than as a type error.
+   */
+  @Test
+  void aLookupThatNamesItsColumnsInAnotherOrderGetsThemUnderThoseNames() throws Exception {
+    String tableName = "local.db.fetch_back_column_order";
+    spark.sql("CREATE NAMESPACE IF NOT EXISTS local.db");
+    spark.sql(
+        String.format(
+            "CREATE TABLE %s (a bigint, b bigint, body string) USING iceberg", tableName));
+
+    spark
+        .range(0, 100)
+        .coalesce(1)
+        .selectExpr("id as a", "id * 10 as b", "concat('row-', id) as body")
+        .writeTo(tableName)
+        .append();
+
+    Table table = Spark3Util.loadIcebergTable(spark, tableName);
+    List<FileScanTask> tasks = IndexEntries.scanTasks(table, table.currentSnapshot().snapshotId());
+    String dataFile = tasks.get(0).file().location();
+    List<Long> asked = ImmutableList.of(3L, 7L, 41L);
+
+    // the order the caller asks for, which is not the order the table declares
+    List<String> columns = ImmutableList.of("b", "a", "body");
+    Map<String, Map<Long, Row>> read =
+        IndexEntries.rowsAt(
+            spark,
+            table,
+            table.currentSnapshot().snapshotId(),
+            ImmutableMap.of(dataFile, asked),
+            columns,
+            IndexEntries.sparkSchema(table, columns));
+
+    for (long position : asked) {
+      Row row = read.get(dataFile).get(position);
+      assertThat(row).as("the row at position %d", position).isNotNull();
+      assertThat(row.<Long>getAs("b")).as("b of position %d", position).isEqualTo(position * 10);
+      assertThat(row.<Long>getAs("a")).as("a of position %d", position).isEqualTo(position);
+      assertThat(row.<String>getAs("body"))
+          .as("body of position %d", position)
+          .isEqualTo("row-" + position);
+    }
+  }
+
+  /**
+   * A lookup whose columns omit the equality-delete key still drops the rows that key removes.
+   *
+   * <p>The read has to carry the key to judge a row, so the row it builds has more columns than the
+   * caller asked for; the caller's projection is applied by name afterwards. A key the caller did
+   * not name is still a column of the read, and the row's schema has to describe it.
+   */
+  @Test
+  void aLookupWithoutTheEqualityDeleteKeyDropsTheRowsThatKeyRemoves() throws Exception {
+    String tableName = "local.db.fetch_back_delete_key";
+    spark.sql("CREATE NAMESPACE IF NOT EXISTS local.db");
+    spark.sql(String.format("CREATE TABLE %s (id bigint, body string) USING iceberg", tableName));
+
+    spark
+        .range(0, 20)
+        .coalesce(1)
+        .selectExpr("id", "concat('row-', id) as body")
+        .writeTo(tableName)
+        .append();
+
+    Table table = Spark3Util.loadIcebergTable(spark, tableName);
+    // row 5 is removed by a key the lookup below does not ask for
+    table.newRowDelta().addDeletes(writeEqualityDelete(table, 5L)).commit();
+    table.refresh();
+
+    List<FileScanTask> tasks = IndexEntries.scanTasks(table, table.currentSnapshot().snapshotId());
+    String dataFile = tasks.get(0).file().location();
+    List<Long> asked = ImmutableList.of(4L, 5L, 6L);
+    List<String> columns = ImmutableList.of("body");
+
+    Map<String, Map<Long, Row>> read =
+        IndexEntries.rowsAt(
+            spark,
+            table,
+            table.currentSnapshot().snapshotId(),
+            ImmutableMap.of(dataFile, asked),
+            columns,
+            IndexEntries.sparkSchema(table, columns));
+
+    assertThat(read.get(dataFile))
+        .as("the live rows among the ones the lookup asked for")
+        .containsOnlyKeys(4L, 6L);
+    assertThat(read.get(dataFile).get(4L).<String>getAs("body")).isEqualTo("row-4");
+    assertThat(read.get(dataFile).get(6L).<String>getAs("body")).isEqualTo("row-6");
+  }
+
+  /** An equality delete file for one row, written the way another engine writes it. */
+  private static DeleteFile writeEqualityDelete(Table table, long id) throws IOException {
+    Schema keySchema = new Schema(Types.NestedField.required(1, "id", Types.LongType.get()));
+    EncryptedOutputFile out =
+        EncryptedFiles.plainAsEncryptedOutput(
+            table
+                .io()
+                .newOutputFile(table.location() + "/data/equality-delete-" + id + ".parquet"));
+    EqualityDeleteWriter<Record> writer =
+        FormatModelRegistry.equalityDeleteWriteBuilder(FileFormat.PARQUET, Record.class, out)
+            .schema(keySchema)
+            .spec(PartitionSpec.unpartitioned())
+            .equalityFieldIds(keySchema.columns().get(0).fieldId())
+            .build();
+    try (writer) {
+      writer.write(GenericRecord.create(keySchema).copy("id", id));
+    }
+
+    return writer.toDeleteFile();
   }
 }
