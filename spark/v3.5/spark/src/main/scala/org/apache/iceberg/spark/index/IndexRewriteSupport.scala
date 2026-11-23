@@ -215,20 +215,5 @@ object IndexRewriteSupport {
       tableSchema)
   }
 
-  /** Turns rows into the internal rows a local relation holds, in the order they are given. */
-  def internalRows(spark: SparkSession, rows: Seq[Row]): Seq[InternalRow] = {
-    if (rows.isEmpty) {
-      Nil
-    } else {
-      spark
-        .createDataFrame(rows.asJava, rows.head.schema)
-        .queryExecution
-        .toRdd
-        .map(row => row.copy())
-        .collect()
-        .toSeq
-    }
-  }
-
   private val EmptyRow: InternalRow = new GenericInternalRow(new Array[Any](0))
 }

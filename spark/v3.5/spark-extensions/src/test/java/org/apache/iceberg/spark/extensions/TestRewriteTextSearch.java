@@ -24,7 +24,10 @@ import static org.assertj.core.api.Assertions.within;
 
 import java.nio.file.Path;
 import java.util.List;
+import java.util.concurrent.atomic.AtomicLong;
 import org.apache.iceberg.index.text.TextIndexTypes;
+import org.apache.spark.scheduler.SparkListener;
+import org.apache.spark.scheduler.SparkListenerJobStart;
 import org.apache.spark.sql.Row;
 import org.apache.spark.sql.SparkSession;
 import org.junit.jupiter.api.AfterAll;
@@ -81,7 +84,9 @@ class TestRewriteTextSearch {
   public void rewritesARankedTextSearchIntoAnIndexLookup() {
     String table = tableWithIndex("docs_ranked");
 
-    assertThat(planOf(table, ranking(table))).contains("LocalRelation");
+    // the ranking form is lowered to the source the table-valued function runs on, so the search
+    // happens when the operator executes rather than while the query is planned
+    assertThat(planOf(table, ranking(table))).contains("TextSearchSource");
 
     // the rows and their order are the ones the table-valued function returns, which searches the
     // same index through another path
@@ -89,10 +94,58 @@ class TestRewriteTextSearch {
   }
 
   @Test
+  void plansARankedSearchWithoutSearching() {
+    String table = tableWithIndex("docs_planned_only");
+
+    // the search runs when the operator does. Reading and scoring the index files while the query
+    // is planned is what made this form an order of magnitude slower than the table function that
+    // asks the same index the same question
+    assertThat(jobsDuring(() -> planOf(table, ranking(table))))
+        .as("jobs started while planning a ranked text search")
+        .isZero();
+  }
+
+  @Test
+  void ranksAcrossEveryIndexFileOfATable() {
+    // a data file per insert, so the index has one file each and an answer is the merge of all of
+    // them: a search that read a single index file would answer with the rows of that file alone
+    String table = "db.docs_many_index_files";
+    spark.sql(String.format("CREATE TABLE local.%s %s", table, COLUMNS));
+    for (String document :
+        new String[] {
+          "(1, 'the quick brown fox jumps over the lazy dog')",
+          "(2, 'the fox runs through the forest')",
+          "(3, 'a dog sleeps in the sun')",
+          "(4, 'the forest is quiet and the fox is quick')",
+          "(5, 'the dog and the fox rest')",
+          "(6, 'a quiet sun over the forest')"
+        }) {
+      spark.sql(String.format("INSERT INTO local.%s VALUES %s", table, document));
+    }
+    // one entry per index file, so every data file gets a file of its own
+    spark.sql(
+        String.format(
+            "CALL local.system.build_text_index(table => '%s', column => 'body', "
+                + "max_entries_per_index_file => 1)",
+            table));
+
+    assertThat(indexFiles(table)).as("index files of the table").isGreaterThan(1);
+    assertThat(planOf(table, ranking(table, 3))).contains("TextSearchSource");
+
+    List<Row> ranked = spark.sql(ranking(table, 3)).collectAsList();
+    assertThat(ranked).as("rows of a top-3 over several index files").hasSize(3);
+    assertThat(idsOf(ranked)).isEqualTo(idsOf(functionRows(table, 3)));
+  }
+
+  @Test
   public void rewritesAFilteredTextSearchIntoAnIndexLookup() {
     String table = tableWithIndex("docs_matched");
 
-    assertThat(planOf(table, filtering(table))).contains("LocalRelation");
+    // the filter form asks for every match rather than the best k, so it is still answered while
+    // planning and materialised in place of the scan
+    assertThat(planOf(table, filtering(table)))
+        .contains("LocalRelation")
+        .doesNotContain("TextSearchSource");
 
     // every row the function returns as a match is in the result, and nothing else
     assertThat(filteringRows(table)).containsExactlyInAnyOrderElementsOf(functionRows(table, 100));
@@ -133,7 +186,7 @@ class TestRewriteTextSearch {
   @Test
   public void saysSoWhenThereIsNoIndex() {
     String table = table("docs_no_text_index");
-    assertThat(planOf(table, ranking(table))).doesNotContain("LocalRelation");
+    assertThat(planOf(table, ranking(table))).doesNotContain("TextSearchSource");
 
     // a score needs the statistics of an index, so the query says so instead of returning rows in
     // an arbitrary order
@@ -164,14 +217,14 @@ class TestRewriteTextSearch {
     // a row added after the index was built leaves the corpus statistics behind
     spark.sql(String.format("INSERT INTO local.%s VALUES (5, 'the fox and the dog rest')", table));
 
-    assertThat(planOf(table, ranking(table))).doesNotContain("LocalRelation");
+    assertThat(planOf(table, ranking(table))).doesNotContain("TextSearchSource");
   }
 
   @Test
   public void leavesThePlanAloneWhenTheQueryIsNotARankedTextSearch() {
     String table = tableWithIndex("docs_text_not_ranked");
     assertThat(planOf(table, String.format("SELECT id FROM local.%s WHERE id > 1", table)))
-        .doesNotContain("LocalRelation");
+        .doesNotContain("TextSearchSource");
   }
 
   @Test
@@ -186,7 +239,7 @@ class TestRewriteTextSearch {
                         + "ORDER BY text_score(body, 'the fox') DESC LIMIT 2",
                     table))
             .collectAsList();
-    assertThat(planOf(table, scoredRanking(table))).contains("LocalRelation");
+    assertThat(planOf(table, scoredRanking(table))).contains("TextSearchSource");
     assertThat(rows).hasSize(2);
 
     // the function searches the same index, so it answers with the same documents and the same
@@ -392,8 +445,40 @@ class TestRewriteTextSearch {
   }
 
   private static String ranking(String table) {
+    return ranking(table, 2);
+  }
+
+  private static String ranking(String table, int k) {
     return String.format(
-        "SELECT id FROM local.%s ORDER BY text_score(body, 'the fox') DESC LIMIT 2", table);
+        "SELECT id FROM local.%s ORDER BY text_score(body, 'the fox') DESC LIMIT %d", table, k);
+  }
+
+  /** How many index files the text index of a table has. */
+  private static long indexFiles(String table) {
+    return spark
+        .sql(String.format("CALL local.system.list_indexes(table => '%s')", table))
+        .head()
+        .getLong(5);
+  }
+
+  /** How many jobs running the given action started. */
+  private static long jobsDuring(Runnable action) {
+    AtomicLong jobs = new AtomicLong();
+    SparkListener listener =
+        new SparkListener() {
+          @Override
+          public void onJobStart(SparkListenerJobStart jobStart) {
+            jobs.incrementAndGet();
+          }
+        };
+    spark.sparkContext().addSparkListener(listener);
+    try {
+      action.run();
+    } finally {
+      spark.sparkContext().removeSparkListener(listener);
+    }
+
+    return jobs.get();
   }
 
   private static String scoredRanking(String table) {
