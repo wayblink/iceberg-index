@@ -74,15 +74,13 @@ public final class VectorIndexes {
   /**
    * Finds the index of a type for a table by the indexed column, failing if none exists.
    *
+   * <p>A column with several indexes of the type has no default: the caller has to name one, which
+   * is what {@link IndexSelection#resolve} reports instead of picking the first.
+   *
    * @param indexType the index type to look for, for example {@code vector} or {@code text}
    */
   public static IndexMetadata findIndex(Table table, String column, String indexType) {
-    IndexMetadata metadata = findIndexOrNull(table, column, indexType);
-    if (metadata == null) {
-      throw new IllegalArgumentException(
-          "No " + indexType + " index exists for column " + column + " of table " + table.name());
-    }
-    return metadata;
+    return IndexSelection.resolve(table, column, indexType, null);
   }
 
   /**
@@ -90,42 +88,12 @@ public final class VectorIndexes {
    *
    * <p>A name is what a caller writes in SQL and a UUID is what the metadata uses, so both select
    * the same index; when neither matches, the message lists what the column does have, which is the
-   * difference between "you typed it wrong" and "there is nothing to search".
+   * difference between "you typed it wrong" and "there is nothing to search". A selector that
+   * matches two indexes is refused rather than attributed to one of them.
    */
   public static IndexMetadata findIndex(
       Table table, String column, String indexType, String nameOrUuid) {
-    if (nameOrUuid == null) {
-      return findIndex(table, column, indexType);
-    }
-
-    int fieldId = fieldId(table, column);
-    Lists.newArrayList();
-    java.util.List<String> available = new java.util.ArrayList<>();
-    for (IndexMetadata metadata : indexesOf(table)) {
-      boolean sameColumn =
-          indexType.equals(metadata.indexType()) && metadata.definition().fieldId() == fieldId;
-      if (!sameColumn) {
-        continue;
-      }
-
-      if (nameOrUuid.equals(metadata.name()) || nameOrUuid.equals(metadata.indexUuid())) {
-        return metadata;
-      }
-
-      available.add(metadata.name() != null ? metadata.name() : metadata.indexUuid());
-    }
-
-    throw new IllegalArgumentException(
-        "No "
-            + indexType
-            + " index named "
-            + nameOrUuid
-            + " exists for column "
-            + column
-            + " of table "
-            + table.name()
-            + "; the column has "
-            + available);
+    return IndexSelection.resolve(table, column, indexType, nameOrUuid);
   }
 
   /** The indexes of a type over one column, which is what a caller has to choose between. */

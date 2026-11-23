@@ -22,6 +22,9 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatCode;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
+import java.io.IOException;
+import java.net.URI;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import org.apache.iceberg.PartitionSpec;
 import org.apache.iceberg.Schema;
@@ -29,6 +32,7 @@ import org.apache.iceberg.SortOrder;
 import org.apache.iceberg.TestTables;
 import org.apache.iceberg.index.CreateIndexRequest;
 import org.apache.iceberg.index.IndexMetadata;
+import org.apache.iceberg.index.IndexMetadataParser;
 import org.apache.iceberg.index.SidecarIndexCatalog;
 import org.apache.iceberg.index.vector.VectorIndexDefinition;
 import org.apache.iceberg.index.vector.VectorIndexTypes;
@@ -136,6 +140,105 @@ class TestIndexSelection {
         .isEqualTo("index-a");
     assertThat(IndexSelection.resolve(table, COLUMN, "vector", "index-b").indexUuid())
         .isEqualTo("index-b");
+  }
+
+  @Test
+  void resolvesTheOnlyIndexNamedByUuidOrWithoutASelector() {
+    register("index-a", "alpha");
+
+    // a column with one index needs no selector, and the name and the UUID are the same token
+    assertThat(VectorIndexes.findIndex(table, COLUMN, "vector").indexUuid()).isEqualTo("index-a");
+    assertThat(VectorIndexes.findIndex(table, COLUMN, "vector", null).indexUuid())
+        .isEqualTo("index-a");
+    assertThat(VectorIndexes.findIndex(table, COLUMN, "vector", "alpha").indexUuid())
+        .isEqualTo("index-a");
+    assertThat(VectorIndexes.findIndex(table, COLUMN, "vector", "index-a").indexUuid())
+        .isEqualTo("index-a");
+  }
+
+  @Test
+  void refusesToPickOneWhenTheColumnHasSeveralIndexes() {
+    register("index-a", "alpha");
+    register("index-b", "beta");
+
+    // no selector means "the index of this column", which two indexes no longer are: picking one
+    // would search a different index than the statement says
+    assertThatThrownBy(() -> VectorIndexes.findIndex(table, COLUMN, "vector"))
+        .isInstanceOf(IllegalArgumentException.class)
+        .hasMessageContaining("has 2 vector indexes")
+        .hasMessageContaining("pass index =>");
+
+    assertThatThrownBy(() -> VectorIndexes.findIndex(table, COLUMN, "vector", null))
+        .isInstanceOf(IllegalArgumentException.class)
+        .hasMessageContaining("has 2 vector indexes");
+  }
+
+  @Test
+  void refusesAVectorIndexSelectorThatMatchesTwoIndexes() {
+    register("index-a", "alpha");
+    // a table written before names were checked against UUIDs: index-b is named after index-a's
+    // UUID, so the selector means both and the search must not attribute it to whichever came first
+    register("index-b", "index-a");
+
+    assertThatThrownBy(() -> VectorIndexes.findIndex(table, COLUMN, "vector", "index-a"))
+        .isInstanceOf(IllegalArgumentException.class)
+        .hasMessageContaining("ambiguous")
+        .hasMessageContaining("index-a")
+        .hasMessageContaining("index-b");
+  }
+
+  @Test
+  void refusesANameTwoOldIndexesShare() throws IOException {
+    // a legacy registry named indexes by uuid only, so it could hold two indexes over one column
+    // with one name: the catalog refuses that now, so the old state is written as it was stored
+    writeLegacyIndex("index-a", "alpha");
+    writeLegacyIndex("index-b", "alpha");
+    writeLegacyRegistry("index-a", "index-b");
+
+    assertThatThrownBy(() -> VectorIndexes.findIndex(table, COLUMN, "vector", "alpha"))
+        .isInstanceOf(IllegalArgumentException.class)
+        .hasMessageContaining("ambiguous")
+        .hasMessageContaining("index-a")
+        .hasMessageContaining("index-b");
+  }
+
+  /** Writes one index the way a registry predating the name checks stored it. */
+  private void writeLegacyIndex(String indexUuid, String name) throws IOException {
+    Path indexDir = tableRoot().resolve(SidecarIndexCatalog.INDEXES_DIR).resolve(indexUuid);
+    IndexMetadata metadata =
+        IndexMetadata.builder()
+            .indexUuid(indexUuid)
+            .name(name)
+            .tableUuid(table.uuid().toString())
+            .tableLocation(table.location())
+            .location(indexDir.toString())
+            .definition(DEFINITION)
+            .build();
+    Path metadataPath =
+        indexDir
+            .resolve(SidecarIndexCatalog.METADATA_DIR)
+            .resolve("index-metadata-v" + IndexMetadata.FORMAT_VERSION + ".json");
+    Files.createDirectories(metadataPath.getParent());
+    Files.writeString(metadataPath, IndexMetadataParser.toJson(metadata));
+  }
+
+  /** Writes the uuid-only registry such indexes were listed from. */
+  private void writeLegacyRegistry(String... indexUuids) throws IOException {
+    StringBuilder uuids = new StringBuilder();
+    for (String indexUuid : indexUuids) {
+      if (uuids.length() > 0) {
+        uuids.append(',');
+      }
+      uuids.append('"').append(indexUuid).append('"');
+    }
+    Path registry =
+        tableRoot().resolve(SidecarIndexCatalog.INDEXES_DIR).resolve("index-registry.json");
+    Files.createDirectories(registry.getParent());
+    Files.writeString(registry, "{\"format-version\":1,\"index-uuids\":[" + uuids + "]}");
+  }
+
+  private Path tableRoot() {
+    return Path.of(URI.create(table.location()));
   }
 
   private IndexMetadata register(String indexUuid, String name) {
