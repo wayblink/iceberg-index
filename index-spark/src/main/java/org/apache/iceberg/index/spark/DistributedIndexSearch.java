@@ -69,12 +69,12 @@ import org.apache.iceberg.relocated.com.google.common.collect.ImmutableList;
 import org.apache.iceberg.relocated.com.google.common.collect.Lists;
 import org.apache.iceberg.relocated.com.google.common.collect.Maps;
 import org.apache.iceberg.types.Types.NestedField;
+import org.apache.spark.SparkContext;
 import org.apache.spark.api.java.JavaPairRDD;
 import org.apache.spark.api.java.JavaRDD;
 import org.apache.spark.api.java.JavaSparkContext;
 import org.apache.spark.api.java.function.FlatMapFunction;
 import org.apache.spark.api.java.function.Function2;
-import org.apache.spark.SparkContext;
 import org.apache.spark.api.java.function.PairFlatMapFunction;
 import org.apache.spark.broadcast.Broadcast;
 import org.apache.spark.sql.Row;
@@ -82,6 +82,7 @@ import org.apache.spark.sql.SparkSession;
 import org.apache.spark.sql.execution.metric.SQLMetric;
 import org.apache.spark.sql.execution.metric.SQLMetrics;
 import org.apache.spark.sql.types.StructType;
+import org.apache.spark.storage.StorageLevel;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import scala.Tuple2;
@@ -676,16 +677,23 @@ public final class DistributedIndexSearch {
    * <p>The distributed search fetches rows in every task that owns an index file, so the rows a
    * query reads are the per-file top-k of every file rather than the query's own top-k. When the
    * caller has one query and no filter, the global search already returns the best hits of the
-   * whole index; this fetches only those hits' rows and returns their order. The win is the number
-   * of rows read: the query's window instead of the window of every index file.
+   * whole index; this fetches only those hits' rows. The win is the number of rows read: the
+   * query's window instead of the window of every index file.
    *
    * <p>The window is {@code opening}, the candidate budget the batch entry point also starts from,
    * so the same query with the same multiple asks both entry points for the same candidates. It is
-   * a window of the estimate and not of the answer: every row it holds is returned, in the index's
-   * order, for the sort above to re-score, while {@code resultK} only says when a short round is
-   * worth widening.
+   * a window of the estimate and not of the answer: every row it holds is returned for the sort
+   * above to re-score, while {@code resultK} only says when a short round is worth widening.
+   *
+   * <p>The rows never come to the driver: the fetch-back is left as an RDD, and the driver only
+   * keeps the hits, which are addresses, and the counts the widening reads. A fetch-back whose rows
+   * were collected here would have to fit every candidate's whole projection, vectors and binary
+   * columns included, into one driver result.
+   *
+   * <p>The answer is not ordered: the operator above this source re-scores and sorts every row it
+   * gets, and a task order is not an answer order in either branch.
    */
-  public static List<Row> searchRowsFromHits(
+  public static JavaRDD<Row> searchRowsFromHits(
       SparkSession spark,
       IndexMetadata metadata,
       Table table,
@@ -701,11 +709,6 @@ public final class DistributedIndexSearch {
       List<String> filterColumns,
       RowCounters counters,
       SearchStages stages) {
-    IndexAdapter adapter =
-        IndexTypes.fromType(metadata.indexType()).createAdapter(metadata.definition());
-    IndexSearchResult higher = IndexSearchResult.of("a", 0L, 1.0);
-    IndexSearchResult lower = IndexSearchResult.of("a", 0L, 0.0);
-    boolean higherScoreFirst = adapter.resultComparator().compare(higher, lower) < 0;
     IndexEntries.SnapshotDeletes deletes =
         IndexEntries.SnapshotDeletes.read(spark, table, scanTasks, table.schema());
     RowReadPlan plan =
@@ -722,15 +725,34 @@ public final class DistributedIndexSearch {
             StorageProperties.resolve(
                 table.io(), table.properties(), spark.sessionState().newHadoopConf()));
 
-    // The two entry points ask the index for the same window: the candidate budget, which is the
+    // the two entry points ask the index for the same window: the candidate budget, which is the
     // query's top-k times its multiple, truncated by the index's own entry count. The window is the
     // candidates the sort above re-scores, so a multiple widens it and buys recall the same way in
     // both entry points; only the rows the caller keeps (target) decide when asking for more is
     // unnecessary, so a window wider than the answer is handed on entire rather than trimmed here.
     int target = resultK;
     int window = opening;
-    List<Row> rows = Lists.newArrayList();
-    for (int round = 0; round < MAX_ROUNDS && rows.size() < target; round++) {
+    // The window widens until the index has no more candidates to give, not for a fixed number of
+    // rounds: a filter that clears the first rounds' rows leaves the answer short while the index
+    // still holds rows past the last window a fixed round count would reach.
+    int entries = -1;
+
+    JavaSparkContext context = JavaSparkContext.fromSparkContext(spark.sparkContext());
+    // the plan is a filter and a read, both of which run in the fetch-back's tasks, so it travels
+    // once rather than with every task's closure
+    Broadcast<RowReadPlan> planRef = context.broadcast(plan);
+
+    Set<String> scanned = new HashSet<>();
+    for (FileScanTask task : scanTasks) {
+      scanned.add(task.file().location().toString());
+    }
+
+    // the rows of a round are read once and reused by whatever the round returns: a wide projection
+    // cached at the executor that read it costs memory there, where the window already lives, and
+    // collecting it here would cost the driver the whole window at once
+    JavaPairRDD<String, Tuple2<Long, Row>> cached = null;
+    JavaRDD<Row> rows = context.emptyRDD();
+    for (int round = 0; ; round++) {
       IndexQuery widened =
           IndexQuery.of(query.sourceTableSnapshotId(), query.payload(), window)
               .withConsistency(query.consistency());
@@ -749,54 +771,81 @@ public final class DistributedIndexSearch {
             .add(hit.rowPosition());
       }
 
-      // the fetch-back is a distributed read, not a loop on the driver: the files the window hits
-      // are read in parallel, the same way a task reads the files it owns
-      long fetchStart = System.nanoTime();
       List<String> columns = Lists.newArrayList();
       for (NestedField field : projection.columns()) {
         columns.add(field.name());
       }
 
-      Map<String, Map<Long, Row>> rowsByFile =
-          IndexEntries.rowsAt(spark, table, positionsByFile, columns, expected, scanTasks);
-      long fetchNanos = System.nanoTime() - fetchStart;
-
-      Set<String> scanned = new HashSet<>();
-      for (FileScanTask task : scanTasks) {
-        scanned.add(task.file().location().toString());
-      }
-
-      List<FetchedRow> fetched = Lists.newArrayList();
-      int unresolved = 0;
       int outside = 0;
-      Set<String> files = new HashSet<>();
+      int scannedHits = 0;
       for (IndexSearchResult hit : hits) {
-        Map<Long, Row> byPosition = rowsByFile.get(hit.dataFile());
-        Row row = byPosition == null ? null : byPosition.get(hit.rowPosition());
-        if (row == null) {
-          if (scanned.contains(hit.dataFile())) {
-            unresolved++;
-          } else {
-            outside++;
-          }
+        if (scanned.contains(hit.dataFile())) {
+          scannedHits++;
         } else {
-          files.add(hit.dataFile());
-          fetched.add(new FetchedRow(hit.dataFile(), hit.rowPosition(), row, hit.score()));
+          outside++;
         }
       }
+
+      // the fetch-back is a distributed read, not a loop on the driver: the files the window hits
+      // are read in parallel, the same way a task reads the files it owns
+      long fetchStart = System.nanoTime();
+      JavaPairRDD<String, Tuple2<Long, Row>> read =
+          IndexEntries.liveRowsRdd(
+              spark,
+              table,
+              positionsByFile,
+              columns,
+              expected,
+              tasksAt(positionsByFile, scanTasks));
+      long fetched = 0L;
+      long admitted = 0L;
+      Set<String> files = new HashSet<>();
+      if (read == null) {
+        rows = context.emptyRDD();
+      } else {
+        read.persist(StorageLevel.MEMORY_AND_DISK());
+        // One job over the round's rows yields everything the widening and the counters need: how
+        // many rows the filter admits, how many were read, and which files they came from. Only
+        // these counts reach the driver, never a row.
+        Map<Tuple2<Boolean, String>, Long> counts =
+            read.map(entry -> new Tuple2<>(planRef.value().admits(entry._2()._2()), entry._1()))
+                .countByValue();
+        for (Map.Entry<Tuple2<Boolean, String>, Long> entry : counts.entrySet()) {
+          long count = entry.getValue();
+          fetched += count;
+          // a file read for a candidate is a file read, whether the filter keeps the row or not
+          files.add(entry.getKey()._2());
+          if (entry.getKey()._1()) {
+            admitted += count;
+          }
+        }
+
+        rows =
+            read.filter(entry -> planRef.value().admits(entry._2()._2()))
+                .map(entry -> planRef.value().narrow(entry._2()._2()));
+      }
+
+      long fetchNanos = System.nanoTime() - fetchStart;
+
+      // the round before this one is no longer part of the answer, so its rows stop being kept
+      if (cached != null) {
+        cached.unpersist();
+      }
+
+      cached = read;
 
       if (counters != null) {
         counters.report(
             window,
             hits.size(),
-            fetched.size(),
-            fetched.size(),
-            unresolved,
+            (int) Math.min(Integer.MAX_VALUE, fetched),
+            (int) Math.min(Integer.MAX_VALUE, fetched),
+            (int) Math.min(Integer.MAX_VALUE, Math.max(0L, scannedHits - fetched)),
             outside,
             files.size(),
             round + 1,
             scanTasks.size(),
-            fetched.size() < target);
+            admitted < target);
       }
       if (stages != null) {
         Stages tally = new Stages();
@@ -804,26 +853,62 @@ public final class DistributedIndexSearch {
         tally.taskNanos = fetchNanos;
         stages.report(tally);
       }
-      fetched.sort(byScore(higherScoreFirst));
-      rows.clear();
-      for (FetchedRow row : fetched) {
-        if (!plan.admits(row.row)) {
-          continue;
-        }
 
-        // the whole window is the answer here: the sort above re-scores it, so trimming it to the
-        // rows the caller keeps would take back the candidates the multiple paid for
-        rows.add(plan.narrow(row.row));
-      }
-
-      if (rows.size() >= target || !outcome.moreHits()) {
+      if (admitted >= target || !outcome.moreHits() || hits.size() < window) {
         break;
       }
 
-      window = Math.max(window * 2, window + 1);
+      // the index's own entry count is the widest window there is: asking for more than it holds
+      // cannot find another hit, and the doubling stops there rather than running past the end
+      if (entries < 0) {
+        entries = entryUpperBound(metadata, table, query);
+      }
+
+      if (window >= entries) {
+        break;
+      }
+
+      long next = Math.min((long) window * 2, entries);
+      if (next <= window) {
+        break;
+      }
+
+      window = (int) next;
     }
 
     return rows;
+  }
+
+  /** The scan tasks the fetch-back reads: the ones whose file is asked for a row of. */
+  private static List<FileScanTask> tasksAt(
+      Map<String, List<Long>> positionsByFile, List<FileScanTask> scanTasks) {
+    List<FileScanTask> tasks = Lists.newArrayList();
+    for (FileScanTask task : scanTasks) {
+      if (positionsByFile.containsKey(task.file().location().toString())) {
+        tasks.add(task);
+      }
+    }
+
+    return tasks;
+  }
+
+  /**
+   * The number of entries the index holds, which is the widest window a search of it can fill.
+   *
+   * <p>An index file never splits, so the entries of a snapshot are the sum over its files. The sum
+   * is capped at the largest window an {@code int} can hold, which is also the most a query can ask
+   * for.
+   */
+  private static int entryUpperBound(IndexMetadata metadata, Table table, IndexQuery query) {
+    long entries = 0L;
+    for (IndexFile file : new IndexReader(metadata, table).indexFiles(query)) {
+      entries += file.entryCount();
+      if (entries >= Integer.MAX_VALUE) {
+        return Integer.MAX_VALUE;
+      }
+    }
+
+    return (int) entries;
   }
 
   /** Every scan task a task may read, which is what the snapshot's deletes are read for. */
@@ -1602,7 +1687,8 @@ public final class DistributedIndexSearch {
     if (adapter instanceof TextIndexAdapter text) {
       // the text batch path scores against merged corpus statistics and only ever sees its own
       // top-k, so it cannot report whether more hits exist
-      return outcomesWithoutMore(searchText(spark, metadata, table, text, queries, null, null, stages));
+      return outcomesWithoutMore(
+          searchText(spark, metadata, table, text, queries, null, null, stages));
     }
 
     if (adapter.searchesAllPayloadsTogether()) {
