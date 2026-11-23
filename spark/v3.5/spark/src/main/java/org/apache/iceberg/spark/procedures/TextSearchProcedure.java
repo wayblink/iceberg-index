@@ -20,6 +20,7 @@ package org.apache.iceberg.spark.procedures;
 
 import java.util.List;
 import org.apache.iceberg.index.IndexMetadata;
+import org.apache.iceberg.index.spark.DistributedIndexSearch;
 import org.apache.iceberg.index.spark.IndexSearch;
 import org.apache.iceberg.index.text.TextIndexAdapter;
 import org.apache.iceberg.index.text.TextIndexDefinition;
@@ -47,6 +48,7 @@ import org.apache.spark.unsafe.types.UTF8String;
  * }</pre>
  */
 class TextSearchProcedure extends BaseProcedure {
+  private static final Logger LOG = LoggerFactory.getLogger(TextSearchProcedure.class);
   private static final ProcedureParameter TABLE_PARAM =
       requiredInParameter("table", DataTypes.StringType);
   private static final ProcedureParameter COLUMN_PARAM =
@@ -113,9 +115,24 @@ class TextSearchProcedure extends BaseProcedure {
           // the search the batch entry point runs, with one query: hit resolution has one
           // implementation, which reads the rows through the table's own data format and applies
           // its deletes, so a single query cannot answer with a row the table no longer holds
+          DistributedIndexSearch.SearchStages stages =
+              DistributedIndexSearch.SearchStages.create(spark().sparkContext());
+          long started = System.nanoTime();
           List<Row> hits =
-              IndexSearch.search(spark(), table, column, metadata, adapter.encodeQuery(query), topK)
+              IndexSearch.search(
+                      spark(), table, column, metadata, adapter.encodeQuery(query), topK, stages)
                   .collectAsList();
+          long totalNanos = System.nanoTime() - started;
+          LOG.info(
+              "BM25 query stages for {}: total={}ms indexRead={}ns score={}ns fetchBack={}ns "
+                  + "merge={}ns task={}ns",
+              table.name(),
+              totalNanos / 1_000_000L,
+              stages.value(DistributedIndexSearch.SearchStages.INDEX_READ_TIME),
+              stages.value(DistributedIndexSearch.SearchStages.PROBE_SCORE_TIME),
+              stages.value(DistributedIndexSearch.SearchStages.FETCH_BACK_TIME),
+              stages.value(DistributedIndexSearch.SearchStages.MERGE_TIME),
+              stages.value(DistributedIndexSearch.SearchStages.TASK_TIME));
 
           List<InternalRow> rows = Lists.newArrayListWithCapacity(hits.size());
           for (Row hit : hits) {

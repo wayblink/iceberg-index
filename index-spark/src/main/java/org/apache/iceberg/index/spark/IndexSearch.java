@@ -127,6 +127,18 @@ public final class IndexSearch {
       IndexMetadata metadata,
       List<ByteBuffer> queries,
       int topK) {
+    return search(spark, table, column, metadata, queries, topK, null);
+  }
+
+  /** The same search, reporting its stages into {@code stages} when a caller passes one. */
+  public static Dataset<Row> search(
+      SparkSession spark,
+      org.apache.iceberg.Table table,
+      String column,
+      IndexMetadata metadata,
+      List<ByteBuffer> queries,
+      int topK,
+      DistributedIndexSearch.SearchStages stages) {
     if (topK <= 0 || queries.isEmpty()) {
       return spark.createDataFrame(Lists.newArrayList(), RESULT_SCHEMA);
     }
@@ -147,7 +159,7 @@ public final class IndexSearch {
       indexQueries.add(IndexQuery.of(snapshot.sourceTableSnapshotId(), query.duplicate(), topK));
     }
     List<List<IndexSearchResult>> hitsPerQuery =
-        DistributedIndexSearch.searchBatch(spark, metadata, table, indexQueries);
+        DistributedIndexSearch.searchBatch(spark, metadata, table, indexQueries, stages);
 
     // the hits are positions in the files the index was built from, but the rows are read from the
     // table as it is now: a row deleted since the index was built must not be returned, and a file
@@ -156,8 +168,14 @@ public final class IndexSearch {
         table.currentSnapshot() != null
             ? table.currentSnapshot().snapshotId()
             : snapshot.sourceTableSnapshotId();
+    long fetchStart = System.nanoTime();
     Map<String, Map<Long, String>> rowsByFile =
         resolveRows(spark, table, resolveSnapshotId, hitsPerQuery);
+    if (stages != null) {
+      DistributedIndexSearch.Stages fetchTally = new DistributedIndexSearch.Stages();
+      fetchTally.fetchBackNanos = System.nanoTime() - fetchStart;
+      stages.report(fetchTally);
+    }
 
     List<Row> rows = Lists.newArrayList();
     for (int queryId = 0; queryId < hitsPerQuery.size(); queryId++) {

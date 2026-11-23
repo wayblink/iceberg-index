@@ -74,11 +74,13 @@ import org.apache.spark.api.java.JavaRDD;
 import org.apache.spark.api.java.JavaSparkContext;
 import org.apache.spark.api.java.function.FlatMapFunction;
 import org.apache.spark.api.java.function.Function2;
+import org.apache.spark.SparkContext;
 import org.apache.spark.api.java.function.PairFlatMapFunction;
 import org.apache.spark.broadcast.Broadcast;
 import org.apache.spark.sql.Row;
 import org.apache.spark.sql.SparkSession;
 import org.apache.spark.sql.execution.metric.SQLMetric;
+import org.apache.spark.sql.execution.metric.SQLMetrics;
 import org.apache.spark.sql.types.StructType;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -293,6 +295,26 @@ public final class DistributedIndexSearch {
       return DESCRIPTIONS;
     }
 
+    /**
+     * Creates the stage metrics for a search a procedure runs, where there is no physical plan to
+     * hang them on. The metrics keep the names an event log reads, so a CALL and a plan report the
+     * same stages.
+     */
+    public static SearchStages create(SparkContext sparkContext) {
+      Map<String, SQLMetric> metrics = new java.util.LinkedHashMap<>();
+      for (Map.Entry<String, String> entry : DESCRIPTIONS.entrySet()) {
+        metrics.put(entry.getKey(), SQLMetrics.createMetric(sparkContext, entry.getValue()));
+      }
+
+      return new SearchStages(metrics);
+    }
+
+    /** The current value of one stage metric, or zero when this caller did not create it. */
+    public long value(String name) {
+      SQLMetric metric = metrics.get(name);
+      return metric == null ? 0L : metric.value();
+    }
+
     /** Adds what one task spent, if any of its metrics were handed in. */
     void report(Stages stages) {
       add(INDEX_READ_TIME, stages.indexReadNanos);
@@ -323,22 +345,22 @@ public final class DistributedIndexSearch {
 
   /** What one task spent, gathered in the stage a caller reports it for. */
   static final class Stages {
-    private long indexReadNanos;
-    private long probeScoreNanos;
-    private long fetchBackNanos;
-    private long mergeNanos;
-    private long taskNanos;
-    private long fileBytesRead;
-    private long rangeBytesRead;
-    private long rangeReadRequests;
-    private long listBlocksRead;
-    private long wholeListAreaReads;
-    private int cacheHits;
-    private int cacheMisses;
-    private long blockCacheHits;
-    private long blockCacheMisses;
-    private long blockLoads;
-    private long blockEvictions;
+    long indexReadNanos;
+    long probeScoreNanos;
+    long fetchBackNanos;
+    long mergeNanos;
+    long taskNanos;
+    long fileBytesRead;
+    long rangeBytesRead;
+    long rangeReadRequests;
+    long listBlocksRead;
+    long wholeListAreaReads;
+    int cacheHits;
+    int cacheMisses;
+    long blockCacheHits;
+    long blockCacheMisses;
+    long blockLoads;
+    long blockEvictions;
   }
 
   /**
@@ -1498,7 +1520,17 @@ public final class DistributedIndexSearch {
    */
   public static List<List<IndexSearchResult>> searchBatch(
       SparkSession spark, IndexMetadata metadata, Table table, List<IndexQuery> queries) {
-    List<SearchOutcome> outcomes = searchBatchOutcomes(spark, metadata, table, queries);
+    return searchBatch(spark, metadata, table, queries, null);
+  }
+
+  /** The same search, reporting its stages into {@code stages} when a caller passes one. */
+  public static List<List<IndexSearchResult>> searchBatch(
+      SparkSession spark,
+      IndexMetadata metadata,
+      Table table,
+      List<IndexQuery> queries,
+      SearchStages stages) {
+    List<SearchOutcome> outcomes = searchBatchOutcomes(spark, metadata, table, queries, null);
     List<List<IndexSearchResult>> perQuery = Lists.newArrayListWithCapacity(outcomes.size());
     for (SearchOutcome outcome : outcomes) {
       perQuery.add(outcome.hits());
@@ -1546,11 +1578,20 @@ public final class DistributedIndexSearch {
       }
     }
 
-    return searchBatchOutcomes(spark, metadata, table, queries);
+    return searchBatchOutcomes(spark, metadata, table, queries, null);
   }
 
   private static List<SearchOutcome> searchBatchOutcomes(
       SparkSession spark, IndexMetadata metadata, Table table, List<IndexQuery> queries) {
+    return searchBatchOutcomes(spark, metadata, table, queries, null);
+  }
+
+  private static List<SearchOutcome> searchBatchOutcomes(
+      SparkSession spark,
+      IndexMetadata metadata,
+      Table table,
+      List<IndexQuery> queries,
+      SearchStages stages) {
     if (queries.isEmpty()) {
       return ImmutableList.of();
     }
@@ -1561,7 +1602,7 @@ public final class DistributedIndexSearch {
     if (adapter instanceof TextIndexAdapter text) {
       // the text batch path scores against merged corpus statistics and only ever sees its own
       // top-k, so it cannot report whether more hits exist
-      return outcomesWithoutMore(searchText(spark, metadata, table, text, queries, null, null));
+      return outcomesWithoutMore(searchText(spark, metadata, table, text, queries, null, null, stages));
     }
 
     if (adapter.searchesAllPayloadsTogether()) {
@@ -1799,6 +1840,18 @@ public final class DistributedIndexSearch {
       List<IndexQuery> queries,
       TextFilterRead filter,
       Map<String, FileScanTask> filteredTasks) {
+    return searchText(spark, metadata, table, adapter, queries, filter, filteredTasks, null);
+  }
+
+  private static List<List<IndexSearchResult>> searchText(
+      SparkSession spark,
+      IndexMetadata metadata,
+      Table table,
+      TextIndexAdapter adapter,
+      List<IndexQuery> queries,
+      TextFilterRead filter,
+      Map<String, FileScanTask> filteredTasks,
+      SearchStages stages) {
     int[] limits = queries.stream().mapToInt(IndexQuery::topK).toArray();
 
     IndexQuery first = queries.get(0);
@@ -1902,6 +1955,9 @@ public final class DistributedIndexSearch {
                       TextIndexAdapter text = scorer.value();
                       List<byte[]> queriesForShard = encodedQueries.value();
                       CorpusStatistics corpusForShard = statistics.value();
+                      Stages tally = stages == null ? null : new Stages();
+                      long taskStart = System.nanoTime();
+                      long shardStart = System.nanoTime();
                       List<List<IndexSearchResult>> results;
                       try (ExecutorIndexCache.Lease lease =
                           useResidentCache
@@ -1927,6 +1983,14 @@ public final class DistributedIndexSearch {
                                                 corpusForShard,
                                                 candidates));
                       }
+                      if (tally != null) {
+                        // reading a shard and scoring it are one call: the payload is read only
+                        // when the executor does not hold it, so the two are reported together
+                        tally.probeScoreNanos += System.nanoTime() - shardStart;
+                        tally.taskNanos = System.nanoTime() - taskStart;
+                        stages.report(tally);
+                      }
+
                       reportCache(cacheReports, queryRun);
                       for (int queryId = 0; queryId < results.size(); queryId++) {
                         for (IndexSearchResult hit : results.get(queryId)) {
@@ -1940,7 +2004,13 @@ public final class DistributedIndexSearch {
                     });
 
         int widest = Arrays.stream(limits).max().orElseThrow();
+        long mergeStart = System.nanoTime();
         Map<Integer, HitTopK> top = aggregateHits(hits, higherScoreFirst, widest);
+        if (stages != null) {
+          Stages mergeTally = new Stages();
+          mergeTally.mergeNanos = System.nanoTime() - mergeStart;
+          stages.report(mergeTally);
+        }
         mergeCacheReports(cacheReports, locationsTable, keys, config, workingSet);
         return orderedHits(top, limits);
       } finally {
