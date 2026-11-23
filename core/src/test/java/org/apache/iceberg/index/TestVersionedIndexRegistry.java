@@ -36,6 +36,11 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
 import java.util.stream.Collectors;
 import org.apache.iceberg.BaseTable;
 import org.apache.iceberg.PartitionSpec;
@@ -45,6 +50,7 @@ import org.apache.iceberg.TableMetadata;
 import org.apache.iceberg.TableOperations;
 import org.apache.iceberg.TestTables;
 import org.apache.iceberg.TestTables.LocalFileIO;
+import org.apache.iceberg.exceptions.AlreadyExistsException;
 import org.apache.iceberg.exceptions.CommitFailedException;
 import org.apache.iceberg.exceptions.NotFoundException;
 import org.apache.iceberg.io.FileIO;
@@ -251,6 +257,112 @@ class TestVersionedIndexRegistry {
         .isInstanceOf(NotFoundException.class)
         .hasMessageContaining("was dropped while it was being updated");
     // a dropped index stays dropped: publishing into it must not put the entry back
+    assertThat(indexUuids(registryPointer(ops))).doesNotContain("index-a");
+  }
+
+  @Test
+  void aSecondIndexCannotReuseANameOnTheSameColumn() {
+    TestTables.TestTableOperations ops = operations();
+    SidecarIndexCatalog catalog = versionedCatalog(ops);
+    catalog.createIndex(namedRequest("index-a", "shared"));
+
+    assertThatThrownBy(() -> catalog.createIndex(namedRequest("index-b", "shared")))
+        .isInstanceOf(AlreadyExistsException.class)
+        .hasMessageContaining("shared")
+        .hasMessageContaining("index-a");
+    // the loser names no entry, and the tree it wrote before losing is removed again
+    assertThat(indexUuids(registryPointer(ops))).containsExactly("index-a");
+    File loserMetadata = new File(indexesRoot(), "index-b/metadata");
+    assertThat(loserMetadata.exists() ? loserMetadata.listFiles() : new File[0]).isEmpty();
+  }
+
+  @Test
+  void aRegistrationThatLosesTheRaceRefusesTheNameTheWinnerTook() {
+    TestTables.TestTableOperations ops = operations();
+    SidecarIndexCatalog winner = versionedCatalog(ops);
+    // the first commit fails after the winner has registered the same name: the loser has to redo
+    // its check against the registry the winner published, not the one it prechecked against
+    SidecarIndexCatalog loser =
+        new SidecarIndexCatalog(
+            new LocalFileIO(),
+            new FailsFirstCommitPointer(
+                new TableIndexRegistryPointer(
+                    new BaseTable(
+                        new TestTables.TestTableOperations(TABLE_NAME, tableDir), TABLE_NAME)),
+                () -> winner.createIndex(namedRequest("winner", "shared"))));
+
+    assertThatThrownBy(() -> loser.createIndex(namedRequest("loser", "shared")))
+        .isInstanceOf(AlreadyExistsException.class)
+        .hasMessageContaining("shared")
+        .hasMessageContaining("winner");
+    assertThat(indexUuids(registryPointer(ops))).containsExactly("winner");
+  }
+
+  @Test
+  void twoWritersRegisteringTheSameNameLeaveOneIndex() throws Exception {
+    TestTables.TestTableOperations ops = operations();
+    ExecutorService executor = Executors.newFixedThreadPool(2);
+    try {
+      CountDownLatch start = new CountDownLatch(1);
+      List<Future<Boolean>> attempts = new ArrayList<>();
+      for (int i = 0; i < 2; i += 1) {
+        String indexUuid = "index-" + i;
+        attempts.add(
+            executor.submit(
+                () -> {
+                  start.await();
+                  SidecarIndexCatalog catalog =
+                      versionedCatalog(new TestTables.TestTableOperations(TABLE_NAME, tableDir));
+                  try {
+                    catalog.createIndex(namedRequest(indexUuid, "shared"));
+                    return true;
+                  } catch (AlreadyExistsException e) {
+                    return false;
+                  }
+                }));
+      }
+
+      start.countDown();
+      assertThat(
+              List.of(
+                  attempts.get(0).get(30, TimeUnit.SECONDS),
+                  attempts.get(1).get(30, TimeUnit.SECONDS)))
+          .containsExactlyInAnyOrder(true, false);
+    } finally {
+      executor.shutdownNow();
+    }
+
+    assertThat(versionedCatalog(ops).listIndexes(tableDir.toString(), "table-uuid"))
+        .extracting(IndexMetadata::name)
+        .containsExactly("shared");
+  }
+
+  @ParameterizedTest
+  @ValueSource(ints = {8, 9, 10})
+  void aDroppedIndexStaysDroppedAfterTheHistoryIsPruned(int registrations) {
+    TestTables.TestTableOperations ops = operations();
+    SidecarIndexCatalog catalog = versionedCatalog(ops);
+    catalog.createIndex(request("index-a"));
+
+    // another session drops the index without purging it: the tree this catalog wrote is still on
+    // disk, so nothing but the registry's own record could say the entry was removed on purpose
+    assertThat(versionedCatalog(ops).dropIndex(tableDir.toString(), "index-a", false)).isTrue();
+    JsonNode dropped = registryJson(registryPointer(ops)).get("dropped");
+    assertThat(dropped).isNotNull();
+    assertThat(dropped.get(0).asText()).isEqualTo("index-a");
+
+    // enough later registrations to prune the version that still named the dropped index, which is
+    // the only evidence a registry without a drop record leaves behind
+    for (int i = 0; i < registrations; i += 1) {
+      versionedCatalog(ops).createIndex(request("index-" + i));
+    }
+
+    assertThatThrownBy(
+            () ->
+                catalog.updateIndex(
+                    tableDir.toString(), "index-a", current -> current.withSnapshot(snapshot(1))))
+        .isInstanceOf(NotFoundException.class)
+        .hasMessageContaining("was dropped while it was being updated");
     assertThat(indexUuids(registryPointer(ops))).doesNotContain("index-a");
   }
 
@@ -507,6 +619,16 @@ class TestVersionedIndexRegistry {
         .build();
   }
 
+  private CreateIndexRequest namedRequest(String indexUuid, String name) {
+    return CreateIndexRequest.builder()
+        .tableLocation(tableDir.toString())
+        .tableUuid("table-uuid")
+        .indexUuid(indexUuid)
+        .name(name)
+        .definition(TestingIndexDefinition.of(4))
+        .build();
+  }
+
   private String registryPointer(TableOperations ops) {
     return ops.refresh().properties().get(SidecarIndexCatalog.REGISTRY_PROPERTY);
   }
@@ -637,6 +759,34 @@ class TestVersionedIndexRegistry {
     @Override
     public long newSnapshotId() {
       return delegate.newSnapshotId();
+    }
+  }
+
+  /** Fails the first pointer move, after letting another writer commit, then behaves normally. */
+  private static final class FailsFirstCommitPointer implements IndexRegistryPointer {
+    private final IndexRegistryPointer delegate;
+    private final Runnable beforeConflict;
+    private boolean failed = false;
+
+    FailsFirstCommitPointer(IndexRegistryPointer delegate, Runnable beforeConflict) {
+      this.delegate = delegate;
+      this.beforeConflict = beforeConflict;
+    }
+
+    @Override
+    public String current() {
+      return delegate.current();
+    }
+
+    @Override
+    public boolean compareAndSet(String expected, String next) {
+      if (!failed) {
+        this.failed = true;
+        beforeConflict.run();
+        return false;
+      }
+
+      return delegate.compareAndSet(expected, next);
     }
   }
 

@@ -27,6 +27,7 @@ import java.nio.file.NoSuchFileException;
 import java.util.HashSet;
 import java.util.Iterator;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -121,6 +122,7 @@ public final class SidecarIndexCatalog implements IndexCatalog {
   private static final String REGISTRY_PREVIOUS_FILE = "previous-file";
   private static final String REGISTRY_METADATA_FILES = "metadata-files";
   private static final String REGISTRY_TABLE_UUIDS = "table-uuids";
+  private static final String REGISTRY_DROPPED = "dropped";
   private static final String METADATA_DOCUMENT = "metadata";
   private static final int REGISTRY_VERSION = 3;
   private static final int UUID_ONLY_REGISTRY_VERSION = 2;
@@ -416,6 +418,13 @@ public final class SidecarIndexCatalog implements IndexCatalog {
           indexUuid, tableLocation);
     }
 
+    if (registry.dropped().contains(indexUuid)) {
+      throw new NotFoundException(
+          "Index %s of table %s was dropped while it was being updated: the registry records that "
+              + "it was dropped",
+          indexUuid, tableLocation);
+    }
+
     if (namedInHistory(tableLocation, previous, indexUuid)) {
       throw new NotFoundException(
           "Index %s of table %s was dropped while it was being updated: a later registry version "
@@ -529,7 +538,18 @@ public final class SidecarIndexCatalog implements IndexCatalog {
         dropForeignIndexes(tableLocation, registry, tableUuid);
       }
 
+      IndexMetadata sameName = conflictingName(tableLocation, registry, metadata);
+      if (sameName != null) {
+        deleteIfExists(metadataRootPath(metadata.location(), root));
+        throw new AlreadyExistsException(
+            "An index named %s already exists for column field %s of table %s: %s",
+            metadata.name(), metadata.definition().fieldId(), tableLocation, sameName.indexUuid());
+      }
+
       entries.put(indexUuid, root);
+      // a registration of this uuid supersedes an earlier drop record: the tree is current again by
+      // the caller's own decision, so a later lost entry is restorable rather than refused
+      registry.dropped().remove(indexUuid);
       if (tableUuid != null) {
         registry.tableUuids().put(indexUuid, tableUuid);
       }
@@ -567,6 +587,7 @@ public final class SidecarIndexCatalog implements IndexCatalog {
       if (recorded == null) {
         IndexMetadata existing = loadRegistered(tableLocation, entry.getKey(), entries);
         if (existing == null) {
+          registry.dropped().add(entry.getKey());
           iterator.remove();
           continue;
         }
@@ -582,6 +603,7 @@ public final class SidecarIndexCatalog implements IndexCatalog {
       }
 
       if (!tableUuid.equals(recorded)) {
+        registry.dropped().add(entry.getKey());
         iterator.remove();
         tableUuids.remove(entry.getKey());
       }
@@ -593,6 +615,66 @@ public final class SidecarIndexCatalog implements IndexCatalog {
     if (indexUuids.remove(indexUuid)) {
       writeLegacyRegistry(tableLocation, indexUuids);
     }
+  }
+
+  /**
+   * Finds the index that already carries this index's name on the same column, or null.
+   *
+   * <p>The check runs against the registry version the registration commits on, inside the retry
+   * loop: two writers that both passed a pre-check against an older version cannot both register
+   * the name, because the writer whose commit loses the race re-reads the winner's registry and
+   * finds the entry there. The name is read from the index metadata rather than kept in the
+   * registry, which costs one read per registered index on a named creation but leaves registries
+   * written before the rule in place: an entry is named where it always was.
+   *
+   * <p>A name is unique per column, not per table: the same name may be reused over another column,
+   * which is what makes the column part of the comparison.
+   */
+  private IndexMetadata conflictingName(
+      String tableLocation, Registry registry, IndexMetadata metadata) {
+    if (metadata.name() == null) {
+      return null;
+    }
+
+    int fieldId = metadata.definition().fieldId();
+    for (Map.Entry<String, String> entry : registry.roots().entrySet()) {
+      if (entry.getKey().equals(metadata.indexUuid())) {
+        continue;
+      }
+
+      IndexMetadata existing = readRegisteredEntry(tableLocation, entry.getKey(), entry.getValue());
+      if (existing != null
+          && metadata.name().equals(existing.name())
+          && existing.definition().fieldId() == fieldId) {
+        return existing;
+      }
+    }
+
+    return null;
+  }
+
+  /**
+   * Reads the metadata a registry entry names, or null when it is gone.
+   *
+   * <p>An entry carried over from a uuid-only registry names no root, and its metadata is still
+   * where the legacy readers look for it. The registry and the metadata are read separately, so a
+   * caller that only consults an entry treats a missing file as the entry being gone rather than as
+   * a broken registry.
+   */
+  private IndexMetadata readRegisteredEntry(String tableLocation, String indexUuid, String root) {
+    String location = indexLocation(tableLocation, indexUuid);
+    if (root == null) {
+      String json = readMetadataFile(location);
+      return json == null ? null : IndexMetadataParser.fromJson(json);
+    }
+
+    String json = readIfExists(metadataRootPath(location, root));
+    if (json == null) {
+      return null;
+    }
+
+    return JsonUtil.parse(
+        json, node -> IndexMetadataParser.fromJson(JsonUtil.get(METADATA_DOCUMENT, node)));
   }
 
   private boolean dropRegistered(String tableLocation, String indexUuid, boolean purge) {
@@ -607,6 +689,9 @@ public final class SidecarIndexCatalog implements IndexCatalog {
       IndexMetadata metadata = purge ? loadRegistered(tableLocation, indexUuid, entries) : null;
       String root = entries.remove(indexUuid);
       registry.tableUuids().remove(indexUuid);
+      // the record outlives the versions that name the entry: an old writer that never saw the drop
+      // must still be refused once the evidence has been pruned
+      registry.dropped().add(indexUuid);
       if (commitRegistry(tableLocation, previous, registry)) {
         registeredRoots.remove(indexUuid);
         if (metadata != null) {
@@ -641,19 +726,19 @@ public final class SidecarIndexCatalog implements IndexCatalog {
     String location = indexLocation(tableLocation, indexUuid);
     String root = registry.get(indexUuid);
     if (root != null) {
-      String path = metadataRootPath(location, root);
-      String json = readIfExists(path);
-      Preconditions.checkState(json != null, "Index metadata file does not exist: %s", path);
-      return JsonUtil.parse(
-          json, node -> IndexMetadataParser.fromJson(JsonUtil.get(METADATA_DOCUMENT, node)));
+      IndexMetadata metadata = readRegisteredEntry(tableLocation, indexUuid, root);
+      Preconditions.checkState(
+          metadata != null,
+          "Index metadata file does not exist: %s",
+          metadataRootPath(location, root));
+      return metadata;
     }
 
     if (pointer != null && !registry.containsKey(indexUuid)) {
       return null;
     }
 
-    String json = readMetadataFile(location);
-    return json == null ? null : IndexMetadataParser.fromJson(json);
+    return readRegisteredEntry(tableLocation, indexUuid, null);
   }
 
   private String writeMetadataRoot(String indexLocation, IndexMetadata metadata, String previous) {
@@ -1018,10 +1103,13 @@ public final class SidecarIndexCatalog implements IndexCatalog {
   private static final class Registry {
     private final Map<String, String> roots;
     private final Map<String, String> tableUuids;
+    private final Set<String> dropped;
 
-    private Registry(Map<String, String> roots, Map<String, String> tableUuids) {
+    private Registry(
+        Map<String, String> roots, Map<String, String> tableUuids, Set<String> dropped) {
       this.roots = roots;
       this.tableUuids = tableUuids;
+      this.dropped = dropped;
     }
 
     /** The tree each index is published under, by index uuid. */
@@ -1032,6 +1120,18 @@ public final class SidecarIndexCatalog implements IndexCatalog {
     /** The table instance each index was built for, by index uuid, when the registry names one. */
     private Map<String, String> tableUuids() {
       return tableUuids;
+    }
+
+    /**
+     * The indexes this registry records as dropped.
+     *
+     * <p>A removal cannot be told from a registration a writer never saw by reading the entries
+     * alone, and the versions that still named the index are pruned: the record is what keeps a
+     * dropped index dropped once its history is gone. Registries written before the record existed
+     * read as one that records no drops.
+     */
+    private Set<String> dropped() {
+      return dropped;
     }
   }
 
@@ -1057,7 +1157,7 @@ public final class SidecarIndexCatalog implements IndexCatalog {
               + "known; unset it to fall back to the file written in place",
           registryFile,
           REGISTRY_PROPERTY);
-      return new Registry(new LinkedHashMap<>(), new LinkedHashMap<>());
+      return new Registry(new LinkedHashMap<>(), new LinkedHashMap<>(), new LinkedHashSet<>());
     }
 
     JsonNode registryNode = JsonUtil.parse(json, node -> node);
@@ -1078,6 +1178,10 @@ public final class SidecarIndexCatalog implements IndexCatalog {
         version == REGISTRY_VERSION
             ? JsonUtil.getStringMapOrNull(REGISTRY_TABLE_UUIDS, registryNode)
             : null;
+    List<String> recordedDrops =
+        version == REGISTRY_VERSION
+            ? JsonUtil.getStringListOrNull(REGISTRY_DROPPED, registryNode)
+            : null;
     Map<String, String> entries = new LinkedHashMap<>();
     Map<String, String> tableUuids = new LinkedHashMap<>();
     for (JsonNode indexUuid : JsonUtil.get(REGISTRY_INDEX_UUIDS, registryNode)) {
@@ -1088,7 +1192,12 @@ public final class SidecarIndexCatalog implements IndexCatalog {
       }
     }
 
-    return new Registry(entries, tableUuids);
+    Set<String> dropped = new LinkedHashSet<>();
+    if (recordedDrops != null) {
+      dropped.addAll(recordedDrops);
+    }
+
+    return new Registry(entries, tableUuids, dropped);
   }
 
   /** Writes a new registry version and returns its file name, which is never reused. */
@@ -1154,6 +1263,14 @@ public final class SidecarIndexCatalog implements IndexCatalog {
           JsonUtil.writeStringMap(REGISTRY_METADATA_FILES, roots, generator);
           if (!tableUuids.isEmpty()) {
             JsonUtil.writeStringMap(REGISTRY_TABLE_UUIDS, tableUuids, generator);
+          }
+
+          if (!registry.dropped().isEmpty()) {
+            generator.writeArrayFieldStart(REGISTRY_DROPPED);
+            for (String droppedUuid : registry.dropped()) {
+              generator.writeString(droppedUuid);
+            }
+            generator.writeEndArray();
           }
 
           if (previousFile != null) {
