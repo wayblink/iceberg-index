@@ -235,6 +235,37 @@ class TestTextIndexPayload {
         .hasMessageContaining("Invalid BM25 payload size");
   }
 
+  @Test
+  void asksForARebuildWhenThePayloadWasWrittenByTheEarlierLayout() {
+    ByteBuffer payload = earlierLayoutPayload();
+
+    assertThat(TextIndexPayload.matches(payload))
+        .as("the per-posting layout cannot pass for the layout this reader decodes")
+        .isFalse();
+    assertThatThrownBy(() -> TextIndexPayload.open(source(bytes(payload)), payload.remaining()))
+        .isInstanceOf(IOException.class)
+        .hasMessageContaining("earlier layout")
+        .hasMessageContaining("rebuild the index");
+  }
+
+  /**
+   * The header of the per-posting layout this build replaced: the signature, the two counts and the
+   * sixty-five bucket offsets, 280 bytes in all.
+   */
+  private static ByteBuffer earlierLayoutPayload() {
+    int headerSize = Integer.BYTES + 2 * Long.BYTES + (64 + 1) * Integer.BYTES;
+    ByteBuffer payload = ByteBuffer.allocate(headerSize);
+    payload.putInt(0x424D3101);
+    payload.putLong(3);
+    payload.putLong(9);
+    for (int bucket = 0; bucket <= 64; bucket++) {
+      payload.putInt(headerSize);
+    }
+
+    payload.position(0);
+    return payload;
+  }
+
   private static FileIndex index(boolean unused) {
     return index(
         List.of(

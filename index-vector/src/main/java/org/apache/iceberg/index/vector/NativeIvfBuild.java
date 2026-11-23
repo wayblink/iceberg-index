@@ -82,12 +82,34 @@ final class NativeIvfBuild {
 
   private static final int METRIC_DOT = 2;
 
-  private static final AtomicBoolean LOADED = new AtomicBoolean(false);
-
-  /** Keeps a JVM that cannot load the library from warning once per build. */
-  private static final AtomicBoolean LOAD_FAILURE_REPORTED = new AtomicBoolean(false);
+  private static final LoadState STATE = new LoadState();
 
   private NativeIvfBuild() {}
+
+  /**
+   * The outcome of one load: whether the library is usable, whether a load has already failed, and
+   * whether that failure has been reported. A failure is kept so that a build does not extract and
+   * load the library again for every call.
+   */
+  static final class LoadState {
+    private final AtomicBoolean loaded = new AtomicBoolean(false);
+    private final AtomicBoolean failed = new AtomicBoolean(false);
+    private final AtomicBoolean reported = new AtomicBoolean(false);
+
+    boolean loaded() {
+      return loaded.get();
+    }
+
+    boolean failed() {
+      return failed.get();
+    }
+  }
+
+  /** One attempt to load the library; answers null on success, or why it failed. */
+  @FunctionalInterface
+  interface LibraryLoader {
+    String load();
+  }
 
   /** The entries a native build reads, one block at a time. */
   interface VectorChunkSource {
@@ -191,7 +213,7 @@ final class NativeIvfBuild {
 
   /** Whether {@link #load} has loaded the library in this JVM. */
   static boolean available() {
-    return LOADED.get();
+    return STATE.loaded();
   }
 
   /** Loads the library from an explicit path, which is what a test does before building. */
@@ -200,7 +222,7 @@ final class NativeIvfBuild {
     System.load(library.toAbsolutePath().toString());
     String failure = versionFailure("The native IVF library at " + library.toAbsolutePath());
     Preconditions.checkState(failure == null, "%s", failure);
-    LOADED.set(true);
+    STATE.loaded.set(true);
   }
 
   /**
@@ -213,28 +235,48 @@ final class NativeIvfBuild {
    * kernel is optional, and a build that asked for it must not fail because it is missing.
    */
   static boolean ensureLoaded() {
-    if (LOADED.get()) {
+    return ensureLoaded(
+        STATE, NativeIvfBuild::loadFromLibraryPath, NativeIvfBuild::loadFromResource);
+  }
+
+  /**
+   * The load of one {@link LoadState}, with the two places a library can come from supplied by the
+   * caller so a test can exercise a failure without a real library.
+   */
+  static boolean ensureLoaded(LoadState state, LibraryLoader libraryPath, LibraryLoader resource) {
+    if (state.loaded.get()) {
       return true;
     }
 
-    synchronized (LOADED) {
-      if (LOADED.get()) {
+    if (state.failed.get()) {
+      return false;
+    }
+
+    synchronized (state) {
+      if (state.loaded.get()) {
         return true;
       }
 
-      String libraryPathFailure = loadFromLibraryPath();
+      if (state.failed.get()) {
+        return false;
+      }
+
+      String libraryPathFailure = libraryPath.load();
       if (libraryPathFailure == null) {
-        LOADED.set(true);
+        state.loaded.set(true);
         return true;
       }
 
-      String resourceFailure = loadFromResource();
+      String resourceFailure = resource.load();
       if (resourceFailure == null) {
-        LOADED.set(true);
+        state.loaded.set(true);
         return true;
       }
 
-      if (LOAD_FAILURE_REPORTED.compareAndSet(false, true)) {
+      // a JVM that cannot load the library cannot load it later either, and every build would
+      // extract a copy and ask the loader again: remember the failure, and report it once
+      state.failed.set(true);
+      if (state.reported.compareAndSet(false, true)) {
         LOG.warn(
             "The native IVF build kernel is not available ({}; {}); builds that ask for it fall"
                 + " back to the Java kernel. It needs a loadable {} on java.library.path, or one"
@@ -281,15 +323,58 @@ final class NativeIvfBuild {
         return "the resource " + resource + " is not in this build";
       }
 
-      Path extracted = Files.createTempFile("iceberg-ivf-native-", librarySuffix());
+      return extractAndLoad(in, resource, null);
+    } catch (IOException e) {
+      return "cannot extract " + resource + ": " + e.getMessage();
+    }
+  }
+
+  /**
+   * Extracts the library bytes and loads them, answering null on success or why the load failed.
+   *
+   * <p>The extracted file is a copy this call owns: on any failure it is deleted rather than left
+   * for the JVM's exit, so a JVM that cannot load the library does not collect one copy per
+   * attempt. A successful load keeps the file, which the platform keeps mapped.
+   *
+   * @param in the library bytes
+   * @param description what the bytes are, for the failure message
+   * @param directory where to write the copy, or null for the system temporary directory
+   */
+  static String extractAndLoad(InputStream in, String description, Path directory) {
+    Path extracted = null;
+    try {
+      extracted =
+          directory == null
+              ? Files.createTempFile("iceberg-ivf-native-", librarySuffix())
+              : Files.createTempFile(directory, "iceberg-ivf-native-", librarySuffix());
       extracted.toFile().deleteOnExit();
       Files.copy(in, extracted, StandardCopyOption.REPLACE_EXISTING);
       System.load(extracted.toAbsolutePath().toString());
-      return versionFailure("The packaged " + resource);
+      String failure = versionFailure("The packaged " + description);
+      if (failure != null) {
+        deleteExtracted(extracted);
+      }
+
+      return failure;
     } catch (IOException e) {
-      return "cannot extract " + resource + ": " + e.getMessage();
+      deleteExtracted(extracted);
+      return "cannot extract " + description + ": " + e.getMessage();
     } catch (UnsatisfiedLinkError | SecurityException e) {
-      return "cannot load " + resource + ": " + e.getMessage();
+      deleteExtracted(extracted);
+      return "cannot load " + description + ": " + e.getMessage();
+    }
+  }
+
+  /** Deletes the copy this call extracted, which no load kept mapped. */
+  private static void deleteExtracted(Path extracted) {
+    if (extracted == null) {
+      return;
+    }
+
+    try {
+      Files.deleteIfExists(extracted);
+    } catch (IOException e) {
+      LOG.warn("Cannot delete the extracted native IVF library {}", extracted, e);
     }
   }
 

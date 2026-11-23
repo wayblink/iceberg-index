@@ -310,21 +310,36 @@ impl Quantizer {
             .iter()
             .map(|value| (*value as f64) * (*value as f64))
             .sum::<f64>();
-        let largest = rotated
-            .iter()
-            .map(|value| value.abs() as f64)
-            .fold(0.0f64, f64::max);
+        // Java's `Math.max` propagates NaN where `f64::max` drops it, and that decides the grid a
+        // coordinate is measured on: a NaN magnitude makes the scale NaN, which makes every level
+        // zero, exactly as the JVM's loop does it
+        let mut largest = 0.0f64;
+        for value in &rotated {
+            let magnitude = value.abs() as f64;
+            largest = if largest.is_nan() || magnitude.is_nan() {
+                f64::NAN
+            } else {
+                largest.max(magnitude)
+            };
+        }
         let levels = self.levels;
         let scale = if largest == 0.0 { 0.0 } else { 1.0 / largest };
         let root = norm.sqrt();
         let mut correction = 0.0f64;
         for (index, value) in rotated.iter().enumerate() {
             let relative = *value as f64 * scale;
-            let level = java_round(
-                ((relative + 1.0) * (levels - 1) as f64 / 2.0)
-                    .min((levels - 1) as f64)
-                    .max(0.0),
-            ) as i32;
+            // Java's `Math.min`/`Math.max` propagate NaN and `Math.round(NaN)` is 0; `f64::min`
+            // and `f64::max` would keep the other operand and put the coordinate on the last
+            // level, which is a different byte for a vector whose transform overflowed
+            let level = if relative.is_nan() {
+                0
+            } else {
+                java_round(
+                    ((relative + 1.0) * (levels - 1) as f64 / 2.0)
+                        .min((levels - 1) as f64)
+                        .max(0.0),
+                ) as i32
+            };
             self.set_level(code, index, level);
             correction += decode_level(level, levels) * (*value as f64 / root);
         }
@@ -1049,6 +1064,33 @@ mod tests {
                 ];
                 same_bytes(dimension, bits, &not_a_number, &signs);
             }
+        }
+    }
+
+    #[test]
+    fn an_overflowed_coordinate_takes_the_jvm_level() {
+        // two dimensions pad to two; seed 0 gives both signs +1 and one bit gives two levels. The
+        // transform of [3e38, 3e38] overflows to [inf, 0], so the grid is [NaN, 0.5] and Java's
+        // Math.round(NaN) is 0: the code is level 1, level 0 -> 0b10. A min/max that keeps the
+        // other operand on NaN would put the first coordinate on the last level -> 0b11.
+        let signs = super::signs(0, 2);
+        let quantizer = Quantizer::train(&[&[0.0f32, 0.0][..]], 2, 1).unwrap();
+        let mut code = vec![0u8; quantizer.code_bytes()];
+        let mut factors = [0.0f32; FACTORS];
+        let mut reference = vec![0u8; quantizer.code_bytes()];
+        let mut reference_factors = [0.0f32; FACTORS];
+        for vector in [[3.0e38f32, 3.0e38f32], [-3.0e38f32, -3.0e38f32]] {
+            quantizer
+                .encode(&signs, &vector, &mut code, &mut factors)
+                .unwrap();
+            quantizer
+                .encode_reference(&signs, &vector, &mut reference, &mut reference_factors)
+                .unwrap();
+            assert_eq!(vec![2u8], code, "the JVM code of {:?}", vector);
+            assert_eq!(
+                reference, code,
+                "the fast path hands a non-finite transform to the reference"
+            );
         }
     }
 

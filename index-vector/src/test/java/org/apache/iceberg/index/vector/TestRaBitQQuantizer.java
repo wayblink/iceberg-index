@@ -176,6 +176,21 @@ class TestRaBitQQuantizer {
   }
 
   @Test
+  public void aVectorThatOverflowsTheTransformTakesTheJavaLevelRule() {
+    // dimension 2 pads to 2 and one bit gives two levels. The transform of [3e38, 3e38] overflows
+    // to [inf, 0]; the grid is [NaN, 0.5], and Math.round(NaN) is 0, so the code is level 1 in the
+    // second coordinate and level 0 in the first: 0b10. A min/max that drops NaN would put the
+    // first coordinate on the last level and write 0b11 instead.
+    RaBitQQuantizer quantizer = RaBitQQuantizer.train(new float[][] {{0.0f, 0.0f}}, 2, 0L, 1);
+    byte[] code = new byte[quantizer.codeBytes()];
+    float[] factors = new float[RaBitQQuantizer.FACTORS];
+    for (float[] vector : new float[][] {{3.0e38f, 3.0e38f}, {-3.0e38f, -3.0e38f}}) {
+      quantizer.encode(vector, code, 0, factors);
+      assertThat(code).as("the one-bit code of the overflowing vector").containsExactly(0x02);
+    }
+  }
+
+  @Test
   public void padsADimensionThatIsNotAPowerOfTwo() {
     // the Hadamard transform needs a power of two, so a vector is zero padded to one; the padding
     // is zero on both sides of an inner product, which leaves the estimate alone

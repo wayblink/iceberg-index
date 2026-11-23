@@ -203,8 +203,9 @@ public final class TextIndexAdapter implements IndexAdapter, java.io.Serializabl
   /**
    * The reader that measures a payload of the layout this definition selects.
    *
-   * <p>The payload layout keeps the {@code text/bm25/1} identity that the residency records of an
-   * index built before it already carry: the reader that decodes it is the same one.
+   * <p>The identity stays {@code text/bm25/1} because the same reader decodes the payload; the
+   * payload itself carries a layout tag that the reader checks, and a file written by the earlier
+   * per-posting layout is rejected with a rebuild hint rather than decoded at the wrong offsets.
    */
   private String readerId() {
     return "text/bm25/" + TextIndexPayload.FORMAT_VERSION;
@@ -381,6 +382,12 @@ public final class TextIndexAdapter implements IndexAdapter, java.io.Serializabl
   /** Opens the payload layout its signature names. */
   private static TextIndexShard decode(TextIndexSource.Source source, int size) throws IOException {
     if (size >= Integer.BYTES && source.read(0, Integer.BYTES).getInt() == TextIndexPayload.MAGIC) {
+      if (TextIndexPayload.isEarlierLayout(source, size)) {
+        // a rebuild, not a search: the payload of the earlier layout cannot be decoded by this
+        // reader, and saying so here keeps a refresh from scoring bytes it does not understand
+        throw new IllegalArgumentException(TextIndexPayload.EARLIER_LAYOUT_MESSAGE);
+      }
+
       return TextIndexPayload.open(source, size);
     }
 
