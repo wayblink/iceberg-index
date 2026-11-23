@@ -1,6 +1,10 @@
 # BM25 索引 payload 设计（单一布局：文件表 + 长度列 + posting）
 
-状态：已收敛。此前存在三种布局（逐条行引用的 v1、按 4096 文档分块的 v2、长度列的 v3），2026-11-23 起只保留第三种，并把它的版本号定为 **1**（blob 类型 `iceberg-text-bm25-v1`、payload magic `0x424D3101`、`FORMAT_VERSION = 1`、readerId `text/bm25/1`）。旧两种布局的代码与读路径已删除，不做向后兼容。
+状态：已收敛。此前存在三种布局（逐条行引用的 v1、按 4096 文档分块的 v2、长度列的 v3），2026-11-23 起只保留第三种；它的 payload 格式版本为 **2**（blob 类型 `iceberg-text-bm25-v1`、payload magic `0x424D3102`、`FORMAT_VERSION = 2`、readerId `text/bm25/2`）。版本号写在 payload 签名的低字节，与向量 kernel 的 `payloadFormatVersion` 同一规范；blob 类型只标角色，不随版本变。旧两种布局的代码与读路径已删除，不做向后兼容。
+
+## 升级
+
+版本 1 写出的文本索引在本版不可读：查询和刷新都会明确报 `Unsupported BM25 payload format version: 1 (this build reads 2); rebuild the index`，`CALL system.check_indexes` 会把它们报成 `readable => false` 并给出重建语句。迁移不能靠 `refresh_text_index`——刷新沿用父快照的分片，旧 payload 不会被重写；必须先 `CALL system.drop_index(table => '...', column => '...', index => '<uuid>', purge => true)`，再 `CALL system.build_text_index(table => '...', column => '...')`。
 
 ## 1. 目标与约束
 

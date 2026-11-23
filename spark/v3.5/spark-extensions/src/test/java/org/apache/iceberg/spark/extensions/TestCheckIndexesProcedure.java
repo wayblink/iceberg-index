@@ -200,11 +200,23 @@ public class TestCheckIndexesProcedure extends ExtensionsTestBase {
       assertThat((Integer) row[6]).as("the version the payload names").isEqualTo(1);
       assertThat((Integer) row[7]).as("the version this build reads").isEqualTo(2);
       assertThat((Boolean) row[8]).as("readable").isFalse();
+
+      // a refresh carries the shards of the previous snapshot over and cannot rewrite an older
+      // payload, so the only statement that migrates the index is a drop followed by a build
+      String qualified = catalogName + "." + table.replaceFirst("^" + catalogName + "\\.", "");
+      String indexUuid = (String) row[2];
       assertThat((String) row[12])
           .as("the report says which version wrote it and what to run")
           .contains("payload was written by text version 1")
           .contains("this build reads 2")
-          .contains("refresh_text_index");
+          .contains(
+              "drop_index(table => '"
+                  + qualified
+                  + "', column => 'body', index => '"
+                  + indexUuid
+                  + "', purge => true)")
+          .contains("build_text_index(table => '" + qualified + "', column => 'body')")
+          .doesNotContain("refresh_text_index");
     } finally {
       sql("DROP TABLE IF EXISTS %s PURGE", table);
     }

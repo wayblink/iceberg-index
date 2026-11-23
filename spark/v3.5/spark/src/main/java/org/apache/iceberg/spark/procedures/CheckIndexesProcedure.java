@@ -74,6 +74,12 @@ class CheckIndexesProcedure extends BaseProcedure {
     return refreshSuggestion(catalog, tableName, column, indexType);
   }
 
+  // package private so a test can pin the statements that migrate an unreadable index
+  static String rebuildSuggestionFor(
+      String catalog, String tableName, String column, String indexType, String indexUuid) {
+    return rebuildSuggestion(catalog, tableName, column, indexType, indexUuid);
+  }
+
   private static final ProcedureParameter TABLE_PARAM =
       ProcedureParameter.required("table", DataTypes.StringType);
 
@@ -291,7 +297,9 @@ class CheckIndexesProcedure extends BaseProcedure {
    *
    * <p>A payload that declares a version this build does not read would be skipped by a query
    * rather than fail it, which is why a partly readable snapshot is reported as needing a rebuild
-   * instead of as readable.
+   * instead of as readable. A refresh carries the readable files of the previous snapshot over, so
+   * it cannot migrate an index whose bytes this build does not decode: the report gives the drop
+   * and the build that can.
    */
   private void checkDeclaredPayloads(
       String catalog,
@@ -305,6 +313,7 @@ class CheckIndexesProcedure extends BaseProcedure {
       List<InternalRow> rows)
       throws java.io.IOException {
     String indexType = metadata.indexType();
+    TextIndexAdapter text = adapter instanceof TextIndexAdapter ? (TextIndexAdapter) adapter : null;
     Set<String> present = new LinkedHashSet<>();
     Set<String> unreadable = new LinkedHashSet<>();
     for (IndexFile file : VectorIndexes.indexFiles(table.io(), snapshot)) {
@@ -320,19 +329,21 @@ class CheckIndexesProcedure extends BaseProcedure {
               table,
               column,
               metadata,
-              null,
+              text == null ? null : "text",
               -1,
-              -1,
+              text == null ? -1 : text.payloadFormatVersion(),
               false,
               snapshot.sourceTableSnapshotId(),
               isStale(table, snapshot),
               uncovered,
               "no payload found in the index files; "
-                  + refreshSuggestion(catalog, tableName, column, indexType)));
+                  + (text == null
+                      ? refreshSuggestion(catalog, tableName, column, indexType)
+                      : rebuildSuggestion(
+                          catalog, tableName, column, indexType, metadata.indexUuid()))));
       return;
     }
 
-    TextIndexAdapter text = adapter instanceof TextIndexAdapter ? (TextIndexAdapter) adapter : null;
     int readerVersion = -1;
     Integer writerVersion = null;
     boolean versionReadable = true;
@@ -340,35 +351,35 @@ class CheckIndexesProcedure extends BaseProcedure {
     String headerError = null;
     if (text != null) {
       readerVersion = text.payloadFormatVersion();
-      try {
-        byte[] payload = firstPayload(table, metadata, snapshot, text.auxiliaryBlobType());
-        if (payload == null) {
-          missingPayload = true;
+      if (unreadable.isEmpty()) {
+        try {
+          byte[] payload = firstPayload(table, metadata, snapshot, text.auxiliaryBlobType());
+          if (payload == null) {
+            missingPayload = true;
+            versionReadable = false;
+          } else {
+            writerVersion = text.payloadVersion(ByteBuffer.wrap(payload));
+            versionReadable = writerVersion == readerVersion;
+          }
+        } catch (RuntimeException e) {
+          // a payload whose header cannot be read at all is exactly what this reports
           versionReadable = false;
-        } else {
-          writerVersion = text.payloadVersion(ByteBuffer.wrap(payload));
-          versionReadable = writerVersion == readerVersion;
+          headerError = e.getMessage();
         }
-      } catch (RuntimeException e) {
-        // a payload whose header cannot be read at all is exactly what this reports
-        versionReadable = false;
-        headerError = e.getMessage();
       }
     }
 
     boolean readable = unreadable.isEmpty() && versionReadable;
     String suggestion = null;
-    if (!unreadable.isEmpty()) {
-      suggestion =
-          "payloads were written as "
-              + String.join(", ", unreadable)
-              + ", this build reads "
-              + String.join(", ", readableBlobTypes(adapter))
-              + "; "
-              + refreshSuggestion(catalog, tableName, column, indexType);
-    } else if (!versionReadable) {
+    if (!readable) {
       String reason;
-      if (missingPayload) {
+      if (!unreadable.isEmpty()) {
+        reason =
+            "payloads were written as "
+                + String.join(", ", unreadable)
+                + ", this build reads "
+                + String.join(", ", readableBlobTypes(adapter));
+      } else if (missingPayload) {
         reason = "no payload found in the index files";
       } else if (headerError != null) {
         reason = "payload header is unreadable (" + headerError + ")";
@@ -380,7 +391,12 @@ class CheckIndexesProcedure extends BaseProcedure {
                 + readerVersion;
       }
 
-      suggestion = reason + "; " + refreshSuggestion(catalog, tableName, column, indexType);
+      suggestion =
+          reason
+              + "; "
+              + (text == null
+                  ? refreshSuggestion(catalog, tableName, column, indexType)
+                  : rebuildSuggestion(catalog, tableName, column, indexType, metadata.indexUuid()));
     }
 
     rows.add(
@@ -414,15 +430,35 @@ class CheckIndexesProcedure extends BaseProcedure {
     return blobTypes;
   }
 
-  /** The statement that rebuilds the index, which is the only thing a mismatch leaves to do. */
+  /** The statement that asks the index of the type to refresh itself from the table. */
   private static String refreshSuggestion(
       String catalog, String tableName, String column, String indexType) {
-    // a table named with or without its catalog both end up as catalog.namespace.table
-    String bare =
-        tableName.startsWith(catalog + ".") ? tableName.substring(catalog.length() + 1) : tableName;
     return String.format(
         "run CALL %s.system.refresh_%s_index(table => '%s', column => '%s')",
-        catalog, indexType, catalog + "." + bare, column);
+        catalog, indexType, qualified(catalog, tableName), column);
+  }
+
+  /**
+   * The two statements that rebuild an index this build cannot read.
+   *
+   * <p>A refresh carries the readable files of the previous snapshot over, so a payload of another
+   * format version survives it: the index has to be dropped and built again. Both statements are
+   * named, in the order they have to run, because either one alone leaves the index as it is.
+   */
+  private static String rebuildSuggestion(
+      String catalog, String tableName, String column, String indexType, String indexUuid) {
+    String qualified = qualified(catalog, tableName);
+    return String.format(
+        "run CALL %s.system.drop_index(table => '%s', column => '%s', index => '%s', purge => true)"
+            + " then CALL %s.system.build_%s_index(table => '%s', column => '%s')",
+        catalog, qualified, column, indexUuid, catalog, indexType, qualified, column);
+  }
+
+  /** A table named with or without its catalog both end up as catalog.namespace.table. */
+  private static String qualified(String catalog, String tableName) {
+    String bare =
+        tableName.startsWith(catalog + ".") ? tableName.substring(catalog.length() + 1) : tableName;
+    return catalog + "." + bare;
   }
 
   /** Reads the header of the first payload, which is where a mismatch shows up first. */
