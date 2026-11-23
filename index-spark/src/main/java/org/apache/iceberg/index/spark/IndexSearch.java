@@ -311,26 +311,15 @@ public final class IndexSearch {
     // added after a file was written is absent from that file, and telling Spark which columns were
     // asked for is what turns the absence into a null instead of a missing field
     StructType readSchema = IndexEntries.sparkSchema(table, readColumns);
-    Map<String, Map<Long, Row>> rowsByFile =
-        IndexEntries.rowsAt(spark, table, snapshotId, positionsByFile, readColumns, readSchema);
-
-    Map<String, Map<Long, String>> jsonByFile = Maps.newHashMap();
-    for (Map.Entry<String, Map<Long, Row>> entry : rowsByFile.entrySet()) {
-      Map<Long, Row> rows = entry.getValue();
-      Map<Long, String> json = Maps.newLinkedHashMap();
-      if (!rows.isEmpty()) {
-        List<Row> rowList = Lists.newArrayList(rows.values());
-        List<String> serialized =
-            spark.createDataFrame(rowList, rowList.get(0).schema()).toJSON().collectAsList();
-        int index = 0;
-        for (Long position : rows.keySet()) {
-          json.put(position, serialized.get(index));
-          index += 1;
-        }
-      }
-      jsonByFile.put(entry.getKey(), json);
-    }
-
-    return jsonByFile;
+    // the JSON of a row is produced by the task that read it, so the rows cross the driver barrier
+    // once: collecting them here and then parallelising them again to serialise them crosses it
+    // twice
+    return IndexEntries.rowsAtJson(
+        spark,
+        table,
+        positionsByFile,
+        readColumns,
+        readSchema,
+        IndexEntries.scanTasks(table, snapshotId));
   }
 }
