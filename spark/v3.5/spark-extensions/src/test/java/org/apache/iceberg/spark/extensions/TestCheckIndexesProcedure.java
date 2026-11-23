@@ -20,8 +20,21 @@ package org.apache.iceberg.spark.extensions;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
+import java.io.IOException;
+import java.io.OutputStream;
+import java.nio.ByteBuffer;
 import java.util.List;
 import org.apache.iceberg.Table;
+import org.apache.iceberg.index.IndexFile;
+import org.apache.iceberg.index.IndexMetadata;
+import org.apache.iceberg.index.spark.VectorIndexes;
+import org.apache.iceberg.io.IOUtil;
+import org.apache.iceberg.io.InputFile;
+import org.apache.iceberg.io.SeekableInputStream;
+import org.apache.iceberg.puffin.BlobMetadata;
+import org.apache.iceberg.puffin.Puffin;
+import org.apache.iceberg.puffin.PuffinReader;
+import org.apache.iceberg.spark.Spark3Util;
 import org.junit.jupiter.api.TestTemplate;
 
 /**
@@ -155,6 +168,86 @@ public class TestCheckIndexesProcedure extends ExtensionsTestBase {
 
   private String tableLocation(Table table) {
     return table.name();
+  }
+
+  @TestTemplate
+  public void aTextPayloadOfAnotherVersionIsReportedAsUnreadable() throws Exception {
+    String table = tableName("check_text_version_" + catalogName);
+    sql("CREATE TABLE %s (id bigint, body string) USING iceberg", table);
+    sql(
+        "INSERT INTO %s VALUES (1, 'iceberg table format'), (2, 'iceberg snapshot manifests')",
+        table);
+    try {
+      sql("CALL %s.system.build_text_index(table => '%s', column => 'body')", catalogName, table);
+
+      Table icebergTable = Spark3Util.loadIcebergTable(spark, table);
+      IndexMetadata metadata = VectorIndexes.findIndex(icebergTable, "body", "text");
+      List<IndexFile> files =
+          VectorIndexes.indexFiles(icebergTable.io(), metadata.latestSnapshot());
+      assertThat(files).isNotEmpty();
+      // the blob type names the role, not the version, so the payload header is the only place a
+      // reader learns that an index was written before the layout moved on. Stamping the previous
+      // version's signature in place is what such an index looks like.
+      for (IndexFile file : files) {
+        stampPayloadVersion(icebergTable, file, 0x424D3101);
+      }
+
+      List<Object[]> rows = check(table);
+      assertThat(rows).hasSize(1);
+      Object[] row = rows.get(0);
+      assertThat((String) row[4]).as("index type").isEqualTo("text");
+      assertThat((String) row[5]).as("writer").isEqualTo("text");
+      assertThat((Integer) row[6]).as("the version the payload names").isEqualTo(1);
+      assertThat((Integer) row[7]).as("the version this build reads").isEqualTo(2);
+      assertThat((Boolean) row[8]).as("readable").isFalse();
+
+      // a refresh carries the shards of the previous snapshot over and cannot rewrite an older
+      // payload, so the only statement that migrates the index is a drop followed by a build
+      String qualified = catalogName + "." + table.replaceFirst("^" + catalogName + "\\.", "");
+      String indexUuid = (String) row[2];
+      assertThat((String) row[12])
+          .as("the report says which version wrote it and what to run")
+          .contains("payload was written by text version 1")
+          .contains("this build reads 2")
+          .contains(
+              "drop_index(table => '"
+                  + qualified
+                  + "', column => 'body', index => '"
+                  + indexUuid
+                  + "', purge => true)")
+          .contains("build_text_index(table => '" + qualified + "', column => 'body')")
+          .doesNotContain("refresh_text_index");
+    } finally {
+      sql("DROP TABLE IF EXISTS %s PURGE", table);
+    }
+  }
+
+  /**
+   * Rewrites the format version of the first payload of an index file, leaving its length and every
+   * offset after the signature unchanged.
+   */
+  private static void stampPayloadVersion(Table table, IndexFile file, int magic)
+      throws IOException {
+    InputFile input = table.io().newInputFile(file.location());
+    int offset;
+    try (PuffinReader reader = Puffin.read(input).build()) {
+      BlobMetadata blob =
+          reader.fileMetadata().blobs().stream()
+              .filter(metadata -> file.blobType().equals(metadata.type()))
+              .findFirst()
+              .orElseThrow(() -> new IOException("No payload blob in " + file.location()));
+      offset = Math.toIntExact(blob.offset());
+    }
+
+    byte[] content = new byte[Math.toIntExact(input.getLength())];
+    try (SeekableInputStream in = input.newStream()) {
+      IOUtil.readFully(in, content, 0, content.length);
+    }
+
+    ByteBuffer.wrap(content).putInt(offset, magic);
+    try (OutputStream out = table.io().newOutputFile(file.location()).createOrOverwrite()) {
+      out.write(content);
+    }
   }
 
   private void createAndIndex(String table) {

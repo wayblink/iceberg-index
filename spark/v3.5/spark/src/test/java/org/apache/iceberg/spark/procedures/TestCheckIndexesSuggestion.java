@@ -46,6 +46,19 @@ class TestCheckIndexesSuggestion {
   }
 
   @Test
+  public void anUnreadableTextIndexSuggestsTheDropAndBuildThatMigratesIt() {
+    // refresh carries the shards of the previous snapshot over, so it cannot rewrite a payload of
+    // another format version; the statements given are the pair that rebuilds the index
+    assertThat(
+            CheckIndexesProcedure.rebuildSuggestionFor(
+                "prod", "db.documents", "body", "text", "9f439b33"))
+        .isEqualTo(
+            "run CALL prod.system.drop_index(table => 'prod.db.documents', column => 'body', "
+                + "index => '9f439b33', purge => true) then CALL "
+                + "prod.system.build_text_index(table => 'prod.db.documents', column => 'body')");
+  }
+
+  @Test
   public void theStatementRefreshesTheIndexOfTheTypeThatNeedsIt() {
     // a text index is rebuilt by the procedure of its own type; suggesting the vector one would
     // hand the operator a statement that cannot fix what the row reports

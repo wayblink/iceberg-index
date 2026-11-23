@@ -480,7 +480,7 @@ ALTER TABLE local.db.papers CREATE INDEX USING fts (body);
 
 写成 `CREATE INDEX body_fts USING fts (body)` 会报 "a text index cannot be named"。这条限制会牵连后续的按名寻址（5.5）。
 
-BM25 v1 默认将每个词的倒排独立压缩，查询按字节范围读取所需词项。构建和刷新都会为索引快照发布全局 DF、文档数和总 token 数，查询直接读取所需统计。此前实验格式写出的索引文件需要重新构建。
+BM25 payload（格式版本 2，blob 类型仍为 `iceberg-text-bm25-v1`）默认将每个词的倒排独立压缩，查询按字节范围读取所需词项。构建和刷新都会为索引快照发布全局 DF、文档数和总 token 数，查询直接读取所需统计。格式版本与构建不匹配的旧索引不能靠 `refresh_text_index` 迁移——刷新会沿用旧分片、旧 payload 不会被重写；查询和刷新会报 `Unsupported BM25 payload format version: ...; rebuild the index`，必须先 `CALL local.system.drop_index(table => 'db.papers', column => 'body', index => '<uuid>', purge => true)` 再 `CALL local.system.build_text_index(table => 'db.papers', column => 'body')`（`CALL local.system.check_indexes(table => 'db.papers')` 会给出这两条语句）。
 
 仅重写 manifest 也会产生新的表快照。运行 `refresh_text_index` 后，新索引快照会复用相同的倒排分片和语料统计。
 

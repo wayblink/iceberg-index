@@ -361,26 +361,26 @@ class TestTextIndexAdapter {
   }
 
   @Test
-  public void aShardWrittenByTheEarlierLayoutAsksForARebuild() {
+  public void aShardOfAnotherVersionAsksForARebuild() {
     TextIndexAdapter adapter =
         new TextIndexAdapter(TextIndexDefinition.builder().fieldId(1).build());
-    ByteBuffer earlier = earlierLayoutPayload();
+    ByteBuffer earlier = versionOnePayload();
 
     assertThatThrownBy(() -> adapter.prepareAuxiliary(earlier))
-        .as("a cached shard written by the earlier layout cannot be decoded")
+        .as("a cached shard of another version cannot be decoded")
         .isInstanceOf(IllegalArgumentException.class)
-        .hasMessageContaining("earlier layout")
+        .hasMessageContaining("Unsupported BM25 payload format version: 1")
         .hasMessageContaining("rebuild the index");
     assertThatThrownBy(
             () -> adapter.searchAuxiliaryAll(List.of(earlier), adapter.encodeQuery("ice"), 1))
-        .as("a search over shards written by the earlier layout fails instead of scoring them")
+        .as("a search over shards of another version fails instead of scoring them")
         .isInstanceOf(IllegalArgumentException.class)
-        .hasMessageContaining("earlier layout")
+        .hasMessageContaining("Unsupported BM25 payload format version: 1")
         .hasMessageContaining("rebuild the index");
   }
 
-  /** The header of the per-posting layout this build replaced, 280 bytes in all. */
-  private static ByteBuffer earlierLayoutPayload() {
+  /** The header a version 1 build wrote, 280 bytes in all. */
+  private static ByteBuffer versionOnePayload() {
     int headerSize = Integer.BYTES + 2 * Long.BYTES + (64 + 1) * Integer.BYTES;
     ByteBuffer payload = ByteBuffer.allocate(headerSize);
     payload.putInt(0x424D3101);
@@ -410,7 +410,19 @@ class TestTextIndexAdapter {
 
     IndexBuildResult build = adapter.encodeAuxiliaryPayloadWithMemory(entries, 1);
     assertThat(build.memory()).isNotNull();
-    assertThat(build.memory().readerId()).isEqualTo("text/bm25/1");
+    assertThat(build.memory().readerId()).isEqualTo("text/bm25/2");
+  }
+
+  @Test
+  void aPayloadNamesTheVersionThisBuildWrites() {
+    TextIndexAdapter adapter =
+        new TextIndexAdapter(TextIndexDefinition.builder().fieldId(1).build());
+
+    ByteBuffer payload = adapter.encodeAuxiliaryPayload(allEntries());
+    assertThat(payload.getInt(payload.position()))
+        .as("the signature names the format version")
+        .isEqualTo(0x424D3102);
+    assertThat(adapter.payloadVersion(payload)).isEqualTo(adapter.payloadFormatVersion());
   }
 
   private static IndexEntry entry(String dataFile, long position, String text) {

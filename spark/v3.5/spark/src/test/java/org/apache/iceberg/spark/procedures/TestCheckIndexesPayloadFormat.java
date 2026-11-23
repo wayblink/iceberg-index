@@ -19,24 +19,37 @@
 package org.apache.iceberg.spark.procedures;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
-import org.apache.iceberg.index.IndexAdapter;
+import java.nio.ByteBuffer;
+import java.nio.charset.StandardCharsets;
+import java.util.List;
+import org.apache.iceberg.index.IndexEntry;
 import org.apache.iceberg.index.IndexFile;
 import org.apache.iceberg.index.text.TextIndexAdapter;
 import org.apache.iceberg.index.text.TextIndexDefinition;
 import org.junit.jupiter.api.Test;
 
 /**
- * Pins which payloads the check accepts for an index type that names its version in the blob type,
- * which is the only thing that can tell such a payload apart from one this build cannot read.
+ * Pins how the check decides which payloads it can read: for an index type that names its version
+ * in the blob type, the manifest alone; for the text index, the format version in the payload
+ * header, the way the vector index is checked by its kernel version. The blob type names the role
+ * either way and does not change when the payload layout does.
  */
 class TestCheckIndexesPayloadFormat {
 
   private static final String TEXT_AUXILIARY_BLOB_TYPE = "iceberg-text-bm25-v1";
   private static final String TEXT_AUXILIARY_BLOB_TYPE_REPLACED = "iceberg-text-bm25-v2";
 
-  private static IndexAdapter textAdapter() {
+  private static TextIndexAdapter textAdapter() {
     return new TextIndexAdapter(TextIndexDefinition.builder().fieldId(2).build());
+  }
+
+  private static List<IndexEntry> entries() {
+    TextIndexAdapter adapter = textAdapter();
+    return List.of(
+        IndexEntry.of("a.parquet", 0, adapter.encodeDocument("ice iceberg")),
+        IndexEntry.of("a.parquet", 1, adapter.encodeDocument("ice vector")));
   }
 
   @Test
@@ -83,5 +96,45 @@ class TestCheckIndexesPayloadFormat {
             CheckIndexesProcedure.readablePayload(
                 textAdapter(), IndexFile.Kind.ENTRY_BEARING, TEXT_AUXILIARY_BLOB_TYPE))
         .isFalse();
+  }
+
+  @Test
+  public void aTextPayloadOfTheVersionThisBuildWritesIsReadable() {
+    TextIndexAdapter adapter = textAdapter();
+    ByteBuffer payload = adapter.encodeAuxiliaryPayload(entries());
+
+    assertThat(adapter.payloadVersion(payload))
+        .as("the version in the signature is the one this build reads")
+        .isEqualTo(adapter.payloadFormatVersion());
+  }
+
+  @Test
+  public void aTextPayloadOfAReplacedVersionIsNotReadable() {
+    TextIndexAdapter adapter = textAdapter();
+    // the bytes of a payload of this build with only the version in its signature changed: that is
+    // what an index written by the previous layout looks like, and the header is the only place a
+    // reader can tell it apart from one it can decode
+    ByteBuffer payload = adapter.encodeAuxiliaryPayload(entries());
+    payload.putInt(payload.position(), 0x424D3101);
+
+    assertThat(adapter.payloadVersion(payload))
+        .as("a reader matches the version in the signature")
+        .isEqualTo(1)
+        .isNotEqualTo(adapter.payloadFormatVersion());
+  }
+
+  @Test
+  public void aPayloadWithoutASignatureIsNotReadable() {
+    TextIndexAdapter adapter = textAdapter();
+
+    assertThatThrownBy(() -> adapter.payloadVersion(ByteBuffer.wrap(new byte[] {1, 2, 3})))
+        .isInstanceOf(IllegalArgumentException.class)
+        .hasMessageContaining("Truncated BM25 payload header");
+    assertThatThrownBy(
+            () ->
+                adapter.payloadVersion(
+                    ByteBuffer.wrap("NOTMAGIC".getBytes(StandardCharsets.US_ASCII))))
+        .isInstanceOf(IllegalArgumentException.class)
+        .hasMessageContaining("Not a BM25 payload");
   }
 }

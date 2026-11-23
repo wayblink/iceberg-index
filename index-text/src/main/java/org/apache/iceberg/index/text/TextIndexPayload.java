@@ -43,44 +43,33 @@ import org.apache.iceberg.relocated.com.google.common.collect.Sets;
  * The payload layout of a text index file: the corpus counts, the file table, one dense
  * document-length column, and the dictionary with its postings.
  *
+ * <p>The signature that starts a payload names the format version, and a reader refuses a version
+ * it does not know rather than guessing at the offsets of a layout it never wrote: a payload of
+ * another version is reported as needing a rebuild, which is the only thing that fixes it. The blob
+ * type names the role of the payload and does not change with its version.
+ *
  * <p>A document's data file and row position are not stored per document. An index file covers the
  * rows of its data files in order, so a file's rows are consecutive: the file table records where
  * each file's first document starts, which makes the position of any document a subtraction. Only
  * the lengths are per document, because scoring needs them and they follow from nothing else; they
- * are a fixed-width column that a query reads in one range instead of the per-document records v2
- * decoded one table chunk at a time.
+ * are a fixed-width column that a query reads in one range instead of the per-document records an
+ * earlier layout decoded one table chunk at a time.
  */
 final class TextIndexPayload {
-  /** The layout version this build writes; it is part of the payload signature. */
-  static final int FORMAT_VERSION = 1;
+  /** The leading bytes every version of this payload shares; the low byte is the version. */
+  static final int SIGNATURE = 0x424D3100;
 
-  static final int MAGIC = 0x424D3100 | FORMAT_VERSION;
+  /** The layout version this build writes; it is the low byte of the payload signature. */
+  static final int FORMAT_VERSION = 2;
+
+  static final int MAGIC = SIGNATURE | FORMAT_VERSION;
 
   private static final int BUCKET_COUNT = 64;
-
-  /**
-   * A second signature that names this layout, written between the signature and the counts.
-   *
-   * <p>The per-posting layout this build replaced kept the version, so the version alone cannot
-   * tell the two apart. That layout wrote its document count where this tag sits, and the high half
-   * of a document count is zero for any shard a build can write, so the tag is what distinguishes
-   * the payloads.
-   */
-  static final int LAYOUT_TAG = 0x4C41594F; // "LAYO"
-
-  /** The header of the earlier per-posting layout: signature, two counts and 65 bucket offsets. */
-  static final int EARLIER_LAYOUT_SIZE =
-      Integer.BYTES + 2 * Long.BYTES + (BUCKET_COUNT + 1) * Integer.BYTES;
-
-  /** The error a reader gives for a payload the earlier per-posting layout wrote. */
-  static final String EARLIER_LAYOUT_MESSAGE =
-      "Invalid BM25 payload written by an earlier layout; rebuild the index";
 
   /** A length at or above this value is stored in the overflow list instead of the column. */
   static final int MAX_INLINE_LENGTH = 0xFFFF;
 
-  static final int HEADER_SIZE =
-      2 * Integer.BYTES + 2 * Long.BYTES + 4 * 7 + (BUCKET_COUNT + 1) * 4;
+  static final int HEADER_SIZE = Integer.BYTES + 2 * Long.BYTES + 4 * 7 + (BUCKET_COUNT + 1) * 4;
 
   private TextIndexPayload() {}
 
@@ -118,7 +107,6 @@ final class TextIndexPayload {
     ByteArrayOutputStream bytes =
         new ByteArrayOutputStream(Math.addExact(postingsStart, dictionary.postings.length));
     writeIntBE(bytes, MAGIC);
-    writeIntBE(bytes, LAYOUT_TAG);
     writeLongBE(bytes, counts.documents);
     writeLongBE(bytes, counts.tokens);
     writeIntBE(bytes, files.size());
@@ -330,18 +318,22 @@ final class TextIndexPayload {
   }
 
   static boolean matches(ByteBuffer payload) {
-    return payload.remaining() >= 2 * Integer.BYTES
-        && payload.getInt(payload.position()) == MAGIC
-        && payload.getInt(payload.position() + Integer.BYTES) == LAYOUT_TAG;
+    return payload.remaining() >= Integer.BYTES && payload.getInt(payload.position()) == MAGIC;
   }
 
   /**
-   * Whether the payload at {@code source} was written by the per-posting layout this build
-   * replaced, which kept the signature but wrote its first count where the layout tag sits.
+   * The format version an in-family signature names, or -1 when the signature belongs to no version
+   * of this payload.
    */
-  static boolean isEarlierLayout(TextIndexSource.Source source, int size) throws IOException {
-    return size >= EARLIER_LAYOUT_SIZE
-        && source.read(Integer.BYTES, Integer.BYTES).getInt() != LAYOUT_TAG;
+  static int versionOf(int magic) {
+    return (magic & ~0xFF) == SIGNATURE ? magic & 0xFF : -1;
+  }
+
+  /** The error a reader gives for a payload written by a version it does not read. */
+  static String unsupportedVersionMessage(int version) {
+    return String.format(
+        "Unsupported BM25 payload format version: %s (this build reads %s); rebuild the index",
+        version, FORMAT_VERSION);
   }
 
   static TextIndexSource.Source source(SeekableInputStream stream, long base) {
@@ -349,15 +341,15 @@ final class TextIndexPayload {
   }
 
   static Reader open(TextIndexSource.Source source, int size) throws IOException {
-    // the earlier layout is the smallest payload that can carry a signature, so the size is checked
-    // against it before the signature and the tag are read: a truncated payload still reads as a
-    // size problem, and an earlier payload is told to rebuild instead of being parsed
-    check(size >= EARLIER_LAYOUT_SIZE, "Invalid BM25 payload size");
-    check(source.read(0, Integer.BYTES).getInt() == MAGIC, "Not a BM25 payload");
-    check(!isEarlierLayout(source, size), EARLIER_LAYOUT_MESSAGE);
+    // the signature is four bytes, so a shorter payload cannot even say what it is; the version is
+    // checked before the header size, because a payload of another version has another header and
+    // would otherwise be reported as truncated
+    check(size >= Integer.BYTES, "Invalid BM25 payload size");
+    int version = versionOf(source.read(0, Integer.BYTES).getInt());
+    check(version >= 0, "Not a BM25 payload");
+    check(version == FORMAT_VERSION, unsupportedVersionMessage(version));
     check(size >= HEADER_SIZE, "Invalid BM25 payload size");
     ByteBuffer header = source.read(0, HEADER_SIZE);
-    header.getInt();
     header.getInt();
     long documents = header.getLong();
     long tokens = header.getLong();

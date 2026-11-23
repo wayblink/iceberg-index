@@ -48,6 +48,7 @@ import org.apache.iceberg.io.SeekableInputStream;
 import org.apache.iceberg.puffin.BlobMetadata;
 import org.apache.iceberg.puffin.Puffin;
 import org.apache.iceberg.puffin.PuffinReader;
+import org.apache.iceberg.relocated.com.google.common.base.Preconditions;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableMap;
 import org.apache.iceberg.relocated.com.google.common.collect.Lists;
 import org.apache.iceberg.relocated.com.google.common.collect.Maps;
@@ -72,7 +73,13 @@ public final class TextIndexAdapter implements IndexAdapter, java.io.Serializabl
 
   static final String ENTRY_BLOB_TYPE = "iceberg-text-entries-v1";
 
-  /** The payload layout: a length column, the file table and the postings. */
+  /**
+   * The payload layout: a length column, the file table and the postings.
+   *
+   * <p>The blob type names the role a payload plays, not the version that wrote it; the version is
+   * the first four bytes of the payload. A layout change bumps that version instead of the blob
+   * type, so a build that cannot read an index still finds it under the type it looks for.
+   */
   static final String AUXILIARY_BLOB_TYPE = "iceberg-text-bm25-v1";
 
   private final TextIndexDefinition definition;
@@ -203,12 +210,38 @@ public final class TextIndexAdapter implements IndexAdapter, java.io.Serializabl
   /**
    * The reader that measures a payload of the layout this definition selects.
    *
-   * <p>The identity stays {@code text/bm25/1} because the same reader decodes the payload; the
-   * payload itself carries a layout tag that the reader checks, and a file written by the earlier
-   * per-posting layout is rejected with a rebuild hint rather than decoded at the wrong offsets.
+   * <p>The identity carries the payload format version, which is bumped whenever the bytes a build
+   * writes would be misread by an older reader: a cached payload measured by an older reader is not
+   * the same payload, and the version is what tells the two apart. This is the same rule a vector
+   * kernel follows with {@code vector/<kernel>/<version>}.
    */
   private String readerId() {
     return "text/bm25/" + TextIndexPayload.FORMAT_VERSION;
+  }
+
+  /**
+   * The text payload format version this build writes and reads.
+   *
+   * <p>Part of the payload rather than of the blob type, for the same reason a vector kernel keeps
+   * its version in the payload: the blob type says which role a payload plays, and the payload says
+   * which of its formats wrote it.
+   */
+  public int payloadFormatVersion() {
+    return TextIndexPayload.FORMAT_VERSION;
+  }
+
+  /**
+   * Reads the format version from the first four bytes of a payload, without reading the rest.
+   *
+   * @throws IllegalArgumentException when the payload is truncated or is not a BM25 payload
+   */
+  public int payloadVersion(ByteBuffer payload) {
+    Preconditions.checkNotNull(payload, "Payload is null");
+    Preconditions.checkArgument(
+        payload.remaining() >= Integer.BYTES, "Truncated BM25 payload header");
+    int version = TextIndexPayload.versionOf(payload.getInt(payload.position()));
+    Preconditions.checkArgument(version >= 0, "Not a BM25 payload");
+    return version;
   }
 
   @Override
@@ -379,13 +412,20 @@ public final class TextIndexAdapter implements IndexAdapter, java.io.Serializabl
     return decode(TextIndexSource.source(stream, blob.offset()), Math.toIntExact(blob.length()));
   }
 
-  /** Opens the payload layout its signature names. */
+  /**
+   * Opens the payload, refusing a version this build does not read instead of decoding its bytes at
+   * the offsets of another layout.
+   */
   private static TextIndexShard decode(TextIndexSource.Source source, int size) throws IOException {
-    if (size >= Integer.BYTES && source.read(0, Integer.BYTES).getInt() == TextIndexPayload.MAGIC) {
-      if (TextIndexPayload.isEarlierLayout(source, size)) {
-        // a rebuild, not a search: the payload of the earlier layout cannot be decoded by this
-        // reader, and saying so here keeps a refresh from scoring bytes it does not understand
-        throw new IllegalArgumentException(TextIndexPayload.EARLIER_LAYOUT_MESSAGE);
+    int version =
+        size >= Integer.BYTES
+            ? TextIndexPayload.versionOf(source.read(0, Integer.BYTES).getInt())
+            : -1;
+    if (version >= 0) {
+      if (version != TextIndexPayload.FORMAT_VERSION) {
+        // a rebuild, not a search: the payload cannot be decoded by this reader, and saying so here
+        // keeps a cached shard or a published one from being scored at the wrong offsets
+        throw new IllegalArgumentException(TextIndexPayload.unsupportedVersionMessage(version));
       }
 
       return TextIndexPayload.open(source, size);
