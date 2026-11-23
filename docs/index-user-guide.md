@@ -173,7 +173,7 @@ DDL 必须给名字；`CALL` 在列上还没有索引时可以不命名。**`dim
 | `options['ivf-train-max-iterations']` | `'25'` | Lloyd 迭代轮数上限，1–100。调小能省训练时间，质心更粗。 |
 | `options['ivf-train-convergence-tolerance']` | `'0.0'` | 相邻两轮质心相对位移小于该值即提前停止，取值 0–0.1；`0` 表示默认的“质心逐位相等”判据。调大通常能早停，质量影响需用 recall 验证。 |
 | `options['ivf-assign-kernel']` | `'exact'` | 归属（最近质心）内核：`exact` 是标量 double 路径，`simd` 用 float32 + Vector API 加速。**只对 `l2` 生效**，`cosine` / `dot` 仍走各自的原路径。`simd` 需要执行器 JVM 带 `--add-modules jdk.incubator.vector`；不带时自动回退 `exact` 并在日志里留一条 WARN，索引文件 `structure` 的 `assign-kernel-simd` 记录实际是否跑成。**`simd` 不保证跨 CPU 架构逐字节可复现**：它按 float32 分 lane 累加再水平归约，加法结合顺序随 AVX-512 / AVX2 / NEON 的 lane 数变化，近等距的行可能落到不同 list；要跨机型复现同一份 payload 就用 `exact`。 |
-| `options['ivf-build-kernel']` | `'java'` | IVF 构建内核：`java` 是默认实现，`native` 用 Rust 内核（**只对 `l2` 生效**，payload 与 `java` 逐字节相同）。native 需要执行器 JVM 能加载 `libiceberg_ivf_native`（先在 `java.library.path` 找，再找 jar 内 `/org/apache/iceberg/index/vector/native/<os>-<arch>/` 下的副本），且库与本桥的 ABI 版本一致；库缺失、ABI 不符、非 L2 或运行异常都会自动回退 `java` 并告警，索引文件 `structure` 的 `build-kernel-native` 记录实际路径（1/0）。 |
+| `options['ivf-build-kernel']` | `'java'` | IVF 构建内核：`java` 是默认实现，`native` 用 Rust 内核（**只对 `l2` 生效**，payload 与 `java` 逐字节相同）。native 需要执行器 JVM 能加载 `libiceberg_ivf_native`（先在 `java.library.path` 找，再找 jar 内 `/org/apache/iceberg/index/vector/native/<os>-<arch>/` 下的副本），且库与本桥的 ABI 版本一致；库缺失、ABI 不符、非 L2 或运行异常都会自动回退 `java` 并告警，索引文件 `structure` 的 `build-kernel-native` 记录实际路径（1/0）。大表构建需配合 `spark.executorEnv.MALLOC_ARENA_MAX=2` 与 16g/12g 的堆/overhead 配比，见 §4.2.1「大表构建的内存配置」。 |
 | `max_entries_per_index_file` | 1,000,000 | 索引文件的条目预算，决定如何分组；不拆单个数据文件 |
 | `name` | 无 | 同列多索引时必须给 |
 | `mode` | 无 | 旧名，`EXACT`→`FLAT`、`HNSW`→`HNSW`；与 `structure` 同时给会报错 |
@@ -243,11 +243,34 @@ ALTER TABLE db.t ALTER COLUMN embedding CREATE INDEX idx
 
 读这几个数时注意口径：单元级是单机共享负载（load≈4.7）下的背靠背测量，集群是同一窗口串行两臂；跨 run 的 payload 字节会因数据文件分组不同而不同（总字节差约 0.001%），同一次构建内 java 与 native 才保证逐字节一致。也不要用 dev 档的库去对比性能。
 
+#### 大表构建的内存配置（实测）
+
+1 亿行、317 个 340k 行单元、12 executor × 4c 的实测（ex103m，103,398,233 行 × 2560 维）：
+
+| 每 executor | 分配器环境变量 | 结果 |
+|---|---|---|
+| 24g 堆 + 12g overhead（36 GiB） | 无 | 被 cgroup OOMKilled，12/12 executor 全灭 |
+| 16g 堆 + 12g overhead（28 GiB） | 无 | 206/317 时累计 46 次 OOMKilled，构建失败 |
+| **16g 堆 + 12g overhead（28 GiB）** | **`MALLOC_ARENA_MAX=2`** | **317/317、0 次 OOMKilled、30 分 40 秒** |
+| 16g 堆 + 20g overhead（36 GiB） | `MALLOC_ARENA_MAX=2` | 317/317、0 次 OOMKilled，31–33 分 |
+
+两件事要注意：
+
+- **`spark.executorEnv.MALLOC_ARENA_MAX=2` 必须在 executor 进程启动前设置**，只能写在
+  `spark.executorEnv.*` 下（`spark.kubernetes.executorEnv.*` 会被 Spark 静默丢弃）。它限制 glibc 的
+  per-thread arena 数量；不给这个值时，单元之间释放的页面留在各 arena 里，executor 的 RSS 只涨不落，
+  最终撞上容器上限。**这个值无法由本产品在运行时设置**：实测在 native 库加载时调
+  `mallopt(M_ARENA_MAX, 2)`，与完全不设置同效（JVM 启动时 arena 已经建好，收不回来）。镜像若带
+  jemalloc，对应旋钮是 `MALLOC_CONF`；本产品镜像用 glibc，`MALLOC_CONF` 是空操作。
+- **`-Xms` 默认等于 `-Xmx`**，堆区 RSS 会一直停在 `-Xmx`（活跃对象远小于它时也一样）。大表构建把
+  堆降到 16g 能立刻腾出十几 GB 给非堆；`spark.executor.extraJavaOptions` 覆盖不了 `-Xms`（Spark 把
+  它排在 `-Xms` 之前），只能改 `spark.executor.memory`。
+
 #### 边界
 
 实验能力，**默认仍是 java**，逐表切 native。回退是静默的（日志留 WARN）：库缺失、ABI 不符、非 L2、运行时异常（含内存分配不出来）都会退回 Java，一致性由测试保证（golden 逐字节对比 + 真实数据 SHA-256），但回退会丢掉性能收益，并且一次运行期失败会让该单元在建 Java 路径之前先白跑一遍 native。带 `ivf-build-kernel` 的定义旧版本读不了，滚动升级窗口内不要用。
 
-**内存**：native 构建会把整个单元的向量读进本进程的 native 堆，峰值约 `4 × entries × dimension` 字节，再加一份编码后的 list body 与一份 payload；这部分**不在 `-Xmx` 里**，容器内存上限要按它留余量，且同一 executor 上可能同时有多个单元。分配不出来时内核返回错误并由 Java 内核接手，不会 abort 进程。
+**内存**：native 构建会把整个单元的向量以**一块连续内存**读进本进程的 native 堆，峰值约 `4 × entries × dimension` 字节，再加一份编码后的 list body 与**一份** payload（当前版本不再同时保留四份拷贝）；这部分**不在 `-Xmx` 里**，容器内存上限要按它留余量，且同一 executor 上可能同时有多个单元。单元结束、payload 写出后这些内存会归还，但 glibc 默认按线程保留 arena，因此大表构建需要配合 `MALLOC_ARENA_MAX=2`，见上一节。分配不出来时内核返回错误并由 Java 内核接手，不会 abort 进程。
 
 ### 4.3 查询：五种入口，先分清再用
 
