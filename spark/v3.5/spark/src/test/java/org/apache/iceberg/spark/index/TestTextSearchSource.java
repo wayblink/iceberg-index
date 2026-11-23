@@ -20,7 +20,6 @@ package org.apache.iceberg.spark.index;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
-import java.nio.ByteBuffer;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -29,7 +28,6 @@ import java.util.Collections;
 import java.util.Comparator;
 import java.util.LinkedHashMap;
 import java.util.List;
-import java.util.stream.Collectors;
 import java.util.Map;
 import org.apache.iceberg.FileScanTask;
 import org.apache.iceberg.Table;
@@ -40,16 +38,13 @@ import org.apache.iceberg.index.IndexMetadata;
 import org.apache.iceberg.index.IndexQuery;
 import org.apache.iceberg.index.IndexSearchResult;
 import org.apache.iceberg.index.SidecarIndexCatalog;
-import org.apache.iceberg.index.spark.IndexSearch;
-import org.apache.iceberg.index.spark.SparkIndexBuilder;
-import org.apache.iceberg.index.spark.VectorIndexes;
-import org.apache.iceberg.index.text.TextIndexAdapter;
-import org.apache.iceberg.index.text.TextIndexDefinition;
-import org.apache.iceberg.index.text.TextIndexTypes;
-import org.apache.iceberg.types.Types;
 import org.apache.iceberg.index.spark.DistributedIndexSearch;
 import org.apache.iceberg.index.spark.IndexEntries;
 import org.apache.iceberg.index.spark.IndexSelection;
+import org.apache.iceberg.index.spark.SparkIndexBuilder;
+import org.apache.iceberg.index.text.TextIndexAdapter;
+import org.apache.iceberg.index.text.TextIndexDefinition;
+import org.apache.iceberg.index.text.TextIndexTypes;
 import org.apache.spark.scheduler.SparkListener;
 import org.apache.spark.scheduler.SparkListenerJobStart;
 import org.apache.spark.scheduler.StageInfo;
@@ -61,6 +56,11 @@ import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 import scala.runtime.BoxedUnit;
+import java.nio.ByteBuffer;
+import java.util.stream.Collectors;
+import org.apache.iceberg.index.spark.IndexSearch;
+import org.apache.iceberg.index.spark.VectorIndexes;
+import org.apache.iceberg.types.Types;
 
 class TestTextSearchSource {
   private static Path warehouse;
@@ -192,42 +192,6 @@ class TestTextSearchSource {
   }
 
   @Test
-  void resolvesOnlyTheRequestedColumnsOfAHit() {
-    spark.sql(
-        "CREATE TABLE local.db.projected_row (id bigint, body string, note string) USING iceberg");
-    spark.sql(
-        "INSERT INTO local.db.projected_row VALUES "
-            + "(1, 'ice iceberg', 'first'), (2, 'ice vector', 'second')");
-    Table table = buildIndex("projected_row");
-    IndexMetadata metadata = VectorIndexes.findIndex(table, "body", "text");
-    ByteBuffer query =
-        new TextIndexAdapter((TextIndexDefinition) metadata.definition()).encodeQuery("iceberg");
-
-    // null is the whole row, which is the contract CALL text_search answers with
-    List<Row> wholeRows =
-        IndexSearch.search(spark, table, "body", metadata, query, 2, null, null).collectAsList();
-    List<String> allColumns =
-        table.schema().columns().stream().map(Types.NestedField::name).collect(Collectors.toList());
-    List<Row> explicitRows =
-        IndexSearch.search(spark, table, "body", metadata, query, 2, allColumns, null)
-            .collectAsList();
-    assertThat(explicitRows).hasSameSizeAs(wholeRows);
-    assertThat(explicitRows.get(0).getString(3)).isEqualTo(wholeRows.get(0).getString(3));
-
-    List<Row> idOnly =
-        IndexSearch.search(spark, table, "body", metadata, query, 2, List.of("id"), null)
-            .collectAsList();
-    assertThat(wholeRows).hasSize(1);
-    assertThat(idOnly).hasSize(1);
-    Row whole = wholeRows.get(0);
-    Row projected = idOnly.get(0);
-    // the projection decides what a row carries, not which hits the search returns
-    assertThat(projected.getString(0)).isEqualTo(whole.getString(0));
-    assertThat(projected.getLong(1)).isEqualTo(whole.getLong(1));
-    assertThat(projected.getDouble(2)).isEqualTo(whole.getDouble(2));
-    assertThat(whole.getString(3)).contains("\"id\"", "\"body\"", "\"note\"");
-    assertThat(projected.getString(3)).contains("\"id\"").doesNotContain("\"body\"", "\"note\"");
-  void readsTheRowsInTheQueryJob() {
   void readsTheRowsInTheAnswerJob() {
     spark.sql("CREATE TABLE local.db.answer_jobs (id bigint, body string) USING iceberg");
     spark.sql("INSERT INTO local.db.answer_jobs VALUES (1, 'ice fox'), (2, 'ice dog')");
@@ -419,5 +383,42 @@ class TestTextSearchSource {
         SparkIndexBuilder.build(
             spark, table, created, table.currentSnapshot().snapshotId(), "body", 1L));
     return table;
+  }
+
+  void resolvesOnlyTheRequestedColumnsOfAHit() {
+    spark.sql(
+        "CREATE TABLE local.db.projected_row (id bigint, body string, note string) USING iceberg");
+    spark.sql(
+        "INSERT INTO local.db.projected_row VALUES "
+            + "(1, 'ice iceberg', 'first'), (2, 'ice vector', 'second')");
+    Table table = buildIndex("projected_row");
+    IndexMetadata metadata = VectorIndexes.findIndex(table, "body", "text");
+    ByteBuffer query =
+        new TextIndexAdapter((TextIndexDefinition) metadata.definition()).encodeQuery("iceberg");
+
+    // null is the whole row, which is the contract CALL text_search answers with
+    List<Row> wholeRows =
+        IndexSearch.search(spark, table, "body", metadata, query, 2, null, null).collectAsList();
+    List<String> allColumns =
+        table.schema().columns().stream().map(Types.NestedField::name).collect(Collectors.toList());
+    List<Row> explicitRows =
+        IndexSearch.search(spark, table, "body", metadata, query, 2, allColumns, null)
+            .collectAsList();
+    assertThat(explicitRows).hasSameSizeAs(wholeRows);
+    assertThat(explicitRows.get(0).getString(3)).isEqualTo(wholeRows.get(0).getString(3));
+
+    List<Row> idOnly =
+        IndexSearch.search(spark, table, "body", metadata, query, 2, List.of("id"), null)
+            .collectAsList();
+    assertThat(wholeRows).hasSize(1);
+    assertThat(idOnly).hasSize(1);
+    Row whole = wholeRows.get(0);
+    Row projected = idOnly.get(0);
+    // the projection decides what a row carries, not which hits the search returns
+    assertThat(projected.getString(0)).isEqualTo(whole.getString(0));
+    assertThat(projected.getLong(1)).isEqualTo(whole.getLong(1));
+    assertThat(projected.getDouble(2)).isEqualTo(whole.getDouble(2));
+    assertThat(whole.getString(3)).contains("\"id\"", "\"body\"", "\"note\"");
+    assertThat(projected.getString(3)).contains("\"id\"").doesNotContain("\"body\"", "\"note\"");
   }
 }
