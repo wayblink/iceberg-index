@@ -37,7 +37,7 @@ import org.junit.jupiter.api.Test;
 /**
  * The v3 layout: file table with its row start, one dense length column, postings and dictionary.
  */
-class TestTextIndexPayloadV3 {
+class TestTextIndexPayload {
   private static final Set<String> ALL = null;
 
   @Test
@@ -69,32 +69,19 @@ class TestTextIndexPayloadV3 {
   }
 
   @Test
-  void equalsTheV2LayoutForTheSameShard() throws IOException {
-    FileIndex index = index(false);
-    CorpusCounts counts = counts(index);
-    FileIndex v3 = decode(TextIndexPayloadV3.encode(counts, index));
-    FileIndex v2 = decodeV2(TextIndexPayloadV2.encode(counts, index));
-
-    assertThat(refs(v3)).containsExactlyElementsOf(refs(v2));
-    assertThat(v3.localDocuments).isEqualTo(v2.localDocuments);
-    assertThat(v3.localTotalLength).isEqualTo(v2.localTotalLength);
-    assertThat(v3.localDocumentFrequency).isEqualTo(v2.localDocumentFrequency);
-  }
-
-  @Test
   void lengthsAboveTheInlineLimitRoundTripExactly() throws IOException {
     FileIndex index =
         index(
             List.of(
-                new Document("a.parquet", 0, TextIndexPayloadV3.MAX_INLINE_LENGTH),
-                new Document("a.parquet", 1, TextIndexPayloadV3.MAX_INLINE_LENGTH + 1),
+                new Document("a.parquet", 0, TextIndexPayload.MAX_INLINE_LENGTH),
+                new Document("a.parquet", 1, TextIndexPayload.MAX_INLINE_LENGTH + 1),
                 new Document("a.parquet", 2, 7)),
             Map.of("ice", List.of(0, 1, 2)));
 
     FileIndex decoded = decode(encode(index));
     assertThat(refs(decoded)).containsExactlyElementsOf(refs(index));
-    assertThat(decoded.documents.get(0).length).isEqualTo(TextIndexPayloadV3.MAX_INLINE_LENGTH);
-    assertThat(decoded.documents.get(1).length).isEqualTo(TextIndexPayloadV3.MAX_INLINE_LENGTH + 1);
+    assertThat(decoded.documents.get(0).length).isEqualTo(TextIndexPayload.MAX_INLINE_LENGTH);
+    assertThat(decoded.documents.get(1).length).isEqualTo(TextIndexPayload.MAX_INLINE_LENGTH + 1);
   }
 
   @Test
@@ -115,11 +102,11 @@ class TestTextIndexPayloadV3 {
   @Test
   void statisticsPayloadHoldsOnlyTheDictionary() throws IOException {
     FileIndex index = index(false);
-    FileIndex decoded = decode(TextIndexPayloadV3.encode(counts(index), index));
-    ByteBuffer statistics = TextIndexPayloadV3.encode(counts(index), null);
+    FileIndex decoded = decode(TextIndexPayload.encode(counts(index), index));
+    ByteBuffer statistics = TextIndexPayload.encode(counts(index), null);
 
     FileIndex read =
-        TextIndexPayloadV3.open(source(bytes(statistics)), statistics.remaining())
+        TextIndexPayload.open(source(bytes(statistics)), statistics.remaining())
             .shard(Set.of("ice", "vector"), true);
     assertThat(read.documents).isEmpty();
     assertThat(read.localDocuments).isEqualTo(index.localDocuments);
@@ -163,7 +150,7 @@ class TestTextIndexPayloadV3 {
           return ByteBuffer.wrap(bytes, offset, length).slice();
         };
 
-    FileIndex decoded = TextIndexPayloadV3.open(counting, bytes.length).shard(Set.of("ice"), false);
+    FileIndex decoded = TextIndexPayload.open(counting, bytes.length).shard(Set.of("ice"), false);
     assertThat(decoded.documents).hasSize(2);
     // the lengths are one range and the posting range is another: the read count cannot grow with
     // the documents of the shard
@@ -206,7 +193,7 @@ class TestTextIndexPayloadV3 {
         };
 
     FileIndex decoded =
-        TextIndexPayloadV3.open(counting, bytes.length).shard(Set.of("missing"), false);
+        TextIndexPayload.open(counting, bytes.length).shard(Set.of("missing"), false);
     assertThat(decoded.documents).isEmpty();
     for (long[] read : reads) {
       assertThat(read[0] == 0 || read[0] >= dictionaryStart)
@@ -221,7 +208,7 @@ class TestTextIndexPayloadV3 {
     ByteBuffer payload = encode(index);
     FileIndex full = decode(payload);
     FileIndex scoped =
-        TextIndexPayloadV3.open(source(bytes(payload)), payload.remaining())
+        TextIndexPayload.open(source(bytes(payload)), payload.remaining())
             .shard(Set.of("ice"), false);
 
     assertThat(refs(scoped))
@@ -232,48 +219,20 @@ class TestTextIndexPayloadV3 {
   }
 
   @Test
-  void theLayoutIsSmallerThanV2ForADenseShard() throws IOException {
-    int documents = 2_000;
-    List<Document> list = Lists.newArrayList();
-    for (int document = 0; document < documents; document++) {
-      list.add(new Document("a.parquet", document, 200 + document % 300));
-    }
-
-    Map<String, List<Integer>> postings = Maps.newLinkedHashMap();
-    List<String> terms = List.of("ice", "berg", "vector", "search", "glacier");
-    for (int term = 0; term < terms.size(); term++) {
-      List<Integer> ids = Lists.newArrayList();
-      for (int document = term; document < documents; document += terms.size()) {
-        ids.add(document);
-      }
-
-      postings.put(terms.get(term), ids);
-    }
-
-    FileIndex index = index(list, postings);
-    CorpusCounts counts = counts(index);
-    ByteBuffer v2 = TextIndexPayloadV2.encode(counts, index);
-    ByteBuffer v3 = TextIndexPayloadV3.encode(counts, index);
-    // the per-document row references disappear: rows follow from the file table, so the column
-    // holds only the lengths
-    assertThat(v3.remaining()).as("v3 bytes vs v2 bytes").isLessThan(v2.remaining());
-  }
-
-  @Test
   void rejectsForeignMagic() {
-    ByteBuffer payload = ByteBuffer.allocate(TextIndexPayloadV3.HEADER_SIZE);
+    ByteBuffer payload = ByteBuffer.allocate(TextIndexPayload.HEADER_SIZE);
     payload.putInt(0x424D3201);
     payload.position(0);
-    assertThatThrownBy(() -> TextIndexPayloadV3.open(source(bytes(payload)), payload.remaining()))
+    assertThatThrownBy(() -> TextIndexPayload.open(source(bytes(payload)), payload.remaining()))
         .isInstanceOf(IOException.class)
-        .hasMessageContaining("Not a BM25 v3 payload");
+        .hasMessageContaining("Not a BM25 payload");
   }
 
   @Test
   void rejectsTruncatedPayload() {
-    assertThatThrownBy(() -> TextIndexPayloadV3.open(source(new byte[8]), 8))
+    assertThatThrownBy(() -> TextIndexPayload.open(source(new byte[8]), 8))
         .isInstanceOf(IOException.class)
-        .hasMessageContaining("Invalid BM25 v3 payload size");
+        .hasMessageContaining("Invalid BM25 payload size");
   }
 
   private static FileIndex index(boolean unused) {
@@ -311,16 +270,11 @@ class TestTextIndexPayloadV3 {
   }
 
   private static ByteBuffer encode(FileIndex index) throws IOException {
-    return TextIndexPayloadV3.encode(counts(index), index);
+    return TextIndexPayload.encode(counts(index), index);
   }
 
   private static FileIndex decode(ByteBuffer payload) throws IOException {
-    return TextIndexPayloadV3.open(source(bytes(payload)), payload.remaining()).shard(ALL, false);
-  }
-
-  private static FileIndex decodeV2(ByteBuffer payload) throws IOException {
-    byte[] bytes = bytes(payload);
-    return TextIndexPayloadV2.open(source(bytes), bytes.length).shard(ALL, false);
+    return TextIndexPayload.open(source(bytes(payload)), payload.remaining()).shard(ALL, false);
   }
 
   private static TextIndexSource.Source source(byte[] payload) {

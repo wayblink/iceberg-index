@@ -44,11 +44,6 @@ import org.apache.spark.unsafe.types.UTF8String;
  * }</pre>
  */
 class BuildTextIndexProcedure extends BaseProcedure {
-  /** The session setting that selects the payload layout a build writes, for comparing layouts. */
-  private static final String PAYLOAD_VERSION_CONF = "spark.iceberg.index.text.payload-version";
-
-  private static final String PAYLOAD_VERSION_PROPERTY = "payload-version";
-
   private static final ProcedureParameter TABLE_PARAM =
       requiredInParameter("table", DataTypes.StringType);
   private static final ProcedureParameter COLUMN_PARAM =
@@ -131,25 +126,6 @@ class BuildTextIndexProcedure extends BaseProcedure {
           IndexProcedures.checkCanBuild(table, column, "text", tableName, name);
 
           TextIndexDefinition.Builder definition = TextIndexDefinition.builder().fieldId(fieldId);
-          // the layout an index file is written in; unset means the adapter's default, and the
-          // property disappears once one layout is chosen
-          String payloadVersion = spark().conf().get(PAYLOAD_VERSION_CONF, null);
-          if (payloadVersion != null && !payloadVersion.isEmpty()) {
-            if (!"1".equals(payloadVersion)
-                && !"2".equals(payloadVersion)
-                && !"3".equals(payloadVersion)) {
-              // refuse an unknown value here, before the index is registered: a build that fell
-              // back to a layout the caller did not ask for would be recorded as that layout
-              throw new IllegalArgumentException(
-                  "Unsupported "
-                      + PAYLOAD_VERSION_CONF
-                      + ": "
-                      + payloadVersion
-                      + "; expected 1, 2 or 3");
-            }
-
-            definition.property(PAYLOAD_VERSION_PROPERTY, payloadVersion);
-          }
           if (input.isProvided(K1_PARAM)) {
             definition.k1(args.getDouble(VectorIndexProcedures.ordinal(PARAMETERS, K1_PARAM)));
           }

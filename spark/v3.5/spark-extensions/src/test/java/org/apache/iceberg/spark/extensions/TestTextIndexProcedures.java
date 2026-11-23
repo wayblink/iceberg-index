@@ -353,15 +353,12 @@ public class TestTextIndexProcedures extends ExtensionsTestBase {
   }
 
   @TestTemplate
-  public void buildWritesThePayloadLayoutTheSessionSelects() throws Exception {
-    String tableName = tableName("text_payload_select_" + catalogName);
-    String conf = "spark.iceberg.index.text.payload-version";
+  public void buildWritesTheOnePayloadLayout() throws Exception {
+    String tableName = tableName("text_payload_" + catalogName);
     String indexUuid = null;
     try {
       sql("CREATE TABLE %s (id bigint, body string) USING iceberg", tableName);
       sql("INSERT INTO %s VALUES (1, 'iceberg table format')", tableName);
-      // the procedure reads the session's configuration, which is where a comparison sets it
-      spark.conf().set(conf, "3");
       List<Object[]> built =
           sql(
               "CALL %s.system.build_text_index(table => '%s', column => 'body')",
@@ -372,40 +369,13 @@ public class TestTextIndexProcedures extends ExtensionsTestBase {
       IndexMetadata metadata =
           new SidecarIndexCatalog(table.io(), table).loadIndex(table.location(), indexUuid);
       TextIndexAdapter adapter = new TextIndexAdapter((TextIndexDefinition) metadata.definition());
-      assertThat(adapter.auxiliaryBlobType()).isEqualTo("iceberg-text-bm25-v3");
+      assertThat(adapter.auxiliaryBlobType()).isEqualTo("iceberg-text-bm25-v1");
     } finally {
-      spark.conf().unset(conf);
-      try {
-        if (indexUuid != null) {
-          Table table = Spark3Util.loadIcebergTable(spark, tableName);
-          new SidecarIndexCatalog(table.io(), table).dropIndex(table.location(), indexUuid, true);
-        }
-      } finally {
-        sql("DROP TABLE IF EXISTS %s PURGE", tableName);
+      if (indexUuid != null) {
+        Table table = Spark3Util.loadIcebergTable(spark, tableName);
+        new SidecarIndexCatalog(table.io(), table).dropIndex(table.location(), indexUuid, true);
       }
-    }
-  }
 
-  @TestTemplate
-  public void buildRefusesAnUnknownPayloadVersion() {
-    String tableName = tableName("text_payload_invalid_" + catalogName);
-    String conf = "spark.iceberg.index.text.payload-version";
-    try {
-      sql("CREATE TABLE %s (id bigint, body string) USING iceberg", tableName);
-      sql("INSERT INTO %s VALUES (1, 'iceberg table format')", tableName);
-      spark.conf().set(conf, "4");
-
-      assertThatThrownBy(
-              () ->
-                  sql(
-                      "CALL %s.system.build_text_index(table => '%s', column => 'body')",
-                      catalogName, tableName))
-          .hasMessageContaining("expected 2 or 3");
-      // the value is refused before the index is registered, so nothing is left behind
-      assertThat(sql("CALL %s.system.list_indexes(table => '%s')", catalogName, tableName))
-          .isEmpty();
-    } finally {
-      spark.conf().unset(conf);
       sql("DROP TABLE IF EXISTS %s PURGE", tableName);
     }
   }

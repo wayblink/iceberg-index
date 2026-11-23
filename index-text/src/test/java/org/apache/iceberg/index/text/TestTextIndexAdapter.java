@@ -136,8 +136,8 @@ class TestTextIndexAdapter {
     ByteBuffer payload = adapter.encodeAuxiliaryPayload(entries);
 
     TextIndexAdapter.FileIndex selected =
-        TextIndexPayloadV2.open(
-                TextIndexPayloadV2.source(new RangeOnlyStream(payload), 0), payload.remaining())
+        TextIndexPayload.open(
+                TextIndexSource.source(new RangeOnlyStream(payload), 0), payload.remaining())
             .shard(Set.of("ice", "glacier"), false);
     assertThat(selected.postingsByTerm).containsOnlyKeys("ice", "glacier");
 
@@ -151,8 +151,8 @@ class TestTextIndexAdapter {
 
   private static long bytesReadByQuery(ByteBuffer payload, String term) throws IOException {
     RangeOnlyStream stream = new RangeOnlyStream(payload);
-    TextIndexPayloadV2.Reader reader =
-        TextIndexPayloadV2.open(TextIndexPayloadV2.source(stream, 0), payload.remaining());
+    TextIndexPayload.Reader reader =
+        TextIndexPayload.open(TextIndexSource.source(stream, 0), payload.remaining());
     reader.shard(Set.of(term), false);
     return stream.bytesRead;
   }
@@ -368,33 +368,15 @@ class TestTextIndexAdapter {
   }
 
   @Test
-  void refusesAnUnknownPayloadVersion() {
-    TextIndexDefinition definition =
-        TextIndexDefinition.builder().fieldId(1).property("payload-version", "4").build();
-    TextIndexAdapter adapter = new TextIndexAdapter(definition);
-
-    assertThatThrownBy(
-            () -> adapter.encodeAuxiliaryPayload(List.of(entry("ice.parquet", 0, "ice"))))
-        .isInstanceOf(IllegalArgumentException.class)
-        .hasMessageContaining("Unsupported BM25 payload version 4");
-  }
-
-  @Test
-  void aPayloadNamesTheReaderOfItsOwnLayout() {
+  void aPayloadNamesTheReaderThatDecodesIt() {
     List<IndexEntry> entries =
         List.of(entry("ice.parquet", 0, "ice"), entry("ice.parquet", 1, "berg"));
-    TextIndexDefinition v2 = TextIndexDefinition.builder().fieldId(1).build();
-    TextIndexDefinition v3 =
-        TextIndexDefinition.builder().fieldId(1).property("payload-version", "3").build();
+    TextIndexAdapter adapter =
+        new TextIndexAdapter(TextIndexDefinition.builder().fieldId(1).build());
 
-    IndexBuildResult v2Build =
-        new TextIndexAdapter(v2).encodeAuxiliaryPayloadWithMemory(entries, 1);
-    IndexBuildResult v3Build =
-        new TextIndexAdapter(v3).encodeAuxiliaryPayloadWithMemory(entries, 1);
-    assertThat(v2Build.memory()).isNotNull();
-    assertThat(v2Build.memory().readerId()).isEqualTo("text/bm25/1");
-    assertThat(v3Build.memory()).isNotNull();
-    assertThat(v3Build.memory().readerId()).isEqualTo("text/bm25/3");
+    IndexBuildResult build = adapter.encodeAuxiliaryPayloadWithMemory(entries, 1);
+    assertThat(build.memory()).isNotNull();
+    assertThat(build.memory().readerId()).isEqualTo("text/bm25/1");
   }
 
   private static IndexEntry entry(String dataFile, long position, String text) {

@@ -32,8 +32,8 @@ import org.junit.jupiter.api.Test;
  */
 class TestCheckIndexesPayloadFormat {
 
-  private static final String TEXT_AUXILIARY_BLOB_TYPE_V3 = "iceberg-text-bm25-v3";
-  private static final String TEXT_AUXILIARY_BLOB_TYPE_V2 = "iceberg-text-bm25-v2";
+  private static final String TEXT_AUXILIARY_BLOB_TYPE = "iceberg-text-bm25-v1";
+  private static final String TEXT_AUXILIARY_BLOB_TYPE_REPLACED = "iceberg-text-bm25-v2";
 
   private static IndexAdapter textAdapter() {
     return new TextIndexAdapter(TextIndexDefinition.builder().fieldId(2).build());
@@ -43,24 +43,24 @@ class TestCheckIndexesPayloadFormat {
   public void aPayloadOfTheLayoutThisBuildWritesIsReadable() {
     assertThat(
             CheckIndexesProcedure.readablePayload(
-                textAdapter(), IndexFile.Kind.AUXILIARY, TEXT_AUXILIARY_BLOB_TYPE_V2))
+                textAdapter(), IndexFile.Kind.AUXILIARY, TEXT_AUXILIARY_BLOB_TYPE))
         .isTrue();
   }
 
   @Test
-  public void aPayloadOfTheOtherLayoutThisBuildReadsIsReadable() {
+  public void aPayloadOfAReplacedLayoutIsNotReadable() {
     assertThat(
             CheckIndexesProcedure.readablePayload(
-                textAdapter(), IndexFile.Kind.AUXILIARY, TEXT_AUXILIARY_BLOB_TYPE_V3))
-        .isTrue();
+                textAdapter(), IndexFile.Kind.AUXILIARY, TEXT_AUXILIARY_BLOB_TYPE_REPLACED))
+        .isFalse();
   }
 
   @Test
-  public void aPayloadOfALayoutThisBuildDroppedIsNotReadable() {
+  public void aPayloadOfTheFirstLayoutIsNotReadable() {
     // the layouts it no longer reads must be reported, not silently skipped
     assertThat(
             CheckIndexesProcedure.readablePayload(
-                textAdapter(), IndexFile.Kind.AUXILIARY, "iceberg-text-bm25-v1"))
+                textAdapter(), IndexFile.Kind.AUXILIARY, "iceberg-text-bm25-v3"))
         .isFalse();
   }
 
@@ -81,7 +81,7 @@ class TestCheckIndexesPayloadFormat {
     // that claims that role carries something this build cannot decode
     assertThat(
             CheckIndexesProcedure.readablePayload(
-                textAdapter(), IndexFile.Kind.ENTRY_BEARING, TEXT_AUXILIARY_BLOB_TYPE_V2))
+                textAdapter(), IndexFile.Kind.ENTRY_BEARING, TEXT_AUXILIARY_BLOB_TYPE))
         .isFalse();
   }
 }

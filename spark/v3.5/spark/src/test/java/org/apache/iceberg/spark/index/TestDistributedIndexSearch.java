@@ -189,8 +189,7 @@ class TestDistributedIndexSearch {
         new HadoopTables(spark.sessionState().newHadoopConf())
             .load(warehouseDir.resolve("db/text_v3").toUri().toString());
     long snapshotId = table.currentSnapshot().snapshotId();
-    TextIndexDefinition definition =
-        TextIndexDefinition.builder().fieldId(2).property("payload-version", "3").build();
+    TextIndexDefinition definition = TextIndexDefinition.builder().fieldId(2).build();
     IndexCatalog catalog = new SidecarIndexCatalog(table.io(), table);
     IndexMetadata created =
         catalog.createIndex(
@@ -208,7 +207,7 @@ class TestDistributedIndexSearch {
     IndexReader reader = new IndexReader(built, table);
     assertThat(reader.indexFiles(query))
         .isNotEmpty()
-        .allSatisfy(file -> assertThat(file.blobType()).isEqualTo("iceberg-text-bm25-v3"));
+        .allSatisfy(file -> assertThat(file.blobType()).isEqualTo("iceberg-text-bm25-v1"));
 
     String statistics = built.latestSnapshot().properties().get("snapshot-statistics-location");
     assertThat(statistics).isNotBlank();
@@ -242,7 +241,7 @@ class TestDistributedIndexSearch {
     IndexReader reader = new IndexReader(built, table);
     assertThat(reader.indexFiles(query))
         .hasSize(2)
-        .allSatisfy(file -> assertThat(file.blobType()).isEqualTo("iceberg-text-bm25-v2"));
+        .allSatisfy(file -> assertThat(file.blobType()).isEqualTo("iceberg-text-bm25-v1"));
     String statistics = built.latestSnapshot().properties().get("snapshot-statistics-location");
     assertThat(statistics).isNotBlank();
     assertThat(table.io().newInputFile(statistics).exists()).isTrue();
