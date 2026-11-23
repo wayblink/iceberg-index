@@ -131,6 +131,42 @@ class TestTextSearchTableFunction {
   }
 
   @Test
+  public void returnsTheColumnsInTheOrderTheCallerNamed() {
+    // the columns come back under the names the caller wrote, in the order it wrote them: a
+    // fetch-back that fills a row in the table's order and labels it in the caller's pairs each
+    // value with the other column's name, which two same-typed columns make invisible to every
+    // check but the value itself
+    String table = "db.ts_column_order";
+    spark.sql(
+        String.format(
+            "CREATE TABLE local.%s (a bigint, b bigint, body string) USING iceberg", table));
+    spark.sql(
+        String.format(
+            "INSERT INTO local.%s VALUES (11, 22, 'error 1064'), (33, 44, 'error 1064')", table));
+    spark.sql(
+        String.format(
+            "CALL local.system.build_text_index(table => '%s', column => 'body')", table));
+
+    List<Row> rows =
+        spark
+            .sql(
+                String.format(
+                    "SELECT * FROM search(table => 'local.%s', query => 'error 1064', "
+                        + "search_columns => array('body'), limit => 2, "
+                        + "columns => array('b', 'a'))",
+                    table))
+            .collectAsList();
+
+    assertThat(rows).hasSize(2);
+    for (Row row : rows) {
+      long b = row.getLong(0);
+      long a = row.getLong(1);
+      assertThat(a).as("a of the row the search answered").isIn(11L, 33L);
+      assertThat(b).as("b of the row the search answered; a is %d", a).isEqualTo(a + 11L);
+    }
+  }
+
+  @Test
   public void ranksByTheNameTheScoreWasGiven() {
     String table = tableWithIndex("ts_alias");
 
