@@ -20,10 +20,13 @@ package org.apache.iceberg.index;
 
 import java.io.IOException;
 import java.nio.ByteBuffer;
+import java.util.Arrays;
 import java.util.List;
 import java.util.Map;
+import org.apache.iceberg.io.IOUtil;
 import org.apache.iceberg.io.InputFile;
 import org.apache.iceberg.io.OutputFile;
+import org.apache.iceberg.io.SeekableInputStream;
 import org.apache.iceberg.puffin.Blob;
 import org.apache.iceberg.puffin.BlobMetadata;
 import org.apache.iceberg.puffin.Puffin;
@@ -115,6 +118,59 @@ public final class PuffinIndexFileContainer implements IndexFileContainer {
       }
       return ImmutableList.copyOf(blobs);
     }
+  }
+
+  /**
+   * The first bytes of the first blob of a file that has the given type.
+   *
+   * <p>A payload names the format version that wrote it in its first bytes, so a caller that only
+   * needs that version must not materialize a payload that can be hundreds of megabytes: this reads
+   * at most {@code maxBytes} of the blob. An uncompressed blob is read in place from its offset. A
+   * compressed blob cannot be decompressed from a prefix, so it is read and decompressed whole -
+   * still one blob rather than the file - and cut to {@code maxBytes}.
+   *
+   * @return the first {@code maxBytes} bytes of that blob, or null when the file has no blob of the
+   *     given type
+   */
+  public static byte[] payloadPrefix(InputFile file, String blobType, int maxBytes)
+      throws IOException {
+    Preconditions.checkNotNull(file, "Input file is null");
+    Preconditions.checkNotNull(blobType, "Blob type is null");
+    Preconditions.checkArgument(maxBytes > 0, "Max bytes must be positive: %s", maxBytes);
+
+    try (PuffinReader reader = Puffin.read(file).build()) {
+      BlobMetadata blob = null;
+      for (BlobMetadata metadata : reader.fileMetadata().blobs()) {
+        if (blobType.equals(metadata.type())) {
+          blob = metadata;
+          break;
+        }
+      }
+
+      if (blob == null) {
+        return null;
+      }
+
+      if (blob.compressionCodec() == null) {
+        // the file is opened a second time because a reader does not expose the stream it holds,
+        // and seeking to the blob is still one range of maxBytes rather than the whole file
+        return readPrefix(file, blob.offset(), (int) Math.min(blob.length(), maxBytes));
+      }
+
+      // a compressed blob is decompressed into one array by the codec, so the prefix is cut from
+      // that array; the cost is one blob of the file, not the file
+      byte[] payload = payloadOf(Lists.newArrayList(reader.readAll(List.of(blob))).get(0).second());
+      return payload.length <= maxBytes ? payload : Arrays.copyOf(payload, maxBytes);
+    }
+  }
+
+  private static byte[] readPrefix(InputFile file, long offset, int length) throws IOException {
+    byte[] prefix = new byte[length];
+    try (SeekableInputStream in = file.newStream()) {
+      in.seek(offset);
+      IOUtil.readFully(in, prefix, 0, length);
+    }
+    return prefix;
   }
 
   /**

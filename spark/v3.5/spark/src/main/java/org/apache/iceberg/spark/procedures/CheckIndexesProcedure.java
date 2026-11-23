@@ -24,7 +24,6 @@ import java.util.List;
 import java.util.Set;
 import org.apache.iceberg.Table;
 import org.apache.iceberg.index.IndexAdapter;
-import org.apache.iceberg.index.IndexBlob;
 import org.apache.iceberg.index.IndexFile;
 import org.apache.iceberg.index.IndexMetadata;
 import org.apache.iceberg.index.IndexQuery;
@@ -37,8 +36,6 @@ import org.apache.iceberg.index.spark.VectorIndexes;
 import org.apache.iceberg.index.text.TextIndexAdapter;
 import org.apache.iceberg.index.vector.VectorIndexAdapter;
 import org.apache.iceberg.index.vector.VectorPayloadHeader;
-import org.apache.iceberg.inmemory.InMemoryInputFile;
-import org.apache.iceberg.io.IOUtil;
 import org.apache.iceberg.io.InputFile;
 import org.apache.iceberg.relocated.com.google.common.collect.Lists;
 import org.apache.iceberg.relocated.com.google.common.collect.Sets;
@@ -79,6 +76,16 @@ class CheckIndexesProcedure extends BaseProcedure {
       String catalog, String tableName, String column, String indexType, String indexUuid) {
     return rebuildSuggestion(catalog, tableName, column, indexType, indexUuid);
   }
+
+  /**
+   * How many bytes of a payload the checks read.
+   *
+   * <p>A payload starts with the format version that wrote it, and a vector payload also names its
+   * kernel and repeats a version after the name, so a kilobyte covers both headers with room for a
+   * long kernel name. Reading no more than this is what keeps a check of an index of hundreds of
+   * megabytes from depending on the driver heap.
+   */
+  private static final int PAYLOAD_PREFIX_BYTES = 1024;
 
   private static final ProcedureParameter TABLE_PARAM =
       ProcedureParameter.required("table", DataTypes.StringType);
@@ -475,10 +482,15 @@ class CheckIndexesProcedure extends BaseProcedure {
   }
 
   /**
-   * The payload of the first file of the index, which is where a format version shows up first.
+   * The head of the payload of the first file of the index, which is where a format version shows
+   * up first.
    *
-   * @return the payload, or null when the index has no file or its first file carries no blob of
-   *     the given type
+   * <p>The version is in the first bytes of the payload, so only those are read: the file can be
+   * hundreds of megabytes, and an operations command must not hold one whole index file in the
+   * driver heap to report a version.
+   *
+   * @return the first {@link #PAYLOAD_PREFIX_BYTES} bytes of the payload, or null when the index
+   *     has no file or its first file carries no blob of the given type
    */
   private byte[] firstPayload(
       Table table, IndexMetadata metadata, IndexSnapshot snapshot, String blobType)
@@ -490,20 +502,8 @@ class CheckIndexesProcedure extends BaseProcedure {
       return null;
     }
 
-    IndexFile file = files.get(0);
-    InputFile input = table.io().newInputFile(file.location());
-    byte[] content = new byte[(int) input.getLength()];
-    try (org.apache.iceberg.io.SeekableInputStream in = input.newStream()) {
-      IOUtil.readFully(in, content, 0, content.length);
-    }
-
-    for (IndexBlob blob : new PuffinIndexFileContainer().read(new InMemoryInputFile(content))) {
-      if (blobType.equals(blob.type())) {
-        return blob.payload();
-      }
-    }
-
-    return null;
+    InputFile input = table.io().newInputFile(files.get(0).location());
+    return PuffinIndexFileContainer.payloadPrefix(input, blobType, PAYLOAD_PREFIX_BYTES);
   }
 
   private static boolean isStale(Table table, IndexSnapshot snapshot) {
