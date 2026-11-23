@@ -360,6 +360,8 @@ CALL local.system.refresh_vector_index(table => 'db.docs', column => 'embedding'
 
 只重建受影响的索引文件：新数据文件会补上段，内容变过的数据文件（出现了删除文件，或被重写换名）会把它所属的组整体重建，没被新快照触及的索引文件原样保留。输出与构建一致；只有当前快照与父索引快照相比什么都没变时才不产新快照，返回 `index_files = 0, entries = 0`。
 
+注意输出的 `index_files` / `entries` 是**发布出来那一版索引的总量**，不是本次重建量。增量构建与补建的完整语义（重建判据、组的放大效应、成本模型、并发下的 0 值含义、表回滚为何被拒）见 [索引的增量构建与补建](index-incremental-build.md)。
+
 **表没动也会补。** 如果当前表快照已经有索引、但那版索引没有覆盖全部数据文件（上一次构建是部分的，见 6.1），刷新会以那一版为基线，只重建没被覆盖的数据文件，然后替换同一表快照上的那一版索引——不会出现"同一份表快照两版索引"让查询挑；`list_indexes` 的 `index_snapshot_id` 会前进一格，`source_snapshot_id` 不变。什么都没缺时仍然返回 `index_files = 0, entries = 0`。
 
 ```sql
@@ -590,6 +592,7 @@ SHOW INDEXES FROM local.db.docs;   -- 只有 FROM，没有 IN
 - **漏了多少数据文件看 `check_indexes.uncovered_data_files`**，不是看 `files_failed`。失败的粒度是组，一组可能覆盖多个数据文件，所以两个数字通常不相等（默认 `max_entries_per_index_file` 为 100 万条目，小文件会被大量并组）。
 - 补缺口用 `refresh_vector_index`（4.5），但**它只在缺口的原因消失之后才管用**：坏文件还在那份表快照里时，刷新仍会去建它、仍然失败。所以顺序是"先修数据（修好或删掉、重写那批文件），再 `refresh_vector_index`"。两类原因要分开处理：`dimension` 不符靠修数据；`payload 超限`是相对于 `max_entries_per_index_file` 的大小，而 `refresh_vector_index` 继承同一个预算，所以重跑会再次超限——那类缺口要用更小的 `max_entries_per_index_file` 重建。
 - `build_vector_index` 的返回行与完整构建同形（`index_uuid, source_snapshot_id, index_files, entries`），**脚本不能靠它判断完整性**，要判断请读 `index_build_status.state`。
+- 补齐缺口的完整流程（按原因分类、验证方式、失败怎么读）见 [索引的增量构建与补建](index-incremental-build.md) 第 6 节。
 
 三个边界必须知道：
 
