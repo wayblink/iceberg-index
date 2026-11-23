@@ -33,6 +33,7 @@ import org.apache.iceberg.index.spark.DistributedIndexSearch
 import org.apache.iceberg.index.spark.IndexEntries
 import org.apache.iceberg.index.text.TextIndexAdapter
 import org.apache.iceberg.index.text.TextIndexDefinition
+import org.apache.spark.Partitioner
 import org.apache.spark.rdd.RDD
 import org.apache.spark.sql.Row
 import org.apache.spark.sql.SparkSession
@@ -46,6 +47,7 @@ import org.apache.spark.sql.catalyst.expressions.InterpretedPredicate
 import org.apache.spark.sql.catalyst.expressions.Literal
 import org.apache.spark.sql.catalyst.expressions.SubqueryExpression
 import org.apache.spark.sql.catalyst.expressions.Unevaluable
+import org.apache.spark.sql.catalyst.expressions.UnsafeProjection
 import org.apache.spark.sql.catalyst.optimizer.ConstantFolding
 import org.apache.spark.sql.catalyst.optimizer.NullPropagation
 import org.apache.spark.sql.catalyst.optimizer.ReplaceExpressions
@@ -55,10 +57,8 @@ import org.apache.spark.sql.catalyst.plans.logical.LocalRelation
 import org.apache.spark.sql.catalyst.plans.logical.Statistics
 import org.apache.spark.sql.execution.LeafExecNode
 import org.apache.spark.sql.execution.datasources.SparkExpressionConverter
-import org.apache.spark.sql.functions
 import org.apache.spark.sql.types.DoubleType
 import org.apache.spark.sql.types.FloatType
-import org.apache.spark.sql.types.IntegerType
 import org.apache.spark.sql.types.StructField
 import org.apache.spark.sql.types.StructType
 
@@ -193,35 +193,49 @@ private[spark] case class TextSearchExec(
         }
 
         // a row carries where its hit sat in the merged order: the reads are per file, so the order
-        // is put back after them rather than before
+        // decides the partition the answer is put together in rather than the order of the read
         rows.iterator.flatMap { case (file, (position, row)) =>
           plan.scored
             .getOrElse((file, position.longValue()), Array.empty[(Int, Double)])
             .iterator
-            .map { case (index, score) =>
-              Row.fromSeq(Seq(Integer.valueOf(index), Row.fromSeq(row.toSeq :+ score)))
-            }
+            .map { case (index, score) => (index, Row.fromSeq(row.toSeq :+ score)) }
         }
       }
 
-    // The answer's rows travel as one struct column and the order of the hits as another: neither
-    // name is one of the answer's own, so no column of the table can be taken for them. The rows
-    // are read in one task per hit file, and the merge order is restored by one shuffle inside this
-    // job: the hits are few, the rows still never cross the driver, and the answer keeps the order
-    // a caller sees instead of answering by data file.
-    val shipped = StructType(
-      Seq(
-        StructField(TextSearchHits.OrderColumn, IntegerType, nullable = false),
-        StructField(TextSearchHits.RowColumn, resultSchema, nullable = false)))
-    spark
-      .createDataFrame(read, shipped)
-      .repartition(1)
-      .sortWithinPartitions(functions.col(TextSearchHits.OrderColumn))
-      .select(output.map(a => functions.col(TextSearchHits.RowColumn).getField(a.name)): _*)
-      .queryExecution
-      .toRdd
-      // a projected row can be a buffer the projection reuses, and the answer is handed on
-      .map(row => row.copy())
+    // One shuffle puts every row in the band of the merged order it sits in and sorts it there: the
+    // rows are read one task per hit data file, so where a task read a row is not where the row
+    // ranks. The partitions in order are then the answer a caller sees, as the one ordered
+    // partition was, and a LIMIT n above the search takes its rows from the first partitions in
+    // order, so it answers with the globally highest ranked n rows while no one task carries every
+    // row. The bands are cut from the number of hits, which is the number of rows, so they need no
+    // sample: a Catalyst sort would sample its child, and the child here is the fetch-back, whose
+    // rows are read from the data files.
+    val partitions = math.min(hits.size, spark.sparkContext.defaultParallelism)
+    read
+      .repartitionAndSortWithinPartitions(new OrderBands(partitions, hits.size))
+      .mapPartitions { ordered =>
+        val convert = CatalystTypeConverters.createToCatalystConverter(resultSchema)
+        val unsafe = UnsafeProjection.create(resultSchema)
+        // the projection and the converter reuse their row, and the answer is handed on
+        ordered.map { case (_, row) => unsafe(convert(row).asInstanceOf[InternalRow]).copy() }
+      }
+  }
+}
+
+/**
+ * Puts a row of the answer in the partition that holds the band of the merged order it sits in.
+ *
+ * <p>Where a row was read is not where it ranks: the reads run one task per hit data file and the
+ * best hits of a search are scattered over the files. The bands are exact rather than sampled:
+ * every hit of the merged order becomes exactly one row of the answer, so the orders are 0 until
+ * the number of hits, and a band is cut from that number alone.
+ */
+private[spark] case class OrderBands(override val numPartitions: Int, orders: Int)
+    extends Partitioner {
+
+  override def getPartition(key: Any): Int = {
+    val order = key.asInstanceOf[Int]
+    if (orders <= numPartitions) order else (order.toLong * numPartitions / orders).toInt
   }
 }
 
@@ -237,12 +251,6 @@ private[spark] case class TextSearchHits(
     expected: Map[String, Set[Long]])
 
 private[spark] object TextSearchHits {
-
-  /** The column that carries where a row's hit sat in the merged order. */
-  val OrderColumn = "_text_search_hit_order"
-
-  /** The column that carries the row of the answer, its own columns nested inside it. */
-  val RowColumn = "_text_search_row"
 
   /** The failure of a hit whose row the snapshot does not have: the index refers to a lost row. */
   def absentRow(

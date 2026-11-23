@@ -199,11 +199,14 @@ class TestTextSearchSource {
     Table table = buildIndex("answer_jobs");
 
     // the answer is read in one task per hit data file and put back in the order the hits merged
-    // in, all inside the job that answers the query: a fetch-back that collected the rows to the
-    // driver would be a job of its own, and the answer's own job would read no data file
-    int hitFiles =
-        (int) hitsOf(table, "ice", 10).stream().map(IndexSearchResult::dataFile).distinct().count();
+    // in by a shuffle over bands of that order, all inside the job that answers the query: a
+    // fetch-back that collected the rows to the driver would be a job of its own, and the answer's
+    // own job would read no data file
+    List<IndexSearchResult> hits = hitsOf(table, "ice", 10);
+    int hitFiles = (int) hits.stream().map(IndexSearchResult::dataFile).distinct().count();
+    int bands = Math.min(hits.size(), spark.sparkContext().defaultParallelism());
     assertThat(hitFiles).as("data files the answer is read from").isGreaterThan(1);
+    assertThat(bands).as("bands of the merged order the answer is assembled in").isGreaterThan(1);
     List<List<Integer>> jobs = new ArrayList<>();
     SparkListener countedJobs =
         new SparkListener() {
@@ -229,8 +232,8 @@ class TestTextSearchSource {
 
     assertThat(rows).hasSize(4);
     assertThat(jobs.get(jobs.size() - 1))
-        .as("tasks of the answer's job: one per hit data file, then one for the ordered answer")
-        .containsExactly(hitFiles, 1);
+        .as("tasks of the answer's job: one per hit data file, then one per band of the order")
+        .containsExactly(hitFiles, bands);
   }
 
   @Test
@@ -284,11 +287,51 @@ class TestTextSearchSource {
                 .getNumPartitions())
         .isEqualTo(2);
 
-    // the answer itself is one partition, because its rows are the order the hits merged in: one
-    // order for one partition, read in parallel before it
+    // the answer itself is put back in the order the hits merged in by a shuffle over bands of that
+    // order, so it is read and sorted by more than one task rather than by one task carrying every
+    // row
     Dataset<Row> answer = spark.sql("SELECT id FROM " + search("hit_files") + ")");
     assertThat(answer.collectAsList()).hasSize(2);
-    assertThat(answer.queryExecution().toRdd().getNumPartitions()).isEqualTo(1);
+    assertThat(answer.queryExecution().toRdd().getNumPartitions())
+        .isEqualTo(Math.min(hits.size(), spark.sparkContext().defaultParallelism()));
+  }
+
+  @Test
+  void limitsTheAnswerToTheHighestRankedRows() {
+    spark.sql("CREATE TABLE local.db.answer_limit (id bigint, body string) USING iceberg");
+    spark.sql(
+        "INSERT INTO local.db.answer_limit VALUES "
+            + "(1, 'ice fox'), (2, 'ice ice ice ice'), (3, 'ice dog'), (4, 'ice')");
+    spark.sql(
+        "INSERT INTO local.db.answer_limit VALUES "
+            + "(5, 'ice ice'), (6, 'ice ice ice'), (7, 'ice cat'), (8, 'ice ice ice ice ice')");
+    buildIndex("answer_limit");
+
+    // the answer is put back in the merged order by bands of it, and it is read in more than one
+    // partition: a LIMIT above the search takes its rows from the first partitions in order, so it
+    // answers with the highest ranked rows of the whole answer, not with the rows of one data file.
+    // The limit is larger than one band, so the answer has to cross a partition boundary and take
+    // the rest of the rows from the next band to be right
+    Dataset<Row> answer = spark.sql("SELECT id, _score FROM " + search("answer_limit") + ")");
+    List<Row> all = answer.collectAsList();
+    assertThat(all).hasSize(8);
+    int bands = Math.min(all.size(), spark.sparkContext().defaultParallelism());
+    assertThat(bands).as("the answer is assembled in bands of the merged order").isGreaterThan(1);
+    assertThat(answer.queryExecution().toRdd().getNumPartitions()).isEqualTo(bands);
+
+    int limit = 6;
+    assertThat(limit).as("the limit crosses a band").isGreaterThan(all.size() / bands);
+    List<Long> top = new ArrayList<>();
+    all.subList(0, limit).forEach(row -> top.add(row.getLong(0)));
+    List<Long> limited = new ArrayList<>();
+    spark
+        .sql("SELECT id FROM " + search("answer_limit") + ") LIMIT " + limit)
+        .collectAsList()
+        .forEach(row -> limited.add(row.getLong(0)));
+
+    assertThat(limited)
+        .as("LIMIT takes the highest ranked rows of the whole answer")
+        .containsExactlyElementsOf(top);
   }
 
   @Test
