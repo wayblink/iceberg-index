@@ -563,21 +563,80 @@ class TestVersionedIndexRegistry {
     catalog.createIndex(request("index-a"));
 
     // a registry written before the table uuids existed names no table instance, so the
-    // registration
-    // reads the metadata to decide whether the index is this table's
+    // registration reads the metadata to decide whether the index is this table's
     String registryFile = registryPointer(ops);
     dropTableUuids(registryFile);
     deleteMetadataRoot("index-a", "index-metadata-" + rootOf(registryFile) + ".json");
 
-    // the index's metadata is gone, and the registration has to read it to learn its table uuid
-    assertThatThrownBy(() -> catalog.createIndex(request("index-b")))
-        .isInstanceOf(RuntimeException.class)
+    // the metadata that would say whose index it is is gone, so no table can claim the entry: the
+    // registration removes it from the registry instead of failing on it, which is what makes the
+    // unreadable entry recoverable
+    catalog.createIndex(request("index-b"));
+
+    assertThat(indexUuids(registryPointer(ops))).containsExactly("index-b");
+  }
+
+  @Test
+  void listingSkipsAnIndexWhoseMetadataIsGone() {
+    TestTables.TestTableOperations ops = operations();
+    SidecarIndexCatalog catalog = versionedCatalog(ops);
+    catalog.createIndex(request("index-a"));
+    catalog.createIndex(request("index-b"));
+    deleteMetadataRoot("index-a", metadataRootOf(registryPointer(ops), "index-a"));
+
+    // one unreadable entry does not fail the listing of the others
+    assertThat(catalog.listIndexes(tableDir.toString()))
+        .extracting(IndexMetadata::indexUuid)
+        .containsExactly("index-b");
+    assertThat(catalog.damagedIndexUuids(tableDir.toString())).containsExactly("index-a");
+    // asking for the damaged index by UUID is still an error: the caller named it
+    assertThatThrownBy(() -> catalog.loadIndex(tableDir.toString(), "index-a"))
+        .isInstanceOf(IllegalStateException.class)
         .hasMessageContaining("Index metadata file does not exist");
   }
 
+  @Test
+  void droppingADamagedEntryRemovesItFromTheRegistry() {
+    TestTables.TestTableOperations ops = operations();
+    SidecarIndexCatalog catalog = versionedCatalog(ops);
+    catalog.createIndex(request("index-a"));
+    catalog.createIndex(request("index-b"));
+    deleteMetadataRoot("index-a", metadataRootOf(registryPointer(ops), "index-a"));
+
+    // a purge of an entry whose metadata is already gone still removes the registration and what is
+    // left of its tree, which is the supported repair for a damaged entry
+    assertThat(catalog.dropIndex(tableDir.toString(), "index-a", true)).isTrue();
+
+    assertThat(indexUuids(registryPointer(ops))).containsExactly("index-b");
+    assertThat(catalog.damagedIndexUuids(tableDir.toString())).isEmpty();
+    assertThat(catalog.listIndexes(tableDir.toString()))
+        .extracting(IndexMetadata::indexUuid)
+        .containsExactly("index-b");
+  }
+
+  @Test
+  void droppingADamagedLegacyEntryRemovesIt() {
+    writeIndex("index-legacy", "table-uuid");
+    writeLegacyRegistry("index-legacy");
+    new File(indexesRoot(), "index-legacy/metadata/index-metadata-v1.json").delete();
+    TestTables.TestTableOperations ops = operations();
+    SidecarIndexCatalog catalog = versionedCatalog(ops);
+
+    assertThat(catalog.dropIndex(tableDir.toString(), "index-legacy", true)).isTrue();
+
+    // the drop publishes a versioned registry; the legacy file stays for readers that predate the
+    // pointer, which is the same rule a first registration follows
+    assertThat(indexUuids(registryPointer(ops))).isEmpty();
+    assertThat(new File(indexesRoot(), "index-registry.json")).exists();
+  }
+
   private String rootOf(String registryFile) {
-    String root = registryJson(registryFile).get("metadata-files").get("index-a").asText();
+    String root = metadataRootOf(registryFile, "index-a");
     return root.substring("index-metadata-".length(), root.length() - ".json".length());
+  }
+
+  private String metadataRootOf(String registryFile, String indexUuid) {
+    return registryJson(registryFile).get("metadata-files").get(indexUuid).asText();
   }
 
   private void dropTableUuids(String registryFile) {

@@ -253,13 +253,39 @@ public final class SidecarIndexCatalog implements IndexCatalog {
   public List<IndexMetadata> listIndexes(String tableLocation) {
     List<IndexMetadata> indexes = Lists.newArrayList();
     Map<String, String> registry = registryEntries(tableLocation);
-    for (String indexUuid : registry.keySet()) {
-      IndexMetadata metadata = loadRegistered(tableLocation, indexUuid, registry);
-      if (metadata != null) {
+    for (Map.Entry<String, String> entry : registry.entrySet()) {
+      String indexUuid = entry.getKey();
+      IndexMetadata metadata = readRegisteredEntry(tableLocation, indexUuid, entry.getValue());
+      if (metadata == null) {
+        // one entry whose metadata is gone must not fail the listing: the other indexes are still
+        // usable, and damagedIndexUuids reports this one so a drop can remove it
+        LOG.warn(
+            "Skipping index {} of table {}: its metadata at {} is gone; drop it to repair the "
+                + "registry",
+            indexUuid,
+            tableLocation,
+            entry.getValue() == null
+                ? indexLocation(tableLocation, indexUuid)
+                : metadataRootPath(indexLocation(tableLocation, indexUuid), entry.getValue()));
+      } else {
         indexes.add(metadata);
       }
     }
     return ImmutableList.copyOf(indexes);
+  }
+
+  @Override
+  public Set<String> damagedIndexUuids(String tableLocation) {
+    Preconditions.checkArgument(
+        tableLocation != null && !tableLocation.isEmpty(), "Table location is empty");
+    Set<String> damaged = new LinkedHashSet<>();
+    Map<String, String> registry = registryEntries(tableLocation);
+    for (Map.Entry<String, String> entry : registry.entrySet()) {
+      if (readRegisteredEntry(tableLocation, entry.getKey(), entry.getValue()) == null) {
+        damaged.add(entry.getKey());
+      }
+    }
+    return damaged;
   }
 
   @Override
@@ -498,8 +524,21 @@ public final class SidecarIndexCatalog implements IndexCatalog {
       return false;
     }
 
-    // load the metadata before unregistering, because purging reads it from disk afterwards
-    IndexMetadata metadata = purge ? loadIndex(tableLocation, indexUuid) : null;
+    // load the metadata before unregistering, because purging reads it from disk afterwards; a
+    // registration whose metadata is already gone is still removed, which is what repairs the
+    // registry
+    IndexMetadata metadata = null;
+    if (purge) {
+      try {
+        metadata = loadIndex(tableLocation, indexUuid);
+      } catch (RuntimeException e) {
+        LOG.warn(
+            "Dropping index {} of table {} without its metadata: it is already unreadable",
+            indexUuid,
+            tableLocation,
+            e);
+      }
+    }
 
     // unregister first: a registration whose files are already gone cannot be loaded, while files
     // left behind by a failed purge are only garbage
@@ -585,7 +624,11 @@ public final class SidecarIndexCatalog implements IndexCatalog {
       Map.Entry<String, String> entry = iterator.next();
       String recorded = tableUuids.get(entry.getKey());
       if (recorded == null) {
-        IndexMetadata existing = loadRegistered(tableLocation, entry.getKey(), entries);
+        // a registry written before the table uuids existed: the metadata decides whether the entry
+        // is this table's. One whose metadata is gone cannot be claimed by any table, so it is
+        // dropped from the registry instead of failing the registration that would repair it.
+        IndexMetadata existing =
+            readRegisteredEntry(tableLocation, entry.getKey(), entry.getValue());
         if (existing == null) {
           registry.dropped().add(entry.getKey());
           iterator.remove();
@@ -686,7 +729,10 @@ public final class SidecarIndexCatalog implements IndexCatalog {
         return false;
       }
 
-      IndexMetadata metadata = purge ? loadRegistered(tableLocation, indexUuid, entries) : null;
+      // a purge removes whatever the entry names; the metadata is read only when it can be read, so
+      // an entry whose metadata is already gone is still removable, which is the repair path
+      IndexMetadata metadata =
+          purge ? readRegisteredEntry(tableLocation, indexUuid, entries.get(indexUuid)) : null;
       String root = entries.remove(indexUuid);
       registry.tableUuids().remove(indexUuid);
       // the record outlives the versions that name the entry: an old writer that never saw the drop
@@ -694,10 +740,14 @@ public final class SidecarIndexCatalog implements IndexCatalog {
       registry.dropped().add(indexUuid);
       if (commitRegistry(tableLocation, previous, registry)) {
         registeredRoots.remove(indexUuid);
-        if (metadata != null) {
-          purgeIndexFiles(metadata);
-          purgeMetadataRoots(metadata.location(), root);
+        if (purge) {
+          if (metadata != null) {
+            purgeIndexFiles(metadata);
+          }
+
+          purgeMetadataRoots(indexLocation(tableLocation, indexUuid), root);
         }
+
         return true;
       }
 

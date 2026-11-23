@@ -20,13 +20,17 @@ package org.apache.iceberg.spark.extensions;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
+import com.fasterxml.jackson.databind.JsonNode;
 import java.io.IOException;
 import java.io.OutputStream;
+import java.io.UncheckedIOException;
 import java.nio.ByteBuffer;
+import java.nio.charset.StandardCharsets;
 import java.util.List;
 import org.apache.iceberg.Table;
 import org.apache.iceberg.index.IndexFile;
 import org.apache.iceberg.index.IndexMetadata;
+import org.apache.iceberg.index.SidecarIndexCatalog;
 import org.apache.iceberg.index.spark.VectorIndexes;
 import org.apache.iceberg.io.IOUtil;
 import org.apache.iceberg.io.InputFile;
@@ -34,7 +38,9 @@ import org.apache.iceberg.io.SeekableInputStream;
 import org.apache.iceberg.puffin.BlobMetadata;
 import org.apache.iceberg.puffin.Puffin;
 import org.apache.iceberg.puffin.PuffinReader;
+import org.apache.iceberg.relocated.com.google.common.io.ByteStreams;
 import org.apache.iceberg.spark.Spark3Util;
+import org.apache.iceberg.util.JsonUtil;
 import org.junit.jupiter.api.TestTemplate;
 
 /**
@@ -248,6 +254,53 @@ public class TestCheckIndexesProcedure extends ExtensionsTestBase {
     try (OutputStream out = table.io().newOutputFile(file.location()).createOrOverwrite()) {
       out.write(content);
     }
+  }
+
+  @TestTemplate
+  public void reportsAnEntryWhoseMetadataIsGone() throws Exception {
+    String table = tableName("check_damaged_" + catalogName);
+    createAndIndex(table);
+    Table loaded = Spark3Util.loadIcebergTable(spark, table);
+    String uuid = VectorIndexes.findAnyIndexOrNull(loaded, "embedding").indexUuid();
+    deleteIndexMetadata(loaded, uuid);
+
+    List<Object[]> rows = sql("CALL %s.system.check_indexes(table => '%s')", catalogName, table);
+    assertThat(rows).as("the damaged entry is reported, not the readable one").hasSize(1);
+    Object[] row = rows.get(0);
+    assertThat(row[2].toString()).isEqualTo(uuid);
+    assertThat(row[1]).as("nothing identifies the column of a damaged entry").isNull();
+    assertThat((Boolean) row[8]).as("readable").isFalse();
+    assertThat((String) row[12])
+        .as("the report says how to repair the registry")
+        .contains("drop_index")
+        .contains(uuid);
+
+    sql("DROP TABLE IF EXISTS %s", table);
+  }
+
+  /**
+   * Deletes the metadata the registry names for one index, leaving the registration behind: this is
+   * the damaged entry a registry and the files under it disagree about.
+   */
+  private static void deleteIndexMetadata(Table table, String indexUuid) {
+    String registryFile = table.properties().get(SidecarIndexCatalog.REGISTRY_PROPERTY);
+    assertThat(registryFile).as("the table names its registry").isNotNull();
+    String indexes = table.location() + "/" + SidecarIndexCatalog.INDEXES_DIR;
+    JsonNode registry;
+    try (SeekableInputStream in =
+        table.io().newInputFile(indexes + "/" + registryFile).newStream()) {
+      registry =
+          JsonUtil.parse(
+              new String(ByteStreams.toByteArray(in), StandardCharsets.UTF_8), node -> node);
+    } catch (IOException e) {
+      throw new UncheckedIOException(e);
+    }
+
+    String root = registry.get("metadata-files").get(indexUuid).asText();
+    table
+        .io()
+        .deleteFile(
+            indexes + "/" + indexUuid + "/" + SidecarIndexCatalog.METADATA_DIR + "/" + root);
   }
 
   private void createAndIndex(String table) {

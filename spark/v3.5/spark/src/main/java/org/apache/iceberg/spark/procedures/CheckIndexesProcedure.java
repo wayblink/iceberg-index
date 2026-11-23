@@ -32,6 +32,7 @@ import org.apache.iceberg.index.IndexReader;
 import org.apache.iceberg.index.IndexSnapshot;
 import org.apache.iceberg.index.IndexTypes;
 import org.apache.iceberg.index.PuffinIndexFileContainer;
+import org.apache.iceberg.index.SidecarIndexCatalog;
 import org.apache.iceberg.index.spark.IndexEntries;
 import org.apache.iceberg.index.spark.VectorIndexes;
 import org.apache.iceberg.index.text.TextIndexAdapter;
@@ -195,6 +196,36 @@ class CheckIndexesProcedure extends BaseProcedure {
         checkDeclaredPayloads(
             catalog, table, tableName, column, metadata, snapshot, adapter, uncovered, rows);
       }
+    }
+
+    // entries the registry names whose metadata is gone are left out of the listing above, because
+    // one unreadable entry must not fail the report of the others; they are still reported here so
+    // the registry can be repaired by dropping them by UUID
+    SidecarIndexCatalog sidecar = VectorIndexProcedures.indexCatalog(table);
+    for (String indexUuid : sidecar.damagedIndexUuids(table.location())) {
+      rows.add(
+          newInternalRow(
+              UTF8String.fromString(table.name()),
+              null,
+              UTF8String.fromString(indexUuid),
+              null,
+              UTF8String.fromString("unknown"),
+              null,
+              null,
+              null,
+              false,
+              null,
+              false,
+              null,
+              UTF8String.fromString(
+                  "the registry names this index but its metadata file is gone; remove it with "
+                      + "CALL "
+                      + catalog
+                      + ".system.drop_index(table => '"
+                      + qualified(catalog, tableName)
+                      + "', column => '<any column>', index => '"
+                      + indexUuid
+                      + "', purge => true)")));
     }
   }
 

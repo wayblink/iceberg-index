@@ -333,6 +333,26 @@ class TestSidecarIndexCatalog {
   }
 
   @Test
+  public void dropsAnEntryWhoseMetadataIsGone(@TempDir Path tempDir) {
+    LocalFileIO fileIO = new LocalFileIO();
+    IndexCatalog catalog = new SidecarIndexCatalog(fileIO);
+    String tableLocation = tempDir.resolve("table").toString();
+    IndexMetadata created = catalog.createIndex(request(tableLocation, "index-gone"));
+
+    // the registry still names the index, but nothing it names can be read: the drop must still
+    // remove the registration, which is the only way to repair the table without editing files
+    File[] metadata = new File(created.location(), "metadata").listFiles();
+    assertThat(metadata).isNotEmpty();
+    for (File file : metadata) {
+      assertThat(file.delete()).isTrue();
+    }
+
+    assertThat(catalog.listIndexes(tableLocation)).isEmpty();
+    assertThat(catalog.dropIndex(tableLocation, "index-gone", true)).isTrue();
+    assertThat(catalog.dropIndex(tableLocation, "index-gone", true)).isFalse();
+  }
+
+  @Test
   public void publishesMetadataVersionsAndSwitchesThePointer(@TempDir Path tempDir)
       throws IOException {
     LocalFileIO fileIO = new LocalFileIO();

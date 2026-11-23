@@ -18,7 +18,9 @@
  */
 package org.apache.iceberg.index;
 
+import java.util.Collections;
 import java.util.List;
+import java.util.Set;
 import java.util.function.UnaryOperator;
 import org.apache.iceberg.relocated.com.google.common.base.Preconditions;
 
@@ -57,6 +59,24 @@ public interface IndexCatalog {
 
   /** Lists the indexes registered for a table, in registration order. */
   List<IndexMetadata> listIndexes(String tableLocation);
+
+  /**
+   * Lists the indexes the registry names whose metadata cannot be read, such as an entry whose
+   * metadata file was deleted.
+   *
+   * <p>These entries are left out of {@link #listIndexes(String)} rather than failing the listing,
+   * because one unreadable entry would otherwise make every index operation of the table fail. They
+   * are still named here so a report can say the registry needs repair, and so a drop can remove
+   * them by UUID: nothing else about them is known, which is why the UUID is the only identifier
+   * that can be reported.
+   *
+   * <p>The default reports none, for a catalog whose registry and metadata cannot disagree.
+   *
+   * @param tableLocation the table's location
+   */
+  default Set<String> damagedIndexUuids(String tableLocation) {
+    return Collections.emptySet();
+  }
 
   /**
    * Lists the indexes registered for a table that belong to the given table instance.

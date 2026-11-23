@@ -21,12 +21,20 @@ package org.apache.iceberg.spark.extensions;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
+import com.fasterxml.jackson.databind.JsonNode;
+import java.io.IOException;
+import java.io.UncheckedIOException;
+import java.nio.charset.StandardCharsets;
 import java.util.List;
 import org.apache.iceberg.ParameterizedTestExtension;
 import org.apache.iceberg.Table;
 import org.apache.iceberg.index.IndexMetadata;
+import org.apache.iceberg.index.SidecarIndexCatalog;
 import org.apache.iceberg.index.spark.VectorIndexes;
+import org.apache.iceberg.io.SeekableInputStream;
 import org.apache.iceberg.relocated.com.google.common.collect.Lists;
+import org.apache.iceberg.relocated.com.google.common.io.ByteStreams;
+import org.apache.iceberg.util.JsonUtil;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.TestTemplate;
 import org.junit.jupiter.api.extension.ExtendWith;
@@ -169,6 +177,61 @@ public class TestDropIndexProcedure extends ExtensionsTestBase {
             catalogName, tableName(TABLE));
     assertThat(dropped.get(0)[0].toString()).isEqualTo(built.get(0)[0].toString());
     assertThat(dropped.get(0)[1].toString()).isEqualTo("vector");
+  }
+
+  @TestTemplate
+  public void dropsADamagedEntryByUuidAndRebuilds() {
+    createTextTable();
+    buildTextIndex();
+    Table table = reload();
+    String uuid = VectorIndexes.findAnyIndexOrNull(table, "body").indexUuid();
+    deleteIndexMetadata(table, uuid);
+
+    // one entry whose metadata is gone no longer fails the listing of the table
+    assertThat(listIndexes()).isEmpty();
+
+    // the column cannot resolve it because the listing skips it, so the UUID it was named by is
+    // what removes it; that is the repair path for a registry the files disagree with
+    List<Object[]> dropped =
+        sql(
+            "CALL %s.system.drop_index(table => '%s', column => 'body', index => '%s')",
+            catalogName, tableName(TABLE), uuid);
+    assertThat(dropped).hasSize(1);
+    assertThat(dropped.get(0)[0].toString()).isEqualTo(uuid);
+    assertThat(dropped.get(0)[1].toString())
+        .as("a damaged entry has no readable index type")
+        .isEqualTo("unknown");
+    assertThat((Boolean) dropped.get(0)[2]).isTrue();
+
+    // and the column can be indexed again once the registry is repaired
+    List<Object[]> rebuilt = buildTextIndex();
+    assertThat(rebuilt).hasSize(1);
+    assertThat(listIndexes()).containsExactly(rebuilt.get(0)[0].toString());
+  }
+
+  /**
+   * Deletes the metadata the registry names for one index, leaving the registration behind: this is
+   * the damaged entry a registry and the files under it disagree about.
+   */
+  private static void deleteIndexMetadata(Table table, String indexUuid) {
+    String registryFile = table.properties().get(SidecarIndexCatalog.REGISTRY_PROPERTY);
+    assertThat(registryFile).as("the table names its registry").isNotNull();
+    String indexes = table.location() + "/" + SidecarIndexCatalog.INDEXES_DIR;
+    JsonNode registry;
+    try (SeekableInputStream in =
+        table.io().newInputFile(indexes + "/" + registryFile).newStream()) {
+      registry =
+          JsonUtil.parse(
+              new String(ByteStreams.toByteArray(in), StandardCharsets.UTF_8), node -> node);
+    } catch (IOException e) {
+      throw new UncheckedIOException(e);
+    }
+
+    String root = registry.get("metadata-files").get(indexUuid).asText();
+    table
+        .io()
+        .deleteFile(
+            indexes + "/" + indexUuid + "/" + SidecarIndexCatalog.METADATA_DIR + "/" + root);
   }
 
   private void createTextTable() {

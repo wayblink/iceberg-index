@@ -65,4 +65,18 @@ final class IndexDrop {
     // the row is for; whether the index was still registered is an error when it was not
     return new Result(metadata.indexUuid(), dropped && purge);
   }
+
+  /**
+   * Removes a registry entry by UUID, for one whose metadata can no longer be read.
+   *
+   * <p>The listing skips such an entry, so it cannot be resolved by name or column; the UUID is the
+   * only identifier that survives. A purge still removes what is left of the tree, so a drop of a
+   * damaged entry is the repair path.
+   *
+   * @return whether the registry named the entry, which is false for a UUID it never held
+   */
+  static boolean dropByUuid(Table table, String indexUuid, boolean purge) {
+    SidecarIndexCatalog catalog = VectorIndexProcedures.indexCatalog(table);
+    return catalog.dropIndex(table.location(), indexUuid, purge);
+  }
 }

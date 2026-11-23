@@ -102,8 +102,26 @@ class DropIndexProcedure extends BaseProcedure {
     return modifyIcebergTable(
         input.ident(TABLE_PARAM),
         table -> {
-          IndexMetadata metadata =
-              IndexSelection.resolveAny(table, column, IndexProcedures.selection(input));
+          String selection = IndexProcedures.selection(input);
+          IndexMetadata metadata;
+          try {
+            metadata = IndexSelection.resolveAny(table, column, selection);
+          } catch (IllegalArgumentException e) {
+            // a selection that names a UUID the registry holds but whose metadata is gone: the
+            // listing skips such an entry, so it cannot be resolved by column, and the drop removes
+            // it directly. A UUID the registry never held keeps the resolution error.
+            if (selection != null && IndexDrop.dropByUuid(table, selection, purge)) {
+              return new InternalRow[] {
+                newInternalRow(
+                    UTF8String.fromString(selection),
+                    UTF8String.fromString("unknown"),
+                    purge)
+              };
+            }
+
+            throw e;
+          }
+
           IndexDrop.Result dropped = IndexDrop.drop(table, metadata, purge);
           return new InternalRow[] {
             newInternalRow(

@@ -374,6 +374,14 @@ CALL local.system.drop_index(table => 'db.papers', column => 'body', index => '<
 
 输出三列 `index_uuid, index_type, purged`：`purged` 是**文件是否真的被删**（`purge => false` 时为 `false`），而 `drop_vector_index` 那两列输出里的第二列沿用旧语义。同一列上存在多个索引时必须用 `index =>` 指定一个，错误信息会列出候选（`type:name(uuid)`）。
 
+`list_indexes` 只列出元数据还能读出来的索引：注册表里登记了、但 `indexes/<uuid>/metadata/` 下的文件已不存在（被手工删、被清理任务误删等）的条目会被跳过并留一条 WARN，而不是让整张表的索引操作直接失败。这类损坏条目没有可读的 name/type/column，只有 uuid 能标识；`check_indexes` 会单独给一行（`column = NULL`、`index_type = unknown`、`readable = false`，`suggestion` 带修复语句），修复是按 uuid 删除：
+
+```sql
+CALL local.system.drop_index(table => 'db.papers', column => 'body', index => '<损坏条目的 uuid>', purge => true);
+```
+
+`column` 对损坏条目只用来定位，任意列名都可以——索引解析失败后会按 uuid 直接删注册表条目；`purge => true` 会一并清掉该 uuid 剩下的 metadata 目录。uuid 不在注册表里时仍报错。
+
 注意 `ALTER TABLE … DROP INDEX <name>` **没有 `purge` 参数**，它落到默认值 `true`，即直接删文件。
 
 ---
@@ -595,6 +603,8 @@ SHOW INDEXES FROM local.db.docs;   -- 只有 FROM，没有 IN
 `source_snapshot_id` 是这份索引覆盖的**表**快照，`index_snapshot_id` 是这个索引**自己**那一版的快照 id：`REFRESH INDEX` 会在同一个 `index_uuid`、同一个名字下发布新的 index snapshot，所以只有 `index_snapshot_id` 能说清「测的是哪一版索引」（验收套件在跑之前就把它冻住，刷新过的索引会被拒绝，而不是被当成准备好的那份）。
 
 `list_indexes` 的 `status` 只有 `PUBLISHED` 或 `NULL`（没有快照时），**不会显示构建进度**——那要看 `index_build_status`。`definition` 是 JSON 字符串，取 `metric` 之类的字段要 `get_json_object`。
+
+注册表与磁盘不一致时（注册表条目还在、`metadata/index-metadata-*.json` 被删），`list_indexes` 跳过这些损坏条目并留 WARN，`check_indexes` 给每个损坏条目一行（`column = NULL`、`index_type = unknown`、`readable = false`）和按 uuid 删除的修复语句；一个坏条目不会让整张表的索引操作失败。
 
 `index_build_status.state` 五种：`RUNNING`、`SUCCEEDED`、`FAILED`、`ABANDONED`（报告停止更新超过 5 分钟，通常是 driver 被杀）、`UNKNOWN`（没有报告，比如更早版本建的）。构建期间约每 30 秒一次心跳，可以反复 `CALL` 观察。
 
