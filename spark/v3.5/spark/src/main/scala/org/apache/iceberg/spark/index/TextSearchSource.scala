@@ -95,6 +95,7 @@ private[spark] case class TextSearchExec(
   override protected def doExecute(): RDD[InternalRow] = {
     val table = source.table
     val metadata = source.metadata
+    val indexUuid = metadata.indexUuid()
     val snapshotId = source.snapshotId
     val adapter = new TextIndexAdapter(metadata.definition().asInstanceOf[TextIndexDefinition])
     val query = IndexQuery.of(snapshotId, adapter.encodeQuery(source.query), source.limit)
@@ -106,7 +107,7 @@ private[spark] case class TextSearchExec(
     val uncovered = new IndexReader(metadata, table).uncoveredDataFiles(query, files)
     require(
       uncovered.isEmpty,
-      s"Text index ${metadata.indexUuid()} leaves ${uncovered.size()} files uncovered " +
+      s"Text index $indexUuid leaves ${uncovered.size()} files uncovered " +
         s"at snapshot $snapshotId; run refresh_text_index")
 
     val hits = source.filter match {
@@ -134,29 +135,103 @@ private[spark] case class TextSearchExec(
 
     val columns = output.dropRight(1).map(_.name)
     val readSchema = IndexEntries.sparkSchema(table, columns.asJava)
-    val positions = hits
+    val resultSchema = StructType(output.map(a => StructField(a.name, a.dataType, a.nullable)))
+
+    // what a task needs to answer with a row: the score of the hit that named it, where that hit
+    // sat in the merged order, and which positions its files owe an answer
+    val searched = hits.zipWithIndex.map { case (hit, index) => (hit, index) }.toVector
+    val scored = searched
+      .groupBy { case (hit, _) => (hit.dataFile(), hit.rowPosition()) }
+      .map { case (at, atPosition) =>
+        at -> atPosition.map { case (hit, index) => (index, hit.score()) }.sortBy(_._1).toArray
+      }
+    val expected = searched
+      .groupBy { case (hit, _) => hit.dataFile() }
+      .map { case (file, ofFile) =>
+        file -> ofFile.map { case (hit, _) => hit.rowPosition() }.toSet
+      }
+
+    // a hit names a data file of the snapshot the index was bound to, so a hit of a file the
+    // snapshot no longer plans is a stale index: failing before the rows are read keeps the answer
+    // from being quietly short
+    val planned = tasks.asScala.map(_.file().location().toString).toSet
+    searched.find { case (hit, _) => !planned.contains(hit.dataFile()) }.foreach { case (hit, _) =>
+      throw TextSearchHits.absentRow(indexUuid, snapshotId, hit.dataFile(), hit.rowPosition())
+    }
+
+    val down = spark.sparkContext.broadcast(TextSearchHits(scored, expected))
+    val wanted = hits
       .groupBy(_.dataFile())
       .map { case (file, matches) =>
         file -> matches.map(hit => java.lang.Long.valueOf(hit.rowPosition())).asJavaCollection
       }
       .asJava
-    val byFile = IndexEntries.rowsAt(spark, table, positions, columns.asJava, readSchema, tasks)
-    val rows = hits.map { hit =>
-      val row = Option(byFile.get(hit.dataFile()))
-        .flatMap(rows => Option(rows.get(hit.rowPosition())))
-        .getOrElse(throw new IllegalStateException(
-          s"Text index ${metadata.indexUuid()} referred to a row absent from snapshot $snapshotId " +
-            s"at ${hit.dataFile()}:${hit.rowPosition()}; run refresh_text_index"))
-      Row.fromSeq(row.toSeq :+ hit.score())
-    }.toVector
+    val fetched =
+      IndexEntries.rowsAtRdd(spark, table, wanted, columns.asJava, readSchema, tasks)
+    if (fetched == null) {
+      return spark.sparkContext.emptyRDD[InternalRow]
+    }
 
-    val resultSchema = StructType(output.map(a => StructField(a.name, a.dataType, a.nullable)))
-    spark.sparkContext.parallelize(rows, 1).mapPartitions { values =>
+    // One partition per hit data file, and the conversion happens in the task that read the row:
+    // the rows of the answer never pass through the driver, and the reads of the hit files run
+    // side by side rather than one after another
+    fetched.rdd.mapPartitions { entries =>
+      val plan = down.value
       val convert = CatalystTypeConverters.createToCatalystConverter(resultSchema)
       val unsafe = UnsafeProjection.create(resultSchema)
-      values.map(row => unsafe(convert(row).asInstanceOf[InternalRow]).copy())
+      val read = entries.toVector
+
+      // a fetch-back reads the positions it was asked for, so a position the answer names and the
+      // read did not answer with is a row the snapshot no longer has, which is a stale index; a
+      // file whose every hit is gone answers no rows at all, which this cannot tell from a file
+      // that was never hit
+      for ((file, ofFile) <- read.groupBy(_._1)) {
+        val found = ofFile.map(entry => entry._2._1.longValue()).toSet
+        val missing = plan.expected.getOrElse(file, Set.empty[Long]) -- found
+        if (missing.nonEmpty) {
+          throw TextSearchHits.absentRow(indexUuid, snapshotId, file, missing.head)
+        }
+      }
+
+      // the rows of a partition arrive in data file and position order, and the answer's order is
+      // the order the hits merged in: sorting one partition's rows is a sort of what this
+      // partition read, not a pass over the whole answer, and for a search whose hits came from
+      // one file it restores exactly the order the answer had when it was built on the driver
+      read
+        .flatMap { case (file, (position, row)) =>
+          plan.scored
+            .getOrElse((file, position.longValue()), Array.empty[(Int, Double)])
+            .map { case (index, score) => (index, Row.fromSeq(row.toSeq :+ score)) }
+        }
+        .sortBy(_._1)
+        .iterator
+        .map { case (_, row) => unsafe(convert(row).asInstanceOf[InternalRow]).copy() }
     }
   }
+}
+
+/**
+ * The hits of one search, as the tasks that answer with their rows see them: the score of the hit
+ * that named a row, where that hit sat in the merged order, and the positions each hit file owes.
+ *
+ * <p>The driver merges the hits, so it knows all of this; handing it down once is what lets the rows
+ * be read and converted where they are read instead of being collected and sent out again.
+ */
+private[spark] case class TextSearchHits(
+    scored: Map[(String, Long), Array[(Int, Double)]],
+    expected: Map[String, Set[Long]])
+
+private[spark] object TextSearchHits {
+
+  /** The failure of a hit whose row the snapshot does not have: the index refers to a lost row. */
+  def absentRow(
+      indexUuid: String,
+      snapshotId: Long,
+      dataFile: String,
+      position: Long): IllegalStateException =
+    new IllegalStateException(
+      s"Text index $indexUuid referred to a row absent from snapshot $snapshotId " +
+        s"at $dataFile:$position; run refresh_text_index")
 }
 
 /** Uses Spark SQL's truth rules for row admission and Iceberg's inclusive filter for pruning. */

@@ -630,10 +630,9 @@ public final class IndexEntries {
       List<String> columns,
       StructType readSchema,
       List<FileScanTask> scanTasks) {
-    List<FileScanTask> tasks = tasksAt(positionsByFile, scanTasks);
     Map<String, Map<Long, Row>> rowsByFile = Maps.newLinkedHashMap();
     JavaPairRDD<String, Tuple2<Long, Row>> rows =
-        liveRowsRdd(spark, table, positionsByFile, columns, readSchema, tasks);
+        rowsAtRdd(spark, table, positionsByFile, columns, readSchema, scanTasks);
     if (rows == null) {
       return rowsByFile;
     }
@@ -645,6 +644,34 @@ public final class IndexEntries {
     }
 
     return rowsByFile;
+  }
+
+  /**
+   * The live rows at the given positions as an RDD, rather than as a map collected to the driver.
+   *
+   * <p>This is {@link #rowsAt} without the collect: a caller that turns the rows into something of
+   * its own, internal rows for instance, reads them where they are read and keeps them there. The
+   * partitions are the fetch-back's own, one task per hit data file, so the reads of the files that
+   * were hit run at the same time instead of one after another.
+   *
+   * @param spark the Spark session
+   * @param table the Iceberg table to read
+   * @param positionsByFile the row positions to read, per data file
+   * @param columns the columns to return, in this order
+   * @param readSchema the schema to read the data files with, or null to infer it from the files
+   * @param scanTasks the scan tasks of the snapshot being answered
+   * @return the live rows, each with its data file and its position; null when no file of the
+   *     lookup is in the snapshot
+   */
+  public static JavaPairRDD<String, Tuple2<Long, Row>> rowsAtRdd(
+      SparkSession spark,
+      Table table,
+      Map<String, ? extends Collection<Long>> positionsByFile,
+      List<String> columns,
+      StructType readSchema,
+      List<FileScanTask> scanTasks) {
+    return liveRowsRdd(
+        spark, table, positionsByFile, columns, readSchema, tasksAt(positionsByFile, scanTasks));
   }
 
   /**
