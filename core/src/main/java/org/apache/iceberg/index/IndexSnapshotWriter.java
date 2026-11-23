@@ -150,14 +150,8 @@ public final class IndexSnapshotWriter {
 
   /** Removes the ledger associated with a manifest list after the catalog resolves publication. */
   public static void finishPublication(FileIO io, String indexLocation, String manifestList) {
-    String prefix = indexLocation + "/" + SNAPSHOTS_DIR + "/" + MANIFEST_LIST_PREFIX;
-    int separator = manifestList.indexOf(ATTEMPT_SEPARATOR, prefix.length());
-    if (manifestList.startsWith(prefix) && separator >= 0) {
-      String attempt = manifestList.substring(separator + ATTEMPT_SEPARATOR.length());
-      if (!attempt.matches("[a-zA-Z0-9-]+")) {
-        return;
-      }
-
+    String attempt = attemptOf(indexLocation, manifestList);
+    if (attempt != null) {
       new IndexSnapshotWriter(
               io,
               new PuffinIndexFileContainer(),
@@ -165,6 +159,90 @@ public final class IndexSnapshotWriter {
               DEFAULT_FILES_PER_MANIFEST,
               attempt)
           .finishAttempt(indexLocation);
+    }
+  }
+
+  /**
+   * Deletes the files of an attempt whose publication never landed.
+   *
+   * <p>Nothing names the files of an unpublished attempt: the metadata that would have is the one
+   * the publication failed to write, so the attempt becomes an orphan index the moment the catalog
+   * refuses the snapshot. The attempt's ledger is the only record of what it wrote, so the declared
+   * paths are read back from it and removed, and the ledger goes with them.
+   *
+   * @param manifestList the manifest list of the snapshot that was not published, which names the
+   *     attempt that wrote it
+   */
+  public static void abortPublication(FileIO io, String manifestList) {
+    String indexLocation = indexLocationOf(manifestList);
+    if (indexLocation == null) {
+      return;
+    }
+
+    String attempt = attemptOf(indexLocation, manifestList);
+    if (attempt == null) {
+      return;
+    }
+
+    new IndexSnapshotWriter(
+            io,
+            new PuffinIndexFileContainer(),
+            DEFAULT_ENTRIES_PER_FILE,
+            DEFAULT_FILES_PER_MANIFEST,
+            attempt)
+        .abortLedger(indexLocation);
+  }
+
+  /**
+   * The attempt a manifest list names, or null when the location is not one this writer wrote.
+   *
+   * <p>The attempt is in the name rather than in the file, so it is known without opening the
+   * manifest list, which is what lets a writer that never had the attempt in memory find its files.
+   */
+  private static String attemptOf(String indexLocation, String manifestList) {
+    String prefix = indexLocation + "/" + SNAPSHOTS_DIR + "/" + MANIFEST_LIST_PREFIX;
+    int separator = manifestList.indexOf(ATTEMPT_SEPARATOR, prefix.length());
+    if (!manifestList.startsWith(prefix) || separator < 0) {
+      return null;
+    }
+
+    String attempt = manifestList.substring(separator + ATTEMPT_SEPARATOR.length());
+    return attempt.matches("[a-zA-Z0-9-]+") ? attempt : null;
+  }
+
+  /** The index a manifest list belongs to, or null when it is not an index manifest list. */
+  private static String indexLocationOf(String manifestList) {
+    int snapshots = manifestList.indexOf("/" + SNAPSHOTS_DIR + "/" + MANIFEST_LIST_PREFIX);
+    return snapshots < 0 ? null : manifestList.substring(0, snapshots);
+  }
+
+  /**
+   * Deletes what a ledger on disk declares, for a caller that no longer has this writer's state.
+   */
+  private void abortLedger(String indexLocation) {
+    List<String> declared = Lists.newArrayList();
+    declaredPathsFromLedger(indexLocation, FILE_MARKER_PREFIX, declared);
+    declaredPathsFromLedger(indexLocation, MANIFEST_MARKER_PREFIX, declared);
+    for (String marker : List.of(MANIFEST_LIST_MARKER, STATISTICS_MARKER)) {
+      String path = readMarker(indexLocation, marker);
+      if (path != null) {
+        declared.add(path.trim());
+      }
+    }
+
+    runInParallel(declared, this::deleteIfExists);
+    deleteLedger(indexLocation);
+  }
+
+  /** Reads the paths a marker sequence declares, stopping where the sequence ends. */
+  private void declaredPathsFromLedger(String indexLocation, String prefix, List<String> declared) {
+    for (int seq = 0; ; seq += 1) {
+      String path = readMarker(indexLocation, prefix + seq);
+      if (path == null) {
+        return;
+      }
+
+      declared.add(path.trim());
     }
   }
 

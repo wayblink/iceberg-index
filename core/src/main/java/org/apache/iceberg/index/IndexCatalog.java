@@ -110,6 +110,8 @@ public interface IndexCatalog {
    * @param indexUuid the index UUID
    * @param change a change to apply to the current metadata; it may be applied more than once
    * @throws IllegalArgumentException if the index does not exist
+   * @throws NotFoundException if the index was dropped while the update was in flight; the change
+   *     is not applied, because publishing it would make the dropped index current again
    */
   default IndexMetadata updateIndex(
       String tableLocation, String indexUuid, UnaryOperator<IndexMetadata> change) {

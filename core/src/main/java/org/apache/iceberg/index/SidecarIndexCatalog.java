@@ -31,6 +31,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.function.UnaryOperator;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
@@ -129,6 +130,17 @@ public final class SidecarIndexCatalog implements IndexCatalog {
 
   private final FileIO fileIO;
   private final IndexRegistryPointer pointer;
+
+  /**
+   * The metadata roots this catalog registered, by index uuid.
+   *
+   * <p>A registry entry can go missing for two reasons that need opposite answers: a writer that
+   * moved the pointer from a view it read before the registration existed leaves the entry out
+   * without removing it, and a writer that drops the index removes it on purpose. Only the tree the
+   * catalog wrote distinguishes them, and once the registry stops naming it, this is the only place
+   * that still knows it.
+   */
+  private final Map<String, String> registeredRoots = new ConcurrentHashMap<>();
 
   /**
    * Creates a catalog for a table whose registry is a single file written in place, which is what a
@@ -330,8 +342,23 @@ public final class SidecarIndexCatalog implements IndexCatalog {
       Registry registry = readRegistry(tableLocation, previous);
       Map<String, String> entries = registry.roots();
       IndexMetadata current = loadRegistered(tableLocation, indexUuid, entries);
-      Preconditions.checkArgument(
-          current != null, "Index not found for table %s: %s", tableLocation, indexUuid);
+      if (current == null) {
+        // the registry names no tree for this index: either an entry a writer that does not compare
+        // the pointer left out, or an index that was dropped while this one was building it
+        if (attempt == MAX_REGISTRY_ATTEMPTS) {
+          throw new CommitFailedException(
+              "Failed to restore the registration of index %s for table %s after %s attempts",
+              indexUuid, tableLocation, MAX_REGISTRY_ATTEMPTS);
+        }
+
+        if (restoreLostRegistration(tableLocation, previous, registry, indexUuid)) {
+          continue;
+        }
+
+        backoff(attempt);
+        continue;
+      }
+
       IndexMetadata next = change.apply(current);
       Preconditions.checkArgument(
           next != null
@@ -353,6 +380,9 @@ public final class SidecarIndexCatalog implements IndexCatalog {
       }
 
       if (commitRegistry(tableLocation, previous, registry)) {
+        // the latest tree of an index this catalog registered: a registration lost later is
+        // restored from it, so what it restores is everything published up to that point
+        registeredRoots.put(indexUuid, root);
         return next;
       }
 
@@ -363,6 +393,87 @@ public final class SidecarIndexCatalog implements IndexCatalog {
     }
 
     throw new CommitFailedException("Failed to update index metadata for index %s", indexUuid);
+  }
+
+  /**
+   * Puts back a registration the registry no longer names, or refuses when the index was dropped.
+   *
+   * <p>The tree this catalog wrote is the only evidence that the index was registered at all: an
+   * entry that a writer moved the pointer past is restored from it, while an entry a drop removed
+   * is not, because publishing into a dropped index would make it current again, which is what the
+   * drop asked not to happen.
+   *
+   * @return true when the registry now names the tree again, false when another writer moved the
+   *     pointer first
+   */
+  private boolean restoreLostRegistration(
+      String tableLocation, String previous, Registry registry, String indexUuid) {
+    String root = registeredRoots.get(indexUuid);
+    if (root == null) {
+      throw new NotFoundException(
+          "Index %s of table %s was dropped while it was being updated: the registry no longer "
+              + "names it, and this catalog did not register it",
+          indexUuid, tableLocation);
+    }
+
+    if (namedInHistory(tableLocation, previous, indexUuid)) {
+      throw new NotFoundException(
+          "Index %s of table %s was dropped while it was being updated: a later registry version "
+              + "removed the entry",
+          indexUuid, tableLocation);
+    }
+
+    String path = metadataRootPath(indexLocation(tableLocation, indexUuid), root);
+    String json = readIfExists(path);
+    if (json == null) {
+      throw new NotFoundException(
+          "Index %s of table %s was dropped while it was being updated: its metadata at %s is gone",
+          indexUuid, tableLocation, path);
+    }
+
+    IndexMetadata metadata =
+        JsonUtil.parse(
+            json, node -> IndexMetadataParser.fromJson(JsonUtil.get(METADATA_DOCUMENT, node)));
+    registry.roots().put(indexUuid, root);
+    if (metadata.tableUuid() != null) {
+      registry.tableUuids().put(indexUuid, metadata.tableUuid());
+    } else {
+      registry.tableUuids().remove(indexUuid);
+    }
+
+    return commitRegistry(tableLocation, previous, registry);
+  }
+
+  /**
+   * Whether a registry version the current one descends from named the index.
+   *
+   * <p>A registration only adds an entry and a drop only removes one, so a version in the chain
+   * that names an index the current registry does not is a removal. A registration that a writer
+   * overwrote without comparing the pointer leaves no trace in the chain: the registry it wrote
+   * descends from the state it read, which never named the index.
+   *
+   * <p>The walk is bounded by the versions that are kept, because the chain is the only index of
+   * them: the first version whose file was pruned ends it.
+   */
+  private boolean namedInHistory(String tableLocation, String registryFile, String indexUuid) {
+    String file = registryFile;
+    for (int depth = 0; file != null && depth < VERSIONS_TO_KEEP; depth += 1) {
+      String json = readIfExists(registryPath(tableLocation, file));
+      if (json == null) {
+        return false;
+      }
+
+      JsonNode node = JsonUtil.parse(json, candidate -> candidate);
+      for (JsonNode named : JsonUtil.get(REGISTRY_INDEX_UUIDS, node)) {
+        if (indexUuid.equals(named.asText())) {
+          return true;
+        }
+      }
+
+      file = previousFile(node);
+    }
+
+    return false;
   }
 
   @Override
@@ -424,6 +535,7 @@ public final class SidecarIndexCatalog implements IndexCatalog {
       }
 
       if (commitRegistry(tableLocation, previous, registry)) {
+        registeredRoots.put(indexUuid, root);
         return;
       }
 
@@ -496,6 +608,7 @@ public final class SidecarIndexCatalog implements IndexCatalog {
       String root = entries.remove(indexUuid);
       registry.tableUuids().remove(indexUuid);
       if (commitRegistry(tableLocation, previous, registry)) {
+        registeredRoots.remove(indexUuid);
         if (metadata != null) {
           purgeIndexFiles(metadata);
           purgeMetadataRoots(metadata.location(), root);

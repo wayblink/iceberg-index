@@ -19,11 +19,19 @@
 package org.apache.iceberg.spark.procedures;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
+import java.io.IOException;
 import java.nio.file.Path;
+import java.util.ArrayList;
+import java.util.List;
 import org.apache.iceberg.Table;
+import org.apache.iceberg.exceptions.NotFoundException;
 import org.apache.iceberg.hadoop.HadoopTables;
 import org.apache.iceberg.index.CreateIndexRequest;
+import org.apache.iceberg.index.IndexFile;
+import org.apache.iceberg.index.IndexManifest;
+import org.apache.iceberg.index.IndexManifestList;
 import org.apache.iceberg.index.IndexMetadata;
 import org.apache.iceberg.index.IndexSnapshot;
 import org.apache.iceberg.index.SidecarIndexCatalog;
@@ -162,5 +170,61 @@ class TestIndexPublicationLifecycle {
     assertThat(catalog.dropIndex(table.location(), refreshed.indexUuid(), true)).isTrue();
     assertThat(table.io().newInputFile(previous.indexManifestList()).exists()).isFalse();
     assertThat(table.io().newInputFile(previous.statisticsLocation()).exists()).isFalse();
+  }
+
+  @Test
+  void publishingAnIndexDroppedWhileItWasBuiltRemovesTheBuiltFiles() throws IOException {
+    spark.sql("CREATE TABLE local.db.dropped_build (id bigint, body string) USING iceberg");
+    spark.sql("INSERT INTO local.db.dropped_build VALUES (1, 'ice')");
+    Table table = table("dropped_build");
+    SidecarIndexCatalog catalog = new SidecarIndexCatalog(table.io(), table);
+    IndexMetadata created =
+        catalog.createIndex(
+            CreateIndexRequest.builder()
+                .tableLocation(table.location())
+                .tableUuid(table.uuid().toString())
+                .indexUuid("dropped-build")
+                .definition(TextIndexDefinition.builder().fieldId(2).build())
+                .build());
+    IndexSnapshot built =
+        SparkIndexBuilder.build(
+                spark, table, created, table.currentSnapshot().snapshotId(), "body", 10L)
+            .latestSnapshot();
+    List<String> builtFiles = filesOf(table, built);
+    assertThat(builtFiles).isNotEmpty();
+
+    // another session drops the index while this build is still running, without purging, so the
+    // tree is there and the publication has to notice that the entry was removed on purpose
+    assertThat(
+            new SidecarIndexCatalog(table.io(), table)
+                .dropIndex(table.location(), created.indexUuid(), false))
+        .isTrue();
+
+    assertThatThrownBy(
+            () -> VectorIndexProcedures.publishSnapshot(catalog, table, created.indexUuid(), built))
+        .isInstanceOf(NotFoundException.class)
+        .hasMessageContaining("was dropped while it was being updated");
+
+    // the publication did not land, so nothing names these files: they are removed with the attempt
+    // that wrote them instead of being left behind as an orphan index
+    for (String file : builtFiles) {
+      assertThat(table.io().newInputFile(file).exists()).isFalse();
+    }
+    assertThat(table.io().newInputFile(built.indexManifestList()).exists()).isFalse();
+    assertThat(table.io().newInputFile(built.statisticsLocation()).exists()).isFalse();
+    assertThat(catalog.listIndexes(table.location(), table.uuid().toString())).isEmpty();
+  }
+
+  private static List<String> filesOf(Table table, IndexSnapshot snapshot) throws IOException {
+    List<String> files = new ArrayList<>();
+    IndexManifestList manifestList =
+        IndexManifestList.read(table.io().newInputFile(snapshot.indexManifestList()));
+    for (IndexManifestList.ManifestRef ref : manifestList.manifests()) {
+      for (IndexFile file :
+          IndexManifest.read(table.io().newInputFile(ref.location())).indexFiles()) {
+        files.add(file.location());
+      }
+    }
+    return files;
   }
 }

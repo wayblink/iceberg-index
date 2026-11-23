@@ -121,6 +121,43 @@ class TestIndexSnapshotWriterAttempts {
   }
 
   @Test
+  public void abortPublicationDeletesWhatAnUnpublishedAttemptWrote(@TempDir Path tempDir)
+      throws IOException {
+    LocalFileIO fileIO = new LocalFileIO();
+    IndexSnapshotWriter writer =
+        new IndexSnapshotWriter(
+            fileIO,
+            new PuffinIndexFileContainer(),
+            2,
+            IndexSnapshotWriter.DEFAULT_FILES_PER_MANIFEST,
+            "attempt-1");
+    String indexLocation = tempDir.resolve("indexes/index-uuid").toString();
+
+    List<IndexFile> indexFiles = writeFiles(writer, indexLocation);
+    String manifestList = writer.writeManifestList(indexLocation, 1, indexFiles);
+    writer.completeAttempt(indexLocation);
+    String manifest = marker(indexLocation, "attempt-1", "m0");
+
+    // the publication never landed, so no metadata names these files, and the process that wrote
+    // them has no writer left to abort with: only the attempt's ledger says what it wrote
+    IndexSnapshotWriter.abortPublication(fileIO, manifestList);
+
+    for (IndexFile indexFile : indexFiles) {
+      assertThat(new File(indexFile.location())).doesNotExist();
+    }
+    assertThat(new File(manifest)).doesNotExist();
+    assertThat(new File(manifestList)).doesNotExist();
+    assertThat(new File(markerPath(indexLocation, "attempt-1", "f0"))).doesNotExist();
+    assertThat(new File(markerPath(indexLocation, "attempt-1", "m0"))).doesNotExist();
+    assertThat(new File(markerPath(indexLocation, "attempt-1", "ml"))).doesNotExist();
+    assertThat(new File(markerPath(indexLocation, "attempt-1", "complete"))).doesNotExist();
+
+    // aborting twice is safe, and a location that is not an attempt's manifest list is left alone
+    IndexSnapshotWriter.abortPublication(fileIO, manifestList);
+    IndexSnapshotWriter.abortPublication(fileIO, tempDir.resolve("manifest-list").toString());
+  }
+
+  @Test
   public void abortAfterAPartialWriteLeavesNothingBehind(@TempDir Path tempDir) throws IOException {
     LocalFileIO fileIO = new LocalFileIO();
     IndexSnapshotWriter writer =

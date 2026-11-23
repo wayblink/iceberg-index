@@ -19,6 +19,7 @@
 package org.apache.iceberg.spark.procedures;
 
 import org.apache.iceberg.Table;
+import org.apache.iceberg.exceptions.NotFoundException;
 import org.apache.iceberg.index.IndexMetadata;
 import org.apache.iceberg.index.IndexSnapshot;
 import org.apache.iceberg.index.IndexSnapshotWriter;
@@ -72,25 +73,45 @@ final class VectorIndexProcedures {
   static IndexSnapshot publishSnapshot(
       SidecarIndexCatalog catalog, Table table, String indexUuid, IndexSnapshot snapshot) {
     long source = snapshot.sourceTableSnapshotId();
-    IndexMetadata result =
-        catalog.updateIndex(
-            table.location(),
+    IndexMetadata result;
+    try {
+      result =
+          catalog.updateIndex(
+              table.location(),
+              indexUuid,
+              current -> {
+                if (current.snapshotForSourceTableSnapshot(source) != null) {
+                  return current;
+                }
+
+                IndexSnapshot latest = current.latestSnapshot();
+                table.refresh();
+                if (latest != null
+                    && SnapshotUtil.isAncestorOf(table, latest.sourceTableSnapshotId(), source)) {
+                  return current;
+                }
+
+                long nextId = latest == null ? 1L : Math.addExact(latest.snapshotId(), 1L);
+                return current.withSnapshot(snapshot.toBuilder().snapshotId(nextId).build());
+              });
+    } catch (NotFoundException e) {
+      // the index was dropped while it was being built, so no publication will ever land and no
+      // metadata will ever name the files this attempt wrote: they are removed with the attempt
+      // instead of being left behind as an orphan index. A conflict is not handled here, because
+      // the publication can be retried and still needs the files it built.
+      try {
+        IndexSnapshotWriter.abortPublication(table.io(), snapshot.indexManifestList());
+      } catch (RuntimeException cleanup) {
+        LOG.warn(
+            "Failed to remove the files of the unpublished index build {} of table {}",
             indexUuid,
-            current -> {
-              if (current.snapshotForSourceTableSnapshot(source) != null) {
-                return current;
-              }
+            table.location(),
+            cleanup);
+      }
 
-              IndexSnapshot latest = current.latestSnapshot();
-              table.refresh();
-              if (latest != null
-                  && SnapshotUtil.isAncestorOf(table, latest.sourceTableSnapshotId(), source)) {
-                return current;
-              }
+      throw e;
+    }
 
-              long nextId = latest == null ? 1L : Math.addExact(latest.snapshotId(), 1L);
-              return current.withSnapshot(snapshot.toBuilder().snapshotId(nextId).build());
-            });
     try {
       IndexSnapshotWriter.finishPublication(
           table.io(), result.location(), snapshot.indexManifestList());

@@ -31,8 +31,11 @@ import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Comparator;
+import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.UUID;
 import java.util.stream.Collectors;
 import org.apache.iceberg.BaseTable;
 import org.apache.iceberg.PartitionSpec;
@@ -43,6 +46,7 @@ import org.apache.iceberg.TableOperations;
 import org.apache.iceberg.TestTables;
 import org.apache.iceberg.TestTables.LocalFileIO;
 import org.apache.iceberg.exceptions.CommitFailedException;
+import org.apache.iceberg.exceptions.NotFoundException;
 import org.apache.iceberg.io.FileIO;
 import org.apache.iceberg.io.LocationProvider;
 import org.apache.iceberg.types.Types;
@@ -51,6 +55,8 @@ import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 
 /**
  * A registration used to read the registry, add to it and overwrite it, so two writers registering
@@ -195,6 +201,112 @@ class TestVersionedIndexRegistry {
     assertThat(winner.loadIndex(tableDir.toString(), "index-a").snapshots())
         .extracting(IndexSnapshot::snapshotId)
         .containsExactly(1L, 2L);
+  }
+
+  @Test
+  void aRegistrationLostToAWriterThatDidNotCompareIsRestored() {
+    TestTables.TestTableOperations ops = operations();
+    SidecarIndexCatalog catalog = versionedCatalog(ops);
+    catalog.createIndex(request("index-b"));
+    catalog.createIndex(request("index-a"));
+
+    // a writer that read the table before index-a was registered: it moves the pointer from its own
+    // view without comparing it, so the registry it published leaves index-a out and names no
+    // previous file, because the view it was built from carried none
+    String staleRegistry = publishRegistryFromStaleView(ops, "index-b");
+
+    catalog.updateIndex(
+        tableDir.toString(), "index-a", current -> current.withSnapshot(snapshot(1)));
+
+    String pointer = registryPointer(ops);
+    // the change is applied to the tree this catalog registered earlier, which is still on disk, so
+    // the publication puts the entry back instead of failing over a registration it never lost. The
+    // restored registry is the version the publication landed on, and it descends from the stale
+    // one
+    assertThat(indexUuids(pointer)).containsExactly("index-b", "index-a");
+    assertThat(previousFile(previousFile(pointer))).isEqualTo(staleRegistry);
+    assertThat(catalog.loadIndex(tableDir.toString(), "index-a").snapshots())
+        .extracting(IndexSnapshot::snapshotId)
+        .containsExactly(1L);
+    // the index the stale writer kept is still readable, so restoring nothing dropped anything
+    assertThat(catalog.loadIndex(tableDir.toString(), "index-b")).isNotNull();
+  }
+
+  @ParameterizedTest
+  @ValueSource(booleans = {false, true})
+  void anIndexDroppedWhileItWasBeingUpdatedIsNotRegisteredAgain(boolean purge) {
+    TestTables.TestTableOperations ops = operations();
+    SidecarIndexCatalog catalog = versionedCatalog(ops);
+    catalog.createIndex(request("index-a"));
+
+    // another session drops the index while this one is still building it. Without the purge the
+    // tree is still on disk, so the registry's history is what says the entry was removed on
+    // purpose rather than lost by a writer that never saw it
+    assertThat(versionedCatalog(ops).dropIndex(tableDir.toString(), "index-a", purge)).isTrue();
+
+    assertThatThrownBy(
+            () ->
+                catalog.updateIndex(
+                    tableDir.toString(), "index-a", current -> current.withSnapshot(snapshot(1))))
+        .isInstanceOf(NotFoundException.class)
+        .hasMessageContaining("was dropped while it was being updated");
+    // a dropped index stays dropped: publishing into it must not put the entry back
+    assertThat(indexUuids(registryPointer(ops))).doesNotContain("index-a");
+  }
+
+  /**
+   * Publishes a registry the way a writer that does not compare the pointer would: from a view of
+   * the table it read before the latest registration existed. That view carried no pointer, so the
+   * registry names no previous file, and its absence from the chain of versions is what tells a
+   * reader that the entries it leaves out were not removed on purpose.
+   */
+  private String publishRegistryFromStaleView(
+      TestTables.TestTableOperations ops, String... indexUuids) {
+    String fileName =
+        SidecarIndexCatalog.REGISTRY_FILE_PREFIX
+            + "1-"
+            + UUID.randomUUID().toString().replace("-", "").substring(0, 8)
+            + ".json";
+    JsonNode named = registryJson(registryPointer(ops));
+    Map<String, String> files = new LinkedHashMap<>();
+    Map<String, String> tableUuids = new LinkedHashMap<>();
+    JsonNode recordedUuids = named.get("table-uuids");
+    for (String indexUuid : indexUuids) {
+      files.put(indexUuid, named.get("metadata-files").get(indexUuid).asText());
+      if (recordedUuids != null && recordedUuids.get(indexUuid) != null) {
+        tableUuids.put(indexUuid, recordedUuids.get(indexUuid).asText());
+      }
+    }
+
+    String json =
+        JsonUtil.generate(
+            generator -> {
+              generator.writeStartObject();
+              generator.writeNumberField("format-version", 3);
+              generator.writeNumberField("updated-ms", System.currentTimeMillis());
+              generator.writeArrayFieldStart("index-uuids");
+              for (String indexUuid : files.keySet()) {
+                generator.writeString(indexUuid);
+              }
+              generator.writeEndArray();
+              JsonUtil.writeStringMap("metadata-files", files, generator);
+              if (!tableUuids.isEmpty()) {
+                JsonUtil.writeStringMap("table-uuids", tableUuids, generator);
+              }
+              generator.writeEndObject();
+            },
+            false);
+    try {
+      Files.write(indexesRoot().toPath().resolve(fileName), json.getBytes(UTF_8));
+    } catch (IOException e) {
+      throw new UncheckedIOException(e);
+    }
+
+    TableMetadata base = ops.refresh();
+    Map<String, String> properties = new HashMap<>(base.properties());
+    properties.put(SidecarIndexCatalog.REGISTRY_PROPERTY, fileName);
+    ops.commit(base, base.replaceProperties(properties));
+    return fileName;
   }
 
   @Test
