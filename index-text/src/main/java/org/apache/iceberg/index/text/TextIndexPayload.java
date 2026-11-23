@@ -58,10 +58,29 @@ final class TextIndexPayload {
 
   private static final int BUCKET_COUNT = 64;
 
+  /**
+   * A second signature that names this layout, written between the signature and the counts.
+   *
+   * <p>The per-posting layout this build replaced kept the version, so the version alone cannot
+   * tell the two apart. That layout wrote its document count where this tag sits, and the high half
+   * of a document count is zero for any shard a build can write, so the tag is what distinguishes
+   * the payloads.
+   */
+  static final int LAYOUT_TAG = 0x4C41594F; // "LAYO"
+
+  /** The header of the earlier per-posting layout: signature, two counts and 65 bucket offsets. */
+  static final int EARLIER_LAYOUT_SIZE =
+      Integer.BYTES + 2 * Long.BYTES + (BUCKET_COUNT + 1) * Integer.BYTES;
+
+  /** The error a reader gives for a payload the earlier per-posting layout wrote. */
+  static final String EARLIER_LAYOUT_MESSAGE =
+      "Invalid BM25 payload written by an earlier layout; rebuild the index";
+
   /** A length at or above this value is stored in the overflow list instead of the column. */
   static final int MAX_INLINE_LENGTH = 0xFFFF;
 
-  static final int HEADER_SIZE = 4 + 8 + 8 + 4 * 7 + (BUCKET_COUNT + 1) * 4;
+  static final int HEADER_SIZE =
+      2 * Integer.BYTES + 2 * Long.BYTES + 4 * 7 + (BUCKET_COUNT + 1) * 4;
 
   private TextIndexPayload() {}
 
@@ -99,6 +118,7 @@ final class TextIndexPayload {
     ByteArrayOutputStream bytes =
         new ByteArrayOutputStream(Math.addExact(postingsStart, dictionary.postings.length));
     writeIntBE(bytes, MAGIC);
+    writeIntBE(bytes, LAYOUT_TAG);
     writeLongBE(bytes, counts.documents);
     writeLongBE(bytes, counts.tokens);
     writeIntBE(bytes, files.size());
@@ -310,7 +330,18 @@ final class TextIndexPayload {
   }
 
   static boolean matches(ByteBuffer payload) {
-    return payload.remaining() >= Integer.BYTES && payload.getInt(payload.position()) == MAGIC;
+    return payload.remaining() >= 2 * Integer.BYTES
+        && payload.getInt(payload.position()) == MAGIC
+        && payload.getInt(payload.position() + Integer.BYTES) == LAYOUT_TAG;
+  }
+
+  /**
+   * Whether the payload at {@code source} was written by the per-posting layout this build
+   * replaced, which kept the signature but wrote its first count where the layout tag sits.
+   */
+  static boolean isEarlierLayout(TextIndexSource.Source source, int size) throws IOException {
+    return size >= EARLIER_LAYOUT_SIZE
+        && source.read(Integer.BYTES, Integer.BYTES).getInt() != LAYOUT_TAG;
   }
 
   static TextIndexSource.Source source(SeekableInputStream stream, long base) {
@@ -318,9 +349,16 @@ final class TextIndexPayload {
   }
 
   static Reader open(TextIndexSource.Source source, int size) throws IOException {
+    // the earlier layout is the smallest payload that can carry a signature, so the size is checked
+    // against it before the signature and the tag are read: a truncated payload still reads as a
+    // size problem, and an earlier payload is told to rebuild instead of being parsed
+    check(size >= EARLIER_LAYOUT_SIZE, "Invalid BM25 payload size");
+    check(source.read(0, Integer.BYTES).getInt() == MAGIC, "Not a BM25 payload");
+    check(!isEarlierLayout(source, size), EARLIER_LAYOUT_MESSAGE);
     check(size >= HEADER_SIZE, "Invalid BM25 payload size");
     ByteBuffer header = source.read(0, HEADER_SIZE);
-    check(header.getInt() == MAGIC, "Not a BM25 payload");
+    header.getInt();
+    header.getInt();
     long documents = header.getLong();
     long tokens = header.getLong();
     int fileCount = header.getInt();

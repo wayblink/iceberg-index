@@ -32,10 +32,12 @@ import jdk.incubator.vector.VectorSpecies;
  * the accumulators are local variables rather than arrays of vectors, because the vector API only
  * turns the loop into machine instructions when every vector stays in a register.
  *
- * <p>The sums are single-precision and the distances are compared without taking a square root:
- * squared distances are ordered the way their roots are, and the comparison is the one the exact
- * kernel makes. A row keeps an earlier list when two distances are equal, and every row decides its
- * list on its own, so the assignment does not depend on which thread walks the row.
+ * <p>The sums are single-precision, except that a sum which overflows to infinity or underflows to
+ * zero is taken again in double: at those extremes two distances that the exact kernel orders can
+ * compare equal. The distances are compared without taking a square root, because squared distances
+ * are ordered the way their roots are. A row keeps an earlier list when two distances are equal,
+ * and every row decides its list on its own, so the assignment does not depend on which thread
+ * walks the row.
  */
 final class SimdAssignKernel implements AssignKernel {
   private static final VectorSpecies<Float> SPECIES = FloatVector.SPECIES_PREFERRED;
@@ -88,10 +90,10 @@ final class SimdAssignKernel implements AssignKernel {
       int lanes,
       int[] assignment,
       int base) {
-    float best0 = Float.POSITIVE_INFINITY;
-    float best1 = Float.POSITIVE_INFINITY;
-    float best2 = Float.POSITIVE_INFINITY;
-    float best3 = Float.POSITIVE_INFINITY;
+    double best0 = Double.POSITIVE_INFINITY;
+    double best1 = Double.POSITIVE_INFINITY;
+    double best2 = Double.POSITIVE_INFINITY;
+    double best3 = Double.POSITIVE_INFINITY;
     int nearest0 = 0;
     int nearest1 = 0;
     int nearest2 = 0;
@@ -125,10 +127,10 @@ final class SimdAssignKernel implements AssignKernel {
         accumulator3 = difference3.fma(difference3, accumulator3);
       }
 
-      float distance0 = accumulator0.reduceLanes(VectorOperators.ADD);
-      float distance1 = accumulator1.reduceLanes(VectorOperators.ADD);
-      float distance2 = accumulator2.reduceLanes(VectorOperators.ADD);
-      float distance3 = accumulator3.reduceLanes(VectorOperators.ADD);
+      float squared0 = accumulator0.reduceLanes(VectorOperators.ADD);
+      float squared1 = accumulator1.reduceLanes(VectorOperators.ADD);
+      float squared2 = accumulator2.reduceLanes(VectorOperators.ADD);
+      float squared3 = accumulator3.reduceLanes(VectorOperators.ADD);
 
       // a dimension that the lanes do not divide is summed one value at a time, as the vector
       // lanes already were: the last dimensions of the row are a suffix of the same sum
@@ -138,11 +140,16 @@ final class SimdAssignKernel implements AssignKernel {
         float difference1 = row1[d] - centre;
         float difference2 = row2[d] - centre;
         float difference3 = row3[d] - centre;
-        distance0 += difference0 * difference0;
-        distance1 += difference1 * difference1;
-        distance2 += difference2 * difference2;
-        distance3 += difference3 * difference3;
+        squared0 += difference0 * difference0;
+        squared1 += difference1 * difference1;
+        squared2 += difference2 * difference2;
+        squared3 += difference3 * difference3;
       }
+
+      double distance0 = squaredDistance(squared0, row0, centroid, dimension);
+      double distance1 = squaredDistance(squared1, row1, centroid, dimension);
+      double distance2 = squaredDistance(squared2, row2, centroid, dimension);
+      double distance3 = squaredDistance(squared3, row3, centroid, dimension);
 
       // the lists are compared in increasing order with a strict comparison, so an equal distance
       // keeps the earlier list, exactly as the scalar kernel does
@@ -175,7 +182,7 @@ final class SimdAssignKernel implements AssignKernel {
 
   /** Assigns one row, which the last block of a range does for the rows it cannot pair up. */
   private static int assignRow(float[] row, float[][] centroids, int dimension, int lanes) {
-    float best = Float.POSITIVE_INFINITY;
+    double best = Double.POSITIVE_INFINITY;
     int nearest = 0;
 
     for (int list = 0; list < centroids.length; list++) {
@@ -190,12 +197,13 @@ final class SimdAssignKernel implements AssignKernel {
         accumulator = difference.fma(difference, accumulator);
       }
 
-      float distance = accumulator.reduceLanes(VectorOperators.ADD);
+      float squared = accumulator.reduceLanes(VectorOperators.ADD);
       for (; d < dimension; d++) {
         float difference = row[d] - centroid[d];
-        distance += difference * difference;
+        squared += difference * difference;
       }
 
+      double distance = squaredDistance(squared, row, centroid, dimension);
       if (distance < best) {
         best = distance;
         nearest = list;
@@ -203,5 +211,28 @@ final class SimdAssignKernel implements AssignKernel {
     }
 
     return nearest;
+  }
+
+  /**
+   * The squared distance a single-precision sum stands for.
+   *
+   * <p>A square of a large value overflows the sum to infinity, and a square of a small one
+   * underflows it to zero: both make distances that the exact kernel orders compare equal, which
+   * assigns the row to a different list. When the sum cannot stand for a finite, non-zero distance,
+   * the sum is taken again in double, in the order the exact kernel adds its terms.
+   */
+  private static double squaredDistance(
+      float squared, float[] row, float[] centroid, int dimension) {
+    if (Float.isFinite(squared) && squared != 0.0f) {
+      return squared;
+    }
+
+    double exact = 0.0;
+    for (int d = 0; d < dimension; d++) {
+      double difference = (double) row[d] - (double) centroid[d];
+      exact += difference * difference;
+    }
+
+    return exact;
   }
 }

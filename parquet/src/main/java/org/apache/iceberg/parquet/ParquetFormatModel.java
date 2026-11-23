@@ -383,7 +383,9 @@ public class ParquetFormatModel<D, S, R>
 
     @Override
     public boolean supportsPositions() {
-      return true;
+      // positions are configured on the scalar reader; a batch reader hands back row batches and
+      // does not seek to a row, so a caller must number its rows by position instead
+      return !isBatchReader;
     }
 
     @Override

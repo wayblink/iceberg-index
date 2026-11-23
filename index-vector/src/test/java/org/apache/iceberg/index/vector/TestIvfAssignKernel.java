@@ -157,6 +157,58 @@ class TestIvfAssignKernel {
   }
 
   @Test
+  void theSimdKernelMatchesTheExactKernelWhenASquareOverflows() {
+    Assumptions.assumeTrue(
+        vectorApiAvailable(), "the vector API is not on this JVM's module graph");
+
+    // every float square here is infinite: the sqrt of the double sum still orders the lists,
+    // while a float sum makes both distances infinity and the first list wins
+    float[][] centroids = {{0.0f, 0.0f, 0.0f, 0.0f}, {2.0e20f, 0.0f, 0.0f, 0.0f}};
+    float[][] one = {{3.0e20f, 0.0f, 0.0f, 0.0f}};
+    assertThat(IvfKernel.nearestCentroidL2(one, centroids, 1)).containsExactly(1);
+    assertThat(IvfKernel.nearestCentroidL2Simd(one, centroids, 1))
+        .as("the one-row path")
+        .containsExactly(1);
+
+    float[][] block = {
+      {3.0e20f, 0.0f, 0.0f, 0.0f},
+      {3.0e20f, 0.0f, 0.0f, 0.0f},
+      {3.0e20f, 0.0f, 0.0f, 0.0f},
+      {3.0e20f, 0.0f, 0.0f, 0.0f}
+    };
+    assertThat(IvfKernel.nearestCentroidL2(block, centroids, 1)).containsExactly(1, 1, 1, 1);
+    assertThat(IvfKernel.nearestCentroidL2Simd(block, centroids, 1))
+        .as("the four-row path")
+        .containsExactly(1, 1, 1, 1);
+  }
+
+  @Test
+  void theSimdKernelMatchesTheExactKernelWhenASquareUnderflows() {
+    Assumptions.assumeTrue(
+        vectorApiAvailable(), "the vector API is not on this JVM's module graph");
+
+    // a float square underflows to zero, which would leave both distances equal at zero; the
+    // double sum keeps them apart and puts the row under the second list
+    float[][] centroids = {{0.0f, 0.0f, 0.0f, 0.0f}, {1.0e-30f, 0.0f, 0.0f, 0.0f}};
+    float[][] one = {{3.0e-30f, 0.0f, 0.0f, 0.0f}};
+    assertThat(IvfKernel.nearestCentroidL2(one, centroids, 1)).containsExactly(1);
+    assertThat(IvfKernel.nearestCentroidL2Simd(one, centroids, 1))
+        .as("the one-row path")
+        .containsExactly(1);
+
+    float[][] block = {
+      {3.0e-30f, 0.0f, 0.0f, 0.0f},
+      {3.0e-30f, 0.0f, 0.0f, 0.0f},
+      {3.0e-30f, 0.0f, 0.0f, 0.0f},
+      {3.0e-30f, 0.0f, 0.0f, 0.0f}
+    };
+    assertThat(IvfKernel.nearestCentroidL2(block, centroids, 1)).containsExactly(1, 1, 1, 1);
+    assertThat(IvfKernel.nearestCentroidL2Simd(block, centroids, 1))
+        .as("the four-row path")
+        .containsExactly(1, 1, 1, 1);
+  }
+
+  @Test
   void withTheModuleTheSimdBuildIsDeterministicAndSearchable() {
     Assumptions.assumeTrue(
         vectorApiAvailable(), "the vector API is not on this JVM's module graph");

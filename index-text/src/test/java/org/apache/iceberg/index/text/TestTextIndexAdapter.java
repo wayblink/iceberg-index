@@ -360,6 +360,40 @@ class TestTextIndexAdapter {
         .hasMessageContaining("Not a text index payload");
   }
 
+  @Test
+  public void aShardWrittenByTheEarlierLayoutAsksForARebuild() {
+    TextIndexAdapter adapter =
+        new TextIndexAdapter(TextIndexDefinition.builder().fieldId(1).build());
+    ByteBuffer earlier = earlierLayoutPayload();
+
+    assertThatThrownBy(() -> adapter.prepareAuxiliary(earlier))
+        .as("a cached shard written by the earlier layout cannot be decoded")
+        .isInstanceOf(IllegalArgumentException.class)
+        .hasMessageContaining("earlier layout")
+        .hasMessageContaining("rebuild the index");
+    assertThatThrownBy(
+            () -> adapter.searchAuxiliaryAll(List.of(earlier), adapter.encodeQuery("ice"), 1))
+        .as("a search over shards written by the earlier layout fails instead of scoring them")
+        .isInstanceOf(IllegalArgumentException.class)
+        .hasMessageContaining("earlier layout")
+        .hasMessageContaining("rebuild the index");
+  }
+
+  /** The header of the per-posting layout this build replaced, 280 bytes in all. */
+  private static ByteBuffer earlierLayoutPayload() {
+    int headerSize = Integer.BYTES + 2 * Long.BYTES + (64 + 1) * Integer.BYTES;
+    ByteBuffer payload = ByteBuffer.allocate(headerSize);
+    payload.putInt(0x424D3101);
+    payload.putLong(3);
+    payload.putLong(9);
+    for (int bucket = 0; bucket <= 64; bucket++) {
+      payload.putInt(headerSize);
+    }
+
+    payload.flip();
+    return payload;
+  }
+
   private static List<IndexEntry> allEntries() {
     return List.of(
         entry("data-1.parquet", 0, "ice iceberg"),
