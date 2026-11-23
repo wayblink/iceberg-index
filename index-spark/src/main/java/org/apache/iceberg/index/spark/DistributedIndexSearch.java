@@ -303,7 +303,11 @@ public final class DistributedIndexSearch {
     public static SearchStages create(SparkContext sparkContext) {
       Map<String, SQLMetric> metrics = new java.util.LinkedHashMap<>();
       for (Map.Entry<String, String> entry : DESCRIPTIONS.entrySet()) {
-        metrics.put(entry.getKey(), SQLMetrics.createMetric(sparkContext, entry.getValue()));
+        SQLMetric metric = SQLMetrics.createMetric(sparkContext, entry.getValue());
+        // a metric a task updates has to be registered on the driver, or the update never comes
+        // back: the copy a task adds to is only merged into a registered accumulator
+        sparkContext.register(metric, entry.getValue());
+        metrics.put(entry.getKey(), metric);
       }
 
       return new SearchStages(metrics);
