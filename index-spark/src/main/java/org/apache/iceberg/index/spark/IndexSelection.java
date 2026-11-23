@@ -47,7 +47,8 @@ public final class IndexSelection {
       Table table, String column, String indexType, String nameOrUuid) {
     List<IndexMetadata> candidates = VectorIndexes.indexesFor(table, column, indexType);
     if (nameOrUuid != null) {
-      IndexMetadata found = findByNameOrUuid(candidates, nameOrUuid);
+      IndexMetadata found =
+          findByNameOrUuid(candidates, nameOrUuid, table.name(), column, indexType);
       if (found != null) {
         return found;
       }
@@ -95,7 +96,7 @@ public final class IndexSelection {
   public static IndexMetadata resolveAny(Table table, String column, String nameOrUuid) {
     List<IndexMetadata> candidates = VectorIndexes.indexesFor(table, column);
     if (nameOrUuid != null) {
-      IndexMetadata found = findByNameOrUuid(candidates, nameOrUuid);
+      IndexMetadata found = findByNameOrUuid(candidates, nameOrUuid, table.name(), column, null);
       if (found != null) {
         return found;
       }
@@ -165,18 +166,74 @@ public final class IndexSelection {
                 + " of table "
                 + tableName);
       }
+
+      if (name.equals(metadata.indexUuid())) {
+        // a name that is another index's UUID makes the selector mean both: a search by it would
+        // hit one index, a drop could hit the other, so the build is refused instead of being
+        // recorded in a state resolution has to report as ambiguous afterwards
+        throw new IllegalArgumentException(
+            "The index name "
+                + name
+                + " is the UUID of the "
+                + indexType
+                + " index on column "
+                + column
+                + " of table "
+                + tableName
+                + "; pass a name that is not an existing index UUID, or the selector would mean"
+                + " both indexes");
+      }
     }
   }
 
-  /** Returns the index with the given name or UUID, or null if none of them is it. */
-  private static IndexMetadata findByNameOrUuid(List<IndexMetadata> candidates, String nameOrUuid) {
+  /**
+   * Returns the index the caller named by name or UUID, or null if none of them is it.
+   *
+   * <p>A selector has to identify one index: a table written before names were checked against the
+   * UUIDs can carry a name that is another index's UUID, and registrations from before that check
+   * could leave two indexes with one name. Resolving such a selector to whichever candidate came
+   * first would silently search or drop the wrong index, so it is refused and the clashing indexes
+   * are named in the message.
+   */
+  private static IndexMetadata findByNameOrUuid(
+      List<IndexMetadata> candidates,
+      String nameOrUuid,
+      String tableName,
+      String column,
+      String indexType) {
+    IndexMetadata found = null;
     for (IndexMetadata metadata : candidates) {
-      if (nameOrUuid.equals(metadata.name()) || nameOrUuid.equals(metadata.indexUuid())) {
-        return metadata;
+      if (!nameOrUuid.equals(metadata.indexUuid()) && !nameOrUuid.equals(metadata.name())) {
+        continue;
       }
+
+      if (found != null && !found.indexUuid().equals(metadata.indexUuid())) {
+        throw new IllegalArgumentException(
+            "The index selector "
+                + nameOrUuid
+                + " is ambiguous for column "
+                + column
+                + " of table "
+                + tableName
+                + ": it matches "
+                + describeOne(metadata)
+                + " and "
+                + describeOne(found)
+                + "; pass a name or UUID that identifies only one "
+                + (indexType == null ? "index" : indexType + " index"));
+      }
+
+      found = metadata;
     }
 
-    return null;
+    return found;
+  }
+
+  /** Lists an index as {@code index-uuid (named name)} so an error can name a clashing pair. */
+  private static String describeOne(IndexMetadata metadata) {
+    return metadata.name() == null
+        ? "index " + metadata.indexUuid()
+        : "index " + metadata.indexUuid() + " (named " + metadata.name() + ")";
   }
 
   /** Lists the resolvable indexes by name, falling back to the UUID of an unnamed one. */

@@ -76,6 +76,25 @@ class TestStorageProperties {
   }
 
   @Test
+  void aKeyRestatedByAMoreSpecificSourceMovesToThatSourcesPosition() {
+    Map<String, String> resolved =
+        StorageProperties.resolve(
+            new FixedFileIO(ImmutableMap.of("s3.endpoint", "http://catalog.example:9000")),
+            ImmutableMap.of("fs.s3a.endpoint", "http://table.example:9000"),
+            ImmutableMap.of(
+                    "fs.s3a.region", "conf-region",
+                    "fs.s3a.endpoint", "http://conf.example:9000")
+                .entrySet());
+
+    // the table's value wins even though it is spelled the way the conf spelled the key, and the
+    // key is visited after everything the less specific sources carry: a format that resolves two
+    // spellings of one setting walks the map from its end and keeps the first value it meets
+    assertThat(resolved).containsEntry("fs.s3a.endpoint", "http://table.example:9000");
+    assertThat(resolved.keySet())
+        .containsExactly("fs.s3a.region", "s3.endpoint", "fs.s3a.endpoint");
+  }
+
+  @Test
   void theCatalogWinsOverTheHadoopConfiguration() {
     Map<String, String> resolved =
         StorageProperties.resolve(
