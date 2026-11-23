@@ -201,10 +201,10 @@ class BuildVectorIndexProcedure extends BaseProcedure {
                           Long.toString(maxEntriesPerIndexFile))
                       .build());
 
-          IndexMetadata updated;
+          SparkIndexBuilder.BuildOutcome outcome;
           try {
-            updated =
-                SparkIndexBuilder.build(
+            outcome =
+                SparkIndexBuilder.buildAllowingPartial(
                     spark(), table, created, sourceSnapshotId, column, System.currentTimeMillis());
           } catch (Exception e) {
             // a build that fails must not leave a registration behind: an index with no snapshot
@@ -221,10 +221,26 @@ class BuildVectorIndexProcedure extends BaseProcedure {
           }
 
           forgetFailedAttempt(table, fieldId);
-          VectorIndexProcedures.publishSnapshot(
-              catalog, table, indexUuid, updated.latestSnapshot());
+          if (!outcome.complete()) {
+            // the build published what it could and said PARTIAL: the index is usable, and a
+            // refresh fills the gap the report names
+            LOG.warn(
+                "Built index {} of table {} without {} data files: {}",
+                indexUuid,
+                table.name(),
+                outcome.failedDataFiles().size(),
+                outcome.summary());
+          }
 
-          IndexSnapshot snapshot = updated.latestSnapshot();
+          IndexSnapshot published =
+              VectorIndexProcedures.publishSnapshot(
+                  catalog,
+                  table,
+                  indexUuid,
+                  outcome.metadata().latestSnapshot(),
+                  outcome.complete());
+          IndexSnapshot snapshot =
+              published == null ? outcome.metadata().latestSnapshot() : published;
           long[] counts = VectorIndexProcedures.counts(table.io(), snapshot);
           InternalRow row =
               newInternalRow(

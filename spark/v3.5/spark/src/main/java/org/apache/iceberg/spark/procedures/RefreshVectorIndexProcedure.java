@@ -110,7 +110,7 @@ class RefreshVectorIndexProcedure extends BaseProcedure {
           IndexMetadata updated =
               SparkIndexBuilder.refresh(
                   spark(), table, metadata, sourceSnapshotId, column, System.currentTimeMillis());
-          if (updated.snapshots().size() == metadata.snapshots().size()) {
+          if (updated == metadata) {
             // nothing changed; the current snapshot was already covered
             InternalRow row =
                 newInternalRow(

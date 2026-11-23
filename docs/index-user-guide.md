@@ -99,7 +99,7 @@ SELECT id FROM local.db.papers WHERE match(body, 'parquet statistics') AND year 
 
 用 `array<float>` 或 `array<double>`。索引内部一律按 `float` 处理，`double` 会损失精度——对 128 维以上的近似检索几乎没有影响。
 
-建索引时声明的 `dimension` 必须等于数组实际长度。长度不符是最常见的失败原因：构建在写出索引文件时失败，`index_build_status.error` 会指出问题。
+建索引时声明的 `dimension` 必须等于数组实际长度。长度不符是最常见的失败原因：那份数据文件写不出索引文件，该组（可能不止一个文件）的构建以失败告终。**向量索引的构建会把失败组排除在外、照常发布其余部分**（6.1），所以长度不符不再让整次构建白跑，但会留下覆盖缺口；`index_build_status.error` 指出原因与部分文件路径，`check_indexes` 的 `uncovered_data_files` 说明缺口有多大。修完数据再 `refresh_vector_index`，刷新期间坏文件还在的话它仍会失败。
 
 值为 `NULL` 的行不被索引、不计入条目数，查询里直接不是候选（见 9.1）。
 
@@ -114,6 +114,8 @@ SELECT id FROM local.db.papers WHERE match(body, 'parquet statistics') AND year 
 ### 3.4 索引不自动维护
 
 索引绑定建索引那一刻的表快照，之后的写入都不更新索引，需要 `refresh_*_index`（4.5 / 5.5）。落后不刷新也不会查错：向量改写会答索引能答的部分、扫未覆盖的文件，合并后排序；文本是例外（5.4）。
+
+表没动、只是索引没覆盖全（部分构建、或旧的构建漏了文件）时，`refresh_vector_index` 也会补：它只重建没被覆盖的数据文件，然后**替换**同一份表快照上的那一版索引，不会为同一份表快照留下两版（4.5、6.1）。
 
 ---
 
@@ -358,6 +360,10 @@ CALL local.system.refresh_vector_index(table => 'db.docs', column => 'embedding'
 
 只重建受影响的索引文件：新数据文件会补上段，内容变过的数据文件（出现了删除文件，或被重写换名）会把它所属的组整体重建，没被新快照触及的索引文件原样保留。输出与构建一致；只有当前快照与父索引快照相比什么都没变时才不产新快照，返回 `index_files = 0, entries = 0`。
 
+注意输出的 `index_files` / `entries` 是**发布出来那一版索引的总量**，不是本次重建量。增量构建与补建的完整语义（重建判据、组的放大效应、成本模型、并发下的 0 值含义、表回滚为何被拒）见 [索引的增量构建与补建](index-incremental-build.md)。
+
+**表没动也会补。** 如果当前表快照已经有索引、但那版索引没有覆盖全部数据文件（上一次构建是部分的，见 6.1），刷新会以那一版为基线，只重建没被覆盖的数据文件，然后替换同一表快照上的那一版索引——不会出现"同一份表快照两版索引"让查询挑；`list_indexes` 的 `index_snapshot_id` 会前进一格，`source_snapshot_id` 不变。什么都没缺时仍然返回 `index_files = 0, entries = 0`。
+
 ```sql
 CALL local.system.drop_vector_index(table => 'db.docs', column => 'embedding', index => 'ivf_1bit');
 CALL local.system.drop_vector_index(table => 'db.docs', column => 'embedding', index => 'ivf_1bit', purge => false);
@@ -573,9 +579,28 @@ SHOW INDEXES FROM local.db.docs;   -- 只有 FROM，没有 IN
 
 `list_indexes` 的 `status` 只有 `PUBLISHED` 或 `NULL`（没有快照时），**不会显示构建进度**——那要看 `index_build_status`。`definition` 是 JSON 字符串，取 `metric` 之类的字段要 `get_json_object`。
 
-`index_build_status.state` 五种：`RUNNING`、`SUCCEEDED`、`FAILED`、`ABANDONED`（报告停止更新超过 5 分钟，通常是 driver 被杀）、`UNKNOWN`（没有报告，比如更早版本建的）。构建期间约每 30 秒一次心跳，可以反复 `CALL` 观察。
+`index_build_status.state` 六种：`RUNNING`、`SUCCEEDED`、`PARTIAL`、`FAILED`、`ABANDONED`（报告停止更新超过 5 分钟，通常是 driver 被杀）、`UNKNOWN`（没有报告，比如更早版本建的）。构建期间约每 30 秒一次心跳，可以反复 `CALL` 观察。`PARTIAL` 的含义见 6.1。
 
-失败报告的位置：向量索引失败会回滚并留下报告在 `<table>/indexes/build-status/<column-field-id>/`；同列下次构建成功时清掉。文本索引失败既不留可读报告也不回滚（5.5）。
+失败报告的位置：向量索引**一个数据文件都没索引成**时会回滚并留下报告在 `<table>/indexes/build-status/<column-field-id>/`；同列下次构建成功时清掉。文本索引失败既不留可读报告也不回滚（5.5）。
+
+### 6.1 部分构建：建到一半也能用
+
+一次向量构建的时间按小时计。如果其中某个数据文件建不出来（最常见的 `dimension` 与数组长度不符，也可能是那一组把 executor 撑死了），**不必等整张表重来**：
+
+- 建不出来的那一组（数据文件）不进索引，其余照常发布。命令正常返回，`index_files` / `entries` 只算发布出去的部分。
+- `index_build_status` 的 `state` 是 `PARTIAL`（不是 `SUCCEEDED`，也不是 `FAILED`）：索引可用，但没盖满。`files_failed` 是**失败的组数**（与 `files_total` 同单位，不是数据文件数），`error` 保留缺口说明与第一个失败原因，并列出若干未能索引的数据文件路径。
+- **漏了多少数据文件看 `check_indexes.uncovered_data_files`**，不是看 `files_failed`。失败的粒度是组，一组可能覆盖多个数据文件，所以两个数字通常不相等（默认 `max_entries_per_index_file` 为 100 万条目，小文件会被大量并组）。
+- 补缺口用 `refresh_vector_index`（4.5），但**它只在缺口的原因消失之后才管用**：坏文件还在那份表快照里时，刷新仍会去建它、仍然失败。所以顺序是"先修数据（修好或删掉、重写那批文件），再 `refresh_vector_index`"。两类原因要分开处理：`dimension` 不符靠修数据；`payload 超限`是相对于 `max_entries_per_index_file` 的大小，而 `refresh_vector_index` 继承同一个预算，所以重跑会再次超限——那类缺口要用更小的 `max_entries_per_index_file` 重建。
+- `build_vector_index` 的返回行与完整构建同形（`index_uuid, source_snapshot_id, index_files, entries`），**脚本不能靠它判断完整性**，要判断请读 `index_build_status.state`。
+- 补齐缺口的完整流程（按原因分类、验证方式、失败怎么读）见 [索引的增量构建与补建](index-incremental-build.md) 第 6 节。
+
+三个边界必须知道：
+
+1. **一个数据文件都没索引成时不发布**，整个构建失败并回滚注册——空索引比没有索引更难解释。这种时候 `index_build_status` 是 `FAILED`。
+2. **部分构建不会替换已经发布的索引**。同一份表快照上如果已有一版（哪怕是更早的完整版），部分构建不覆盖它，因为那会拿掉查询的覆盖；只有一次完整构建才替换。（当前 `build_vector_index` 每次都新建索引，不会走到这条，属防御。）
+3. **部分提交保住的是构建时间，不是坏数据**。会进"部分提交"的只有数据本身建不出来的失败（维度不符、payload 超限这类重试也不会变的）；对象存储抖动、task 被抢占、引擎 bug 仍会让构建失败并由 Spark 重试，这是有意的——否则一次瞬时故障会被永久记成数据缺口。而且没进索引的那些行，查询残差扫描时照样会读到，脏数据该报的错还是会报。
+
+文本索引不参与部分构建：BM25 要求完整覆盖才能绑定，建得半截的倒排既用不上、全局统计也会偏，所以文本索引仍是"整次成功才发布"；失败时既不留报告也不回滚（5.5）。
 
 ### 清理
 
@@ -721,7 +746,9 @@ BM25 和向量索引共用 executor 的容量预算、LRU 和状态入口。用�
 
 **9.10 缓存关掉时状态里看到的是“预算 0 + STREAM”。** `cache.enabled=false` 时 executor 不广告预算、`load_index` 以 `CACHE_DISABLED` 失败，但上报的档位字段仍是 `STREAM`（内部“关闭”配置沿用了它）。所以 `index_cache_status` 里出现“预算 0 + STREAM”时，先看 `cache.enabled`：分不清“忘了开”和“选了 STREAM”是当前已知的表述限制，状态词表不在这版改动范围内。
 
-**9.11 构建部分失败仍报成功，是设计而不是缺陷。** `state = SUCCEEDED` 说的是“这次构建跑完并发布了”，不是“每个数据文件都被索引”。默认语义下，某些索引文件构建失败时任务不抛异常、已成功的那部分照常发布，失败组的数据文件由查询时的残差扫描兜住——**结果仍然正确，只是那些文件每次都要扫**。判断完整性看 `index_build_status` 的 `files_failed`，以及 `check_indexes` 的 `uncovered_data_files`（未覆盖数据文件数）与 `suggestion`（会给 `refresh_vector_index` 的补齐语句；漏掉的文件从没被覆盖过，刷新只是补段，成本低）。构建日志里也会有一条 WARN 报出失败文件数。注意“刷新很便宜”只对**补段**成立：如果表里出现了删除或被重写的数据文件，刷新会重建它所在的组，成本按组算，不是按新增文件算。
+**9.11 部分构建报 `PARTIAL`，不再报 `SUCCEEDED`。** 一次向量构建里某组数据建不出来时，那一组排除在外、其余照常发布，报告是 `PARTIAL`（6.1）；一个都没建成时才 `FAILED` 并回滚注册。判断覆盖看 `check_indexes` 的 `uncovered_data_files`（未覆盖数据文件数）与 `suggestion`（会给 `refresh_vector_index` 的补齐语句）；`index_build_status` 的 `files_failed` 是失败的**组数**，不是文件数。driver 日志里那条 WARN 会给出缺口文件数与若干具体路径，完整的失败堆栈只在该组的 executor 日志里。**失败以"组"为单位，默认预算很大**：`max_entries_per_index_file` 默认 100 万条目，会把大量小数据文件并成一组，一组失败带走整组——实测 4 个文件、预算 2 时，1 组失败让 2 个数据文件同时失去索引。把预算设小（如 `max_entries_per_index_file => 1`）可以让失败只影响单个文件，代价是索引文件更多、HNSW 图更碎。刷新补缺口时成本按组算，不是按新增文件算。
+
+另注：`refresh_*_index` 报的 `SUCCEEDED` 说的是"这次刷新重建的那部分都成功了"，它的 `files_built`/`files_total` 只覆盖本次重建的子集，不是全表覆盖。全表覆盖看 `check_indexes`。
 
 **9.12 批量过程没有逐块输出，表函数也不是流式。** `CALL … vector_search_batch` 是 Spark 的结果集 API，driver 必须收全结果才能返回；表函数 `FROM vector_index_search_batch(…)` 按块转换成 `UnsafeRow`、每块 `.coalesce(1)` 成一个分区、最后 `union`，但 driver 在 `union` 执行前仍持有整批的 `UnsafeRow`（峰值 O(整批)，不是 O(一块)），真实收益是每块的 `Row`+JSON 转换后即释放。大批量优先用表函数，或把过程的 `coverage` 设为 `positions`（每行约 30 B；带行 JSON 时约 `20 B/dim`，10k×k=10 的总量按常量推算约 5 GB 量级，未实测）。
 
@@ -734,7 +761,9 @@ BM25 和向量索引共用 executor 的容量预算、LRU 和状态入口。用�
 | 现象 | 原因 | 处置 |
 |---|---|---|
 | `already exists` | 该列已有索引 | 传 `name => '…'`，或先 drop |
-| 建索引 `FAILED` | 常见是 `dimension` 与数组长度不符 | 看 `index_build_status.error` |
+| 建索引 `FAILED` | 一个数据文件都没建成，常见是 `dimension` 与数组长度不符 | 看 `index_build_status.error` |
+| 建索引 `PARTIAL` | 部分数据文件没建成，索引可用但没盖满 | 修数据或删掉那些文件，再 `refresh_vector_index`；缺口看 `check_indexes.uncovered_data_files` |
+| `refresh_vector_index` 返回 0 文件但 `check_indexes` 仍报缺口 | 缺口不在当前表快照里（比如缺口是更早快照的事） | 确认 `source_snapshot_id` 与 `uncovered_data_files` 是否对同一份表快照 |
 | `ABANDONED` | driver 在构建中退出 | 重新构建，再 `cleanup_index_files` |
 | `No vector index exists` | 列上没有向量索引 | `build_vector_index` |
 | `does not match index dimension` | 查询向量长度与索引维度不符 | 对齐长度 |

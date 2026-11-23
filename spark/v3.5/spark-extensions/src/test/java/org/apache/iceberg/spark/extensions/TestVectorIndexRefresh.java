@@ -35,6 +35,8 @@ import org.apache.iceberg.index.IndexMetadata;
 import org.apache.iceberg.index.IndexQuery;
 import org.apache.iceberg.index.IndexReader;
 import org.apache.iceberg.index.IndexSnapshot;
+import org.apache.iceberg.index.IndexSnapshotWriter;
+import org.apache.iceberg.index.SidecarIndexCatalog;
 import org.apache.iceberg.index.spark.IndexEntries;
 import org.apache.iceberg.index.spark.VectorIndexes;
 import org.apache.iceberg.index.vector.VectorIndexTypes;
@@ -431,6 +433,88 @@ class TestVectorIndexRefresh {
                     refreshedSnapshot, IndexEntries.dataFiles(refreshedTable, refreshedSnapshot)))
         .as("the refresh fills the gap instead of reporting it again")
         .isEmpty();
+  }
+
+  @Test
+  public void refreshFillsTheGapsOfTheSameSourceSnapshot() throws Exception {
+    String table = "db.refresh_same_source_gap";
+    spark.sql(String.format("CREATE TABLE local.%s %s", table, COLUMNS));
+    // two data files, so a partial build is visible as a file the index does not cover
+    spark.sql(String.format("INSERT INTO local.%s VALUES (1, array(1.0d, 0.0d))", table));
+    spark.sql(String.format("INSERT INTO local.%s VALUES (2, array(0.0d, 1.0d))", table));
+    buildIndexWithFileBudget(table, 1L);
+
+    Table indexed = Spark3Util.loadIcebergTable(spark, "local." + table);
+    long sourceSnapshot = indexed.currentSnapshot().snapshotId();
+    IndexMetadata metadata = VectorIndexes.findIndex(indexed, "embedding", "vector", null);
+    List<IndexFile> files = indexFiles(indexed, metadata.latestSnapshot());
+    assertThat(files).hasSize(2);
+
+    // pretend the build stopped after the first index file: the second data file stays uncovered,
+    // and the snapshot it published replaces the complete build as the one readers see
+    IndexSnapshotWriter writer = new IndexSnapshotWriter(indexed.io());
+    String partialManifestList =
+        writer.writeManifestList(
+            metadata.location(), metadata.latestSnapshot().snapshotId(), List.of(files.get(0)));
+    IndexSnapshot partial =
+        metadata.latestSnapshot().toBuilder().indexManifestList(partialManifestList).build();
+    SidecarIndexCatalog catalog = new SidecarIndexCatalog(indexed.io(), indexed);
+    catalog.updateIndex(
+        indexed.location(), metadata.indexUuid(), current -> current.replaceSnapshot(partial));
+    indexed.refresh();
+
+    IndexReader reader =
+        new IndexReader(VectorIndexes.findIndex(indexed, "embedding", "vector", null), indexed);
+    assertThat(
+            reader.uncoveredDataFiles(
+                sourceSnapshot, IndexEntries.dataFiles(indexed, sourceSnapshot)))
+        .as("the second data file is not covered before the refresh")
+        .hasSize(1);
+
+    // the table did not move, so the refresh has to fill the gap of the snapshot it already answers
+    refresh(table);
+
+    Table refreshed = Spark3Util.loadIcebergTable(spark, "local." + table);
+    IndexMetadata refreshedMetadata =
+        VectorIndexes.findIndex(refreshed, "embedding", "vector", null);
+    assertThat(refreshedMetadata.snapshots())
+        .as("the gap-filling build replaces the partial build of the same source snapshot")
+        .hasSize(1);
+    assertThat(refreshedMetadata.latestSnapshot().sourceTableSnapshotId())
+        .isEqualTo(sourceSnapshot);
+    assertThat(refreshedMetadata.latestSnapshot().snapshotId()).isEqualTo(2L);
+    assertThat(indexFiles(refreshed, refreshedMetadata.latestSnapshot())).hasSize(2);
+    assertThat(
+            new IndexReader(refreshedMetadata, refreshed)
+                .uncoveredDataFiles(
+                    sourceSnapshot, IndexEntries.dataFiles(refreshed, sourceSnapshot)))
+        .isEmpty();
+    assertThat(
+            spark
+                .sql(
+                    String.format(
+                        "SELECT id FROM local.%s "
+                            + "ORDER BY vec_distance(embedding, array(0.5d, 0.5d)) LIMIT 3",
+                        table))
+                .collectAsList())
+        .extracting(row -> row.getLong(0))
+        .containsExactlyInAnyOrder(1L, 2L);
+  }
+
+  private static List<IndexFile> indexFiles(Table table, IndexSnapshot snapshot) {
+    try {
+      IndexManifestList manifestList =
+          IndexManifestList.read(table.io().newInputFile(snapshot.indexManifestList()));
+      List<IndexFile> files = new java.util.ArrayList<>();
+      for (IndexManifestList.ManifestRef manifestRef : manifestList.manifests()) {
+        files.addAll(
+            IndexManifest.read(table.io().newInputFile(manifestRef.location())).indexFiles());
+      }
+
+      return files;
+    } catch (IOException e) {
+      throw new UncheckedIOException(e);
+    }
   }
 
   private static Set<String> indexFileLocations(Table table) {
