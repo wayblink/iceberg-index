@@ -113,9 +113,7 @@ class DropIndexProcedure extends BaseProcedure {
             if (selection != null && IndexDrop.dropByUuid(table, selection, purge)) {
               return new InternalRow[] {
                 newInternalRow(
-                    UTF8String.fromString(selection),
-                    UTF8String.fromString("unknown"),
-                    purge)
+                    UTF8String.fromString(selection), UTF8String.fromString("unknown"), purge)
               };
             }
 
