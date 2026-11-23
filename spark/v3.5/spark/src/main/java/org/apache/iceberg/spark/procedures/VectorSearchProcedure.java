@@ -52,9 +52,6 @@ class VectorSearchProcedure extends BaseProcedure {
       requiredInParameter("query", DataTypes.createArrayType(DataTypes.DoubleType));
   private static final ProcedureParameter K_PARAM = requiredInParameter("k", DataTypes.IntegerType);
 
-  private static final ProcedureParameter INDEX_PARAM =
-      optionalInParameter("index", DataTypes.StringType);
-
   private static final ProcedureParameter COVERAGE_PARAM =
       optionalInParameter("coverage", DataTypes.StringType);
 
@@ -76,7 +73,7 @@ class VectorSearchProcedure extends BaseProcedure {
         COLUMN_PARAM,
         QUERY_PARAM,
         K_PARAM,
-        INDEX_PARAM,
+        IndexProcedures.INDEX_PARAM,
         COVERAGE_PARAM,
         NPROBE_PARAM,
         REFINE_FACTOR_PARAM,
@@ -136,7 +133,7 @@ class VectorSearchProcedure extends BaseProcedure {
 
           // the same planning and parameter decisions the other vector entry points use: an
           // explicit setting is kept, and only an unset multiplier is decided here
-          String indexArgument = input.isProvided(INDEX_PARAM) ? input.asString(INDEX_PARAM) : null;
+          String indexArgument = IndexProcedures.selection(input);
           String coverage =
               input.isProvided(COVERAGE_PARAM) ? input.asString(COVERAGE_PARAM) : "table";
           // a value the call names is the query's own question and wins over the session

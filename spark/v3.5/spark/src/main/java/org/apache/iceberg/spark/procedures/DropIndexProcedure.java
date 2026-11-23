@@ -20,11 +20,8 @@ package org.apache.iceberg.spark.procedures;
 
 import static org.apache.iceberg.spark.procedures.SparkProcedures.ProcedureBuilder;
 
-import java.util.ArrayList;
-import java.util.List;
-import org.apache.iceberg.Table;
 import org.apache.iceberg.index.IndexMetadata;
-import org.apache.iceberg.index.spark.VectorIndexes;
+import org.apache.iceberg.index.spark.IndexSelection;
 import org.apache.spark.sql.catalyst.InternalRow;
 import org.apache.spark.sql.connector.catalog.TableCatalog;
 import org.apache.spark.sql.connector.iceberg.catalog.ProcedureParameter;
@@ -56,13 +53,13 @@ class DropIndexProcedure extends BaseProcedure {
       requiredInParameter("table", DataTypes.StringType);
   private static final ProcedureParameter COLUMN_PARAM =
       requiredInParameter("column", DataTypes.StringType);
-  private static final ProcedureParameter INDEX_PARAM =
-      optionalInParameter("index", DataTypes.StringType);
   private static final ProcedureParameter PURGE_PARAM =
       optionalInParameter("purge", DataTypes.BooleanType);
 
   private static final ProcedureParameter[] PARAMETERS =
-      new ProcedureParameter[] {TABLE_PARAM, COLUMN_PARAM, INDEX_PARAM, PURGE_PARAM};
+      new ProcedureParameter[] {
+        TABLE_PARAM, COLUMN_PARAM, IndexProcedures.INDEX_PARAM, PURGE_PARAM
+      };
 
   private static final StructType OUTPUT_TYPE =
       new StructType(
@@ -100,13 +97,13 @@ class DropIndexProcedure extends BaseProcedure {
     VectorIndexProcedures.registerVectorIndexType();
     ProcedureInput input = new ProcedureInput(spark(), tableCatalog(), PARAMETERS, args);
     String column = input.asString(COLUMN_PARAM);
-    String nameOrUuid = input.asString(INDEX_PARAM, null);
     boolean purge = input.asBoolean(PURGE_PARAM, Boolean.TRUE);
 
     return modifyIcebergTable(
         input.ident(TABLE_PARAM),
         table -> {
-          IndexMetadata metadata = resolve(table, column, nameOrUuid);
+          IndexMetadata metadata =
+              IndexSelection.resolveAny(table, column, IndexProcedures.selection(input));
           IndexDrop.Result dropped = IndexDrop.drop(table, metadata, purge);
           return new InternalRow[] {
             newInternalRow(
@@ -117,63 +114,8 @@ class DropIndexProcedure extends BaseProcedure {
         });
   }
 
-  /**
-   * Resolves the index to remove: the only one on the column, or the named one when several exist.
-   */
-  private static IndexMetadata resolve(Table table, String column, String nameOrUuid) {
-    int fieldId = VectorIndexes.fieldId(table, column);
-    List<IndexMetadata> found = new ArrayList<>();
-    for (IndexMetadata metadata : VectorIndexes.indexesOf(table)) {
-      if (metadata.definition().fieldId() == fieldId) {
-        found.add(metadata);
-      }
-    }
-
-    if (nameOrUuid != null) {
-      for (IndexMetadata metadata : found) {
-        if (nameOrUuid.equals(metadata.name()) || nameOrUuid.equals(metadata.indexUuid())) {
-          return metadata;
-        }
-      }
-
-      throw new IllegalArgumentException(
-          "No index named "
-              + nameOrUuid
-              + " exists for column "
-              + column
-              + " of table "
-              + table.name()
-              + (found.isEmpty() ? "" : "; existing indexes: " + describe(found)));
-    }
-
-    if (found.isEmpty()) {
-      throw new IllegalArgumentException(
-          "No index exists for column " + column + " of table " + table.name());
-    }
-
-    if (found.size() > 1) {
-      throw new IllegalArgumentException(
-          "Column "
-              + column
-              + " of table "
-              + table.name()
-              + " has "
-              + found.size()
-              + " indexes; pass index => <name or uuid> to pick one: "
-              + describe(found));
-    }
-
-    return found.get(0);
-  }
-
-  /** Lists the resolvable indexes as {@code type:name(uuid)} so an error can name them. */
-  private static String describe(List<IndexMetadata> indexes) {
-    List<String> described = new ArrayList<>(indexes.size());
-    for (IndexMetadata metadata : indexes) {
-      String name = metadata.name() != null ? metadata.name() : metadata.indexUuid();
-      described.add(metadata.indexType() + ":" + name + "(" + metadata.indexUuid() + ")");
-    }
-
-    return String.join(", ", described);
+  @Override
+  public String description() {
+    return "DropIndexProcedure";
   }
 }

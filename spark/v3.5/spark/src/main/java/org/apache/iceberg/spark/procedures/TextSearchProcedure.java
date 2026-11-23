@@ -55,7 +55,9 @@ class TextSearchProcedure extends BaseProcedure {
       requiredInParameter("query", DataTypes.StringType);
   private static final ProcedureParameter K_PARAM = requiredInParameter("k", DataTypes.IntegerType);
   private static final ProcedureParameter[] PARAMETERS =
-      new ProcedureParameter[] {TABLE_PARAM, COLUMN_PARAM, QUERY_PARAM, K_PARAM};
+      new ProcedureParameter[] {
+        TABLE_PARAM, COLUMN_PARAM, QUERY_PARAM, K_PARAM, IndexProcedures.INDEX_PARAM
+      };
 
   private static final StructType OUTPUT_TYPE =
       new StructType(
@@ -104,7 +106,7 @@ class TextSearchProcedure extends BaseProcedure {
             return new InternalRow[0];
           }
 
-          IndexMetadata metadata = VectorIndexProcedures.findIndex(table, column, "text");
+          IndexMetadata metadata = IndexProcedures.resolveIndex(table, column, "text", input);
           TextIndexAdapter adapter =
               new TextIndexAdapter((TextIndexDefinition) metadata.definition());
 
@@ -112,7 +114,7 @@ class TextSearchProcedure extends BaseProcedure {
           // implementation, which reads the rows through the table's own data format and applies
           // its deletes, so a single query cannot answer with a row the table no longer holds
           List<Row> hits =
-              IndexSearch.search(spark(), table, column, "text", adapter.encodeQuery(query), topK)
+              IndexSearch.search(spark(), table, column, metadata, adapter.encodeQuery(query), topK)
                   .collectAsList();
 
           List<InternalRow> rows = Lists.newArrayListWithCapacity(hits.size());

@@ -142,6 +142,21 @@ public final class VectorIndexes {
     return found;
   }
 
+  /**
+   * The indexes of any type over one column, which is what removing one index has to choose from.
+   */
+  public static java.util.List<IndexMetadata> indexesFor(Table table, String column) {
+    int fieldId = fieldId(table, column);
+    java.util.List<IndexMetadata> found = Lists.newArrayList();
+    for (IndexMetadata metadata : indexesOf(table)) {
+      if (metadata.definition().fieldId() == fieldId) {
+        found.add(metadata);
+      }
+    }
+
+    return found;
+  }
+
   /** Finds the index of a type for a table by the indexed column, or null if none exists. */
   public static IndexMetadata findIndexOrNull(Table table, String column, String indexType) {
     int fieldId = fieldId(table, column);

@@ -142,6 +142,23 @@ class TestRewriteTextSearch {
   }
 
   @Test
+  public void refusesToScoreAgainstOneOfSeveralIndexes() {
+    String table = tableWithIndex("docs_text_two_indexes");
+    spark.sql(
+        String.format(
+            "CALL local.system.build_text_index(table => '%s', column => 'body', name => 'body_case', "
+                + "lowercase => false)",
+            table));
+
+    // the written form names no index, so it must not score with whichever index happened to be
+    // found first: with two indexes built by different analyzers that would be a scoring bug the
+    // caller cannot see
+    assertThatThrownBy(() -> spark.sql(ranking(table)).collectAsList())
+        .hasStackTraceContaining("has 2 text indexes")
+        .hasStackTraceContaining("body_case");
+  }
+
+  @Test
   public void leavesThePlanAloneForAnIndexThatIsBehind() {
     String table = tableWithIndex("docs_text_behind");
     // a row added after the index was built leaves the corpus statistics behind

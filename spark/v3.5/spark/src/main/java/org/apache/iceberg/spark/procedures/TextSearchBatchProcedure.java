@@ -59,7 +59,9 @@ class TextSearchBatchProcedure extends BaseProcedure {
       requiredInParameter("queries", DataTypes.createArrayType(DataTypes.StringType));
   private static final ProcedureParameter K_PARAM = requiredInParameter("k", DataTypes.IntegerType);
   private static final ProcedureParameter[] PARAMETERS =
-      new ProcedureParameter[] {TABLE_PARAM, COLUMN_PARAM, QUERIES_PARAM, K_PARAM};
+      new ProcedureParameter[] {
+        TABLE_PARAM, COLUMN_PARAM, QUERIES_PARAM, K_PARAM, IndexProcedures.INDEX_PARAM
+      };
 
   private static final StructType OUTPUT_TYPE = IndexSearch.RESULT_SCHEMA;
 
@@ -101,7 +103,7 @@ class TextSearchBatchProcedure extends BaseProcedure {
             return new org.apache.spark.sql.catalyst.InternalRow[0];
           }
 
-          IndexMetadata metadata = VectorIndexProcedures.findIndex(table, column, "text");
+          IndexMetadata metadata = IndexProcedures.resolveIndex(table, column, "text", input);
           TextIndexDefinition definition = (TextIndexDefinition) metadata.definition();
           TextIndexAdapter adapter = new TextIndexAdapter(definition);
 
@@ -111,7 +113,7 @@ class TextSearchBatchProcedure extends BaseProcedure {
           }
 
           List<Row> hits =
-              IndexSearch.search(spark(), table, column, "text", payloads, topK).collectAsList();
+              IndexSearch.search(spark(), table, column, metadata, payloads, topK).collectAsList();
 
           List<InternalRow> rows = Lists.newArrayListWithCapacity(hits.size());
           for (Row hit : hits) {

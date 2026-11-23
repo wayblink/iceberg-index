@@ -114,47 +114,6 @@ final class VectorIndexProcedures {
     return input.asLong(parameter, DEFAULT_MAX_ENTRIES_PER_INDEX_FILE);
   }
 
-  /**
-   * The index a search should use: the one the caller named, or the only one the column has.
-   *
-   * <p>When a column carries several indexes and the caller named none, the message lists them
-   * rather than picking one, because a query that silently used the other index would look like an
-   * accuracy problem instead of a missing argument.
-   */
-  static org.apache.iceberg.index.IndexMetadata resolveIndex(
-      Table table,
-      String column,
-      org.apache.spark.sql.connector.iceberg.catalog.ProcedureParameter indexParam,
-      ProcedureInput input) {
-    String nameOrUuid = input.asString(indexParam, null);
-    if (nameOrUuid != null) {
-      return org.apache.iceberg.index.spark.VectorIndexes.findIndex(
-          table, column, "vector", nameOrUuid);
-    }
-
-    java.util.List<org.apache.iceberg.index.IndexMetadata> indexes =
-        org.apache.iceberg.index.spark.VectorIndexes.indexesFor(table, column, "vector");
-    if (indexes.size() > 1) {
-      java.util.List<String> names = new java.util.ArrayList<>();
-      for (org.apache.iceberg.index.IndexMetadata metadata : indexes) {
-        names.add(metadata.name() != null ? metadata.name() : metadata.indexUuid());
-      }
-
-      throw new IllegalArgumentException(
-          "Column "
-              + column
-              + " of table "
-              + table.name()
-              + " has "
-              + indexes.size()
-              + " vector indexes "
-              + names
-              + "; pass index => '...' to say which one to search");
-    }
-
-    return org.apache.iceberg.index.spark.VectorIndexes.findIndex(table, column, "vector");
-  }
-
   static int fieldId(Table table, String column) {
     return VectorIndexes.fieldId(table, column);
   }
@@ -162,16 +121,6 @@ final class VectorIndexProcedures {
   /** Resolves the column name of a field ID. */
   static String columnName(Table table, int fieldId) {
     return VectorIndexes.columnName(table, fieldId);
-  }
-
-  /** Finds the index of a type for a table by the indexed column, failing if none exists. */
-  static IndexMetadata findIndex(Table table, String column, String indexType) {
-    return VectorIndexes.findIndex(table, column, indexType);
-  }
-
-  /** Finds any index of any type for a table by the indexed column, or null if none exists. */
-  static IndexMetadata findAnyIndexOrNull(Table table, String column) {
-    return VectorIndexes.findAnyIndexOrNull(table, column);
   }
 
   /** Counts the index files and entries of an index snapshot. */

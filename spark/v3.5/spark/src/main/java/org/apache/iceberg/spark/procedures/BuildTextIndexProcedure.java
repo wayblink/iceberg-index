@@ -69,7 +69,8 @@ class BuildTextIndexProcedure extends BaseProcedure {
         MIN_TOKEN_LENGTH_PARAM,
         LOWERCASE_PARAM,
         STOPWORDS_PARAM,
-        MAX_ENTRIES_PER_INDEX_FILE_PARAM
+        MAX_ENTRIES_PER_INDEX_FILE_PARAM,
+        IndexProcedures.NAME_PARAM
       };
 
   private static final StructType OUTPUT_TYPE =
@@ -121,10 +122,8 @@ class BuildTextIndexProcedure extends BaseProcedure {
 
           int fieldId = VectorIndexProcedures.fieldId(table, column);
           SidecarIndexCatalog catalog = VectorIndexProcedures.indexCatalog(table);
-          if (VectorIndexProcedures.findAnyIndexOrNull(table, column) != null) {
-            throw new IllegalArgumentException(
-                "An index already exists for column " + column + " of table " + tableName);
-          }
+          String name = IndexProcedures.name(input);
+          IndexProcedures.checkCanBuild(table, column, "text", tableName, name);
 
           TextIndexDefinition.Builder definition = TextIndexDefinition.builder().fieldId(fieldId);
           if (input.isProvided(K1_PARAM)) {
@@ -155,6 +154,7 @@ class BuildTextIndexProcedure extends BaseProcedure {
                       .tableLocation(table.location())
                       .tableUuid(String.valueOf(table.uuid()))
                       .indexUuid(indexUuid)
+                      .name(name)
                       .definition(definition.build())
                       .property(
                           IndexMetadata.MAX_ENTRIES_PER_INDEX_FILE_PROPERTY,

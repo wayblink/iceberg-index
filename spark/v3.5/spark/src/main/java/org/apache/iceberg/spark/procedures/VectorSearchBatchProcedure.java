@@ -67,8 +67,6 @@ class VectorSearchBatchProcedure extends BaseProcedure {
       optionalInParameter("queries", STRING_ARRAY);
   private static final ProcedureParameter K_PARAM = requiredInParameter("k", DataTypes.IntegerType);
 
-  private static final ProcedureParameter INDEX_PARAM =
-      optionalInParameter("index", DataTypes.StringType);
   private static final ProcedureParameter COVERAGE_PARAM =
       optionalInParameter("coverage", DataTypes.StringType);
   private static final ProcedureParameter QUERY_TABLE_PARAM =
@@ -97,7 +95,7 @@ class VectorSearchBatchProcedure extends BaseProcedure {
         QUERY_TABLE_PARAM,
         QUERY_ID_COLUMN_PARAM,
         VECTOR_COLUMN_PARAM,
-        INDEX_PARAM,
+        IndexProcedures.INDEX_PARAM,
         COVERAGE_PARAM,
         NPROBE_PARAM,
         REFINE_FACTOR_PARAM,
@@ -159,7 +157,7 @@ class VectorSearchBatchProcedure extends BaseProcedure {
 
           // one plan for the whole batch: the same parameter decision as the other entry points;
           // how the rows are resolved depends on coverage, see the class comment
-          String indexArgument = input.isProvided(INDEX_PARAM) ? input.asString(INDEX_PARAM) : null;
+          String indexArgument = IndexProcedures.selection(input);
           String coverage =
               input.isProvided(COVERAGE_PARAM) ? input.asString(COVERAGE_PARAM) : "table";
           // a value the call names is the query's own question and wins over the session

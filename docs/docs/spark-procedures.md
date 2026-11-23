@@ -1392,6 +1392,10 @@ Builds a BM25 text index over a string column, used by `text_search`. One index 
 data file, each holding the local postings and statistics of that file; corpus-wide statistics are
 merged at query time, so an incremental refresh never has to rewrite the whole index.
 
+A column carries one unnamed index. A second index over the same column must be given a `name`, and
+whatever reads one of several indexes must name it, so two analyzers or parameter sets can be
+compared on the same data instead of on two copies of the table.
+
 | Argument Name | Required? | Type   | Description                                            |
 |---------------|-----------|--------|--------------------------------------------------------|
 | `table`       | ✔️        | string | Name of the table                                      |
@@ -1402,6 +1406,7 @@ merged at query time, so an incremental refresh never has to rewrite the whole i
 | `lowercase`   |           | boolean| Lowercase tokens before indexing (default `true`)      |
 | `stopwords`   |           | array<string> | Optional stopword list                          |
 | `max_entries_per_index_file` |   | long  | Upper bound on the entries of one index file (default 1000000). Never splits a data file, so a table with large data files keeps one index file per data file; a table with many small ones sees them merged |
+| `name`        |           | string | Optional name, so several indexes can live on one column. A name is unique per column; repeating it is an error |
 
 #### Output
 
@@ -1417,6 +1422,11 @@ merged at query time, so an incremental refresh never has to rewrite the whole i
 ```sql
 CALL catalog_name.system.build_text_index(
     table => 'db.documents', column => 'body', k1 => 1.2, length_norm => 0.75);
+
+-- a second index over the same column must be named
+CALL catalog_name.system.build_text_index(
+    table => 'db.documents', column => 'body', name => 'body_case_sensitive',
+    lowercase => false);
 ```
 
 `max_entries_per_index_file` sets the budget: data files are packed until the budget is reached, and
@@ -1449,6 +1459,7 @@ with, because a deleted document must stop influencing them.
 |---------------|-----------|--------|--------------------|
 | `table`       | ✔️        | string | Name of the table  |
 | `column`      | ✔️        | string | Indexed column name |
+| `index`       |           | string | Index to refresh, by name or UUID. Required when the column carries several indexes; the error lists them |
 
 #### Output
 
@@ -1464,6 +1475,10 @@ with, because a deleted document must stop influencing them.
 ```sql
 CALL catalog_name.system.refresh_text_index(
     table => 'db.documents', column => 'body');
+
+-- the column has several indexes: name the one to refresh
+CALL catalog_name.system.refresh_text_index(
+    table => 'db.documents', column => 'body', index => 'body_case_sensitive');
 ```
 
 ### `text_search`
@@ -1472,12 +1487,16 @@ Searches a BM25 text index and resolves the matched rows. Returns the row refere
 `_pos`) of each hit with its score, plus the matched row itself as a JSON string, ordered by score
 descending.
 
+When the column carries several indexes, `index` names the one to search; without it a search on
+such a column fails and lists the candidates rather than silently using one of them.
+
 | Argument Name | Required? | Type   | Description                       |
 |---------------|-----------|--------|-----------------------------------|
 | `table`       | ✔️        | string | Name of the table                 |
 | `column`      | ✔️        | string | Name of the indexed column        |
 | `query`       | ✔️        | string | Query text                        |
 | `k`           | ✔️        | int    | Number of results to return       |
+| `index`       |           | string | Index to search, by name or UUID  |
 
 #### Output
 
@@ -1494,6 +1513,11 @@ descending.
 CALL catalog_name.system.text_search(
     table => 'db.documents', column => 'body',
     query => 'iceberg table format', k => 10);
+
+-- choose one of the indexes the column carries
+CALL catalog_name.system.text_search(
+    table => 'db.documents', column => 'body',
+    query => 'iceberg table format', k => 10, index => 'body_case_sensitive');
 ```
 
 ### `cleanup_index_files`
@@ -1554,12 +1578,15 @@ Unlike repeated single searches, the matched rows of all queries are resolved by
 data file once, so a batch of N queries costs one read per distinct hit data file instead of one
 read per query per hit data file.
 
+`index` names the index to search when the column carries several, as in `text_search`.
+
 | Argument Name | Required? | Type          | Description                     |
 |---------------|-----------|---------------|---------------------------------|
 | `table`       | ✔️        | string        | Name of the table               |
 | `column`      | ✔️        | string        | Name of the indexed column      |
 | `queries`     | ✔️        | array<string> | Query texts, one per query      |
 | `k`           | ✔️        | int           | Number of results per query     |
+| `index`       |           | string        | Index to search, by name or UUID |
 
 #### Output
 
@@ -1589,7 +1616,9 @@ their arguments positionally and can be used in a `FROM` clause like any other t
 |----------|-----------|--------|
 | `vector_index_search` | `(table, column, query array<double>, k int)` | `data_file, pos, score, row` |
 | `vector_index_search_batch` | `(table, column, queries array<string>, k int)` | `query_id, data_file, pos, score, row` |
-| `text_index_search` | `(table, column, query string, k int)` | `data_file, pos, score, row` |
+| `text_index_search` | `(table, column, query string, k int[, index])` | `data_file, pos, score, row` |
+
+`text_index_search` takes the same `index` named option as `text_search`: `text_index_search('db.documents', 'body', 'iceberg', 10, index => 'body_case_sensitive')`.
 
 Each function returns the shape of the corresponding procedure, but the address functions have a
 fixed answer: `vector_index_search` and `vector_index_search_batch` have no `coverage` argument and

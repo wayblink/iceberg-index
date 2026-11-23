@@ -21,7 +21,7 @@ package org.apache.iceberg.spark.index
 import java.util.Locale
 import org.apache.iceberg.SerializableTable
 import org.apache.iceberg.index.spark.IndexSearch
-import org.apache.iceberg.index.spark.VectorIndexes
+import org.apache.iceberg.index.spark.IndexSelection
 import org.apache.iceberg.index.text.TextIndexTypes
 import org.apache.iceberg.index.vector.VectorIndexDefinition.Metric
 import org.apache.iceberg.index.vector.VectorIndexTypes
@@ -110,13 +110,12 @@ object IndexTableFunctions {
           "vector_index_search_batch(table, column, queries, k[, nprobe, refine_factor, index]): the "
             + "index's own hits for many queries at once"),
         vectorIndexSearchBatch))
-    extensions.injectTableFunction(
-      (
-        new FunctionIdentifier(TEXT_INDEX_SEARCH),
-        new ExpressionInfo(
-          TEXT_INDEX_SEARCH,
-          "text_index_search(table, column, query, k): searches a BM25 text index"),
-        textIndexSearch))
+    extensions.injectTableFunction((
+      new FunctionIdentifier(TEXT_INDEX_SEARCH),
+      new ExpressionInfo(
+        TEXT_INDEX_SEARCH,
+        "text_index_search(table, column, query, k[, index]): the index's own hits for one query"),
+      textIndexSearch))
   }
 
   /**
@@ -142,7 +141,8 @@ object IndexTableFunctions {
       new TableFunctionArguments(TEXT_SEARCH, args, Seq("table", "query", "search_columns", "k"))
     arguments.requireOnly(
       required = Seq("table", "search_columns"),
-      optional = Seq("query", "query_string", "limit", "k", "num_results", "columns", "filter"))
+      optional =
+        Seq("query", "query_string", "limit", "k", "num_results", "columns", "filter", "index"))
 
     val tableName = arguments.string("table")
     val query = arguments
@@ -156,6 +156,7 @@ object IndexTableFunctions {
       .orElse(arguments.int("num_results"))
       .getOrElse(DefaultLimit)
     val columns = arguments.strings("columns")
+    val indexName = arguments.stringOption("index")
 
     Preconditions.checkArgument(
       searched.size == 1,
@@ -196,7 +197,12 @@ object IndexTableFunctions {
       .getOrElse(
         analysisError(s"Table $tableName has no snapshot; build a text index after writing data"))
     val frozen = SerializableTable.copyOf(icebergTable)
-    val index = VectorIndexes.findIndex(frozen, column, "text")
+    val index =
+      try {
+        IndexSelection.resolve(frozen, column, "text", indexName.orNull)
+      } catch {
+        case e: IllegalArgumentException => analysisError(e.getMessage)
+      }
     if (index.snapshotForSourceTableSnapshot(snapshotId) == null) {
       analysisError(
         s"Text index of $tableName.$column does not cover snapshot $snapshotId; " +
@@ -493,7 +499,11 @@ object IndexTableFunctions {
   }
 
   private def textIndexSearch(args: Seq[Expression]): LogicalPlan = {
-    checkArity(args, SearchArgumentCount, TEXT_INDEX_SEARCH, "(table, column, query, k)")
+    checkAtLeast(
+      args,
+      SearchArgumentCount,
+      TEXT_INDEX_SEARCH,
+      "(table, column, query, k[, index => '...'])")
     val spark = SparkSession.active
     TextIndexTypes.register()
     val tableName = stringArg(args, 0)
@@ -501,24 +511,36 @@ object IndexTableFunctions {
     val query = stringArg(args, 2)
     val topK = intArg(args, 3)
 
+    val table = Spark3Util.loadIcebergTable(spark, tableName)
+    val index =
+      try {
+        IndexSelection.resolve(table, column, "text", textIndexOption(args).orNull)
+      } catch {
+        case e: IllegalArgumentException => analysisError(e.getMessage)
+      }
     val payload =
-      new org.apache.iceberg.index.text.TextIndexAdapter(indexDefinition(spark, tableName, column))
+      new org.apache.iceberg.index.text.TextIndexAdapter(
+        index.definition().asInstanceOf[org.apache.iceberg.index.text.TextIndexDefinition])
         .encodeQuery(query)
     IndexSearch
-      .search(spark, Spark3Util.loadIcebergTable(spark, tableName), column, "text", payload, topK)
+      .search(spark, table, column, index, payload, topK)
       .queryExecution
       .analyzed
   }
 
-  private def indexDefinition(
-      spark: SparkSession,
-      tableName: String,
-      column: String): org.apache.iceberg.index.text.TextIndexDefinition = {
-    val table = Spark3Util.loadIcebergTable(spark, tableName)
-    org.apache.iceberg.index.spark.VectorIndexes
-      .findIndex(table, column, "text")
-      .definition()
-      .asInstanceOf[org.apache.iceberg.index.text.TextIndexDefinition]
+  /** Reads the index a text index function names after its positional arguments. */
+  private def textIndexOption(args: Seq[Expression]): Option[String] = {
+    val extras = args.drop(SearchArgumentCount)
+    extras.foreach {
+      case _: NamedArgumentExpression => ()
+      case other =>
+        analysisError(
+          s"$TEXT_INDEX_SEARCH takes only named options after its arguments, got $other")
+    }
+
+    val arguments = new TableFunctionArguments(TEXT_INDEX_SEARCH, extras, Seq.empty)
+    arguments.requireOnly(required = Seq.empty, optional = Seq("index"))
+    arguments.stringOption("index")
   }
 
   /** Parses a comma-separated list of numbers, the form the batch functions take. */
@@ -564,16 +586,6 @@ object IndexTableFunctions {
     require(
       args.length >= expected,
       s"$name expects at least $expected arguments $signature, got ${args.length}")
-  }
-
-  private def checkArity(
-      args: Seq[Expression],
-      expected: Int,
-      name: String,
-      signature: String): Unit = {
-    require(
-      args.length == expected,
-      s"$name expects $expected arguments $signature, got ${args.length}")
   }
 
   private def stringArg(args: Seq[Expression], ordinal: Int): String = {

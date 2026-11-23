@@ -30,6 +30,7 @@ import org.apache.iceberg.index.text.TextIndexDefinition
 import org.apache.spark.sql.Row
 import org.apache.spark.sql.SparkSession
 import org.apache.spark.sql.catalyst.InternalRow
+import org.apache.spark.sql.catalyst.analysis.IndexErrors
 import org.apache.spark.sql.catalyst.expressions.Alias
 import org.apache.spark.sql.catalyst.expressions.AttributeReference
 import org.apache.spark.sql.catalyst.expressions.Descending
@@ -355,10 +356,25 @@ case class RewriteTextSearch(spark: SparkSession) extends Rule[LogicalPlan] {
       case _ => return None
     }
 
-    val index = VectorIndexes.findIndexOrNull(table, column, "text")
-    if (index == null) {
+    val candidates = VectorIndexes.indexesFor(table, column, "text")
+    if (candidates.isEmpty) {
       return None
     }
+    if (candidates.size() > 1) {
+      // this form names no index, and a score needs the statistics of one: taking the first would
+      // answer with another index's statistics, which reads as a scoring bug rather than as a
+      // missing choice, so the caller is told how to choose instead
+      val names = candidates.asScala.map {
+        case metadata if metadata.name() != null => metadata.name()
+        case metadata => metadata.indexUuid()
+      }
+      throw IndexErrors.analysis(
+        s"Column $column of table ${table.name()} has ${candidates.size()} text indexes " +
+          s"${names.mkString("[", ", ", "]")}; the text_score form cannot choose one. " +
+          "Use CALL text_search(..., index => '...') or the search table function, or keep one index")
+    }
+
+    val index = candidates.get(0)
     if (!IndexRewriteSupport.isIndexTypeRegistered(index)) {
       logger.warn(
         "Index type {} of column {} of table {} is not registered in this session, scanning",

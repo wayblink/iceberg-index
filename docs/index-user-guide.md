@@ -468,7 +468,8 @@ CALL local.system.build_text_index(
   min_token_length => 2,         -- 默认 2
   lowercase => true,             -- 默认 true
   stopwords => array('the', 'a'),-- 可选
-  max_entries_per_index_file => 1000000);
+  max_entries_per_index_file => 1000000,
+  name => 'body_v1');            -- 可选：同列并存多个索引时用来区分
 ```
 
 DDL 用 `USING fts`，**不能带索引名**：
@@ -485,7 +486,7 @@ BM25 v1 默认将每个词的倒排独立压缩，查询按字节范围读取所
 
 停用词请用小写：分词后的 token 是小写的，停用词表不做归一化，大写写的停用词不会生效。
 
-**同列已有任何类型的索引时会被拒**（不只是文本索引）。
+不传 `name` 且同列已有任何类型的索引时会被拒（不只是文本索引），错误会提示 `pass name => '...'`；传了 `name` 才允许同列并存，名字在同一列内唯一，重复报错。
 
 ### 5.3 查询
 
@@ -506,7 +507,16 @@ SELECT id, body, _score FROM search(
 
 -- 表函数：返回命中地址
 SELECT * FROM text_index_search('local.db.papers', 'body', 'table format', 10);
+
+-- 同列多个索引时按名字或 uuid 选一个
+CALL local.system.text_search(table => 'db.papers', column => 'body',
+  query => 'table format', k => 10, index => 'body_v1');
+SELECT id, _score FROM search(
+  table => 'local.db.papers', query => 'table format',
+  search_columns => array('body'), limit => 10, index => 'body_v1');
 ```
+
+同列有多个文本索引而不传 `index` 时，`text_search`、`text_search_batch`、`text_index_search`、`search` 与 `refresh_text_index` 都会报错并列出候选（例如 `has 2 text indexes [body_v1, body_v2]; pass index => '...'`），不会静默取第一个。只传 uuid 也可以；同一个索引用名字和 uuid 选到的是同一份结果。
 
 `search` 在执行阶段用全局 BM25 统计给各索引分片打分，只回表读取全局命中行。它返回最多 `limit` 条正分结果，要求索引完整覆盖查询快照。索引落后时先运行 `refresh_text_index`。
 
@@ -545,9 +555,11 @@ ORDER BY text_score(d.body, 'fox') DESC LIMIT 10;
 
 ```sql
 CALL local.system.refresh_text_index(table => 'db.papers', column => 'body');
-```
 
-按列刷新，没有 `index` 参数（因为文本索引没有名字）。
+-- 同列多个索引时按名字刷新其中一个，另一个的构建保持不变
+CALL local.system.refresh_text_index(
+  table => 'db.papers', column => 'body', index => 'body_v1');
+```
 
 删除文本索引用通用的 `drop_index`（见 §4.5）：
 
@@ -709,7 +721,7 @@ BM25 和向量索引共用 executor 的容量预算、LRU 和状态入口。用�
 
 **9.4 索引不自动维护。** 见 3.4。
 
-**9.5 文本索引无法删除、无法按名刷新，且建索引失败不回滚。** 见 5.5。
+**9.5 文本索引的 DDL 仍不完整，且建索引失败不回滚。** `CALL build_text_index / refresh_text_index / drop_index` 都支持按名或 uuid 选定同列索引，但 `ALTER TABLE … DROP INDEX` / `REFRESH INDEX` 对文本索引仍报 `cannot be dropped: unsupported type text`，`CREATE INDEX USING fts` 也不能带名字。另外文本索引构建失败不回滚，见 5.5。
 
 **9.6 中文不可用。** 见 5.1。
 
@@ -769,9 +781,9 @@ BM25 和向量索引共用 executor 的容量预算、LRU 和状态入口。用�
 | 过程 | 必填参数 | 可选参数 |
 |---|---|---|
 | `build_vector_index` | `table, column, dimension` | `metric, structure, quantizer, options, max_m, ef_construction, ef_search, name, max_entries_per_index_file, mode` |
-| `build_text_index` | `table, column` | `k1, length_norm, min_token_length, lowercase, stopwords, max_entries_per_index_file` |
+| `build_text_index` | `table, column` | `k1, length_norm, min_token_length, lowercase, stopwords, max_entries_per_index_file, name` |
 | `refresh_vector_index` | `table, column` | `index` |
-| `refresh_text_index` | `table, column` | — |
+| `refresh_text_index` | `table, column` | `index` |
 | `drop_vector_index` | `table, column` | `index, purge` |
 | `list_indexes` | `table` | — |
 | `check_indexes` | `table` | — |
@@ -779,8 +791,8 @@ BM25 和向量索引共用 executor 的容量预算、LRU 和状态入口。用�
 | `index_cache_status` | — | `refresh` |
 | `vector_search`（过程） | `table, column, query, k` | `index, coverage, nprobe, refine_factor` |
 | `vector_search_batch` | `table, column, k` | `queries, query_table, query_id_column, vector_column, index, coverage, nprobe, refine_factor` |
-| `text_search` | `table, column, query, k` | — |
-| `text_search_batch` | `table, column, queries, k` | — |
+| `text_search` | `table, column, query, k` | `index` |
+| `text_search_batch` | `table, column, queries, k` | `index` |
 | `load_index` | `table, index` | `retain_for` |
 | `offload_index` | `table, index` | — |
 | `cleanup_index_files` | `table` | — |
@@ -792,8 +804,8 @@ BM25 和向量索引共用 executor 的容量预算、LRU 和状态入口。用�
 | `vector_search` | `table, query_vector, k, vector_column`（位置序）＋ `nprobe` / `refine_factor` / `index` / `distance_type` / `columns` 命名选项；没有 `coverage` | 业务行 + `_distance` |
 | `vector_index_search` | `table, column, query(array\<double\>), k`（位置序）＋ 同一组命名选项；没有 `coverage` | `data_file, pos, score, row`（固定 `index_hits` 语义） |
 | `vector_index_search_batch` | `table, column, queries(array\<string\>，逗号分隔), k`（位置序）＋ 同一组命名选项；没有 `coverage` | 同上 + `query_id`（固定 `index_hits` 语义） |
-| `search` | `table, query, search_columns(array\<string\>，恰好 1 列), k` | 业务行 + `_score` |
-| `text_index_search` | `table, column, query(string), k` | `data_file, pos, score, row` |
+| `search` | `table, query, search_columns(array\<string\>，恰好 1 列), k`（另有 `filter` / `columns` / `index` 命名选项） | 业务行 + `_score` |
+| `text_index_search` | `table, column, query(string), k`（另有 `index` 命名选项） | `data_file, pos, score, row` |
 
 ### SQL 表达式与 DDL
 

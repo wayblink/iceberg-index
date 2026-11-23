@@ -46,13 +46,12 @@ class DropVectorIndexProcedure extends BaseProcedure {
       requiredInParameter("table", DataTypes.StringType);
   private static final ProcedureParameter COLUMN_PARAM =
       requiredInParameter("column", DataTypes.StringType);
-  private static final ProcedureParameter INDEX_PARAM =
-      optionalInParameter("index", DataTypes.StringType);
-
   private static final ProcedureParameter PURGE_PARAM =
       optionalInParameter("purge", DataTypes.BooleanType);
   private static final ProcedureParameter[] PARAMETERS =
-      new ProcedureParameter[] {TABLE_PARAM, COLUMN_PARAM, INDEX_PARAM, PURGE_PARAM};
+      new ProcedureParameter[] {
+        TABLE_PARAM, COLUMN_PARAM, IndexProcedures.INDEX_PARAM, PURGE_PARAM
+      };
 
   private static final StructType OUTPUT_TYPE =
       new StructType(
@@ -97,8 +96,7 @@ class DropVectorIndexProcedure extends BaseProcedure {
     return modifyIcebergTable(
         input.ident(TABLE_PARAM),
         table -> {
-          IndexMetadata metadata =
-              VectorIndexProcedures.resolveIndex(table, column, INDEX_PARAM, input);
+          IndexMetadata metadata = IndexProcedures.resolveIndex(table, column, "vector", input);
           IndexDrop.Result dropped = IndexDrop.drop(table, metadata, purge);
           InternalRow row =
               newInternalRow(UTF8String.fromString(dropped.indexUuid()), dropped.purged());

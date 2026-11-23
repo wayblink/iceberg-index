@@ -50,7 +50,7 @@ class RefreshTextIndexProcedure extends BaseProcedure {
   private static final ProcedureParameter COLUMN_PARAM =
       requiredInParameter("column", DataTypes.StringType);
   private static final ProcedureParameter[] PARAMETERS =
-      new ProcedureParameter[] {TABLE_PARAM, COLUMN_PARAM};
+      new ProcedureParameter[] {TABLE_PARAM, COLUMN_PARAM, IndexProcedures.INDEX_PARAM};
 
   private static final StructType OUTPUT_TYPE =
       new StructType(
@@ -99,7 +99,7 @@ class RefreshTextIndexProcedure extends BaseProcedure {
                 "Table " + tableName + " has no data: cannot refresh an index");
           }
 
-          IndexMetadata metadata = VectorIndexProcedures.findIndex(table, column, "text");
+          IndexMetadata metadata = IndexProcedures.resolveIndex(table, column, "text", input);
           SidecarIndexCatalog catalog = VectorIndexProcedures.indexCatalog(table);
           long sourceSnapshotId = table.currentSnapshot().snapshotId();
 

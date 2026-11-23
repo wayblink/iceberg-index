@@ -193,6 +193,17 @@ public final class IndexSearch {
     return search(spark, table, column, indexType, List.of(query), topK).drop(QUERY_ID_COLUMN);
   }
 
+  /** The same single-query search, over an index a caller already resolved. */
+  public static Dataset<Row> search(
+      SparkSession spark,
+      org.apache.iceberg.Table table,
+      String column,
+      IndexMetadata metadata,
+      ByteBuffer query,
+      int topK) {
+    return search(spark, table, column, metadata, List.of(query), topK).drop(QUERY_ID_COLUMN);
+  }
+
   /**
    * Reads the matched rows of every hit data file once and serializes them as JSON, keyed by data
    * file and row position. Positions are the row ordinals of the data file, which is what the index
