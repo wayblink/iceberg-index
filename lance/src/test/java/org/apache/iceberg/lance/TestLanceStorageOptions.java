@@ -22,6 +22,10 @@ import static org.assertj.core.api.Assertions.assertThat;
 
 import java.util.List;
 import java.util.Map;
+import org.apache.iceberg.io.FileIO;
+import org.apache.iceberg.io.InputFile;
+import org.apache.iceberg.io.OutputFile;
+import org.apache.iceberg.io.StorageProperties;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableMap;
 import org.apache.iceberg.relocated.com.google.common.collect.Maps;
 import org.junit.jupiter.api.Test;
@@ -130,6 +134,60 @@ class TestLanceStorageOptions {
                     "s3.endpoint", "http://from-s3-property:9000",
                     "lance.storage.endpoint", "http://explicit:8080")))
         .isEqualTo(ImmutableMap.of("endpoint", "http://explicit:8080"));
+  }
+
+  @Test
+  void theTableWinsOverTheCatalogWhenTheSettingIsSpelledDifferently() {
+    // the table spells the endpoint the Hadoop way while the catalog spells it the Iceberg way: the
+    // resolved map visits the table's key last, so walking it backwards gives Lance the table value
+    Map<String, String> resolved =
+        StorageProperties.resolve(
+            new FixedFileIO(ImmutableMap.of("s3.endpoint", "http://catalog.example:9000")),
+            ImmutableMap.of("fs.s3a.endpoint", "http://table.example:9000"),
+            ImmutableMap.of("fs.s3a.endpoint", "http://conf.example:9000").entrySet());
+
+    assertThat(LanceStorageOptions.from(resolved))
+        .containsEntry("endpoint", "http://table.example:9000");
+  }
+
+  @Test
+  void theCatalogWinsOverTheConfWhenTheSettingIsSpelledDifferently() {
+    Map<String, String> resolved =
+        StorageProperties.resolve(
+            new FixedFileIO(ImmutableMap.of("s3.endpoint", "http://catalog.example:9000")),
+            ImmutableMap.of(),
+            ImmutableMap.of("fs.s3a.endpoint", "http://conf.example:9000").entrySet());
+
+    assertThat(LanceStorageOptions.from(resolved))
+        .containsEntry("endpoint", "http://catalog.example:9000");
+  }
+
+  private static class FixedFileIO implements FileIO {
+    private final Map<String, String> properties;
+
+    FixedFileIO(Map<String, String> properties) {
+      this.properties = properties;
+    }
+
+    @Override
+    public Map<String, String> properties() {
+      return properties;
+    }
+
+    @Override
+    public InputFile newInputFile(String path) {
+      throw new UnsupportedOperationException("not used");
+    }
+
+    @Override
+    public OutputFile newOutputFile(String path) {
+      throw new UnsupportedOperationException("not used");
+    }
+
+    @Override
+    public void deleteFile(String path) {
+      throw new UnsupportedOperationException("not used");
+    }
   }
 
   @Test

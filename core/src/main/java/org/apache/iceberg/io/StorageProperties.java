@@ -92,6 +92,12 @@ public final class StorageProperties {
    * The settings a format should be given, with the table's properties winning over the catalog's
    * and the catalog's over the Hadoop configuration's.
    *
+   * <p>The returned map is ordered from the least to the most specific source, and a key that a
+   * later source restates is moved to that source's position. A consumer that translates several
+   * spellings of one setting into one key can then walk the map from its end and keep the first
+   * value it meets, which is how the source of a value survives the translation. The values do not
+   * depend on the order; only the order records which source a key came from.
+   *
    * @param io the table's FileIO, or null when the path has no FileIO behind it
    * @param tableProperties the table's properties, most specific
    * @param conf the engine's Hadoop configuration entries, least specific
@@ -99,15 +105,29 @@ public final class StorageProperties {
   public static Map<String, String> resolve(
       FileIO io, Map<String, String> tableProperties, Iterable<Map.Entry<String, String>> conf) {
     Map<String, String> properties = Maps.newLinkedHashMap();
-    properties.putAll(fromConf(conf));
+    putAll(properties, fromConf(conf));
     if (io != null) {
-      properties.putAll(fromFileIO(io));
+      putAll(properties, fromFileIO(io));
     }
 
     if (tableProperties != null) {
-      properties.putAll(tableProperties);
+      putAll(properties, tableProperties);
     }
 
     return properties;
+  }
+
+  /**
+   * Adds the settings of one source, keeping the map in source order.
+   *
+   * <p>A plain {@code putAll} leaves a key it overwrites at the position the earlier source gave
+   * it, so a consumer reading the map in order could not tell which spelling of one setting is the
+   * more specific: removing the key first moves it to the position of the source that wins.
+   */
+  private static void putAll(Map<String, String> target, Map<String, String> source) {
+    for (Map.Entry<String, String> entry : source.entrySet()) {
+      target.remove(entry.getKey());
+      target.put(entry.getKey(), entry.getValue());
+    }
   }
 }

@@ -75,6 +75,12 @@ final class LanceStorageOptions {
   /**
    * Returns the storage options Lance should be given for these properties.
    *
+   * <p>The properties are expected in the order {@code StorageProperties.resolve} returns, from the
+   * least to the most specific source. The translation walks them backwards so that the more
+   * specific spelling of one setting wins over the less specific one: a table that sets {@code
+   * fs.s3a.endpoint} has to beat a catalog that sets {@code s3.endpoint}, and a map without an
+   * order cannot say which of the two was the table's.
+   *
    * <p>Values are shaped for {@code LanceFileReader}/{@code LanceFileWriter}; properties that are
    * not storage settings, and storage settings Lance has no equivalent for, are left out rather
    * than failing the read.
@@ -85,7 +91,9 @@ final class LanceStorageOptions {
 
     // Two passes, not one: the explicit escape hatch is applied after every translation, so a
     // setting spelled both ways resolves to the explicit one whatever order the map iterates in.
-    for (Map.Entry<String, String> entry : properties.entrySet()) {
+    List<Map.Entry<String, String>> entries = Lists.newArrayList(properties.entrySet());
+    for (int i = entries.size() - 1; i >= 0; i -= 1) {
+      Map.Entry<String, String> entry = entries.get(i);
       String key = entry.getKey();
       String value = entry.getValue();
       if (value == null) {
@@ -98,18 +106,19 @@ final class LanceStorageOptions {
       }
 
       if (bareKey != null) {
-        options.put(bareKey, value);
+        // the first entry in reverse order comes from the most specific source that spells it
+        options.putIfAbsent(bareKey, value);
       } else if (PATH_STYLE_KEYS.contains(key)) {
         // Iceberg says "path style = yes"; Lance asks for the opposite flag
         Boolean pathStyle = parseBoolean(key, value);
         if (pathStyle != null) {
-          options.put("virtual_hosted_style_request", Boolean.toString(!pathStyle));
+          options.putIfAbsent("virtual_hosted_style_request", Boolean.toString(!pathStyle));
         }
       } else if (SSL_KEYS.contains(key)) {
         // Hadoop says "ssl enabled"; Lance asks whether plain http is allowed
         Boolean sslEnabled = parseBoolean(key, value);
         if (sslEnabled != null) {
-          options.put("allow_http", Boolean.toString(!sslEnabled));
+          options.putIfAbsent("allow_http", Boolean.toString(!sslEnabled));
         }
       } else if (!key.startsWith(LANCE_PREFIX) && looksLikeStorageConfig(key)) {
         unmapped.add(key);
