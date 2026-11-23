@@ -219,7 +219,20 @@ public final class IndexSearch {
       IndexMetadata metadata,
       ByteBuffer query,
       int topK) {
-    return search(spark, table, column, metadata, List.of(query), topK).drop(QUERY_ID_COLUMN);
+    return search(spark, table, column, metadata, query, topK, null);
+  }
+
+  /** The same single-query search, reporting its stages into {@code stages} when given one. */
+  public static Dataset<Row> search(
+      SparkSession spark,
+      org.apache.iceberg.Table table,
+      String column,
+      IndexMetadata metadata,
+      ByteBuffer query,
+      int topK,
+      DistributedIndexSearch.SearchStages stages) {
+    return search(spark, table, column, metadata, List.of(query), topK, stages)
+        .drop(QUERY_ID_COLUMN);
   }
 
   /**
