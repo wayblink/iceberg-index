@@ -20,6 +20,7 @@ package org.apache.iceberg.spark.index;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
+import java.nio.ByteBuffer;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -29,6 +30,7 @@ import java.util.Comparator;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.stream.Collectors;
 import org.apache.iceberg.FileScanTask;
 import org.apache.iceberg.Table;
 import org.apache.iceberg.hadoop.HadoopTables;
@@ -40,11 +42,14 @@ import org.apache.iceberg.index.IndexSearchResult;
 import org.apache.iceberg.index.SidecarIndexCatalog;
 import org.apache.iceberg.index.spark.DistributedIndexSearch;
 import org.apache.iceberg.index.spark.IndexEntries;
+import org.apache.iceberg.index.spark.IndexSearch;
 import org.apache.iceberg.index.spark.IndexSelection;
 import org.apache.iceberg.index.spark.SparkIndexBuilder;
+import org.apache.iceberg.index.spark.VectorIndexes;
 import org.apache.iceberg.index.text.TextIndexAdapter;
 import org.apache.iceberg.index.text.TextIndexDefinition;
 import org.apache.iceberg.index.text.TextIndexTypes;
+import org.apache.iceberg.types.Types;
 import org.apache.spark.scheduler.SparkListener;
 import org.apache.spark.scheduler.SparkListenerJobStart;
 import org.apache.spark.scheduler.StageInfo;
@@ -56,11 +61,6 @@ import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 import scala.runtime.BoxedUnit;
-import java.nio.ByteBuffer;
-import java.util.stream.Collectors;
-import org.apache.iceberg.index.spark.IndexSearch;
-import org.apache.iceberg.index.spark.VectorIndexes;
-import org.apache.iceberg.types.Types;
 
 class TestTextSearchSource {
   private static Path warehouse;

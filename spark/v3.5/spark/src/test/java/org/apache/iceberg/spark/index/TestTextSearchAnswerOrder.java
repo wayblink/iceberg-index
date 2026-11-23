@@ -111,8 +111,14 @@ class TestTextSearchAnswerOrder {
               + "CAST(id AS STRING)), "
               + "concat_ws('', collect_list(md5(concat(CAST(id AS STRING), '-', "
               + "CAST(chunk AS STRING))))) "
-              + "FROM range(" + from + ", " + to + ") AS docs(id) "
-              + "LATERAL VIEW explode(sequence(0, " + (CHUNKS - 1) + ")) AS chunk "
+              + "FROM range("
+              + from
+              + ", "
+              + to
+              + ") AS docs(id) "
+              + "LATERAL VIEW explode(sequence(0, "
+              + (CHUNKS - 1)
+              + ")) AS chunk "
               + "GROUP BY id");
     }
 
@@ -136,7 +142,8 @@ class TestTextSearchAnswerOrder {
             + limit
             + ")";
 
-    System.out.println("PROFILE plan k=" + limit + ":" + spark.sql(query).queryExecution().executedPlan());
+    System.out.println(
+        "PROFILE plan k=" + limit + ":" + spark.sql(query).queryExecution().executedPlan());
 
     for (int run = 0; run < WARMUPS; run++) {
       spark.sql(query).collectAsList();
@@ -288,10 +295,7 @@ class TestTextSearchAnswerOrder {
               (job, stages) -> {
                 text.append(
                     String.format(
-                        Locale.ROOT,
-                        "%n    job %d: %dms",
-                        job,
-                        jobTime.getOrDefault(job, -1L)));
+                        Locale.ROOT, "%n    job %d: %dms", job, jobTime.getOrDefault(job, -1L)));
                 stages.forEach(
                     stage -> {
                       long[] cost = stageCosts.getOrDefault(stage, new long[6]);
