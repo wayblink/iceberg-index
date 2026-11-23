@@ -46,7 +46,6 @@ import org.apache.spark.sql.catalyst.expressions.InterpretedPredicate
 import org.apache.spark.sql.catalyst.expressions.Literal
 import org.apache.spark.sql.catalyst.expressions.SubqueryExpression
 import org.apache.spark.sql.catalyst.expressions.Unevaluable
-import org.apache.spark.sql.catalyst.expressions.UnsafeProjection
 import org.apache.spark.sql.catalyst.optimizer.ConstantFolding
 import org.apache.spark.sql.catalyst.optimizer.NullPropagation
 import org.apache.spark.sql.catalyst.optimizer.ReplaceExpressions
@@ -56,8 +55,10 @@ import org.apache.spark.sql.catalyst.plans.logical.LocalRelation
 import org.apache.spark.sql.catalyst.plans.logical.Statistics
 import org.apache.spark.sql.execution.LeafExecNode
 import org.apache.spark.sql.execution.datasources.SparkExpressionConverter
+import org.apache.spark.sql.functions
 import org.apache.spark.sql.types.DoubleType
 import org.apache.spark.sql.types.FloatType
+import org.apache.spark.sql.types.IntegerType
 import org.apache.spark.sql.types.StructField
 import org.apache.spark.sql.types.StructType
 
@@ -172,41 +173,55 @@ private[spark] case class TextSearchExec(
       return spark.sparkContext.emptyRDD[InternalRow]
     }
 
-    // One partition per hit data file, and the conversion happens in the task that read the row:
-    // the rows of the answer never pass through the driver, and the reads of the hit files run
-    // side by side rather than one after another
-    fetched.rdd.mapPartitions { entries =>
-      val plan = down.value
-      val convert = CatalystTypeConverters.createToCatalystConverter(resultSchema)
-      val unsafe = UnsafeProjection.create(resultSchema)
-      val read = entries.toVector
+    // One partition per hit data file, and the answer is assembled in the task that read the row:
+    // the rows never pass through the driver, and the reads of the hit files run side by side
+    val read =
+      fetched.rdd.mapPartitions { entries =>
+        val plan = down.value
+        val rows = entries.toVector
 
-      // a fetch-back reads the positions it was asked for, so a position the answer names and the
-      // read did not answer with is a row the snapshot no longer has, which is a stale index; a
-      // file whose every hit is gone answers no rows at all, which this cannot tell from a file
-      // that was never hit
-      for ((file, ofFile) <- read.groupBy(_._1)) {
-        val found = ofFile.map(entry => entry._2._1.longValue()).toSet
-        val missing = plan.expected.getOrElse(file, Set.empty[Long]) -- found
-        if (missing.nonEmpty) {
-          throw TextSearchHits.absentRow(indexUuid, snapshotId, file, missing.head)
+        // a fetch-back reads the positions it was asked for, so a position the answer names and the
+        // read did not answer with is a row the snapshot no longer has, which is a stale index; a
+        // file whose every hit is gone answers no rows at all, which this cannot tell from a file
+        // that was never hit
+        for ((file, ofFile) <- rows.groupBy(_._1)) {
+          val found = ofFile.map(entry => entry._2._1.longValue()).toSet
+          val missing = plan.expected.getOrElse(file, Set.empty[Long]) -- found
+          if (missing.nonEmpty) {
+            throw TextSearchHits.absentRow(indexUuid, snapshotId, file, missing.head)
+          }
+        }
+
+        // a row carries where its hit sat in the merged order: the reads are per file, so the order
+        // is put back after them rather than before
+        rows.iterator.flatMap { case (file, (position, row)) =>
+          plan.scored
+            .getOrElse((file, position.longValue()), Array.empty[(Int, Double)])
+            .iterator
+            .map { case (index, score) =>
+              Row.fromSeq(Seq(Integer.valueOf(index), Row.fromSeq(row.toSeq :+ score)))
+            }
         }
       }
 
-      // the rows of a partition arrive in data file and position order, and the answer's order is
-      // the order the hits merged in: sorting one partition's rows is a sort of what this
-      // partition read, not a pass over the whole answer, and for a search whose hits came from
-      // one file it restores exactly the order the answer had when it was built on the driver
-      read
-        .flatMap { case (file, (position, row)) =>
-          plan.scored
-            .getOrElse((file, position.longValue()), Array.empty[(Int, Double)])
-            .map { case (index, score) => (index, Row.fromSeq(row.toSeq :+ score)) }
-        }
-        .sortBy(_._1)
-        .iterator
-        .map { case (_, row) => unsafe(convert(row).asInstanceOf[InternalRow]).copy() }
-    }
+    // The answer's rows travel as one struct column and the order of the hits as another: neither
+    // name is one of the answer's own, so no column of the table can be taken for them. The rows
+    // are read in one task per hit file, and the merge order is restored by one shuffle inside this
+    // job: the hits are few, the rows still never cross the driver, and the answer keeps the order
+    // a caller sees instead of answering by data file.
+    val shipped = StructType(
+      Seq(
+        StructField(TextSearchHits.OrderColumn, IntegerType, nullable = false),
+        StructField(TextSearchHits.RowColumn, resultSchema, nullable = false)))
+    spark
+      .createDataFrame(read, shipped)
+      .repartition(1)
+      .sortWithinPartitions(functions.col(TextSearchHits.OrderColumn))
+      .select(output.map(a => functions.col(TextSearchHits.RowColumn).getField(a.name)): _*)
+      .queryExecution
+      .toRdd
+      // a projected row can be a buffer the projection reuses, and the answer is handed on
+      .map(row => row.copy())
   }
 }
 
@@ -222,6 +237,12 @@ private[spark] case class TextSearchHits(
     expected: Map[String, Set[Long]])
 
 private[spark] object TextSearchHits {
+
+  /** The column that carries where a row's hit sat in the merged order. */
+  val OrderColumn = "_text_search_hit_order"
+
+  /** The column that carries the row of the answer, its own columns nested inside it. */
+  val RowColumn = "_text_search_row"
 
   /** The failure of a hit whose row the snapshot does not have: the index refers to a lost row. */
   def absentRow(

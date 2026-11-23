@@ -31,7 +31,6 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.stream.Collectors;
 import java.util.Map;
-import java.util.concurrent.atomic.AtomicInteger;
 import org.apache.iceberg.FileScanTask;
 import org.apache.iceberg.Table;
 import org.apache.iceberg.hadoop.HadoopTables;
@@ -53,6 +52,7 @@ import org.apache.iceberg.index.spark.IndexEntries;
 import org.apache.iceberg.index.spark.IndexSelection;
 import org.apache.spark.scheduler.SparkListener;
 import org.apache.spark.scheduler.SparkListenerJobStart;
+import org.apache.spark.scheduler.StageInfo;
 import org.apache.spark.sql.Dataset;
 import org.apache.spark.sql.Row;
 import org.apache.spark.sql.SparkSession;
@@ -228,20 +228,30 @@ class TestTextSearchSource {
     assertThat(whole.getString(3)).contains("\"id\"", "\"body\"", "\"note\"");
     assertThat(projected.getString(3)).contains("\"id\"").doesNotContain("\"body\"", "\"note\"");
   void readsTheRowsInTheQueryJob() {
+  void readsTheRowsInTheAnswerJob() {
     spark.sql("CREATE TABLE local.db.answer_jobs (id bigint, body string) USING iceberg");
-    spark.sql("INSERT INTO local.db.answer_jobs VALUES (1, 'ice fox'), (2, 'ice dog'), (3, 'ice')");
-    buildIndex("answer_jobs");
+    spark.sql("INSERT INTO local.db.answer_jobs VALUES (1, 'ice fox'), (2, 'ice dog')");
+    spark.sql("INSERT INTO local.db.answer_jobs VALUES (3, 'ice cat'), (4, 'ice')");
+    Table table = buildIndex("answer_jobs");
 
-    // scoring merges the hits on the driver, which is a job of its own. Answering with their rows
-    // used to be a second one: the rows were collected to the driver and parallelised out again.
-    // They are read and converted inside the query's own job now, so a search costs the scoring
-    // and the query.
-    AtomicInteger jobs = new AtomicInteger();
+    // the answer is read in one task per hit data file and put back in the order the hits merged
+    // in, all inside the job that answers the query: a fetch-back that collected the rows to the
+    // driver would be a job of its own, and the answer's own job would read no data file
+    int hitFiles =
+        (int) hitsOf(table, "ice", 10).stream().map(IndexSearchResult::dataFile).distinct().count();
+    assertThat(hitFiles).as("data files the answer is read from").isGreaterThan(1);
+    List<List<Integer>> jobs = new ArrayList<>();
     SparkListener countedJobs =
         new SparkListener() {
           @Override
           public void onJobStart(SparkListenerJobStart jobStart) {
-            jobs.incrementAndGet();
+            List<Integer> tasks = new ArrayList<>();
+            scala.collection.Iterator<StageInfo> stages = jobStart.stageInfos().iterator();
+            while (stages.hasNext()) {
+              tasks.add(stages.next().numTasks());
+            }
+
+            jobs.add(tasks);
           }
         };
 
@@ -253,8 +263,10 @@ class TestTextSearchSource {
       spark.sparkContext().removeSparkListener(countedJobs);
     }
 
-    assertThat(rows).hasSize(3);
-    assertThat(jobs.get()).as("jobs to score the query and answer with its rows").isEqualTo(2);
+    assertThat(rows).hasSize(4);
+    assertThat(jobs.get(jobs.size() - 1))
+        .as("tasks of the answer's job: one per hit data file, then one for the ordered answer")
+        .containsExactly(hitFiles, 1);
   }
 
   @Test
@@ -265,24 +277,12 @@ class TestTextSearchSource {
             + "(1, 'ice fox'), (2, 'ice ice ice ice'), (3, 'ice dog'), (4, 'ice')");
     buildIndex("answer_order");
 
-    // one write can land in more than one data file, and the answer is read in one partition per
-    // hit file. One task for the fetch-back puts the whole answer in a single partition, where its
-    // rows are the order the hits merged in, best first; with a task per file the same order holds
-    // for the rows a task read.
-    String previous = System.getProperty("iceberg.index.fetch-back.tasks");
-    List<Row> rows;
-    try {
-      System.setProperty("iceberg.index.fetch-back.tasks", "1");
-      rows = spark.sql("SELECT id, _score FROM " + search("answer_order") + ")").collectAsList();
-    } finally {
-      if (previous == null) {
-        System.clearProperty("iceberg.index.fetch-back.tasks");
-      } else {
-        System.setProperty("iceberg.index.fetch-back.tasks", previous);
-      }
-    }
-
+    // the hits of this answer come from more than one data file, so its rows are read by more than
+    // one task: the answer is still the order the hits merged in, best first
+    List<Row> rows =
+        spark.sql("SELECT id, _score FROM " + search("answer_order") + ")").collectAsList();
     assertThat(rows).hasSize(4);
+
     List<Double> scores = new ArrayList<>();
     rows.forEach(row -> scores.add(row.getDouble(1)));
     List<Double> ranked = new ArrayList<>();
@@ -301,13 +301,30 @@ class TestTextSearchSource {
     spark.sql("CREATE TABLE local.db.hit_files (id bigint, body string) USING iceberg");
     spark.sql("INSERT INTO local.db.hit_files VALUES (1, 'ice')");
     spark.sql("INSERT INTO local.db.hit_files VALUES (2, 'ice')");
-    buildIndex("hit_files");
+    Table table = buildIndex("hit_files");
 
-    // the hits answer from two data files, and a file is read by one task: the answer is read in
-    // two partitions rather than in the single partition the driver used to fill
+    List<String> columns = Arrays.asList("id", "body");
+    List<FileScanTask> tasks = IndexEntries.scanTasks(table, table.currentSnapshot().snapshotId());
+    List<IndexSearchResult> hits = hitsOf(table, "ice", 10);
+
+    // the hits answer from two data files, and the fetch-back hands a file to a task: the reads are
+    // two tasks rather than the one partition the driver used to fill
+    assertThat(
+            IndexEntries.rowsAtRdd(
+                    spark,
+                    table,
+                    positionsOf(hits),
+                    columns,
+                    IndexEntries.sparkSchema(table, columns),
+                    tasks)
+                .getNumPartitions())
+        .isEqualTo(2);
+
+    // the answer itself is one partition, because its rows are the order the hits merged in: one
+    // order for one partition, read in parallel before it
     Dataset<Row> answer = spark.sql("SELECT id FROM " + search("hit_files") + ")");
     assertThat(answer.collectAsList()).hasSize(2);
-    assertThat(answer.queryExecution().toRdd().getNumPartitions()).isEqualTo(2);
+    assertThat(answer.queryExecution().toRdd().getNumPartitions()).isEqualTo(1);
   }
 
   @Test
@@ -318,28 +335,22 @@ class TestTextSearchSource {
     Table table = buildIndex("answer_rows");
 
     // the answer a driver used to assemble: the hits in their merged order, each with the row it
-    // names, read back by file and position. The rows are read in the tasks now, so this is the
-    // reference the answer is held to: the same rows, with the same scores, from the same hits.
+    // names, read back by file and position. That order is what a caller sees, so the answer is
+    // held to it row by row, whichever task read which file.
     List<String> columns = Arrays.asList("id", "body");
-    long snapshotId = table.currentSnapshot().snapshotId();
-    IndexMetadata metadata = IndexSelection.resolve(table, "body", "text", null);
-    TextIndexAdapter adapter = new TextIndexAdapter((TextIndexDefinition) metadata.definition());
-    IndexQuery query = IndexQuery.of(snapshotId, adapter.encodeQuery("ice"), 10);
-    List<IndexSearchResult> hits =
-        DistributedIndexSearch.searchBatch(spark, metadata, table, Collections.singletonList(query))
-            .get(0);
+    List<IndexSearchResult> hits = hitsOf(table, "ice", 10);
     assertThat(hits).isNotEmpty();
-
-    Map<String, Collection<Long>> positions = new LinkedHashMap<>();
-    hits.forEach(
-        hit ->
-            positions
-                .computeIfAbsent(hit.dataFile(), file -> new ArrayList<>())
-                .add(hit.rowPosition()));
-    List<FileScanTask> tasks = IndexEntries.scanTasks(table, snapshotId);
+    assertThat(hits.stream().map(IndexSearchResult::dataFile).distinct().count())
+        .as("data files the answer is read from")
+        .isGreaterThan(1);
     Map<String, Map<Long, Row>> byFile =
         IndexEntries.rowsAt(
-            spark, table, positions, columns, IndexEntries.sparkSchema(table, columns), tasks);
+            spark,
+            table,
+            positionsOf(hits),
+            columns,
+            IndexEntries.sparkSchema(table, columns),
+            IndexEntries.scanTasks(table, table.currentSnapshot().snapshotId()));
     List<List<Object>> expected = new ArrayList<>();
     hits.forEach(
         hit -> {
@@ -355,7 +366,31 @@ class TestTextSearchSource {
         .forEach(
             row -> answer.add(Arrays.asList(row.getLong(0), row.getString(1), row.getDouble(2))));
 
-    assertThat(answer).containsExactlyInAnyOrderElementsOf(expected);
+    assertThat(answer).containsExactlyElementsOf(expected);
+  }
+
+  /** The hits of a search on the index built for a table, best first. */
+  private static List<IndexSearchResult> hitsOf(Table table, String query, int k) {
+    IndexMetadata metadata = IndexSelection.resolve(table, "body", "text", null);
+    TextIndexAdapter adapter = new TextIndexAdapter((TextIndexDefinition) metadata.definition());
+    return DistributedIndexSearch.searchBatch(
+            spark,
+            metadata,
+            table,
+            Collections.singletonList(
+                IndexQuery.of(table.currentSnapshot().snapshotId(), adapter.encodeQuery(query), k)))
+        .get(0);
+  }
+
+  /** The positions a fetch-back reads, per data file, for the given hits. */
+  private static Map<String, Collection<Long>> positionsOf(List<IndexSearchResult> hits) {
+    Map<String, Collection<Long>> positions = new LinkedHashMap<>();
+    hits.forEach(
+        hit ->
+            positions
+                .computeIfAbsent(hit.dataFile(), file -> new ArrayList<>())
+                .add(hit.rowPosition()));
+    return positions;
   }
 
   private static String search(String name) {
