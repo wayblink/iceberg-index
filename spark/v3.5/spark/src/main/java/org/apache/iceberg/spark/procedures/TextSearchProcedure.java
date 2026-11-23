@@ -120,9 +120,18 @@ class TextSearchProcedure extends BaseProcedure {
           DistributedIndexSearch.SearchStages stages =
               DistributedIndexSearch.SearchStages.create(spark().sparkContext());
           long started = System.nanoTime();
+          // the procedure answers with the whole matched row as JSON, so every column is read: a
+          // projection belongs to a caller whose own contract names the columns it needs
           List<Row> hits =
               IndexSearch.search(
-                      spark(), table, column, metadata, adapter.encodeQuery(query), topK, stages)
+                      spark(),
+                      table,
+                      column,
+                      metadata,
+                      adapter.encodeQuery(query),
+                      topK,
+                      null,
+                      stages)
                   .collectAsList();
           long totalNanos = System.nanoTime() - started;
           LOG.info(

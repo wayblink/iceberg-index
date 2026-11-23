@@ -139,6 +139,25 @@ public final class IndexSearch {
       List<ByteBuffer> queries,
       int topK,
       DistributedIndexSearch.SearchStages stages) {
+    return search(spark, table, column, metadata, queries, topK, null, stages);
+  }
+
+  /**
+   * The same search, reading only the given columns of each matched row.
+   *
+   * <p>The columns are the projection of the {@code row} column, in the order the JSON object of a
+   * hit carries them. Pass {@code null} to read every column of the table, which is what a caller
+   * that answers with the whole matched row needs. A column the table does not have is rejected.
+   */
+  public static Dataset<Row> search(
+      SparkSession spark,
+      org.apache.iceberg.Table table,
+      String column,
+      IndexMetadata metadata,
+      List<ByteBuffer> queries,
+      int topK,
+      List<String> columns,
+      DistributedIndexSearch.SearchStages stages) {
     if (topK <= 0 || queries.isEmpty()) {
       return spark.createDataFrame(Lists.newArrayList(), RESULT_SCHEMA);
     }
@@ -176,7 +195,7 @@ public final class IndexSearch {
             : snapshot.sourceTableSnapshotId();
     long fetchStart = System.nanoTime();
     Map<String, Map<Long, String>> rowsByFile =
-        resolveRows(spark, table, resolveSnapshotId, hitsPerQuery);
+        resolveRows(spark, table, resolveSnapshotId, hitsPerQuery, columns);
     if (stages != null) {
       DistributedIndexSearch.Stages fetchTally = new DistributedIndexSearch.Stages();
       fetchTally.fetchBackNanos = System.nanoTime() - fetchStart;
@@ -237,7 +256,20 @@ public final class IndexSearch {
       ByteBuffer query,
       int topK,
       DistributedIndexSearch.SearchStages stages) {
-    return search(spark, table, column, metadata, List.of(query), topK, stages)
+    return search(spark, table, column, metadata, query, topK, null, stages);
+  }
+
+  /** The same single-query search over a projection of the matched row; {@code null} reads all. */
+  public static Dataset<Row> search(
+      SparkSession spark,
+      org.apache.iceberg.Table table,
+      String column,
+      IndexMetadata metadata,
+      ByteBuffer query,
+      int topK,
+      List<String> columns,
+      DistributedIndexSearch.SearchStages stages) {
+    return search(spark, table, column, metadata, List.of(query), topK, columns, stages)
         .drop(QUERY_ID_COLUMN);
   }
 
@@ -249,12 +281,15 @@ public final class IndexSearch {
    * <p>The rows are read through the same delete-aware reader the index is built with, so a row
    * removed after the index snapshot was built is not returned. Its position is then absent from
    * the result and the hit is reported without a row.
+   *
+   * @param columns the columns to read, in this order, or null for every column of the table
    */
   private static Map<String, Map<Long, String>> resolveRows(
       SparkSession spark,
       org.apache.iceberg.Table table,
       long snapshotId,
-      List<List<IndexSearchResult>> hitsPerQuery) {
+      List<List<IndexSearchResult>> hitsPerQuery,
+      List<String> columns) {
     Map<String, Set<Long>> positionsByFile = new LinkedHashMap<>();
     for (List<IndexSearchResult> hits : hitsPerQuery) {
       for (IndexSearchResult hit : hits) {
@@ -264,17 +299,20 @@ public final class IndexSearch {
       }
     }
 
-    List<String> columns = Lists.newArrayList();
-    for (Types.NestedField field : table.schema().columns()) {
-      columns.add(field.name());
+    List<String> readColumns = columns;
+    if (readColumns == null) {
+      readColumns = Lists.newArrayList();
+      for (Types.NestedField field : table.schema().columns()) {
+        readColumns.add(field.name());
+      }
     }
 
     // the read is given the table's own schema for these columns rather than the file's: a column
     // added after a file was written is absent from that file, and telling Spark which columns were
     // asked for is what turns the absence into a null instead of a missing field
-    StructType readSchema = IndexEntries.sparkSchema(table, columns);
+    StructType readSchema = IndexEntries.sparkSchema(table, readColumns);
     Map<String, Map<Long, Row>> rowsByFile =
-        IndexEntries.rowsAt(spark, table, snapshotId, positionsByFile, columns, readSchema);
+        IndexEntries.rowsAt(spark, table, snapshotId, positionsByFile, readColumns, readSchema);
 
     Map<String, Map<Long, String>> jsonByFile = Maps.newHashMap();
     for (Map.Entry<String, Map<Long, Row>> entry : rowsByFile.entrySet()) {
