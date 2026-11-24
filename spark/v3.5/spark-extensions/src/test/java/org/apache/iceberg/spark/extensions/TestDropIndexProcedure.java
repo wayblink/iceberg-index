@@ -201,12 +201,47 @@ public class TestDropIndexProcedure extends ExtensionsTestBase {
     assertThat(dropped.get(0)[1].toString())
         .as("a damaged entry has no readable index type")
         .isEqualTo("unknown");
-    assertThat((Boolean) dropped.get(0)[2]).isTrue();
+    assertThat((Boolean) dropped.get(0)[2])
+        .as("the drop cannot find the data files of an entry it cannot read, so nothing was purged")
+        .isFalse();
 
     // and the column can be indexed again once the registry is repaired
     List<Object[]> rebuilt = buildTextIndex();
     assertThat(rebuilt).hasSize(1);
     assertThat(listIndexes()).containsExactly(rebuilt.get(0)[0].toString());
+  }
+
+  @TestTemplate
+  public void doesNotDropAnIndexOfAnotherColumnByUuid() {
+    sql(
+        "CREATE TABLE %s (id bigint, body string, embedding array<float>) USING iceberg",
+        tableName(TABLE));
+    sql(
+        "INSERT INTO %s VALUES "
+            + "(1, 'the quick brown fox', array(1.0, 0.0)), "
+            + "(2, 'a dog sleeps', array(0.0, 1.0))",
+        tableName(TABLE));
+    String textUuid = buildTextIndex().get(0)[0].toString();
+    String vectorUuid =
+        sql(
+                "CALL %s.system.build_vector_index(table => '%s', column => 'embedding', "
+                    + "dimension => 2, metric => 'cosine')",
+                catalogName, tableName(TABLE))
+            .get(0)[0]
+            .toString();
+
+    // a UUID named under the wrong column keeps the resolution error: the drop would otherwise
+    // purge
+    // a live index of another column, which cannot be undone
+    assertThatThrownBy(
+            () ->
+                sql(
+                    "CALL %s.system.drop_index(table => '%s', column => 'body', index => '%s')",
+                    catalogName, tableName(TABLE), vectorUuid))
+        .isInstanceOf(IllegalArgumentException.class)
+        .hasMessageContaining("No index named");
+
+    assertThat(listIndexes()).containsExactlyInAnyOrder(textUuid, vectorUuid);
   }
 
   /**

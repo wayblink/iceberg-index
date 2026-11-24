@@ -380,7 +380,7 @@ CALL local.system.drop_index(table => 'db.papers', column => 'body', index => '<
 CALL local.system.drop_index(table => 'db.papers', column => 'body', index => '<损坏条目的 uuid>', purge => true);
 ```
 
-`column` 对损坏条目只用来定位，任意列名都可以——索引解析失败后会按 uuid 直接删注册表条目；`purge => true` 会一并清掉该 uuid 剩下的 metadata 目录。uuid 不在注册表里时仍报错。
+`column` 对损坏条目只用来定位，任意列名都可以——索引解析失败后会按 uuid 直接删注册表条目。损坏条目的 `purged` 会是 `false`：metadata 不可读，drop 找不到该索引写出的数据文件，只能删注册表条目和能枚举到的 metadata 文件；残留的数据文件用 `cleanup_index_files` 回收。uuid 不在注册表里、或该 uuid 是另一列上的健康索引时仍报解析错误，不会删除。
 
 注意 `ALTER TABLE … DROP INDEX <name>` **没有 `purge` 参数**，它落到默认值 `true`，即直接删文件。
 
@@ -602,7 +602,9 @@ SHOW INDEXES FROM local.db.docs;   -- 只有 FROM，没有 IN
 
 `list_indexes` 的 `status` 只有 `PUBLISHED` 或 `NULL`（没有快照时），**不会显示构建进度**——那要看 `index_build_status`。`definition` 是 JSON 字符串，取 `metric` 之类的字段要 `get_json_object`。
 
-注册表与磁盘不一致时（注册表条目还在、`metadata/index-metadata-*.json` 被删），`list_indexes` 跳过这些损坏条目并留 WARN，`check_indexes` 给每个损坏条目一行（`column = NULL`、`index_type = unknown`、`readable = false`）和按 uuid 删除的修复语句；一个坏条目不会让整张表的索引操作失败。
+注册表与磁盘不一致时（注册表条目还在、`metadata/index-metadata-*.json` 被删或不是合法 JSON），`list_indexes` 跳过这些损坏条目并留 WARN，`check_indexes` 给每个损坏条目一行（`column = NULL`、`index_type = unknown`、`readable = false`）和按 uuid 删除的修复语句；一个坏条目不会让整张表的索引操作失败。损坏条目的 drop 返回 `purged = false`（数据文件靠 `cleanup_index_files` 回收）。
+
+注册表由更早的 build 写入（文档里没有 `dropped` 记录字段）时，一个丢失的注册条目不会被自动恢复：无法区分“并发写丢”和“被旧写者删除”，恢复可能把已删索引重新登记回来，所以会报错要求重建或显式 `drop_index` 清理。
 
 `index_build_status.state` 五种：`RUNNING`、`SUCCEEDED`、`FAILED`、`ABANDONED`（报告停止更新超过 5 分钟，通常是 driver 被杀）、`UNKNOWN`（没有报告，比如更早版本建的）。构建期间约每 30 秒一次心跳，可以反复 `CALL` 观察。
 

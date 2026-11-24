@@ -405,6 +405,10 @@ class TestVersionedIndexRegistry {
               if (!tableUuids.isEmpty()) {
                 JsonUtil.writeStringMap("table-uuids", tableUuids, generator);
               }
+              // a registry the current build writes always carries the record, even when empty: a
+              // registration is restored only when the document could have recorded a drop
+              generator.writeArrayFieldStart("dropped");
+              generator.writeEndArray();
               generator.writeEndObject();
             },
             false);
@@ -596,6 +600,48 @@ class TestVersionedIndexRegistry {
   }
 
   @Test
+  void treatsAMetadataDocumentThatIsNotJsonAsDamaged() {
+    TestTables.TestTableOperations ops = operations();
+    SidecarIndexCatalog catalog = versionedCatalog(ops);
+    catalog.createIndex(request("index-a"));
+    catalog.createIndex(request("index-b"));
+    String root = metadataRootOf(registryPointer(ops), "index-a");
+    corruptMetadataRoot("index-a", root);
+
+    // a document nothing can parse is as unusable as one that is gone: the entries that are
+    // readable still list, and the damaged one is reported and removable
+    assertThat(catalog.listIndexes(tableDir.toString()))
+        .extracting(IndexMetadata::indexUuid)
+        .containsExactly("index-b");
+    assertThat(catalog.damagedIndexUuids(tableDir.toString())).containsExactly("index-a");
+    assertThat(catalog.dropIndex(tableDir.toString(), "index-a", true)).isTrue();
+    assertThat(catalog.damagedIndexUuids(tableDir.toString())).isEmpty();
+  }
+
+  @Test
+  void refusesToRestoreARegistrationWhenTheRegistryRecordsNoDrops() {
+    TestTables.TestTableOperations ops = operations();
+    SidecarIndexCatalog catalog = versionedCatalog(ops);
+    catalog.createIndex(request("index-b"));
+    catalog.createIndex(request("index-a"));
+
+    // a writer of an older build moved the pointer past the registration of index-a and wrote a
+    // registry without the drop record, so nothing on disk can tell a lost registration from one
+    // that was dropped on purpose
+    String staleRegistry = publishRegistryFromStaleView(ops, "index-b");
+    dropDroppedRecord(staleRegistry);
+
+    assertThatThrownBy(
+            () ->
+                catalog.updateIndex(
+                    tableDir.toString(), "index-a", current -> current.withSnapshot(snapshot(1))))
+        .isInstanceOf(NotFoundException.class)
+        .hasMessageContaining("records no dropped indexes");
+    // the entry is left out because restoring it could bring back an index someone removed
+    assertThat(indexUuids(registryPointer(ops))).doesNotContain("index-a");
+  }
+
+  @Test
   void droppingADamagedEntryRemovesItFromTheRegistry() {
     TestTables.TestTableOperations ops = operations();
     SidecarIndexCatalog catalog = versionedCatalog(ops);
@@ -644,6 +690,27 @@ class TestVersionedIndexRegistry {
     try {
       JsonNode node = registryJson(registryFile);
       ((com.fasterxml.jackson.databind.node.ObjectNode) node).remove("table-uuids");
+      Files.write(path, node.toString().getBytes(UTF_8));
+    } catch (IOException e) {
+      throw new UncheckedIOException(e);
+    }
+  }
+
+  private void corruptMetadataRoot(String indexUuid, String root) {
+    try {
+      Files.write(
+          Path.of(indexesRoot().toString(), indexUuid, "metadata", root),
+          ("{\"metadata\": ").getBytes(UTF_8));
+    } catch (IOException e) {
+      throw new UncheckedIOException(e);
+    }
+  }
+
+  private void dropDroppedRecord(String registryFile) {
+    Path path = indexesRoot().toPath().resolve(registryFile);
+    try {
+      JsonNode node = registryJson(registryFile);
+      ((com.fasterxml.jackson.databind.node.ObjectNode) node).remove("dropped");
       Files.write(path, node.toString().getBytes(UTF_8));
     } catch (IOException e) {
       throw new UncheckedIOException(e);

@@ -458,6 +458,19 @@ public final class SidecarIndexCatalog implements IndexCatalog {
           indexUuid, tableLocation);
     }
 
+    if (!registry.hasDroppedRecord()) {
+      // the registry was written before the drop record existed: a writer that never saw a drop
+      // looks exactly like a writer that was moved past the entry, and restoring the second would
+      // bring back an index someone removed. The registration is left missing and named here rather
+      // than restored on a guess.
+      throw new NotFoundException(
+          "Index %s of table %s is not named by the registry, which records no dropped indexes: a "
+              + "writer of an older build could have removed the entry without recording it, so it "
+              + "is not restored. Rebuild the index if it is needed, or drop the registration to "
+              + "repair the table",
+          indexUuid, tableLocation);
+    }
+
     String path = metadataRootPath(indexLocation(tableLocation, indexUuid), root);
     String json = readIfExists(path);
     if (json == null) {
@@ -707,17 +720,47 @@ public final class SidecarIndexCatalog implements IndexCatalog {
   private IndexMetadata readRegisteredEntry(String tableLocation, String indexUuid, String root) {
     String location = indexLocation(tableLocation, indexUuid);
     if (root == null) {
+      // the metadata a uuid-only registry points at is written as the document itself, without the
+      // registry wrapper the versioned entries carry
       String json = readMetadataFile(location);
-      return json == null ? null : IndexMetadataParser.fromJson(json);
+      return json == null
+          ? null
+          : parseRegisteredEntry(tableLocation, indexUuid, location, json, false);
     }
 
-    String json = readIfExists(metadataRootPath(location, root));
+    String path = metadataRootPath(location, root);
+    String json = readIfExists(path);
     if (json == null) {
       return null;
     }
 
-    return JsonUtil.parse(
-        json, node -> IndexMetadataParser.fromJson(JsonUtil.get(METADATA_DOCUMENT, node)));
+    return parseRegisteredEntry(tableLocation, indexUuid, path, json, true);
+  }
+
+  /**
+   * Parses the metadata a registry entry names.
+   *
+   * <p>A document that is not valid JSON is indistinguishable from one whose file is gone: nothing
+   * but a rewrite can read it, so the entry is treated as damaged and a drop can remove it. A valid
+   * document this build cannot read is different - the file is intact and only the reader is old -
+   * and is reported as that error instead of becoming a deletable entry.
+   */
+  private IndexMetadata parseRegisteredEntry(
+      String tableLocation, String indexUuid, String path, String json, boolean document) {
+    try {
+      return document
+          ? JsonUtil.parse(
+              json, node -> IndexMetadataParser.fromJson(JsonUtil.get(METADATA_DOCUMENT, node)))
+          : IndexMetadataParser.fromJson(json);
+    } catch (UncheckedIOException e) {
+      LOG.warn(
+          "Treating index {} of table {} as damaged: its metadata at {} is not valid JSON",
+          indexUuid,
+          tableLocation,
+          path,
+          e);
+      return null;
+    }
   }
 
   private boolean dropRegistered(String tableLocation, String indexUuid, boolean purge) {
@@ -818,8 +861,20 @@ public final class SidecarIndexCatalog implements IndexCatalog {
         return;
       }
 
-      current = JsonUtil.parse(json, SidecarIndexCatalog::previousFile);
+      // the file goes even when it cannot be parsed: a purge of a damaged entry is exactly the case
+      // where the document is unreadable, and leaving it behind would keep what the drop removed
       deleteIfExists(path);
+      try {
+        current = JsonUtil.parse(json, SidecarIndexCatalog::previousFile);
+      } catch (UncheckedIOException e) {
+        // a document that cannot be parsed cannot name the version before it: the chain ends here
+        LOG.warn(
+            "Stopped purging the metadata roots of {}: {} cannot be parsed",
+            indexLocation,
+            path,
+            e);
+        return;
+      }
     }
   }
 
@@ -1154,12 +1209,17 @@ public final class SidecarIndexCatalog implements IndexCatalog {
     private final Map<String, String> roots;
     private final Map<String, String> tableUuids;
     private final Set<String> dropped;
+    private final boolean hasDroppedRecord;
 
     private Registry(
-        Map<String, String> roots, Map<String, String> tableUuids, Set<String> dropped) {
+        Map<String, String> roots,
+        Map<String, String> tableUuids,
+        Set<String> dropped,
+        boolean hasDroppedRecord) {
       this.roots = roots;
       this.tableUuids = tableUuids;
       this.dropped = dropped;
+      this.hasDroppedRecord = hasDroppedRecord;
     }
 
     /** The tree each index is published under, by index uuid. */
@@ -1182,6 +1242,18 @@ public final class SidecarIndexCatalog implements IndexCatalog {
      */
     private Set<String> dropped() {
       return dropped;
+    }
+
+    /**
+     * Whether the document this registry was read from carries the record field at all.
+     *
+     * <p>An empty set and a document written before the field existed read the same through {@link
+     * #dropped}, but they mean opposite things when a registration is missing: one says nothing was
+     * dropped, the other says a writer of an older build could have dropped it without recording
+     * that. Only the first is safe to restore.
+     */
+    private boolean hasDroppedRecord() {
+      return hasDroppedRecord;
     }
   }
 
@@ -1207,7 +1279,10 @@ public final class SidecarIndexCatalog implements IndexCatalog {
               + "known; unset it to fall back to the file written in place",
           registryFile,
           REGISTRY_PROPERTY);
-      return new Registry(new LinkedHashMap<>(), new LinkedHashMap<>(), new LinkedHashSet<>());
+      // there is no registry document, so there is nothing whose record of drops could have been
+      // lost: a writer never removed an entry of a document that does not exist
+      return new Registry(
+          new LinkedHashMap<>(), new LinkedHashMap<>(), new LinkedHashSet<>(), true);
     }
 
     JsonNode registryNode = JsonUtil.parse(json, node -> node);
@@ -1247,7 +1322,10 @@ public final class SidecarIndexCatalog implements IndexCatalog {
       dropped.addAll(recordedDrops);
     }
 
-    return new Registry(entries, tableUuids, dropped);
+    // the field, not the set, tells a document written before the record existed from one that
+    // records no drops: an older writer could have removed an entry without recording it
+    boolean hasDroppedRecord = version == REGISTRY_VERSION && registryNode.has(REGISTRY_DROPPED);
+    return new Registry(entries, tableUuids, dropped, hasDroppedRecord);
   }
 
   /** Writes a new registry version and returns its file name, which is never reused. */

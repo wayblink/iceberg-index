@@ -21,6 +21,7 @@ package org.apache.iceberg.spark.procedures;
 import static org.apache.iceberg.spark.procedures.SparkProcedures.ProcedureBuilder;
 
 import org.apache.iceberg.index.IndexMetadata;
+import org.apache.iceberg.index.SidecarIndexCatalog;
 import org.apache.iceberg.index.spark.IndexSelection;
 import org.apache.spark.sql.catalyst.InternalRow;
 import org.apache.spark.sql.connector.catalog.TableCatalog;
@@ -107,14 +108,22 @@ class DropIndexProcedure extends BaseProcedure {
           try {
             metadata = IndexSelection.resolveAny(table, column, selection);
           } catch (IllegalArgumentException e) {
-            // a selection that names a UUID the registry holds but whose metadata is gone: the
-            // listing skips such an entry, so it cannot be resolved by column, and the drop removes
-            // it directly. A UUID the registry never held keeps the resolution error.
-            if (selection != null && IndexDrop.dropByUuid(table, selection, purge)) {
-              return new InternalRow[] {
-                newInternalRow(
-                    UTF8String.fromString(selection), UTF8String.fromString("unknown"), purge)
-              };
+            // a selection that names an entry the registry holds but whose metadata cannot be read:
+            // the listing skips such an entry, so it cannot be resolved by column, and the drop
+            // removes it directly. Only a damaged entry is answered this way: a UUID that names a
+            // live index of another column keeps the resolution error instead of being purged.
+            SidecarIndexCatalog catalog = VectorIndexProcedures.indexCatalog(table);
+            if (selection != null
+                && catalog.damagedIndexUuids(table.location()).contains(selection)) {
+              IndexDrop.Result damaged = IndexDrop.dropByUuid(table, selection, purge);
+              if (damaged.dropped()) {
+                return new InternalRow[] {
+                  newInternalRow(
+                      UTF8String.fromString(damaged.indexUuid()),
+                      UTF8String.fromString("unknown"),
+                      damaged.purged())
+                };
+              }
             }
 
             throw e;

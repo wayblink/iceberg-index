@@ -38,8 +38,8 @@ final class IndexDrop {
 
   private IndexDrop() {}
 
-  /** What a drop did: the index it removed and whether its files were deleted. */
-  record Result(String indexUuid, boolean purged) {}
+  /** What a drop did: the index it removed, whether it was registered, and whether files went. */
+  record Result(String indexUuid, boolean dropped, boolean purged) {}
 
   /**
    * Removes the index and reports what was done.
@@ -63,7 +63,7 @@ final class IndexDrop {
 
     // the column reports whether files were purged, which is what the caller asked for and what
     // the row is for; whether the index was still registered is an error when it was not
-    return new Result(metadata.indexUuid(), dropped && purge);
+    return new Result(metadata.indexUuid(), dropped, dropped && purge);
   }
 
   /**
@@ -75,8 +75,24 @@ final class IndexDrop {
    *
    * @return whether the registry named the entry, which is false for a UUID it never held
    */
-  static boolean dropByUuid(Table table, String indexUuid, boolean purge) {
+  static Result dropByUuid(Table table, String indexUuid, boolean purge) {
     SidecarIndexCatalog catalog = VectorIndexProcedures.indexCatalog(table);
-    return catalog.dropIndex(table.location(), indexUuid, purge);
+    boolean readable;
+    try {
+      catalog.loadIndex(table.location(), indexUuid);
+      readable = true;
+    } catch (RuntimeException e) {
+      // a damaged entry has no readable metadata: the drop removes the registration and the
+      // metadata tree it can still see, but it cannot know the data files the index wrote, so the
+      // purge it reports is only the part that happened
+      LOG.warn(
+          "Dropping index {} without its metadata: its files cannot be purged by the drop",
+          indexUuid,
+          e);
+      readable = false;
+    }
+
+    boolean dropped = catalog.dropIndex(table.location(), indexUuid, purge);
+    return new Result(indexUuid, dropped, dropped && purge && readable);
   }
 }
