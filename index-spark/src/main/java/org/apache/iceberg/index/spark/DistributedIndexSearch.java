@@ -818,8 +818,10 @@ public final class DistributedIndexSearch {
         IndexQuery widened =
             IndexQuery.of(query.sourceTableSnapshotId(), query.payload(), window)
                 .withConsistency(query.consistency());
+        // the caller asked for the stages, so the round reports them: without this the hit-only
+        // path leaves indexReadTimeNs/probeScoreTimeNs at zero and the split is invisible
         List<SearchOutcome> outcomes =
-            searchBatchWithOutcomes(spark, metadata, table, Lists.newArrayList(widened));
+            searchBatchOutcomes(spark, metadata, table, Lists.newArrayList(widened), stages);
         if (outcomes.isEmpty()) {
           break;
         }
@@ -1909,6 +1911,13 @@ public final class DistributedIndexSearch {
                       ExecutorIndexCache.Config cacheConfig = cacheRef.getValue();
                       List<Tuple2<Integer, Tuple3<String, Long, Double>>> batchHits =
                           Lists.newArrayList();
+                      // a task's own clock: the hits-only search reports what it spent per file,
+                      // not what the driver waited for
+                      long taskStart = System.nanoTime();
+                      long indexReadNanos = 0L;
+                      long probeScoreNanos = 0L;
+                      int cacheHits = 0;
+                      int cacheMisses = 0;
                       while (indexFiles.hasNext()) {
                         IndexFileTask indexFile = indexFiles.next();
                         String location = indexFile.location();
@@ -1924,6 +1933,14 @@ public final class DistributedIndexSearch {
                                 indexFile.fileLength(),
                                 indexUuid);
                         long readNanos = System.nanoTime() - readStart;
+                        if (stages != null) {
+                          indexReadNanos += readNanos;
+                          if (opened.servedFromCache()) {
+                            cacheHits++;
+                          } else {
+                            cacheMisses++;
+                          }
+                        }
 
                         long searchStart = System.nanoTime();
                         try (opened) {
@@ -1947,7 +1964,20 @@ public final class DistributedIndexSearch {
                               });
                         }
 
+                        if (stages != null) {
+                          probeScoreNanos += System.nanoTime() - searchStart;
+                        }
+
                         logReadTimes(location, opened, readNanos, System.nanoTime() - searchStart);
+                      }
+                      if (stages != null) {
+                        Stages tally = new Stages();
+                        tally.indexReadNanos = indexReadNanos;
+                        tally.probeScoreNanos = probeScoreNanos;
+                        tally.taskNanos = System.nanoTime() - taskStart;
+                        tally.cacheHits = cacheHits;
+                        tally.cacheMisses = cacheMisses;
+                        stages.report(tally);
                       }
                       reportCache(cacheReports, queryRun);
                       return batchHits.iterator();
@@ -1955,8 +1985,14 @@ public final class DistributedIndexSearch {
 
     // the per-query top-k is merged with a bounded accumulator, so the shuffle carries at most one
     // entry per (query, index file) instead of every hit
+    long mergeStart = System.nanoTime();
     Map<Integer, HitTopK> topByQuery =
         aggregateHits(fileHits, ranksLargerScoreFirst(adapter), localTopK);
+    if (stages != null) {
+      Stages mergeTally = new Stages();
+      mergeTally.mergeNanos = System.nanoTime() - mergeStart;
+      stages.report(mergeTally);
+    }
     mergeCacheReports(cacheReports, locationsTable, cacheKeys, cacheRef.getValue(), workingSet);
 
     for (int queryId = 0; queryId < queries.size(); queryId++) {

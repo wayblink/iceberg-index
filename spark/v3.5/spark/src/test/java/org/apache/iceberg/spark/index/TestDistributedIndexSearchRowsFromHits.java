@@ -131,6 +131,50 @@ class TestDistributedIndexSearchRowsFromHits {
     assertThat(collected.get(0).getLong(0)).isEqualTo(512L);
   }
 
+  /**
+   * The hit-only path is what a SQL rewrite uses when the table has many data files; it has to
+   * report the stages the other entries report, or the split its metrics promise stays zero.
+   */
+  @Test
+  void reportsTheStagesOfTheHitOnlySearch() {
+    spark.sql(
+        "CREATE TABLE local.db.stage_rows (id bigint, embedding array<double>) USING iceberg");
+    spark.sql(
+        "INSERT INTO local.db.stage_rows "
+            + "SELECT id, array(cast(id + 1 as double), cast(0 as double)) FROM range(64)");
+
+    Table table = loadTable("stage_rows");
+    long snapshotId = table.currentSnapshot().snapshotId();
+    IndexMetadata metadata = buildVectorIndex(table, snapshotId, "stage-vectors", 2);
+    DistributedIndexSearch.SearchStages stages =
+        DistributedIndexSearch.SearchStages.create(spark.sparkContext());
+
+    try (DistributedIndexSearch.SearchRows rows =
+        DistributedIndexSearch.searchRowsFromHits(
+            spark,
+            metadata,
+            table,
+            query(metadata, snapshotId, 1),
+            table.schema().select("id", "embedding"),
+            spark.table("local.db.stage_rows").schema(),
+            2,
+            1,
+            1,
+            scanTasks(table),
+            null,
+            null,
+            List.of("id"),
+            null,
+            stages)) {
+      assertThat(rows.rows().collect()).isNotEmpty();
+    }
+
+    assertThat(stages.value(DistributedIndexSearch.SearchStages.PROBE_SCORE_TIME))
+        .as("the hit-only path reports what its tasks spent instead of leaving zeros")
+        .isPositive();
+    assertThat(stages.value(DistributedIndexSearch.SearchStages.TASK_TIME)).isPositive();
+  }
+
   @Test
   void readsTheFetchedRowsOnTheExecutorsRatherThanCollectingThem() {
     // the projection of a hit is a whole row, wide columns included; a fetch-back that collects the

@@ -34,10 +34,15 @@ import org.apache.iceberg.index.vector.VectorIndexDefinition
 import org.apache.iceberg.spark.Spark3Util
 import org.apache.iceberg.spark.SparkSchemaUtil
 import org.apache.spark.sql.SparkSession
+import org.slf4j.Logger
+import org.slf4j.LoggerFactory
 import scala.collection.JavaConverters._
 import scala.collection.mutable
 private[spark] object BindVectorSearch {
+  private val logger: Logger = LoggerFactory.getLogger(getClass)
+
   def bind(spark: SparkSession, request: VectorSearchRequest): VectorBindingResult = {
+    val bindStart = System.nanoTime()
     val input = request.input
     val liveTable = if (input.table == null) {
       Spark3Util.loadIcebergTable(spark, input.tableName)
@@ -58,6 +63,8 @@ private[spark] object BindVectorSearch {
         s"Cannot read vector table snapshot ${input.tableSnapshotId}")
       return NoApplicableVectorIndex
     }
+    // what the table metadata read cost: the snapshot resolution is what forces it
+    val afterSnapshotNanos = System.nanoTime()
     val keys = Set(
       VectorQueryParameters.RefineFactorConf,
       VectorQueryParameters.IndexNameConf,
@@ -92,6 +99,7 @@ private[spark] object BindVectorSearch {
       }
       indexes.get(0)
     }
+    val afterIndexLookupNanos = System.nanoTime()
     // the two index views answer with what the index itself holds, so they read its latest snapshot:
     // a hit of a row that was deleted after the build is still one of the index's hits, and a caller
     // who reindexed the table does not have to read an older index to see what it now ranks. A
@@ -120,13 +128,16 @@ private[spark] object BindVectorSearch {
       definition.fieldId() == field.fieldId(),
       s"Vector index ${metadata.indexUuid()} does not match column ${input.column}")
     val scanTasks = IndexEntries.scanTasks(frozen, snapshot.snapshotId()).asScala.toVector.asJava
+    val afterDataPlanNanos = System.nanoTime()
     val dataFiles = scanTasks.asScala.map(_.file().location().toString).toSet
     val files = Vector.newBuilder[IndexFile]
     val covered = mutable.Set.empty[String]
     val uri = indexSnapshot.indexManifestList()
     // the manifests are read through the reader's cache: load_index has already parsed them, and a
     // repeated bind over the same index snapshot must not read them from storage again
-    new IndexReader(metadata, frozen).manifests(indexSnapshot).asScala.foreach { manifest =>
+    val manifests = new IndexReader(metadata, frozen).manifests(indexSnapshot)
+    val indexManifests = manifests.size()
+    manifests.asScala.foreach { manifest =>
       covered ++= manifest.indexedDataFiles().asScala
       manifest.indexFiles().asScala.foreach { file =>
         val searchable = file.kind() match {
@@ -140,6 +151,7 @@ private[spark] object BindVectorSearch {
         }
       }
     }
+    val afterManifestReadsNanos = System.nanoTime()
     val descriptors = files.result()
     val inputs = ResolvedExecutionInputs(
       frozen,
@@ -155,6 +167,19 @@ private[spark] object BindVectorSearch {
       dataFiles -- covered,
       entryUpperBound(descriptors.asJava),
       definition)
+    if (logger.isInfoEnabled) {
+      logger.info(
+        "vector search bind: total={}ms tableMeta={}ms indexLookup={}ms dataPlan={}ms " +
+          "indexManifests={}ms reads={indexRegistry:1,indexManifestList:1,indexManifests:{},"
+          + "dataPlanFiles:1}",
+        Array[Object](
+          JLong.valueOf((afterManifestReadsNanos - bindStart) / 1000000L),
+          JLong.valueOf((afterSnapshotNanos - bindStart) / 1000000L),
+          JLong.valueOf((afterIndexLookupNanos - afterSnapshotNanos) / 1000000L),
+          JLong.valueOf((afterDataPlanNanos - afterIndexLookupNanos) / 1000000L),
+          JLong.valueOf((afterManifestReadsNanos - afterDataPlanNanos) / 1000000L),
+          Integer.valueOf(indexManifests)): _*)
+    }
     BoundVectorSearch(VectorSearchContext(request, inputs, raw))
   }
 
