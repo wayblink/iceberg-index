@@ -19,6 +19,7 @@
 package org.apache.iceberg.spark.extensions;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 import java.io.IOException;
 import java.nio.file.Path;
@@ -248,6 +249,73 @@ class TestFetchBackPositions {
         .containsOnlyKeys(4L, 6L);
     assertThat(read.get(dataFile).get(4L).<String>getAs("body")).isEqualTo("row-4");
     assertThat(read.get(dataFile).get(6L).<String>getAs("body")).isEqualTo("row-6");
+  }
+
+  /**
+   * A lookup that asks for positions of a file and gets none of them answers with a failure, not
+   * with nothing.
+   *
+   * <p>Every row the lookup asked for can be gone (deleted after the index named it), and a
+   * fetch-back that only answers with the rows it found cannot tell "the file is not part of the
+   * answer" from "the file answered nothing": a caller that needs its rows has to be told the index
+   * is stale.
+   */
+  @Test
+  void aFetchBackThatFindsNoneOfTheRowsItWasAskedForFailsWhenTheCallerNeedsThem() throws Exception {
+    String tableName = "local.db.fetch_back_all_gone";
+    spark.sql("CREATE NAMESPACE IF NOT EXISTS local.db");
+    spark.sql(String.format("CREATE TABLE %s (id bigint, body string) USING iceberg", tableName));
+    spark
+        .range(0, 3)
+        .coalesce(1)
+        .selectExpr("id", "concat('row-', id) as body")
+        .writeTo(tableName)
+        .append();
+
+    Table table = Spark3Util.loadIcebergTable(spark, tableName);
+    // every row of the one file is removed by equality deletes, so the fetch-back finds nothing
+    org.apache.iceberg.RowDelta delta = table.newRowDelta();
+    for (long id = 0; id < 3; id++) {
+      delta.addDeletes(writeEqualityDelete(table, id));
+    }
+
+    delta.commit();
+    table.refresh();
+
+    List<FileScanTask> tasks = IndexEntries.scanTasks(table, table.currentSnapshot().snapshotId());
+    String dataFile = tasks.get(0).file().location();
+    Map<String, Collection<Long>> asked =
+        ImmutableMap.<String, Collection<Long>>of(dataFile, ImmutableList.of(0L, 1L, 2L));
+
+    // without the requirement the rows are gone and the answer is empty, which is the behaviour a
+    // caller that can tolerate a lost row uses
+    assertThat(
+            IndexEntries.rowsAtRdd(
+                    spark,
+                    table,
+                    asked,
+                    ImmutableList.of("body"),
+                    IndexEntries.sparkSchema(table, ImmutableList.of("body")),
+                    tasks,
+                    null)
+                .count())
+        .as("rows found for three positions whose rows are all gone")
+        .isZero();
+
+    // a caller whose answer is the rows has to see the failure
+    org.apache.spark.api.java.JavaPairRDD<String, scala.Tuple2<Long, Row>> rows =
+        IndexEntries.rowsAtRdd(
+            spark,
+            table,
+            asked,
+            ImmutableList.of("body"),
+            IndexEntries.sparkSchema(table, ImmutableList.of("body")),
+            tasks,
+            "The index refers to a row the snapshot does not have");
+    // a task failure reaches the caller wrapped, so the failure is matched by what it says
+    assertThatThrownBy(rows::count)
+        .hasStackTraceContaining("The index refers to a row the snapshot does not have")
+        .hasStackTraceContaining(dataFile);
   }
 
   /** An equality delete file for one row, written the way another engine writes it. */
