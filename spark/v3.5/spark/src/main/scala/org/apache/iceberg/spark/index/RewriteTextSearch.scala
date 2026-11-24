@@ -29,12 +29,12 @@ import org.apache.iceberg.index.text.TextIndexAdapter
 import org.apache.iceberg.index.text.TextIndexAdapter.CorpusStatistics
 import org.apache.iceberg.index.text.TextIndexDefinition
 import org.apache.spark.sql.AnalysisException
-import org.apache.spark.sql.Row
 import org.apache.spark.sql.SparkSession
 import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.analysis.IndexErrors
 import org.apache.spark.sql.catalyst.expressions.Alias
 import org.apache.spark.sql.catalyst.expressions.And
+import org.apache.spark.sql.catalyst.expressions.Literal.TrueLiteral
 import org.apache.spark.sql.catalyst.expressions.Attribute
 import org.apache.spark.sql.catalyst.expressions.AttributeReference
 import org.apache.spark.sql.catalyst.expressions.AttributeSet
@@ -45,7 +45,6 @@ import org.apache.spark.sql.catalyst.expressions.SortOrder
 import org.apache.spark.sql.catalyst.plans.logical.Filter
 import org.apache.spark.sql.catalyst.plans.logical.GlobalLimit
 import org.apache.spark.sql.catalyst.plans.logical.LocalLimit
-import org.apache.spark.sql.catalyst.plans.logical.LocalRelation
 import org.apache.spark.sql.catalyst.plans.logical.LogicalPlan
 import org.apache.spark.sql.catalyst.plans.logical.Project
 import org.apache.spark.sql.catalyst.plans.logical.Sort
@@ -96,9 +95,6 @@ case class RewriteTextSearch(spark: SparkSession) extends Rule[LogicalPlan] {
 
   private val logger: Logger = LoggerFactory.getLogger(getClass)
 
-  /** Above this many matching rows the filter form is left alone: materialising them would cost. */
-  private val MaxMatchRows = 100000
-
   /** The name the lowered source gives the score of a hit. */
   private val ScoreColumn = TextSearchSource.ScoreColumn
 
@@ -117,12 +113,17 @@ case class RewriteTextSearch(spark: SparkSession) extends Rule[LogicalPlan] {
           case None => node
         }
 
-      // the filter form: a predicate over the scan
-      case filter @ Filter(matchExpression: TextMatchExpression, _) if !alreadyLowered(filter) =>
-        rewriteFilter(filter, matchExpression) match {
-          case Some((replacement, bound, statistics)) =>
-            boundSearches.append((replacement, bound, statistics))
-            replacement
+      // the filter form: the match is answered by the source, the rest of the condition stays a
+      // filter over the rows it returns
+      case filter @ Filter(condition, _) if !alreadyLowered(filter) =>
+        textMatchIn(condition) match {
+          case Some(matchExpression) =>
+            rewriteFilter(filter, matchExpression) match {
+              case Some((replacement, bound, statistics)) =>
+                boundSearches.append((replacement, bound, statistics))
+                replacement
+              case None => filter
+            }
           case None => filter
         }
     }
@@ -481,12 +482,12 @@ case class RewriteTextSearch(spark: SparkSession) extends Rule[LogicalPlan] {
   }
 
   /**
-   * Rewrites a filter node, or says it cannot, with the index and the statistics it was bound to.
+   * Lowers a filter over a text match to the index source, or says it cannot.
    *
-   * <p>This form is answered while planning, by reading the index and materialising the rows in
-   * place of the scan. The index source answers a top-k and this form asks for every match, so
-   * lowering it needs the source to answer an unbounded search; until it does, this is the shape the
-   * rewrite keeps.
+   * <p>The match is the search itself: the source answers every row whose score is positive, which
+   * is what the predicate tests, and the rest of the condition stays a filter over those rows. The
+   * rows are read where they were found instead of being collected to the driver and materialised,
+   * which is what this form used to do.
    */
   private def rewriteFilter(
       filter: Filter,
@@ -511,8 +512,8 @@ case class RewriteTextSearch(spark: SparkSession) extends Rule[LogicalPlan] {
       bind(table, sparkTable, scan, matchExpression.score, column, query)
         .getOrElse(return None)
     val snapshotId = bound.snapshotId
-    // a score of a row this form returns is computed here, so the statistics have to be readable
-    // before anything is materialised
+    // a score computed above this filter is still bound while planning, so its statistics have to
+    // be readable before the plan is lowered
     val statistics = statisticsOf(bound, column).getOrElse(return None)
 
     val dataFiles = IndexEntries.dataFiles(table, snapshotId).asScala.toSet
@@ -529,50 +530,85 @@ case class RewriteTextSearch(spark: SparkSession) extends Rule[LogicalPlan] {
       return None
     }
 
-    // a filter asks for every matching row, and a score of zero is not a match
-    val hits =
-      search(bound, snapshotId, query, Int.MaxValue).filter(hit => hit.score() > 0.0)
-    if (hits.isEmpty) {
+    val remaining = removeMatch(filter.condition, matchExpression).getOrElse(return None)
+
+    val scoreAttribute = AttributeReference(ScoreColumn, DoubleType, nullable = false)()
+    val source =
+      TextSearchSource(
+        table,
+        bound.metadata,
+        snapshotId,
+        query,
+        TextSearchSource.AllRows,
+        None,
+        scan.output :+ scoreAttribute)
+
+    // the scan goes by identity, and the filter is rebuilt after: a node is rebuilt with its new
+    // children before a rule sees it, so a filter replaced in the same pass would hand back the scan
+    val withSource = filter.transformDown {
+      case relation: DataSourceV2Relation if relation eq scan => source
+      case other => other
+    }
+
+    val lowered = withSource.transformDown {
+      case current: Filter if current.condition eq filter.condition =>
+        remaining match {
+          case TrueLiteral => current.child
+          case other => current.copy(condition = other)
+        }
+      case other => other
+    }
+
+    // a match left in the plan would be an expression the lowering cannot bind a score for
+    if (lowered.exists(_.expressions.exists(_.exists(_.isInstanceOf[TextMatchExpression])))) {
       return None
     }
 
-    if (hits.size > MaxMatchRows) {
-      logger.warn(
-        "Text search of column {} of table {} matches {} rows, which is more than the {} a rewrite"
-          + " reads back, scanning",
-        Array(
-          column,
-          table.name(),
-          hits.size: java.lang.Integer,
-          MaxMatchRows: java.lang.Integer): _*)
-      return None
-    }
-
-    val tableSchema = IndexRewriteSupport.tableSchema(sparkTable)
-    val rows = hitsRows(sparkTable, snapshotId, hits, names, tableSchema).getOrElse(return None)
-    if (rows.isEmpty) {
-      return None
-    }
-
-    Some((rowsInPlaceOfScan(filter, scan, rows), bound, statistics))
+    // the source carries the score as an attribute; a caller that asked for the table's columns
+    // keeps getting exactly those
+    Some((Project(filter.output, lowered), bound, statistics))
   }
 
   /**
-   * Replaces the scan with the rows the index returned, keeping what the plan put above it.
+   * The match an AND-shaped condition carries, which the filter form can answer from the index.
    *
-   * <p>The rows are turned into the internal rows a local relation holds by the same conversion
-   * Spark applies to a local collection, not by reading them back through a dataset: going through
-   * one cost a job to convert a handful of rows, and the rows only ever fill a relation that the
-   * plan above reads. They are given the scan's own attributes, so every column the plan above
-   * named still resolves, and the score it recomputes is read from the columns it asked for.
+   * <p>A match under an OR, a NOT or any other expression is not this form's question: the search
+   * selects the rows that match, and that selection has to be combined with the other branch rather
+   * than replaced by it.
    */
-  private def rowsInPlaceOfScan(
-      node: LogicalPlan,
-      scan: DataSourceV2Relation,
-      rows: Seq[Row]): LogicalPlan = {
-    val relation = LocalRelation.fromExternalRows(scan.output, rows)
-    // the scan goes by identity, so the node replaced is the one this search read and no other
-    node.transformDown { case current if current eq scan => relation }
+  private def textMatchIn(condition: Expression): Option[TextMatchExpression] = condition match {
+    case matchExpression: TextMatchExpression => Some(matchExpression)
+    case And(left, right) => textMatchIn(left).orElse(textMatchIn(right))
+    case _ => None
+  }
+
+  /**
+   * The condition without the match, or nothing when the match is not in a place the search can
+   * answer.
+   *
+   * <p>A condition that carries two matches is not lowered either: the source answers one query.
+   */
+  private def removeMatch(
+      condition: Expression,
+      matchExpression: TextMatchExpression): Option[Expression] = {
+    if (condition eq matchExpression) {
+      Some(TrueLiteral)
+    } else if (!condition.exists(_ eq matchExpression)) {
+      // this branch asks nothing of the search: it stays a filter over the rows the search returns
+      Some(condition)
+    } else {
+      condition match {
+        case And(left, right) =>
+          (removeMatch(left, matchExpression), removeMatch(right, matchExpression)) match {
+            case (Some(TrueLiteral), Some(remaining)) => Some(remaining)
+            case (Some(remaining), Some(TrueLiteral)) => Some(remaining)
+            case (Some(leftRemaining), Some(rightRemaining)) =>
+              Some(And(leftRemaining, rightRemaining))
+            case _ => None
+          }
+        case _ => None
+      }
+    }
   }
 
   /**
@@ -722,38 +758,6 @@ case class RewriteTextSearch(spark: SparkSession) extends Rule[LogicalPlan] {
           "Cannot read the statistics of the text index of column {} because of {}",
           Array[Object](column, String.valueOf(e.getMessage)): _*)
         None
-    }
-  }
-
-  /** Searches the index for the query of a score expression, which has to be a constant. */
-  private def search(
-      bound: BoundIndex,
-      snapshotId: Long,
-      query: String,
-      limit: Int): List[IndexSearchResult] = {
-    val payload = new TextIndexAdapter(bound.definition).encodeQuery(query)
-    bound.reader
-      .search(IndexQuery.of(snapshotId, payload, limit))
-      .asScala
-      .toList
-  }
-
-  /** The live rows of the given hits, or nothing when they cannot be read back. */
-  private def hitsRows(
-      sparkTable: org.apache.iceberg.spark.source.SparkTable,
-      snapshotId: Long,
-      hits: List[IndexSearchResult],
-      names: Seq[String],
-      tableSchema: org.apache.spark.sql.types.StructType): Option[List[Row]] = {
-    val rowsByFile =
-      IndexRewriteSupport.rowsAt(spark, sparkTable, snapshotId, hits, names, tableSchema)
-    val rows = hits.flatMap(hit =>
-      Option(rowsByFile.get(hit.dataFile())).flatMap(byPosition =>
-        Option(byPosition.get(hit.rowPosition()))))
-    if (rows.isEmpty) {
-      None
-    } else {
-      Some(rows)
     }
   }
 

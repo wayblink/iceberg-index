@@ -300,14 +300,40 @@ class TestRewriteTextSearch {
   public void rewritesAFilteredTextSearchIntoAnIndexLookup() {
     String table = tableWithIndex("docs_matched");
 
-    // the filter form asks for every match rather than the best k, so it is still answered while
-    // planning and materialised in place of the scan
+    // the filter form asks for every match, which the source answers from the index: the plan is
+    // lowered rather than materialised while the query is planned
     assertThat(planOf(table, filtering(table)))
-        .contains("LocalRelation")
-        .doesNotContain("TextSearchSource");
+        .contains("TextSearchSource")
+        .doesNotContain("LocalRelation");
 
     // every row the function returns as a match is in the result, and nothing else
     assertThat(filteringRows(table)).containsExactlyInAnyOrderElementsOf(functionRows(table, 100));
+  }
+
+  @Test
+  void plansAFilteredSearchWithoutSearching() {
+    String table = tableWithIndex("docs_matched_planned");
+
+    assertThat(jobsDuring(() -> planOf(table, filtering(table))))
+        .as("jobs started while planning a filtered text search")
+        .isZero();
+  }
+
+  @Test
+  void keepsTheOtherPredicatesOfAFilteredSearch() {
+    String table =
+        indexedTextTable(
+            "docs_matched_and",
+            "(1, 'the quick brown fox'), (2, 'the fox runs'), (3, 'a quiet sun')");
+    String query =
+        String.format("SELECT id FROM local.%s WHERE match(body, 'the fox') AND id > 1", table);
+
+    // the match is answered by the search and the rest of the condition is still applied: both rows
+    // that match are read, and the filter decides which of them the answer keeps
+    assertThat(spark.sql(query).queryExecution().optimizedPlan().toString())
+        .contains("TextSearchSource")
+        .doesNotContain("LocalRelation");
+    assertThat(idsOf(spark.sql(query).collectAsList())).containsExactly(2L);
   }
 
   @Test

@@ -115,14 +115,40 @@ private[spark] case class TextSearchSource(
       s"prefilter=${filter.isDefined}",
       s"reads=${readColumns.mkString("[", ", ", "]")}")
 
-  override def computeStats(): Statistics =
-    Statistics(BigInt(limit) * math.max(1, output.map(_.dataType.defaultSize).sum))
+  override def computeStats(): Statistics = {
+    // an all-rows source is unbounded; a million rows is a stand-in that keeps the planner from
+    // treating it as an empty or a one-row relation, which it would do with a negative limit
+    val rows = if (limit == TextSearchSource.AllRows) 1L << 20 else limit.toLong
+    Statistics(BigInt(rows) * math.max(1, output.map(_.dataType.defaultSize).sum))
+  }
 }
 
 private[spark] object TextSearchSource {
 
   /** The column a search answers with the score of a hit, which no data file carries. */
   val ScoreColumn = "_score"
+
+  /**
+   * The limit that asks a source for every matching row rather than the best k.
+   *
+   * <p>The filter form of a text search answers "which rows match" instead of "the best rows", so
+   * it cannot be expressed as a top-k. The operator turns this into the number of entries the index
+   * holds, which is the widest window a search can need: an answer cannot have more rows than the
+   * index has entries, and asking for them all in one round keeps the lowered plan a single
+   * operator rather than a page loop.
+   */
+  val AllRows: Int = -1
+
+  /** The limit a query built from this source should ask the search for. */
+  def limitFor(source: TextSearchSource, entries: Long): Int = {
+    if (source.limit != AllRows) {
+      return source.limit
+    }
+
+    // the search keeps one more hit than the limit to say whether another round is needed, and it
+    // works in ints while the entry count is a long
+    Math.max(1, Math.min(entries + 1L, Int.MaxValue.toLong - 1L).toInt)
+  }
 }
 
 /** Runs distributed scoring and reads only the rows that won the global merge. */
@@ -138,7 +164,19 @@ private[spark] case class TextSearchExec(
     val indexUuid = metadata.indexUuid()
     val snapshotId = source.snapshotId
     val adapter = new TextIndexAdapter(metadata.definition().asInstanceOf[TextIndexDefinition])
-    val query = IndexQuery.of(snapshotId, adapter.encodeQuery(source.query), source.limit)
+    val entries =
+      if (source.limit == TextSearchSource.AllRows) {
+        val counts =
+          org.apache.iceberg.index.spark.VectorIndexes.counts(table.io(), metadata.latestSnapshot())
+        if (counts == null) 0L else counts(1)
+      } else {
+        0L
+      }
+    val query =
+      IndexQuery.of(
+        snapshotId,
+        adapter.encodeQuery(source.query),
+        TextSearchSource.limitFor(source, entries))
     val tasks = source.filter match {
       case Some(filter) => IndexEntries.scanTasks(table, snapshotId, filter.statsColumns.asJava)
       case None => IndexEntries.scanTasks(table, snapshotId)
