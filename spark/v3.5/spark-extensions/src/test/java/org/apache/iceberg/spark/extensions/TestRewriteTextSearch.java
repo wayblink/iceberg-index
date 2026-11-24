@@ -94,6 +94,26 @@ class TestRewriteTextSearch {
   }
 
   @Test
+  public void leavesAnOuterOrderByOverANestedSearchToSpark() {
+    // the outer order decides which two rows the query asks for; the inner score order only orders
+    // the subquery. Lowering the nested score order to the index's limit would answer with the two
+    // highest-scoring rows instead of the two smallest ids, and nothing would fail
+    String table =
+        indexedTextTable(
+            "docs_nested_order",
+            "(1, 'quiet sun'), (2, 'quiet moon'), (3, 'fox fox fox'), (4, 'fox fox')");
+
+    String query =
+        String.format(
+            "SELECT id FROM (SELECT id, body FROM local.%s ORDER BY text_score(body, 'fox') DESC) x "
+                + "ORDER BY id ASC LIMIT 2",
+            table);
+
+    assertThat(planOf(table, query)).doesNotContain("TextSearchSource");
+    assertThat(idsOf(spark.sql(query).collectAsList())).containsExactly(1L, 2L);
+  }
+
+  @Test
   void plansARankedSearchWithoutSearching() {
     String table = tableWithIndex("docs_planned_only");
 

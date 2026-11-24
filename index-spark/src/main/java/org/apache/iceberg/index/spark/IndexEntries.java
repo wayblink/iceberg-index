@@ -670,8 +670,34 @@ public final class IndexEntries {
       List<String> columns,
       StructType readSchema,
       List<FileScanTask> scanTasks) {
+    return rowsAtRdd(spark, table, positionsByFile, columns, readSchema, scanTasks, null);
+  }
+
+  /**
+   * The same fetch-back, failing when a file it asked for rows of answers none of them.
+   *
+   * <p>This is what a caller whose answer is the live rows of its hits needs: a file whose every
+   * asked position is gone cannot be told from a file the lookup did not read, so the answer would
+   * be quietly short instead of the stale index being reported.
+   *
+   * @param missingRowsError the failure to report, or null to answer with the rows that were found
+   */
+  public static JavaPairRDD<String, Tuple2<Long, Row>> rowsAtRdd(
+      SparkSession spark,
+      Table table,
+      Map<String, ? extends Collection<Long>> positionsByFile,
+      List<String> columns,
+      StructType readSchema,
+      List<FileScanTask> scanTasks,
+      String missingRowsError) {
     return liveRowsRdd(
-        spark, table, positionsByFile, columns, readSchema, tasksAt(positionsByFile, scanTasks));
+        spark,
+        table,
+        positionsByFile,
+        columns,
+        readSchema,
+        tasksAt(positionsByFile, scanTasks),
+        missingRowsError);
   }
 
   /**
@@ -754,6 +780,28 @@ public final class IndexEntries {
       List<String> columns,
       StructType readSchema,
       List<FileScanTask> tasks) {
+    return liveRowsRdd(spark, table, positionsByFile, columns, readSchema, tasks, null);
+  }
+
+  /**
+   * The same fetch-back, failing when a file it asked for rows of answers none of them.
+   *
+   * <p>A lookup asks for the positions a hit named, and every one of them can be gone since the
+   * index named it. The rows alone cannot tell a file that answered nothing from a file the lookup
+   * did not read, and a caller whose answer is the rows of its hits has to be told: the index
+   * refers to rows the snapshot does not have, which only a rebuild or a refresh repairs.
+   *
+   * @param missingRowsError the failure to report when a file answers none of its asked positions,
+   *     or null to answer with the rows that were found
+   */
+  static JavaPairRDD<String, Tuple2<Long, Row>> liveRowsRdd(
+      SparkSession spark,
+      Table table,
+      Map<String, ? extends Collection<Long>> positionsByFile,
+      List<String> columns,
+      StructType readSchema,
+      List<FileScanTask> tasks,
+      String missingRowsError) {
     if (tasks.isEmpty()) {
       return null;
     }
@@ -763,7 +811,8 @@ public final class IndexEntries {
     // the configuration, the delete files and the storage settings belong to the fetch-back
     // rather than to a file: broadcasting them once keeps a task binary from carrying its own copy
     // of them, which across thousands of tasks is megabytes
-    Broadcast<FetchPlan> plan = jsc.broadcast(fetchPlan(spark, table, tasks, columns, readSchema));
+    Broadcast<FetchPlan> plan =
+        jsc.broadcast(fetchPlan(spark, table, tasks, columns, readSchema, missingRowsError));
 
     // a caller may hand over a collection view, such as a map's key set, which Spark cannot ship to
     // an executor; copying it here keeps that from surfacing as a task serialization failure
@@ -816,6 +865,7 @@ public final class IndexEntries {
     private final List<String> readColumns;
     private final List<String> columns;
     private final StructType rowSchema;
+    private final String missingRowsError;
     private final SerializableConfiguration conf;
     private final SnapshotDeletes deletes;
     private final Map<String, String> storageProperties;
@@ -825,6 +875,7 @@ public final class IndexEntries {
         List<String> readColumns,
         List<String> columns,
         StructType rowSchema,
+        String missingRowsError,
         SerializableConfiguration conf,
         SnapshotDeletes deletes,
         Map<String, String> storageProperties) {
@@ -832,6 +883,7 @@ public final class IndexEntries {
       this.readColumns = readColumns;
       this.columns = columns;
       this.rowSchema = rowSchema;
+      this.missingRowsError = missingRowsError;
       this.conf = conf;
       this.deletes = deletes;
       this.storageProperties = storageProperties;
@@ -844,7 +896,8 @@ public final class IndexEntries {
       Table table,
       List<FileScanTask> tasks,
       List<String> columns,
-      StructType readSchema) {
+      StructType readSchema,
+      String missingRowsError) {
     // one serializable configuration for the whole fetch-back: building it copies the session's
     // Hadoop configuration, which is not something to do once per data file
     SerializableConfiguration conf =
@@ -876,6 +929,7 @@ public final class IndexEntries {
         read,
         columns,
         rowSchema,
+        missingRowsError,
         conf,
         deletes,
         StorageProperties.resolve(table.io(), table.properties(), conf.get()));
@@ -941,14 +995,77 @@ public final class IndexEntries {
             }
           };
 
-      return CloseableIterator.transform(
-          live,
-          entry ->
-              new Tuple2<>(
-                  entry._2(),
-                  new GenericRowWithSchema(
-                      asValues(entry._1(), plan.readColumns, plan.columns),
-                      schemaFor(plan.columns, entry._1().schema()))));
+      CloseableIterator<Tuple2<Long, Row>> rows =
+          CloseableIterator.transform(
+              live,
+              entry ->
+                  new Tuple2<>(
+                      entry._2(),
+                      new GenericRowWithSchema(
+                          asValues(entry._1(), plan.readColumns, plan.columns),
+                          schemaFor(plan.columns, entry._1().schema()))));
+
+      if (plan.missingRowsError == null || positions == null || positions.isEmpty()) {
+        return rows;
+      }
+
+      // every position this file was asked for can be gone since the index named it, and a file
+      // that answered none of them is indistinguishable from a file the lookup never read: a
+      // caller whose answer is the rows is told instead of being handed a short answer
+      return new RowsRequired(rows, plan.missingRowsError, dataFile, positions.get(0));
+    }
+  }
+
+  /**
+   * Fails at the end of a read that answered none of the positions its file was asked for.
+   *
+   * <p>The check has to run when the read ends rather than when it starts: a row is only shown to
+   * be absent once the reader has said it has no more rows to give.
+   */
+  private static final class RowsRequired implements CloseableIterator<Tuple2<Long, Row>> {
+    private final CloseableIterator<Tuple2<Long, Row>> rows;
+    private final String message;
+    private final String dataFile;
+    private final long position;
+    private boolean answered;
+    private IllegalStateException failure;
+
+    private RowsRequired(
+        CloseableIterator<Tuple2<Long, Row>> rows, String message, String dataFile, long position) {
+      this.rows = rows;
+      this.message = message;
+      this.dataFile = dataFile;
+      this.position = position;
+    }
+
+    @Override
+    public boolean hasNext() {
+      if (failure != null) {
+        throw failure;
+      }
+
+      boolean next = rows.hasNext();
+      if (!next && !answered) {
+        // kept rather than thrown from here: an iterator whose hasNext is asked again after it has
+        // failed must fail the same way, or a caller that ignores the first answer reads an empty
+        // result
+        failure =
+            new IllegalStateException(message + " (" + dataFile + ", position " + position + ")");
+        throw failure;
+      }
+
+      return next;
+    }
+
+    @Override
+    public Tuple2<Long, Row> next() {
+      answered = true;
+      return rows.next();
+    }
+
+    @Override
+    public void close() throws java.io.IOException {
+      rows.close();
     }
   }
 

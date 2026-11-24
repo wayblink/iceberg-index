@@ -83,7 +83,7 @@ final class IndexProcedures {
       String column,
       String indexUuid,
       IndexBuildStatus report,
-      Exception failure) {
+      Throwable failure) {
     IndexBuildStatus failed =
         report == null
             ? IndexBuildStatus.builder()

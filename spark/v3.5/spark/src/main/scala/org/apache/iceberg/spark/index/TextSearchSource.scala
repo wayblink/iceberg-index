@@ -167,8 +167,20 @@ private[spark] case class TextSearchExec(
         file -> matches.map(hit => java.lang.Long.valueOf(hit.rowPosition())).asJavaCollection
       }
       .asJava
+    // a file whose every asked position is gone cannot be told from a file the lookup never read,
+    // so the fetch-back is told what to say instead of answering with fewer rows
+    val missingRowsError =
+      s"Text index $indexUuid referred to a row absent from snapshot $snapshotId; " +
+        "run refresh_text_index"
     val fetched =
-      IndexEntries.rowsAtRdd(spark, table, wanted, columns.asJava, readSchema, tasks)
+      IndexEntries.rowsAtRdd(
+        spark,
+        table,
+        wanted,
+        columns.asJava,
+        readSchema,
+        tasks,
+        missingRowsError)
     if (fetched == null) {
       return spark.sparkContext.emptyRDD[InternalRow]
     }

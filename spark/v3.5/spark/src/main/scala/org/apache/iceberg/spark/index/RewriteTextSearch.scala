@@ -284,16 +284,25 @@ case class RewriteTextSearch(spark: SparkSession) extends Rule[LogicalPlan] {
    */
   private def rankedScan(limit: LogicalPlan): Option[DataSourceV2Relation] = {
     @scala.annotation.tailrec
-    def downThrough(node: LogicalPlan): Option[DataSourceV2Relation] = node match {
-      case relation: DataSourceV2Relation => Some(relation)
-      case sort: Sort => downThrough(sort.child)
-      case project: Project => downThrough(project.child)
-      case local: LocalLimit => downThrough(local.child)
-      case alias: SubqueryAlias => downThrough(alias.child)
-      case _ => None
-    }
+    def downThrough(node: LogicalPlan, sorts: Int): (Option[DataSourceV2Relation], Int) =
+      node match {
+        case relation: DataSourceV2Relation => (Some(relation), sorts)
+        case sort: Sort => downThrough(sort.child, sorts + 1)
+        case project: Project => downThrough(project.child, sorts)
+        case local: LocalLimit => downThrough(local.child, sorts)
+        case alias: SubqueryAlias => downThrough(alias.child, sorts)
+        case _ => (None, sorts)
+      }
 
-    downThrough(limit.children.head)
+    downThrough(limit.children.head, 0) match {
+      case (Some(scan), 1) => Some(scan)
+      case _ =>
+        // no sort of the limit means there is no ranking to answer, and more than one means one of
+        // them orders a subquery rather than the limit: the outermost is the one the limit takes its
+        // rows by, and lowering a nested one would answer with a different set of rows. The vector
+        // rewrite refuses a chain with more than one sort for the same reason.
+        None
+    }
   }
 
   /**
