@@ -167,23 +167,45 @@ class BuildTextIndexProcedure extends BaseProcedure {
             updated =
                 SparkIndexBuilder.build(
                     spark(), table, created, sourceSnapshotId, column, System.currentTimeMillis());
-          } catch (Exception e) {
+            // publishing is part of the attempt: a registration no publish ever pointed at is the
+            // same "index that exists with no snapshot" the rollback removes
+            VectorIndexProcedures.publishSnapshot(
+                catalog, table, indexUuid, updated.latestSnapshot());
+          } catch (Throwable failure) {
             // a build that fails must not leave a registration behind: an index with no snapshot
             // looks like an index that exists, and the column then refuses a retry that does not
             // name it, so the registration and whatever it wrote are removed before the failure is
-            // reported. The failure is caught as an Exception because a Spark job reports its
-            // failure as a SparkException, which a RuntimeException catch does not see.
-            IndexBuildStatus report =
-                IndexBuildStatus.read(
-                    table.io(), IndexBuildStatus.statusDirFor(created.location()));
-            catalog.dropIndex(table.location(), indexUuid, true);
-            IndexProcedures.keepFailedAttempt(table, fieldId, column, indexUuid, report, e);
-            throw e instanceof RuntimeException ? (RuntimeException) e : new RuntimeException(e);
+            // reported. Throwable rather than Exception because a driver failure such as an OOM
+            // ends the attempt just as surely, and the rollback is the only thing that cleans up.
+            IndexBuildStatus report = null;
+            try {
+              report =
+                  IndexBuildStatus.read(
+                      table.io(), IndexBuildStatus.statusDirFor(created.location()));
+            } catch (RuntimeException unreadable) {
+              // the report is an observation: it must not replace the failure that ended the build
+              failure.addSuppressed(unreadable);
+            }
+
+            try {
+              catalog.dropIndex(table.location(), indexUuid, true);
+            } catch (RuntimeException rollbackFailure) {
+              // the caller has to see the failure that ended the build; a rollback that failed is
+              // attached to it rather than thrown in its place
+              failure.addSuppressed(rollbackFailure);
+            }
+
+            IndexProcedures.keepFailedAttempt(table, fieldId, column, indexUuid, report, failure);
+            if (failure instanceof RuntimeException) {
+              throw (RuntimeException) failure;
+            } else if (failure instanceof Error) {
+              throw (Error) failure;
+            } else {
+              throw new RuntimeException(failure);
+            }
           }
 
           IndexProcedures.forgetFailedAttempt(table, fieldId);
-          VectorIndexProcedures.publishSnapshot(
-              catalog, table, indexUuid, updated.latestSnapshot());
 
           IndexSnapshot snapshot = updated.latestSnapshot();
           long[] counts = VectorIndexProcedures.counts(table.io(), snapshot);
