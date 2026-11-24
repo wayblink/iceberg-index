@@ -21,6 +21,9 @@ package org.apache.iceberg.lance;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableMap;
 import org.apache.iceberg.relocated.com.google.common.collect.Lists;
 import org.apache.iceberg.relocated.com.google.common.collect.Maps;
@@ -42,6 +45,19 @@ final class LanceStorageOptions {
   private static final Logger LOG = LoggerFactory.getLogger(LanceStorageOptions.class);
 
   private static final String LANCE_PREFIX = "lance.storage.";
+
+  /** The region the AWS clients sign for when nothing else names one. */
+  private static final String DEFAULT_REGION = "us-east-1";
+
+  /**
+   * The region an endpoint names when the endpoint is one of AWS's own: a host such as {@code
+   * s3.eu-west-1.amazonaws.com}, {@code s3-eu-west-1.amazonaws.com}, or the VPC endpoint form, all
+   * of which carry the region.
+   */
+  private static final Pattern REGION_IN_ENDPOINT =
+      Pattern.compile("(?:^|[./])s3[.-]([a-z]{2}(?:-[a-z]+)*-[0-9]+)\\.[a-z0-9.-]*amazonaws");
+
+  private static final AtomicBoolean DEFAULT_REGION_WARNED = new AtomicBoolean(false);
 
   /** Iceberg's {@code s3.*} catalog properties, in the names Lance understands. */
   private static final Map<String, String> S3_KEYS =
@@ -88,6 +104,7 @@ final class LanceStorageOptions {
   static Map<String, String> from(Map<String, String> properties) {
     Map<String, String> options = Maps.newHashMap();
     List<String> unmapped = Lists.newArrayList();
+    boolean s3 = false;
 
     // Two passes, not one: the explicit escape hatch is applied after every translation, so a
     // setting spelled both ways resolves to the explicit one whatever order the map iterates in.
@@ -106,6 +123,7 @@ final class LanceStorageOptions {
       }
 
       if (bareKey != null) {
+        s3 = true;
         // the first entry in reverse order comes from the most specific source that spells it
         options.putIfAbsent(bareKey, value);
       } else if (PATH_STYLE_KEYS.contains(key)) {
@@ -138,6 +156,10 @@ final class LanceStorageOptions {
       }
     }
 
+    if (s3) {
+      addRegion(options);
+    }
+
     if (!unmapped.isEmpty()) {
       // the Hadoop configuration brings dozens of fs.s3a.* tuning keys of its own, all expected
       // here; a warning per file open would drown the log
@@ -145,6 +167,63 @@ final class LanceStorageOptions {
     }
 
     return options;
+  }
+
+  /**
+   * Fills in the region the S3 reader has to be told, when the properties do not name one.
+   *
+   * <p>Lance asks the AWS instance metadata service for the region it was not given. That service
+   * is not there outside EC2, and asking costs the client's one-second connect timeout on every
+   * open: a fetch-back that resolves hundreds of data files pays it once per file, which is most of
+   * the time such a lookup takes. The region the endpoint names is used where it names one, the
+   * region the process names where it names one, and the one the AWS clients fall back to
+   * otherwise.
+   *
+   * <p>Only a reader that was handed credentials and an endpoint is filled in: such a reader needs
+   * no metadata service, while one that was handed neither may be on an instance that keeps the
+   * region and the credentials there, and overriding that would sign for the wrong region.
+   */
+  private static void addRegion(Map<String, String> options) {
+    if (options.containsKey("region")
+        || !options.containsKey("endpoint")
+        || !options.containsKey("access_key_id")
+        || !options.containsKey("secret_access_key")) {
+      return;
+    }
+
+    String region = regionOfEndpoint(options.get("endpoint"));
+    if (region == null) {
+      region = environment("AWS_REGION");
+    }
+    if (region == null) {
+      region = environment("AWS_DEFAULT_REGION");
+    }
+    if (region == null) {
+      region = DEFAULT_REGION;
+      // once per lifetime rather than once per lookup: the settings are the same for every read
+      if (DEFAULT_REGION_WARNED.compareAndSet(false, true)) {
+        LOG.warn(
+            "No region was configured for the S3 endpoint {}, so reads sign for {}. Lance otherwise "
+                + "asks the instance metadata service for a region, and that lookup costs each data "
+                + "file open its one-second connect timeout. Set s3.region (or "
+                + "fs.s3a.endpoint.region) if the store expects another region.",
+            options.get("endpoint"),
+            DEFAULT_REGION);
+      }
+    }
+
+    options.put("region", region);
+  }
+
+  /** The AWS region an endpoint host names, or null when the host names none. */
+  private static String regionOfEndpoint(String endpoint) {
+    Matcher matcher = REGION_IN_ENDPOINT.matcher(endpoint);
+    return matcher.find() ? matcher.group(1) : null;
+  }
+
+  private static String environment(String name) {
+    String value = System.getenv(name);
+    return value == null || value.trim().isEmpty() ? null : value.trim();
   }
 
   private static boolean looksLikeStorageConfig(String key) {

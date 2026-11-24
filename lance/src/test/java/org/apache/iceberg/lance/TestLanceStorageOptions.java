@@ -19,6 +19,7 @@
 package org.apache.iceberg.lance;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
 import java.util.List;
 import java.util.Map;
@@ -107,6 +108,87 @@ class TestLanceStorageOptions {
 
     assertThat(LanceStorageOptions.from(ImmutableMap.of("fs.s3a.connection.ssl.enabled", "true")))
         .isEqualTo(ImmutableMap.of("allow_http", "false"));
+  }
+
+  @Test
+  void fillsInTheRegionThePropertiesLeaveOut() {
+    // Lance asks the AWS instance metadata service for a region it was not given, and every file
+    // open then waits out that client's one-second connect timeout. A reader handed credentials for
+    // an S3-compatible endpoint needs no metadata service, so the region it would have asked for is
+    // filled in instead.
+    assumeTrue(System.getenv("AWS_REGION") == null && System.getenv("AWS_DEFAULT_REGION") == null);
+
+    assertThat(
+            LanceStorageOptions.from(
+                ImmutableMap.of(
+                    "s3.endpoint", "http://oss.internal:8080",
+                    "s3.access-key-id", "ak",
+                    "s3.secret-access-key", "sk")))
+        .isEqualTo(
+            ImmutableMap.of(
+                "endpoint", "http://oss.internal:8080",
+                "access_key_id", "ak",
+                "secret_access_key", "sk",
+                "region", "us-east-1"));
+  }
+
+  @Test
+  void readsTheRegionOffAnAwsEndpoint() {
+    // a custom endpoint can be an AWS one, and signing needs the region its host names
+    assertThat(
+            LanceStorageOptions.from(
+                ImmutableMap.of(
+                    "s3.endpoint", "https://s3.us-west-2.amazonaws.com",
+                    "s3.access-key-id", "ak",
+                    "s3.secret-access-key", "sk")))
+        .containsEntry("region", "us-west-2");
+
+    assertThat(
+            LanceStorageOptions.from(
+                ImmutableMap.of(
+                    "fs.s3a.endpoint",
+                        "https://bucket.vpce-0abc.s3.eu-central-1.vpce.amazonaws.com",
+                    "fs.s3a.access.key", "ak",
+                    "fs.s3a.secret.key", "sk")))
+        .containsEntry("region", "eu-central-1");
+  }
+
+  @Test
+  void theRegionThePropertiesSpellWins() {
+    assertThat(
+            LanceStorageOptions.from(
+                ImmutableMap.of(
+                    "s3.endpoint", "http://oss.internal:8080",
+                    "s3.access-key-id", "ak",
+                    "s3.secret-access-key", "sk",
+                    "s3.region", "cn-north-1")))
+        .containsEntry("region", "cn-north-1");
+
+    assertThat(
+            LanceStorageOptions.from(
+                ImmutableMap.of(
+                    "s3.endpoint", "http://oss.internal:8080",
+                    "s3.access-key-id", "ak",
+                    "s3.secret-access-key", "sk",
+                    "lance.storage.region", "cn-north-1")))
+        .containsEntry("region", "cn-north-1");
+  }
+
+  @Test
+  void leavesTheRegionToTheReaderWhenNoEndpointIsConfigured() {
+    // the reader's own chain reaches the default AWS endpoint, and on an instance that carries a
+    // region that chain is the only one that knows it
+    assertThat(
+            LanceStorageOptions.from(
+                ImmutableMap.of("s3.access-key-id", "ak", "s3.secret-access-key", "sk")))
+        .doesNotContainKey("region");
+  }
+
+  @Test
+  void doesNotFillInARegionForAReaderThatWasGivenNoCredentials() {
+    // nothing says the reader would not find a region of its own, so nothing is guessed
+    assertThat(LanceStorageOptions.from(ImmutableMap.of("s3.endpoint", "http://oss.internal:8080")))
+        .isEqualTo(ImmutableMap.of("endpoint", "http://oss.internal:8080"));
   }
 
   @Test
