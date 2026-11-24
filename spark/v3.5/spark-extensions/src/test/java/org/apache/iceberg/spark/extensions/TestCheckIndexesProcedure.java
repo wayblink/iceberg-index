@@ -25,6 +25,7 @@ import java.io.IOException;
 import java.io.OutputStream;
 import java.io.UncheckedIOException;
 import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
 import java.nio.charset.StandardCharsets;
 import java.util.List;
 import org.apache.iceberg.Table;
@@ -254,6 +255,94 @@ public class TestCheckIndexesProcedure extends ExtensionsTestBase {
     try (OutputStream out = table.io().newOutputFile(file.location()).createOrOverwrite()) {
       out.write(content);
     }
+  }
+
+  /**
+   * Rewrites the footer of an index file so that the payload size it names cannot fit the file,
+   * which is what an index file damaged on disk looks like: it is still where the index manifest
+   * says, and reading it fails while reading it rather than while parsing a payload.
+   */
+  private static void breakIndexFile(Table table, IndexFile file) throws IOException {
+    InputFile input = table.io().newInputFile(file.location());
+    byte[] content = new byte[Math.toIntExact(input.getLength())];
+    try (SeekableInputStream in = input.newStream()) {
+      IOUtil.readFully(in, content, 0, content.length);
+    }
+
+    // a Puffin file ends with the footer: the payload length, the flags and the magic, 4 bytes each
+    ByteBuffer.wrap(content)
+        .order(ByteOrder.LITTLE_ENDIAN)
+        .putInt(content.length - 3 * Integer.BYTES, content.length);
+    try (OutputStream out = table.io().newOutputFile(file.location()).createOrOverwrite()) {
+      out.write(content);
+    }
+  }
+
+  private static void breakIndexFiles(Table table, IndexMetadata metadata) throws IOException {
+    for (IndexFile file : VectorIndexes.indexFiles(table.io(), metadata.latestSnapshot())) {
+      breakIndexFile(table, file);
+    }
+  }
+
+  @TestTemplate
+  public void reportsAnIndexFileThatCannotBeRead() throws Exception {
+    String table = tableName("check_broken_file_" + catalogName);
+    sql("CREATE TABLE %s (id bigint, embedding array<double>, body string) USING iceberg", table);
+    sql(
+        "INSERT INTO %s VALUES "
+            + "(1, array(1.0d, 0.0d), 'iceberg table format'), "
+            + "(2, array(0.0d, 1.0d), 'iceberg snapshot manifests')",
+        table);
+    sql(
+        "CALL %s.system.build_vector_index(table => '%s', column => 'embedding', dimension => 2)",
+        catalogName, table);
+    sql("CALL %s.system.build_text_index(table => '%s', column => 'body')", catalogName, table);
+
+    try {
+      Table loaded = Spark3Util.loadIcebergTable(spark, table);
+      IndexMetadata text = VectorIndexes.findIndex(loaded, "body", "text");
+      IndexMetadata vector = VectorIndexes.findIndex(loaded, "embedding", "vector");
+
+      // a file that is damaged rather than missing: the read fails with the IOException of the
+      // file,
+      // which is not a payload that fails to parse
+      breakIndexFiles(loaded, text);
+
+      List<Object[]> withBrokenText = check(table);
+      assertThat(withBrokenText).as("the readable index is still reported").hasSize(2);
+      Object[] textRow = rowOf(withBrokenText, text.indexUuid());
+      assertThat((Boolean) textRow[8]).as("readable").isFalse();
+      assertThat((String) textRow[12])
+          .as("the report says which file failed and what replaces the index")
+          .contains("unreadable")
+          .contains("drop_index")
+          .contains("build_text_index")
+          .doesNotContain("refresh_text_index");
+      Object[] vectorRow = rowOf(withBrokenText, vector.indexUuid());
+      assertThat((Boolean) vectorRow[8]).as("the index whose file is intact").isTrue();
+
+      breakIndexFiles(loaded, vector);
+
+      List<Object[]> withBothBroken = check(table);
+      assertThat(withBothBroken).as("one unreadable index does not end the report").hasSize(2);
+      Object[] brokenVectorRow = rowOf(withBothBroken, vector.indexUuid());
+      assertThat((Boolean) brokenVectorRow[8]).as("readable").isFalse();
+      assertThat((String) brokenVectorRow[12])
+          .as("a vector index whose payload cannot be read is rebuilt, not refreshed")
+          .contains("unreadable")
+          .contains("index => '" + vector.indexUuid() + "'")
+          .contains("build_vector_index")
+          .doesNotContain("refresh_vector_index");
+    } finally {
+      sql("DROP TABLE IF EXISTS %s", table);
+    }
+  }
+
+  private static Object[] rowOf(List<Object[]> rows, String indexUuid) {
+    return rows.stream()
+        .filter(row -> indexUuid.equals(row[2]))
+        .findFirst()
+        .orElseThrow(() -> new AssertionError("No row for index " + indexUuid));
   }
 
   @TestTemplate

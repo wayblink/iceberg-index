@@ -18,7 +18,9 @@
  */
 package org.apache.iceberg.index;
 
+import io.airlift.compress.zstd.ZstdInputStream;
 import java.io.IOException;
+import java.io.InputStream;
 import java.nio.ByteBuffer;
 import java.util.Arrays;
 import java.util.List;
@@ -124,13 +126,17 @@ public final class PuffinIndexFileContainer implements IndexFileContainer {
    * The first bytes of the first blob of a file that has the given type.
    *
    * <p>A payload names the format version that wrote it in its first bytes, so a caller that only
-   * needs that version must not materialize a payload that can be hundreds of megabytes: this reads
-   * at most {@code maxBytes} of the blob. An uncompressed blob is read in place from its offset. A
-   * compressed blob cannot be decompressed from a prefix, so it is read and decompressed whole -
+   * needs that version must not read a payload that can be hundreds of megabytes: this reads at
+   * most {@code maxBytes} of the payload. An uncompressed blob is read in place from its offset. A
+   * compressed blob cannot be decompressed from a prefix, but it can be decoded one block at a
+   * time: the codec's stream decodes it from its start only as far as those bytes, so a payload of
+   * the whole table is never held in one array. A codec without such a decoder is decoded whole -
    * still one blob rather than the file - and cut to {@code maxBytes}.
    *
    * @return the first {@code maxBytes} bytes of that blob, or null when the file has no blob of the
    *     given type
+   * @throws IOException if the file cannot be read, or its footer describes a blob that cannot be
+   *     part of it
    */
   public static byte[] payloadPrefix(InputFile file, String blobType, int maxBytes)
       throws IOException {
@@ -151,16 +157,39 @@ public final class PuffinIndexFileContainer implements IndexFileContainer {
         return null;
       }
 
+      checkBlobMetadata(file, blob);
+
       if (blob.compressionCodec() == null) {
         // the file is opened a second time because a reader does not expose the stream it holds,
         // and seeking to the blob is still one range of maxBytes rather than the whole file
         return readPrefix(file, blob.offset(), (int) Math.min(blob.length(), maxBytes));
       }
 
-      // a compressed blob is decompressed into one array by the codec, so the prefix is cut from
-      // that array; the cost is one blob of the file, not the file
+      if (PuffinCompressionCodec.ZSTD.codecName().equals(blob.compressionCodec())) {
+        return streamedPrefix(file, blob, maxBytes);
+      }
+
+      // a compressed blob of another codec is decompressed into one array, so the prefix is cut
+      // from that array; the cost is one blob of the file, not the file
       byte[] payload = payloadOf(Lists.newArrayList(reader.readAll(List.of(blob))).get(0).second());
       return payload.length <= maxBytes ? payload : Arrays.copyOf(payload, maxBytes);
+    }
+  }
+
+  /**
+   * Refuses blob metadata no file can contain.
+   *
+   * <p>A footer names the offset and the length of every blob, and a footer that was written wrong
+   * or has been damaged names a negative offset or length: read as they are, they either seek
+   * before the start of the file or allocate an array of a negative size, neither of which says
+   * what is broken. The file and the metadata are what the error reports.
+   */
+  private static void checkBlobMetadata(InputFile file, BlobMetadata blob) throws IOException {
+    if (blob.offset() < 0 || blob.length() <= 0) {
+      throw new IOException(
+          String.format(
+              "Invalid %s blob in %s: offset %s, length %s",
+              blob.type(), file.location(), blob.offset(), blob.length()));
     }
   }
 
@@ -171,6 +200,87 @@ public final class PuffinIndexFileContainer implements IndexFileContainer {
       IOUtil.readFully(in, prefix, 0, length);
     }
     return prefix;
+  }
+
+  /**
+   * The first bytes of a zstd-compressed blob, decoded from its start.
+   *
+   * <p>The frame is decoded by a stream, so only the blocks needed to produce {@code maxBytes} are
+   * decompressed. A FLAT vector index can write the vectors of the whole table as one blob, which
+   * is the case a prefix read must not turn into an allocation of that whole array.
+   */
+  private static byte[] streamedPrefix(InputFile file, BlobMetadata blob, int maxBytes)
+      throws IOException {
+    try (SeekableInputStream in = file.newStream()) {
+      in.seek(blob.offset());
+      try (InputStream decoded = new ZstdInputStream(new BlobStream(in, blob.length()))) {
+        byte[] prefix = new byte[maxBytes];
+        int read = 0;
+        while (read < maxBytes) {
+          int count = decoded.read(prefix, read, maxBytes - read);
+          if (count < 0) {
+            break;
+          }
+
+          read += count;
+        }
+
+        return read == maxBytes ? prefix : Arrays.copyOf(prefix, read);
+      }
+    }
+  }
+
+  /**
+   * The bytes of one blob of a file, read from a stream that the caller opened and closes.
+   *
+   * <p>It ends the stream at the blob's length, so a decoder that reads past the frame it was given
+   * cannot read the other blobs of the file; it does not close the stream it was given.
+   */
+  private static class BlobStream extends InputStream {
+    private final InputStream stream;
+    private long remaining;
+
+    private BlobStream(InputStream stream, long length) {
+      this.stream = stream;
+      this.remaining = length;
+    }
+
+    @Override
+    public int read() throws IOException {
+      if (remaining <= 0) {
+        return -1;
+      }
+
+      int value = stream.read();
+      if (value >= 0) {
+        remaining -= 1;
+      }
+
+      return value;
+    }
+
+    @Override
+    public int read(byte[] b, int off, int len) throws IOException {
+      if (len == 0) {
+        return 0;
+      }
+
+      if (remaining <= 0) {
+        return -1;
+      }
+
+      int read = stream.read(b, off, (int) Math.min(len, remaining));
+      if (read > 0) {
+        remaining -= read;
+      }
+
+      return read;
+    }
+
+    @Override
+    public void close() {
+      // the stream belongs to the caller, which closes it; this only bounds what is read from it
+    }
   }
 
   /**

@@ -608,6 +608,8 @@ SHOW INDEXES FROM local.db.docs;   -- 只有 FROM，没有 IN
 
 `index_build_status.state` 五种：`RUNNING`、`SUCCEEDED`、`FAILED`、`ABANDONED`（报告停止更新超过 5 分钟，通常是 driver 被杀）、`UNKNOWN`（没有报告，比如更早版本建的）。构建期间约每 30 秒一次心跳，可以反复 `CALL` 观察。
 
+`check_indexes` 的 `suggestion` 分两类：索引还能读、只是落后或漏了文件，给 `refresh_<type>_index`；索引的 payload 这个版本读不了（版本不认、header 解析失败、文件本身读不出来），给 `drop_index(... purge => true)` + `build_<type>_index`——刷新沿用上一版的分片，改不了旧 payload。单个索引的文件读失败（被删、损坏、存储报 IO 错误）只让它自己那行 `readable = false`、`suggestion` 带异常摘要，同表其它索引照常报告，不会让整条 `CALL` 失败。
+
 失败报告的位置：向量或文本索引失败都会回滚并留下报告在 `<table>/indexes/build-status/<column-field-id>/`；同列下次构建成功时清掉（5.5）。
 
 ### 清理

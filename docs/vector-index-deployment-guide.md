@@ -141,7 +141,7 @@ ALTER TABLE hms.db.docs DROP INDEX docs_ivf_1bit;
 | 过程 | 用途 | 什么时候用 |
 |---|---|---|
 | `list_indexes(table=>...)` | 列出索引与状态 | 日常巡检；**失败要当故障处理**（见 §6） |
-| `check_indexes(table=>...)` | 体检：是否需要重建 | 定期跑；返回可粘贴的 `refresh_vector_index(...)` 建议 |
+| `check_indexes(table=>...)` | 体检：是否需要重建 | 定期跑；返回可粘贴的修复语句（落后/漏文件给 `refresh_vector_index(...)`，读不了给 `drop_index` + `build_vector_index`） |
 | `index_build_status(...)` | 构建进度 | 大表构建期间；状态落文件，随时可查 |
 | `index_cache_status()` | 各执行器缓存占用/覆盖 | 排查"为什么某次查询慢" |
 | `refresh_vector_index(...)` | 补段 + 重建内容变过的组 | 数据变更后；索引落后不阻塞查询，但覆盖率下降会变慢 |

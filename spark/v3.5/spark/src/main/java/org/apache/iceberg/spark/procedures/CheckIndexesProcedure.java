@@ -18,6 +18,7 @@
  */
 package org.apache.iceberg.spark.procedures;
 
+import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.util.LinkedHashSet;
 import java.util.List;
@@ -147,18 +148,12 @@ class CheckIndexesProcedure extends BaseProcedure {
     return withIcebergTable(
         input.ident(TABLE_PARAM),
         table -> {
-          try {
-            checkTable(tableCatalog().name(), table, tableName, rows);
-          } catch (java.io.IOException e) {
-            throw new java.io.UncheckedIOException("Failed to read index payloads", e);
-          }
-
+          checkTable(tableCatalog().name(), table, tableName, rows);
           return rows.toArray(new InternalRow[0]);
         });
   }
 
-  private void checkTable(String catalog, Table table, String tableName, List<InternalRow> rows)
-      throws java.io.IOException {
+  private void checkTable(String catalog, Table table, String tableName, List<InternalRow> rows) {
     for (IndexMetadata metadata : VectorIndexes.indexesOf(table)) {
       IndexSnapshot snapshot = metadata.latestSnapshot();
       String column = VectorIndexProcedures.columnName(table, metadata.definition().fieldId());
@@ -249,15 +244,16 @@ class CheckIndexesProcedure extends BaseProcedure {
       IndexSnapshot snapshot,
       VectorIndexAdapter adapter,
       Long uncovered,
-      List<InternalRow> rows)
-      throws java.io.IOException {
+      List<InternalRow> rows) {
     String indexType = metadata.indexType();
+    int readerVersion = adapter.kernel().payloadFormatVersion();
     VectorPayloadHeader header;
     try {
       header = readHeader(table, metadata, snapshot, adapter);
-    } catch (RuntimeException e) {
-      // a payload whose header cannot be read at all is exactly what this reports: the index has
-      // to be rebuilt, and the error says why
+    } catch (IOException | RuntimeException e) {
+      // a payload whose header cannot be read at all - a file that is gone or unreadable, or bytes
+      // that do not parse - is exactly what this reports: the index has to be rebuilt, and the
+      // error says why
       rows.add(
           row(
               table,
@@ -265,15 +261,16 @@ class CheckIndexesProcedure extends BaseProcedure {
               metadata,
               null,
               -1,
-              adapter.kernel().payloadFormatVersion(),
+              readerVersion,
               false,
               snapshot.sourceTableSnapshotId(),
               isStale(table, snapshot),
               uncovered,
               "payload header is unreadable ("
-                  + e.getMessage()
+                  + summary(e)
                   + "); "
-                  + refreshSuggestion(catalog, tableName, column, indexType)));
+                  + rebuildSuggestion(
+                      catalog, tableName, column, indexType, metadata.indexUuid())));
       return;
     }
 
@@ -291,12 +288,12 @@ class CheckIndexesProcedure extends BaseProcedure {
               isStale(table, snapshot),
               uncovered,
               "no payload found in the index files; "
-                  + refreshSuggestion(catalog, tableName, column, indexType)));
+                  + rebuildSuggestion(
+                      catalog, tableName, column, indexType, metadata.indexUuid())));
       return;
     }
 
     boolean readable = header.readableBy(adapter.kernel());
-    int readerVersion = adapter.kernel().payloadFormatVersion();
     rows.add(
         row(
             table,
@@ -318,7 +315,8 @@ class CheckIndexesProcedure extends BaseProcedure {
                     + " version "
                     + readerVersion
                     + "; "
-                    + refreshSuggestion(catalog, tableName, column, indexType)));
+                    + rebuildSuggestion(
+                        catalog, tableName, column, indexType, metadata.indexUuid())));
   }
 
   /**
@@ -348,8 +346,7 @@ class CheckIndexesProcedure extends BaseProcedure {
       IndexSnapshot snapshot,
       IndexAdapter adapter,
       Long uncovered,
-      List<InternalRow> rows)
-      throws java.io.IOException {
+      List<InternalRow> rows) {
     String indexType = metadata.indexType();
     TextIndexAdapter text = adapter instanceof TextIndexAdapter ? (TextIndexAdapter) adapter : null;
     Set<String> present = new LinkedHashSet<>();
@@ -399,10 +396,11 @@ class CheckIndexesProcedure extends BaseProcedure {
             writerVersion = text.payloadVersion(ByteBuffer.wrap(payload));
             versionReadable = writerVersion == readerVersion;
           }
-        } catch (RuntimeException e) {
-          // a payload whose header cannot be read at all is exactly what this reports
+        } catch (IOException | RuntimeException e) {
+          // a payload that cannot be read at all - a file that is gone or unreadable, or bytes that
+          // do not parse - is exactly what this reports
           versionReadable = false;
-          headerError = e.getMessage();
+          headerError = summary(e);
         }
       }
     }
@@ -499,10 +497,16 @@ class CheckIndexesProcedure extends BaseProcedure {
     return catalog + "." + bare;
   }
 
+  /** What a failure says went wrong, which is what the report quotes of it. */
+  private static String summary(Throwable failure) {
+    String message = failure.getMessage();
+    return message == null || message.isEmpty() ? failure.getClass().getSimpleName() : message;
+  }
+
   /** Reads the header of the first payload, which is where a mismatch shows up first. */
   private VectorPayloadHeader readHeader(
       Table table, IndexMetadata metadata, IndexSnapshot snapshot, VectorIndexAdapter adapter)
-      throws java.io.IOException {
+      throws IOException {
     byte[] payload =
         firstPayload(
             table,
@@ -525,7 +529,7 @@ class CheckIndexesProcedure extends BaseProcedure {
    */
   private byte[] firstPayload(
       Table table, IndexMetadata metadata, IndexSnapshot snapshot, String blobType)
-      throws java.io.IOException {
+      throws IOException {
     List<IndexFile> files =
         new IndexReader(metadata, table)
             .indexFiles(IndexQuery.of(snapshot.sourceTableSnapshotId(), ByteBuffer.allocate(4), 1));
