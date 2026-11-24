@@ -337,6 +337,17 @@ class TestRewriteTextSearch {
   }
 
   @Test
+  void readsOnlyTheColumnsAFilteredQueryUses() {
+    String table =
+        indexedTextTable("docs_matched_columns", "(1, 'the quick brown fox'), (2, 'the fox runs')");
+    String query = String.format("SELECT id FROM local.%s WHERE match(body, 'the fox')", table);
+
+    // the filter form answers with the rows the match found, and the columns those rows are read
+    // with are the columns the plan above names, the same way the ranking form is narrowed
+    assertThat(planOf(table, query)).contains("TextSearchSource").contains("reads=[id]");
+  }
+
+  @Test
   public void matchOfANullDocumentIsUnknownNotFalse() {
     String table = "db.docs_null_body";
     spark.sql("CREATE NAMESPACE IF NOT EXISTS local.db");

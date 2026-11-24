@@ -111,11 +111,10 @@ class TestLanceStorageOptions {
   }
 
   @Test
-  void fillsInTheRegionThePropertiesLeaveOut() {
-    // Lance asks the AWS instance metadata service for a region it was not given, and every file
-    // open then waits out that client's one-second connect timeout. A reader handed credentials for
-    // an S3-compatible endpoint needs no metadata service, so the region it would have asked for is
-    // filled in instead.
+  void leavesAnEndpointOfNoKnownRegionToTheReader() {
+    // signing for us-east-1 when the store expects another region is a rejected read, not a slow
+    // one: a region nothing named is left to the reader, which asks the instance metadata service
+    // for it at the cost of that lookup
     assumeTrue(System.getenv("AWS_REGION") == null && System.getenv("AWS_DEFAULT_REGION") == null);
 
     assertThat(
@@ -128,8 +127,20 @@ class TestLanceStorageOptions {
             ImmutableMap.of(
                 "endpoint", "http://oss.internal:8080",
                 "access_key_id", "ak",
-                "secret_access_key", "sk",
-                "region", "us-east-1"));
+                "secret_access_key", "sk"));
+  }
+
+  @Test
+  void doesNotReadARegionOffAnEndpointThatNamesAFeatureInstead() {
+    // s3.dualstack.<region> has the region after a feature name, and reading the feature name as
+    // one would sign for the wrong region
+    assertThat(
+            LanceStorageOptions.from(
+                ImmutableMap.of(
+                    "s3.endpoint", "https://s3.dualstack.us-west-2.amazonaws.com",
+                    "s3.access-key-id", "ak",
+                    "s3.secret-access-key", "sk")))
+        .doesNotContainKey("region");
   }
 
   @Test

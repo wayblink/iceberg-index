@@ -20,9 +20,7 @@ package org.apache.iceberg.spark.index
 
 import org.apache.iceberg.index.IndexMetadata
 import org.apache.iceberg.index.IndexQuery
-import org.apache.iceberg.index.IndexQuery.Consistency
 import org.apache.iceberg.index.IndexReader
-import org.apache.iceberg.index.IndexSearchResult
 import org.apache.iceberg.index.spark.IndexEntries
 import org.apache.iceberg.index.spark.VectorIndexes
 import org.apache.iceberg.index.text.TextIndexAdapter
@@ -41,7 +39,6 @@ import org.apache.spark.sql.catalyst.expressions.AttributeSet
 import org.apache.spark.sql.catalyst.expressions.Descending
 import org.apache.spark.sql.catalyst.expressions.Expression
 import org.apache.spark.sql.catalyst.expressions.GenericInternalRow
-import org.apache.spark.sql.catalyst.expressions.SortOrder
 import org.apache.spark.sql.catalyst.plans.logical.Filter
 import org.apache.spark.sql.catalyst.plans.logical.GlobalLimit
 import org.apache.spark.sql.catalyst.plans.logical.LocalLimit
@@ -76,9 +73,11 @@ import scala.collection.JavaConverters._
  * cannot be judged from an index entry, a non-deterministic one for instance, does not lower the
  * query silently: the error says why, instead of leaving a score that no index was found for.
  *
- * <p>The filter form is still answered while planning: it reads the index and materialises the
- * matched rows in place of the scan. The source answers a top-k, and a filter asks for every match,
- * so lowering it needs the source to answer "all matches" rather than the best k.
+ * <p>The filter form is answered by the same source: the match is a search for every row whose
+ * score is positive, and the rest of the condition stays a filter over the rows the source returns.
+ * The source answers a top-k, and a filter asks for every match, so the filter form lowers it with
+ * a limit of "all rows" rather than the best k. The rows are read where they were found instead of
+ * being collected to the driver and materialised.
  *
  * <p>Unlike a vector search, a text search is only answered from an index snapshot bound to exactly
  * the snapshot being read. A BM25 score depends on corpus statistics, the document frequency of the
@@ -155,10 +154,22 @@ case class RewriteTextSearch(spark: SparkSession) extends Rule[LogicalPlan] {
     def prune(node: LogicalPlan, needed: AttributeSet): LogicalPlan = node match {
       case source: TextSearchSource => source.answeringOnly(needed)
       case project: Project =>
-        // a projection answers with its own attributes, so its child is only asked for what its
-        // expressions name
-        project.withNewChildren(
-          Seq(prune(project.child, AttributeSet(project.projectList.flatMap(_.references)))))
+        // a projection answers with its own attributes: one it passes through is kept only when the
+        // plan above names it, while an expression is kept because its value is the column the
+        // projection defines. A projection that would answer with no column keeps what it had,
+        // because an empty answer is not a narrower one
+        val kept = project.projectList.filter {
+          case attribute: AttributeReference => needed.contains(attribute.toAttribute)
+          case _ => true
+        }
+        if (kept.isEmpty || kept.size == project.projectList.size) {
+          project.withNewChildren(
+            Seq(prune(project.child, AttributeSet(project.projectList.flatMap(_.references)))))
+        } else {
+          project
+            .copy(projectList = kept)
+            .withNewChildren(Seq(prune(project.child, AttributeSet(kept.flatMap(_.references)))))
+        }
       case unary @ (_: Filter | _: Sort | _: GlobalLimit | _: LocalLimit | _: SubqueryAlias) =>
         // these answer with the attributes of their child, so what is needed above them is needed
         // below them, and what they say themselves is needed as well
@@ -169,7 +180,8 @@ case class RewriteTextSearch(spark: SparkSession) extends Rule[LogicalPlan] {
         other.withNewChildren(other.children.map(child => prune(child, child.outputSet)))
     }
 
-    prune(plan, AttributeSet.empty)
+    // the plan is what its consumer reads, so the output of the root is needed in full
+    prune(plan, plan.outputSet)
   }
 
   /** A lowered source is not lowered again, so repeated optimization keeps the same plan. */

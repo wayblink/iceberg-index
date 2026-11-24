@@ -90,7 +90,13 @@ public final class IndexBuildStatus {
   public static String rolledBackStatusDir(String tableLocation, int fieldId) {
     Preconditions.checkArgument(
         tableLocation != null && !tableLocation.isEmpty(), "Invalid table location: null or empty");
-    return tableLocation + "/" + SidecarIndexCatalog.INDEXES_DIR + "/build-status/" + fieldId;
+    return tableLocation
+        + "/"
+        + SidecarIndexCatalog.INDEXES_DIR
+        + "/"
+        + SidecarIndexCatalog.BUILD_STATUS_DIR
+        + "/"
+        + fieldId;
   }
 
   private static final String GENERATION = "generation";

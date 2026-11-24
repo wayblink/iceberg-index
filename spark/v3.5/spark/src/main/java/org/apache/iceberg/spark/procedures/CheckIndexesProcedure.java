@@ -155,14 +155,58 @@ class CheckIndexesProcedure extends BaseProcedure {
 
   private void checkTable(String catalog, Table table, String tableName, List<InternalRow> rows) {
     for (IndexMetadata metadata : VectorIndexes.indexesOf(table)) {
-      IndexSnapshot snapshot = metadata.latestSnapshot();
-      String column = VectorIndexProcedures.columnName(table, metadata.definition().fieldId());
-      // what this index does not cover: a build that lost a group, an append nobody refreshed, or a
-      // rewrite that replaced a covered file. Queries still answer correctly - the uncovered files
-      // are scanned - but every one of them is a slower path, so the count belongs in the report.
-      Long uncovered = uncoveredDataFiles(table, snapshot);
+      String column = null;
+      try {
+        IndexSnapshot snapshot = metadata.latestSnapshot();
+        column = VectorIndexProcedures.columnName(table, metadata.definition().fieldId());
+        // what this index does not cover: a build that lost a group, an append nobody refreshed, or
+        // a
+        // rewrite that replaced a covered file. Queries still answer correctly - the uncovered
+        // files
+        // are scanned - but every one of them is a slower path, so the count belongs in the report.
+        Long uncovered = uncoveredDataFiles(table, snapshot);
 
-      if (snapshot == null) {
+        if (snapshot == null) {
+          rows.add(
+              row(
+                  table,
+                  column,
+                  metadata,
+                  null,
+                  -1,
+                  -1,
+                  false,
+                  null,
+                  false,
+                  uncovered,
+                  "the index has no snapshot; it cannot be refreshed: "
+                      + rebuildSuggestion(
+                          catalog, tableName, column, metadata.indexType(), metadata.indexUuid())));
+          continue;
+        }
+
+        // the reader belongs to the index type, so a table holding indexes of several types is
+        // checked one type-specific way each rather than through the one type this knows best
+        IndexAdapter adapter =
+            IndexTypes.fromType(metadata.indexType()).createAdapter(metadata.definition());
+        if (adapter instanceof VectorIndexAdapter) {
+          checkVectorPayload(
+              catalog,
+              table,
+              tableName,
+              column,
+              metadata,
+              snapshot,
+              (VectorIndexAdapter) adapter,
+              uncovered,
+              rows);
+        } else {
+          checkDeclaredPayloads(
+              catalog, table, tableName, column, metadata, snapshot, adapter, uncovered, rows);
+        }
+      } catch (RuntimeException e) {
+        // one index whose manifests or payloads cannot be read is reported as unreadable instead of
+        // failing the report of every other index of the table
         rows.add(
             row(
                 table,
@@ -174,29 +218,17 @@ class CheckIndexesProcedure extends BaseProcedure {
                 false,
                 null,
                 false,
-                uncovered,
-                "the index has no snapshot; build or refresh it"));
-        continue;
-      }
-
-      // the reader belongs to the index type, so a table holding indexes of several types is
-      // checked one type-specific way each rather than through the one type this knows best
-      IndexAdapter adapter =
-          IndexTypes.fromType(metadata.indexType()).createAdapter(metadata.definition());
-      if (adapter instanceof VectorIndexAdapter) {
-        checkVectorPayload(
-            catalog,
-            table,
-            tableName,
-            column,
-            metadata,
-            snapshot,
-            (VectorIndexAdapter) adapter,
-            uncovered,
-            rows);
-      } else {
-        checkDeclaredPayloads(
-            catalog, table, tableName, column, metadata, snapshot, adapter, uncovered, rows);
+                null,
+                "the index could not be checked: "
+                    + summary(e)
+                    + "; report it as unreadable, or remove it by UUID with "
+                    + "CALL "
+                    + catalog
+                    + ".system.drop_index(table => '"
+                    + qualified(catalog, tableName)
+                    + "', column => '<any column>', index => '"
+                    + metadata.indexUuid()
+                    + "', purge => true)"));
       }
     }
 

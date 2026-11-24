@@ -195,6 +195,32 @@ class TestVectorSearchGlobalFetch {
   }
 
   /**
+   * The same dataset answers a second action after the query that built it ended.
+   *
+   * <p>The rows are read by tasks that hold the values the fetch-back shipped. A dataset executes
+   * the same RDD again for a second action, so a release that destroyed those values with the first
+   * query would leave the second one with nothing to read.
+   */
+  @Test
+  void answersASecondActionAfterTheQueryThatBuiltItEnds() throws Exception {
+    String table = tableWithIndex("global_second_action");
+    Dataset<Row> frame =
+        spark.sql(
+            String.format(
+                "SELECT id FROM local.db.%s "
+                    + "ORDER BY vec_distance(embedding, array(1.0d, 0.0d), 'l2') LIMIT 1",
+                table));
+
+    assertThat(frame.collectAsList()).hasSize(1);
+    assertThat(metric(sourceExec(frame), "numFetchedRows"))
+        .as("the answer came from the fetch-back the index's global hits are read with")
+        .isPositive();
+
+    // the first query has ended; this action recomputes the same RDD from the same plan
+    assertThat(frame.collectAsList()).hasSize(1);
+  }
+
+  /**
    * A table of 65 data files of {@link #ROWS_PER_FILE} rows, and a flat vector index over it.
    *
    * <p>The id of a row is its position in the distance order: the row nearest the query is id 0 and

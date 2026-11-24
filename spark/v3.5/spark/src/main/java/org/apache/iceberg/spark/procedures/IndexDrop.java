@@ -26,19 +26,15 @@ import org.apache.iceberg.Table;
 import org.apache.iceberg.index.IndexMetadata;
 import org.apache.iceberg.index.SidecarIndexCatalog;
 import org.apache.spark.sql.SparkSession;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
 
 /**
- * Removes one index of a table: unregisters it, optionally deletes its files, and clears the report
- * of its builds.
+ * Removes one index of a table: unregisters it and, when asked, deletes its whole tree.
  *
  * <p>The index and vector index procedures differ only in how they resolve the index to remove, so
- * they share this part: a drop of either kind has to leave the table's metadata pointing at no
- * index, and an index whose files were deleted must not leave a build report behind.
+ * they share this part. The report of a column's failed builds lives beside the index trees and is
+ * shared by the column's attempts, so a drop leaves it for the next build to clear.
  */
 final class IndexDrop {
-  private static final Logger LOG = LoggerFactory.getLogger(IndexDrop.class);
 
   private IndexDrop() {}
 
@@ -48,8 +44,8 @@ final class IndexDrop {
   /**
    * Removes the index and reports what was done.
    *
-   * <p>{@code purge} deletes the index files. Leaving them behind is for a caller that wants to
-   * read the index after it is unregistered; such files are garbage to everyone else.
+   * <p>{@code purge} deletes the index's whole tree. Leaving it behind is for a caller that wants
+   * to read the index after it is unregistered; such files are garbage to everyone else.
    */
   static Result drop(SparkSession spark, Table table, IndexMetadata metadata, boolean purge) {
     SidecarIndexCatalog catalog = VectorIndexProcedures.indexCatalog(table);
@@ -64,8 +60,8 @@ final class IndexDrop {
     boolean dropped = catalog.dropIndex(table.location(), metadata.indexUuid(), false);
 
     // the column reports whether files were purged, which is what the caller asked for and what
-    // the row is for; whether the index was still registered is an error when it was not
-    return new Result(metadata.indexUuid(), dropped, dropped && purge);
+    // the row is for; the tree was deleted above even when another drop removed the entry first
+    return new Result(metadata.indexUuid(), dropped, purge);
   }
 
   /**
@@ -75,7 +71,7 @@ final class IndexDrop {
    * only identifier that survives. A purge still removes what is left of the tree, so a drop of a
    * damaged entry is the repair path.
    *
-   * @return whether the registry named the entry, which is false for a UUID it never held
+   * @return the UUID, whether the registry still named the entry, and whether the tree was deleted
    */
   static Result dropByUuid(SparkSession spark, Table table, String indexUuid, boolean purge) {
     SidecarIndexCatalog catalog = VectorIndexProcedures.indexCatalog(table);
@@ -89,7 +85,7 @@ final class IndexDrop {
     // the tree already holds no file: the entry is removed without a second purge, which would
     // read the metadata the tree no longer has
     boolean dropped = catalog.dropIndex(table.location(), indexUuid, false);
-    return new Result(indexUuid, dropped, dropped && purge);
+    return new Result(indexUuid, dropped, purge);
   }
 
   /**
@@ -107,6 +103,13 @@ final class IndexDrop {
   static void purgeTree(SparkSession spark, Table table, String indexUuid) {
     if (indexUuid == null || !indexUuid.matches("[A-Za-z0-9_-]+")) {
       throw new IllegalArgumentException("Invalid index UUID for a purge: " + indexUuid);
+    }
+
+    // the build reports live beside the index trees and belong to a column, not to an index: a
+    // registry a hand edit corrupted must not turn a purge into a delete of every column's report
+    if (indexUuid.equals(SidecarIndexCatalog.BUILD_STATUS_DIR)) {
+      throw new IllegalArgumentException(
+          "Refusing to purge the shared build reports: " + indexUuid);
     }
 
     String location = SidecarIndexCatalog.locationOf(table.location(), indexUuid);

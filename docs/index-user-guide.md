@@ -583,7 +583,7 @@ CALL local.system.drop_index(table => 'db.papers', column => 'body');
 
 它按列解析任意类型的索引，`purge` 默认 `true`；输出 `index_uuid, index_type, purged`。`CALL system.drop_vector_index(...)` 保留为只认 `vector` 的旧写法；`ALTER TABLE … DROP INDEX` 与 `REFRESH INDEX` 按类型分派，文本索引仍报 `cannot be dropped: unsupported type text`，DDL 又按名字寻址而文本索引没有名字——所以文本索引走 `CALL`。
 
-`build_text_index` 中途失败（payload 写失败、task 失败、OOM 等）会像向量索引一样回滚：删掉本次写出的**整棵索引树**并注销注册，失败报告写到 `<table>/indexes/build-status/<column-field-id>/` 供 `index_build_status` 读取；同列重试不会再被残留注册拒绝，下一次成功构建会清掉失败报告。如果树删不掉（权限、存储故障），注销不会发生：注册保留下来，之后可以用 `drop_index(... index => '<uuid>', purge => true)` 重试清理——先注销再删树会留下没有入口的残留，所以顺序是删树在前、注销在后。更早版本留下的注册残留（`list_indexes` 里一行 `index_type = text`、`status = NULL`、`index_files = 0`）仍可能出现在旧表上，用 `drop_index` 清掉即可（`purge => false` 明确表示保留文件排查，之后需要手工删 `indexes/<uuid>/`）。
+`build_text_index` 中途失败（payload 写失败、task 失败、OOM 等）会像向量索引一样回滚：删掉本次写出的**整棵索引树**并注销注册，失败报告写到 `<table>/indexes/build-status/<column-field-id>/` 供 `index_build_status` 读取；同列重试不会再被残留注册拒绝（除非整棵树删不掉、注册被保留，见下一句），下一次成功构建会清掉失败报告。如果树删不掉（权限、存储故障），注销不会发生：注册保留下来，之后可以用 `drop_index(... index => '<uuid>', purge => true)` 重试清理——先注销再删树会留下没有入口的残留，所以顺序是删树在前、注销在后。更早版本留下的注册残留（`list_indexes` 里一行 `index_type = text`、`status = NULL`、`index_files = 0`）仍可能出现在旧表上，用 `drop_index` 清掉即可（`purge => false` 明确表示保留文件排查，之后需要手工删 `indexes/<uuid>/`）。
 
 ---
 
@@ -614,7 +614,7 @@ SHOW INDEXES FROM local.db.docs;   -- 只有 FROM，没有 IN
 
 `index_build_status.state` 五种：`RUNNING`、`SUCCEEDED`、`FAILED`、`ABANDONED`（报告停止更新超过 5 分钟，通常是 driver 被杀）、`UNKNOWN`（没有报告，比如更早版本建的）。构建期间约每 30 秒一次心跳，可以反复 `CALL` 观察。
 
-`check_indexes` 的 `suggestion` 分两类：索引还能读、只是落后或漏了文件，给 `refresh_<type>_index`；索引的 payload 这个版本读不了（版本不认、header 解析失败、文件本身读不出来），给 `drop_index(... purge => true)` + `build_<type>_index`——刷新沿用上一版的分片，改不了旧 payload。单个索引的文件读失败（被删、损坏、存储报 IO 错误）只让它自己那行 `readable = false`、`suggestion` 带异常摘要，同表其它索引照常报告，不会让整条 `CALL` 失败。
+`check_indexes` 的 `suggestion` 分三类：索引还能读、只是落后或漏了文件，给 `refresh_<type>_index`；索引的 payload 这个版本读不了（版本不认、header 解析失败、文件本身读不出来），给 `drop_index(... purge => true)` + `build_<type>_index`——刷新沿用上一版的分片，改不了旧 payload；`status = NULL`（没有快照）的注册不能 refresh，给的同样是 `drop_index(... purge => true)` + `build_<type>_index`。单个索引的文件读失败（被删、损坏、存储报 IO 错误）只让它自己那行 `readable = false`、`suggestion` 带异常摘要，同表其它索引照常报告，不会让整条 `CALL` 失败。
 
 失败报告的位置：向量或文本索引失败都会回滚并留下报告在 `<table>/indexes/build-status/<column-field-id>/`；同列下次构建成功时清掉（5.5）。
 

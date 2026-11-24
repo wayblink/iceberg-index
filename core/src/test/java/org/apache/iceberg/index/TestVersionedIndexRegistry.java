@@ -529,6 +529,21 @@ class TestVersionedIndexRegistry {
   }
 
   @Test
+  void recordsTheDroppedFieldEvenWhenNothingWasDropped() {
+    TestTables.TestTableOperations ops = operations();
+    SidecarIndexCatalog catalog = versionedCatalog(ops);
+    catalog.createIndex(request("index-a"));
+
+    // a registration is restored from a registry whose document could have recorded a drop, and the
+    // field's presence is that evidence: a build that wrote the field only for a non-empty set
+    // would
+    // never restore a registration on a table that never dropped an index
+    JsonNode dropped = registryJson(registryPointer(ops)).get("dropped");
+    assertThat(dropped).isNotNull();
+    assertThat(dropped.size()).isZero();
+  }
+
+  @Test
   void recordsTheTableInstanceEachIndexWasBuiltFor() {
     TestTables.TestTableOperations ops = operations();
     SidecarIndexCatalog catalog = versionedCatalog(ops);

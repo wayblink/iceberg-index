@@ -46,9 +46,6 @@ final class LanceStorageOptions {
 
   private static final String LANCE_PREFIX = "lance.storage.";
 
-  /** The region the AWS clients sign for when nothing else names one. */
-  private static final String DEFAULT_REGION = "us-east-1";
-
   /**
    * The region an endpoint names when the endpoint is one of AWS's own: a host such as {@code
    * s3.eu-west-1.amazonaws.com}, {@code s3-eu-west-1.amazonaws.com}, or the VPC endpoint form, all
@@ -57,7 +54,7 @@ final class LanceStorageOptions {
   private static final Pattern REGION_IN_ENDPOINT =
       Pattern.compile("(?:^|[./])s3[.-]([a-z]{2}(?:-[a-z]+)*-[0-9]+)\\.[a-z0-9.-]*amazonaws");
 
-  private static final AtomicBoolean DEFAULT_REGION_WARNED = new AtomicBoolean(false);
+  private static final AtomicBoolean NO_REGION_WARNED = new AtomicBoolean(false);
 
   /** Iceberg's {@code s3.*} catalog properties, in the names Lance understands. */
   private static final Map<String, String> S3_KEYS =
@@ -199,17 +196,17 @@ final class LanceStorageOptions {
       region = environment("AWS_DEFAULT_REGION");
     }
     if (region == null) {
-      region = DEFAULT_REGION;
-      // once per lifetime rather than once per lookup: the settings are the same for every read
-      if (DEFAULT_REGION_WARNED.compareAndSet(false, true)) {
+      // signing for a region nothing named can be worse than the lookup it saves: a store that
+      // checks the signature rejects the read, while the lookup only makes each open slower
+      if (NO_REGION_WARNED.compareAndSet(false, true)) {
         LOG.warn(
-            "No region was configured for the S3 endpoint {}, so reads sign for {}. Lance otherwise "
-                + "asks the instance metadata service for a region, and that lookup costs each data "
-                + "file open its one-second connect timeout. Set s3.region (or "
-                + "fs.s3a.endpoint.region) if the store expects another region.",
-            options.get("endpoint"),
-            DEFAULT_REGION);
+            "No region was configured for the S3 endpoint {}, and its host names none: Lance asks "
+                + "the instance metadata service for one, which costs each data file open its "
+                + "one-second connect timeout. Set s3.region (or fs.s3a.endpoint.region) to skip "
+                + "that lookup.",
+            options.get("endpoint"));
       }
+      return;
     }
 
     options.put("region", region);

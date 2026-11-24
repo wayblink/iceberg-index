@@ -304,9 +304,10 @@ public final class IndexSearch {
       Types.NestedField field = fieldOf(table, column);
       Preconditions.checkArgument(
           field != null,
-          "Column %s of the columns parameter is not in table %s",
+          "Column %s of the columns parameter is not in table %s; the table has %s",
           column,
-          table.name());
+          table.name(),
+          columnNames(table));
       Preconditions.checkArgument(
           !resolved.contains(field.name()),
           "The columns parameter names column %s more than once",
@@ -315,6 +316,16 @@ public final class IndexSearch {
     }
 
     return resolved;
+  }
+
+  /** Every top-level column of the table, for a message that says what it could have read. */
+  private static String columnNames(org.apache.iceberg.Table table) {
+    List<String> names = Lists.newArrayList();
+    for (Types.NestedField field : table.schema().columns()) {
+      names.add(field.name());
+    }
+
+    return String.join(", ", names);
   }
 
   /**

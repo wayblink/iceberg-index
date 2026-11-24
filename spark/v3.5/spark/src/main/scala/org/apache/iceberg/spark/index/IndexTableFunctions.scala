@@ -189,7 +189,19 @@ object IndexTableFunctions {
     }
 
     val column = columnOf(searched.head).name
-    val selected = if (columns.isEmpty) relation.output else columns.map(columnOf)
+    val selected =
+      if (columns.isEmpty) {
+        relation.output
+      } else {
+        val chosen = columns.map(columnOf)
+        val seen = scala.collection.mutable.Set.empty[String]
+        chosen.foreach { attribute =>
+          if (!seen.add(attribute.name.toLowerCase(java.util.Locale.ROOT))) {
+            analysisError(s"columns names column ${attribute.name} more than once")
+          }
+        }
+        chosen
+      }
     if (relation.output.exists(attribute => attribute.name.equalsIgnoreCase(SCORE_COLUMN))) {
       analysisError(s"$tableName already has a column named $SCORE_COLUMN")
     }
@@ -281,7 +293,19 @@ object IndexTableFunctions {
     }
 
     val vector = columnOf(column)
-    val selected = if (columns.isEmpty) relation.output else columns.map(columnOf)
+    val selected =
+      if (columns.isEmpty) {
+        relation.output
+      } else {
+        val chosen = columns.map(columnOf)
+        val seen = scala.collection.mutable.Set.empty[String]
+        chosen.foreach { attribute =>
+          if (!seen.add(attribute.name.toLowerCase(java.util.Locale.ROOT))) {
+            analysisError(s"columns names column ${attribute.name} more than once")
+          }
+        }
+        chosen
+      }
     // the caller's list is not the only thing that ends up in the output, so the table itself decides
     // whether the distance can be added without a duplicate name
     if (relation.output.exists(attribute => attribute.name.equalsIgnoreCase(DISTANCE_COLUMN))) {

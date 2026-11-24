@@ -83,6 +83,12 @@ public final class SidecarIndexCatalog implements IndexCatalog {
   public static final String INDEXES_DIR = "indexes";
 
   /**
+   * The directory, relative to {@link #INDEXES_DIR}, that holds the failed-build reports. It is
+   * shared by every column of the table and named after the column, so it is not an index UUID.
+   */
+  public static final String BUILD_STATUS_DIR = "build-status";
+
+  /**
    * The table property that names the current registry file, relative to the {@code indexes}
    * directory. A table without it keeps its registry in a single file written in place.
    */
@@ -878,11 +884,11 @@ public final class SidecarIndexCatalog implements IndexCatalog {
       } catch (UncheckedIOException e) {
         // a document that cannot be parsed cannot name the version before it: the chain ends here
         LOG.warn(
-            "Stopped purging the metadata roots of {}: {} cannot be parsed",
+            "Stopped walking the metadata roots of {}: {} cannot be parsed",
             indexLocation,
             path,
             e);
-        return;
+        break;
       }
     }
 
@@ -1415,13 +1421,14 @@ public final class SidecarIndexCatalog implements IndexCatalog {
             JsonUtil.writeStringMap(REGISTRY_TABLE_UUIDS, tableUuids, generator);
           }
 
-          if (!registry.dropped().isEmpty()) {
-            generator.writeArrayFieldStart(REGISTRY_DROPPED);
-            for (String droppedUuid : registry.dropped()) {
-              generator.writeString(droppedUuid);
-            }
-            generator.writeEndArray();
+          // the field, not the set, tells a document of this build from one written before the drop
+          // record existed: a reader restores a lost registration only from a document that could
+          // have recorded the drop, so an empty set is still written
+          generator.writeArrayFieldStart(REGISTRY_DROPPED);
+          for (String droppedUuid : registry.dropped()) {
+            generator.writeString(droppedUuid);
           }
+          generator.writeEndArray();
 
           if (previousFile != null) {
             generator.writeStringField(REGISTRY_PREVIOUS_FILE, previousFile);

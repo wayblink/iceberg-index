@@ -379,23 +379,23 @@ public final class DistributedIndexSearch {
    * <p>The rows stay where they were read: the round that produced the answer kept them on the
    * executors, and the tasks that hand them on read that copy rather than reading the data files
    * again. Nothing on the driver reads the rows, so the copy outlives the call that built it. A
-   * caller that runs inside a SQL query has it released when that query ends; any other caller
-   * releases it with {@link #close()} once the rows are done with. The rows must not be read after
-   * that: the values their tasks were handed are released with the copy they read.
+   * caller that runs inside a SQL query has the kept copy released when that query ends; any other
+   * caller releases it with {@link #close()} once the rows are done with.
+   *
+   * <p>The values the tasks were handed are not released here. They are part of the row RDD's
+   * lineage: a dataset that is executed twice computes the RDD again from the same plan, so a value
+   * destroyed at the end of the first query leaves the second one with nothing to read. Their
+   * lifetime is the Spark context's, which is also what it was before the kept copy was released at
+   * all.
    */
   public static final class SearchRows implements AutoCloseable {
     private final JavaRDD<Row> rows;
     private final JavaPairRDD<String, Tuple2<Long, Row>> retained;
-    private final List<Broadcast<?>> owned;
     private final AtomicBoolean closed = new AtomicBoolean(false);
 
-    private SearchRows(
-        JavaRDD<Row> rows,
-        JavaPairRDD<String, Tuple2<Long, Row>> retained,
-        List<Broadcast<?>> owned) {
+    private SearchRows(JavaRDD<Row> rows, JavaPairRDD<String, Tuple2<Long, Row>> retained) {
       this.rows = rows;
       this.retained = retained;
-      this.owned = owned;
     }
 
     /** The rows the fetch-back found, already read on the executors that read them. */
@@ -403,9 +403,7 @@ public final class DistributedIndexSearch {
       return rows;
     }
 
-    /**
-     * Releases the rows kept for this answer and the values the tasks that read them were given.
-     */
+    /** Releases the copy of the rows kept for this answer. */
     @Override
     public void close() {
       if (!closed.compareAndSet(false, true)) {
@@ -414,14 +412,6 @@ public final class DistributedIndexSearch {
 
       if (retained != null) {
         retained.unpersist();
-      }
-
-      for (Broadcast<?> broadcast : owned) {
-        try {
-          broadcast.destroy(false);
-        } catch (RuntimeException e) {
-          LOG.warn("Failed to release a value a fetch-back shipped", e);
-        }
       }
     }
   }
@@ -861,8 +851,8 @@ public final class DistributedIndexSearch {
         // the fetch-back is a distributed read, not a loop on the driver: the files the window hits
         // are read in parallel, the same way a task reads the files it owns
         long fetchStart = System.nanoTime();
-        // the values this round's tasks are handed are part of the answer's reach: the release of
-        // the result owns them along with the rows it keeps
+        // a round that fails hands nothing on, so the values its tasks were handed are released
+        // with the rows it read rather than with the answer it did not build
         List<Broadcast<?>> roundOwned = Lists.newArrayList();
         JavaPairRDD<String, Tuple2<Long, Row>> read =
             IndexEntries.liveRowsRdd(
@@ -957,7 +947,7 @@ public final class DistributedIndexSearch {
 
       // a plan reads these rows lazily, after this method returns; the copy that saved the second
       // read of them is released when the query that reads them ends
-      SearchRows result = releaseWhenQueryEnds(spark, new SearchRows(rows, cached, owned));
+      SearchRows result = releaseWhenQueryEnds(spark, new SearchRows(rows, cached));
       handedOn = true;
       return result;
     } finally {
@@ -989,9 +979,10 @@ public final class DistributedIndexSearch {
    *
    * <p>A plan is executed lazily: the call that built the answer returns before a single row is
    * handed on, and the query that reads them ends after. Attaching to the end of that query is what
-   * lets the rows be kept for the one read they save and released as soon as nothing reads them any
-   * more, instead of being kept until a collection reclaims them. A caller outside a SQL query has
-   * no such end to attach to and closes the result itself.
+   * lets the kept copy be released as soon as nothing reads it any more, instead of being kept
+   * until a collection reclaims it. A caller outside a SQL query has no such end to attach to and
+   * closes the result itself. The values the tasks were handed are not part of that release: the
+   * same plan may be executed again, and its tasks still have to read those values.
    */
   private static SearchRows releaseWhenQueryEnds(SparkSession spark, SearchRows result) {
     SparkContext context = spark.sparkContext();
