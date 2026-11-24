@@ -35,6 +35,8 @@ import org.apache.spark.sql.types.Metadata;
 import org.apache.spark.sql.types.StructField;
 import org.apache.spark.sql.types.StructType;
 import org.apache.spark.unsafe.types.UTF8String;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 /**
  * Builds a full BM25 text index for a table snapshot and registers it.
@@ -45,6 +47,8 @@ import org.apache.spark.unsafe.types.UTF8String;
  * }</pre>
  */
 class BuildTextIndexProcedure extends BaseProcedure {
+  private static final Logger LOG = LoggerFactory.getLogger(BuildTextIndexProcedure.class);
+
   private static final ProcedureParameter TABLE_PARAM =
       requiredInParameter("table", DataTypes.StringType);
   private static final ProcedureParameter COLUMN_PARAM =
@@ -187,21 +191,34 @@ class BuildTextIndexProcedure extends BaseProcedure {
               failure.addSuppressed(unreadable);
             }
 
+            boolean treePurged = false;
             try {
               // the whole tree, not only the files a published snapshot names: an attempt that
               // failed can have written files no metadata points at yet
               IndexDrop.purgeTree(spark(), table, indexUuid);
+              treePurged = true;
             } catch (RuntimeException rollbackFailure) {
               failure.addSuppressed(rollbackFailure);
             }
 
-            try {
-              // the tree is already gone; removing the registration must not try to read it again
-              catalog.dropIndex(table.location(), indexUuid, false);
-            } catch (RuntimeException rollbackFailure) {
-              // the caller has to see the failure that ended the build; a rollback that failed is
-              // attached to it rather than thrown in its place
-              failure.addSuppressed(rollbackFailure);
+            if (treePurged) {
+              try {
+                // the tree is already gone; removing the registration must not try to read it
+                catalog.dropIndex(table.location(), indexUuid, false);
+              } catch (RuntimeException rollbackFailure) {
+                // the caller has to see the failure that ended the build; a rollback that failed is
+                // attached to it rather than thrown in its place
+                failure.addSuppressed(rollbackFailure);
+              }
+            } else {
+              // the files this attempt wrote could not be removed, so the registration stays: it is
+              // what a later drop by uuid needs to find and purge them. Dropping it here would
+              // leave
+              // files no entry names, which is the one state a product cannot clean up.
+              LOG.warn(
+                  "Keeping the registration of the failed index {} of {} so its files can be purged",
+                  indexUuid,
+                  table.name());
             }
 
             IndexProcedures.keepFailedAttempt(table, fieldId, column, indexUuid, report, failure);

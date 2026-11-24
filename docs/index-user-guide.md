@@ -577,7 +577,7 @@ CALL local.system.drop_index(table => 'db.papers', column => 'body');
 
 它按列解析任意类型的索引，`purge` 默认 `true`；输出 `index_uuid, index_type, purged`。`CALL system.drop_vector_index(...)` 保留为只认 `vector` 的旧写法；`ALTER TABLE … DROP INDEX` 与 `REFRESH INDEX` 按类型分派，文本索引仍报 `cannot be dropped: unsupported type text`，DDL 又按名字寻址而文本索引没有名字——所以文本索引走 `CALL`。
 
-`build_text_index` 中途失败（payload 写失败、task 失败、OOM 等）会像向量索引一样回滚：注销注册并 `purge` 掉本次写出的索引树，失败报告写到 `<table>/indexes/build-status/<column-field-id>/` 供 `index_build_status` 读取；同列重试不会再被残留注册拒绝，下一次成功构建会清掉失败报告。更早版本留下的注册残留（`list_indexes` 里一行 `index_type = text`、`status = NULL`、`index_files = 0`）仍可能出现在旧表上，用 `drop_index` 清掉即可（`purge => false` 可以留文件排查，随后手工删 `indexes/<uuid>/`）。
+`build_text_index` 中途失败（payload 写失败、task 失败、OOM 等）会像向量索引一样回滚：删掉本次写出的**整棵索引树**并注销注册，失败报告写到 `<table>/indexes/build-status/<column-field-id>/` 供 `index_build_status` 读取；同列重试不会再被残留注册拒绝，下一次成功构建会清掉失败报告。如果树删不掉（权限、存储故障），注销不会发生：注册保留下来，之后可以用 `drop_index(... index => '<uuid>', purge => true)` 重试清理——先注销再删树会留下没有入口的残留，所以顺序是删树在前、注销在后。更早版本留下的注册残留（`list_indexes` 里一行 `index_type = text`、`status = NULL`、`index_files = 0`）仍可能出现在旧表上，用 `drop_index` 清掉即可（`purge => false` 明确表示保留文件排查，之后需要手工删 `indexes/<uuid>/`）。
 
 ---
 
