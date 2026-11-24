@@ -93,6 +93,19 @@ final class IndexDrop {
     }
 
     boolean dropped = catalog.dropIndex(table.location(), indexUuid, purge);
+    if (dropped && purge) {
+      // the report of the builds of this index lives inside the tree the drop purges, and nothing
+      // names it once the entry is gone; it is not one of the data files the drop cannot find
+      try {
+        IndexBuildStatus.delete(
+            table.io(),
+            IndexBuildStatus.statusDirFor(
+                SidecarIndexCatalog.locationOf(table.location(), indexUuid)));
+      } catch (RuntimeException e) {
+        LOG.warn("Failed to clear the build reports of the dropped index {}", indexUuid, e);
+      }
+    }
+
     return new Result(indexUuid, dropped, dropped && purge && readable);
   }
 }

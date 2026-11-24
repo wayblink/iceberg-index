@@ -30,6 +30,7 @@ import org.apache.iceberg.ParameterizedTestExtension;
 import org.apache.iceberg.Table;
 import org.apache.iceberg.index.IndexMetadata;
 import org.apache.iceberg.index.SidecarIndexCatalog;
+import org.apache.iceberg.index.spark.IndexBuildStatus;
 import org.apache.iceberg.index.spark.VectorIndexes;
 import org.apache.iceberg.io.SeekableInputStream;
 import org.apache.iceberg.relocated.com.google.common.collect.Lists;
@@ -305,5 +306,53 @@ public class TestDropIndexProcedure extends ExtensionsTestBase {
   private Table reload() {
     return validationCatalog.loadTable(
         org.apache.iceberg.catalog.TableIdentifier.of("default", TABLE));
+  }
+
+  @TestTemplate
+  public void aDamagedEntryDropClearsItsBuildStatus() {
+    createTextTable();
+    buildTextIndex();
+    Table table = reload();
+    String uuid = VectorIndexes.findAnyIndexOrNull(table, "body").indexUuid();
+    String indexLocation = table.location() + "/" + SidecarIndexCatalog.INDEXES_DIR + "/" + uuid;
+
+    // the status a build writes about itself lives inside the index tree, so a drop that repairs a
+    // damaged entry has to clear it: nothing else names the directory once the entry is gone
+    IndexBuildStatus.write(
+        table.io(),
+        IndexBuildStatus.statusDirFor(indexLocation),
+        IndexBuildStatus.builder()
+            .state(IndexBuildStatus.State.FAILED)
+            .indexUuid(uuid)
+            .column("body")
+            .sourceSnapshotId(0L)
+            .startedAtMillis(1L)
+            .error("planted")
+            .build());
+    assertThat(statusFiles(table, indexLocation)).as("the planted build status").isNotEmpty();
+
+    deleteIndexMetadata(table, uuid);
+
+    List<Object[]> dropped =
+        sql(
+            "CALL %s.system.drop_index(table => '%s', column => 'body', index => '%s')",
+            catalogName, tableName(TABLE), uuid);
+    assertThat(dropped).hasSize(1);
+    assertThat(statusFiles(table, indexLocation))
+        .as("the build status of the index the drop repaired")
+        .isEmpty();
+  }
+
+  /** The status files a build left under the index location. */
+  private static List<String> statusFiles(Table table, String indexLocation) {
+    List<String> present = Lists.newArrayList();
+    for (int slot = 0; slot < 2; slot += 1) {
+      String path = indexLocation + "/status/build-status-" + slot + ".json";
+      if (table.io().newInputFile(path).exists()) {
+        present.add(path);
+      }
+    }
+
+    return present;
   }
 }
