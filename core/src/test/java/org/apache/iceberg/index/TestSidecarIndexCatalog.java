@@ -576,4 +576,25 @@ class TestSidecarIndexCatalog {
                 .build())
         .build();
   }
+
+  @Test
+  public void aLegacyDropPurgesTheMetadataFile(@TempDir Path tempDir) {
+    LocalFileIO fileIO = new LocalFileIO();
+    IndexCatalog catalog = new SidecarIndexCatalog(fileIO);
+    String tableLocation = tempDir.resolve("table").toString();
+    String indexUuid = "index-legacy";
+
+    catalog.createIndex(request(tableLocation, indexUuid));
+    File metadata =
+        Path.of(
+                tableLocation,
+                SidecarIndexCatalog.INDEXES_DIR,
+                indexUuid,
+                SidecarIndexCatalog.METADATA_DIR)
+            .toFile();
+    assertThat(metadata.list()).as("the metadata the registration names").isNotEmpty();
+
+    assertThat(catalog.dropIndex(tableLocation, indexUuid, true)).isTrue();
+    assertThat(metadata.list()).as("a purge removes the metadata with the index").isNullOrEmpty();
+  }
 }

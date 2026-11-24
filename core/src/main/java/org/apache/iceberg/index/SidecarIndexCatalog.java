@@ -561,6 +561,12 @@ public final class SidecarIndexCatalog implements IndexCatalog {
       purgeIndexFiles(metadata);
     }
 
+    // the documents this registration named are part of the index: a purge removes them even when
+    // the metadata could not be read, which is what makes a drop of a damaged entry a repair
+    if (purge) {
+      purgeMetadataRoots(indexLocation(tableLocation, indexUuid), null);
+    }
+
     return true;
   }
 
@@ -789,6 +795,9 @@ public final class SidecarIndexCatalog implements IndexCatalog {
           }
 
           purgeMetadataRoots(indexLocation(tableLocation, indexUuid), root);
+          // a tree written before the pointer named a single document, and a registration that
+          // outlived the switch can still have one under the same directory
+          deleteIfExists(legacyMetadataPath(indexLocation(tableLocation, indexUuid)));
         }
 
         return true;
@@ -858,7 +867,7 @@ public final class SidecarIndexCatalog implements IndexCatalog {
       String path = metadataRootPath(indexLocation, current);
       String json = readIfExists(path);
       if (json == null) {
-        return;
+        break;
       }
 
       // the file goes even when it cannot be parsed: a purge of a damaged entry is exactly the case
@@ -876,6 +885,19 @@ public final class SidecarIndexCatalog implements IndexCatalog {
         return;
       }
     }
+
+    // the slots name the document each generation published, and a purge removes them with the
+    // documents they name: nothing else ever reads a slot of an index that is gone
+    for (int slot = 0; slot < POINTER_SLOTS; slot += 1) {
+      Pointer pointer = readPointer(indexLocation, slot);
+      if (pointer != null) {
+        deleteIfExists(pointer.file);
+      }
+
+      deleteIfExists(pointerPath(indexLocation, slot));
+    }
+
+    deleteIfExists(legacyMetadataPath(indexLocation));
   }
 
   private static String metadataRootPath(String indexLocation, String name) {
@@ -1523,6 +1545,19 @@ public final class SidecarIndexCatalog implements IndexCatalog {
         registryFile,
         REGISTRY_FILE_PREFIX);
     return indexesRoot(tableLocation) + "/" + registryFile;
+  }
+
+  /**
+   * The directory of one index on the table's sidecar path.
+   *
+   * <p>A caller repairing a registry entry it can no longer read needs it: the entry names no
+   * readable tree, so the location is the only thing that identifies what is left to delete.
+   */
+  public static String locationOf(String tableLocation, String indexUuid) {
+    Preconditions.checkArgument(
+        tableLocation != null && !tableLocation.isEmpty(), "Table location is empty");
+    Preconditions.checkArgument(indexUuid != null && !indexUuid.isEmpty(), "Index UUID is empty");
+    return indexLocation(tableLocation, indexUuid);
   }
 
   private static String indexLocation(String tableLocation, String indexUuid) {
