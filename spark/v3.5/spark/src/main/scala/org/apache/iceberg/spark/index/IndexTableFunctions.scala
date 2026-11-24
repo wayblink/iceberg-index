@@ -210,7 +210,7 @@ object IndexTableFunctions {
       .scanSnapshotId(sparkTable)
       .getOrElse(
         analysisError(s"Table $tableName has no snapshot; build a text index after writing data"))
-    val frozen = SerializableTable.copyOf(icebergTable)
+    val frozen = SerializableTable.copyOfLoaded(icebergTable)
     val index =
       try {
         IndexSelection.resolve(frozen, column, "text", indexName.orNull)

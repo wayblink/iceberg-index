@@ -97,6 +97,13 @@ public class SerializableTable implements Table, HasTableOperations, Serializabl
     this.formatVersion = formatVersion(table);
   }
 
+  protected SerializableTable(Table table, TableMetadata metadata) {
+    this(table);
+    LocationProvider locationProvider =
+        locationProviderTry.isSuccess() ? locationProviderTry.getOrThrow() : null;
+    this.lazyTable = newTable(new StaticTableOperations(metadata, io, locationProvider), name);
+  }
+
   /**
    * Creates a read-only serializable table that can be sent to other nodes in a cluster.
    *
@@ -109,6 +116,45 @@ public class SerializableTable implements Table, HasTableOperations, Serializabl
     } else {
       return new SerializableTable(table);
     }
+  }
+
+  /**
+   * Creates a read-only serializable table that can be sent to other nodes in a cluster, using the
+   * metadata the caller has already loaded.
+   *
+   * <p>The copy keeps that metadata so that the driver does not read the metadata file again to
+   * answer {@link #currentSnapshot()}, {@link #snapshot(long)}, or {@link #newScan()}. The metadata
+   * is transient: a copy deserialized on another node falls back to the metadata file location, as
+   * before.
+   *
+   * @param table the original table to copy the state from
+   * @param metadata the current metadata of the original table, already loaded
+   * @return a read-only serializable table reflecting that state
+   */
+  public static Table copyOf(Table table, TableMetadata metadata) {
+    if (metadata == null || table instanceof BaseMetadataTable) {
+      return copyOf(table);
+    }
+
+    return new SerializableTable(table, metadata);
+  }
+
+  /**
+   * Creates a read-only serializable table from a table whose metadata is already loaded.
+   *
+   * <p>This is {@link #copyOf(Table)} for a table that carries its own {@link TableOperations}: the
+   * loaded metadata is handed to the copy, so the driver does not read the metadata file again. A
+   * table without operations, or a metadata table, falls back to {@link #copyOf(Table)}.
+   *
+   * @param table the original table to copy the state from
+   * @return a read-only serializable table reflecting the loaded state of the original table
+   */
+  public static Table copyOfLoaded(Table table) {
+    if (table instanceof HasTableOperations && !(table instanceof BaseMetadataTable)) {
+      return copyOf(table, ((HasTableOperations) table).operations().current());
+    }
+
+    return copyOf(table);
   }
 
   public String metadataFileLocation() {

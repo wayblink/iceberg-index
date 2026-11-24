@@ -47,7 +47,9 @@ private[spark] object BindVectorSearch {
     } else {
       input.table
     }
-    val frozen = SerializableTable.copyOf(liveTable)
+    // the caller already holds the loaded metadata: hand it to the copy instead of letting it read
+    // the metadata file again on every bind (that read is one object-store GET per query)
+    val frozen = SerializableTable.copyOfLoaded(liveTable)
     val snapshot = if (input.tableSnapshotId == null) {
       frozen.currentSnapshot()
     } else {

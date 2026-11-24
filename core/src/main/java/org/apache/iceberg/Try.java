@@ -53,6 +53,11 @@ class Try<T> implements Serializable {
     }
   }
 
+  /** Returns whether the operation succeeded. */
+  boolean isSuccess() {
+    return throwable == null;
+  }
+
   /** Returns the value if present or throws the original exception if the operation failed. */
   T getOrThrow() {
     if (throwable != null) {
