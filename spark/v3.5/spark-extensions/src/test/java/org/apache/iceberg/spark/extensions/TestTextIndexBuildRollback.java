@@ -23,7 +23,13 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 import java.io.IOException;
 import java.io.UncheckedIOException;
+import java.net.URI;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
 import java.util.List;
+import java.util.stream.Collectors;
+import java.util.stream.Stream;
 import org.apache.iceberg.CatalogProperties;
 import org.apache.iceberg.ParameterizedTestExtension;
 import org.apache.iceberg.Parameters;
@@ -103,6 +109,12 @@ public class TestTextIndexBuildRollback extends ExtensionsTestBase {
     Table table = Spark3Util.loadIcebergTable(spark, tableName);
     assertThat(new SidecarIndexCatalog(table.io(), table).listIndexes(table.location())).isEmpty();
 
+    // the registration is not the only thing that has to go: an attempt that failed can have
+    // written files no metadata points at, and the purge deletes the tree that holds them
+    assertThat(indexDirectories(table))
+        .as("index directories under the table's index root after a failed build")
+        .isEmpty();
+
     // the failure the rollback deleted the report of is still readable, or the only account of why
     // the build failed would be gone with the index it described
     List<Object[]> failed =
@@ -170,6 +182,22 @@ public class TestTextIndexBuildRollback extends ExtensionsTestBase {
       }
 
       return super.newOutputFile(path);
+    }
+  }
+
+  /** The directories under the table's index root, which one index each should fill. */
+  private static List<Path> indexDirectories(Table table) throws IOException {
+    Path root = Paths.get(URI.create(table.location())).resolve("indexes");
+    if (!Files.exists(root)) {
+      return List.of();
+    }
+
+    try (Stream<Path> entries = Files.list(root)) {
+      // the report of the failed attempt is column-keyed and stays outside any index's tree
+      return entries
+          .filter(Files::isDirectory)
+          .filter(entry -> !entry.getFileName().toString().equals("build-status"))
+          .collect(Collectors.toList());
     }
   }
 }

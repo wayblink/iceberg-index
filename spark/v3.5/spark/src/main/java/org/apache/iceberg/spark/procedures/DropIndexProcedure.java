@@ -115,7 +115,7 @@ class DropIndexProcedure extends BaseProcedure {
             SidecarIndexCatalog catalog = VectorIndexProcedures.indexCatalog(table);
             if (selection != null
                 && catalog.damagedIndexUuids(table.location()).contains(selection)) {
-              IndexDrop.Result damaged = IndexDrop.dropByUuid(table, selection, purge);
+              IndexDrop.Result damaged = IndexDrop.dropByUuid(spark(), table, selection, purge);
               if (damaged.dropped()) {
                 return new InternalRow[] {
                   newInternalRow(
@@ -129,7 +129,7 @@ class DropIndexProcedure extends BaseProcedure {
             throw e;
           }
 
-          IndexDrop.Result dropped = IndexDrop.drop(table, metadata, purge);
+          IndexDrop.Result dropped = IndexDrop.drop(spark(), table, metadata, purge);
           return new InternalRow[] {
             newInternalRow(
                 UTF8String.fromString(dropped.indexUuid()),

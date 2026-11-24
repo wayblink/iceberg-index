@@ -188,7 +188,16 @@ class BuildTextIndexProcedure extends BaseProcedure {
             }
 
             try {
-              catalog.dropIndex(table.location(), indexUuid, true);
+              // the whole tree, not only the files a published snapshot names: an attempt that
+              // failed can have written files no metadata points at yet
+              IndexDrop.purgeTree(spark(), table, indexUuid);
+            } catch (RuntimeException rollbackFailure) {
+              failure.addSuppressed(rollbackFailure);
+            }
+
+            try {
+              // the tree is already gone; removing the registration must not try to read it again
+              catalog.dropIndex(table.location(), indexUuid, false);
             } catch (RuntimeException rollbackFailure) {
               // the caller has to see the failure that ended the build; a rollback that failed is
               // attached to it rather than thrown in its place

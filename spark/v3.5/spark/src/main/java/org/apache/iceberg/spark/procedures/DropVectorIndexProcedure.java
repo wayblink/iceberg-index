@@ -97,7 +97,7 @@ class DropVectorIndexProcedure extends BaseProcedure {
         input.ident(TABLE_PARAM),
         table -> {
           IndexMetadata metadata = IndexProcedures.resolveIndex(table, column, "vector", input);
-          IndexDrop.Result dropped = IndexDrop.drop(table, metadata, purge);
+          IndexDrop.Result dropped = IndexDrop.drop(spark(), table, metadata, purge);
           InternalRow row =
               newInternalRow(UTF8String.fromString(dropped.indexUuid()), dropped.purged());
           return new InternalRow[] {row};

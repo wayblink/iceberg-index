@@ -24,7 +24,11 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import com.fasterxml.jackson.databind.JsonNode;
 import java.io.IOException;
 import java.io.UncheckedIOException;
+import java.net.URI;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
 import java.util.List;
 import org.apache.iceberg.ParameterizedTestExtension;
 import org.apache.iceberg.Table;
@@ -187,6 +191,10 @@ public class TestDropIndexProcedure extends ExtensionsTestBase {
     Table table = reload();
     String uuid = VectorIndexes.findAnyIndexOrNull(table, "body").indexUuid();
     deleteIndexMetadata(table, uuid);
+    String indexLocation = table.location() + "/" + SidecarIndexCatalog.INDEXES_DIR + "/" + uuid;
+    // a file the metadata never named: an attempt that died before publishing leaves them, and only
+    // the tree itself knows they are there
+    plantOrphan(indexLocation);
 
     // one entry whose metadata is gone no longer fails the listing of the table
     assertThat(listIndexes()).isEmpty();
@@ -203,13 +211,45 @@ public class TestDropIndexProcedure extends ExtensionsTestBase {
         .as("a damaged entry has no readable index type")
         .isEqualTo("unknown");
     assertThat((Boolean) dropped.get(0)[2])
-        .as("the drop cannot find the data files of an entry it cannot read, so nothing was purged")
+        .as("the purge deletes the tree even when the metadata cannot be read")
+        .isTrue();
+    assertThat(Files.exists(Paths.get(URI.create(indexLocation))))
+        .as("the whole tree of a damaged entry after the purge")
         .isFalse();
 
     // and the column can be indexed again once the registry is repaired
     List<Object[]> rebuilt = buildTextIndex();
     assertThat(rebuilt).hasSize(1);
     assertThat(listIndexes()).containsExactly(rebuilt.get(0)[0].toString());
+  }
+
+  @TestTemplate
+  public void aPurgeDeletesTheWholeIndexTree() {
+    createTextTable();
+    buildTextIndex();
+    Table table = reload();
+    String uuid = VectorIndexes.findAnyIndexOrNull(table, "body").indexUuid();
+    String indexLocation = table.location() + "/" + SidecarIndexCatalog.INDEXES_DIR + "/" + uuid;
+    plantOrphan(indexLocation);
+
+    List<Object[]> dropped = dropByColumn("");
+    assertThat(dropped).hasSize(1);
+    assertThat((Boolean) dropped.get(0)[2]).as("purged").isTrue();
+    assertThat(Files.exists(Paths.get(URI.create(indexLocation))))
+        .as("the tree of a purged index, including the files no snapshot named")
+        .isFalse();
+  }
+
+  /** Writes a file under the index's data directory that its metadata does not name. */
+  private static void plantOrphan(String indexLocation) {
+    try {
+      Path orphan =
+          Paths.get(URI.create(indexLocation + "/data/orphan-from-a-dead-attempt.parquet"));
+      Files.createDirectories(orphan.getParent());
+      Files.write(orphan, new byte[] {1, 2, 3});
+    } catch (java.io.IOException e) {
+      throw new java.io.UncheckedIOException(e);
+    }
   }
 
   @TestTemplate

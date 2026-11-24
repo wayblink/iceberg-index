@@ -18,10 +18,14 @@
  */
 package org.apache.iceberg.spark.procedures;
 
+import java.io.IOException;
+import java.io.UncheckedIOException;
+import org.apache.hadoop.fs.FileSystem;
+import org.apache.hadoop.fs.Path;
 import org.apache.iceberg.Table;
 import org.apache.iceberg.index.IndexMetadata;
 import org.apache.iceberg.index.SidecarIndexCatalog;
-import org.apache.iceberg.index.spark.IndexBuildStatus;
+import org.apache.spark.sql.SparkSession;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -47,19 +51,17 @@ final class IndexDrop {
    * <p>{@code purge} deletes the index files. Leaving them behind is for a caller that wants to
    * read the index after it is unregistered; such files are garbage to everyone else.
    */
-  static Result drop(Table table, IndexMetadata metadata, boolean purge) {
+  static Result drop(SparkSession spark, Table table, IndexMetadata metadata, boolean purge) {
     SidecarIndexCatalog catalog = VectorIndexProcedures.indexCatalog(table);
-    boolean dropped = catalog.dropIndex(table.location(), metadata.indexUuid(), purge);
-    if (dropped && purge) {
-      // the report of the builds of this index lives beside the tree the drop purges, so it is
-      // cleared here rather than left behind with nothing to describe
-      try {
-        IndexBuildStatus.delete(table.io(), IndexBuildStatus.statusDirFor(metadata.location()));
-      } catch (RuntimeException e) {
-        LOG.warn(
-            "Failed to clear the build reports of the dropped index {}", metadata.indexUuid(), e);
-      }
+    if (purge) {
+      // before the registration goes: a tree that cannot be deleted that way leaves the entry in
+      // place, so the drop can be retried instead of leaving files nothing names any more
+      purgeTree(spark, table, metadata.indexUuid());
     }
+
+    // the tree already holds no file: the registration is removed without a second purge, which
+    // would read the metadata the tree no longer has
+    boolean dropped = catalog.dropIndex(table.location(), metadata.indexUuid(), false);
 
     // the column reports whether files were purged, which is what the caller asked for and what
     // the row is for; whether the index was still registered is an error when it was not
@@ -75,37 +77,48 @@ final class IndexDrop {
    *
    * @return whether the registry named the entry, which is false for a UUID it never held
    */
-  static Result dropByUuid(Table table, String indexUuid, boolean purge) {
+  static Result dropByUuid(SparkSession spark, Table table, String indexUuid, boolean purge) {
     SidecarIndexCatalog catalog = VectorIndexProcedures.indexCatalog(table);
-    boolean readable;
+    if (purge) {
+      // a damaged entry has no readable metadata to enumerate its files from, so the tree its UUID
+      // names is the only complete list; it is deleted before the entry so a failure leaves the
+      // entry to retry
+      purgeTree(spark, table, indexUuid);
+    }
+
+    // the tree already holds no file: the entry is removed without a second purge, which would
+    // read the metadata the tree no longer has
+    boolean dropped = catalog.dropIndex(table.location(), indexUuid, false);
+    return new Result(indexUuid, dropped, dropped && purge);
+  }
+
+  /**
+   * Deletes the tree under one index's UUID, which is everything a purge has to remove.
+   *
+   * <p>Enumerating payloads from the metadata finds the files a retained snapshot names, which
+   * leaves the files an attempt wrote but never published, and for a damaged entry the metadata is
+   * exactly what is gone. Nothing under {@code indexes/<uuid>} is shared with another index and
+   * nothing names the directory after the entry is removed, so the purge deletes it whole.
+   *
+   * <p>The UUID becomes a path, and it comes from a registry a hand edit could corrupt: a value
+   * that walked out of the index root would turn a purge into a delete of something else, so a
+   * value that is not a plain name is refused.
+   */
+  static void purgeTree(SparkSession spark, Table table, String indexUuid) {
+    if (indexUuid == null || !indexUuid.matches("[A-Za-z0-9_-]+")) {
+      throw new IllegalArgumentException("Invalid index UUID for a purge: " + indexUuid);
+    }
+
+    String location = SidecarIndexCatalog.locationOf(table.location(), indexUuid);
+    Path path = new Path(location);
     try {
-      catalog.loadIndex(table.location(), indexUuid);
-      readable = true;
-    } catch (RuntimeException e) {
-      // a damaged entry has no readable metadata: the drop removes the registration and the
-      // metadata tree it can still see, but it cannot know the data files the index wrote, so the
-      // purge it reports is only the part that happened
-      LOG.warn(
-          "Dropping index {} without its metadata: its files cannot be purged by the drop",
-          indexUuid,
-          e);
-      readable = false;
-    }
-
-    boolean dropped = catalog.dropIndex(table.location(), indexUuid, purge);
-    if (dropped && purge) {
-      // the report of the builds of this index lives inside the tree the drop purges, and nothing
-      // names it once the entry is gone; it is not one of the data files the drop cannot find
-      try {
-        IndexBuildStatus.delete(
-            table.io(),
-            IndexBuildStatus.statusDirFor(
-                SidecarIndexCatalog.locationOf(table.location(), indexUuid)));
-      } catch (RuntimeException e) {
-        LOG.warn("Failed to clear the build reports of the dropped index {}", indexUuid, e);
+      FileSystem fileSystem = path.getFileSystem(spark.sessionState().newHadoopConf());
+      if (fileSystem.exists(path) && !fileSystem.delete(path, true)) {
+        throw new UncheckedIOException(
+            new IOException("Failed to delete the index tree " + location));
       }
+    } catch (IOException e) {
+      throw new UncheckedIOException("Failed to delete the index tree " + location, e);
     }
-
-    return new Result(indexUuid, dropped, dropped && purge && readable);
   }
 }
