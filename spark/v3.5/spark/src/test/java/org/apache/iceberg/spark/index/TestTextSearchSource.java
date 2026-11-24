@@ -428,6 +428,7 @@ class TestTextSearchSource {
     return table;
   }
 
+  @Test
   void resolvesOnlyTheRequestedColumnsOfAHit() {
     spark.sql(
         "CREATE TABLE local.db.projected_row (id bigint, body string, note string) USING iceberg");
