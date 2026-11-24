@@ -48,6 +48,7 @@ import org.apache.spark.sql.SparkSession;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.condition.EnabledIfSystemProperty;
 import org.junit.jupiter.api.io.TempDir;
 import scala.runtime.BoxedUnit;
 
@@ -57,6 +58,12 @@ import scala.runtime.BoxedUnit;
  * harness; it is meant to be run on its own against one implementation at a time and the numbers
  * compared.
  */
+@EnabledIfSystemProperty(
+    named = "iceberg.test.text.answer.profile",
+    matches = "true",
+    disabledReason =
+        "Profiles the cost of assembling an answer; it is a measurement, not a regression test, and"
+            + " it builds megabytes of text and runs minutes of queries")
 class TestTextSearchAnswerOrder {
   private static final int FILES = 8;
   private static final int ROWS = 10000;

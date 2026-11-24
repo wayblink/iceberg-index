@@ -276,7 +276,7 @@ case class RewriteTextSearch(spark: SparkSession) extends Rule[LogicalPlan] {
     val ordered = orderByScoreColumn(pointed, bound, scoreAttribute)
     val remaining = scoresOf(ordered, bound)
     if (remaining.isEmpty) {
-      Some(ordered)
+      Some(Project(node.output, ordered))
     } else {
       statisticsOf(bound, column) match {
         case Some(statistics) =>
@@ -288,7 +288,7 @@ case class RewriteTextSearch(spark: SparkSession) extends Rule[LogicalPlan] {
               table.name(),
               remaining.size: java.lang.Integer,
               snapshotId: java.lang.Long): _*)
-          Some(bindScores(ordered, bound, statistics))
+          Some(Project(node.output, bindScores(ordered, bound, statistics)))
         case None =>
           logger.warn(
             "Text search of column {} of table {} leaves scores outside the reach of the index"

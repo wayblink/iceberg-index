@@ -29,6 +29,7 @@ import java.util.stream.Collectors;
 import org.apache.iceberg.index.text.TextIndexTypes;
 import org.apache.spark.scheduler.SparkListener;
 import org.apache.spark.scheduler.SparkListenerJobStart;
+import org.apache.spark.sql.Dataset;
 import org.apache.spark.sql.Row;
 import org.apache.spark.sql.SparkSession;
 import org.junit.jupiter.api.AfterAll;
@@ -79,6 +80,26 @@ class TestRewriteTextSearch {
     if (spark != null) {
       spark.stop();
     }
+  }
+
+  @Test
+  void keepsTheOutputOfADataframeRankingUnchanged() {
+    String table = tableWithIndex("docs_dataframe_ranking");
+    org.apache.spark.sql.Column score =
+        org.apache.spark.sql.functions.call_function(
+            "text_score",
+            org.apache.spark.sql.functions.col("body"),
+            org.apache.spark.sql.functions.lit("the fox"));
+    Dataset<Row> ranked = spark.table("local." + table).orderBy(score.desc()).limit(2);
+
+    // no select list means the engine's own plan must not grow the output by the score column the
+    // rewrite carries inside the source
+    assertThat(ranked.columns()).containsExactly("id", "body");
+    // the caller asked for two columns and the plan the rewrite returns has to carry those two: a
+    // score column left in it would make every downstream read of the plan wider than the dataset
+    assertThat(ranked.queryExecution().optimizedPlan().output().size()).isEqualTo(2);
+    List<Row> rows = ranked.collectAsList();
+    assertThat(rows).hasSize(2);
   }
 
   @Test
