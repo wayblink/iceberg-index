@@ -27,6 +27,7 @@ import java.util.Collection;
 import java.util.Collections;
 import java.util.Comparator;
 import java.util.Iterator;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.NoSuchElementException;
@@ -2291,9 +2292,23 @@ public final class IndexEntries {
     return scanTasks(table, snapshotId, List.of());
   }
 
-  /** Plans the snapshot's files and retains column statistics for the requested columns. */
+  /**
+   * Plans the snapshot's files and retains column statistics for the requested columns.
+   *
+   * <p>The plan of a snapshot is immutable, and planning it reads the snapshot's manifest list and
+   * every manifest. A query plans the snapshot once for its index and once more for the rows it
+   * reads, so the second plan is a cache hit rather than a second pass over the object store.
+   */
   public static List<FileScanTask> scanTasks(
       Table table, long snapshotId, Collection<String> statsColumns) {
+    List<Object> key =
+        ImmutableList.<Object>of(
+            String.valueOf(table.uuid()), snapshotId, ImmutableList.copyOf(statsColumns));
+    List<FileScanTask> cached = cachedPlan(key);
+    if (cached != null) {
+      return cached;
+    }
+
     TableScan scan = table.newScan().useSnapshot(snapshotId);
     if (!statsColumns.isEmpty()) {
       scan = scan.includeColumnStats(statsColumns);
@@ -2308,7 +2323,49 @@ public final class IndexEntries {
       throw new UncheckedIOException(
           "Failed to plan files for snapshot " + snapshotId + " of table " + table.name(), e);
     }
-    return tasks;
+
+    List<FileScanTask> plan = ImmutableList.copyOf(tasks);
+    cachePlan(key, plan);
+    return plan;
+  }
+
+  /** How many snapshots' plans an application keeps, and how many tasks those plans may hold. */
+  private static final int CACHED_PLANS = 8;
+
+  private static final int CACHED_PLAN_TASKS = 20000;
+
+  private static final Map<List<Object>, List<FileScanTask>> PLAN_CACHE =
+      Collections.synchronizedMap(
+          new LinkedHashMap<List<Object>, List<FileScanTask>>(16, 0.75f, true));
+
+  private static int cachedPlanTasks = 0;
+
+  private static List<FileScanTask> cachedPlan(List<Object> key) {
+    synchronized (PLAN_CACHE) {
+      return PLAN_CACHE.get(key);
+    }
+  }
+
+  private static void cachePlan(List<Object> key, List<FileScanTask> plan) {
+    synchronized (PLAN_CACHE) {
+      List<FileScanTask> previous = PLAN_CACHE.put(key, plan);
+      if (previous != null) {
+        cachedPlanTasks -= previous.size();
+      }
+      cachedPlanTasks += plan.size();
+      // the newest plan is the one this call needs: it stays even when it alone is over the budget
+      Iterator<Map.Entry<List<Object>, List<FileScanTask>>> eldest =
+          PLAN_CACHE.entrySet().iterator();
+      while (eldest.hasNext()
+          && (PLAN_CACHE.size() > CACHED_PLANS || cachedPlanTasks > CACHED_PLAN_TASKS)) {
+        Map.Entry<List<Object>, List<FileScanTask>> entry = eldest.next();
+        if (entry.getKey().equals(key)) {
+          break;
+        }
+        cachedPlanTasks -= entry.getValue().size();
+        eldest.remove();
+      }
+    }
   }
 
   private static List<DeleteFile> positionDeletes(List<DeleteFile> deleteFiles) {
