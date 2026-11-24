@@ -59,6 +59,7 @@ public class TestTextIndexProcedures extends ExtensionsTestBase {
     sql("DROP TABLE IF EXISTS %s", tableName("text_refresh_" + catalogName));
     sql("DROP TABLE IF EXISTS %s", tableName("text_errors_" + catalogName));
     sql("DROP TABLE IF EXISTS %s", tableName("text_batch_" + catalogName));
+    sql("DROP TABLE IF EXISTS %s", tableName("text_columns_" + catalogName));
   }
 
   @TestTemplate
@@ -378,6 +379,96 @@ public class TestTextIndexProcedures extends ExtensionsTestBase {
 
       sql("DROP TABLE IF EXISTS %s PURGE", tableName);
     }
+  }
+
+  @TestTemplate
+  public void textSearchAnswersOnlyTheColumnsItWasGiven() {
+    String tableName = searchableTable("text_columns_" + catalogName);
+
+    // the row of a hit is the projection the call names, in the order it names it: what the JSON
+    // object carries is what the fetch-back read, so nothing else was read either
+    List<Object[]> named =
+        sql(
+            "CALL %s.system.text_search(table => '%s', column => 'body', "
+                + "query => 'iceberg table', k => 1, columns => array('note', 'id'))",
+            catalogName, tableName);
+    assertThat(named).hasSize(1);
+    assertThat(named.get(0)[3]).isEqualTo("{\"note\":\"first\",\"id\":1}");
+
+    // the batch entry point answers with the same projection
+    List<Object[]> batch =
+        sql(
+            "CALL %s.system.text_search_batch(table => '%s', column => 'body', "
+                + "queries => array('iceberg table'), k => 1, columns => array('id'))",
+            catalogName, tableName);
+    assertThat(batch).hasSize(1);
+    assertThat(batch.get(0)[4]).isEqualTo("{\"id\":1}");
+  }
+
+  @TestTemplate
+  public void textSearchWithoutColumnsAnswersTheWholeRow() {
+    String tableName = searchableTable("text_columns_" + catalogName);
+
+    // a call that names no columns answers the way it always has: the whole matched row, under the
+    // names and in the order the table declares them
+    List<Object[]> whole =
+        sql(
+            "CALL %s.system.text_search(table => '%s', column => 'body', "
+                + "query => 'iceberg table', k => 1)",
+            catalogName, tableName);
+    assertThat(whole).hasSize(1);
+    assertThat(whole.get(0)[3])
+        .isEqualTo("{\"id\":1,\"body\":\"iceberg table format\",\"note\":\"first\"}");
+
+    List<Object[]> batch =
+        sql(
+            "CALL %s.system.text_search_batch(table => '%s', column => 'body', "
+                + "queries => array('iceberg table'), k => 1)",
+            catalogName, tableName);
+    assertThat(batch).hasSize(1);
+    assertThat(batch.get(0)[4])
+        .isEqualTo("{\"id\":1,\"body\":\"iceberg table format\",\"note\":\"first\"}");
+  }
+
+  @TestTemplate
+  public void textSearchRefusesAColumnTheTableDoesNotHave() {
+    String tableName = searchableTable("text_columns_" + catalogName);
+
+    // a column the table does not have is refused rather than answered with a null, and the message
+    // names the argument that was wrong
+    assertThatThrownBy(
+            () ->
+                sql(
+                    "CALL %s.system.text_search(table => '%s', column => 'body', "
+                        + "query => 'iceberg table', k => 1, columns => array('nope'))",
+                    catalogName, tableName))
+        .isInstanceOf(RuntimeException.class)
+        .hasMessageContaining("columns parameter")
+        .hasMessageContaining("nope");
+
+    assertThatThrownBy(
+            () ->
+                sql(
+                    "CALL %s.system.text_search_batch(table => '%s', column => 'body', "
+                        + "queries => array('iceberg table'), k => 1, columns => array('nope'))",
+                    catalogName, tableName))
+        .isInstanceOf(RuntimeException.class)
+        .hasMessageContaining("columns parameter");
+  }
+
+  /**
+   * A table with a text index on {@code body} and two documents, {@code id} of the best being 1.
+   */
+  private String searchableTable(String name) {
+    String tableName = tableName(name);
+    sql("CREATE TABLE %s (id bigint, body string, note string) USING iceberg", tableName);
+    sql(
+        "INSERT INTO %s VALUES "
+            + "(1, 'iceberg table format', 'first'), "
+            + "(2, 'iceberg vector index', 'second')",
+        tableName);
+    sql("CALL %s.system.build_text_index(table => '%s', column => 'body')", catalogName, tableName);
+    return tableName;
   }
 
   private static List<Long> searchIds(List<Object[]> output) {

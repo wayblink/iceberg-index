@@ -37,6 +37,7 @@ import org.apache.spark.sql.catalyst.expressions.Alias
 import org.apache.spark.sql.catalyst.expressions.And
 import org.apache.spark.sql.catalyst.expressions.Attribute
 import org.apache.spark.sql.catalyst.expressions.AttributeReference
+import org.apache.spark.sql.catalyst.expressions.AttributeSet
 import org.apache.spark.sql.catalyst.expressions.Descending
 import org.apache.spark.sql.catalyst.expressions.Expression
 import org.apache.spark.sql.catalyst.expressions.GenericInternalRow
@@ -85,6 +86,11 @@ import scala.collection.JavaConverters._
  * query terms and the average document length, so an older snapshot would give scores a full scan
  * cannot reproduce, and the data files it does not cover would not be scored at all. An index that
  * is behind therefore means leaving the plan as it is.
+ *
+ * <p>A lowered search reads the columns its answer carries, so it is narrowed to the columns the plan
+ * above it names and the score: a query that names one column reads one column of each hit data file
+ * rather than every column of the table. That is a read optimization only, which is why it needs no
+ * argument and changes no answer.
  */
 case class RewriteTextSearch(spark: SparkSession) extends Rule[LogicalPlan] {
 
@@ -94,7 +100,7 @@ case class RewriteTextSearch(spark: SparkSession) extends Rule[LogicalPlan] {
   private val MaxMatchRows = 100000
 
   /** The name the lowered source gives the score of a hit. */
-  private val ScoreColumn = "_score"
+  private val ScoreColumn = TextSearchSource.ScoreColumn
 
   override def apply(plan: LogicalPlan): LogicalPlan = {
     // each search answered while planning, with the node that now stands in its place: binding its
@@ -121,9 +127,48 @@ case class RewriteTextSearch(spark: SparkSession) extends Rule[LogicalPlan] {
         }
     }
 
-    boundSearches.foldLeft(rewritten) { case (current, (target, bound, statistics)) =>
-      bindPath(current, target, bound, statistics)._1
+    val bound =
+      boundSearches.foldLeft(rewritten) { case (current, (target, index, statistics)) =>
+        bindPath(current, target, index, statistics)._1
+      }
+
+    // the columns a search reads are the columns its answer carries, and what the answer carries is
+    // known once the search stands in the plan it was lowered into
+    pruneSearchColumns(bound)
+  }
+
+  /**
+   * Narrows every lowered search to the columns the plan above it names.
+   *
+   * <p>A search reads the columns its answer carries, so a search that answers with every column of
+   * the table reads every column of every hit data file even when the query names one of them. Only
+   * the plan above says which of them are named, and lowering a query does not see that plan, so the
+   * pass runs over the plan the lowering produced.
+   *
+   * <p>The pass is a read optimization: no row and no value changes, only the columns a hit data file
+   * is read into. It walks through the nodes a ranking query is made of, and through nothing else: a
+   * join, an aggregate or a distinct above the search decides which rows the answer has by the values
+   * of columns it does not name, and dropping one of those columns would change the answer.
+   */
+  private def pruneSearchColumns(plan: LogicalPlan): LogicalPlan = {
+    def prune(node: LogicalPlan, needed: AttributeSet): LogicalPlan = node match {
+      case source: TextSearchSource => source.answeringOnly(needed)
+      case project: Project =>
+        // a projection answers with its own attributes, so its child is only asked for what its
+        // expressions name
+        project.withNewChildren(
+          Seq(prune(project.child, AttributeSet(project.projectList.flatMap(_.references)))))
+      case unary @ (_: Filter | _: Sort | _: GlobalLimit | _: LocalLimit | _: SubqueryAlias) =>
+        // these answer with the attributes of their child, so what is needed above them is needed
+        // below them, and what they say themselves is needed as well
+        val child = unary.children.head
+        unary.withNewChildren(
+          Seq(prune(child, needed.intersect(child.outputSet) ++ unary.references)))
+      case other =>
+        other.withNewChildren(other.children.map(child => prune(child, child.outputSet)))
     }
+
+    prune(plan, AttributeSet.empty)
   }
 
   /** A lowered source is not lowered again, so repeated optimization keeps the same plan. */

@@ -41,6 +41,7 @@ import org.apache.spark.sql.catalyst.CatalystTypeConverters
 import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.analysis.IndexErrors
 import org.apache.spark.sql.catalyst.expressions.Attribute
+import org.apache.spark.sql.catalyst.expressions.AttributeSet
 import org.apache.spark.sql.catalyst.expressions.BindReferences
 import org.apache.spark.sql.catalyst.expressions.Expression
 import org.apache.spark.sql.catalyst.expressions.InterpretedPredicate
@@ -75,15 +76,53 @@ private[spark] case class TextSearchSource(
     override val output: Seq[Attribute])
     extends LeafNode {
 
+  /**
+   * The columns of the table the answer carries, which are the columns the fetch-back reads.
+   *
+   * <p>This is the one place a search's columns come from, whether a caller named them, as the table
+   * function does, or the plan above named them, as a lowered SQL query does. The score is the last
+   * attribute of the answer and is not one of them: no data file carries it, the source computes it.
+   */
+  def readColumns: Seq[String] = output.dropRight(1).map(_.name)
+
+  /**
+   * The same search answering only the columns the plan above it names, and the score.
+   *
+   * <p>A search reads the columns its answer carries, so answering with every column of the table
+   * reads every column of every hit data file even for a query that names one of them. The score is
+   * kept whether or not it is named: it is one number the source already has, and a ranking needs it.
+   * It is kept as the attribute it is, not as a column of that name: a table may hold a column a
+   * search would call the same.
+   *
+   * <p>A search whose rows no ancestor reads a column of is left as it is rather than read with no
+   * projection at all: what a fetch-back does with no column to read is a property of the data file
+   * format, and a query that names no column does not ask for one.
+   */
+  def answeringOnly(needed: AttributeSet): TextSearchSource = {
+    val kept = output.dropRight(1).filter(needed.contains) :+ output.last
+    if (kept.size == output.size || kept.size == 1) {
+      this
+    } else {
+      copy(output = kept)
+    }
+  }
+
   override protected def stringArgs: Iterator[Any] =
     Iterator(
       s"index=${metadata.indexUuid()}",
       s"snapshot=$snapshotId",
       s"k=$limit",
-      s"prefilter=${filter.isDefined}")
+      s"prefilter=${filter.isDefined}",
+      s"reads=${readColumns.mkString("[", ", ", "]")}")
 
   override def computeStats(): Statistics =
     Statistics(BigInt(limit) * math.max(1, output.map(_.dataType.defaultSize).sum))
+}
+
+private[spark] object TextSearchSource {
+
+  /** The column a search answers with the score of a hit, which no data file carries. */
+  val ScoreColumn = "_score"
 }
 
 /** Runs distributed scoring and reads only the rows that won the global merge. */
@@ -134,7 +173,7 @@ private[spark] case class TextSearchExec(
       return spark.sparkContext.emptyRDD[InternalRow]
     }
 
-    val columns = output.dropRight(1).map(_.name)
+    val columns = source.readColumns
     val readSchema = IndexEntries.sparkSchema(table, columns.asJava)
     val resultSchema = StructType(output.map(a => StructField(a.name, a.dataType, a.nullable)))
 

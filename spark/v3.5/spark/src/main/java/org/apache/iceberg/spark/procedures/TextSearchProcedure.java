@@ -18,6 +18,7 @@
  */
 package org.apache.iceberg.spark.procedures;
 
+import java.util.Arrays;
 import java.util.List;
 import org.apache.iceberg.index.IndexMetadata;
 import org.apache.iceberg.index.spark.DistributedIndexSearch;
@@ -44,9 +45,17 @@ import org.slf4j.LoggerFactory;
  * <p>Returns the row reference ({@code _file} + {@code _pos}) of each hit with its score, plus the
  * matched row itself as a JSON string. Rows are ordered by score, descending.
  *
+ * <p>{@code columns} names the columns of the matched row to answer with, in the order the JSON
+ * object carries them. Only those columns are read: the ones named are the fetch-back's projection.
+ * A call that names none answers with the whole row, as it always has.
+ *
  * <pre>{@code
  * CALL spark_catalog.system.text_search(
  *   table => 'db.documents', column => 'body', query => 'iceberg vector search', k => 10);
+ *
+ * CALL spark_catalog.system.text_search(
+ *   table => 'db.documents', column => 'body', query => 'iceberg vector search', k => 10,
+ *   columns => array('doc_uuid', 'title'));
  * }</pre>
  */
 class TextSearchProcedure extends BaseProcedure {
@@ -58,9 +67,11 @@ class TextSearchProcedure extends BaseProcedure {
   private static final ProcedureParameter QUERY_PARAM =
       requiredInParameter("query", DataTypes.StringType);
   private static final ProcedureParameter K_PARAM = requiredInParameter("k", DataTypes.IntegerType);
+  private static final ProcedureParameter COLUMNS_PARAM =
+      optionalInParameter("columns", DataTypes.createArrayType(DataTypes.StringType));
   private static final ProcedureParameter[] PARAMETERS =
       new ProcedureParameter[] {
-        TABLE_PARAM, COLUMN_PARAM, QUERY_PARAM, K_PARAM, IndexProcedures.INDEX_PARAM
+        TABLE_PARAM, COLUMN_PARAM, QUERY_PARAM, K_PARAM, IndexProcedures.INDEX_PARAM, COLUMNS_PARAM
       };
 
   private static final StructType OUTPUT_TYPE =
@@ -102,6 +113,8 @@ class TextSearchProcedure extends BaseProcedure {
     String column = input.asString(COLUMN_PARAM);
     String query = input.asString(QUERY_PARAM);
     int topK = input.asInt(K_PARAM);
+    // the columns the answer carries, and so the columns the fetch-back reads
+    String[] columns = input.asStringArray(COLUMNS_PARAM, null);
 
     return modifyIcebergTable(
         input.ident(TABLE_PARAM),
@@ -120,8 +133,8 @@ class TextSearchProcedure extends BaseProcedure {
           DistributedIndexSearch.SearchStages stages =
               DistributedIndexSearch.SearchStages.create(spark().sparkContext());
           long started = System.nanoTime();
-          // the procedure answers with the whole matched row as JSON, so every column is read: a
-          // projection belongs to a caller whose own contract names the columns it needs
+          // a call that names no columns answers with the whole matched row as JSON, which is the
+          // contract this procedure has always had; one that names them answers with those
           List<Row> hits =
               IndexSearch.search(
                       spark(),
@@ -130,7 +143,7 @@ class TextSearchProcedure extends BaseProcedure {
                       metadata,
                       adapter.encodeQuery(query),
                       topK,
-                      null,
+                      columns == null ? null : Arrays.asList(columns),
                       stages)
                   .collectAsList();
           long totalNanos = System.nanoTime() - started;

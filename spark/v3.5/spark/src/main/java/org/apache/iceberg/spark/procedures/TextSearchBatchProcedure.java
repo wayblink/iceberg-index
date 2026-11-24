@@ -19,6 +19,7 @@
 package org.apache.iceberg.spark.procedures;
 
 import java.nio.ByteBuffer;
+import java.util.Arrays;
 import java.util.List;
 import org.apache.iceberg.index.IndexMetadata;
 import org.apache.iceberg.index.spark.IndexSearch;
@@ -44,10 +45,18 @@ import org.apache.spark.unsafe.types.UTF8String;
  * hit data file once, so a batch of N queries costs one read per distinct hit data file instead of
  * one read per query per hit data file.
  *
+ * <p>{@code columns} names the columns of the matched row to answer with, in the order the JSON
+ * object carries them. Only those columns are read: the ones named are the fetch-back's projection.
+ * A call that names none answers with the whole row, as it always has.
+ *
  * <pre>{@code
  * CALL spark_catalog.system.text_search_batch(
  *   table => 'db.documents', column => 'body',
  *   queries => array('iceberg table', 'vector search'), k => 10);
+ *
+ * CALL spark_catalog.system.text_search_batch(
+ *   table => 'db.documents', column => 'body',
+ *   queries => array('iceberg table', 'vector search'), k => 10, columns => array('doc_uuid'));
  * }</pre>
  */
 class TextSearchBatchProcedure extends BaseProcedure {
@@ -58,9 +67,16 @@ class TextSearchBatchProcedure extends BaseProcedure {
   private static final ProcedureParameter QUERIES_PARAM =
       requiredInParameter("queries", DataTypes.createArrayType(DataTypes.StringType));
   private static final ProcedureParameter K_PARAM = requiredInParameter("k", DataTypes.IntegerType);
+  private static final ProcedureParameter COLUMNS_PARAM =
+      optionalInParameter("columns", DataTypes.createArrayType(DataTypes.StringType));
   private static final ProcedureParameter[] PARAMETERS =
       new ProcedureParameter[] {
-        TABLE_PARAM, COLUMN_PARAM, QUERIES_PARAM, K_PARAM, IndexProcedures.INDEX_PARAM
+        TABLE_PARAM,
+        COLUMN_PARAM,
+        QUERIES_PARAM,
+        K_PARAM,
+        IndexProcedures.INDEX_PARAM,
+        COLUMNS_PARAM
       };
 
   private static final StructType OUTPUT_TYPE = IndexSearch.RESULT_SCHEMA;
@@ -95,6 +111,8 @@ class TextSearchBatchProcedure extends BaseProcedure {
     ProcedureInput input = new ProcedureInput(spark(), tableCatalog(), PARAMETERS, args);
     String column = input.asString(COLUMN_PARAM);
     int topK = input.asInt(K_PARAM);
+    // the columns the answer carries, and so the columns the fetch-back reads
+    String[] columns = input.asStringArray(COLUMNS_PARAM, null);
 
     return modifyIcebergTable(
         input.ident(TABLE_PARAM),
@@ -113,7 +131,16 @@ class TextSearchBatchProcedure extends BaseProcedure {
           }
 
           List<Row> hits =
-              IndexSearch.search(spark(), table, column, metadata, payloads, topK).collectAsList();
+              IndexSearch.search(
+                      spark(),
+                      table,
+                      column,
+                      metadata,
+                      payloads,
+                      topK,
+                      columns == null ? null : Arrays.asList(columns),
+                      null)
+                  .collectAsList();
 
           List<InternalRow> rows = Lists.newArrayListWithCapacity(hits.size());
           for (Row hit : hits) {

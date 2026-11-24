@@ -27,6 +27,7 @@ import org.apache.iceberg.index.IndexMetadata;
 import org.apache.iceberg.index.IndexQuery;
 import org.apache.iceberg.index.IndexSearchResult;
 import org.apache.iceberg.index.IndexSnapshot;
+import org.apache.iceberg.relocated.com.google.common.base.Preconditions;
 import org.apache.iceberg.relocated.com.google.common.collect.Lists;
 import org.apache.iceberg.relocated.com.google.common.collect.Maps;
 import org.apache.iceberg.relocated.com.google.common.collect.Sets;
@@ -147,7 +148,8 @@ public final class IndexSearch {
    *
    * <p>The columns are the projection of the {@code row} column, in the order the JSON object of a
    * hit carries them. Pass {@code null} to read every column of the table, which is what a caller
-   * that answers with the whole matched row needs. A column the table does not have is rejected.
+   * that answers with the whole matched row needs. A column the table does not have is rejected,
+   * and the columns are resolved by {@link #resolveColumns}.
    */
   public static Dataset<Row> search(
       SparkSession spark,
@@ -161,6 +163,10 @@ public final class IndexSearch {
     if (topK <= 0 || queries.isEmpty()) {
       return spark.createDataFrame(Lists.newArrayList(), RESULT_SCHEMA);
     }
+
+    // the columns are resolved before anything is read: a name the table does not have is refused
+    // without spending a pass over the index files on an answer that cannot be built
+    List<String> readColumns = resolveColumns(table, columns);
 
     IndexSnapshot snapshot = metadata.latestSnapshot();
     if (snapshot == null) {
@@ -194,7 +200,7 @@ public final class IndexSearch {
     // takes is timed here: nothing else reports it, which is what keeps it from being counted twice
     long fetchStart = System.nanoTime();
     Map<String, Map<Long, String>> rowsByFile =
-        resolveRows(spark, table, resolveSnapshotId, hitsPerQuery, columns);
+        resolveRows(spark, table, resolveSnapshotId, hitsPerQuery, readColumns);
     if (stages != null) {
       DistributedIndexSearch.Stages fetchTally = new DistributedIndexSearch.Stages();
       fetchTally.fetchBackNanos = System.nanoTime() - fetchStart;
@@ -270,6 +276,63 @@ public final class IndexSearch {
       DistributedIndexSearch.SearchStages stages) {
     return search(spark, table, column, metadata, List.of(query), topK, columns, stages)
         .drop(QUERY_ID_COLUMN);
+  }
+
+  /**
+   * The columns a caller asked for, in its order, under the names the table declares.
+   *
+   * <p>This is where the columns a caller names become the projection a search reads: the read
+   * schema and the JSON of a row are both built from what this returns, so a column that is not
+   * answered with is not read either. The entry points that publish the answer of a search rather
+   * than the rows of one derive the same projection from that answer, and read exactly the columns
+   * they answer with.
+   *
+   * <p>{@code null}, and an empty list, mean every column of the table: that is what a caller whose
+   * answer is the whole matched row asks for, and what a caller that names no columns keeps
+   * answering. Names are matched without regard to case, so a caller spelling a column the way SQL
+   * writes it is answered with the table's own column rather than with a null. A name the table
+   * does not have is refused instead of read as a null, and a column named twice is refused rather
+   * than read once under two spellings.
+   */
+  public static List<String> resolveColumns(org.apache.iceberg.Table table, List<String> columns) {
+    if (columns == null || columns.isEmpty()) {
+      return null;
+    }
+
+    List<String> resolved = Lists.newArrayListWithCapacity(columns.size());
+    for (String column : columns) {
+      Types.NestedField field = fieldOf(table, column);
+      Preconditions.checkArgument(
+          field != null,
+          "Column %s of the columns parameter is not in table %s",
+          column,
+          table.name());
+      Preconditions.checkArgument(
+          !resolved.contains(field.name()),
+          "The columns parameter names column %s more than once",
+          field.name());
+      resolved.add(field.name());
+    }
+
+    return resolved;
+  }
+
+  /**
+   * The table's own description of a column, matched without regard to case, or null when it has
+   * none of that name.
+   */
+  private static Types.NestedField fieldOf(org.apache.iceberg.Table table, String column) {
+    if (column == null) {
+      return null;
+    }
+
+    for (Types.NestedField field : table.schema().columns()) {
+      if (field.name().equalsIgnoreCase(column)) {
+        return field;
+      }
+    }
+
+    return null;
   }
 
   /**

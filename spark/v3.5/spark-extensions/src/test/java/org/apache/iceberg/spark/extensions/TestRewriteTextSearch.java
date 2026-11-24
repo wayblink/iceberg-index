@@ -116,6 +116,30 @@ class TestRewriteTextSearch {
   }
 
   @Test
+  public void readsOnlyTheColumnsTheQueryUses() {
+    String table = tableWithIndex("docs_read_columns");
+
+    // a query that names one column reads that column and the score, not the column the ranking was
+    // written against: the ranking is the search's own, so the document text is not read back
+    String query =
+        String.format(
+            "SELECT id FROM local.%s ORDER BY text_score(body, 'the fox') DESC LIMIT 2", table);
+    assertThat(planOf(table, query)).contains("TextSearchSource").contains("reads=[id]");
+
+    // a query that names no column of the row keeps the search answering with the whole row: a
+    // fetch-back with no column to read is not what such a query asks for
+    String scored =
+        String.format(
+            "SELECT text_score(body, 'the fox') AS s FROM local.%s ORDER BY s DESC LIMIT 2", table);
+    assertThat(planOf(table, scored)).contains("reads=[id, body]");
+
+    // the columns read are the only thing that changed: the answer is still the one the
+    // table-valued
+    // function returns for the same search
+    assertThat(idsOf(spark.sql(query).collectAsList())).isEqualTo(idsOf(functionHits(table, 2)));
+  }
+
+  @Test
   public void rewritesARankedTextSearchWithAFilterIntoAPrefilteredLookup() {
     // four documents that contain the query term four, three, two and one times: their scores are
     // distinct, so the order of the filtered answer is a fact rather than a tie

@@ -516,6 +516,10 @@ SELECT id, body, _score FROM search(
 -- 表函数：返回命中地址
 SELECT * FROM text_index_search('local.db.papers', 'body', 'table format', 10);
 
+-- 过程：只回答指定列（`row` 的 JSON 只含这些键，按给定顺序），读取也只读这些列
+CALL local.system.text_search(table => 'db.papers', column => 'body',
+  query => 'table format', k => 10, columns => array('id'));
+
 -- 同列多个索引时按名字或 uuid 选一个
 CALL local.system.text_search(table => 'db.papers', column => 'body',
   query => 'table format', k => 10, index => 'body_v1');
@@ -527,6 +531,8 @@ SELECT id, _score FROM search(
 同列有多个文本索引而不传 `index` 时，`text_search`、`text_search_batch`、`text_index_search`、`search` 与 `refresh_text_index` 都会报错并列出候选（例如 `has 2 text indexes [body_v1, body_v2]; pass index => '...'`），不会静默取第一个。只传 uuid 也可以；同一个索引用名字和 uuid 选到的是同一份结果。
 
 `search` 在执行阶段用全局 BM25 统计给各索引分片打分，只回表读取全局命中行。它返回最多 `limit` 条正分结果，要求索引完整覆盖查询快照。索引落后时先运行 `refresh_text_index`。
+
+回表读多少列由返回列决定，三条入口同一规则：过程 `text_search` / `text_search_batch` 与表函数 `search` 用 `columns` 指定（不传就是整行），改写形态（`ORDER BY text_score(...) DESC LIMIT k`）用查询自身引用到的列加 `_score`，不参与排名的列不读。所以宽表上只取 `doc_uuid` 一类窄列时，回表成本按列数下降；不传 `columns` 的过程仍然返回整行 JSON，与以前逐字节一致。
 
 要在某个业务范围内选 top‑k，把条件作为 `filter` 参数传入。参数是一个 SQL 字符串，内容可以是引用顶层标量列的确定性布尔表达式。只有确认安全的条件才用于文件裁剪，Spark 对候选行计算完整条件。过滤列可以不出现在 `columns` 中。过滤影响入选资格，BM25 的语料统计仍来自完整快照。外层 `WHERE` 则过滤已选出的结果。
 
@@ -803,8 +809,8 @@ BM25 和向量索引共用 executor 的容量预算、LRU 和状态入口。用�
 | `index_cache_status` | — | `refresh` |
 | `vector_search`（过程） | `table, column, query, k` | `index, coverage, nprobe, refine_factor` |
 | `vector_search_batch` | `table, column, k` | `queries, query_table, query_id_column, vector_column, index, coverage, nprobe, refine_factor` |
-| `text_search` | `table, column, query, k` | `index` |
-| `text_search_batch` | `table, column, queries, k` | `index` |
+| `text_search` | `table, column, query, k` | `index, columns` |
+| `text_search_batch` | `table, column, queries, k` | `index, columns` |
 | `load_index` | `table, index` | `retain_for` |
 | `offload_index` | `table, index` | — |
 | `cleanup_index_files` | `table` | — |

@@ -68,7 +68,9 @@ object IndexTableFunctions {
   private val TEXT_SEARCH = "search"
   private val VECTOR_COLUMN = "vector_column"
   private val DISTANCE_COLUMN = "_distance"
-  private val SCORE_COLUMN = "_score"
+  // the column a search answers the score it ranked by in: one name for every entry point that
+  // publishes one, and the name the source keeps when it answers fewer columns
+  private val SCORE_COLUMN = TextSearchSource.ScoreColumn
   private val VECTOR_INDEX_SEARCH = "vector_index_search"
   private val VECTOR_INDEX_SEARCH_BATCH = "vector_index_search_batch"
   private val TEXT_INDEX_SEARCH = "text_index_search"

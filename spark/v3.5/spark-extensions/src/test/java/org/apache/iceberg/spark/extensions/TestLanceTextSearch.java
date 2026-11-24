@@ -104,6 +104,36 @@ class TestLanceTextSearch {
   }
 
   @Test
+  public void searchReadsOnlyTheColumnsItWasGiven() {
+    String table = createIndexedTable("lance_text_columns", "");
+
+    // a Lance data file is read through a projection, so a hit whose row is answered with one
+    // column
+    // is read into that column rather than into every column of the table: what the JSON object of
+    // the row carries is what the fetch-back read
+    Row single =
+        spark
+            .sql(
+                String.format(
+                    "CALL local.system.text_search(table => '%s', column => 'body', "
+                        + "query => 'iceberg table', k => 1, columns => array('id'))",
+                    table))
+            .head();
+    assertThat(single.getString(3)).isEqualTo("{\"id\":1}");
+
+    // the batch form reads the same projection
+    Row batch =
+        spark
+            .sql(
+                String.format(
+                    "CALL local.system.text_search_batch(table => '%s', column => 'body', "
+                        + "queries => array('iceberg table'), k => 1, columns => array('id'))",
+                    table))
+            .head();
+    assertThat(batch.getString(4)).isEqualTo("{\"id\":1}");
+  }
+
+  @Test
   public void aDeletedDocumentComesBackWithoutARow() {
     String table =
         createIndexedTable("lance_text_deleted", ", 'write.delete.mode' = 'merge-on-read'");

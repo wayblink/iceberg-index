@@ -429,6 +429,27 @@ class TestTextSearchSource {
   }
 
   @Test
+  void readsOnlyTheColumnsTheAnswerCarries() {
+    spark.sql(
+        "CREATE TABLE local.db.read_columns (id bigint, body string, note string) USING iceberg");
+    spark.sql("INSERT INTO local.db.read_columns VALUES (1, 'ice iceberg', 'first')");
+    buildIndex("read_columns");
+
+    // the columns of the answer are the columns the fetch-back reads: a call that names none reads
+    // the whole row, and one that names two reads those two, in the order it named them
+    assertThat(planOf("SELECT * FROM " + search("read_columns") + ")"))
+        .contains("reads=[id, body, note]");
+    assertThat(
+            planOf("SELECT * FROM " + search("read_columns") + ", columns => array('note', 'id'))"))
+        .contains("reads=[note, id]");
+  }
+
+  /** The plan of a query, where the search it runs shows the columns it reads. */
+  private static String planOf(String query) {
+    return spark.sql(query).queryExecution().optimizedPlan().toString();
+  }
+
+  @Test
   void resolvesOnlyTheRequestedColumnsOfAHit() {
     spark.sql(
         "CREATE TABLE local.db.projected_row (id bigint, body string, note string) USING iceberg");
