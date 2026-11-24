@@ -166,7 +166,9 @@ private[spark] object VectorSearchExec {
         if (prefilter) context.filterColumns.toList.asJava else java.util.Collections.emptyList(),
         counters,
         stages)
-      return spark.createDataFrame(fetched, readSchema).queryExecution.toRdd
+      // the rows are read once, on the executors, and the copy that saves the second read is
+      // released when this query ends rather than when the plan was built
+      return spark.createDataFrame(fetched.rows(), readSchema).queryExecution.toRdd
     }
 
     val rows =

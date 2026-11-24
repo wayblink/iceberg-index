@@ -177,14 +177,11 @@ public final class IndexSearch {
     for (ByteBuffer query : queries) {
       indexQueries.add(IndexQuery.of(snapshot.sourceTableSnapshotId(), query.duplicate(), topK));
     }
-    long scoreStart = System.nanoTime();
+    // the scoring phase is reported by the tasks that do it, which is what the stage names measure:
+    // the driver waiting for the whole batch is not that work, and adding it to the probe stage
+    // would count the probe time a second time
     List<List<IndexSearchResult>> hitsPerQuery =
         DistributedIndexSearch.searchBatch(spark, metadata, table, indexQueries, stages);
-    if (stages != null) {
-      DistributedIndexSearch.Stages scoreTally = new DistributedIndexSearch.Stages();
-      scoreTally.probeScoreNanos = System.nanoTime() - scoreStart;
-      stages.report(scoreTally);
-    }
 
     // the hits are positions in the files the index was built from, but the rows are read from the
     // table as it is now: a row deleted since the index was built must not be returned, and a file
@@ -193,6 +190,8 @@ public final class IndexSearch {
         table.currentSnapshot() != null
             ? table.currentSnapshot().snapshotId()
             : snapshot.sourceTableSnapshotId();
+    // the fetch-back of a CALL is a distributed read whose tasks report nothing, so the phase it
+    // takes is timed here: nothing else reports it, which is what keeps it from being counted twice
     long fetchStart = System.nanoTime();
     Map<String, Map<Long, String>> rowsByFile =
         resolveRows(spark, table, resolveSnapshotId, hitsPerQuery, columns);

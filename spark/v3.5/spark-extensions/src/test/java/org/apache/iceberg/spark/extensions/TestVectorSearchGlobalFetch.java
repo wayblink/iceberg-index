@@ -22,6 +22,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 
 import java.nio.file.Path;
 import java.util.List;
+import java.util.concurrent.TimeUnit;
 import org.apache.iceberg.FileScanTask;
 import org.apache.iceberg.Table;
 import org.apache.iceberg.index.vector.VectorIndexTypes;
@@ -159,6 +160,38 @@ class TestVectorSearchGlobalFetch {
     } finally {
       spark.conf().unset(parameter);
     }
+  }
+
+  /**
+   * The rows the fetch-back kept are released when the query that read them ends.
+   *
+   * <p>The plan is executed after the source built those rows, so nothing in the source knows when
+   * they are done with. The query they belong to ends after the plan's last job, and that end is
+   * what releases them: a query that leaves its fetched window in the executors is a window per
+   * query, kept until a collection happens to reclaim it.
+   */
+  @Test
+  void releasesTheRowsItFetchedWhenTheQueryEnds() throws Exception {
+    String table = tableWithIndex("global_release");
+    int before = spark.sparkContext().getPersistentRDDs().size();
+
+    Dataset<Row> frame =
+        spark.sql(
+            String.format(
+                "SELECT id FROM local.db.%s "
+                    + "ORDER BY vec_distance(embedding, array(1.0d, 0.0d), 'l2') LIMIT 1",
+                table));
+    assertThat(frame.collectAsList()).hasSize(1);
+    assertThat(metric(sourceExec(frame), "numFetchedRows"))
+        .as("the answer came from the fetch-back the index's global hits are read with")
+        .isPositive();
+
+    // the query posts its end after the plan's last job, so the release runs by the time the bus
+    // of the session has processed what the query posted
+    spark.sparkContext().listenerBus().waitUntilEmpty(TimeUnit.SECONDS.toMillis(10));
+    assertThat(spark.sparkContext().getPersistentRDDs().size())
+        .as("the rows the fetch-back kept are released when the query ends")
+        .isEqualTo(before);
   }
 
   /**

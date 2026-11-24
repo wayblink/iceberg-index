@@ -19,6 +19,7 @@
 package org.apache.iceberg.spark.index;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 import java.io.IOException;
 import java.io.UncheckedIOException;
@@ -43,7 +44,6 @@ import org.apache.iceberg.index.vector.VectorIndexDefinition.Metric;
 import org.apache.iceberg.index.vector.VectorIndexTypes;
 import org.apache.iceberg.io.CloseableIterable;
 import org.apache.iceberg.relocated.com.google.common.collect.Lists;
-import org.apache.spark.api.java.JavaRDD;
 import org.apache.spark.sql.Row;
 import org.apache.spark.sql.SparkSession;
 import org.junit.jupiter.api.AfterAll;
@@ -106,7 +106,8 @@ class TestDistributedIndexSearchRowsFromHits {
     long snapshotId = table.currentSnapshot().snapshotId();
     IndexMetadata metadata = buildVectorIndex(table, snapshotId, "window-vectors", 2);
 
-    JavaRDD<Row> rows =
+    List<Row> collected;
+    try (DistributedIndexSearch.SearchRows rows =
         DistributedIndexSearch.searchRowsFromHits(
             spark,
             metadata,
@@ -122,9 +123,10 @@ class TestDistributedIndexSearchRowsFromHits {
             null,
             List.of("id"),
             null,
-            null);
+            null)) {
+      collected = rows.rows().collect();
+    }
 
-    List<Row> collected = rows.collect();
     assertThat(collected).as("the only row the filter admits is the 513th hit").hasSize(1);
     assertThat(collected.get(0).getLong(0)).isEqualTo(512L);
   }
@@ -148,7 +150,8 @@ class TestDistributedIndexSearchRowsFromHits {
     IndexMetadata metadata = buildVectorIndex(table, snapshotId, "wide-vectors", 3);
 
     // the filter admits only the 400th nearest row, so the search has to widen to the whole index
-    JavaRDD<Row> rows =
+    List<Row> collected;
+    try (DistributedIndexSearch.SearchRows rows =
         DistributedIndexSearch.searchRowsFromHits(
             spark,
             metadata,
@@ -164,12 +167,115 @@ class TestDistributedIndexSearchRowsFromHits {
             null,
             List.of("id"),
             null,
-            null);
+            null)) {
+      collected = rows.rows().collect();
+    }
 
-    List<Row> collected = rows.collect();
     assertThat(collected).hasSize(1);
     assertThat(collected.get(0).getLong(0)).isEqualTo(399L);
     assertThat(collected.get(0).getString(1)).hasSize(4096);
+  }
+
+  /**
+   * The rows the answer is read from are kept on the executors until the answer is released.
+   *
+   * <p>The round that fills the answer reads its rows once, keeps them where they were read and
+   * hands the kept copy on; a result that outlives the call has to carry what releases that copy,
+   * or every query leaves a window of rows in the executors for a collection to reclaim.
+   */
+  @Test
+  void keepsTheRowsItReadUntilTheAnswerIsReleased() {
+    spark.sql(
+        "CREATE TABLE local.db.released_rows (id bigint, embedding array<double>) USING iceberg");
+    spark.sql(
+        "INSERT INTO local.db.released_rows "
+            + "SELECT id, array(cast(id + 1 as double), cast(0 as double)) FROM range(8)");
+
+    Table table = loadTable("released_rows");
+    long snapshotId = table.currentSnapshot().snapshotId();
+    IndexMetadata metadata = buildVectorIndex(table, snapshotId, "released-vectors", 2);
+    int before = spark.sparkContext().getPersistentRDDs().size();
+
+    DistributedIndexSearch.SearchRows rows =
+        DistributedIndexSearch.searchRowsFromHits(
+            spark,
+            metadata,
+            table,
+            query(metadata, snapshotId, 2),
+            table.schema().select("id", "embedding"),
+            spark.table("local.db.released_rows").schema(),
+            2,
+            2,
+            2,
+            scanTasks(table),
+            null,
+            null,
+            List.of("id"),
+            null,
+            null);
+
+    int kept = spark.sparkContext().getPersistentRDDs().size();
+    assertThat(kept)
+        .as("the rows the answer is read from are kept until the answer is released")
+        .isEqualTo(before + 1);
+    assertThat(rows.rows().collect()).hasSize(2);
+
+    rows.close();
+    rows.close();
+    int released = spark.sparkContext().getPersistentRDDs().size();
+    assertThat(released)
+        .as("releasing the answer releases the rows it kept, once")
+        .isEqualTo(before);
+  }
+
+  /**
+   * A fetch-back that fails keeps nothing: the rows it read are released before the failure leaves
+   * the call.
+   */
+  @Test
+  void releasesTheRowsItReadWhenTheFetchFails() {
+    spark.sql(
+        "CREATE TABLE local.db.failed_rows (id bigint, embedding array<double>) USING iceberg");
+    spark.sql(
+        "INSERT INTO local.db.failed_rows "
+            + "SELECT id, array(cast(id + 1 as double), cast(0 as double)) FROM range(8)");
+
+    Table table = loadTable("failed_rows");
+    long snapshotId = table.currentSnapshot().snapshotId();
+    IndexMetadata metadata = buildVectorIndex(table, snapshotId, "failed-vectors", 2);
+    List<FileScanTask> tasks = scanTasks(table);
+    for (FileScanTask task : tasks) {
+      // the index still names these files, so the fetch-back of its hits fails where it reads them
+      table.io().deleteFile(task.file().location());
+    }
+
+    int before = spark.sparkContext().getPersistentRDDs().size();
+    assertThatThrownBy(
+            () ->
+                DistributedIndexSearch.searchRowsFromHits(
+                    spark,
+                    metadata,
+                    table,
+                    query(metadata, snapshotId, 2),
+                    table.schema().select("id", "embedding"),
+                    spark.table("local.db.failed_rows").schema(),
+                    1,
+                    1,
+                    4,
+                    tasks,
+                    null,
+                    null,
+                    List.of("id"),
+                    null,
+                    null))
+        .as("a fetch-back whose data files are gone fails")
+        .isInstanceOf(Exception.class)
+        .hasMessageContaining("Job aborted");
+
+    int afterFailure = spark.sparkContext().getPersistentRDDs().size();
+    assertThat(afterFailure)
+        .as("a fetch-back that failed releases the rows it read")
+        .isEqualTo(before);
   }
 
   private static IndexQuery query(IndexMetadata metadata, long snapshotId, int topK) {

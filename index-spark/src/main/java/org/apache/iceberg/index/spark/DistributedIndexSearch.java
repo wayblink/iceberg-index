@@ -31,6 +31,7 @@ import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.Predicate;
 import org.apache.iceberg.FileScanTask;
 import org.apache.iceberg.Schema;
@@ -77,10 +78,13 @@ import org.apache.spark.api.java.function.FlatMapFunction;
 import org.apache.spark.api.java.function.Function2;
 import org.apache.spark.api.java.function.PairFlatMapFunction;
 import org.apache.spark.broadcast.Broadcast;
+import org.apache.spark.scheduler.SparkListener;
+import org.apache.spark.scheduler.SparkListenerEvent;
 import org.apache.spark.sql.Row;
 import org.apache.spark.sql.SparkSession;
 import org.apache.spark.sql.execution.metric.SQLMetric;
 import org.apache.spark.sql.execution.metric.SQLMetrics;
+import org.apache.spark.sql.execution.ui.SparkListenerSQLExecutionEnd;
 import org.apache.spark.sql.types.StructType;
 import org.apache.spark.storage.StorageLevel;
 import org.slf4j.Logger;
@@ -117,6 +121,11 @@ import scala.Tuple3;
 public final class DistributedIndexSearch {
 
   private static final Logger LOG = LoggerFactory.getLogger(DistributedIndexSearch.class);
+
+  /**
+   * The local property Spark sets while the driver runs a SQL query, which is what it ends under.
+   */
+  private static final String QUERY_EXECUTION_ID = "spark.sql.execution.id";
 
   private DistributedIndexSearch() {}
 
@@ -362,6 +371,59 @@ public final class DistributedIndexSearch {
     long blockCacheMisses;
     long blockLoads;
     long blockEvictions;
+  }
+
+  /**
+   * The rows a fetch-back found, and the executor state that let them be read once.
+   *
+   * <p>The rows stay where they were read: the round that produced the answer kept them on the
+   * executors, and the tasks that hand them on read that copy rather than reading the data files
+   * again. Nothing on the driver reads the rows, so the copy outlives the call that built it. A
+   * caller that runs inside a SQL query has it released when that query ends; any other caller
+   * releases it with {@link #close()} once the rows are done with. The rows must not be read after
+   * that: the values their tasks were handed are released with the copy they read.
+   */
+  public static final class SearchRows implements AutoCloseable {
+    private final JavaRDD<Row> rows;
+    private final JavaPairRDD<String, Tuple2<Long, Row>> retained;
+    private final List<Broadcast<?>> owned;
+    private final AtomicBoolean closed = new AtomicBoolean(false);
+
+    private SearchRows(
+        JavaRDD<Row> rows,
+        JavaPairRDD<String, Tuple2<Long, Row>> retained,
+        List<Broadcast<?>> owned) {
+      this.rows = rows;
+      this.retained = retained;
+      this.owned = owned;
+    }
+
+    /** The rows the fetch-back found, already read on the executors that read them. */
+    public JavaRDD<Row> rows() {
+      return rows;
+    }
+
+    /**
+     * Releases the rows kept for this answer and the values the tasks that read them were given.
+     */
+    @Override
+    public void close() {
+      if (!closed.compareAndSet(false, true)) {
+        return;
+      }
+
+      if (retained != null) {
+        retained.unpersist();
+      }
+
+      for (Broadcast<?> broadcast : owned) {
+        try {
+          broadcast.destroy(false);
+        } catch (RuntimeException e) {
+          LOG.warn("Failed to release a value a fetch-back shipped", e);
+        }
+      }
+    }
   }
 
   /**
@@ -692,8 +754,12 @@ public final class DistributedIndexSearch {
    *
    * <p>The answer is not ordered: the operator above this source re-scores and sorts every row it
    * gets, and a task order is not an answer order in either branch.
+   *
+   * <p>The rows a round reads are kept on the executors until the answer is handed on, and the
+   * result carries what has to be released once it is: running inside a SQL query releases that
+   * when the query ends, and a caller outside one closes the result itself.
    */
-  public static JavaRDD<Row> searchRowsFromHits(
+  public static SearchRows searchRowsFromHits(
       SparkSession spark,
       IndexMetadata metadata,
       Table table,
@@ -750,133 +816,211 @@ public final class DistributedIndexSearch {
     // the rows of a round are read once and reused by whatever the round returns: a wide projection
     // cached at the executor that read it costs memory there, where the window already lives, and
     // collecting it here would cost the driver the whole window at once
+    List<Broadcast<?>> owned = Lists.newArrayList(planRef);
     JavaPairRDD<String, Tuple2<Long, Row>> cached = null;
+    JavaPairRDD<String, Tuple2<Long, Row>> current = null;
     JavaRDD<Row> rows = context.emptyRDD();
-    for (int round = 0; ; round++) {
-      IndexQuery widened =
-          IndexQuery.of(query.sourceTableSnapshotId(), query.payload(), window)
-              .withConsistency(query.consistency());
-      List<SearchOutcome> outcomes =
-          searchBatchWithOutcomes(spark, metadata, table, Lists.newArrayList(widened));
-      if (outcomes.isEmpty()) {
-        break;
-      }
-
-      SearchOutcome outcome = outcomes.get(0);
-      List<IndexSearchResult> hits = outcome.hits();
-      Map<String, List<Long>> positionsByFile = Maps.newLinkedHashMap();
-      for (IndexSearchResult hit : hits) {
-        positionsByFile
-            .computeIfAbsent(hit.dataFile(), key -> Lists.newArrayList())
-            .add(hit.rowPosition());
-      }
-
-      List<String> columns = Lists.newArrayList();
-      for (NestedField field : projection.columns()) {
-        columns.add(field.name());
-      }
-
-      int outside = 0;
-      int scannedHits = 0;
-      for (IndexSearchResult hit : hits) {
-        if (scanned.contains(hit.dataFile())) {
-          scannedHits++;
-        } else {
-          outside++;
+    // a round that fails hands nothing on, and a Spark failure is a checked exception the call is
+    // allowed to throw: the release runs whether the failure is checked or not
+    boolean handedOn = false;
+    try {
+      for (int round = 0; ; round++) {
+        IndexQuery widened =
+            IndexQuery.of(query.sourceTableSnapshotId(), query.payload(), window)
+                .withConsistency(query.consistency());
+        List<SearchOutcome> outcomes =
+            searchBatchWithOutcomes(spark, metadata, table, Lists.newArrayList(widened));
+        if (outcomes.isEmpty()) {
+          break;
         }
-      }
 
-      // the fetch-back is a distributed read, not a loop on the driver: the files the window hits
-      // are read in parallel, the same way a task reads the files it owns
-      long fetchStart = System.nanoTime();
-      JavaPairRDD<String, Tuple2<Long, Row>> read =
-          IndexEntries.liveRowsRdd(
-              spark,
-              table,
-              positionsByFile,
-              columns,
-              expected,
-              tasksAt(positionsByFile, scanTasks));
-      long fetched = 0L;
-      long admitted = 0L;
-      Set<String> files = new HashSet<>();
-      if (read == null) {
-        rows = context.emptyRDD();
-      } else {
-        read.persist(StorageLevel.MEMORY_AND_DISK());
-        // One job over the round's rows yields everything the widening and the counters need: how
-        // many rows the filter admits, how many were read, and which files they came from. Only
-        // these counts reach the driver, never a row.
-        Map<Tuple2<Boolean, String>, Long> counts =
-            read.map(entry -> new Tuple2<>(planRef.value().admits(entry._2()._2()), entry._1()))
-                .countByValue();
-        for (Map.Entry<Tuple2<Boolean, String>, Long> entry : counts.entrySet()) {
-          long count = entry.getValue();
-          fetched += count;
-          // a file read for a candidate is a file read, whether the filter keeps the row or not
-          files.add(entry.getKey()._2());
-          if (entry.getKey()._1()) {
-            admitted += count;
+        SearchOutcome outcome = outcomes.get(0);
+        List<IndexSearchResult> hits = outcome.hits();
+        Map<String, List<Long>> positionsByFile = Maps.newLinkedHashMap();
+        for (IndexSearchResult hit : hits) {
+          positionsByFile
+              .computeIfAbsent(hit.dataFile(), key -> Lists.newArrayList())
+              .add(hit.rowPosition());
+        }
+
+        List<String> columns = Lists.newArrayList();
+        for (NestedField field : projection.columns()) {
+          columns.add(field.name());
+        }
+
+        int outside = 0;
+        int scannedHits = 0;
+        for (IndexSearchResult hit : hits) {
+          if (scanned.contains(hit.dataFile())) {
+            scannedHits++;
+          } else {
+            outside++;
           }
         }
 
-        rows =
-            read.filter(entry -> planRef.value().admits(entry._2()._2()))
-                .map(entry -> planRef.value().narrow(entry._2()._2()));
+        // the fetch-back is a distributed read, not a loop on the driver: the files the window hits
+        // are read in parallel, the same way a task reads the files it owns
+        long fetchStart = System.nanoTime();
+        // the values this round's tasks are handed are part of the answer's reach: the release of
+        // the result owns them along with the rows it keeps
+        List<Broadcast<?>> roundOwned = Lists.newArrayList();
+        JavaPairRDD<String, Tuple2<Long, Row>> read =
+            IndexEntries.liveRowsRdd(
+                spark,
+                table,
+                positionsByFile,
+                columns,
+                expected,
+                tasksAt(positionsByFile, scanTasks),
+                null,
+                roundOwned);
+        owned.addAll(roundOwned);
+        current = read;
+        long fetched = 0L;
+        long admitted = 0L;
+        Set<String> files = new HashSet<>();
+        if (read == null) {
+          rows = context.emptyRDD();
+        } else {
+          read.persist(StorageLevel.MEMORY_AND_DISK());
+          // One job over the round's rows yields everything the widening and the counters need: how
+          // many rows the filter admits, how many were read, and which files they came from. Only
+          // these counts reach the driver, never a row.
+          Map<Tuple2<Boolean, String>, Long> counts =
+              read.map(entry -> new Tuple2<>(planRef.value().admits(entry._2()._2()), entry._1()))
+                  .countByValue();
+          for (Map.Entry<Tuple2<Boolean, String>, Long> entry : counts.entrySet()) {
+            long count = entry.getValue();
+            fetched += count;
+            // a file read for a candidate is a file read, whether the filter keeps the row or not
+            files.add(entry.getKey()._2());
+            if (entry.getKey()._1()) {
+              admitted += count;
+            }
+          }
+
+          rows =
+              read.filter(entry -> planRef.value().admits(entry._2()._2()))
+                  .map(entry -> planRef.value().narrow(entry._2()._2()));
+        }
+
+        long fetchNanos = System.nanoTime() - fetchStart;
+
+        // the round before this one is no longer part of the answer, so its rows stop being kept
+        if (cached != null) {
+          cached.unpersist();
+        }
+
+        cached = read;
+
+        if (counters != null) {
+          counters.report(
+              window,
+              hits.size(),
+              (int) Math.min(Integer.MAX_VALUE, fetched),
+              (int) Math.min(Integer.MAX_VALUE, fetched),
+              (int) Math.min(Integer.MAX_VALUE, Math.max(0L, scannedHits - fetched)),
+              outside,
+              files.size(),
+              round + 1,
+              scanTasks.size(),
+              admitted < target);
+        }
+        if (stages != null) {
+          Stages tally = new Stages();
+          tally.fetchBackNanos = fetchNanos;
+          tally.taskNanos = fetchNanos;
+          stages.report(tally);
+        }
+
+        if (admitted >= target || !outcome.moreHits() || hits.size() < window) {
+          break;
+        }
+
+        // the index's own entry count is the widest window there is: asking for more than it holds
+        // cannot find another hit, and the doubling stops there rather than running past the end
+        if (entries < 0) {
+          entries = entryUpperBound(metadata, table, query);
+        }
+
+        if (window >= entries) {
+          break;
+        }
+
+        long next = Math.min((long) window * 2, entries);
+        if (next <= window) {
+          break;
+        }
+
+        window = (int) next;
       }
 
-      long fetchNanos = System.nanoTime() - fetchStart;
+      // a plan reads these rows lazily, after this method returns; the copy that saved the second
+      // read of them is released when the query that reads them ends
+      SearchRows result = releaseWhenQueryEnds(spark, new SearchRows(rows, cached, owned));
+      handedOn = true;
+      return result;
+    } finally {
+      if (!handedOn) {
+        // nothing was handed on, so nothing may stay kept or shipped for an answer that was not
+        // built
+        if (cached != null) {
+          cached.unpersist();
+        }
 
-      // the round before this one is no longer part of the answer, so its rows stop being kept
-      if (cached != null) {
-        cached.unpersist();
+        if (current != null) {
+          current.unpersist();
+        }
+
+        for (Broadcast<?> broadcast : owned) {
+          try {
+            broadcast.destroy(false);
+          } catch (RuntimeException e) {
+            LOG.warn("Failed to release a value a fetch-back shipped", e);
+          }
+        }
       }
+    }
+  }
 
-      cached = read;
-
-      if (counters != null) {
-        counters.report(
-            window,
-            hits.size(),
-            (int) Math.min(Integer.MAX_VALUE, fetched),
-            (int) Math.min(Integer.MAX_VALUE, fetched),
-            (int) Math.min(Integer.MAX_VALUE, Math.max(0L, scannedHits - fetched)),
-            outside,
-            files.size(),
-            round + 1,
-            scanTasks.size(),
-            admitted < target);
-      }
-      if (stages != null) {
-        Stages tally = new Stages();
-        tally.fetchBackNanos = fetchNanos;
-        tally.taskNanos = fetchNanos;
-        stages.report(tally);
-      }
-
-      if (admitted >= target || !outcome.moreHits() || hits.size() < window) {
-        break;
-      }
-
-      // the index's own entry count is the widest window there is: asking for more than it holds
-      // cannot find another hit, and the doubling stops there rather than running past the end
-      if (entries < 0) {
-        entries = entryUpperBound(metadata, table, query);
-      }
-
-      if (window >= entries) {
-        break;
-      }
-
-      long next = Math.min((long) window * 2, entries);
-      if (next <= window) {
-        break;
-      }
-
-      window = (int) next;
+  /**
+   * Hands the rows of a fetch-back to the query that reads them, and releases what they kept when
+   * that query ends.
+   *
+   * <p>A plan is executed lazily: the call that built the answer returns before a single row is
+   * handed on, and the query that reads them ends after. Attaching to the end of that query is what
+   * lets the rows be kept for the one read they save and released as soon as nothing reads them any
+   * more, instead of being kept until a collection reclaims them. A caller outside a SQL query has
+   * no such end to attach to and closes the result itself.
+   */
+  private static SearchRows releaseWhenQueryEnds(SparkSession spark, SearchRows result) {
+    SparkContext context = spark.sparkContext();
+    String executionId = context.getLocalProperty(QUERY_EXECUTION_ID);
+    if (executionId == null) {
+      // the driver thread is not inside a SQL execution: the caller owns the result
+      return result;
     }
 
-    return rows;
+    long query;
+    try {
+      query = Long.parseLong(executionId);
+    } catch (NumberFormatException e) {
+      return result;
+    }
+
+    SparkListener release =
+        new SparkListener() {
+          @Override
+          public void onOtherEvent(SparkListenerEvent event) {
+            if (event instanceof SparkListenerSQLExecutionEnd
+                && ((SparkListenerSQLExecutionEnd) event).executionId() == query) {
+              context.removeSparkListener(this);
+              result.close();
+            }
+          }
+        };
+    context.addSparkListener(release);
+    return result;
   }
 
   /** The scan tasks the fetch-back reads: the ones whose file is asked for a row of. */
@@ -1615,7 +1759,7 @@ public final class DistributedIndexSearch {
       Table table,
       List<IndexQuery> queries,
       SearchStages stages) {
-    List<SearchOutcome> outcomes = searchBatchOutcomes(spark, metadata, table, queries, null);
+    List<SearchOutcome> outcomes = searchBatchOutcomes(spark, metadata, table, queries, stages);
     List<List<IndexSearchResult>> perQuery = Lists.newArrayListWithCapacity(outcomes.size());
     for (SearchOutcome outcome : outcomes) {
       perQuery.add(outcome.hits());
@@ -2041,6 +2185,10 @@ public final class DistributedIndexSearch {
                       TextIndexAdapter text = scorer.value();
                       List<byte[]> queriesForShard = encodedQueries.value();
                       CorpusStatistics corpusForShard = statistics.value();
+                      // the payload is opened inside the shard search, and the read stays inside it
+                      // when the executor does not hold the file: a task reports the read and the
+                      // score together rather than opening the file twice to tell them apart
+                      long shardStart = System.nanoTime();
                       List<List<IndexSearchResult>> results;
                       try (ExecutorIndexCache.Lease lease =
                           useResidentCache
@@ -2066,6 +2214,15 @@ public final class DistributedIndexSearch {
                                                 corpusForShard,
                                                 candidates));
                       }
+                      if (stages != null) {
+                        // the stages a procedure was handed are the task's own, not the driver
+                        // waiting for it: a CALL and a plan report the same work the same way
+                        Stages tally = new Stages();
+                        tally.probeScoreNanos = System.nanoTime() - shardStart;
+                        tally.taskNanos = tally.probeScoreNanos;
+                        stages.report(tally);
+                      }
+
                       reportCache(cacheReports, queryRun);
                       for (int queryId = 0; queryId < results.size(); queryId++) {
                         for (IndexSearchResult hit : results.get(queryId)) {
@@ -2079,6 +2236,9 @@ public final class DistributedIndexSearch {
                     });
 
         int widest = Arrays.stream(limits).max().orElseThrow();
+        // the merge of a CALL is the job that aggregates the shards' hits: the driver waits for it,
+        // so its wall clock is the phase. The shard work inside it is the tasks' own, which is what
+        // they report as their score and their clock
         long mergeStart = System.nanoTime();
         Map<Integer, HitTopK> top = aggregateHits(hits, higherScoreFirst, widest);
         if (stages != null) {

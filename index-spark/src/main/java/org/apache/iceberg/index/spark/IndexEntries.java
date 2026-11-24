@@ -780,7 +780,7 @@ public final class IndexEntries {
       List<String> columns,
       StructType readSchema,
       List<FileScanTask> tasks) {
-    return liveRowsRdd(spark, table, positionsByFile, columns, readSchema, tasks, null);
+    return liveRowsRdd(spark, table, positionsByFile, columns, readSchema, tasks, null, null);
   }
 
   /**
@@ -802,6 +802,27 @@ public final class IndexEntries {
       StructType readSchema,
       List<FileScanTask> tasks,
       String missingRowsError) {
+    return liveRowsRdd(
+        spark, table, positionsByFile, columns, readSchema, tasks, missingRowsError, null);
+  }
+
+  /**
+   * The same fetch-back, handing the value it broadcasts to its tasks to {@code owned} when a
+   * caller passes a list.
+   *
+   * <p>The value is what a task reads the files with, so it has to live as long as the rows are
+   * read from this RDD; a caller whose rows outlive the read releases it then, rather than waiting
+   * for a collection to notice that nothing refers to it any more.
+   */
+  static JavaPairRDD<String, Tuple2<Long, Row>> liveRowsRdd(
+      SparkSession spark,
+      Table table,
+      Map<String, ? extends Collection<Long>> positionsByFile,
+      List<String> columns,
+      StructType readSchema,
+      List<FileScanTask> tasks,
+      String missingRowsError,
+      List<Broadcast<?>> owned) {
     if (tasks.isEmpty()) {
       return null;
     }
@@ -813,6 +834,9 @@ public final class IndexEntries {
     // of them, which across thousands of tasks is megabytes
     Broadcast<FetchPlan> plan =
         jsc.broadcast(fetchPlan(spark, table, tasks, columns, readSchema, missingRowsError));
+    if (owned != null) {
+      owned.add(plan);
+    }
 
     // a caller may hand over a collection view, such as a map's key set, which Spark cannot ship to
     // an executor; copying it here keeps that from surfacing as a task serialization failure
@@ -949,11 +973,15 @@ public final class IndexEntries {
     private final FileFormat format;
     // null means every row of the file, which is how a caller that has no positions reads it
     private final List<Long> positions;
+    // the positions as the row filter asks for them: sorted, and without the boxing a scan of the
+    // list would pay for on every row read
+    private final long[] askedPositions;
 
     private FileFetch(String dataFile, FileFormat format, List<Long> positions) {
       this.dataFile = dataFile;
       this.format = format;
       this.positions = positions;
+      this.askedPositions = askedPositions(positions);
     }
 
     /**
@@ -991,7 +1019,7 @@ public final class IndexEntries {
               // a format that ignored the positions read the whole file, so the rows it returned
               // are
               // numbered but not narrowed: only the ones that were asked for are part of the answer
-              return isLive(entry._2(), entry._1(), positions, deletedPositions, keySets);
+              return isLive(entry._2(), entry._1(), askedPositions, deletedPositions, keySets);
             }
           };
 
@@ -1208,11 +1236,12 @@ public final class IndexEntries {
             conf,
             storageProperties);
 
+    long[] asked = askedPositions(wantedPositions);
     List<String> capturedReadColumns = readColumns;
     List<String> capturedColumns = columns;
     return data.filter(
             (Function<Tuple2<Row, Long>, Boolean>)
-                tuple -> isLive(tuple, wantedPositions, deletedPositions, keySets))
+                tuple -> isLive(tuple, asked, deletedPositions, keySets))
         .mapToPair(
             (PairFunction<Tuple2<Row, Long>, Long, Row>)
                 tuple ->
@@ -1223,23 +1252,55 @@ public final class IndexEntries {
                             schemaFor(capturedColumns, tuple._1().schema()))));
   }
 
+  /**
+   * The positions a lookup asked for, sorted so that each row of a file is judged by a binary
+   * search.
+   *
+   * <p>A window can hold millions of positions, and a row filter that scans them per row turns a
+   * read of a file into a quadratic walk of its own lookup. Sorting costs one pass on the driver
+   * and is what the read of the file then searches; a lookup of no positions asks for every row,
+   * which a null array says the same way.
+   */
+  static long[] askedPositions(Collection<Long> positions) {
+    if (positions == null || positions.isEmpty()) {
+      return null;
+    }
+
+    long[] sorted = new long[positions.size()];
+    int index = 0;
+    for (Long position : positions) {
+      Preconditions.checkArgument(position != null, "A row position cannot be null");
+      sorted[index++] = position;
+    }
+
+    Arrays.sort(sorted);
+    return sorted;
+  }
+
+  /**
+   * Whether a lookup that asked for these positions asked for this row; null asks for every row.
+   */
+  static boolean askedFor(long[] askedPositions, long position) {
+    return askedPositions == null || Arrays.binarySearch(askedPositions, position) >= 0;
+  }
+
   /** Whether a row of a data file survives its position and equality delete files. */
   private static boolean isLive(
       Tuple2<Row, Long> tuple,
-      Collection<Long> positions,
+      long[] askedPositions,
       long[] deletedPositions,
       List<EqualityKeySet> keySets) {
-    return isLive(tuple._2(), tuple._1(), positions, deletedPositions, keySets);
+    return isLive(tuple._2(), tuple._1(), askedPositions, deletedPositions, keySets);
   }
 
   /** Whether the row at the given position of a data file survives its delete files. */
   private static boolean isLive(
       long position,
       Row row,
-      Collection<Long> positions,
+      long[] askedPositions,
       long[] deletedPositions,
       List<EqualityKeySet> keySets) {
-    if (positions != null && !positions.isEmpty() && !positions.contains(position)) {
+    if (!askedFor(askedPositions, position)) {
       return false;
     }
 

@@ -465,4 +465,44 @@ class TestTextSearchSource {
     assertThat(whole.getString(3)).contains("\"id\"", "\"body\"", "\"note\"");
     assertThat(projected.getString(3)).contains("\"id\"").doesNotContain("\"body\"", "\"note\"");
   }
+
+  /**
+   * The stages a CALL text_search logs are the work its tasks did, not the driver waiting for them.
+   *
+   * <p>The procedure creates the stage metrics itself, so they reach the tasks only when the batch
+   * search hands them on: the score a shard costs and the clock its task took are the task's own
+   * numbers, and the fetch-back that resolves the answer's rows is timed as its own phase.
+   */
+  @Test
+  void callReportsTheStagesItsTasksSpent() {
+    spark.sql("CREATE TABLE local.db.call_stages (id bigint, body string) USING iceberg");
+    spark.sql(
+        "INSERT INTO local.db.call_stages VALUES (1, 'ice'), (2, 'ice ice ice ice'), "
+            + "(3, 'ice berg'), (4, 'nothing here')");
+    Table table = buildIndex("call_stages");
+    IndexMetadata metadata = VectorIndexes.findIndex(table, "body", "text");
+    ByteBuffer query =
+        new TextIndexAdapter((TextIndexDefinition) metadata.definition()).encodeQuery("ice");
+    DistributedIndexSearch.SearchStages stages =
+        DistributedIndexSearch.SearchStages.create(spark.sparkContext());
+
+    // the search CALL text_search runs, with the stages the procedure logs
+    List<Row> rows =
+        IndexSearch.search(spark, table, "body", metadata, query, 2, null, stages).collectAsList();
+    assertThat(rows).isNotEmpty();
+
+    long probeScore = stages.value(DistributedIndexSearch.SearchStages.PROBE_SCORE_TIME);
+    long taskTime = stages.value(DistributedIndexSearch.SearchStages.TASK_TIME);
+    assertThat(probeScore).as("a task reported the shard it read and scored").isPositive();
+    assertThat(taskTime).as("a task reported what its index file cost").isPositive();
+    assertThat(probeScore)
+        .as("the score is part of the task's clock, not more than it")
+        .isLessThanOrEqualTo(taskTime);
+    assertThat(stages.value(DistributedIndexSearch.SearchStages.INDEX_READ_TIME))
+        .as("a shard is opened inside its search, so the read is reported as part of the score")
+        .isZero();
+    assertThat(stages.value(DistributedIndexSearch.SearchStages.FETCH_BACK_TIME))
+        .as("the fetch-back of the answer's rows is timed as its own phase")
+        .isPositive();
+  }
 }
