@@ -25,6 +25,7 @@ import static org.assertj.core.api.Assertions.within;
 import java.nio.file.Path;
 import java.util.List;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.stream.Collectors;
 import org.apache.iceberg.index.text.TextIndexTypes;
 import org.apache.spark.scheduler.SparkListener;
 import org.apache.spark.scheduler.SparkListenerJobStart;
@@ -90,6 +91,99 @@ class TestRewriteTextSearch {
 
     // the rows and their order are the ones the table-valued function returns, which searches the
     // same index through another path
+    assertThat(rankingRows(table)).isEqualTo(functionRows(table, 2));
+  }
+
+  @Test
+  public void rewritesARankedTextSearchWithAFilterIntoAPrefilteredLookup() {
+    // four documents that contain the query term four, three, two and one times: their scores are
+    // distinct, so the order of the filtered answer is a fact rather than a tie
+    String table =
+        indexedTextTable(
+            "docs_ranked_filtered",
+            "(1, 'fox fox fox fox'), (2, 'fox fox'), (3, 'fox'), (4, 'dog'), (5, 'fox fox fox')");
+
+    String query =
+        String.format(
+            "SELECT id FROM local.%s WHERE id > 1 ORDER BY text_score(body, 'fox') DESC LIMIT 2",
+            table);
+
+    // the filter is carried into the search, so the source answers the top-k of the rows the filter
+    // admits rather than a top-k the plan filters afterwards
+    assertThat(planOf(table, query)).contains("TextSearchSource").contains("prefilter=true");
+
+    // the expected answer is the whole ranking of the term with the filtered-out row dropped: rows
+    // 5 and 2 are the best two of the rows the filter admits
+    List<Long> filteredRanking =
+        idsOf(functionHitsOf(table, "fox", 100)).stream()
+            .filter(id -> id > 1)
+            .limit(2)
+            .collect(Collectors.toList());
+    assertThat(filteredRanking).containsExactly(5L, 2L);
+    assertThat(idsOf(spark.sql(query).collectAsList())).containsExactlyElementsOf(filteredRanking);
+
+    // the other order, filtering the unfiltered top-2, answers with one row: that is the shape the
+    // rewrite is here to avoid, and it is why the filter has to be part of the search
+    List<Row> filteredTopK =
+        spark
+            .sql(
+                String.format(
+                    "SELECT id FROM (SELECT id FROM local.%s "
+                        + "ORDER BY text_score(body, 'fox') DESC LIMIT 2) x WHERE id > 1",
+                    table))
+            .collectAsList();
+    assertThat(idsOf(filteredTopK)).containsExactly(5L);
+  }
+
+  @Test
+  void rewritesARankedTextSearchWithAFilterAndAProjectedScore() {
+    String table = tableWithIndex("docs_ranked_filtered_score");
+
+    String query =
+        String.format(
+            "SELECT id, text_score(body, 'the fox') AS score FROM local.%s WHERE id > 1 "
+                + "ORDER BY score DESC LIMIT 2",
+            table);
+    assertThat(planOf(table, query)).contains("TextSearchSource").contains("prefilter=true");
+
+    List<Long> expected =
+        idsOf(functionHits(table, 100)).stream()
+            .filter(id -> id > 1)
+            .limit(2)
+            .collect(Collectors.toList());
+    List<Row> rows = spark.sql(query).collectAsList();
+    assertThat(idsOf(rows)).containsExactlyElementsOf(expected);
+    assertThat(rows)
+        .allSatisfy(row -> assertThat(row.getDouble(1)).as("the projected score").isPositive());
+  }
+
+  @Test
+  void saysWhichFilterARankedTextSearchCannotPush() {
+    String table = tableWithIndex("docs_ranked_unpushable_filter");
+    String query =
+        String.format(
+            "SELECT id FROM local.%s WHERE rand() > 0.5 "
+                + "ORDER BY text_score(body, 'the fox') DESC LIMIT 2",
+            table);
+
+    // a non-deterministic filter cannot be judged from the index entry a row is ranked by, so the
+    // query keeps its score. It is not answered with "no index was found" either: the index is
+    // there and the filter is what stands in the way, so the error names the filter shape
+    assertThat(spark.sql(query).queryExecution().analyzed().toString())
+        .contains("text_score")
+        .doesNotContain("TextSearchSource");
+    assertThatThrownBy(() -> spark.sql(query).collectAsList())
+        .hasStackTraceContaining("text_score cannot apply this filter before ranking")
+        .hasStackTraceContaining("deterministic");
+  }
+
+  @Test
+  void keepsTheUnfilteredRankingUnchanged() {
+    String table = tableWithIndex("docs_ranked_unfiltered_shape");
+
+    // the filter support must not change the plan of a ranking query without one
+    String plan = planOf(table, ranking(table));
+    assertThat(plan).contains("TextSearchSource").contains("prefilter=false");
     assertThat(rankingRows(table)).isEqualTo(functionRows(table, 2));
   }
 
@@ -520,6 +614,17 @@ class TestRewriteTextSearch {
                 "SELECT CAST(get_json_object(row, '$.id') AS bigint) AS id, score FROM "
                     + "text_index_search('local.%s', 'body', 'the fox', %d) ORDER BY score DESC",
                 table, limit))
+        .collectAsList();
+  }
+
+  /** The hits of the table-valued function for a query, with their scores, best first. */
+  private static List<Row> functionHitsOf(String table, String query, int limit) {
+    return spark
+        .sql(
+            String.format(
+                "SELECT CAST(get_json_object(row, '$.id') AS bigint) AS id, score FROM "
+                    + "text_index_search('local.%s', 'body', '%s', %d) ORDER BY score DESC",
+                table, query, limit))
         .collectAsList();
   }
 

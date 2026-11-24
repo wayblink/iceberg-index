@@ -28,11 +28,13 @@ import org.apache.iceberg.index.spark.VectorIndexes
 import org.apache.iceberg.index.text.TextIndexAdapter
 import org.apache.iceberg.index.text.TextIndexAdapter.CorpusStatistics
 import org.apache.iceberg.index.text.TextIndexDefinition
+import org.apache.spark.sql.AnalysisException
 import org.apache.spark.sql.Row
 import org.apache.spark.sql.SparkSession
 import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.analysis.IndexErrors
 import org.apache.spark.sql.catalyst.expressions.Alias
+import org.apache.spark.sql.catalyst.expressions.And
 import org.apache.spark.sql.catalyst.expressions.Attribute
 import org.apache.spark.sql.catalyst.expressions.AttributeReference
 import org.apache.spark.sql.catalyst.expressions.Descending
@@ -66,6 +68,13 @@ import scala.collection.JavaConverters._
  * search the procedure and the table function use. Reading and scoring every index file on the
  * driver while planning made the plain SQL form of a search an order of magnitude slower than the
  * CALL that asks the same index the same question.
+ *
+ * <p>A filter below the ranking sort is a filter on which rows are ranked, so it is carried into
+ * the search as a pre-filter rather than left above it: the source answers the top-k of the rows
+ * that pass it, while a filter applied to the source's own top-k would answer with the rows of the
+ * global top-k that happen to pass, which is fewer rows than the limit asks for. A filter that
+ * cannot be judged from an index entry, a non-deterministic one for instance, does not lower the
+ * query silently: the error says why, instead of leaving a score that no index was found for.
  *
  * <p>The filter form is still answered while planning: it reads the index and materialises the
  * matched rows in place of the scan. The source answers a top-k, and a filter asks for every match,
@@ -178,7 +187,14 @@ case class RewriteTextSearch(spark: SparkSession) extends Rule[LogicalPlan] {
       return None
     }
 
-    val scan = rankedScan(node).getOrElse(return None)
+    val chain = rankedScan(node).getOrElse(return None)
+    // a filter that names a text search is the filter form's question: this rewrite has no score
+    // bound yet to judge such a filter with, so that form answers it
+    if (chain.filters.exists(holdsTextSearch)) {
+      return None
+    }
+
+    val scan = chain.scan
     val sparkTable = IndexRewriteSupport.icebergTable(scan).getOrElse(return None)
     val table = sparkTable.table()
 
@@ -217,16 +233,26 @@ case class RewriteTextSearch(spark: SparkSession) extends Rule[LogicalPlan] {
     }
 
     val scoreAttribute = AttributeReference(ScoreColumn, DoubleType, nullable = false)()
+    val prefilter = bindPrefilter(chain.filters, scan, table)
     val source = TextSearchSource(
       table,
       bound.metadata,
       snapshotId,
       query,
       limit,
-      None,
+      prefilter,
       scan.output :+ scoreAttribute)
-    val lowered = node.transformDown {
+    // the scan goes by identity, so the node replaced is the one this search read and no other. The
+    // filters are removed afterwards: a node is rebuilt with its new children before a rule sees it,
+    // so a filter that was replaced in the same pass would hand back the scan and the replacement
+    // would never be visited. A filter is recognised by the condition it judges, which is the part
+    // of it that is not rebuilt
+    val replaced = node.transformDown {
       case relation: DataSourceV2Relation if relation eq scan => source
+      case other => other
+    }
+    val lowered = replaced.transformDown {
+      case filter: Filter if chain.filters.exists(_.condition eq filter.condition) => filter.child
       case other => other
     }
 
@@ -274,36 +300,89 @@ case class RewriteTextSearch(spark: SparkSession) extends Rule[LogicalPlan] {
   }
 
   /**
-   * The scan of an eligible ranking query: a limit over a global sort of the score, with only
-   * projections, local limits and aliases in between.
+   * The scan of an eligible ranking query and the filters it applies before ranking.
    *
-   * <p>A join, an aggregate, a window, an offset or a filter decides which rows there are, and the
-   * source answers with its own top-k of the whole table: lifting the scan through one of them
-   * would answer a different question than the one that was asked. The vector rewrite recognises
-   * its own queries by the same shape.
+   * <p>The scan is a limit over a global sort of the score, with only projections, local limits,
+   * aliases and filters in between. A filter below the sort decides which rows are ranked, so it is
+   * carried into the search rather than left above it: the source answers with the top-k of the rows
+   * that pass the filter. A filter above the sort decides which ranked rows the query returns, and
+   * applying it before the ranking would answer with rows the query would have dropped.
+   *
+   * <p>A join, an aggregate, a window or an offset decides which rows there are, and the source
+   * answers with its own top-k of the whole table: lifting the scan through one of them would answer
+   * a different question than the one that was asked. The vector rewrite recognises its own queries
+   * by the same shape.
    */
-  private def rankedScan(limit: LogicalPlan): Option[DataSourceV2Relation] = {
-    @scala.annotation.tailrec
-    def downThrough(node: LogicalPlan, sorts: Int): (Option[DataSourceV2Relation], Int) =
+  private def rankedScan(limit: LogicalPlan): Option[RankedChain] = {
+    var node = limit.children.head
+    var sorts = 0
+    val filters = scala.collection.mutable.ListBuffer.empty[Filter]
+    while (true) {
       node match {
-        case relation: DataSourceV2Relation => (Some(relation), sorts)
-        case sort: Sort => downThrough(sort.child, sorts + 1)
-        case project: Project => downThrough(project.child, sorts)
-        case local: LocalLimit => downThrough(local.child, sorts)
-        case alias: SubqueryAlias => downThrough(alias.child, sorts)
-        case _ => (None, sorts)
+        case relation: DataSourceV2Relation =>
+          return if (sorts == 1) Some(RankedChain(relation, filters.toList)) else None
+        case sort: Sort =>
+          sorts += 1
+          node = sort.child
+        case project: Project =>
+          node = project.child
+        case local: LocalLimit =>
+          node = local.child
+        case alias: SubqueryAlias =>
+          node = alias.child
+        case filter: Filter if sorts > 0 =>
+          filters += filter
+          node = filter.child
+        case _ =>
+          // no sort of the limit means there is no ranking to answer, and more than one means one of
+          // them orders a subquery rather than the limit: the outermost is the one the limit takes
+          // its rows by, and lowering a nested one would answer with a different set of rows
+          return None
       }
+    }
 
-    downThrough(limit.children.head, 0) match {
-      case (Some(scan), 1) => Some(scan)
-      case _ =>
-        // no sort of the limit means there is no ranking to answer, and more than one means one of
-        // them orders a subquery rather than the limit: the outermost is the one the limit takes its
-        // rows by, and lowering a nested one would answer with a different set of rows. The vector
-        // rewrite refuses a chain with more than one sort for the same reason.
-        None
+    None
+  }
+
+  /**
+   * The filter a query carries, bound for the search to apply before ranking.
+   *
+   * <p>The index exists and the snapshot is covered, so a filter the search cannot judge is the one
+   * thing in the way. Leaving the query alone would answer it with an unbound score and the message
+   * that no index was found, which points at the wrong thing: the caller is told which filter shape
+   * the search cannot push instead.
+   */
+  private def bindPrefilter(
+      filters: Seq[Filter],
+      scan: DataSourceV2Relation,
+      table: org.apache.iceberg.Table): Option[TextSearchFilter] = {
+    if (filters.isEmpty) {
+      return None
+    }
+
+    val condition = filters.map(_.condition).reduceLeft(And)
+    try {
+      Some(TextSearchFilter.bind(table.schema(), scan.output, condition))
+    } catch {
+      case error: AnalysisException =>
+        throw IndexErrors.analysis(
+          s"text_score cannot apply this filter before ranking: ${error.getMessage}. " +
+            "A ranked text search lowers a deterministic filter on top-level primitive columns " +
+            "into the index; filter the rows after the search instead")
     }
   }
+
+  /** Whether a filter names a text search, and so asks to be judged by a score this form has not bound. */
+  private def holdsTextSearch(filter: Filter): Boolean = {
+    filter.condition.exists {
+      case _: TextScoreExpression => true
+      case _: TextMatchExpression => true
+      case _ => false
+    }
+  }
+
+  /** The scan a ranking query reads, and the filters below its sort that decide which rows rank. */
+  private case class RankedChain(scan: DataSourceV2Relation, filters: Seq[Filter])
 
   /**
    * Orders a sort of the score by the column that already holds it.

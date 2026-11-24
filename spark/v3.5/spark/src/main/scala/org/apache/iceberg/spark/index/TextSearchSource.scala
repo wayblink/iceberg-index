@@ -292,6 +292,8 @@ private[spark] case class TextSearchFilter(
 }
 
 private[spark] object TextSearchFilter {
+
+  /** Binds a filter written for the {@code search} table function, which names its columns by SQL. */
   def bind(
       spark: SparkSession,
       schema: Schema,
@@ -305,14 +307,48 @@ private[spark] object TextSearchFilter {
     val relation = LocalRelation(attributes)
     val resolved =
       ReplaceExpressions(spark.sessionState.executePlan(Filter(parsed, relation)).analyzed)
-    val condition = resolved match {
-      case Filter(expression, _: LocalRelation) if expression.deterministic => expression
+    resolved match {
+      case Filter(expression, _: LocalRelation) => bind(schema, attributes, expression)
       case _ => throw IndexErrors.analysis("search requires a deterministic scalar filter")
     }
-    val columns = attributes.filter(condition.references.contains)
-    if (columns.exists(attr => !schema.findField(attr.name).`type`().isPrimitiveType)) {
+  }
+
+  /**
+   * Binds a filter the plan already holds, which a search applies before ranking its rows.
+   *
+   * <p>The search judges a row from the index entries it reads, so the filter has to be answerable
+   * from top-level scalar columns of the table: a subquery, a non-deterministic expression or a
+   * nested column would judge a row by something the entry does not carry.
+   *
+   * <p>The columns are the ones the condition names, and each of them is read back with the row. The
+   * pruning expression is derived from the same condition, so a filter that also prunes data files
+   * costs no more than the one the row filter needs.
+   */
+  def bind(schema: Schema, attributes: Seq[Attribute], condition: Expression): TextSearchFilter = {
+    if (condition.exists(_.isInstanceOf[SubqueryExpression])) {
+      throw IndexErrors.analysis("search filter does not accept subqueries")
+    }
+
+    if (!condition.deterministic) {
+      throw IndexErrors.analysis("search requires a deterministic scalar filter")
+    }
+
+    // a condition that names a column the scan does not carry is judged against a value the search
+    // never read, so it is refused rather than bound to a column that only shares the name
+    val columns = attributes.filter(attribute => condition.references.contains(attribute))
+    if (columns.size != condition.references.size) {
       throw IndexErrors.analysis("search filter requires top-level scalar columns")
     }
+
+    val primitive = columns.forall { attribute =>
+      val field = schema.findField(attribute.name)
+      field != null && field.`type`().isPrimitiveType
+    }
+    if (!primitive) {
+      throw IndexErrors.analysis("search filter requires top-level scalar columns")
+    }
+
+    val relation = LocalRelation(attributes)
 
     val bound = BindReferences.bindReference(condition, columns)
     if (bound.exists(_.isInstanceOf[Unevaluable])) {
