@@ -21,6 +21,8 @@ package org.apache.iceberg.index;
 import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.nio.ByteBuffer;
+import java.util.Collections;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -415,17 +417,81 @@ public final class IndexReader {
     return null;
   }
 
+  /**
+   * How many parsed index snapshots and manifests a driver keeps.
+   *
+   * <p>A manifest is immutable once written, so parsing it again for the next query over the same
+   * index snapshot is work that was already done: `load_index` reads them, and every query after it
+   * would read them again. The cache is bounded and keyed by the index uuid, so two indexes never
+   * share an entry.
+   */
+  private static final int CACHED_MANIFEST_LISTS = 16;
+
+  private static final int CACHED_MANIFESTS = 64;
+
+  private static final Map<List<Object>, IndexManifestList> MANIFEST_LISTS =
+      lruCache(CACHED_MANIFEST_LISTS);
+
+  private static final Map<List<Object>, IndexManifest> MANIFESTS = lruCache(CACHED_MANIFESTS);
+
+  private static <V> Map<List<Object>, V> lruCache(int capacity) {
+    return Collections.synchronizedMap(
+        new LinkedHashMap<List<Object>, V>(16, 0.75f, true) {
+          @Override
+          protected boolean removeEldestEntry(Map.Entry<List<Object>, V> eldest) {
+            return size() > capacity;
+          }
+        });
+  }
+
+  /**
+   * The manifests of one index snapshot, parsed.
+   *
+   * <p>This is what a caller that needs to know what an index covers reads: the files it can search
+   * and the data files its entries were built from. The manifest list and each manifest are cached,
+   * so a repeated bind over the same snapshot reads neither from storage.
+   */
+  public List<IndexManifest> manifests(IndexSnapshot snapshot) {
+    Preconditions.checkNotNull(snapshot, "Index snapshot is null");
+    List<IndexManifest> manifests = Lists.newArrayList();
+    for (IndexManifestList.ManifestRef ref : readManifestList(snapshot).manifests()) {
+      manifests.add(readManifest(ref.location()));
+    }
+
+    return manifests;
+  }
+
   private IndexManifestList readManifestList(IndexSnapshot snapshot) {
+    // the list's own location is the key, not the snapshot id: a snapshot id is unique within an
+    // index, but two indexes in one process can carry the same one, and a cached list from another
+    // index's snapshot would describe files this table does not have
+    List<Object> key = ImmutableList.<Object>of(metadata.indexUuid(), snapshot.indexManifestList());
+    IndexManifestList cached = MANIFEST_LISTS.get(key);
+    if (cached != null) {
+      return cached;
+    }
+
     try {
-      return IndexManifestList.read(fileIO.newInputFile(snapshot.indexManifestList()));
+      IndexManifestList read =
+          IndexManifestList.read(fileIO.newInputFile(snapshot.indexManifestList()));
+      MANIFEST_LISTS.put(key, read);
+      return read;
     } catch (IOException e) {
       throw new UncheckedIOException("Failed to read index manifest list", e);
     }
   }
 
   private IndexManifest readManifest(String location) {
+    List<Object> key = ImmutableList.<Object>of(metadata.indexUuid(), location);
+    IndexManifest cached = MANIFESTS.get(key);
+    if (cached != null) {
+      return cached;
+    }
+
     try {
-      return IndexManifest.read(fileIO.newInputFile(location));
+      IndexManifest read = IndexManifest.read(fileIO.newInputFile(location));
+      MANIFESTS.put(key, read);
+      return read;
     } catch (IOException e) {
       throw new UncheckedIOException("Failed to read index manifest", e);
     }
