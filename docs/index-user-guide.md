@@ -477,6 +477,7 @@ CALL local.system.build_text_index(
   lowercase => true,             -- 默认 true
   stopwords => array('the', 'a'),-- 可选
   max_entries_per_index_file => 1000000,
+  text_statistics => 'auto',     -- auto | always | never：是否在构建期合并全库词表统计
   name => 'body_v1');            -- 可选：同列并存多个索引时用来区分
 ```
 
@@ -488,7 +489,17 @@ ALTER TABLE local.db.papers CREATE INDEX USING fts (body);
 
 写成 `CREATE INDEX body_fts USING fts (body)` 会报 "a text index cannot be named"。这条限制会牵连后续的按名寻址（5.5）。
 
-BM25 payload（格式版本 2，blob 类型仍为 `iceberg-text-bm25-v1`）默认将每个词的倒排独立压缩，查询按字节范围读取所需词项。构建和刷新都会为索引快照发布全局 DF、文档数和总 token 数，查询直接读取所需统计。格式版本与构建不匹配的旧索引不能靠 `refresh_text_index` 迁移——刷新会沿用旧分片、旧 payload 不会被重写；查询和刷新会报 `Unsupported BM25 payload format version: ...; rebuild the index`，必须先 `CALL local.system.drop_index(table => 'db.papers', column => 'body', index => '<uuid>', purge => true)` 再 `CALL local.system.build_text_index(table => 'db.papers', column => 'body')`（`CALL local.system.check_indexes(table => 'db.papers')` 会给出这两条语句）。
+BM25 payload（格式版本 2，blob 类型仍为 `iceberg-text-bm25-v1`）默认将每个词的倒排独立压缩，查询按字节范围读取所需词项。
+
+BM25 的 IDF 与平均文档长度需要全库量，产品有两种口径，由建索引时的 `text_statistics` 决定，并记录在索引属性 `text-statistics` 上（`refresh_text_index` 沿用创建时的取值）：
+
+- `auto`（默认）：构建时先把各分片词表大小加起来估一个上界，不超过内部上限（4 GB 的分片词表总和）才把全库 DF、文档数、总 token 数合并成一份快照统计文件；超过就跳过，索引照常发布。
+- `always`：无条件合并。语料大到合并不下时会耗尽执行器内存，这个取值只用于小表复现或对照，不要在大语料上使用。
+- `never`：从不合并。查询时按本次查询词到各分片取局部 DF 求和，文档数与总 token 数同样由分片计数得到，答案与合并口径逐条相同；代价是每次查询多一趟跨分片的统计读取，延迟随分片是否常驻内存变化。
+
+查询侧没有开关：快照上有统计文件就直接读，没有就按词求和。
+
+格式版本与构建不匹配的旧索引不能靠 `refresh_text_index` 迁移——刷新会沿用旧分片、旧 payload 不会被重写；查询和刷新会报 `Unsupported BM25 payload format version: ...; rebuild the index`，必须先 `CALL local.system.drop_index(table => 'db.papers', column => 'body', index => '<uuid>', purge => true)` 再 `CALL local.system.build_text_index(table => 'db.papers', column => 'body')`（`CALL local.system.check_indexes(table => 'db.papers')` 会给出这两条语句）。
 
 仅重写 manifest 也会产生新的表快照。运行 `refresh_text_index` 后，新索引快照会复用相同的倒排分片和语料统计。
 

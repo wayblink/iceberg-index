@@ -52,6 +52,12 @@ public final class IndexMetadata {
    */
   public static final String MAX_ENTRIES_PER_INDEX_FILE_PROPERTY = "max-entries-per-index-file";
 
+  /**
+   * Index property holding the {@link TextStatisticsPolicy policy} a text index was built with for
+   * its corpus-wide statistics. Absent means {@link TextStatisticsPolicy#AUTO}.
+   */
+  public static final String TEXT_STATISTICS_PROPERTY = "text-statistics";
+
   private final String indexUuid;
 
   /** An optional human-readable name, so a table can hold several indexes of one column. */
@@ -211,6 +217,18 @@ public final class IndexMetadata {
       throw new IllegalArgumentException(
           "Invalid " + MAX_ENTRIES_PER_INDEX_FILE_PROPERTY + " property: " + value, e);
     }
+  }
+
+  /**
+   * Returns what this index's build did about its corpus-wide text statistics, which also says what
+   * a query of it reads: a merged statistics file when the snapshot carries one, the shards' own
+   * counts when it does not. See {@link #TEXT_STATISTICS_PROPERTY}.
+   *
+   * @throws IllegalArgumentException when the property names none of the policies
+   */
+  public TextStatisticsPolicy textStatistics() {
+    String value = properties.get(TEXT_STATISTICS_PROPERTY);
+    return value == null ? TextStatisticsPolicy.AUTO : TextStatisticsPolicy.parse(value);
   }
 
   public List<IndexSnapshot> snapshots() {

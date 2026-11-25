@@ -23,6 +23,7 @@ import org.apache.iceberg.index.CreateIndexRequest;
 import org.apache.iceberg.index.IndexMetadata;
 import org.apache.iceberg.index.IndexSnapshot;
 import org.apache.iceberg.index.SidecarIndexCatalog;
+import org.apache.iceberg.index.TextStatisticsPolicy;
 import org.apache.iceberg.index.spark.IndexBuildStatus;
 import org.apache.iceberg.index.spark.SparkIndexBuilder;
 import org.apache.iceberg.index.text.TextIndexDefinition;
@@ -45,6 +46,10 @@ import org.slf4j.LoggerFactory;
  * CALL spark_catalog.system.build_text_index(
  *   table => 'db.documents', column => 'body');
  * }</pre>
+ *
+ * <p>A build also decides what it does with the corpus-wide statistics BM25 scores with: {@code
+ * text_statistics => 'auto'|'always'|'never'}, default {@code auto}. The choice is recorded on the
+ * index rather than read at query time; see {@link org.apache.iceberg.index.TextStatisticsPolicy}.
  */
 class BuildTextIndexProcedure extends BaseProcedure {
   private static final Logger LOG = LoggerFactory.getLogger(BuildTextIndexProcedure.class);
@@ -65,6 +70,8 @@ class BuildTextIndexProcedure extends BaseProcedure {
       optionalInParameter("max_entries_per_index_file", DataTypes.LongType);
   private static final ProcedureParameter STOPWORDS_PARAM =
       optionalInParameter("stopwords", STRING_ARRAY);
+  private static final ProcedureParameter TEXT_STATISTICS_PARAM =
+      optionalInParameter("text_statistics", DataTypes.StringType);
   private static final ProcedureParameter[] PARAMETERS =
       new ProcedureParameter[] {
         TABLE_PARAM,
@@ -75,6 +82,7 @@ class BuildTextIndexProcedure extends BaseProcedure {
         LOWERCASE_PARAM,
         STOPWORDS_PARAM,
         MAX_ENTRIES_PER_INDEX_FILE_PARAM,
+        TEXT_STATISTICS_PARAM,
         IndexProcedures.NAME_PARAM
       };
 
@@ -151,6 +159,13 @@ class BuildTextIndexProcedure extends BaseProcedure {
 
           long maxEntriesPerIndexFile =
               VectorIndexProcedures.maxEntriesPerIndexFile(input, MAX_ENTRIES_PER_INDEX_FILE_PARAM);
+          // the policy describes the artifact this build produces, so it is recorded with the index
+          // rather than read at query time: a query reads a published statistics file when the
+          // snapshot has one and sums the shards' counts when it does not
+          TextStatisticsPolicy textStatistics =
+              input.isProvided(TEXT_STATISTICS_PARAM)
+                  ? TextStatisticsPolicy.parse(input.asString(TEXT_STATISTICS_PARAM))
+                  : TextStatisticsPolicy.AUTO;
           String indexUuid = UUID.randomUUID().toString();
           long sourceSnapshotId = table.currentSnapshot().snapshotId();
           IndexMetadata created =
@@ -164,6 +179,7 @@ class BuildTextIndexProcedure extends BaseProcedure {
                       .property(
                           IndexMetadata.MAX_ENTRIES_PER_INDEX_FILE_PROPERTY,
                           Long.toString(maxEntriesPerIndexFile))
+                      .property(IndexMetadata.TEXT_STATISTICS_PROPERTY, textStatistics.value())
                       .build());
 
           IndexMetadata updated;

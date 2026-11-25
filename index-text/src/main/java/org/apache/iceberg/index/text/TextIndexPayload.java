@@ -506,6 +506,12 @@ final class TextIndexPayload {
     }
 
     @Override
+    public long dictionaryBytes() {
+      // the bucket offsets are header fields, so this is known before a single term is read
+      return (long) bucketOffsets[BUCKET_COUNT] - bucketOffsets[0];
+    }
+
+    @Override
     public FileIndex shard(Set<String> terms, boolean statisticsOnly) throws IOException {
       check(documents <= Integer.MAX_VALUE, "Invalid BM25 shard document count");
       int localDocuments = Math.toIntExact(documents);

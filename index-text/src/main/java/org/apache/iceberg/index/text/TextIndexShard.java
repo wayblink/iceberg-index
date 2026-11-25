@@ -40,4 +40,13 @@ interface TextIndexShard {
    * @param statisticsOnly whether to read the statistics header only, without postings or documents
    */
   FileIndex shard(Set<String> terms, boolean statisticsOnly) throws IOException;
+
+  /**
+   * The size of the payload's term dictionary, which is the part of a shard that a build merges
+   * into its snapshot's corpus statistics.
+   *
+   * <p>Reads the header only: the dictionary's buckets are located by offsets the header carries,
+   * so a build can size a merge over every shard without reading a single term.
+   */
+  long dictionaryBytes() throws IOException;
 }

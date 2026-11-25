@@ -53,6 +53,7 @@ public class TestNamedTextIndexes extends ExtensionsTestBase {
   private static final String AMBIGUOUS = "named_text_ambiguous";
   private static final String DROP = "named_text_drop";
   private static final String REFRESH = "named_text_refresh";
+  private static final String STATISTICS = "named_text_statistics";
 
   @BeforeAll
   static void registerTextIndexType() {
@@ -61,7 +62,8 @@ public class TestNamedTextIndexes extends ExtensionsTestBase {
 
   @AfterEach
   public void removeTables() {
-    for (String table : List.of(COEXIST, CONFLICT, UNNAMED, SELECT, AMBIGUOUS, DROP, REFRESH)) {
+    for (String table :
+        List.of(COEXIST, CONFLICT, UNNAMED, SELECT, AMBIGUOUS, DROP, REFRESH, STATISTICS)) {
       sql("DROP TABLE IF EXISTS %s PURGE", tableName(table));
     }
   }
@@ -250,6 +252,59 @@ public class TestNamedTextIndexes extends ExtensionsTestBase {
             catalogName, table);
     assertThat(hits.stream().map(row -> (String) row[3]).collect(Collectors.toList()))
         .anyMatch(row -> row.contains("iceberg data file manifests"));
+  }
+
+  /**
+   * A build chooses what its corpus statistics file is, and the choice is a property of the index.
+   *
+   * <p>A merged file is read once per query; a build that publishes none leaves every query summing
+   * the shards' own counts, which is the same answer at a higher cost. The two indexes here answer
+   * the same query with the same rows because the statistics are the same numbers either way.
+   */
+  @TestTemplate
+  public void aBuildChoosesWhatItsStatisticsFileIs() {
+    String table = tableName(STATISTICS);
+    createTextTable(table);
+
+    sql(
+        "CALL %s.system.build_text_index(table => '%s', column => 'body', "
+            + "name => 'body_merged', text_statistics => 'always')",
+        catalogName, table);
+    sql(
+        "CALL %s.system.build_text_index(table => '%s', column => 'body', "
+            + "name => 'body_summed', text_statistics => 'never')",
+        catalogName, table);
+
+    IndexMetadata merged = metadataOf(table, "body_merged");
+    IndexMetadata summed = metadataOf(table, "body_summed");
+    assertThat(merged.properties()).containsEntry(IndexMetadata.TEXT_STATISTICS_PROPERTY, "always");
+    assertThat(summed.properties()).containsEntry(IndexMetadata.TEXT_STATISTICS_PROPERTY, "never");
+    assertThat(merged.latestSnapshot().statisticsLocation()).isNotBlank();
+    assertThat(summed.latestSnapshot().statisticsLocation())
+        .as("a build told to skip the merge publishes no statistics file")
+        .isNull();
+
+    List<Object[]> byMerged =
+        sql(
+            "CALL %s.system.text_search(table => '%s', column => 'body', "
+                + "query => 'iceberg iceberg', k => 10, index => 'body_merged')",
+            catalogName, table);
+    List<Object[]> bySummed =
+        sql(
+            "CALL %s.system.text_search(table => '%s', column => 'body', "
+                + "query => 'iceberg iceberg', k => 10, index => 'body_summed')",
+            catalogName, table);
+    assertThat(rows(bySummed))
+        .as("summing the shard counts answers what the merged file answers")
+        .isEqualTo(rows(byMerged));
+
+    assertThatThrownBy(
+            () ->
+                sql(
+                    "CALL %s.system.build_text_index(table => '%s', column => 'body', "
+                        + "name => 'body_bad', text_statistics => 'sometimes')",
+                    catalogName, table))
+        .hasMessageContaining("expected auto, always or never");
   }
 
   private void createTextTable(String table) {

@@ -280,6 +280,23 @@ public final class TextIndexAdapter implements IndexAdapter, java.io.Serializabl
     }
   }
 
+  /**
+   * Reads the size of a shard's term dictionary without reading its terms.
+   *
+   * <p>A build sizes the merge that produces the snapshot's corpus statistics before attempting it,
+   * and the shards' dictionaries add up to an upper bound of what that merge holds. The size is a
+   * header field, so sizing the merge costs one small read per shard rather than the merge itself.
+   */
+  public long dictionaryBytes(InputFile file) {
+    BlobMetadata blob = rangeBlob(file);
+    try (SeekableInputStream stream = file.newStream()) {
+      return openRange(stream, blob).dictionaryBytes();
+    } catch (IOException e) {
+      throw new UncheckedIOException(
+          "Failed to read BM25 dictionary size of " + file.location(), e);
+    }
+  }
+
   /** Encodes the merged counts for a snapshot's term dictionary. */
   public ByteBuffer encodeSnapshotStatistics(CorpusCounts counts) {
     try {

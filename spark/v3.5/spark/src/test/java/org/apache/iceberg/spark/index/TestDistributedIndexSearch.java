@@ -41,6 +41,7 @@ import org.apache.iceberg.index.IndexQuery;
 import org.apache.iceberg.index.IndexReader;
 import org.apache.iceberg.index.IndexSearchResult;
 import org.apache.iceberg.index.SidecarIndexCatalog;
+import org.apache.iceberg.index.TextStatisticsPolicy;
 import org.apache.iceberg.index.spark.DistributedIndexSearch;
 import org.apache.iceberg.index.spark.SparkIndexBuilder;
 import org.apache.iceberg.index.text.TextIndexAdapter;
@@ -212,6 +213,70 @@ class TestDistributedIndexSearch {
     String statistics = built.latestSnapshot().properties().get("snapshot-statistics-location");
     assertThat(statistics).isNotBlank();
     assertThat(table.io().newInputFile(statistics).exists()).isTrue();
+  }
+
+  /**
+   * An index built without the merged statistics file answers from the shards' own counts, and the
+   * answers are the ones the merged file produces.
+   *
+   * <p>The snapshot's statistics are only an optimization over summing the per-shard counts, so a
+   * build that cannot merge a large corpus publishes without them; a query of such an index has to
+   * agree with a query of a merged one term for term, through both the single-process reader and
+   * the distributed entry point.
+   */
+  @Test
+  void answersFromShardCountsWhenNoStatisticsWereMerged() throws Exception {
+    TextIndexTypes.register();
+    spark.sql("CREATE TABLE local.db.text_summed (id bigint, body string) USING iceberg");
+    spark.sql("INSERT INTO local.db.text_summed VALUES (1, 'ice ice glacier')");
+    spark.sql("INSERT INTO local.db.text_summed VALUES (2, 'ice cold')");
+    spark.sql("INSERT INTO local.db.text_summed VALUES (3, 'glacier cold ice')");
+    Table table =
+        new HadoopTables(spark.sessionState().newHadoopConf())
+            .load(warehouseDir.resolve("db/text_summed").toUri().toString());
+    long snapshotId = table.currentSnapshot().snapshotId();
+    TextIndexDefinition definition = TextIndexDefinition.builder().fieldId(2).build();
+    TextIndexAdapter adapter = new TextIndexAdapter(definition);
+    IndexQuery query = IndexQuery.of(snapshotId, adapter.encodeQuery("ice glacier"), 2);
+
+    IndexMetadata merged =
+        buildTextIndex(table, definition, "text-merged", snapshotId, TextStatisticsPolicy.ALWAYS);
+    IndexMetadata summed =
+        buildTextIndex(table, definition, "text-summed", snapshotId, TextStatisticsPolicy.NEVER);
+
+    assertThat(merged.latestSnapshot().statisticsLocation()).isNotBlank();
+    assertThat(summed.latestSnapshot().statisticsLocation())
+        .as("a build told to skip the merge publishes no statistics file")
+        .isNull();
+
+    List<IndexSearchResult> fromMerged = new IndexReader(merged, table).search(query);
+    List<IndexSearchResult> fromSummed = new IndexReader(summed, table).search(query);
+    assertThat(fromSummed).isEqualTo(fromMerged);
+
+    assertThat(DistributedIndexSearch.searchBatch(spark, summed, table, List.of(query)).get(0))
+        .as("the distributed entry point sums the same per-shard counts")
+        .containsExactlyElementsOf(fromMerged);
+  }
+
+  private static IndexMetadata buildTextIndex(
+      Table table,
+      TextIndexDefinition definition,
+      String indexUuid,
+      long snapshotId,
+      TextStatisticsPolicy policy) {
+    IndexCatalog catalog = new SidecarIndexCatalog(table.io(), table);
+    IndexMetadata created =
+        catalog.createIndex(
+            CreateIndexRequest.builder()
+                .tableLocation(table.location())
+                .tableUuid(table.uuid().toString())
+                .indexUuid(indexUuid)
+                .definition(definition)
+                .property(IndexMetadata.TEXT_STATISTICS_PROPERTY, policy.value())
+                .build());
+    IndexMetadata built = SparkIndexBuilder.build(spark, table, created, snapshotId, "body", 1L);
+    catalog.updateIndex(built);
+    return built;
   }
 
   @Test

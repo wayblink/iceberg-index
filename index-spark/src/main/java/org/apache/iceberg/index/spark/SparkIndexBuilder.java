@@ -42,6 +42,7 @@ import org.apache.iceberg.index.IndexSnapshot;
 import org.apache.iceberg.index.IndexSnapshotWriter;
 import org.apache.iceberg.index.IndexTypes;
 import org.apache.iceberg.index.PuffinIndexFileContainer;
+import org.apache.iceberg.index.TextStatisticsPolicy;
 import org.apache.iceberg.index.text.TextIndexAdapter;
 import org.apache.iceberg.index.text.TextIndexAdapter.CorpusCounts;
 import org.apache.iceberg.index.text.TextIndexTypes;
@@ -80,6 +81,23 @@ public final class SparkIndexBuilder {
 
   private static final String DATA_DIR = "data";
   private static final String FILE_MARKER_PREFIX = "f";
+
+  /**
+   * The largest total size of the shards' term dictionaries that a build merges into one snapshot
+   * statistics file.
+   *
+   * <p>Merging holds corpus-wide structures: the shards' dictionaries add up to an upper bound of
+   * the merged one (a term appears in every shard that holds it, so merging only removes repeats),
+   * and the merge runs over a fraction of the shards per task. A limit on the sum therefore limits
+   * what one merge task holds, and a corpus whose dictionaries do not fit is published without the
+   * merged file rather than failing the build: queries of it sum the document frequency of their
+   * own terms instead.
+   *
+   * <p>The number is the size the merge holds on the executor profile builds run on: a corpus of
+   * ten million documents, whose shard dictionaries add up to a few gigabytes, merges today, while
+   * a hundred million documents measure about twenty gigabytes and did not fit.
+   */
+  private static final long MAX_TEXT_STATISTICS_SHARD_BYTES = 4L * 1024 * 1024 * 1024;
 
   static {
     // the vector and text adapters live in their own modules; register them with the core registry
@@ -134,7 +152,15 @@ public final class SparkIndexBuilder {
               currentMetadata.maxEntriesPerIndexFile(),
               writer);
       snapshotProperties =
-          writeTextStatistics(spark, table, adapter, indexLocation, snapshotId, indexFiles, writer);
+          writeTextStatistics(
+              spark,
+              table,
+              adapter,
+              currentMetadata.textStatistics(),
+              indexLocation,
+              snapshotId,
+              indexFiles,
+              writer);
       manifestList = writer.writeManifestList(indexLocation, snapshotId, indexFiles);
     } catch (Exception | Error e) {
       writer.abortAttempt(indexLocation);
@@ -273,7 +299,15 @@ public final class SparkIndexBuilder {
       indexFiles = Lists.newArrayList(carried);
       indexFiles.addAll(newIndexFiles);
       snapshotProperties =
-          writeTextStatistics(spark, table, adapter, indexLocation, snapshotId, indexFiles, writer);
+          writeTextStatistics(
+              spark,
+              table,
+              adapter,
+              currentMetadata.textStatistics(),
+              indexLocation,
+              snapshotId,
+              indexFiles,
+              writer);
       manifestList = writer.writeManifestList(indexLocation, snapshotId, indexFiles);
     } catch (Exception | Error e) {
       // carried-over files belong to the parent snapshot and must survive a failed refresh
@@ -778,6 +812,7 @@ public final class SparkIndexBuilder {
       SparkSession spark,
       Table table,
       IndexAdapter adapter,
+      TextStatisticsPolicy policy,
       String indexLocation,
       long snapshotId,
       List<IndexFile> files,
@@ -787,6 +822,10 @@ public final class SparkIndexBuilder {
     }
 
     FileIO io = table.io();
+    if (!publishesTextStatistics(spark, io, files, text, policy)) {
+      return Map.of();
+    }
+
     CorpusCounts counts = CorpusCounts.empty();
     if (!files.isEmpty()) {
       List<String> shards = files.stream().map(IndexFile::location).toList();
@@ -808,6 +847,76 @@ public final class SparkIndexBuilder {
     }
 
     return Map.of(IndexSnapshot.STATISTICS_LOCATION_PROPERTY, location);
+  }
+
+  /**
+   * Whether this build merges the shards' dictionaries into the snapshot's corpus statistics.
+   *
+   * <p>{@code NEVER} and {@code ALWAYS} are the caller's answer. {@code AUTO} sizes the merge
+   * first, from the shards' own dictionary sizes, and keeps it inside the limit one merge task
+   * holds; a corpus that does not fit publishes no statistics file and is read back by summing
+   * per-shard counts, which is what a query does when a snapshot has no statistics file anyway.
+   */
+  private static boolean publishesTextStatistics(
+      SparkSession spark,
+      FileIO io,
+      List<IndexFile> files,
+      TextIndexAdapter text,
+      TextStatisticsPolicy policy) {
+    if (policy == TextStatisticsPolicy.NEVER) {
+      LOG.info(
+          "BM25 corpus statistics: policy=never, publishing none; queries sum their own terms");
+      return false;
+    }
+
+    if (files.isEmpty()) {
+      return true;
+    }
+
+    long estimatedBytes =
+        policy == TextStatisticsPolicy.AUTO ? dictionaryBytes(spark, io, files, text) : 0L;
+    boolean publish = writesTextStatistics(policy, estimatedBytes, MAX_TEXT_STATISTICS_SHARD_BYTES);
+    LOG.info(
+        "BM25 corpus statistics: policy={} shardDictionaryBytes={} limitBytes={} publish={} files={}",
+        policy.value(),
+        policy == TextStatisticsPolicy.AUTO ? estimatedBytes : -1L,
+        MAX_TEXT_STATISTICS_SHARD_BYTES,
+        publish,
+        files.size());
+    return publish;
+  }
+
+  /**
+   * Decides whether a build publishes the merged corpus statistics.
+   *
+   * <p>{@code ALWAYS} and {@code NEVER} say so themselves; {@code AUTO} compares the size the merge
+   * has to hold against the build's own limit. The comparison is inclusive: a corpus exactly at the
+   * limit is merged.
+   *
+   * <p>Kept apart from the build so the boundary is testable without running a merge of that size.
+   */
+  static boolean writesTextStatistics(
+      TextStatisticsPolicy policy, long estimatedBytes, long limitBytes) {
+    return switch (policy) {
+      case ALWAYS -> true;
+      case NEVER -> false;
+      case AUTO -> estimatedBytes <= limitBytes;
+    };
+  }
+
+  /**
+   * The summed dictionary size of the shards a merge would read, which bounds what it holds.
+   *
+   * <p>Reads headers only, in parallel: the answer sizes the merge, so it must not cost the merge.
+   */
+  private static long dictionaryBytes(
+      SparkSession spark, FileIO io, List<IndexFile> files, TextIndexAdapter text) {
+    List<String> shards = files.stream().map(IndexFile::location).toList();
+    JavaSparkContext context = JavaSparkContext.fromSparkContext(spark.sparkContext());
+    return context
+        .parallelize(shards, Math.min(shards.size(), spark.sparkContext().defaultParallelism()))
+        .map(shard -> text.dictionaryBytes(io.newInputFile(shard)))
+        .reduce(Long::sum);
   }
 
   private static int dataFileCount(Map<Integer, List<FileScanTask>> tasksByIndexFile, int index) {
