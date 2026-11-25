@@ -2255,8 +2255,17 @@ public final class IndexEntries {
 
   /** Lists the data file locations of the given table snapshot, on the driver. */
   public static List<String> dataFiles(Table table, long snapshotId) {
+    return dataFiles(table, snapshotId, true);
+  }
+
+  /**
+   * Lists the data file locations of the given table snapshot, with a choice about the plan cache.
+   *
+   * @param cachePlan whether the plan may answer from the plan cache and be recorded there
+   */
+  public static List<String> dataFiles(Table table, long snapshotId, boolean cachePlan) {
     List<String> dataFiles = Lists.newArrayList();
-    for (FileScanTask task : scanTasks(table, snapshotId)) {
+    for (FileScanTask task : scanTasks(table, snapshotId, cachePlan)) {
       dataFiles.add(task.file().location().toString());
     }
     return dataFiles;
@@ -2289,7 +2298,16 @@ public final class IndexEntries {
    * again.
    */
   public static List<FileScanTask> scanTasks(Table table, long snapshotId) {
-    return scanTasks(table, snapshotId, List.of());
+    return scanTasks(table, snapshotId, List.of(), true);
+  }
+
+  /**
+   * Plans the snapshot's files with a choice about the driver-side plan cache.
+   *
+   * @param cachePlan whether this call may answer from the plan cache and record its plan there
+   */
+  public static List<FileScanTask> scanTasks(Table table, long snapshotId, boolean cachePlan) {
+    return scanTasks(table, snapshotId, List.of(), cachePlan);
   }
 
   /**
@@ -2297,16 +2315,30 @@ public final class IndexEntries {
    *
    * <p>The plan of a snapshot is immutable, and planning it reads the snapshot's manifest list and
    * every manifest. A query plans the snapshot once for its index and once more for the rows it
-   * reads, so the second plan is a cache hit rather than a second pass over the object store.
+   * reads, so the second plan is a cache hit rather than a second pass over the object store. A
+   * caller without a session keeps the cache on: the switch over it gates the query path only.
    */
   public static List<FileScanTask> scanTasks(
       Table table, long snapshotId, Collection<String> statsColumns) {
+    return scanTasks(table, snapshotId, statsColumns, true);
+  }
+
+  /**
+   * Plans the snapshot's files, retaining column statistics for the requested columns, with a
+   * choice about the driver-side plan cache.
+   *
+   * @param cachePlan whether this call may answer from the plan cache and record its plan there
+   */
+  public static List<FileScanTask> scanTasks(
+      Table table, long snapshotId, Collection<String> statsColumns, boolean cachePlan) {
     List<Object> key =
         ImmutableList.<Object>of(
             String.valueOf(table.uuid()), snapshotId, ImmutableList.copyOf(statsColumns));
-    List<FileScanTask> cached = cachedPlan(key);
-    if (cached != null) {
-      return cached;
+    if (cachePlan) {
+      List<FileScanTask> cached = cachedPlan(key);
+      if (cached != null) {
+        return cached;
+      }
     }
 
     TableScan scan = table.newScan().useSnapshot(snapshotId);
@@ -2325,7 +2357,10 @@ public final class IndexEntries {
     }
 
     List<FileScanTask> plan = ImmutableList.copyOf(tasks);
-    cachePlan(key, plan);
+    if (cachePlan) {
+      cachePlan(key, plan);
+    }
+
     return plan;
   }
 

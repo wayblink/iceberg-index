@@ -393,6 +393,6 @@ public final class IndexSearch {
         positionsByFile,
         readColumns,
         readSchema,
-        IndexEntries.scanTasks(table, snapshotId));
+        IndexEntries.scanTasks(table, snapshotId, IndexDriverMetadata.enabled(spark)));
   }
 }

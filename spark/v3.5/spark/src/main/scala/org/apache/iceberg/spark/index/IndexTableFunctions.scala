@@ -20,6 +20,7 @@ package org.apache.iceberg.spark.index
 
 import java.util.Locale
 import org.apache.iceberg.SerializableTable
+import org.apache.iceberg.index.spark.IndexDriverMetadata
 import org.apache.iceberg.index.spark.IndexSearch
 import org.apache.iceberg.index.spark.IndexSelection
 import org.apache.iceberg.index.text.TextIndexTypes
@@ -210,7 +211,12 @@ object IndexTableFunctions {
       .scanSnapshotId(sparkTable)
       .getOrElse(
         analysisError(s"Table $tableName has no snapshot; build a text index after writing data"))
-    val frozen = SerializableTable.copyOfLoaded(icebergTable)
+    val frozen =
+      if (IndexDriverMetadata.enabled(spark)) {
+        SerializableTable.copyOfLoaded(icebergTable)
+      } else {
+        SerializableTable.copyOf(icebergTable)
+      }
     val index =
       try {
         IndexSelection.resolve(frozen, column, "text", indexName.orNull)

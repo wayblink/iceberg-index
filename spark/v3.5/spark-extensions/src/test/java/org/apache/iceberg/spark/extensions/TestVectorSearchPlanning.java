@@ -27,7 +27,9 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
+import org.apache.iceberg.HasTableOperations;
 import org.apache.iceberg.Table;
+import org.apache.iceberg.exceptions.NotFoundException;
 import org.apache.iceberg.index.IndexFile;
 import org.apache.iceberg.index.IndexMetadata;
 import org.apache.iceberg.index.IndexQuery;
@@ -49,6 +51,8 @@ import org.junit.jupiter.api.io.TempDir;
 
 class TestVectorSearchPlanning {
   private static final String REFINE_FACTOR = "spark.iceberg.index.vector.refine-factor";
+  private static final String DRIVER_METADATA_ENABLED =
+      "spark.iceberg.index.driver-metadata.enabled";
 
   private static SparkSession spark;
 
@@ -411,6 +415,33 @@ class TestVectorSearchPlanning {
       spark.conf().unset(probes);
       spark.conf().unset(cache);
       spark.conf().unset(budget);
+    }
+  }
+
+  /**
+   * The switch that turns the driver-side metadata reuse off puts the bind back on the old path.
+   *
+   * <p>With the switch on the copy is handed the metadata the caller already holds, so the bind
+   * answers with the metadata file gone. With it off the copy keeps only the location, so the bind
+   * has to read the file, and it fails once the file is gone: that read is exactly what the switch
+   * restores.
+   */
+  @Test
+  void disabledDriverMetadataReuseReadsTheMetadataFileAgain() throws Exception {
+    Table table = tableWithIndex("planning_metadata_switch");
+    String metadataLocation =
+        ((HasTableOperations) table).operations().current().metadataFileLocation();
+    table.io().deleteFile(metadataLocation);
+
+    spark.conf().set(DRIVER_METADATA_ENABLED, "true");
+    bind(table, null, "INDEX_HITS");
+
+    spark.conf().set(DRIVER_METADATA_ENABLED, "false");
+    try {
+      assertThatThrownBy(() -> bind(table, null, "INDEX_HITS"))
+          .isInstanceOf(NotFoundException.class);
+    } finally {
+      spark.conf().unset(DRIVER_METADATA_ENABLED);
     }
   }
 

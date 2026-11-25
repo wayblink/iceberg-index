@@ -480,7 +480,7 @@ public final class DistributedIndexSearch {
         metadata.indexUuid());
 
     JavaSparkContext context = JavaSparkContext.fromSparkContext(spark.sparkContext());
-    IndexReader reader = new IndexReader(metadata, table);
+    IndexReader reader = reader(spark, metadata, table);
     List<IndexFile> files = reader.indexFiles(query);
     if (files.isEmpty() || encodedQueries.isEmpty()) {
       return context.emptyRDD();
@@ -932,7 +932,7 @@ public final class DistributedIndexSearch {
         // the index's own entry count is the widest window there is: asking for more than it holds
         // cannot find another hit, and the doubling stops there rather than running past the end
         if (entries < 0) {
-          entries = entryUpperBound(metadata, table, query);
+          entries = entryUpperBound(spark, metadata, table, query);
         }
 
         if (window >= entries) {
@@ -1065,9 +1065,10 @@ public final class DistributedIndexSearch {
    * is capped at the largest window an {@code int} can hold, which is also the most a query can ask
    * for.
    */
-  private static int entryUpperBound(IndexMetadata metadata, Table table, IndexQuery query) {
+  private static int entryUpperBound(
+      SparkSession spark, IndexMetadata metadata, Table table, IndexQuery query) {
     long entries = 0L;
-    for (IndexFile file : new IndexReader(metadata, table).indexFiles(query)) {
+    for (IndexFile file : reader(spark, metadata, table).indexFiles(query)) {
       entries += file.entryCount();
       if (entries >= Integer.MAX_VALUE) {
         return Integer.MAX_VALUE;
@@ -1618,10 +1619,10 @@ public final class DistributedIndexSearch {
     if (adapter.searchesAllPayloadsTogether()) {
       // the payloads have to be merged before any of them can be scored, and such a search only
       // ever sees its own top-k, so it cannot report whether more hits exist
-      return new SearchOutcome(new IndexReader(metadata, table).search(query), false);
+      return new SearchOutcome(reader(spark, metadata, table).search(query), false);
     }
 
-    IndexReader reader = new IndexReader(metadata, table);
+    IndexReader reader = reader(spark, metadata, table);
     List<IndexFile> files = reader.indexFiles(query);
     if (files.isEmpty()) {
       return new SearchOutcome(ImmutableList.of(), false);
@@ -1860,14 +1861,14 @@ public final class DistributedIndexSearch {
     if (adapter.searchesAllPayloadsTogether()) {
       // each query needs the merged payloads, and such a search has no per-file form to batch
       List<SearchOutcome> perQuery = Lists.newArrayListWithCapacity(queries.size());
-      IndexReader togetherReader = new IndexReader(metadata, table);
+      IndexReader togetherReader = reader(spark, metadata, table);
       for (IndexQuery query : queries) {
         perQuery.add(new SearchOutcome(togetherReader.search(query), false));
       }
       return perQuery;
     }
 
-    IndexReader reader = new IndexReader(metadata, table);
+    IndexReader reader = reader(spark, metadata, table);
     List<IndexFile> files = reader.indexFiles(queries.get(0));
     List<SearchOutcome> perQuery = Lists.newArrayListWithCapacity(queries.size());
     if (files.isEmpty()) {
@@ -2141,7 +2142,7 @@ public final class DistributedIndexSearch {
     int[] limits = queries.stream().mapToInt(IndexQuery::topK).toArray();
 
     IndexQuery first = queries.get(0);
-    IndexReader reader = new IndexReader(metadata, table);
+    IndexReader reader = reader(spark, metadata, table);
     List<IndexFile> files = reader.indexFiles(first);
     Set<String> terms = new HashSet<>();
     List<byte[]> payloads = Lists.newArrayListWithCapacity(queries.size());
@@ -2552,6 +2553,17 @@ public final class DistributedIndexSearch {
 
   private static boolean localityEnabled(SparkSession spark) {
     return Boolean.parseBoolean(spark.conf().get("spark.iceberg.index.schedule.locality", "true"));
+  }
+
+  /**
+   * The reader a search of this session answers from.
+   *
+   * <p>Every search goes through here so that one setting decides whether a query reuses the parsed
+   * manifests the driver already has, or reads them again: a reader is never created here without
+   * the switch, not even for the searches whose answer is computed from a single snapshot.
+   */
+  private static IndexReader reader(SparkSession spark, IndexMetadata metadata, Table table) {
+    return new IndexReader(metadata, table, IndexDriverMetadata.enabled(spark));
   }
 
   /**

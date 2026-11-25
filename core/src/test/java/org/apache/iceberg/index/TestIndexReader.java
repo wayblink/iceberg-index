@@ -26,6 +26,7 @@ import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.nio.file.Path;
 import java.util.List;
+import java.util.Map;
 import java.util.UUID;
 import org.apache.iceberg.DataFiles;
 import org.apache.iceberg.PartitionSpec;
@@ -35,7 +36,9 @@ import org.apache.iceberg.TestTables;
 import org.apache.iceberg.TestTables.LocalFileIO;
 import org.apache.iceberg.index.IndexFile.Kind;
 import org.apache.iceberg.index.IndexManifestList.ManifestRef;
+import org.apache.iceberg.io.InputFile;
 import org.apache.iceberg.relocated.com.google.common.collect.Lists;
+import org.apache.iceberg.relocated.com.google.common.collect.Maps;
 import org.apache.iceberg.types.Types;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
@@ -134,6 +137,50 @@ class TestIndexReader {
                 20,
                 List.of("data-1.parquet", "data-2.parquet", "data-3.parquet", "data-4.parquet")))
         .containsExactly("data-4.parquet");
+  }
+
+  @Test
+  public void rereadsTheManifestsWhenCachingIsDisabled(@TempDir Path tempDir) throws IOException {
+    CountingFileIO fileIO = new CountingFileIO();
+    IndexSnapshot snapshot = snapshotWithOneFile(fileIO, tempDir);
+    IndexMetadata metadata = metadataFor(tempDir, snapshot);
+    String manifestList = snapshot.indexManifestList();
+    String manifest = tempDir.resolve("index-manifest-10.imn").toString();
+    IndexQuery query = IndexQuery.of(20, query(5), 1);
+
+    new IndexReader(metadata, fileIO).indexFiles(query);
+    assertThat(fileIO.reads(manifestList)).isEqualTo(1);
+    assertThat(fileIO.reads(manifest)).isEqualTo(1);
+
+    // a second reader over the same snapshot reads neither file again: the cache keeps them
+    new IndexReader(metadata, fileIO).indexFiles(query);
+    assertThat(fileIO.reads(manifestList)).isEqualTo(1);
+    assertThat(fileIO.reads(manifest)).isEqualTo(1);
+
+    // a reader that was told not to cache reads both files again, so a caller can measure them
+    new IndexReader(metadata, fileIO, false).indexFiles(query);
+    assertThat(fileIO.reads(manifestList)).isEqualTo(2);
+    assertThat(fileIO.reads(manifest)).isEqualTo(2);
+  }
+
+  @Test
+  public void cachingDisabledDoesNotFillTheCache(@TempDir Path tempDir) throws IOException {
+    CountingFileIO fileIO = new CountingFileIO();
+    IndexSnapshot snapshot = snapshotWithOneFile(fileIO, tempDir);
+    IndexMetadata metadata = metadataFor(tempDir, snapshot);
+    String manifestList = snapshot.indexManifestList();
+    String manifest = tempDir.resolve("index-manifest-10.imn").toString();
+    IndexQuery query = IndexQuery.of(20, query(5), 1);
+
+    new IndexReader(metadata, fileIO, false).indexFiles(query);
+    assertThat(fileIO.reads(manifestList)).isEqualTo(1);
+    assertThat(fileIO.reads(manifest)).isEqualTo(1);
+
+    // a reader that may cache still reads both files: the uncached read recorded nothing, so the
+    // switch is not just a skip of the lookup but a skip of the store as well
+    new IndexReader(metadata, fileIO).indexFiles(query);
+    assertThat(fileIO.reads(manifestList)).isEqualTo(2);
+    assertThat(fileIO.reads(manifest)).isEqualTo(2);
   }
 
   @Test
@@ -330,6 +377,20 @@ class TestIndexReader {
     return ids;
   }
 
+  /** Writes one index file, its manifest and its manifest list for source table snapshot 20. */
+  private static IndexSnapshot snapshotWithOneFile(CountingFileIO fileIO, Path tempDir)
+      throws IOException {
+    return snapshot(
+        fileIO,
+        new PuffinIndexFileContainer(),
+        new TestingIndexAdapter(TestingIndexDefinition.of(4)),
+        tempDir,
+        10,
+        20,
+        "data-1.parquet",
+        10);
+  }
+
   /** Writes one index file and its manifest list, and returns a snapshot bound to the source. */
   private static IndexSnapshot snapshot(
       LocalFileIO fileIO,
@@ -418,5 +479,20 @@ class TestIndexReader {
 
   private static ByteBuffer query(int value) {
     return ByteBuffer.allocate(4).putInt(value).flip();
+  }
+
+  /** Counts the reads of every location, so a test can tell a cache hit from a storage read. */
+  private static final class CountingFileIO extends LocalFileIO {
+    private final Map<String, Integer> reads = Maps.newHashMap();
+
+    @Override
+    public InputFile newInputFile(String path) {
+      reads.merge(path, 1, Integer::sum);
+      return super.newInputFile(path);
+    }
+
+    private int reads(String location) {
+      return reads.getOrDefault(location, 0);
+    }
   }
 }

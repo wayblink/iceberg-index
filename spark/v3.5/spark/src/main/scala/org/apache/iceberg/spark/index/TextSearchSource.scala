@@ -30,6 +30,7 @@ import org.apache.iceberg.index.IndexMetadata
 import org.apache.iceberg.index.IndexQuery
 import org.apache.iceberg.index.IndexReader
 import org.apache.iceberg.index.spark.DistributedIndexSearch
+import org.apache.iceberg.index.spark.IndexDriverMetadata
 import org.apache.iceberg.index.spark.IndexEntries
 import org.apache.iceberg.index.text.TextIndexAdapter
 import org.apache.iceberg.index.text.TextIndexDefinition
@@ -177,12 +178,15 @@ private[spark] case class TextSearchExec(
         snapshotId,
         adapter.encodeQuery(source.query),
         TextSearchSource.limitFor(source, entries))
+    val reuseMetadata = IndexDriverMetadata.enabled(spark)
     val tasks = source.filter match {
-      case Some(filter) => IndexEntries.scanTasks(table, snapshotId, filter.statsColumns.asJava)
-      case None => IndexEntries.scanTasks(table, snapshotId)
+      case Some(filter) =>
+        IndexEntries.scanTasks(table, snapshotId, filter.statsColumns.asJava, reuseMetadata)
+      case None => IndexEntries.scanTasks(table, snapshotId, reuseMetadata)
     }
     val files = tasks.asScala.map(_.file().location().toString).asJava
-    val uncovered = new IndexReader(metadata, table).uncoveredDataFiles(query, files)
+    val uncovered =
+      new IndexReader(metadata, table, reuseMetadata).uncoveredDataFiles(query, files)
     require(
       uncovered.isEmpty,
       s"Text index $indexUuid leaves ${uncovered.size()} files uncovered " +

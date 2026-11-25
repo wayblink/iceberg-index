@@ -58,16 +58,24 @@ public final class IndexReader {
   private final FileIO fileIO;
   private final IndexFileContainer container;
   private final Table sourceTable;
+  private final boolean cacheManifests;
 
   public IndexReader(IndexMetadata metadata, FileIO fileIO) {
-    this(metadata, fileIO, new PuffinIndexFileContainer());
+    this(metadata, fileIO, new PuffinIndexFileContainer(), null, true);
+  }
+
+  /**
+   * A reader with a choice about the driver-side manifest cache.
+   *
+   * @param cacheManifests whether this reader may use the parsed manifest cache; false parses the
+   *     manifest list and the manifests on every call, and records nothing in the cache
+   */
+  public IndexReader(IndexMetadata metadata, FileIO fileIO, boolean cacheManifests) {
+    this(metadata, fileIO, new PuffinIndexFileContainer(), null, cacheManifests);
   }
 
   public IndexReader(IndexMetadata metadata, FileIO fileIO, IndexFileContainer container) {
-    this.metadata = Preconditions.checkNotNull(metadata, "Index metadata is null");
-    this.fileIO = Preconditions.checkNotNull(fileIO, "File IO is null");
-    this.container = Preconditions.checkNotNull(container, "Index file container is null");
-    this.sourceTable = null;
+    this(metadata, fileIO, container, null, true);
   }
 
   /**
@@ -76,10 +84,35 @@ public final class IndexReader {
    * parent chain: snapshot ids are not ordered.
    */
   public IndexReader(IndexMetadata metadata, Table sourceTable) {
+    this(metadata, sourceTable, true);
+  }
+
+  /**
+   * The source table reader, with a choice about the driver-side manifest cache.
+   *
+   * @param cacheManifests whether this reader may use the parsed manifest cache; false reads the
+   *     manifest list and the manifests on every call, and records nothing in the cache
+   */
+  public IndexReader(IndexMetadata metadata, Table sourceTable, boolean cacheManifests) {
+    this(
+        metadata,
+        Preconditions.checkNotNull(sourceTable, "Source table is null").io(),
+        new PuffinIndexFileContainer(),
+        sourceTable,
+        cacheManifests);
+  }
+
+  private IndexReader(
+      IndexMetadata metadata,
+      FileIO fileIO,
+      IndexFileContainer container,
+      Table sourceTable,
+      boolean cacheManifests) {
     this.metadata = Preconditions.checkNotNull(metadata, "Index metadata is null");
-    this.fileIO = Preconditions.checkNotNull(sourceTable, "Source table is null").io();
-    this.container = new PuffinIndexFileContainer();
+    this.fileIO = Preconditions.checkNotNull(fileIO, "File IO is null");
+    this.container = Preconditions.checkNotNull(container, "Index file container is null");
     this.sourceTable = sourceTable;
+    this.cacheManifests = cacheManifests;
   }
 
   /**
@@ -423,7 +456,7 @@ public final class IndexReader {
    * <p>A manifest is immutable once written, so parsing it again for the next query over the same
    * index snapshot is work that was already done: `load_index` reads them, and every query after it
    * would read them again. The cache is bounded and keyed by the index uuid, so two indexes never
-   * share an entry.
+   * share an entry. A reader constructed with caching turned off neither reads nor fills it.
    */
   private static final int CACHED_MANIFEST_LISTS = 16;
 
@@ -449,7 +482,7 @@ public final class IndexReader {
    *
    * <p>This is what a caller that needs to know what an index covers reads: the files it can search
    * and the data files its entries were built from. The manifest list and each manifest are cached,
-   * so a repeated bind over the same snapshot reads neither from storage.
+   * so a repeated bind over the same snapshot reads neither from storage unless caching is off.
    */
   public List<IndexManifest> manifests(IndexSnapshot snapshot) {
     Preconditions.checkNotNull(snapshot, "Index snapshot is null");
@@ -462,36 +495,52 @@ public final class IndexReader {
   }
 
   private IndexManifestList readManifestList(IndexSnapshot snapshot) {
+    String location = snapshot.indexManifestList();
     // the list's own location is the key, not the snapshot id: a snapshot id is unique within an
     // index, but two indexes in one process can carry the same one, and a cached list from another
     // index's snapshot would describe files this table does not have
-    List<Object> key = ImmutableList.<Object>of(metadata.indexUuid(), snapshot.indexManifestList());
+    List<Object> key = ImmutableList.<Object>of(metadata.indexUuid(), location);
+    if (!cacheManifests) {
+      return loadManifestList(location);
+    }
+
     IndexManifestList cached = MANIFEST_LISTS.get(key);
     if (cached != null) {
       return cached;
     }
 
-    try {
-      IndexManifestList read =
-          IndexManifestList.read(fileIO.newInputFile(snapshot.indexManifestList()));
-      MANIFEST_LISTS.put(key, read);
-      return read;
-    } catch (IOException e) {
-      throw new UncheckedIOException("Failed to read index manifest list", e);
-    }
+    IndexManifestList read = loadManifestList(location);
+    MANIFEST_LISTS.put(key, read);
+    return read;
   }
 
   private IndexManifest readManifest(String location) {
     List<Object> key = ImmutableList.<Object>of(metadata.indexUuid(), location);
+    if (!cacheManifests) {
+      return loadManifest(location);
+    }
+
     IndexManifest cached = MANIFESTS.get(key);
     if (cached != null) {
       return cached;
     }
 
+    IndexManifest read = loadManifest(location);
+    MANIFESTS.put(key, read);
+    return read;
+  }
+
+  private IndexManifestList loadManifestList(String location) {
     try {
-      IndexManifest read = IndexManifest.read(fileIO.newInputFile(location));
-      MANIFESTS.put(key, read);
-      return read;
+      return IndexManifestList.read(fileIO.newInputFile(location));
+    } catch (IOException e) {
+      throw new UncheckedIOException("Failed to read index manifest list", e);
+    }
+  }
+
+  private IndexManifest loadManifest(String location) {
+    try {
+      return IndexManifest.read(fileIO.newInputFile(location));
     } catch (IOException e) {
       throw new UncheckedIOException("Failed to read index manifest", e);
     }

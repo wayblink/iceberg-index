@@ -21,6 +21,7 @@ package org.apache.iceberg.spark.index
 import org.apache.iceberg.index.IndexMetadata
 import org.apache.iceberg.index.IndexQuery
 import org.apache.iceberg.index.IndexReader
+import org.apache.iceberg.index.spark.IndexDriverMetadata
 import org.apache.iceberg.index.spark.IndexEntries
 import org.apache.iceberg.index.spark.VectorIndexes
 import org.apache.iceberg.index.text.TextIndexAdapter
@@ -276,7 +277,8 @@ case class RewriteTextSearch(spark: SparkSession) extends Rule[LogicalPlan] {
 
     // a text search is only answered from the snapshot it is bound to, so anything the index does
     // not cover has to be absent
-    val dataFiles = IndexEntries.dataFiles(table, snapshotId).asScala.toSet
+    val dataFiles =
+      IndexEntries.dataFiles(table, snapshotId, IndexDriverMetadata.enabled(spark)).asScala.toSet
     val uncovered = bound.reader.uncoveredDataFiles(snapshotId, dataFiles.asJava).asScala.toSet
     if (uncovered.nonEmpty) {
       logger.warn(
@@ -528,7 +530,8 @@ case class RewriteTextSearch(spark: SparkSession) extends Rule[LogicalPlan] {
     // be readable before the plan is lowered
     val statistics = statisticsOf(bound, column).getOrElse(return None)
 
-    val dataFiles = IndexEntries.dataFiles(table, snapshotId).asScala.toSet
+    val dataFiles =
+      IndexEntries.dataFiles(table, snapshotId, IndexDriverMetadata.enabled(spark)).asScala.toSet
     val uncovered = bound.reader.uncoveredDataFiles(snapshotId, dataFiles.asJava).asScala.toSet
     if (uncovered.nonEmpty) {
       logger.warn(
@@ -746,7 +749,7 @@ case class RewriteTextSearch(spark: SparkSession) extends Rule[LogicalPlan] {
     }
 
     val definition = index.definition().asInstanceOf[TextIndexDefinition]
-    val reader = new IndexReader(index, table)
+    val reader = new IndexReader(index, table, IndexDriverMetadata.enabled(spark))
     Some(BoundIndex(snapshotId, index, definition, reader, attribute, query))
   }
 

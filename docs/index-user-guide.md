@@ -687,6 +687,9 @@ BM25 和向量索引共用 executor 的容量预算、LRU 和状态入口。用�
 | `spark.iceberg.index.cache.mode` | `auto` | 缓存档位 |
 | `spark.iceberg.index.cache.idle-ttl` | `30m` | 整文件条目与 list 块的空闲淘汰 |
 | `spark.iceberg.index.schedule.locality` | `true` | 按持有情况派 task |
+| `spark.iceberg.index.driver-metadata.enabled` | `true` | driver 侧复用已加载的表 metadata、缓存索引 manifest 的解析结果与快照的文件计划；**仅排障用**，设 `false` 时这三处回到旧路径（每次查询重读 metadata、重解析 manifest、重规划文件），答案不变 |
+
+`spark.iceberg.index.driver-metadata.enabled` 不是调优项：开着的时候查询省掉的是 driver 上那几次本来就不该重复的读，关掉只会更慢，所以只在怀疑缓存里有旧内容时用它把三处一次性退回旧路径（`SET` 或提交时的 `--conf` 都可以，下一次查询生效）。
 
 查询期参数分两层，优先级从高到低：
 

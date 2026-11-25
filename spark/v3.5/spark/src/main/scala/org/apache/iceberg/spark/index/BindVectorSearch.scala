@@ -18,7 +18,7 @@
  */
 package org.apache.iceberg.spark.index
 
-import java.lang.{Long => JLong}
+import java.lang.{Boolean => JBoolean, Long => JLong}
 import java.util.{List => JList}
 import org.apache.iceberg.SerializableTable
 import org.apache.iceberg.Snapshot
@@ -27,6 +27,7 @@ import org.apache.iceberg.index.IndexFile
 import org.apache.iceberg.index.IndexMetadata
 import org.apache.iceberg.index.IndexReader
 import org.apache.iceberg.index.IndexSnapshot
+import org.apache.iceberg.index.spark.IndexDriverMetadata
 import org.apache.iceberg.index.spark.IndexEntries
 import org.apache.iceberg.index.spark.VectorIndexes
 import org.apache.iceberg.index.vector.VectorIndexAdapter
@@ -49,9 +50,17 @@ private[spark] object BindVectorSearch {
     } else {
       input.table
     }
+    // one read of the driver-side switch, which also decides the manifest and plan caches below
+    val reuseMetadata = IndexDriverMetadata.enabled(spark)
     // the caller already holds the loaded metadata: hand it to the copy instead of letting it read
-    // the metadata file again on every bind (that read is one object-store GET per query)
-    val frozen = SerializableTable.copyOfLoaded(liveTable)
+    // the metadata file again on every bind (that read is one object-store GET per query). The
+    // switch off puts the plain copy back, which reads the file on the first snapshot lookup.
+    val frozen =
+      if (reuseMetadata) {
+        SerializableTable.copyOfLoaded(liveTable)
+      } else {
+        SerializableTable.copyOf(liveTable)
+      }
     val snapshot = if (input.tableSnapshotId == null) {
       frozen.currentSnapshot()
     } else {
@@ -127,15 +136,17 @@ private[spark] object BindVectorSearch {
     require(
       definition.fieldId() == field.fieldId(),
       s"Vector index ${metadata.indexUuid()} does not match column ${input.column}")
-    val scanTasks = IndexEntries.scanTasks(frozen, snapshot.snapshotId()).asScala.toVector.asJava
+    val scanTasks =
+      IndexEntries.scanTasks(frozen, snapshot.snapshotId(), reuseMetadata).asScala.toVector.asJava
     val afterDataPlanNanos = System.nanoTime()
     val dataFiles = scanTasks.asScala.map(_.file().location().toString).toSet
     val files = Vector.newBuilder[IndexFile]
     val covered = mutable.Set.empty[String]
     val uri = indexSnapshot.indexManifestList()
     // the manifests are read through the reader's cache: load_index has already parsed them, and a
-    // repeated bind over the same index snapshot must not read them from storage again
-    val manifests = new IndexReader(metadata, frozen).manifests(indexSnapshot)
+    // repeated bind over the same index snapshot must not read them from storage again. With the
+    // switch off the reader parses them here and on every bind.
+    val manifests = new IndexReader(metadata, frozen, reuseMetadata).manifests(indexSnapshot)
     val indexManifests = manifests.size()
     manifests.asScala.foreach { manifest =>
       covered ++= manifest.indexedDataFiles().asScala
@@ -171,14 +182,15 @@ private[spark] object BindVectorSearch {
       logger.info(
         "vector search bind: total={}ms tableMeta={}ms indexLookup={}ms dataPlan={}ms " +
           "indexManifests={}ms reads={indexRegistry:1,indexManifestList:1,indexManifests:{},"
-          + "dataPlanFiles:1}",
+          + "dataPlanFiles:1} driverMetadata={}",
         Array[Object](
           JLong.valueOf((afterManifestReadsNanos - bindStart) / 1000000L),
           JLong.valueOf((afterSnapshotNanos - bindStart) / 1000000L),
           JLong.valueOf((afterIndexLookupNanos - afterSnapshotNanos) / 1000000L),
           JLong.valueOf((afterDataPlanNanos - afterIndexLookupNanos) / 1000000L),
           JLong.valueOf((afterManifestReadsNanos - afterDataPlanNanos) / 1000000L),
-          Integer.valueOf(indexManifests)): _*)
+          Integer.valueOf(indexManifests),
+          JBoolean.valueOf(reuseMetadata)): _*)
     }
     BoundVectorSearch(VectorSearchContext(request, inputs, raw))
   }
