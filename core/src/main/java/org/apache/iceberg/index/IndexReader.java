@@ -323,6 +323,16 @@ public final class IndexReader {
     return adapter.searchStatistics(statisticsPayloads);
   }
 
+  /**
+   * Returns the id of the index snapshot the query is answered from.
+   *
+   * <p>Which snapshot answers a query depends on its consistency, so a caller that keys anything by
+   * "the snapshot behind this query" has to ask here rather than assume the latest one.
+   */
+  public long snapshotId(IndexQuery query) {
+    return snapshotForQuery(query).snapshotId();
+  }
+
   /** Returns the statistics file of the snapshot selected by the query, if published. */
   public String statisticsLocation(IndexQuery query) {
     return snapshotForQuery(query).statisticsLocation();

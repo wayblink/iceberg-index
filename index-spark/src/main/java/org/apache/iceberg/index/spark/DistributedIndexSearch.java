@@ -26,8 +26,10 @@ import java.util.Collections;
 import java.util.Comparator;
 import java.util.HashSet;
 import java.util.Iterator;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
@@ -2212,8 +2214,10 @@ public final class DistributedIndexSearch {
       String publishedStatistics = reader.statisticsLocation(first);
       CorpusStatistics corpus =
           publishedStatistics == null
-              ? mergeTextStatistics(
+              ? summedTextStatistics(
                   context,
+                  reader.snapshotId(first),
+                  metadata,
                   files,
                   io,
                   scorer,
@@ -2316,6 +2320,115 @@ public final class DistributedIndexSearch {
       scorer.destroy();
       io.destroy();
     }
+  }
+
+  /**
+   * The corpus statistics a query summed for its terms, and the ones an earlier query summed.
+   *
+   * <p>Summing costs a pass over every shard, and its answer depends only on the index snapshot and
+   * the terms, so the driver keeps what it summed: a query that names the same terms again pays for
+   * its search and not for its statistics. Entries hold the document frequency of the key's terms
+   * and the corpus totals, which is small next to a shard, and the map is bounded so a session that
+   * sees many term sets does not grow without end.
+   *
+   * <p>A published statistics file is not kept here: reading it is one small file, and the file is
+   * the index's own answer rather than one this driver computed.
+   */
+  private static final int MAX_CACHED_TEXT_STATISTICS = 4096;
+
+  private static final Map<TextStatisticsKey, CorpusStatistics> SUMMED_TEXT_STATISTICS =
+      Collections.synchronizedMap(
+          new LinkedHashMap<TextStatisticsKey, CorpusStatistics>(16, 0.75f, true) {
+            @Override
+            protected boolean removeEldestEntry(
+                Map.Entry<TextStatisticsKey, CorpusStatistics> eldest) {
+              return size() > MAX_CACHED_TEXT_STATISTICS;
+            }
+          });
+
+  /** The identity of one summed statistics answer: the index snapshot and the terms. */
+  private static final class TextStatisticsKey {
+    private final String owner;
+    private final String indexUuid;
+    private final long indexSnapshotId;
+    private final List<String> terms;
+
+    private TextStatisticsKey(
+        String owner, String indexUuid, long indexSnapshotId, Set<String> terms) {
+      this.owner = owner;
+      this.indexUuid = indexUuid;
+      this.indexSnapshotId = indexSnapshotId;
+      // the terms are a set, so the order a query happened to carry them in must not cost a second
+      // pass over the shards for the same answer
+      this.terms = terms.stream().sorted().toList();
+    }
+
+    @Override
+    public boolean equals(Object other) {
+      if (this == other) {
+        return true;
+      }
+
+      if (!(other instanceof TextStatisticsKey)) {
+        return false;
+      }
+
+      TextStatisticsKey that = (TextStatisticsKey) other;
+      return indexSnapshotId == that.indexSnapshotId
+          && owner.equals(that.owner)
+          && indexUuid.equals(that.indexUuid)
+          && terms.equals(that.terms);
+    }
+
+    @Override
+    public int hashCode() {
+      return Objects.hash(owner, indexUuid, indexSnapshotId, terms);
+    }
+  }
+
+  /**
+   * Answers the corpus statistics of a snapshot's terms, summing them only when no earlier query
+   * did.
+   *
+   * <p>The terms a query carries decide the answer, so the key is the index snapshot and the terms.
+   * The index snapshot rather than the source table snapshot identifies the shards: a rebuild over
+   * the same source snapshot reads them with another definition and must not read an earlier
+   * answer.
+   */
+  private static CorpusStatistics summedTextStatistics(
+      JavaSparkContext context,
+      long indexSnapshotId,
+      IndexMetadata metadata,
+      List<IndexFile> files,
+      Broadcast<FileIO> io,
+      Broadcast<TextIndexAdapter> scorer,
+      Set<String> terms,
+      String owner,
+      String readerKey,
+      IndexCacheLocations locationsTable,
+      boolean locality,
+      boolean useResidentCache) {
+    TextStatisticsKey key =
+        new TextStatisticsKey(owner, metadata.indexUuid(), indexSnapshotId, terms);
+    CorpusStatistics cached = SUMMED_TEXT_STATISTICS.get(key);
+    if (cached != null) {
+      return cached;
+    }
+
+    CorpusStatistics summed =
+        mergeTextStatistics(
+            context,
+            files,
+            io,
+            scorer,
+            terms,
+            owner,
+            readerKey,
+            locationsTable,
+            locality,
+            useResidentCache);
+    SUMMED_TEXT_STATISTICS.put(key, summed);
+    return summed;
   }
 
   private static CorpusStatistics mergeTextStatistics(

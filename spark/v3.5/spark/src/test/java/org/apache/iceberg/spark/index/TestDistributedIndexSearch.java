@@ -258,6 +258,65 @@ class TestDistributedIndexSearch {
         .containsExactlyElementsOf(fromMerged);
   }
 
+  /**
+   * The terms of a query are summed once: the next query that names them pays for its search only.
+   *
+   * <p>Summing walks every shard, and the answer depends on the snapshot and the terms rather than
+   * on the query that carried them, so a driver keeps it. The second run here names the same terms
+   * in another order, which is the same set and must not cost another pass.
+   */
+  @Test
+  void sumsTheTermsOfAQueryOnce() throws Exception {
+    TextIndexTypes.register();
+    spark.sql("CREATE TABLE local.db.text_summed_once (id bigint, body string) USING iceberg");
+    spark.sql("INSERT INTO local.db.text_summed_once VALUES (1, 'ice ice glacier')");
+    spark.sql("INSERT INTO local.db.text_summed_once VALUES (2, 'ice cold')");
+    spark.sql("INSERT INTO local.db.text_summed_once VALUES (3, 'glacier cold ice')");
+    Table table =
+        new HadoopTables(spark.sessionState().newHadoopConf())
+            .load(warehouseDir.resolve("db/text_summed_once").toUri().toString());
+    long snapshotId = table.currentSnapshot().snapshotId();
+    TextIndexDefinition definition = TextIndexDefinition.builder().fieldId(2).build();
+    TextIndexAdapter adapter = new TextIndexAdapter(definition);
+    IndexMetadata summed =
+        buildTextIndex(
+            table, definition, "text-summed-once", snapshotId, TextStatisticsPolicy.NEVER);
+    assertThat(summed.latestSnapshot().statisticsLocation()).isNull();
+
+    IndexQuery firstQuery = IndexQuery.of(snapshotId, adapter.encodeQuery("ice glacier"), 2);
+    IndexQuery sameTermsOtherOrder =
+        IndexQuery.of(snapshotId, adapter.encodeQuery("glacier ice"), 2);
+
+    Counted first = searchInItsOwnGroup("bm25-first-sum", summed, table, firstQuery);
+    Counted second = searchInItsOwnGroup("bm25-second-sum", summed, table, sameTermsOtherOrder);
+
+    assertThat(second.hits)
+        .as("summing the same terms in another order answers the same rows")
+        .isEqualTo(first.hits);
+    assertThat(first.jobs)
+        .as("the first run sums the terms over the shards and then searches")
+        .isGreaterThan(second.jobs);
+    assertThat(second.jobs)
+        .as("the second run reuses the statistics the first summed instead of walking the shards")
+        .isEqualTo(1);
+  }
+
+  private record Counted(List<IndexSearchResult> hits, int jobs) {}
+
+  private static Counted searchInItsOwnGroup(
+      String group, IndexMetadata metadata, Table table, IndexQuery query) throws Exception {
+    spark.sparkContext().setJobGroup(group, group, false);
+    try {
+      List<IndexSearchResult> hits =
+          DistributedIndexSearch.searchBatch(spark, metadata, table, List.of(query)).get(0);
+      spark.sparkContext().listenerBus().waitUntilEmpty();
+      int jobs = spark.sparkContext().statusTracker().getJobIdsForGroup(group).length;
+      return new Counted(hits, jobs);
+    } finally {
+      spark.sparkContext().clearJobGroup();
+    }
+  }
+
   private static IndexMetadata buildTextIndex(
       Table table,
       TextIndexDefinition definition,
