@@ -221,6 +221,61 @@ class TestDistributedIndexSearchRowsFromHits {
   }
 
   /**
+   * The answer is merged at the session's parallelism, not once per data file it was read from.
+   *
+   * <p>The fetch-back has a task per file it reads, which is what makes the reads parallel, and
+   * that partitioning is what the operator above this source sees: it merges a partial answer per
+   * task on the driver. A table of a thousand files therefore hands the driver a thousand partial
+   * answers for one query's rows. They are merged where they are kept, at the parallelism the rest
+   * of the query runs at, so the driver merges about as many partial answers as the session has
+   * slots.
+   */
+  @Test
+  void mergesTheAnswerAtTheSessionParallelism() {
+    spark.sql(
+        "CREATE TABLE local.db.merged_rows (id bigint, embedding array<double>) USING iceberg");
+    for (int id = 0; id < 12; id++) {
+      spark.sql(
+          String.format(
+              "INSERT INTO local.db.merged_rows "
+                  + "VALUES (%d, array(cast(%d as double), cast(0 as double)))",
+              id, id + 1));
+    }
+
+    Table table = loadTable("merged_rows");
+    long snapshotId = table.currentSnapshot().snapshotId();
+    IndexMetadata metadata = buildVectorIndex(table, snapshotId, "merged-vectors", 2);
+    List<FileScanTask> tasks = scanTasks(table);
+    int parallelism = spark.sparkContext().defaultParallelism();
+    assertThat(tasks.size())
+        .as("the fixture has to read more files than the session has slots")
+        .isGreaterThan(parallelism);
+
+    try (DistributedIndexSearch.SearchRows rows =
+        DistributedIndexSearch.searchRowsFromHits(
+            spark,
+            metadata,
+            table,
+            query(metadata, snapshotId, tasks.size()),
+            table.schema().select("id", "embedding"),
+            spark.table("local.db.merged_rows").schema(),
+            2,
+            tasks.size(),
+            tasks.size(),
+            tasks,
+            null,
+            null,
+            List.of("id"),
+            null,
+            null)) {
+      assertThat(rows.rows().getNumPartitions())
+          .as("one query's answer is merged at the session's parallelism, not once per file")
+          .isEqualTo(parallelism);
+      assertThat(rows.rows().collect()).hasSize(tasks.size());
+    }
+  }
+
+  /**
    * The rows the answer is read from are kept on the executors until the answer is released.
    *
    * <p>The round that fills the answer reads its rows once, keeps them where they were read and

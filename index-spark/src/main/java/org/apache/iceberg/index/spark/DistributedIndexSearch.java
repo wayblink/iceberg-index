@@ -947,6 +947,13 @@ public final class DistributedIndexSearch {
         window = (int) next;
       }
 
+      // a fetch-back has a task per file it reads, which is what makes the reads parallel; the
+      // answer inherits that partitioning, and the operator above this source merges one partial
+      // answer per task on the driver, so one query's rows are merged once per data file. The rows
+      // are kept where they were read, so merging them here is a regroup of what the tasks produced
+      // rather than a read of anything again.
+      rows = mergeToQueryParallelism(context, rows);
+
       // a plan reads these rows lazily, after this method returns; the copy that saved the second
       // read of them is released when the query that reads them ends
       SearchRows result = releaseWhenQueryEnds(spark, new SearchRows(rows, cached));
@@ -973,6 +980,28 @@ public final class DistributedIndexSearch {
         }
       }
     }
+  }
+
+  /**
+   * Merges the rows of a fetch-back down to the parallelism the rest of the query runs at.
+   *
+   * <p>The fetch-back has a task per file it reads, which is what makes the reads parallel, and the
+   * answer it hands on inherits that partitioning. The operator above this source merges a partial
+   * answer per task on the driver, so a table of a thousand files hands the driver a thousand
+   * partial answers for one query's rows. The rows of the answer are already kept on the executors,
+   * so regrouping them costs neither a shuffle nor another read of the data files; it only decides
+   * how many partial answers meet on the driver.
+   *
+   * <p>An answer that is already at or below that parallelism is handed on as it is: a fetch-back
+   * of few files is its own merge, and regrouping it would only move rows between executors.
+   */
+  private static JavaRDD<Row> mergeToQueryParallelism(JavaSparkContext context, JavaRDD<Row> rows) {
+    int parallelism = context.defaultParallelism();
+    if (parallelism <= 0 || rows.getNumPartitions() <= parallelism) {
+      return rows;
+    }
+
+    return rows.coalesce(parallelism);
   }
 
   /**
