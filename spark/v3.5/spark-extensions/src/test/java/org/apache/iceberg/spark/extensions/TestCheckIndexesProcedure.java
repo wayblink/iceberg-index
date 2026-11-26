@@ -294,7 +294,9 @@ public class TestCheckIndexesProcedure extends ExtensionsTestBase {
             + "(2, array(0.0d, 1.0d), 'iceberg snapshot manifests')",
         table);
     sql(
-        "CALL %s.system.build_vector_index(table => '%s', column => 'embedding', dimension => 2)",
+        "CALL %s.system.build_vector_index(table => '%s', column => 'embedding', dimension => 2, "
+            + "name => 'named_graph', structure => 'hnsw', metric => 'cosine', max_m => 8, "
+            + "max_entries_per_index_file => 10L)",
         catalogName, table);
     sql("CALL %s.system.build_text_index(table => '%s', column => 'body')", catalogName, table);
 
@@ -323,7 +325,13 @@ public class TestCheckIndexesProcedure extends ExtensionsTestBase {
 
       breakIndexFiles(loaded, vector);
 
-      List<Object[]> withBothBroken = check(table);
+      List<Object[]> withBothBroken;
+      sql("USE %s.default", catalogName);
+      try {
+        withBothBroken = check("check_broken_file_" + catalogName);
+      } finally {
+        sql("USE spark_catalog.default");
+      }
       assertThat(withBothBroken).as("one unreadable index does not end the report").hasSize(2);
       Object[] brokenVectorRow = rowOf(withBothBroken, vector.indexUuid());
       assertThat((Boolean) brokenVectorRow[8]).as("readable").isFalse();
@@ -333,6 +341,48 @@ public class TestCheckIndexesProcedure extends ExtensionsTestBase {
           .contains("index => '" + vector.indexUuid() + "'")
           .contains("build_vector_index")
           .doesNotContain("refresh_vector_index");
+      String suggestion = (String) brokenVectorRow[12];
+      String[] statements =
+          suggestion.substring(suggestion.indexOf("run CALL ") + 4).split(" then ");
+      sql("%s", statements[0]);
+      sql("%s", statements[1]);
+      Table reloaded = Spark3Util.loadIcebergTable(spark, table);
+      IndexMetadata rebuilt = VectorIndexes.findIndex(reloaded, "embedding", "vector");
+      assertThat(rebuilt.name()).isEqualTo(vector.name());
+      assertThat(rebuilt.definition()).isEqualTo(vector.definition());
+      assertThat(rebuilt.maxEntriesPerIndexFile()).isEqualTo(vector.maxEntriesPerIndexFile());
+    } finally {
+      sql("DROP TABLE IF EXISTS %s", table);
+    }
+  }
+
+  @TestTemplate
+  void rebuildsAnUnnamedVectorIndexAlongsideANamedIndex() throws Exception {
+    String table = tableName("check_unnamed_vector_" + catalogName);
+    createAndIndex(table);
+    sql(
+        "CALL %s.system.build_vector_index(table => '%s', column => 'embedding', "
+            + "dimension => 2, name => 'sibling')",
+        catalogName, table);
+
+    try {
+      Table loaded = Spark3Util.loadIcebergTable(spark, table);
+      IndexMetadata unnamed =
+          VectorIndexes.indexesFor(loaded, "embedding").stream()
+              .filter(index -> index.name() == null)
+              .findFirst()
+              .orElseThrow();
+      breakIndexFiles(loaded, unnamed);
+      String suggestion = (String) rowOf(check(table), unnamed.indexUuid())[12];
+      String[] statements =
+          suggestion.substring(suggestion.indexOf("run CALL ") + 4).split(" then ");
+      sql("%s", statements[0]);
+      sql("%s", statements[1]);
+
+      Table reloaded = Spark3Util.loadIcebergTable(spark, table);
+      assertThat(VectorIndexes.indexesFor(reloaded, "embedding"))
+          .extracting(IndexMetadata::name)
+          .containsExactlyInAnyOrder("sibling", unnamed.indexUuid());
     } finally {
       sql("DROP TABLE IF EXISTS %s", table);
     }

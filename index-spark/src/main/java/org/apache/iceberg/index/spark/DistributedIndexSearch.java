@@ -2431,6 +2431,51 @@ public final class DistributedIndexSearch {
     return summed;
   }
 
+  /** Loads the statistics needed by a Spark expression that scores rows outside the index. */
+  public static CorpusStatistics textStatistics(
+      SparkSession spark,
+      IndexMetadata metadata,
+      Table table,
+      TextIndexAdapter adapter,
+      IndexQuery query) {
+    IndexReader reader = reader(spark, metadata, table);
+    List<IndexFile> files = reader.indexFiles(query);
+    Set<String> terms = adapter.queryTerms(query.payload());
+    String published = reader.statisticsLocation(query);
+    if (published != null) {
+      return adapter.snapshotStatistics(table.io().newInputFile(published), terms);
+    }
+
+    if (files.isEmpty() || terms.isEmpty()) {
+      return CorpusStatistics.empty();
+    }
+
+    JavaSparkContext context = JavaSparkContext.fromSparkContext(spark.sparkContext());
+    String owner = table.location();
+    boolean useResidentCache = ExecutorIndexCache.Config.enabled(spark);
+    IndexCacheLocations locations = IndexCacheLocations.forContext(context.sc());
+    Broadcast<FileIO> io = context.broadcast(table.io());
+    Broadcast<TextIndexAdapter> scorer = context.broadcast(adapter);
+    try {
+      return summedTextStatistics(
+          context,
+          reader.snapshotId(query),
+          metadata,
+          files,
+          io,
+          scorer,
+          terms,
+          owner,
+          adapterKey(adapter),
+          locations,
+          useResidentCache && localityEnabled(spark),
+          useResidentCache);
+    } finally {
+      scorer.destroy();
+      io.destroy();
+    }
+  }
+
   private static CorpusStatistics mergeTextStatistics(
       JavaSparkContext context,
       List<IndexFile> files,

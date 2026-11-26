@@ -18,6 +18,7 @@
  */
 package org.apache.iceberg.spark.procedures;
 
+import java.io.FileNotFoundException;
 import java.io.IOException;
 import java.io.UncheckedIOException;
 import org.apache.hadoop.fs.FileSystem;
@@ -25,6 +26,7 @@ import org.apache.hadoop.fs.Path;
 import org.apache.iceberg.Table;
 import org.apache.iceberg.index.IndexMetadata;
 import org.apache.iceberg.index.SidecarIndexCatalog;
+import org.apache.iceberg.io.SupportsPrefixOperations;
 import org.apache.spark.sql.SparkSession;
 
 /**
@@ -113,6 +115,24 @@ final class IndexDrop {
     }
 
     String location = SidecarIndexCatalog.locationOf(table.location(), indexUuid);
+    if (table.io() instanceof SupportsPrefixOperations prefixIO) {
+      // Include the separator because object stores match literal prefixes.
+      String prefix = location + "/";
+      prefixIO.deletePrefix(prefix);
+      try {
+        if (prefixIO.listPrefix(prefix).iterator().hasNext()) {
+          throw new UncheckedIOException(
+              new IOException("Failed to delete the index tree " + location));
+        }
+      } catch (UncheckedIOException e) {
+        // A hierarchical FileIO can report a missing directory instead of an empty listing.
+        if (!(e.getCause() instanceof FileNotFoundException)) {
+          throw e;
+        }
+      }
+      return;
+    }
+
     Path path = new Path(location);
     try {
       FileSystem fileSystem = path.getFileSystem(spark.sessionState().newHadoopConf());

@@ -26,7 +26,10 @@ import java.nio.file.Path;
 import java.util.List;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.stream.Collectors;
+import org.apache.iceberg.Table;
+import org.apache.iceberg.index.spark.VectorIndexes;
 import org.apache.iceberg.index.text.TextIndexTypes;
+import org.apache.iceberg.spark.Spark3Util;
 import org.apache.spark.scheduler.SparkListener;
 import org.apache.spark.scheduler.SparkListenerJobStart;
 import org.apache.spark.sql.Dataset;
@@ -308,6 +311,63 @@ class TestRewriteTextSearch {
 
     // every row the function returns as a match is in the result, and nothing else
     assertThat(filteringRows(table)).containsExactlyInAnyOrderElementsOf(functionRows(table, 100));
+  }
+
+  @Test
+  void matchesEveryRowOfAHistoricalSnapshot() {
+    String table = "local.db.docs_historical_match";
+    spark.sql(
+        "CREATE TABLE " + table + " (id bigint, body string) USING iceberg PARTITIONED BY (id)");
+    spark.sql(
+        "INSERT INTO "
+            + table
+            + " VALUES (1,'fox'),(2,'fox'),(3,'fox'),(4,'fox'),(5,'fox'),(6,'fox'),(7,'fox'),(8,'fox')");
+    long snapshot =
+        spark
+            .sql(
+                "CALL local.system.build_text_index(table => 'db.docs_historical_match', column => 'body')")
+            .head()
+            .getLong(1);
+    spark.sql("DELETE FROM " + table + " WHERE id > 1");
+    spark.sql(
+        "CALL local.system.refresh_text_index(table => 'db.docs_historical_match', column => 'body')");
+
+    assertThat(
+            idsOf(
+                spark
+                    .sql(
+                        "SELECT id FROM "
+                            + table
+                            + " VERSION AS OF "
+                            + snapshot
+                            + " WHERE match(body, 'fox')")
+                    .collectAsList()))
+        .containsExactlyInAnyOrder(1L, 2L, 3L, 4L, 5L, 6L, 7L, 8L);
+  }
+
+  @Test
+  void matchesAndProjectsAScoreWithoutPublishedStatistics() {
+    String table = table("docs_without_statistics");
+    spark.sql(
+        "CALL local.system.build_text_index(table => '"
+            + table
+            + "', column => 'body', text_statistics => 'never')");
+    String where = " FROM local." + table + " WHERE match(body, 'fox')";
+    assertThat(jobsDuring(() -> planOf(table, "SELECT id" + where))).isZero();
+    assertThat(idsOf(spark.sql("SELECT id, text_score(body, 'fox')" + where).collectAsList()))
+        .containsExactlyInAnyOrder(1L, 2L, 4L);
+  }
+
+  @Test
+  void plansMatchWithoutReadingTheStatisticsFile() throws Exception {
+    String table = tableWithIndex("docs_match_without_statistics_read");
+    Table loaded = Spark3Util.loadIcebergTable(spark, "local." + table);
+    loaded
+        .io()
+        .deleteFile(
+            VectorIndexes.findIndex(loaded, "body", "text").latestSnapshot().statisticsLocation());
+
+    assertThat(planOf(table, filtering(table))).contains("TextSearchSource");
   }
 
   @Test

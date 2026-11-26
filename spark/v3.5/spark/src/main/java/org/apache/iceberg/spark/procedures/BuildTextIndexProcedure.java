@@ -82,8 +82,8 @@ class BuildTextIndexProcedure extends BaseProcedure {
         LOWERCASE_PARAM,
         STOPWORDS_PARAM,
         MAX_ENTRIES_PER_INDEX_FILE_PARAM,
-        TEXT_STATISTICS_PARAM,
-        IndexProcedures.NAME_PARAM
+        IndexProcedures.NAME_PARAM,
+        TEXT_STATISTICS_PARAM
       };
 
   private static final StructType OUTPUT_TYPE =

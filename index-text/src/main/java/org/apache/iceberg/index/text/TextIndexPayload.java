@@ -71,6 +71,11 @@ final class TextIndexPayload {
 
   static final int HEADER_SIZE = Integer.BYTES + 2 * Long.BYTES + 4 * 7 + (BUCKET_COUNT + 1) * 4;
 
+  // Charge for the reader's directory, mutable and immutable maps, and simultaneous merge inputs
+  // and output. The term bytes also feed the UTF-16 strings and the encoder's temporary buffers.
+  private static final long MERGE_BYTES_PER_TERM = 512L;
+  private static final long MERGE_BYTES_PER_TERM_BYTE = 16L;
+
   private TextIndexPayload() {}
 
   /**
@@ -509,6 +514,46 @@ final class TextIndexPayload {
     public long dictionaryBytes() {
       // the bucket offsets are header fields, so this is known before a single term is read
       return (long) bucketOffsets[BUCKET_COUNT] - bucketOffsets[0];
+    }
+
+    @Override
+    public long statisticsMergeBytes(long budget) throws IOException {
+      long estimate = dictionaryBytes();
+      if (estimate > budget) {
+        return estimate;
+      }
+
+      for (int bucket = 0; bucket < BUCKET_COUNT; bucket++) {
+        int start = bucketOffsets[bucket];
+        int length = bucketOffsets[bucket + 1] - start;
+        if (length == 0) {
+          continue;
+        }
+
+        int previousLength = 0;
+        try (DataInputStream in =
+            new DataInputStream(new ByteArrayInputStream(bytes(source.read(start, length))))) {
+          while (in.available() > 0) {
+            int shared = readVarint(in);
+            int suffix = readVarint(in);
+            check(
+                shared >= 0 && shared <= previousLength && suffix >= 0,
+                "Invalid BM25 dictionary entry length");
+            previousLength = Math.addExact(shared, suffix);
+            estimate += MERGE_BYTES_PER_TERM + MERGE_BYTES_PER_TERM_BYTE * previousLength;
+            if (estimate > budget) {
+              return estimate;
+            }
+
+            in.skipNBytes(suffix);
+            readLongVarint(in); // Document frequency
+            readVarint(in); // Posting offset
+            readVarint(in); // Posting length
+          }
+        }
+      }
+
+      return estimate;
     }
 
     @Override

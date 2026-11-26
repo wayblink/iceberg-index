@@ -49,4 +49,7 @@ interface TextIndexShard {
    * so a build can size a merge over every shard without reading a single term.
    */
   long dictionaryBytes() throws IOException;
+
+  /** Estimates the bytes charged to a merge, stopping once the budget is exceeded. */
+  long statisticsMergeBytes(long budget) throws IOException;
 }

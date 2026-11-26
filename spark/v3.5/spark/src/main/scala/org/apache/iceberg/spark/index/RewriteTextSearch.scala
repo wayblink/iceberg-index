@@ -21,6 +21,7 @@ package org.apache.iceberg.spark.index
 import org.apache.iceberg.index.IndexMetadata
 import org.apache.iceberg.index.IndexQuery
 import org.apache.iceberg.index.IndexReader
+import org.apache.iceberg.index.spark.DistributedIndexSearch
 import org.apache.iceberg.index.spark.IndexDriverMetadata
 import org.apache.iceberg.index.spark.IndexEntries
 import org.apache.iceberg.index.spark.VectorIndexes
@@ -99,11 +100,8 @@ case class RewriteTextSearch(spark: SparkSession) extends Rule[LogicalPlan] {
   private val ScoreColumn = TextSearchSource.ScoreColumn
 
   override def apply(plan: LogicalPlan): LogicalPlan = {
-    // each search answered while planning, with the node that now stands in its place: binding its
-    // score expressions needs the plan around that node, which the pass below cannot see from
-    // inside
-    val boundSearches =
-      collection.mutable.ListBuffer.empty[(LogicalPlan, BoundIndex, CorpusStatistics)]
+    // Score expressions above a lowered MATCH can only be found after the replacement is in place.
+    val boundSearches = collection.mutable.ListBuffer.empty[(LogicalPlan, BoundIndex)]
 
     val rewritten = plan.transformDown {
       // the ranking form: a limit over a global sort, with the projection in between
@@ -119,8 +117,8 @@ case class RewriteTextSearch(spark: SparkSession) extends Rule[LogicalPlan] {
         textMatchIn(condition) match {
           case Some(matchExpression) =>
             rewriteFilter(filter, matchExpression) match {
-              case Some((replacement, bound, statistics)) =>
-                boundSearches.append((replacement, bound, statistics))
+              case Some((replacement, bound)) =>
+                boundSearches.append((replacement, bound))
                 replacement
               case None => filter
             }
@@ -129,7 +127,8 @@ case class RewriteTextSearch(spark: SparkSession) extends Rule[LogicalPlan] {
     }
 
     val bound =
-      boundSearches.foldLeft(rewritten) { case (current, (target, index, statistics)) =>
+      boundSearches.foldLeft(rewritten) { case (current, (target, index)) =>
+        lazy val statistics = readStatistics(index)
         bindPath(current, target, index, statistics)._1
       }
 
@@ -505,7 +504,7 @@ case class RewriteTextSearch(spark: SparkSession) extends Rule[LogicalPlan] {
    */
   private def rewriteFilter(
       filter: Filter,
-      matchExpression: TextMatchExpression): Option[(LogicalPlan, BoundIndex, CorpusStatistics)] = {
+      matchExpression: TextMatchExpression): Option[(LogicalPlan, BoundIndex)] = {
     val scan = IndexRewriteSupport.findIcebergScan(filter).getOrElse(return None)
     val sparkTable = IndexRewriteSupport.icebergTable(scan).getOrElse(return None)
     val table = sparkTable.table()
@@ -526,9 +525,6 @@ case class RewriteTextSearch(spark: SparkSession) extends Rule[LogicalPlan] {
       bind(table, sparkTable, scan, matchExpression.score, column, query)
         .getOrElse(return None)
     val snapshotId = bound.snapshotId
-    // a score computed above this filter is still bound while planning, so its statistics have to
-    // be readable before the plan is lowered
-    val statistics = statisticsOf(bound, column).getOrElse(return None)
 
     val dataFiles =
       IndexEntries.dataFiles(table, snapshotId, IndexDriverMetadata.enabled(spark)).asScala.toSet
@@ -581,7 +577,7 @@ case class RewriteTextSearch(spark: SparkSession) extends Rule[LogicalPlan] {
 
     // the source carries the score as an attribute; a caller that asked for the table's columns
     // keeps getting exactly those
-    Some((Project(filter.output, lowered), bound, statistics))
+    Some((Project(filter.output, lowered), bound))
   }
 
   /**
@@ -643,7 +639,7 @@ case class RewriteTextSearch(spark: SparkSession) extends Rule[LogicalPlan] {
       plan: LogicalPlan,
       target: LogicalPlan,
       bound: BoundIndex,
-      statistics: CorpusStatistics): (LogicalPlan, Boolean) = {
+      statistics: => CorpusStatistics): (LogicalPlan, Boolean) = {
     if (plan eq target) {
       (bindScores(plan, bound, statistics), true)
     } else {
@@ -666,7 +662,7 @@ case class RewriteTextSearch(spark: SparkSession) extends Rule[LogicalPlan] {
   private def bindScores(
       node: LogicalPlan,
       bound: BoundIndex,
-      statistics: CorpusStatistics): LogicalPlan = {
+      statistics: => CorpusStatistics): LogicalPlan = {
     node.transformUp { case plan => bindNode(plan, bound, statistics) }
   }
 
@@ -680,7 +676,7 @@ case class RewriteTextSearch(spark: SparkSession) extends Rule[LogicalPlan] {
   private def bindNode(
       node: LogicalPlan,
       bound: BoundIndex,
-      statistics: CorpusStatistics): LogicalPlan = {
+      statistics: => CorpusStatistics): LogicalPlan = {
     node.mapExpressions { expression =>
       expression.transformDown {
         case score: TextScoreExpression if answers(score, bound) =>
@@ -750,7 +746,7 @@ case class RewriteTextSearch(spark: SparkSession) extends Rule[LogicalPlan] {
 
     val definition = index.definition().asInstanceOf[TextIndexDefinition]
     val reader = new IndexReader(index, table, IndexDriverMetadata.enabled(spark))
-    Some(BoundIndex(snapshotId, index, definition, reader, attribute, query))
+    Some(BoundIndex(table, snapshotId, index, definition, reader, attribute, query))
   }
 
   /**
@@ -762,11 +758,7 @@ case class RewriteTextSearch(spark: SparkSession) extends Rule[LogicalPlan] {
    */
   private def statisticsOf(bound: BoundIndex, column: String): Option[CorpusStatistics] = {
     try {
-      val payload = new TextIndexAdapter(bound.definition).encodeQuery(bound.query)
-      Some(
-        bound.reader
-          .searchStatistics(IndexQuery.of(bound.snapshotId, payload, 0))
-          .asInstanceOf[CorpusStatistics])
+      Some(readStatistics(bound))
     } catch {
       case scala.util.control.NonFatal(e) =>
         logger.warn(
@@ -774,6 +766,12 @@ case class RewriteTextSearch(spark: SparkSession) extends Rule[LogicalPlan] {
           Array[Object](column, String.valueOf(e.getMessage)): _*)
         None
     }
+  }
+
+  private def readStatistics(bound: BoundIndex): CorpusStatistics = {
+    val adapter = new TextIndexAdapter(bound.definition)
+    val query = IndexQuery.of(bound.snapshotId, adapter.encodeQuery(bound.query), 0)
+    DistributedIndexSearch.textStatistics(spark, bound.metadata, bound.table, adapter, query)
   }
 
   private def textColumn(score: TextScoreExpression): Option[String] = {
@@ -800,6 +798,7 @@ case class RewriteTextSearch(spark: SparkSession) extends Rule[LogicalPlan] {
 
   /** The index a search is answered from, and what its score expressions are matched by. */
   private case class BoundIndex(
+      table: org.apache.iceberg.Table,
       snapshotId: Long,
       metadata: IndexMetadata,
       definition: TextIndexDefinition,

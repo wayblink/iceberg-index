@@ -39,6 +39,20 @@ import org.junit.jupiter.api.Test;
  * postings and dictionary, behind a signature that names the format version.
  */
 class TestTextIndexPayload {
+
+  @Test
+  void accountsForExpandedTermsWhenSizingAStatisticsMerge() throws IOException {
+    String prefix = "a".repeat(1024);
+    ByteBuffer payload =
+        TextIndexPayload.encode(new CorpusCounts(1, 2, Map.of(prefix, 1L, prefix + "b", 1L)), null);
+    TextIndexPayload.Reader reader =
+        TextIndexPayload.open(source(bytes(payload)), payload.remaining());
+
+    long budget = 8192;
+    assertThat(reader.dictionaryBytes()).isLessThan(budget);
+    assertThat(reader.statisticsMergeBytes(budget)).isGreaterThan(budget);
+  }
+
   private static final Set<String> ALL = null;
 
   @Test

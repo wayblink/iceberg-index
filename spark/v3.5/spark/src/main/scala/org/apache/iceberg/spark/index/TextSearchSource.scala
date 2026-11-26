@@ -32,6 +32,7 @@ import org.apache.iceberg.index.IndexReader
 import org.apache.iceberg.index.spark.DistributedIndexSearch
 import org.apache.iceberg.index.spark.IndexDriverMetadata
 import org.apache.iceberg.index.spark.IndexEntries
+import org.apache.iceberg.index.spark.VectorIndexes
 import org.apache.iceberg.index.text.TextIndexAdapter
 import org.apache.iceberg.index.text.TextIndexDefinition
 import org.apache.spark.Partitioner
@@ -167,9 +168,7 @@ private[spark] case class TextSearchExec(
     val adapter = new TextIndexAdapter(metadata.definition().asInstanceOf[TextIndexDefinition])
     val entries =
       if (source.limit == TextSearchSource.AllRows) {
-        val counts =
-          org.apache.iceberg.index.spark.VectorIndexes.counts(table.io(), metadata.latestSnapshot())
-        if (counts == null) 0L else counts(1)
+        VectorIndexes.counts(table.io(), metadata.snapshotForSourceTableSnapshot(snapshotId))(1)
       } else {
         0L
       }

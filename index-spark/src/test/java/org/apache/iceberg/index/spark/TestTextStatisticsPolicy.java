@@ -68,6 +68,17 @@ class TestTextStatisticsPolicy {
   }
 
   @Test
+  void budgetsForHeapAndDriverResultLimits() {
+    long gibibyte = 1024L * 1024 * 1024;
+    assertThat(SparkIndexBuilder.textStatisticsMergeBudget(4 * gibibyte, gibibyte, 0))
+        .isEqualTo(gibibyte / 4);
+    assertThat(SparkIndexBuilder.textStatisticsMergeBudget(gibibyte, 4 * gibibyte, gibibyte / 8))
+        .isEqualTo(gibibyte / 8);
+    assertThat(SparkIndexBuilder.textStatisticsMergeBudget(64 * gibibyte, 64 * gibibyte, 0))
+        .isLessThan(Integer.MAX_VALUE);
+  }
+
+  @Test
   void alwaysAndNeverDoNotDependOnTheSize() {
     long limit = 1024L;
 

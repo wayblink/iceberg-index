@@ -60,6 +60,23 @@ public class TestTextIndexProcedures extends ExtensionsTestBase {
     sql("DROP TABLE IF EXISTS %s", tableName("text_errors_" + catalogName));
     sql("DROP TABLE IF EXISTS %s", tableName("text_batch_" + catalogName));
     sql("DROP TABLE IF EXISTS %s", tableName("text_columns_" + catalogName));
+    sql("DROP TABLE IF EXISTS %s", tableName("text_positional_" + catalogName));
+  }
+
+  @TestTemplate
+  void keepsThePositionalNameArgument() {
+    String tableName = tableName("text_positional_" + catalogName);
+    sql("CREATE TABLE %s (id bigint, body string) USING iceberg", tableName);
+    sql("INSERT INTO %s VALUES (1, 'fox')", tableName);
+
+    assertThat(
+            sql(
+                "CALL %s.system.build_text_index('%s', 'body', 1.2D, 0.75D, 1, true, "
+                    + "array('the'), 100L, 'old_name')",
+                catalogName, tableName))
+        .hasSize(1);
+    assertThat(sql("CALL %s.system.list_indexes(table => '%s')", catalogName, tableName))
+        .anySatisfy(row -> assertThat(row).contains("old_name"));
   }
 
   @TestTemplate

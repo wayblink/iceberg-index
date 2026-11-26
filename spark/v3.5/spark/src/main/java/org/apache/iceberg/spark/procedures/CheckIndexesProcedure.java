@@ -23,6 +23,8 @@ import java.nio.ByteBuffer;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Set;
+import java.util.TreeMap;
+import java.util.stream.Collectors;
 import org.apache.iceberg.Table;
 import org.apache.iceberg.index.IndexAdapter;
 import org.apache.iceberg.index.IndexFile;
@@ -37,12 +39,16 @@ import org.apache.iceberg.index.spark.IndexEntries;
 import org.apache.iceberg.index.spark.VectorIndexes;
 import org.apache.iceberg.index.text.TextIndexAdapter;
 import org.apache.iceberg.index.vector.VectorIndexAdapter;
+import org.apache.iceberg.index.vector.VectorIndexDefinition;
+import org.apache.iceberg.index.vector.VectorIndexDefinition.VectorStructure;
 import org.apache.iceberg.index.vector.VectorPayloadHeader;
 import org.apache.iceberg.io.InputFile;
 import org.apache.iceberg.relocated.com.google.common.collect.Lists;
 import org.apache.iceberg.relocated.com.google.common.collect.Sets;
+import org.apache.iceberg.spark.Spark3Util;
 import org.apache.iceberg.spark.procedures.SparkProcedures.ProcedureBuilder;
 import org.apache.spark.sql.catalyst.InternalRow;
+import org.apache.spark.sql.connector.catalog.Identifier;
 import org.apache.spark.sql.connector.catalog.TableCatalog;
 import org.apache.spark.sql.connector.iceberg.catalog.ProcedureParameter;
 import org.apache.spark.sql.types.DataTypes;
@@ -70,13 +76,14 @@ class CheckIndexesProcedure extends BaseProcedure {
   // package private so a test can pin the statement a row suggests without staging a broken index
   static String refreshSuggestionFor(
       String catalog, String tableName, String column, String indexType) {
-    return refreshSuggestion(catalog, tableName, column, indexType);
+    return refreshSuggestion(catalog, qualified(catalog, tableName), column, indexType);
   }
 
   // package private so a test can pin the statements that migrate an unreadable index
   static String rebuildSuggestionFor(
       String catalog, String tableName, String column, String indexType, String indexUuid) {
-    return rebuildSuggestion(catalog, tableName, column, indexType, indexUuid);
+    return rebuildSuggestion(
+        catalog, qualified(catalog, tableName), column, indexType, indexUuid, "");
   }
 
   /**
@@ -141,14 +148,16 @@ class CheckIndexesProcedure extends BaseProcedure {
     ProcedureInput input = new ProcedureInput(spark(), tableCatalog(), PARAMETERS, args);
     List<InternalRow> rows = Lists.newArrayList();
 
-    String tableName = input.asString(TABLE_PARAM, null);
+    Identifier identifier = input.ident(TABLE_PARAM);
+    String catalog = tableCatalog().name();
+    String tableName = Spark3Util.quotedFullIdentifier(catalog, identifier);
 
     // resolved through the catalog the call names, so that the table of `CALL local.system...` is
     // the one checked even when the session's current catalog is another one
     return withIcebergTable(
-        input.ident(TABLE_PARAM),
+        identifier,
         table -> {
-          checkTable(tableCatalog().name(), table, tableName, rows);
+          checkTable(quotedCatalog(catalog), table, tableName, rows);
           return rows.toArray(new InternalRow[0]);
         });
   }
@@ -180,8 +189,7 @@ class CheckIndexesProcedure extends BaseProcedure {
                   false,
                   uncovered,
                   "the index has no snapshot; it cannot be refreshed: "
-                      + rebuildSuggestion(
-                          catalog, tableName, column, metadata.indexType(), metadata.indexUuid())));
+                      + rebuildSuggestion(catalog, table, tableName, column, metadata)));
           continue;
         }
 
@@ -225,7 +233,7 @@ class CheckIndexesProcedure extends BaseProcedure {
                     + "CALL "
                     + catalog
                     + ".system.drop_index(table => '"
-                    + qualified(catalog, tableName)
+                    + tableName
                     + "', column => '<any column>', index => '"
                     + metadata.indexUuid()
                     + "', purge => true)"));
@@ -256,7 +264,7 @@ class CheckIndexesProcedure extends BaseProcedure {
                       + "CALL "
                       + catalog
                       + ".system.drop_index(table => '"
-                      + qualified(catalog, tableName)
+                      + tableName
                       + "', column => '<any column>', index => '"
                       + indexUuid
                       + "', purge => true)")));
@@ -301,8 +309,7 @@ class CheckIndexesProcedure extends BaseProcedure {
               "payload header is unreadable ("
                   + summary(e)
                   + "); "
-                  + rebuildSuggestion(
-                      catalog, tableName, column, indexType, metadata.indexUuid())));
+                  + rebuildSuggestion(catalog, table, tableName, column, metadata)));
       return;
     }
 
@@ -320,8 +327,7 @@ class CheckIndexesProcedure extends BaseProcedure {
               isStale(table, snapshot),
               uncovered,
               "no payload found in the index files; "
-                  + rebuildSuggestion(
-                      catalog, tableName, column, indexType, metadata.indexUuid())));
+                  + rebuildSuggestion(catalog, table, tableName, column, metadata)));
       return;
     }
 
@@ -347,8 +353,7 @@ class CheckIndexesProcedure extends BaseProcedure {
                     + " version "
                     + readerVersion
                     + "; "
-                    + rebuildSuggestion(
-                        catalog, tableName, column, indexType, metadata.indexUuid())));
+                    + rebuildSuggestion(catalog, table, tableName, column, metadata)));
   }
 
   /**
@@ -406,8 +411,7 @@ class CheckIndexesProcedure extends BaseProcedure {
               "no payload found in the index files; "
                   + (text == null
                       ? refreshSuggestion(catalog, tableName, column, indexType)
-                      : rebuildSuggestion(
-                          catalog, tableName, column, indexType, metadata.indexUuid()))));
+                      : rebuildSuggestion(catalog, table, tableName, column, metadata))));
       return;
     }
 
@@ -464,7 +468,7 @@ class CheckIndexesProcedure extends BaseProcedure {
               + "; "
               + (text == null
                   ? refreshSuggestion(catalog, tableName, column, indexType)
-                  : rebuildSuggestion(catalog, tableName, column, indexType, metadata.indexUuid()));
+                  : rebuildSuggestion(catalog, table, tableName, column, metadata));
     }
 
     rows.add(
@@ -503,7 +507,7 @@ class CheckIndexesProcedure extends BaseProcedure {
       String catalog, String tableName, String column, String indexType) {
     return String.format(
         "run CALL %s.system.refresh_%s_index(table => '%s', column => '%s')",
-        catalog, indexType, qualified(catalog, tableName), column);
+        catalog, indexType, tableName, column);
   }
 
   /**
@@ -514,12 +518,71 @@ class CheckIndexesProcedure extends BaseProcedure {
    * named, in the order they have to run, because either one alone leaves the index as it is.
    */
   private static String rebuildSuggestion(
-      String catalog, String tableName, String column, String indexType, String indexUuid) {
-    String qualified = qualified(catalog, tableName);
+      String catalog, Table table, String tableName, String column, IndexMetadata metadata) {
+    StringBuilder options = new StringBuilder();
+    if (metadata.definition() instanceof VectorIndexDefinition vector) {
+      options.append(", dimension => ").append(vector.dimension());
+      options.append(", metric => ").append(sqlString(vector.metric().name()));
+      options.append(", structure => ").append(sqlString(vector.structure().name()));
+      options.append(", quantizer => ").append(sqlString(vector.quantizer().name()));
+
+      var properties = new TreeMap<>(vector.properties());
+      if (vector.structure() == VectorStructure.IVF) {
+        // Older indexes persisted nprobe, which is now a query setting.
+        properties.remove("nprobe");
+      }
+
+      if (!properties.isEmpty()) {
+        String arguments =
+            properties.entrySet().stream()
+                .map(entry -> sqlString(entry.getKey()) + ", " + sqlString(entry.getValue()))
+                .collect(Collectors.joining(", "));
+        options.append(", options => map(").append(arguments).append(")");
+      }
+
+      options
+          .append(", max_entries_per_index_file => ")
+          .append(metadata.maxEntriesPerIndexFile())
+          .append("L");
+    }
+
+    String name = metadata.name();
+    if (name == null && column != null && VectorIndexes.indexesFor(table, column).size() > 1) {
+      // A replacement alongside another index needs a name. The old UUID remains a valid selector.
+      name = metadata.indexUuid();
+    }
+
+    if (name != null) {
+      options.append(", name => ").append(sqlString(name));
+    }
+
+    return rebuildSuggestion(
+        catalog, tableName, column, metadata.indexType(), metadata.indexUuid(), options.toString());
+  }
+
+  private static String rebuildSuggestion(
+      String catalog,
+      String tableName,
+      String column,
+      String indexType,
+      String indexUuid,
+      String options) {
+    String table = sqlString(tableName);
+    String field = sqlString(String.valueOf(column));
     return String.format(
-        "run CALL %s.system.drop_index(table => '%s', column => '%s', index => '%s', purge => true)"
-            + " then CALL %s.system.build_%s_index(table => '%s', column => '%s')",
-        catalog, qualified, column, indexUuid, catalog, indexType, qualified, column);
+        "run CALL %s.system.drop_index(table => %s, column => %s, index => %s, purge => true)"
+            + " then CALL %s.system.build_%s_index(table => %s, column => %s%s)",
+        catalog, table, field, sqlString(indexUuid), catalog, indexType, table, field, options);
+  }
+
+  private static String sqlString(String value) {
+    return "'" + value.replace("\\", "\\\\").replace("'", "\\'") + "'";
+  }
+
+  private static String quotedCatalog(String catalog) {
+    return catalog.matches("[a-zA-Z_][a-zA-Z0-9_]*")
+        ? catalog
+        : "`" + catalog.replace("`", "``") + "`";
   }
 
   /** A table named with or without its catalog both end up as catalog.namespace.table. */
