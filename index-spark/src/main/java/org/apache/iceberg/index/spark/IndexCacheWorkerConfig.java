@@ -24,11 +24,15 @@ import org.apache.iceberg.relocated.com.google.common.base.Preconditions;
 /** Driver-visible settings of the control channel; every value must be positive. */
 final class IndexCacheWorkerConfig {
   static final String PREFIX = "spark.iceberg.index.cache.";
-  static final String POLL_INTERVAL = PREFIX + "control.poll-interval";
-  static final String MAX_COMMANDS = PREFIX + "control.max-commands";
-  static final String MAX_CONCURRENT = PREFIX + "load.max-concurrent";
+  static final String POLL_INTERVAL = PREFIX + "control.poll.interval";
+  static final String LEGACY_POLL_INTERVAL = PREFIX + "control.poll-interval";
+  static final String MAX_COMMANDS = PREFIX + "control.max.commands";
+  static final String LEGACY_MAX_COMMANDS = PREFIX + "control.max-commands";
+  static final String MAX_CONCURRENT = PREFIX + "load.max.concurrent";
+  static final String LEGACY_MAX_CONCURRENT = PREFIX + "load.max-concurrent";
   static final String TIMEOUT = PREFIX + "load.timeout";
-  static final String MAX_ATTEMPTS = PREFIX + "load.max-attempts";
+  static final String MAX_ATTEMPTS = PREFIX + "load.max.attempts";
+  static final String LEGACY_MAX_ATTEMPTS = PREFIX + "load.max-attempts";
 
   private final long pollMillis;
   private final int maxCommands;
@@ -52,46 +56,92 @@ final class IndexCacheWorkerConfig {
   static IndexCacheWorkerConfig parse(Map<String, String> settings) {
     Map<String, String> values = settings == null ? Map.of() : settings;
     return new IndexCacheWorkerConfig(
-        seconds(values, POLL_INTERVAL, 1),
-        (int) positive(values, MAX_COMMANDS, 64),
-        (int) positive(values, MAX_CONCURRENT, 1),
-        seconds(values, TIMEOUT, 600),
-        (int) positive(values, MAX_ATTEMPTS, 3));
+        seconds(values, POLL_INTERVAL, LEGACY_POLL_INTERVAL, 1),
+        (int) positive(values, MAX_COMMANDS, LEGACY_MAX_COMMANDS, 64),
+        (int) positive(values, MAX_CONCURRENT, LEGACY_MAX_CONCURRENT, 1),
+        seconds(values, TIMEOUT, null, 600),
+        (int) positive(values, MAX_ATTEMPTS, LEGACY_MAX_ATTEMPTS, 3));
   }
 
-  private static long seconds(Map<String, String> values, String key, long fallbackSeconds) {
+  /**
+   * The value of a setting and the name it was set under.
+   *
+   * <p>A renamed setting is still read, so a run that carries the old name is obeyed; the name is
+   * kept so an error can quote the key the operator actually wrote. Within one configuration the
+   * new name answers when both are set.
+   */
+  private static final class Setting {
+    private final String value;
+    private final String key;
+
+    private Setting(String value, String key) {
+      this.value = value;
+      this.key = key;
+    }
+
+    private String value() {
+      return value;
+    }
+
+    private String key() {
+      return key;
+    }
+  }
+
+  private static Setting find(Map<String, String> values, String key, String legacyKey) {
+    Setting fromNew = nonBlank(values, key);
+    return fromNew != null ? fromNew : nonBlank(values, legacyKey);
+  }
+
+  private static Setting nonBlank(Map<String, String> values, String key) {
+    if (key == null) {
+      return null;
+    }
+
     String raw = values.get(key);
-    if (raw == null || raw.isBlank()) {
+    return raw == null || raw.isBlank() ? null : new Setting(raw, key);
+  }
+
+  private static long seconds(
+      Map<String, String> values, String key, String legacyKey, long fallbackSeconds) {
+    Setting setting = find(values, key, legacyKey);
+    if (setting == null) {
       return fallbackSeconds * 1_000L;
     }
 
     long seconds;
     try {
-      seconds = Long.parseLong(raw.trim());
+      seconds = Long.parseLong(setting.value().trim());
     } catch (NumberFormatException e) {
       throw new IllegalArgumentException(
-          String.format("Invalid %s: %s (expected whole seconds)", key, raw), e);
+          String.format("Invalid %s: %s (expected whole seconds)", setting.key(), setting.value()),
+          e);
     }
 
-    Preconditions.checkArgument(seconds > 0, "Invalid %s: %s (must be positive)", key, raw);
+    Preconditions.checkArgument(
+        seconds > 0, "Invalid %s: %s (must be positive)", setting.key(), setting.value());
     return Math.multiplyExact(seconds, 1_000L);
   }
 
-  private static long positive(Map<String, String> values, String key, long fallback) {
-    String raw = values.get(key);
-    if (raw == null || raw.isBlank()) {
+  private static long positive(
+      Map<String, String> values, String key, String legacyKey, long fallback) {
+    Setting setting = find(values, key, legacyKey);
+    if (setting == null) {
       return fallback;
     }
 
     long value;
     try {
-      value = Long.parseLong(raw.trim());
+      value = Long.parseLong(setting.value().trim());
     } catch (NumberFormatException e) {
-      throw new IllegalArgumentException(String.format("Invalid %s: %s", key, raw), e);
+      throw new IllegalArgumentException(
+          String.format("Invalid %s: %s", setting.key(), setting.value()), e);
     }
 
-    Preconditions.checkArgument(value > 0, "Invalid %s: %s (must be positive)", key, raw);
-    Preconditions.checkArgument(value <= Integer.MAX_VALUE, "Invalid %s: %s (too large)", key, raw);
+    Preconditions.checkArgument(
+        value > 0, "Invalid %s: %s (must be positive)", setting.key(), setting.value());
+    Preconditions.checkArgument(
+        value <= Integer.MAX_VALUE, "Invalid %s: %s (too large)", setting.key(), setting.value());
     return value;
   }
 

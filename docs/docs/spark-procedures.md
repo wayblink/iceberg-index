@@ -1255,7 +1255,7 @@ ascending: smaller is closer, whatever the metric.
 | `k`           | ✔️        | int           | Number of results to return                  |
 | `coverage`    |           | string        | `table` (default), `indexed`, `index_hits` or `positions` |
 | `nprobe`      |           | int           | IVF probe count for this call; wins over `spark.iceberg.index.vector.ivf.nprobe`. A call-named value on a non-IVF index is an error. |
-| `refine_factor` |           | int           | Candidate multiplier for this call; overrides `spark.iceberg.index.vector.refine-factor` |
+| `refine_factor` |           | int           | Candidate multiplier for this call; overrides `spark.iceberg.index.vector.refine.factor` |
 
 A query setting is read from the call first, then from the session:
 
@@ -1264,7 +1264,7 @@ A query setting is read from the call first, then from the session:
 | the call's argument | `nprobe => 64` | what the query asked for; it wins, and an invalid value fails the call rather than falling back |
 | session configuration | `SET spark.iceberg.index.vector.ivf.nprobe=32` | the default for every query of the session; a session `nprobe` is used by IVF indexes only, and a value named on the call against a non-IVF index is an error |
 
-`filter_mode` is not a call argument. The session setting `spark.iceberg.index.vector.filter-mode`
+`filter_mode` is not a call argument. The session setting `spark.iceberg.index.vector.filter.mode`
 governs the `ORDER BY vec_distance(...)` rewrite when a filter is carried into the search; it is
 described with the rewrite, below.
 
@@ -1695,7 +1695,7 @@ results, just by scanning. Shape matters as well: a join, an aggregate, a window
 than one sort key, or a filter that cannot be expressed as an index-side predicate (a subquery, a
 UDF, a column of another relation) keeps the plan as it is. A scalar filter on ordinary columns is
 carried into the search instead, and the task applies it before or after scoring according to the
-session setting `spark.iceberg.index.vector.filter-mode`; a filtered query is therefore answered
+session setting `spark.iceberg.index.vector.filter.mode`; a filtered query is therefore answered
 from the index rather than by scanning the table, and its answer is as approximate as the index
 itself — the filter selects among the rows the index ranks, it does not make the query exact. A
 warning is logged when the matched rows cannot be read back, and when the type of an index is not
@@ -1704,15 +1704,23 @@ registered in the session.
 Every structure is available to the rewrite. An approximate one (`HNSW`, `IVF`, or any quantized
 index) ranks candidates by an estimate, so the answer is the index's approximation: asking it for
 `k` candidates returns whichever rows the estimate preferred, and the true nearest rows may never be
-listed. `spark.iceberg.index.vector.refine-factor` widens the candidate window before the exact
+listed. `spark.iceberg.index.vector.refine.factor` widens the candidate window before the exact
 re-scoring, so a value above one trades memory and fetch-back cost for recall; the default is one
 and zero means the same base window. Whether to set it is not what decides whether the rewrite
 happens. An exact index (`FLAT` over unquantized vectors)
 enumerates every candidate and needs no widening. The multiplier must be a non-negative integer; an
 invalid value is an error rather than a silent default.
 
-The setting was renamed from `spark.iceberg.index.vector.over-sample`; a session that still sets the
-old key fails with a message naming the new one instead of silently applying the default. The call
+The setting is spelled with a dot rather than a hyphen so a client that only speaks SQL can set it:
+`SET spark.iceberg.index.vector.refine.factor=10` is parsed by the client itself, and a hyphenated
+key has to be quoted (``SET `spark.iceberg.index.vector.refine-factor`=10``) or the statement is
+rejected before the product sees it. The earlier name is still read, so a session, a `spark-submit
+--conf` or a script that still spells it that way keeps working; when one layer sets both, the new
+name answers, and a setting in the session still beats one in the submit configuration.
+
+The setting was renamed from `spark.iceberg.index.vector.over-sample` before that; a session that
+still sets the old key fails with a message naming the replacement instead of silently applying the
+default. The call
 argument is `refine_factor`: a procedure or table function call that still writes `over_sample`
 fails with a message naming the replacement, and the old spelling is kept only to give that
 message.
@@ -1724,7 +1732,7 @@ asks for — the same rows the rewrite returns; `indexed` stays inside the cover
 `index_hits` is the diagnostic view that reports the index's own hits in the index's own order, with
 its estimate as the score and a null `row` for a row the table no longer has. `positions` reports
 the same hits with the row always null and reads no data file. The rewrite is parameterized by
-`spark.iceberg.index.vector.filter-mode`, which decides whether a filter carried into the search is
+`spark.iceberg.index.vector.filter.mode`, which decides whether a filter carried into the search is
 applied before or after scoring; it is a session setting, not a call argument. `EXPLAIN` shows
 whether the rewrite happened, by the presence of the vector source:
 

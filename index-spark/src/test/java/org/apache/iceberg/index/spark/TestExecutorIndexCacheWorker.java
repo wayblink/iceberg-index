@@ -651,6 +651,39 @@ class TestExecutorIndexCacheWorker {
         .isEqualTo(1_000L);
   }
 
+  @Test
+  void workerConfigurationReadsTheNewNameAndTheNameItHad() {
+    assertThat(
+            IndexCacheWorkerConfig.parse(
+                    Map.of("spark.iceberg.index.cache.control.poll.interval", "5"))
+                .pollMillis())
+        .isEqualTo(5_000L);
+    assertThat(
+            IndexCacheWorkerConfig.parse(
+                    Map.of("spark.iceberg.index.cache.control.poll-interval", "5"))
+                .pollMillis())
+        .as("a run that still spells the setting the old way is obeyed")
+        .isEqualTo(5_000L);
+    assertThat(
+            IndexCacheWorkerConfig.parse(
+                    Map.of(
+                        "spark.iceberg.index.cache.load.max.attempts", "2",
+                        "spark.iceberg.index.cache.load.max-attempts", "5"))
+                .maxAttempts())
+        .as("within one configuration the new name is the one that answers")
+        .isEqualTo(2);
+  }
+
+  @Test
+  void anInvalidWorkerSettingIsReportedUnderTheNameItWasSetWith() {
+    assertThatThrownBy(
+            () ->
+                IndexCacheWorkerConfig.parse(
+                    Map.of("spark.iceberg.index.cache.load.max.concurrent", "-1")))
+        .isInstanceOf(IllegalArgumentException.class)
+        .hasMessageContaining("max.concurrent");
+  }
+
   private static boolean awaitLatch(CountDownLatch latch) {
     try {
       return latch.await(30, TimeUnit.SECONDS);

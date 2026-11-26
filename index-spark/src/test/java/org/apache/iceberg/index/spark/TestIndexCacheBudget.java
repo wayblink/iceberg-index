@@ -33,6 +33,22 @@ class TestIndexCacheBudget {
         .isEqualTo(ExecutorIndexCache.Mode.PIN_HOT);
   }
 
+  /**
+   * The name a setting is written under is not a layer: within one layer the new name answers, and
+   * a name left unset falls through to the one it had before.
+   */
+  @Test
+  void theNewSettingNameIsReadBeforeTheOneItHad() {
+    assertThat(ExecutorIndexCache.Config.firstSet("0.5", "0.4"))
+        .as("the new name wins when both are set at the same layer")
+        .isEqualTo("0.5");
+    assertThat(ExecutorIndexCache.Config.firstSet(null, "0.4")).isEqualTo("0.4");
+    assertThat(ExecutorIndexCache.Config.firstSet("", "0.4"))
+        .as("a blank value is not a value")
+        .isEqualTo("0.4");
+    assertThat(ExecutorIndexCache.Config.firstSet(null, null)).isNull();
+  }
+
   @Test
   void totalCapacityOverflowDoesNotDisableCaching() {
     assertThat(ExecutorIndexCache.Config.mode("auto", Long.MAX_VALUE, Long.MAX_VALUE / 2, 3))

@@ -328,6 +328,32 @@ class TestVectorIndexGuide {
         .isEqualTo(exact.get(0).getLong(0));
   }
 
+  /**
+   * §4.4 · the multiplier is spelled so a client that only speaks SQL can set it without quoting.
+   *
+   * <p>A client such as a Thrift Server session parses `SET` itself, and it does not accept a key
+   * with a hyphen in it: before the setting was renamed the statement failed before the product
+   * ever read the value.
+   */
+  @Test
+  void theMultiplierIsSetFromPlainSql() {
+    createTable("plain_set", 8);
+    buildIndex("db.plain_set");
+    assertThat(planOf("db.plain_set")).contains("[DEFAULT]");
+
+    try {
+      spark.sql("SET spark.iceberg.index.vector.refine.factor=10");
+      assertThat(planOf("db.plain_set"))
+          .as("an unquoted SET reaches the query that follows it")
+          .contains("refineFactor=10 [SESSION_CONF");
+
+      spark.sql("RESET spark.iceberg.index.vector.refine.factor");
+      assertThat(planOf("db.plain_set")).as("RESET needs no quoting either").contains("[DEFAULT]");
+    } finally {
+      spark.conf().unset("spark.iceberg.index.vector.refine.factor");
+    }
+  }
+
   /** §4.2 and §9 · a deleted row is gone from the live answer and null in the index hits. */
   @Test
   void aRowDeletedAfterTheBuildComesBackWithoutItsRow() {

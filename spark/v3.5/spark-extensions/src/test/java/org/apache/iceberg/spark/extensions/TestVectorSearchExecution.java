@@ -685,7 +685,7 @@ class TestVectorSearchExecution {
             + "column => 'embedding', dimension => 2, metric => 'l2', structure => 'IVF', "
             + "max_entries_per_index_file => 128, "
             + "options => map('nlist', '8', 'ivf-list-blocks', 'true'))");
-    String range = "spark.iceberg.index.vector.ivf.range-read.enabled";
+    String range = "spark.iceberg.index.vector.ivf.range.read.enabled";
     String cache = "spark.iceberg.index.cache.enabled";
     try {
       spark.conf().set(cache, "false");

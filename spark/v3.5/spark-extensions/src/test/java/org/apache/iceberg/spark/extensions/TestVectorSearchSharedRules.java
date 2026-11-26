@@ -273,7 +273,7 @@ class TestVectorSearchSharedRules {
           .as("the procedure does not take a filter link")
           .isInstanceOf(org.apache.spark.sql.AnalysisException.class);
       assertThatThrownBy(() -> spark.sql(call + ", refine_factor => -1)"))
-          .hasMessageContaining("spark.iceberg.index.vector.refine-factor");
+          .hasMessageContaining("spark.iceberg.index.vector.refine.factor");
 
       // a count the call names is accepted while the session disagrees
       assertThat(spark.sql(call + ", nprobe => 1)").collectAsList()).isNotEmpty();

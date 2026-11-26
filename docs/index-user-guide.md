@@ -336,13 +336,15 @@ SELECT id, title, _distance FROM vector_search(
 
 默认值为 `1`，基础候选预算为 `K`，执行计划显示 `refineFactor=1 [DEFAULT]`。`0` 与 `1` 等价，都表示不放大：两者算出的候选预算都是 `K`。业务行查询仍按原始向量精排，过滤或删除导致活行不足时可以扩窗。显式正整数按 `K × refine-factor` 计算候选预算。SQL 改写与批量 `CALL` 两条入口取的是同一个窗口，同一个倍数在两边取到同样多的候选（这也是同一问题在两个入口给出同一答案的前提）。使用量化索引时，扩大候选窗口可能提高召回率，也可能增加回表成本。可以为会话显式设置倍数。
 
-这个参数此前叫 `over-sample`（配置键 `spark.iceberg.index.vector.over-sample`），现已统一改名为 `refine_factor`（配置键 `spark.iceberg.index.vector.refine-factor`）。旧配置键不再读取：会话或提交参数里还留着旧键时，查询会直接报错并指出新名字，而不是静默退回默认值。`CALL` 过程和表函数里的旧参数 `over_sample` 也不再被接受：两者都会直接报错并提示改叫 `refine_factor`（过程保留旧参数名只为了给出这条报错，它不会生效）。
+这个参数此前叫 `over-sample`（配置键 `spark.iceberg.index.vector.over-sample`），现已统一改名为 `refine_factor`（配置键 `spark.iceberg.index.vector.refine.factor`）。旧配置键不再读取：会话或提交参数里还留着旧键时，查询会直接报错并指出新名字，而不是静默退回默认值。`CALL` 过程和表函数里的旧参数 `over_sample` 也不再被接受：两者都会直接报错并提示改叫 `refine_factor`（过程保留旧参数名只为了给出这条报错，它不会生效）。
 
 ```sql
-SET `spark.iceberg.index.vector.refine-factor`=10;
+SET spark.iceberg.index.vector.refine.factor=10;
 ```
 
-配置名里有点和短横，`SET` 必须用反引号包起来，否则解析器报语法错误。
+`refine.factor` 这个写法是为了**纯 SQL 客户端能直接设**：JDBC/beeline（包括 Thrift Server）自己解析 `SET`，键名带连字符时 `SET spark.iceberg.index.vector.refine-factor=10` 会直接报 `INVALID_SET_SYNTAX`，必须先写成 ``SET `spark.iceberg.index.vector.refine-factor`=10``。改名后普通 `SET` 即可，`RESET` 同理。
+
+旧名（带连字符的那个）仍然**可读**：已经写在 `spark.conf.set(...)`、`spark-submit --conf` 或旧脚本里的值继续生效，不需要立刻改；给旧会话留出迁移时间。优先级是「先看层、再看名」：会话配置压过提交配置这一点不变；**同一层里新名压过旧名**（两个都设时按新名）。反过来，会话里设的是旧名、提交时设的是新名，仍按会话的旧名生效。
 
 放宽不是免费的，倍数直接乘在回表行数上。无量化 `IVF` 与 `FLAT` 设不设这个倍数，答案都一样（只是多读一些行回来重排）。
 
@@ -386,9 +388,9 @@ CALL local.system.drop_index(table => 'db.papers', column => 'body', index => '<
 
 ---
 
-### 4.6 过滤落在检索的哪一侧：`filter-mode`
+### 4.6 过滤落在检索的哪一侧：`filter.mode`
 
-带标量过滤的向量查询有两种走法，由会话配置 `spark.iceberg.index.vector.filter-mode` 指定。它是**每个 task 内部的策略**：task 拿到的是自己那份索引分片和它覆盖的数据文件，取值决定它怎么处理这一份局部数据，而不是"全局先算一遍再检索"。
+带标量过滤的向量查询有两种走法，由会话配置 `spark.iceberg.index.vector.filter.mode` 指定（旧名 `spark.iceberg.index.vector.filter-mode` 仍可读，同一层里新名优先）。它是**每个 task 内部的策略**：task 拿到的是自己那份索引分片和它覆盖的数据文件，取值决定它怎么处理这一份局部数据，而不是"全局先算一遍再检索"。
 
 这个配置**只在 `ORDER BY vec_distance(...)` 改写、且查询的过滤被带进检索时**才有可观察差别；`CALL` 的两个过程与三个表函数都不接受 `filter_mode` 调用参数，也没有把标量过滤带进检索的入口，因此不受它影响。（本节下面描述的都是改写路径。）
 
@@ -683,24 +685,41 @@ BM25 和向量索引共用 executor 的容量预算、LRU 和状态入口。用�
 
 ## 8. 配置总表
 
-### 8.1 查询期（会话级，`SET` 时用反引号）
+### 8.1 查询期（会话级，纯 SQL 可以直接 `SET`，不必加反引号）
 
 | 键 | 默认 | 作用 |
 |---|---|---|
-| `spark.iceberg.index.vector.ivf.range-read.enabled` | `false` | 整索引缓存未命中时，按字节范围读取分块 IVF 索引。 |
+| `spark.iceberg.index.vector.ivf.range.read.enabled` | `false` | 整索引缓存未命中时，按字节范围读取分块 IVF 索引。 |
 | `spark.iceberg.index.vector.ivf.nprobe` | `8` | 每次查询在每个 IVF 索引文件中初始探测的列表数。使用正整数；调用里显式写的值优先，本项 session 值只对 IVF 生效（非 IVF 索引上显式传 `nprobe` 报错）。 |
-| `spark.iceberg.index.vector.refine-factor` | `1` | 基础候选预算为 K。正整数按 K 乘倍数计算；`0` 与 `1` 等价，都是 K。SQL 改写与批量 `CALL` 用同一个窗口。 |
+| `spark.iceberg.index.vector.refine.factor` | `1` | 基础候选预算为 K。正整数按 K 乘倍数计算；`0` 与 `1` 等价，都是 K。SQL 改写与批量 `CALL` 用同一个窗口。 |
 | `spark.iceberg.index.vector.name` | 不设 | 同列多索引时选哪个 |
-| `spark.iceberg.index.vector.filter-mode` | `pre` | task 内过滤落在打分前（`pre`）还是后（`post`）：`pre` 只给放行行打分，`post` 打分后逐行判定再扩样；只在 `ORDER BY vec_distance` 改写带过滤时生效，不是调用参数（见 4.6），非法值直接失败 |
+| `spark.iceberg.index.vector.filter.mode` | `pre` | task 内过滤落在打分前（`pre`）还是后（`post`）：`pre` 只给放行行打分，`post` 打分后逐行判定再扩样；只在 `ORDER BY vec_distance` 改写带过滤时生效，不是调用参数（见 4.6），非法值直接失败 |
 | `spark.iceberg.index.cache.enabled` | `false` | 缓存开关；关掉时 `load_index` 报 `CACHE_DISABLED` |
 | `spark.iceberg.index.cache.bytes` | 自动 | 每 executor 预算 |
-| `spark.iceberg.index.cache.heap-fraction` | `0.25` | 自动预算的堆占比 |
+| `spark.iceberg.index.cache.heap.fraction` | `0.25` | 自动预算的堆占比 |
 | `spark.iceberg.index.cache.mode` | `auto` | 缓存档位 |
-| `spark.iceberg.index.cache.idle-ttl` | `30m` | 整文件条目与 list 块的空闲淘汰 |
+| `spark.iceberg.index.cache.idle.ttl` | `30m` | 整文件条目与 list 块的空闲淘汰 |
 | `spark.iceberg.index.schedule.locality` | `true` | 按持有情况派 task |
-| `spark.iceberg.index.driver-metadata.enabled` | `true` | driver 侧复用已加载的表 metadata、缓存索引 manifest 的解析结果与快照的文件计划；**仅排障用**，设 `false` 时这三处回到旧路径（每次查询重读 metadata、重解析 manifest、重规划文件），答案不变 |
+| `spark.iceberg.index.driver.metadata.enabled` | `true` | driver 侧复用已加载的表 metadata、缓存索引 manifest 的解析结果与快照的文件计划；**仅排障用**，设 `false` 时这三处回到旧路径（每次查询重读 metadata、重解析 manifest、重规划文件），答案不变 |
 
-`spark.iceberg.index.driver-metadata.enabled` 不是调优项：开着的时候查询省掉的是 driver 上那几次本来就不该重复的读，关掉只会更慢，所以只在怀疑缓存里有旧内容时用它把三处一次性退回旧路径（`SET` 或提交时的 `--conf` 都可以，下一次查询生效）。
+**键名里带连字符的都换成了点分写法，原因只有一个：纯 SQL 客户端解析不了带连字符的键。** 会话里 `SET spark.iceberg.index.cache.heap.fraction=0.5` 直接可用；旧名（`...heap-fraction`）仍然可读，但要用它就得加反引号。当前这一批的对应关系是：
+
+| 旧名（仍可读） | 新名 |
+|---|---|
+| `spark.iceberg.index.vector.refine-factor` | `spark.iceberg.index.vector.refine.factor` |
+| `spark.iceberg.index.vector.filter-mode` | `spark.iceberg.index.vector.filter.mode` |
+| `spark.iceberg.index.vector.ivf.range-read.enabled` | `spark.iceberg.index.vector.ivf.range.read.enabled` |
+| `spark.iceberg.index.cache.heap-fraction` | `spark.iceberg.index.cache.heap.fraction` |
+| `spark.iceberg.index.cache.idle-ttl` | `spark.iceberg.index.cache.idle.ttl` |
+| `spark.iceberg.index.driver-metadata.enabled` | `spark.iceberg.index.driver.metadata.enabled` |
+| `spark.iceberg.index.cache.control.poll-interval` | `spark.iceberg.index.cache.control.poll.interval` |
+| `spark.iceberg.index.cache.control.max-commands` | `spark.iceberg.index.cache.control.max.commands` |
+| `spark.iceberg.index.cache.load.max-concurrent` | `spark.iceberg.index.cache.load.max.concurrent` |
+| `spark.iceberg.index.cache.load.max-attempts` | `spark.iceberg.index.cache.load.max.attempts` |
+
+生效顺序是**先看层、再看名**：会话配置压过提交配置；同一层里两个名字都设了，按新名。没有连字符的键（`cache.enabled` / `cache.bytes` / `cache.mode` / `ivf.nprobe` / `vector.name` / `schedule.locality` / `cache.load.timeout`）不受这次改名影响。
+
+`spark.iceberg.index.driver.metadata.enabled` 不是调优项：开着的时候查询省掉的是 driver 上那几次本来就不该重复的读，关掉只会更慢，所以只在怀疑缓存里有旧内容时用它把三处一次性退回旧路径（`SET` 或提交时的 `--conf` 都可以，下一次查询生效）。
 
 查询期参数分两层，优先级从高到低：
 
@@ -709,19 +728,19 @@ BM25 和向量索引共用 executor 的容量预算、LRU 和状态入口。用�
 
 索引定义目前不记录 `nprobe` / `refine_factor` 的默认值，所以实际就是上面两层；`nprobe` 的历史索引期选项已退役，会被忽略。`nprobe` 以调用值为准，只写 session 时该值只对 IVF 索引生效；非 IVF 索引上显式传 `nprobe` 是错误。`refine_factor`、`index` 也适用这条链；`index` 的语句级写法在过程和表函数里都支持。
 
-`filter_mode` 不在这条链里：它不是调用参数，只有会话配置 `spark.iceberg.index.vector.filter-mode`，而且只作用于 `ORDER BY vec_distance` 改写带过滤的查询（4.6）。
+`filter_mode` 不在这条链里：它不是调用参数，只有会话配置 `spark.iceberg.index.vector.filter.mode`，而且只作用于 `ORDER BY vec_distance` 改写带过滤的查询（4.6）。
 
 ### 8.2 executor 侧的调优键（有陷阱）
 
 | 键（前缀 `spark.iceberg.index.cache.`） | 默认 | 是否真的生效 |
 |---|---|---|
-| `control.poll-interval` | `1s` | 生效（executor 轮询周期） |
-| `control.max-commands` | `64` | 生效 |
-| `load.max-concurrent` | `1` | 生效（加载线程池大小） |
+| `control.poll.interval` | `1s` | 生效（executor 轮询周期） |
+| `control.max.commands` | `64` | 生效 |
+| `load.max.concurrent` | `1` | 生效（加载线程池大小） |
 | `load.timeout` | `600s` | 生效 |
-| `load.max-attempts` | `3` | 生效 |
+| `load.max.attempts` | `3` | 生效 |
 
-**陷阱**：executor 侧只认 Spark 注入的 `spark.plugins.internal.conf.<IndexCachePlugin 的类名>.<key>`，只有 driver 侧才回退到裸键 `spark.iceberg.index.cache.*`。直接用裸键 `--conf` 传时，executor 收到的仍是默认值。要改 executor 行为，必须用注入形式。
+旧写法（`control.poll-interval` 等）仍可读，同一层里新名优先。**陷阱**：executor 侧只认 Spark 注入的 `spark.plugins.internal.conf.<IndexCachePlugin 的类名>.<key>`，只有 driver 侧才回退到裸键 `spark.iceberg.index.cache.*`。直接用裸键 `--conf` 传时，executor 收到的仍是默认值。要改 executor 行为，必须用注入形式。
 
 ### 8.3 建索引时写死、事后不可改
 
@@ -796,7 +815,7 @@ BM25 和向量索引共用 executor 的容量预算、LRU 和状态入口。用�
 | 查询没走索引（`EXPLAIN` 里没有 `VectorSearchSource`） | 形态/分区/metric 不满足，或没加载扩展 | 按 4.3 逐条排查 |
 | 召回明显偏低 | `nprobe` 太小，或带量化时倍数太小 | 先调 `nprobe`（无量化 `IVF` 只有这一个旋钮）；带量化再调倍数，1bit 可到 50–100 |
 | 查询慢、`coverage` 低 | 缓存没开或预算不足 | 开 `cache.enabled` |
-| `SET` 报 `INVALID_SET_SYNTAX` | 键名有 `.` 和 `-` | 用反引号包键名 |
+| `SET` 报 `INVALID_SET_SYNTAX` | 用了带连字符的旧键名 | 改用点分新名（见 8.1 的对照表），或给旧名加反引号 |
 | `text_score needs a text index … none was found`（但索引存在） | 索引落后，或 `match` 与别的谓词并列，或零命中 | 先 `refresh_text_index`；把 `match` 单独用（5.4） |
 | 文本查询搜不到中文 | 分词不支持 | 见 5.1 |
 | 文本建索引失败后无法重试（旧版本残留） | 注册未回滚且无删除入口 | 升级后由 5.5 的回滚处理；旧表用 `drop_index` 清残留 |

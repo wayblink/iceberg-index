@@ -240,7 +240,7 @@ class TestVectorSearchFiltered {
                                     + "), 'l2') LIMIT 5")
                             .collectAsList()))
         .as("an unknown mode is refused rather than answered some other way")
-        .hasMessageContaining("filter-mode");
+        .hasMessageContaining("filter.mode");
   }
 
   @Test
@@ -322,11 +322,11 @@ class TestVectorSearchFiltered {
   }
 
   private static <T> T withConf(String mode, java.util.function.Supplier<T> body) {
-    spark.conf().set("spark.iceberg.index.vector.filter-mode", mode);
+    spark.conf().set("spark.iceberg.index.vector.filter.mode", mode);
     try {
       return body.get();
     } finally {
-      spark.conf().unset("spark.iceberg.index.vector.filter-mode");
+      spark.conf().unset("spark.iceberg.index.vector.filter.mode");
     }
   }
 

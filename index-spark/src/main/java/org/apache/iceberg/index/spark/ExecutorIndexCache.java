@@ -104,9 +104,21 @@ final class ExecutorIndexCache {
   static final class Config implements Serializable {
     static final String ENABLED = "spark.iceberg.index.cache.enabled";
     static final String BYTES = "spark.iceberg.index.cache.bytes";
-    static final String HEAP_FRACTION = "spark.iceberg.index.cache.heap-fraction";
+
+    /** The share of the executor heap a derived budget may use. */
+    static final String HEAP_FRACTION = "spark.iceberg.index.cache.heap.fraction";
+
+    /** The name the heap share had before it was spelled so SQL can set it without quoting. */
+    static final String LEGACY_HEAP_FRACTION = "spark.iceberg.index.cache.heap-fraction";
+
     static final String MODE = "spark.iceberg.index.cache.mode";
-    static final String IDLE_TTL = "spark.iceberg.index.cache.idle-ttl";
+
+    /** How long an entry may sit unused before it is reported stale. */
+    static final String IDLE_TTL = "spark.iceberg.index.cache.idle.ttl";
+
+    /** The name the idle bound had before it was spelled so SQL can set it without quoting. */
+    static final String LEGACY_IDLE_TTL = "spark.iceberg.index.cache.idle-ttl";
+
     static final long MIN_BUDGET_BYTES = 512L * 1024L * 1024L;
 
     /** The executor heap a budget is derived from when the application does not size one. */
@@ -145,21 +157,54 @@ final class ExecutorIndexCache {
      */
     private static String setting(
         org.apache.spark.sql.SparkSession spark, String key, String fallback) {
-      String fromSession = spark.conf().get(key, null);
-      if (fromSession != null && !fromSession.isEmpty()) {
+      return setting(spark, key, null, fallback);
+    }
+
+    /**
+     * Reads a setting documented under {@code key}, or under the name it had before the rename.
+     *
+     * <p>A layer answers as a whole: the session is asked under both names before the application
+     * is asked at all, so a value left in the session under the old name is not overridden by the
+     * new name passed at submit time. Within one layer the new name wins.
+     */
+    private static String setting(
+        org.apache.spark.sql.SparkSession spark, String key, String legacyKey, String fallback) {
+      String fromSession =
+          firstSet(
+              spark.conf().get(key, null),
+              legacyKey == null ? null : spark.conf().get(legacyKey, null));
+      if (fromSession != null) {
         return fromSession;
       }
 
-      String fromApplication = spark.sparkContext().getConf().get(key, null);
-      return fromApplication != null && !fromApplication.isEmpty() ? fromApplication : fallback;
+      String fromApplication =
+          firstSet(
+              spark.sparkContext().getConf().get(key, null),
+              legacyKey == null ? null : spark.sparkContext().getConf().get(legacyKey, null));
+      return fromApplication != null ? fromApplication : fallback;
     }
 
-    static Config disabled() {
-      return DISABLED;
+    /**
+     * The new spelling of a setting when it is set, otherwise the old one; blank counts as unset.
+     */
+    static String firstSet(String preferred, String legacy) {
+      if (preferred != null && !preferred.isEmpty()) {
+        return preferred;
+      }
+
+      if (legacy != null && !legacy.isEmpty()) {
+        return legacy;
+      }
+
+      return null;
     }
 
     static boolean enabled(org.apache.spark.sql.SparkSession spark) {
       return Boolean.parseBoolean(setting(spark, ENABLED, "false"));
+    }
+
+    static Config disabled() {
+      return DISABLED;
     }
 
     static Config of(boolean enabled, long maxBytes) {
@@ -212,7 +257,8 @@ final class ExecutorIndexCache {
               heapBytes(spark),
               heapFraction(spark));
       Mode mode = mode(setting(spark, MODE, "auto"), workingSetBytes, budget, executors);
-      long idleTtlMillis = durationMillis(setting(spark, IDLE_TTL, "30m"), IDLE_TTL);
+      long idleTtlMillis =
+          durationMillis(setting(spark, IDLE_TTL, LEGACY_IDLE_TTL, "30m"), IDLE_TTL);
       return new Config(true, budget, mode, idleTtlMillis, owner == null ? "" : owner);
     }
 
@@ -328,7 +374,7 @@ final class ExecutorIndexCache {
     }
 
     private static double heapFraction(org.apache.spark.sql.SparkSession spark) {
-      return fraction(setting(spark, HEAP_FRACTION, DEFAULT_HEAP_FRACTION));
+      return fraction(setting(spark, HEAP_FRACTION, LEGACY_HEAP_FRACTION, DEFAULT_HEAP_FRACTION));
     }
 
     /**

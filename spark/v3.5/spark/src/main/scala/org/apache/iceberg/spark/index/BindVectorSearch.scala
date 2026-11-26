@@ -76,10 +76,13 @@ private[spark] object BindVectorSearch {
     val afterSnapshotNanos = System.nanoTime()
     val keys = Set(
       VectorQueryParameters.RefineFactorConf,
+      // the name the multiple had before it was spelled so SQL can set it: still read
+      VectorQueryParameters.LegacyRefineFactorConf,
       VectorQueryParameters.IndexNameConf,
       VectorQueryParameters.FilterModeConf,
+      VectorQueryParameters.LegacyFilterModeConf,
       VectorQueryParameters.NprobeConf,
-      // the name this setting used to have: kept in the view so the capture can refuse it by name
+      // the name the multiple had before that: kept in the view so the capture can refuse it by name
       // instead of Spark ignoring a key nobody reads
       VectorQueryParameters.RenamedOverSampleConf)
     val session = spark.conf.getAll.filter { case (key, _) => keys.contains(key) }.asJava

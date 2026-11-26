@@ -37,17 +37,30 @@ import org.apache.spark.sql.SparkSession;
 public final class IndexDriverMetadata {
 
   /** Whether a query may reuse loaded metadata and cache parsed manifests and planned files. */
-  public static final String ENABLED = "spark.iceberg.index.driver-metadata.enabled";
+  public static final String ENABLED = "spark.iceberg.index.driver.metadata.enabled";
+
+  /** The name the switch had before it was spelled so SQL can set it without quoting. */
+  public static final String LEGACY_ENABLED = "spark.iceberg.index.driver-metadata.enabled";
 
   private static final String DEFAULT = "true";
 
   private IndexDriverMetadata() {}
 
-  /** Whether the driver may reuse and cache what the query path reads. */
+  /**
+   * Whether the driver may reuse and cache what the query path reads.
+   *
+   * <p>The session answers before the application's configuration does, and within each the new
+   * name answers before the old one: a name is not a layer, so a session value set under the old
+   * name is not overridden by the new name passed at submit time.
+   */
   public static boolean enabled(SparkSession spark) {
-    String configured = spark.conf().get(ENABLED, null);
+    String configured = spark.conf().get(ENABLED, spark.conf().get(LEGACY_ENABLED, null));
     if (configured == null) {
-      configured = spark.sparkContext().getConf().get(ENABLED, DEFAULT);
+      configured =
+          spark
+              .sparkContext()
+              .getConf()
+              .get(ENABLED, spark.sparkContext().getConf().get(LEGACY_ENABLED, DEFAULT));
     }
 
     String value = configured.trim();
@@ -60,6 +73,12 @@ public final class IndexDriverMetadata {
     }
 
     throw new IllegalArgumentException(
-        "Invalid " + ENABLED + ": '" + configured + "', expected true or false");
+        "Invalid "
+            + ENABLED
+            + " (formerly "
+            + LEGACY_ENABLED
+            + "): '"
+            + configured
+            + "', expected true or false");
   }
 }

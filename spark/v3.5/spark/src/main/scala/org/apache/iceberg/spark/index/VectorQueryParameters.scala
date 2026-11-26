@@ -28,12 +28,17 @@ import org.apache.iceberg.index.vector.VectorIndexDefinition
  * <p>{@code locked} says whether the value is passed on as the query's own instruction instead of
  * staying a default: a call's argument is, and so is a configured multiple or index name, while a
  * configured probe count is not, because the encoder reads that setting itself.
+ *
+ * <p>{@code key} is the name the setting was written under, which is the name an error has to quote:
+ * a value refused under a name the operator never wrote sends them looking for a line that is not
+ * there. A call's argument has no name in the configuration, so it is null.
  */
 private[spark] case class VectorParameter(
     value: String,
     origin: String,
     locked: Boolean,
-    shadowedOrigin: String)
+    shadowedOrigin: String,
+    key: String)
 
 private[spark] case class RawVectorParameters(
     refineFactor: VectorParameter,
@@ -56,7 +61,10 @@ private[spark] case class ResolvedVectorParameters(
     nprobeShadowedOrigin: String = null)
 
 private[spark] object VectorQueryParameters {
-  val RefineFactorConf = "spark.iceberg.index.vector.refine-factor"
+  val RefineFactorConf = "spark.iceberg.index.vector.refine.factor"
+
+  /** The name this setting carried before it was spelled so SQL can set it without quoting. */
+  val LegacyRefineFactorConf = "spark.iceberg.index.vector.refine-factor"
 
   /**
    * The name this setting carried before the rename; kept only so it can be refused by name.
@@ -78,7 +86,10 @@ private[spark] object VectorQueryParameters {
    * always was, not the way a threshold guessed. It is not an argument a call can name, because it
    * describes the rewrite that carries the filter, not the search a call asks for.
    */
-  val FilterModeConf = "spark.iceberg.index.vector.filter-mode"
+  val FilterModeConf = "spark.iceberg.index.vector.filter.mode"
+
+  /** The name this setting carried before it was spelled so SQL can set it without quoting. */
+  val LegacyFilterModeConf = "spark.iceberg.index.vector.filter-mode"
 
   /**
    * The probe count a query uses when it names none.
@@ -120,10 +131,13 @@ private[spark] object VectorQueryParameters {
     require(session != null, "Session configuration cannot be null")
     require(submit != null, "Submit configuration cannot be null")
     refuseRenamed(session, submit)
-    val refineFactor = argued(refineFactorArgument, configured(session, submit, RefineFactorConf))
-    val index = argued(indexArgument, configured(session, submit, IndexNameConf))
-    val filterMode = configured(session, submit, FilterModeConf)
-    val nprobe = namedProbe(nprobeArgument, configured(session, submit, NprobeConf))
+    val refineFactor =
+      argued(
+        refineFactorArgument,
+        configured(session, submit, RefineFactorConf, LegacyRefineFactorConf))
+    val index = argued(indexArgument, configured(session, submit, IndexNameConf, null))
+    val filterMode = configured(session, submit, FilterModeConf, LegacyFilterModeConf)
+    val nprobe = namedProbe(nprobeArgument, configured(session, submit, NprobeConf, null))
     RawVectorParameters(refineFactor, index, filterMode, nprobe)
   }
 
@@ -137,7 +151,7 @@ private[spark] object VectorQueryParameters {
     if (argument == null) {
       configured
     } else {
-      VectorParameter(argument, "CALL_ARGUMENT", true, shadowedBy(configured))
+      VectorParameter(argument, "CALL_ARGUMENT", true, shadowedBy(configured), null)
     }
   }
 
@@ -162,7 +176,7 @@ private[spark] object VectorQueryParameters {
    */
   private def namedProbe(argument: String, configuredValue: VectorParameter): VectorParameter = {
     if (argument != null) {
-      VectorParameter(argument, "CALL_ARGUMENT", true, shadowedBy(configuredValue))
+      VectorParameter(argument, "CALL_ARGUMENT", true, shadowedBy(configuredValue), null)
     } else if (configuredValue == null) {
       null
     } else {
@@ -204,8 +218,9 @@ private[spark] object VectorQueryParameters {
         probes._3,
         probes._4)
     } else {
+      val name = if (parameter.key == null) RefineFactorConf else parameter.key
       val message =
-        s"Invalid $RefineFactorConf: '${parameter.value}'; expected a non-negative integer"
+        s"Invalid $name: '${parameter.value}'; expected a non-negative integer"
       require(parameter.value != null, message)
       val value =
         try {
@@ -245,9 +260,10 @@ private[spark] object VectorQueryParameters {
     val value =
       if (parameter.value == null) null else parameter.value.trim.toLowerCase(java.util.Locale.ROOT)
     val valid = Set(FilterModePre, FilterModePost)
+    val name = if (parameter.key == null) FilterModeConf else parameter.key
     require(
       valid.contains(value),
-      s"Invalid $FilterModeConf: '${parameter.value}'; expected one of pre, post")
+      s"Invalid $name: '${parameter.value}'; expected one of pre, post")
     (value, parameter.origin)
   }
 
@@ -289,17 +305,43 @@ private[spark] object VectorQueryParameters {
       s"$RenamedOverSampleConf was renamed to $RefineFactorConf; update the setting")
   }
 
+  /**
+   * The value of a setting, read under the name it is documented under and then under the one it had
+   * before the rename.
+   *
+   * <p>Renaming a setting does not change what it means, so a run that still carries the old name is
+   * obeyed rather than left on the default. Within one layer the new name answers, which is why the
+   * names are tried in that order before the layer below is asked at all: a name is not a layer, and
+   * a session value must not be overridden by a renamed key passed at submit time.
+   */
   private def configured(
       session: JMap[String, String],
       submit: JMap[String, String],
-      key: String): VectorParameter = {
-    if (session.containsKey(key)) {
-      val sameSubmit = submit.containsKey(key) && session.get(key) == submit.get(key)
+      key: String,
+      legacyKey: String): VectorParameter = {
+    val fromSession = settingIn(session, key, legacyKey)
+    val fromSubmit = settingIn(submit, key, legacyKey)
+    if (fromSession != null) {
+      val sameSubmit = fromSubmit != null && fromSession._1 == fromSubmit._1
       val origin = if (sameSubmit) "USER_CONF(session-or-submit)" else "SESSION_CONF"
-      val shadowed = if (submit.containsKey(key) && !sameSubmit) "SUBMIT_CONF" else null
-      VectorParameter(session.get(key), origin, true, shadowed)
-    } else if (submit.containsKey(key)) {
-      VectorParameter(submit.get(key), "SUBMIT_CONF", true, null)
+      val shadowed = if (fromSubmit != null && !sameSubmit) "SUBMIT_CONF" else null
+      VectorParameter(fromSession._1, origin, true, shadowed, fromSession._2)
+    } else if (fromSubmit != null) {
+      VectorParameter(fromSubmit._1, "SUBMIT_CONF", true, null, fromSubmit._2)
+    } else {
+      null
+    }
+  }
+
+  /** The value and the name it was set under in this layer, or null when neither name is set. */
+  private def settingIn(
+      conf: JMap[String, String],
+      key: String,
+      legacyKey: String): (String, String) = {
+    if (conf.containsKey(key)) {
+      (conf.get(key), key)
+    } else if (legacyKey != null && conf.containsKey(legacyKey)) {
+      (conf.get(legacyKey), legacyKey)
     } else {
       null
     }

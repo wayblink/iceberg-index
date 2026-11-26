@@ -84,29 +84,54 @@ public class IndexCachePlugin implements SparkPlugin {
      * Spark stores per-plugin configuration under {@code spark.plugins.internal.conf.<plugin
      * class>.<key>} for the executor; the driver reads the same names and falls back to the plain
      * key for applications that set it directly.
+     *
+     * <p>A layer answers as a whole: the injected form is what an executor receives, so it is asked
+     * under both names before the bare keys are, and within one layer the new name wins.
      */
-    private static Map<String, String> pluginSettings(org.apache.spark.SparkConf conf) {
+    static Map<String, String> pluginSettings(org.apache.spark.SparkConf conf) {
       Map<String, String> settings = new java.util.LinkedHashMap<>();
-      for (String key :
+      for (List<String> names :
           List.of(
-              IndexCacheWorkerConfig.POLL_INTERVAL,
-              IndexCacheWorkerConfig.MAX_COMMANDS,
-              IndexCacheWorkerConfig.MAX_CONCURRENT,
-              IndexCacheWorkerConfig.TIMEOUT,
-              IndexCacheWorkerConfig.MAX_ATTEMPTS)) {
-        String prefixed =
-            "spark.plugins.internal.conf." + IndexCachePlugin.class.getName() + "." + key;
-        String value = conf.get(prefixed, null);
+              List.of(
+                  IndexCacheWorkerConfig.POLL_INTERVAL,
+                  IndexCacheWorkerConfig.LEGACY_POLL_INTERVAL),
+              List.of(
+                  IndexCacheWorkerConfig.MAX_COMMANDS, IndexCacheWorkerConfig.LEGACY_MAX_COMMANDS),
+              List.of(
+                  IndexCacheWorkerConfig.MAX_CONCURRENT,
+                  IndexCacheWorkerConfig.LEGACY_MAX_CONCURRENT),
+              List.of(IndexCacheWorkerConfig.TIMEOUT),
+              List.of(
+                  IndexCacheWorkerConfig.MAX_ATTEMPTS,
+                  IndexCacheWorkerConfig.LEGACY_MAX_ATTEMPTS))) {
+        String value =
+            firstSet(
+                conf,
+                "spark.plugins.internal.conf." + IndexCachePlugin.class.getName() + ".",
+                names);
         if (value == null) {
-          value = conf.get(key, null);
+          value = firstSet(conf, "", names);
         }
 
         if (value != null) {
-          settings.put(key, value);
+          settings.put(names.get(0), value);
         }
       }
 
       return settings;
+    }
+
+    /** The first name in {@code names} that is set under {@code prefix}. */
+    private static String firstSet(
+        org.apache.spark.SparkConf conf, String prefix, List<String> names) {
+      for (String name : names) {
+        String value = conf.get(prefix + name, null);
+        if (value != null) {
+          return value;
+        }
+      }
+
+      return null;
     }
 
     @Override
@@ -175,12 +200,17 @@ public class IndexCachePlugin implements SparkPlugin {
      * converse is just as wrong: advertising a budget while the queries run with the cache off
      * answered a load with COMPLETE and filled an executor nothing would read.
      */
-    private static long advertisedBudget(org.apache.spark.SparkConf conf) {
+    static long advertisedBudget(org.apache.spark.SparkConf conf) {
       return ExecutorIndexCache.Config.advertisedBudget(
           conf.get(ExecutorIndexCache.Config.ENABLED, null),
           conf.get(ExecutorIndexCache.Config.BYTES, null),
           conf.get(ExecutorIndexCache.Config.EXECUTOR_MEMORY, null),
-          conf.get(ExecutorIndexCache.Config.HEAP_FRACTION, null));
+          // the query side reads both names, so the advertised capacity must too: a heap share left
+          // under the old name would size a query's budget and not the executor's, and the two have
+          // to agree about what the cache can hold.
+          ExecutorIndexCache.Config.firstSet(
+              conf.get(ExecutorIndexCache.Config.HEAP_FRACTION, null),
+              conf.get(ExecutorIndexCache.Config.LEGACY_HEAP_FRACTION, null)));
     }
 
     private static String incarnation(PluginContext pluginContext) {

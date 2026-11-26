@@ -52,6 +52,8 @@ import org.junit.jupiter.api.io.TempDir;
 class TestVectorSearchPlanning {
   private static final String REFINE_FACTOR = "spark.iceberg.index.vector.refine-factor";
   private static final String DRIVER_METADATA_ENABLED =
+      "spark.iceberg.index.driver.metadata.enabled";
+  private static final String LEGACY_DRIVER_METADATA_ENABLED =
       "spark.iceberg.index.driver-metadata.enabled";
 
   private static SparkSession spark;
@@ -442,6 +444,15 @@ class TestVectorSearchPlanning {
           .isInstanceOf(NotFoundException.class);
     } finally {
       spark.conf().unset(DRIVER_METADATA_ENABLED);
+    }
+
+    spark.conf().set(LEGACY_DRIVER_METADATA_ENABLED, "false");
+    try {
+      assertThatThrownBy(() -> bind(table, null, "INDEX_HITS"))
+          .as("the name the switch had before it was renamed still turns it off")
+          .isInstanceOf(NotFoundException.class);
+    } finally {
+      spark.conf().unset(LEGACY_DRIVER_METADATA_ENABLED);
     }
   }
 

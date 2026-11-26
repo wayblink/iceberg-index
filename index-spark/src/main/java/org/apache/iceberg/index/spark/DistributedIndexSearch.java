@@ -2669,6 +2669,25 @@ public final class DistributedIndexSearch {
   }
 
   /**
+   * A session setting, read under the name it is documented under and then under the name it had.
+   *
+   * <p>A layer answers as a whole: the session is asked under both names before the application is
+   * asked at all, so a value left in the session under the old name is not overridden by the new
+   * name passed at submit time. Within one layer the new name wins.
+   */
+  private static String setting(SparkSession spark, String key, String legacyKey, String fallback) {
+    String fromSession = spark.conf().get(key, spark.conf().get(legacyKey, null));
+    if (fromSession != null) {
+      return fromSession;
+    }
+
+    return spark
+        .sparkContext()
+        .getConf()
+        .get(key, spark.sparkContext().getConf().get(legacyKey, fallback));
+  }
+
+  /**
    * The reader a search of this session answers from.
    *
    * <p>Every search goes through here so that one setting decides whether a query reuses the parsed
@@ -2811,13 +2830,14 @@ public final class DistributedIndexSearch {
   }
 
   private static boolean rangeReadEnabled(SparkSession spark, IndexAdapter adapter) {
-    String key = "spark.iceberg.index.vector.ivf.range-read.enabled";
+    String key = "spark.iceberg.index.vector.ivf.range.read.enabled";
+    // the name it had before it was spelled so SQL can set it without quoting; still read
+    String legacyKey = "spark.iceberg.index.vector.ivf.range-read.enabled";
     return adapter instanceof VectorIndexAdapter
         && adapter.definition() instanceof VectorIndexDefinition definition
         && definition.structure() == VectorIndexDefinition.VectorStructure.IVF
         && Boolean.parseBoolean(definition.properties().get("ivf-list-blocks"))
-        && Boolean.parseBoolean(
-            spark.conf().get(key, spark.sparkContext().getConf().get(key, "false")));
+        && Boolean.parseBoolean(setting(spark, key, legacyKey, "false"));
   }
 
   private static void logReadTimes(

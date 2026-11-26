@@ -29,7 +29,8 @@ import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
 
 class TestVectorQueryParameters {
-  private static final String REFINE_FACTOR = "spark.iceberg.index.vector.refine-factor";
+  private static final String REFINE_FACTOR = "spark.iceberg.index.vector.refine.factor";
+  private static final String LEGACY_REFINE_FACTOR = "spark.iceberg.index.vector.refine-factor";
   private static final String INDEX_NAME = "spark.iceberg.index.vector.name";
 
   private static final VectorIndexDefinition FLAT =
@@ -151,6 +152,66 @@ class TestVectorQueryParameters {
         .isInstanceOf(IllegalArgumentException.class)
         .hasMessageContaining(renamed)
         .hasMessageContaining(VectorQueryParameters.RefineFactorConf());
+  }
+
+  @Test
+  void theOldMultipleIsStillReadUnderItsOldName() {
+    RawVectorParameters raw =
+        VectorQueryParameters.capture(Map.of(LEGACY_REFINE_FACTOR, "7"), Map.of(), null);
+    ResolvedVectorParameters chosen = VectorQueryParameters.decide(raw, FLAT);
+
+    assertThat(chosen.refineFactor()).isEqualTo(7L);
+    assertThat(chosen.refineFactorOrigin()).isEqualTo("SESSION_CONF");
+  }
+
+  /**
+   * A name is not a layer: the new spelling is the one the setting is written with, so within one
+   * layer it answers when both are set.
+   */
+  @Test
+  void theNewMultipleWinsWithinOneLayer() {
+    RawVectorParameters raw =
+        VectorQueryParameters.capture(
+            Map.of(REFINE_FACTOR, "9", LEGACY_REFINE_FACTOR, "7"), Map.of(), null);
+
+    assertThat(VectorQueryParameters.decide(raw, FLAT).refineFactor()).isEqualTo(9L);
+  }
+
+  @Test
+  void aSessionOldNameStillBeatsASubmitNewName() {
+    RawVectorParameters raw =
+        VectorQueryParameters.capture(
+            Map.of(LEGACY_REFINE_FACTOR, "3"), Map.of(REFINE_FACTOR, "9"), null);
+    ResolvedVectorParameters chosen = VectorQueryParameters.decide(raw, FLAT);
+
+    assertThat(chosen.refineFactor()).isEqualTo(3L);
+    assertThat(chosen.refineFactorOrigin()).isEqualTo("SESSION_CONF");
+    assertThat(chosen.refineFactorShadowedOrigin()).isEqualTo("SUBMIT_CONF");
+  }
+
+  @Test
+  void anInvalidMultipleIsReportedUnderTheNameItWasSetWith() {
+    RawVectorParameters raw =
+        VectorQueryParameters.capture(Map.of(LEGACY_REFINE_FACTOR, "many"), Map.of(), null);
+
+    assertThatThrownBy(() -> VectorQueryParameters.decide(raw, FLAT))
+        .isInstanceOf(IllegalArgumentException.class)
+        .as("a value is reported under the key the operator wrote")
+        .hasMessageContaining(LEGACY_REFINE_FACTOR);
+  }
+
+  @Test
+  void theFilterModeIsReadUnderItsNewAndItsOldName() {
+    for (String key :
+        new String[] {
+          VectorQueryParameters.FilterModeConf(), VectorQueryParameters.LegacyFilterModeConf()
+        }) {
+      ResolvedVectorParameters chosen =
+          VectorQueryParameters.decide(
+              VectorQueryParameters.capture(Map.of(key, "post"), Map.of(), null), FLAT);
+
+      assertThat(chosen.filterMode()).as(key).isEqualTo(VectorQueryParameters.FilterModePost());
+    }
   }
 
   @Test

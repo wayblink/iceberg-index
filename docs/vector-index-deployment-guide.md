@@ -53,8 +53,8 @@ CALL prod.system.build_vector_index(
 
 | 场景 | 建议 | 实测依据 |
 |---|---|---|
-| SIFT 10M～100M，默认 | IVF + RaBitQ **1bit**，`nprobe=32`，refine-factor **100** | 10M 4.4 s、100M 13.5 s，均为精确 recall；比全表扫描快 4.3×／9.9× |
-| 表是 Parquet 且 ≥100M | IVF + 3bit，`nprobe=32`，refine-factor 10 | 1bit 在 Parquet 上每个候选要贵 34–47 ms，宽候选付不起；3bit 只需 10 倍候选 |
+| SIFT 10M～100M，默认 | IVF + RaBitQ **1bit**，`nprobe=32`，refine.factor **100** | 10M 4.4 s、100M 13.5 s，均为精确 recall；比全表扫描快 4.3×／9.9× |
+| 表是 Parquet 且 ≥100M | IVF + 3bit，`nprobe=32`，refine.factor 10 | 1bit 在 Parquet 上每个候选要贵 34–47 ms，宽候选付不起；3bit 只需 10 倍候选 |
 | 表 < 10M 且索引能常驻 | HNSW 可用 | 10M 上 HNSW 最快 10–13 s，仍比 1bit 慢 2 倍；100M 上等于全表扫描，**不要用** |
 | 需要"不走索引"的对照 | FLAT | 只作标尺；但注意它现在也会被改写成索引路径，做对照要自己写不命中改写的表达式（如距离后加 `+ 0.0d`） |
 
@@ -109,15 +109,17 @@ LIMIT 10;
 
 ```
 SET spark.iceberg.index.vector.name = docs_ivf_1bit;
-SET `spark.iceberg.index.vector.ivf.nprobe` = 32;
-SET `spark.iceberg.index.vector.refine-factor` = 100;
+SET spark.iceberg.index.vector.ivf.nprobe = 32;
+SET spark.iceberg.index.vector.refine.factor = 100;
 ```
 
-`refine-factor` 的含义是"向索引要 k×over 个候选，再取前 k"。对 `ORDER BY` 的自动改写，取前 k 之前会**精确重排**，所以放大倍数提高的是**召回**。对 `CALL vector_search`，结果合同由 `coverage` 决定：默认 `table` 会回表、判删除、并按查询要求的距离精确重排（与改写同一答案），`indexed` / `index_hits` / `positions` 才是不补未覆盖文件的索引侧视图；对两个地址类 TVF（`vector_index_search` / `vector_index_search_batch`），合同固定是"索引自己的原始分数、按索引顺序取前 k、删掉的行以 `row = null` 保留"，**不精确重排、不扫未覆盖文件、没有 `coverage` 参数**。因此在索引侧视图上，放大倍数只扩大候选范围、不会让结果变成"精确 Top-K"（近似 kernel 扩大范围后候选集本身可能变，但不保证与旧 `C=k` 逐条一致）。
+这些键名都是点分写法，纯 SQL 客户端可以直接 `SET`（带连字符的旧名仍可读，但要加反引号才能通过解析器）。会话配置压过提交配置；同一层里两个名字都设了，按新名。
 
-`refine-factor` 默认 `1`，基础候选预算为 K，计划显示 `refineFactor=1 [DEFAULT]`。`0` 与 `1` 等价，都表示不放大。正整数按 K 乘倍数计算；SQL 改写与批量 `CALL` 用同一个窗口，同一个倍数在两条入口取到同样多的候选。IVF 的 `nprobe` 控制初始探测的列表数，和候选预算分别设置。
+`refine.factor` 的含义是"向索引要 k×over 个候选，再取前 k"。对 `ORDER BY` 的自动改写，取前 k 之前会**精确重排**，所以放大倍数提高的是**召回**。对 `CALL vector_search`，结果合同由 `coverage` 决定：默认 `table` 会回表、判删除、并按查询要求的距离精确重排（与改写同一答案），`indexed` / `index_hits` / `positions` 才是不补未覆盖文件的索引侧视图；对两个地址类 TVF（`vector_index_search` / `vector_index_search_batch`），合同固定是"索引自己的原始分数、按索引顺序取前 k、删掉的行以 `row = null` 保留"，**不精确重排、不扫未覆盖文件、没有 `coverage` 参数**。因此在索引侧视图上，放大倍数只扩大候选范围、不会让结果变成"精确 Top-K"（近似 kernel 扩大范围后候选集本身可能变，但不保证与旧 `C=k` 逐条一致）。
 
-**近似 kernel 要拿到与精确扫描一致的结果，必须放大 refine-factor。** 集群验收实测：200k 行、16 维、IVF+RaBitQ 4bit、`nprobe=1024`、`nlist=256` 时，`refine-factor` 的实验值为 1 时，Top-10 与 L2 真值**不同**（召回不满）；把 `spark.iceberg.index.vector.refine-factor` 设成 4000 后，Top-10 与 L2 真值逐行一致。也就是说"索引结果 = 精确结果"不是默认行为，而是候选预算足够的产物。
+`refine.factor` 默认 `1`，基础候选预算为 K，计划显示 `refineFactor=1 [DEFAULT]`。`0` 与 `1` 等价，都表示不放大。正整数按 K 乘倍数计算；SQL 改写与批量 `CALL` 用同一个窗口，同一个倍数在两条入口取到同样多的候选。IVF 的 `nprobe` 控制初始探测的列表数，和候选预算分别设置。
+
+**近似 kernel 要拿到与精确扫描一致的结果，必须放大 refine.factor。** 集群验收实测：200k 行、16 维、IVF+RaBitQ 4bit、`nprobe=1024`、`nlist=256` 时，`refine.factor` 的实验值为 1 时，Top-10 与 L2 真值**不同**（召回不满）；把 `spark.iceberg.index.vector.refine.factor` 设成 4000 后，Top-10 与 L2 真值逐行一致。也就是说"索引结果 = 精确结果"不是默认行为，而是候选预算足够的产物。
 
 **注意度量**：`vec_distance` 默认算 L2，只有在被改写命中时才特化成索引的 metric。所以"手写一个不走索引的对照查询"时，`vec_distance(...) + 0.0d` 这种写法其实是 L2 排序——若索引是 COSINE，两者排序不同，会出现"精确索引也差一行"的假象。做对照必须自己写与索引一致的 metric（如显式 `'cosine'`）。
 
@@ -216,7 +218,7 @@ docker push hub.i.basemind.com/spark/sparkann-e2e:<tag>
 
 ### 4.4 灰度与回滚
 
-- **灰度**：先单表建索引 → 观察一周（查询延迟、`check_indexes`、缓存占用）→ 再扩到同库其它表 → 最后才改默认配置（`refine-factor`、缓存预算）。
+- **灰度**：先单表建索引 → 观察一周（查询延迟、`check_indexes`、缓存占用）→ 再扩到同库其它表 → 最后才改默认配置（`refine.factor`、缓存预算）。
 - **回滚**：镜像回退到上一 tag 即可，索引数据不用动——读侧同时接受 manifest v1 与 v2（`IndexManifest.read` 断言 `version == 1 || version == 2`），旧镜像能读旧索引；**但新镜像建的 v2 索引，旧镜像读不了**（写入无条件写 v2）。所以回滚窗口内不要再建新索引，或回滚后对相关表执行一次 `cleanup_index_files` + 重建。
 - **向前兼容责任**：新增字段必须走"写入端可跳过、读取端可缺省"的路子，否则就是又一次 #2756。
 
@@ -241,7 +243,7 @@ docker push hub.i.basemind.com/spark/sparkann-e2e:<tag>
 
 `spark.iceberg.index.cache.enabled`（**默认 false**，必须显式打开；只设 `bytes` 不会启用）、`spark.iceberg.index.cache.bytes`（每个执行器的预算，默认按工作集与堆推导）、`spark.iceberg.index.cache.mode`。开关是两侧共读的：关掉时执行器不广告预算，`load_index` 会以 `CACHE_DISABLED` 失败，查询也不会使用缓存——不会出现"加载报 COMPLETE、查询却看不到缓存"的分裂。缓存关闭时 `index_cache_status()` **返回 0 行**（它不会报"未启用"），2026-10-30 在 A 集群实测：只设 `bytes` 时 0 行，加上 `enabled=true` 后每个执行器与 driver 各一行（`mode=PIN_ALL`、`entries`、`bytes`、`coverage`）。经验：**索引装不进缓存时会退化成"每次查询读自己的索引文件"**，100M 的 HNSW（23.7 GB / 6 执行器）就是这样废掉的——它的延迟等于全表扫描。所以缓存预算要按"最大索引 ÷ 执行器数"给，宁多勿少。
 
-**list 块缓存与整文件条目共享同一份预算。** `range-read.enabled=true` 的查询把探测到的 list 块放进 executor 缓存，块只从整文件占用后的剩余预算里装入；整文件装入需要空间时，会先按 LRU 回收块，再走原有的整文件逐出。块计入 `index_cache_status` 上报的常驻字节（`bytes`），空闲 TTL 淘汰与 `offload_index` / 释放索引会清掉对应的块。所以判断"缓存有没有生效"时，`bytes` 是整文件条目与 list 块的合计，不能只看 `entries`。
+**list 块缓存与整文件条目共享同一份预算。** `range.read.enabled=true` 的查询把探测到的 list 块放进 executor 缓存，块只从整文件占用后的剩余预算里装入；整文件装入需要空间时，会先按 LRU 回收块，再走原有的整文件逐出。块计入 `index_cache_status` 上报的常驻字节（`bytes`），空闲 TTL 淘汰与 `offload_index` / 释放索引会清掉对应的块。所以判断"缓存有没有生效"时，`bytes` 是整文件条目与 list 块的合计，不能只看 `entries`。
 
 ### 5.3 驻留与放置
 
@@ -281,7 +283,7 @@ docker push hub.i.basemind.com/spark/sparkann-e2e:<tag>
 查询期的正常调参走**语句参数**（`CALL ... nprobe => ...`、`SELECT ... FROM vector_search(..., nprobe => ...)`）
 或 **session conf**（`SET spark.iceberg.index.vector.ivf.nprobe=...`），优先级是
 **语句 > session**：`nprobe` 以调用值为准，session 值只对 IVF 生效，非 IVF 索引上显式传 `nprobe`
-报错。`filter_mode` 不是调用参数，只有 session 配置 `spark.iceberg.index.vector.filter-mode`，
+报错。`filter_mode` 不是调用参数，只有 session 配置 `spark.iceberg.index.vector.filter.mode`，
 且只在 `ORDER BY vec_distance` 改写带过滤时生效。见 `docs/docs/spark-procedures.md` 与
 `docs/index-user-guide.md`。
 
@@ -396,7 +398,7 @@ docker push hub.i.basemind.com/spark/sparkann-e2e:<tag>
 
 ### 7.5.2 集群六条验收（2026-10-28，`sh-a-spark` / ns `spark`）
 
-镜像 `hub.i.basemind.com/spark/sparkann-e2e:2769-5f646565`（digest `sha256:09f0d367…`），8 executor × (8g+2g)/2core、driver 6g，表 200k 行 × 16 维，`IVF × RaBitQ 4bit`、`nlist=256`、`nprobe=1024`、`refine-factor=4000`。驱动 `cluster/ClusterIndexAcceptance`（工具仓），每项打印一行 `CHECK n PASS/FAIL`。
+镜像 `hub.i.basemind.com/spark/sparkann-e2e:2769-5f646565`（digest `sha256:09f0d367…`），8 executor × (8g+2g)/2core、driver 6g，表 200k 行 × 16 维，`IVF × RaBitQ 4bit`、`nlist=256`、`nprobe=1024`、`refine.factor=4000`。驱动 `cluster/ClusterIndexAcceptance`（工具仓），每项打印一行 `CHECK n PASS/FAIL`。
 
 | 卡上的验收项 | 结果 | 证据 |
 |---|---|---|
@@ -407,7 +409,7 @@ docker push hub.i.basemind.com/spark/sparkann-e2e:<tag>
 | 5 杀掉 executor 后仍一致 | PASS | 第 1 次迭代后 `Lost executor 2 ... deleted by a user`，其后 5 次迭代 Top-10 与 L2 真值逐行相同 |
 | 6 `index_cache_status` 可读、不 OOM | PASS（附带说明） | 可读、无 OOM；返回 **0 行**，因为该路径 `driverMaterialization=true`，索引检索在 driver 侧完成，执行器没有缓存条目可报。这不是缺陷，但意味着"缓存状态"目前不能用来判断这个计划下的缓存占用 |
 
-**验收过程中学到的两条（已写回 §2.2）**：非恒等分区（`bucket(...)`）曾让改写规则让路，现已改为按查询需要的列判断（见 §2.2 第 3 条）；近似 kernel 要拿到与精确扫描一致的结果，必须把 `refine-factor` 放大（默认 1 时 Top-10 与真值不同，4000 时一致）。
+**验收过程中学到的两条（已写回 §2.2）**：非恒等分区（`bucket(...)`）曾让改写规则让路，现已改为按查询需要的列判断（见 §2.2 第 3 条）；近似 kernel 要拿到与精确扫描一致的结果，必须把 `refine.factor` 放大（默认 1 时 Top-10 与真值不同，4000 时一致）。
 
 **本节不做的事**：没有测 100M、没有测多索引并存、没有更新集群默认配置。验收用的表与索引留在 HDFS `/user/wanganyang/iceberg-acc/warehouse` 作为证据。
 
@@ -478,7 +480,7 @@ docker push hub.i.basemind.com/spark/sparkann-e2e:<tag>
 
 1. **镜像与构建器版本必须对齐**（#2756）。当前没有自动门禁，只靠发布清单里的 smoke。**建议在 CI 增加断言**：镜像内 `IndexManifest` 可读版本集合 ⊇ 构建器 `FORMAT_VERSION`。
 2. **驻留管理未收口**（#2391，7/9）。`load_index`/`offload_index` 的语义已定（按 index 粒度、固定保护期、索引级 LRU），实现仍在推进；生产先别依赖手工驻留。
-3. **nprobe 未系统扫**。旧报告 10M 用 150、100M 用 32；回溯版的 10M 回归用的是 **32**，refine-factor 100 时 recall 天花板 0.983 与旧基线一致（§7.5.3），说明 32 在 10M 可用，但**没有做 32↔150 的同轮对照**，也没扫 100M。这是上线后第一个该调的旋钮，调它要按 §7.5.3 的口径同时记录 recall 而不是只看延迟。
+3. **nprobe 未系统扫**。旧报告 10M 用 150、100M 用 32；回溯版的 10M 回归用的是 **32**，refine.factor 100 时 recall 天花板 0.983 与旧基线一致（§7.5.3），说明 32 在 10M 可用，但**没有做 32↔150 的同轮对照**，也没扫 100M。这是上线后第一个该调的旋钮，调它要按 §7.5.3 的口径同时记录 recall 而不是只看延迟。
 4. **只在 Hive catalog 上验证过**。REST catalog 的元数据更新路径（`MetadataUpdate` 序列化）有单测覆盖，但没有端到端跑过；用 REST catalog 上线前要单独验收。
 5. **DDL 与 `CALL` 并存**（2026-10-30 起）。`SHOW/`CREATE/`REFRESH/`DROP INDEX` 已实现并经 A 集群镜像 smoke；`CALL` 过程仍是参数最全的入口。文本索引尚无名字，`OPTIMIZE INDEX` 与短语/多列/混合检索未实现。
 6. **`FLAT` 不作为生产查询手段**（它在规模上省不了开销），但它**不再被改写规则拒绝**：旧规则里"FLAT 代价等同扫描所以跳过"的判断已删除，`TestVectorIndexGuide.theRewriteUsesWhateverStructureTheIndexHas` 断言 FLAT 也会生成 `VectorSearchSource`。早先"FLAT 走 `ORDER BY` 拿不到结果"的观察对应旧行为；用户手册里"索引不能是 `FLAT`"一句已过期，改文档时以本条为准。
@@ -495,7 +497,7 @@ docker push hub.i.basemind.com/spark/sparkann-e2e:<tag>
 - [ ] §4.3 六条验收全绿，特别是 `list_indexes` 返回全部行
 - [ ] 单表灰度一周：延迟、`check_indexes`、缓存占用都有数
 - [ ] 缓存预算 ≥ 最大索引 ÷ 执行器数
-- [ ] `refine-factor` 默认值写进集群配置（建议 100），并在用户文档里说明它是什么
+- [ ] `refine.factor` 默认值写进集群配置（建议 100），并在用户文档里说明它是什么
 - [ ] 建索引用的 principal 有表元数据写权限
 - [ ] 回滚方案演练过：旧镜像 + 新索引的唯一问题是读不了 v2，确认窗口内不建索引
 - [ ] 基线符合 §7.1：Iceberg 取厂内 `step-1.9`；**不替换** Spark 的 parquet/avro jar（内部 shaded 1.15.2 / 1.12.0 随 runtime jar 走）
@@ -508,4 +510,4 @@ docker push hub.i.basemind.com/spark/sparkann-e2e:<tag>
 
 ---
 
-**参考**：基准报告 `docs/sift-vector-index-benchmark.html`（10M/100M × Parquet/Lance × HNSW/IVF/暴力 × 1/2/3/4bit × refine-factor）；用户过程手册 `docs/docs/spark-procedures.md`；改写规则 `spark/v3.5/spark/src/main/scala/org/apache/iceberg/spark/index/RewriteVectorSearch.scala`；索引格式 `core/src/main/java/org/apache/iceberg/index/IndexManifest.java`；集群侧工具（建索引入口、镜像、测量）在并列的工具仓 `iceberg-tools`。
+**参考**：基准报告 `docs/sift-vector-index-benchmark.html`（10M/100M × Parquet/Lance × HNSW/IVF/暴力 × 1/2/3/4bit × refine.factor）；用户过程手册 `docs/docs/spark-procedures.md`；改写规则 `spark/v3.5/spark/src/main/scala/org/apache/iceberg/spark/index/RewriteVectorSearch.scala`；索引格式 `core/src/main/java/org/apache/iceberg/index/IndexManifest.java`；集群侧工具（建索引入口、镜像、测量）在并列的工具仓 `iceberg-tools`。

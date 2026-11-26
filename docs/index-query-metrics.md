@@ -41,7 +41,7 @@ Lance 的分布式 `VECTOR_SEARCH` 从 #3089 起上报 12 个读路径指标（`
 
 - **回表的字节数与请求数没有报**：`lance-iceberg` 格式的回表走 Lance SDK，不经过 `InputFile`，无法在现有读路径上计数；`parquet` 格式的 `readFileWithFormat` 同样没有暴露 IO 计数。回表先用 `fetchBackTimeNs` + 已有的 `numFetchedRows` / `numRowsAtFiles` 代理，字节级归因留给回表重写（#3122）。
 - **只有融合路径有这些指标**：`CALL system.vector_search` / `vector_search_batch` 与地址类表函数 `vector_index_search` / `vector_index_search_batch` 走的是 driver 侧搜索（`VectorSearchBridge`，CALL 默认还回表），不经过 `searchWithRows`，因此不产出这组指标。
-- **range 与整文件缓存不是同一种缓存**：`range-read.enabled=true` 时查询不读整文件，所以 `numIndexCacheHits` 通常为 0、`numIndexCacheMisses` 约等于索引文件数；range 路径复用内存靠的是 **list 块缓存**（`numIndexBlockCacheHits`/`numIndexBlockCacheMisses`），它与整文件缓存共享同一个开关与预算（`spark.iceberg.index.cache.enabled` / `spark.iceberg.index.cache.bytes`）：块从整文件占用后的剩余预算里装入，整文件装入需要空间时也会回收块；块与整文件共用同一份预算，但**块不计入 `index_cache_status` 的 `usedBytes`**（那是整文件的内存模型投影），所以看占用时 `usedBytes` 是下界；空闲 TTL 淘汰与 `offload_index` 释放索引都会清掉对应的块。命中块时 `numIndexRangeBytesRead` 只剩容器 footer 与描述区。
+- **range 与整文件缓存不是同一种缓存**：`range.read.enabled=true` 时查询不读整文件，所以 `numIndexCacheHits` 通常为 0、`numIndexCacheMisses` 约等于索引文件数；range 路径复用内存靠的是 **list 块缓存**（`numIndexBlockCacheHits`/`numIndexBlockCacheMisses`），它与整文件缓存共享同一个开关与预算（`spark.iceberg.index.cache.enabled` / `spark.iceberg.index.cache.bytes`）：块从整文件占用后的剩余预算里装入，整文件装入需要空间时也会回收块；块与整文件共用同一份预算，但**块不计入 `index_cache_status` 的 `usedBytes`**（那是整文件的内存模型投影），所以看占用时 `usedBytes` 是下界；空闲 TTL 淘汰与 `offload_index` 释放索引都会清掉对应的块。命中块时 `numIndexRangeBytesRead` 只剩容器 footer 与描述区。
 - **`taskTimeNs` 不是 Spark 的 task 时长**：它只覆盖 task 处理索引文件的那段墙钟，不含调度、反序列化广播、框架开销；和 event log 的 `tasks` 相位对比时，后者还会包含 task 之间的空隙与尾部。
 - **指标只在有 task 的执行里出现**：没有 task 的计划/管理命令（如 `CALL index_cache_status`）不会带这些 accumulable。
 

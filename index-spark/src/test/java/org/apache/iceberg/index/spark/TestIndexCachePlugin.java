@@ -477,6 +477,57 @@ class TestIndexCachePlugin {
     }
   }
 
+  /**
+   * The control settings are documented under their new names, and a run that still spells them the
+   * old way is obeyed: both are read, and the new one answers when both are set.
+   */
+  @Test
+  void driverReadsTheControlSettingsUnderEitherName() {
+    String prefix = "spark.plugins.internal.conf." + IndexCachePlugin.class.getName() + ".";
+
+    SparkConf injected = new SparkConf(false);
+    injected.set(prefix + "spark.iceberg.index.cache.control.max.commands", "7");
+    assertThat(IndexCachePlugin.IndexCacheDriverPlugin.pluginSettings(injected))
+        .as("the executor's injected form of the name the manual now shows")
+        .containsEntry("spark.iceberg.index.cache.control.max.commands", "7");
+
+    SparkConf plainOld = new SparkConf(false);
+    plainOld.set("spark.iceberg.index.cache.control.max-commands", "5");
+    assertThat(IndexCachePlugin.IndexCacheDriverPlugin.pluginSettings(plainOld))
+        .as("a bare key under the name it had before, which is what an older script sets")
+        .containsEntry("spark.iceberg.index.cache.control.max.commands", "5");
+
+    SparkConf both = new SparkConf(false);
+    both.set("spark.iceberg.index.cache.control.max-commands", "5");
+    both.set("spark.iceberg.index.cache.control.max.commands", "7");
+    assertThat(IndexCachePlugin.IndexCacheDriverPlugin.pluginSettings(both))
+        .as("the new name wins when the same layer sets both")
+        .containsEntry("spark.iceberg.index.cache.control.max.commands", "7");
+  }
+
+  /**
+   * A query reads the heap share under either name, so the advertised capacity has to as well: a
+   * share left under the old name would size the query's budget and not the executor's, and a load
+   * would be refused against a capacity the query believed it had.
+   */
+  @Test
+  void advertisedCapacityReadsTheHeapShareUnderEitherName() {
+    SparkConf conf = new SparkConf(false);
+    conf.set("spark.iceberg.index.cache.enabled", "true");
+    conf.set("spark.executor.memory", "1g");
+    conf.set("spark.iceberg.index.cache.heap-fraction", "0.1");
+    long oneGigabyte = 1024L * 1024L * 1024L;
+
+    assertThat(IndexCachePlugin.IndexCacheExecutorPlugin.advertisedBudget(conf))
+        .as("a share left under the old name is read, not replaced by the default")
+        .isEqualTo((long) (oneGigabyte * 0.1));
+
+    conf.set("spark.iceberg.index.cache.heap.fraction", "0.5");
+    assertThat(IndexCachePlugin.IndexCacheExecutorPlugin.advertisedBudget(conf))
+        .as("the new name answers when one layer sets both")
+        .isEqualTo((long) (oneGigabyte * 0.5));
+  }
+
   private static IndexCacheProtocol.NodeReport report(long sequence) {
     return report(sequence, INCARNATION);
   }
