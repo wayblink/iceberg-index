@@ -125,7 +125,7 @@ SELECT id FROM local.db.papers WHERE match(body, 'parquet statistics') AND year 
 |---|---|---|---|
 | `FLAT` | 精确，逐条比 | 小规模对拍、要求绝对精确 | 搜索量等同全扫，省不了时间 |
 | `HNSW` | 近似，图 | 追求高召回、内存装得下 | 索引最大（10M/128 维约 2.2 GB） |
-| `IVF` | 近似，倒排 + 质心 | 大表、要控制索引体积 | 召回靠 `nprobe`；**带量化时**还要靠查询期 refine-factor 补 |
+| `IVF` | 近似，倒排 + 质心 | 大表、要控制索引体积 | 召回靠 `nprobe`；**带量化时**还要靠查询期 refine.factor 补 |
 
 `quantizer => 'RABITQ'` 只对 `IVF` 有意义：每维压到 1–8 bit，体积降一个数量级，分数变成估计值，召回靠候选放宽补。
 
@@ -308,9 +308,9 @@ SELECT id, title, _distance FROM vector_search(
 非 IVF 索引上**显式**传 `nprobe` 是错误（不会静默忽略）。
 
 `filter_mode` **不是**调用参数：`CALL` 和表函数都不接受它，只有会话配置
-`spark.iceberg.index.vector.filter-mode`（见 4.6）。
+`spark.iceberg.index.vector.filter.mode`（见 4.6；旧名 `...filter-mode` 仍可读）。
 
-> **升级提醒（本轮两处 SQL 表面变更）**：① `filter_mode => ...` 作为调用参数已移除，旧语句会直接报“无此参数”，改用会话配置 `SET spark.iceberg.index.vector.filter-mode=pre|post`；② 三个地址类表函数（`vector_index_search` / `vector_index_search_batch`）固定为 `index_hits` 语义——用索引最新快照、不补未覆盖文件、被删行保留 `row = NULL`、分数是索引估计，**不再**按整表覆盖回答。要活行或精确分数用 `CALL ... coverage => 'table'|'indexed'` 或 `FROM vector_search(...)`。
+> **升级提醒（本轮两处 SQL 表面变更）**：① `filter_mode => ...` 作为调用参数已移除，旧语句会直接报“无此参数”，改用会话配置 `SET spark.iceberg.index.vector.filter.mode=pre|post`；② 三个地址类表函数（`vector_index_search` / `vector_index_search_batch`）固定为 `index_hits` 语义——用索引最新快照、不补未覆盖文件、被删行保留 `row = NULL`、分数是索引估计，**不再**按整表覆盖回答。要活行或精确分数用 `CALL ... coverage => 'table'|'indexed'` 或 `FROM vector_search(...)`。
 
 `vector_search` 表函数的 `distance_type` 可以显式指定 `l2` / `cosine` / `dot`（早期的 `euclidean`、`dot_product` 等写法仍接受）；**不写它就跟随索引的 metric**（索引是 `l2`，返回的就是 L2 距离）；写了但与索引不一致时，改写会退让并做全表扫描，但**答案仍是你要的那个 metric 的精确值**。
 
@@ -320,7 +320,7 @@ SELECT id, title, _distance FROM vector_search(
 2. 表只有 identity 分区；
 3. 形态是"单表 + 唯一一个升序距离排序 + 可折叠的正数 `LIMIT`"，中间只有投影、子查询别名，以及能被转换成索引侧表达式的过滤条件（向量列上的 `IS NOT NULL` 是其中最简单的一种）；
 4. 显式 `metric`（如果写了第三参数）与索引的 metric 一致，否则只 WARN 并退扫描；
-5. 索引存在、覆盖当前快照，就参与改写——**是否设置 `refine-factor` 不影响走不走索引**，只影响候选宽度（4.4）。
+5. 索引存在、覆盖当前快照，就参与改写——**是否设置 `refine.factor` 不影响走不走索引**，只影响候选宽度（4.4）。
 
 反过来，`DESC`、多个排序键、`OFFSET`、join、聚合、窗口、无法转换成索引侧表达式的过滤（子查询、UDF、跨表列）、非 identity 分区、`LIMIT` 不是字面量——都会让规则退让，退回全表扫描。
 
@@ -330,11 +330,11 @@ SELECT id, title, _distance FROM vector_search(
 
 ### 4.4 候选宽度：默认值从哪里来，什么时候要自己调
 
-**索引总是被使用**（前提是它存在、覆盖当前快照、形态匹配）。`refine-factor` 不是"允许近似"的开关，它是**候选宽度**：向索引多要一些候选，交给上面的精确重排去挑。因此它决定的是召回与延迟的折中，不是走不走索引。
+**索引总是被使用**（前提是它存在、覆盖当前快照、形态匹配）。`refine.factor` 不是"允许近似"的开关，它是**候选宽度**：向索引多要一些候选，交给上面的精确重排去挑。因此它决定的是召回与延迟的折中，不是走不走索引。
 
 计划里标 `exact` 还是 `approximate` 由另一件事决定——**候选集是否完整**：只有 `FLAT` 且无量化才枚举全部条目（`exact`）；`IVF` 只访问 `nprobe` 个分区，`HNSW` 只走图的一部分，两者都是表的一个样本（`approximate`）。近似与否是索引形态的属性，不是参数设置的属性。
 
-默认值为 `1`，基础候选预算为 `K`，执行计划显示 `refineFactor=1 [DEFAULT]`。`0` 与 `1` 等价，都表示不放大：两者算出的候选预算都是 `K`。业务行查询仍按原始向量精排，过滤或删除导致活行不足时可以扩窗。显式正整数按 `K × refine-factor` 计算候选预算。SQL 改写与批量 `CALL` 两条入口取的是同一个窗口，同一个倍数在两边取到同样多的候选（这也是同一问题在两个入口给出同一答案的前提）。使用量化索引时，扩大候选窗口可能提高召回率，也可能增加回表成本。可以为会话显式设置倍数。
+默认值为 `1`，基础候选预算为 `K`，执行计划显示 `refineFactor=1 [DEFAULT]`。`0` 与 `1` 等价，都表示不放大：两者算出的候选预算都是 `K`。业务行查询仍按原始向量精排，过滤或删除导致活行不足时可以扩窗。显式正整数按 `K × refine.factor` 计算候选预算。SQL 改写与批量 `CALL` 两条入口取的是同一个窗口，同一个倍数在两边取到同样多的候选（这也是同一问题在两个入口给出同一答案的前提）。使用量化索引时，扩大候选窗口可能提高召回率，也可能增加回表成本。可以为会话显式设置倍数。
 
 这个参数此前叫 `over-sample`（配置键 `spark.iceberg.index.vector.over-sample`），现已统一改名为 `refine_factor`（配置键 `spark.iceberg.index.vector.refine.factor`）。旧配置键不再读取：会话或提交参数里还留着旧键时，查询会直接报错并指出新名字，而不是静默退回默认值。`CALL` 过程和表函数里的旧参数 `over_sample` 也不再被接受：两者都会直接报错并提示改叫 `refine_factor`（过程保留旧参数名只为了给出这条报错，它不会生效）。
 
@@ -653,12 +653,12 @@ CALL local.system.cleanup_index_files(table => 'db.docs');
 |---|---|---|
 | `spark.iceberg.index.cache.enabled` | `false` | 总开关；关掉时 executor 不广告预算，`load_index` 以 `CACHE_DISABLED` 失败 |
 | `spark.iceberg.index.cache.bytes` | 自动（按工作集推导，下限 512MB） | 每 executor 预算 |
-| `spark.iceberg.index.cache.heap-fraction` | `0.25` | 自动预算的堆占比上限 |
+| `spark.iceberg.index.cache.heap.fraction` | `0.25` | 自动预算的堆占比上限（旧名 `...heap-fraction` 仍可读） |
 | `spark.iceberg.index.cache.mode` | `auto` | `PIN_ALL` / `PIN_HOT` / `STREAM` |
-| `spark.iceberg.index.cache.idle-ttl` | `30m` | 整文件条目与 list 块的空闲淘汰 |
+| `spark.iceberg.index.cache.idle.ttl` | `30m` | 整文件条目与 list 块的空闲淘汰（旧名 `...idle-ttl` 仍可读） |
 | `spark.iceberg.index.schedule.locality` | `true` | 把 task 派到已持有该索引文件的 executor |
 
-自动预算按**整个工作集**（所有索引文件 prepare 后的常驻内存）× 1.2 估算，再被 `堆大小 × heap-fraction` 截住。不是"每个 executor 分 1/N"——任何一个 task 都可能被派到任何 executor。
+自动预算按**整个工作集**（所有索引文件 prepare 后的常驻内存）× 1.2 估算，再被 `堆大小 × heap.fraction` 截住。不是"每个 executor 分 1/N"——任何一个 task 都可能被派到任何 executor。
 
 手工驻留：
 
