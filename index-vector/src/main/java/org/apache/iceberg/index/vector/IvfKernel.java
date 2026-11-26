@@ -296,7 +296,7 @@ public final class IvfKernel implements VectorKernel, RetainedBytes {
     return buildResult(
         count,
         dataFiles,
-        encoded,
+        ByteBuffer.wrap(encoded),
         centroids.length,
         trained.samples,
         trained.iterations,
@@ -375,7 +375,7 @@ public final class IvfKernel implements VectorKernel, RetainedBytes {
   private IndexBuildResult buildResult(
       int entryCount,
       List<String> dataFiles,
-      byte[] encoded,
+      ByteBuffer encoded,
       int listCount,
       int samples,
       int iterations,
@@ -386,9 +386,9 @@ public final class IvfKernel implements VectorKernel, RetainedBytes {
         isQuantized() ? RaBitQQuantizer.estimatedListBytes(dimension, listCount) : 0L;
     return VectorMemoryEstimates.result(
         this,
-        ByteBuffer.wrap(encoded),
+        encoded,
         preparedBytes(
-            encoded.length,
+            encoded.remaining(),
             listCount,
             dataFiles.size(),
             dictionaryBytes,
@@ -402,7 +402,7 @@ public final class IvfKernel implements VectorKernel, RetainedBytes {
             Map.entry("list-count", (long) listCount),
             Map.entry("data-file-count", (long) dataFiles.size()),
             Map.entry("data-file-string-bytes", dictionaryBytes),
-            Map.entry("payload-bytes", (long) encoded.length),
+            Map.entry("payload-bytes", (long) encoded.remaining()),
             Map.entry("list-directory-bytes", 2L * PreparedStructureSize.ints(listCount)),
             Map.entry("quantizer-bytes", quantizerBytes),
             Map.entry("quantizer-bits", isQuantized() ? (long) quantizer.bits() : 0L),
@@ -433,7 +433,7 @@ public final class IvfKernel implements VectorKernel, RetainedBytes {
   /** Decodes one entry, and refuses a vector the metric cannot use. */
   private void decodeInto(List<IndexEntry> entries, float[][] vectors, int i) {
     {
-      vectors[i] = VectorPayloads.decodeVector(entries.get(i).payload(), dimension, "Entry");
+      vectors[i] = VectorPayloads.decodeVector(entries.get(i).payloadView(), dimension, "Entry");
       if (scoring.metric() == VectorIndexDefinition.Metric.COSINE) {
         // a vector with no direction cannot be assigned to a partition: every centroid is equally
         // (dis)similar to it, and the score of anything stored under it would be meaningless

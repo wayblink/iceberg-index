@@ -130,7 +130,7 @@ final class NativeIvfBuild {
 
   /** The payload a native build wrote, and what the build spent. */
   static final class Built {
-    private final byte[] payload;
+    private final ByteBuffer payload;
     private final int listCount;
     private final int sampleCount;
     private final int iterations;
@@ -141,7 +141,7 @@ final class NativeIvfBuild {
     private final long nanosEncode;
 
     private Built(
-        byte[] payload,
+        ByteBuffer payload,
         int listCount,
         int sampleCount,
         int iterations,
@@ -161,8 +161,8 @@ final class NativeIvfBuild {
       this.nanosEncode = nanosEncode;
     }
 
-    byte[] payload() {
-      return payload.clone();
+    ByteBuffer payload() {
+      return payload.duplicate();
     }
 
     int listCount() {
@@ -729,15 +729,18 @@ final class NativeIvfBuild {
       int payloadBytes = in.readInt();
       Preconditions.checkState(
           payloadBytes >= 0, "Invalid native IVF payload bytes: %s", payloadBytes);
-      byte[] payload = new byte[payloadBytes];
-      in.readFully(payload);
       Preconditions.checkState(
-          in.available() == 0,
-          "The native IVF build returned %s bytes after its payload",
-          in.available());
+          in.available() == payloadBytes,
+          "The native IVF build returned %s bytes after its counters, the frame says %s",
+          in.available(),
+          payloadBytes);
+      // the payload is the last part of the frame, and it is used from there rather than copied
+      // off it: a payload of hundreds of megabytes is not something to hold twice while it is
+      // written to the index file
+      int payloadStart = frame.length - payloadBytes;
 
       return new Built(
-          payload,
+          ByteBuffer.wrap(frame, payloadStart, payloadBytes).slice().asReadOnlyBuffer(),
           listCount,
           sampleCount,
           iterations,
@@ -813,17 +816,18 @@ final class NativeIvfBuild {
         int offset = i * recordBytes;
         // the payload carries its own version and dimension, which the native side checks; only
         // its length is checked here, where a record is copied as a whole
-        byte[] payload = entries.get(row).payload();
+        ByteBuffer payload = entries.get(row).payloadView();
         Preconditions.checkArgument(
-            payload.length == payloadBytes,
+            payload.remaining() == payloadBytes,
             "Native IVF entry %s carries a %s-byte payload; %s dimensions need %s bytes",
             row,
-            payload.length,
+            payload.remaining(),
             dimension,
             payloadBytes);
         out.putInt(offset, fileIndexes[row]);
         out.putLong(offset + Integer.BYTES, entries.get(row).rowPosition());
-        out.put(offset + Integer.BYTES + Long.BYTES, payload, 0, payload.length);
+        out.position(offset + Integer.BYTES + Long.BYTES);
+        out.put(payload);
       }
     }
   }

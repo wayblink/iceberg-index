@@ -82,10 +82,43 @@ pub struct BuildOutcome {
     pub nanos_encode: u64,
 }
 
-/// Builds one IVF payload.
+/// The counts and timings of a payload build, which the caller frames around the bytes.
+#[derive(Debug)]
+pub struct BuildStats {
+    pub iterations: usize,
+    pub sample_count: usize,
+    pub nanos_read: u64,
+    pub nanos_train: u64,
+    pub nanos_assign: u64,
+    pub nanos_encode: u64,
+}
+
+/// Builds one IVF payload into a new buffer.
 pub fn build(request: &BuildRequest, source: &mut dyn EntrySource) -> Result<BuildOutcome, String> {
+    let mut payload = Writer::new();
+    let stats = build_payload(request, source, &mut payload)?;
+    Ok(BuildOutcome {
+        payload: payload.bytes,
+        iterations: stats.iterations,
+        sample_count: stats.sample_count,
+        nanos_read: stats.nanos_read,
+        nanos_train: stats.nanos_train,
+        nanos_assign: stats.nanos_assign,
+        nanos_encode: stats.nanos_encode,
+    })
+}
+
+/// Builds one IVF payload, appending its bytes to `out`.
+///
+/// This is the entry point a caller that frames the payload itself uses: the result frame holds the
+/// payload exactly once, so a build of hundreds of megabytes does not copy it again to put it there.
+pub fn build_payload(
+    request: &BuildRequest,
+    source: &mut dyn EntrySource,
+    out: &mut Writer,
+) -> Result<BuildStats, String> {
     let unit = request.unit_id.as_str();
-    build_inner(request, source).map_err(|message| {
+    build_inner(request, source, out).map_err(|message| {
         if unit.is_empty() {
             message
         } else {
@@ -97,20 +130,32 @@ pub fn build(request: &BuildRequest, source: &mut dyn EntrySource) -> Result<Bui
 fn build_inner(
     request: &BuildRequest,
     source: &mut dyn EntrySource,
-) -> Result<BuildOutcome, String> {
+    payload_out: &mut Writer,
+) -> Result<BuildStats, String> {
     validate(request)?;
 
     let read_start = Instant::now();
-    // The vectors of a unit live in memory for the whole build, so an allocation the machine cannot
+    // The coordinates of a unit live in one block for the whole build: a vector per allocation gave
+    // every row its own small object, and the allocator keeps the pages of those after they are
+    // freed, so a build of several units ratcheted the process's resident memory up instead of
+    // releasing each unit when it was written. One block is also one mapping, which the allocator
+    // hands back to the operating system when the build is done. An allocation the machine cannot
     // serve is reported rather than left to abort the process: the Java side treats it as a failed
     // native build and runs its own kernel, which fails one task instead of the executor.
-    let mut vectors: Vec<Vec<f32>> = Vec::new();
-    vectors
-        .try_reserve_exact(request.entry_count)
+    let dimension = request.dimension;
+    let coordinate_count = request.entry_count.checked_mul(dimension).ok_or_else(|| {
+        format!(
+            "{} vectors of {} dimensions overflow",
+            request.entry_count, dimension
+        )
+    })?;
+    let mut coordinates: Vec<f32> = Vec::new();
+    coordinates
+        .try_reserve_exact(coordinate_count)
         .map_err(|error| {
             format!(
-                "Cannot hold the {} vectors of this unit: {}",
-                request.entry_count, error
+                "Cannot hold the {} coordinates of this unit: {}",
+                coordinate_count, error
             )
         })?;
     let mut positions: Vec<(i32, i64)> = Vec::new();
@@ -151,17 +196,35 @@ fn build_inner(
             }
 
             let row_position = reader.i64("row position")?;
-            let vector = if request.raw_values {
-                read_entry_payload(&mut reader, request.dimension, data_file, row_position)?
+            if request.raw_values {
+                read_entry_payload_into(
+                    &mut reader,
+                    dimension,
+                    data_file,
+                    row_position,
+                    &mut coordinates,
+                )?;
             } else {
-                read_coordinates(&mut reader, request.dimension, data_file, row_position)?
-            };
+                read_coordinates_into(
+                    &mut reader,
+                    dimension,
+                    data_file,
+                    row_position,
+                    &mut coordinates,
+                )?;
+            }
 
             positions.push((data_file, row_position));
-            vectors.push(vector);
         }
 
         read += count;
+    }
+
+    // The rows are slices of the one block, built once it can no longer move.
+    let mut vectors: Vec<&[f32]> = Vec::with_capacity(request.entry_count);
+    for row in 0..request.entry_count {
+        let start = row * dimension;
+        vectors.push(&coordinates[start..start + dimension]);
     }
     let nanos_read = nanos(read_start);
 
@@ -192,23 +255,25 @@ fn build_inner(
         list_sizes.push(size);
     }
 
-    let payload = payload::write(&PayloadSpec {
-        dimension: request.dimension,
-        centroids: &trained.centroids,
-        data_files: &request.data_files,
-        entry_count: request.entry_count,
-        quantized: if request.bits == 0 {
-            None
-        } else {
-            Some((request.bits, request.seed))
+    payload::write_into(
+        &PayloadSpec {
+            dimension: request.dimension,
+            centroids: &trained.centroids,
+            data_files: &request.data_files,
+            entry_count: request.entry_count,
+            quantized: if request.bits == 0 {
+                None
+            } else {
+                Some((request.bits, request.seed))
+            },
+            list_blocks: request.list_blocks,
+            lists: &lists,
+            list_sizes: &list_sizes,
         },
-        list_blocks: request.list_blocks,
-        lists: &lists,
-        list_sizes: &list_sizes,
-    })?;
+        payload_out,
+    )?;
 
-    Ok(BuildOutcome {
-        payload,
+    Ok(BuildStats {
         iterations: trained.iterations,
         sample_count: trained.sample_count,
         nanos_read,
@@ -223,12 +288,13 @@ fn build_inner(
 /// The payload is the versioned value the Java side hands over: its version and dimension, then the
 /// coordinates. Both are checked here because this side is the one that would otherwise read the
 /// coordinates of another format as if they were its own.
-fn read_entry_payload(
+fn read_entry_payload_into(
     reader: &mut crate::abi::Reader,
     dimension: usize,
     data_file: i32,
     row_position: i64,
-) -> Result<Vec<f32>, String> {
+    out: &mut Vec<f32>,
+) -> Result<(), String> {
     let version = reader.i32("entry payload version")?;
     if version != ENTRY_VALUE_FORMAT_VERSION {
         return Err(format!(
@@ -248,23 +314,17 @@ fn read_entry_payload(
         ));
     }
 
-    read_coordinates(reader, dimension, data_file, row_position)
+    read_coordinates_into(reader, dimension, data_file, row_position, out)
 }
 
 /// Reads one vector as the decoded coordinates the older chunk layout carries.
-fn read_coordinates(
+fn read_coordinates_into(
     reader: &mut crate::abi::Reader,
     dimension: usize,
     data_file: i32,
     row_position: i64,
-) -> Result<Vec<f32>, String> {
-    let mut vector = Vec::new();
-    vector.try_reserve_exact(dimension).map_err(|error| {
-        format!(
-            "Cannot hold the {} dimensions of data file {} position {}: {}",
-            dimension, data_file, row_position, error
-        )
-    })?;
+    out: &mut Vec<f32>,
+) -> Result<(), String> {
     for _ in 0..dimension {
         let value = reader.f32("vector coordinate")?;
         if !value.is_finite() {
@@ -274,16 +334,16 @@ fn read_coordinates(
             ));
         }
 
-        vector.push(value);
+        out.push(value);
     }
 
-    Ok(vector)
+    Ok(())
 }
 
 /// The bytes of every list and its member count, in centroid order.
 fn encode_lists(
     request: &BuildRequest,
-    vectors: &[Vec<f32>],
+    vectors: &[&[f32]],
     positions: &[(i32, i64)],
     members: &[Vec<usize>],
 ) -> Result<Vec<(Vec<u8>, usize)>, String> {
@@ -339,22 +399,69 @@ fn encode_lists(
 /// One encoded list body and the number of entries it holds.
 type EncodedList = Result<(Vec<u8>, usize), String>;
 
+/// The exact bytes an encoded list body takes, where zero code bytes means the vectors themselves.
+fn body_bytes(
+    dimension: usize,
+    members: usize,
+    code_bytes: usize,
+    factors: usize,
+) -> Result<usize, String> {
+    let overflow = || "The bytes of a list body overflow".to_string();
+    let vector_bytes = dimension.checked_mul(FLOAT_BYTES).ok_or_else(overflow)?;
+    let per_member = INTEGER_BYTES
+        .checked_add(POSITION_BYTES)
+        .and_then(|fixed| fixed.checked_add(code_bytes))
+        .and_then(|fixed| {
+            factors
+                .checked_mul(FLOAT_BYTES)
+                .and_then(|factor_bytes| fixed.checked_add(factor_bytes))
+        })
+        .ok_or_else(overflow)?;
+    let members_bytes = members.checked_mul(per_member).ok_or_else(overflow)?;
+    if code_bytes == 0 {
+        // the member count, then the entries themselves: no centre, and every vector at full width
+        INTEGER_BYTES
+            .checked_add(members_bytes)
+            .and_then(|bytes| {
+                members
+                    .checked_mul(vector_bytes)
+                    .and_then(|all| bytes.checked_add(all))
+            })
+            .ok_or_else(overflow)
+    } else {
+        // the centre, the member count, then each entry's code and factors
+        INTEGER_BYTES
+            .checked_add(vector_bytes)
+            .and_then(|bytes| bytes.checked_add(members_bytes))
+            .ok_or_else(overflow)
+    }
+}
+
 /// Encodes one list: the vectors themselves, or one RaBitQ code and its factors per entry.
 fn encode_list(
     list: usize,
     request: &BuildRequest,
-    vectors: &[Vec<f32>],
+    vectors: &[&[f32]],
     positions: &[(i32, i64)],
     members: &[usize],
     signs: &[f32],
 ) -> Result<(Vec<u8>, usize), String> {
     let mut body = Writer::new();
     if request.bits == 0 {
+        // one exact reservation per list: growing from empty reallocates the body about ten times,
+        // and every one of those copies a list that is most of a megabyte
+        let bytes = body_bytes(request.dimension, members.len(), 0, 0)?;
+        body.bytes.try_reserve_exact(bytes).map_err(|error| {
+            format!(
+                "Cannot hold the {} bytes of list {}: {}",
+                bytes, list, error
+            )
+        })?;
         body.i32(members.len() as i32);
         for member in members {
             body.i32(positions[*member].0);
             body.i64(positions[*member].1);
-            for value in &vectors[*member] {
+            for value in vectors[*member] {
                 body.f32(*value);
             }
         }
@@ -362,12 +469,21 @@ fn encode_list(
         return Ok((body.bytes, members.len()));
     }
 
-    let selected: Vec<&[f32]> = members
-        .iter()
-        .map(|member| vectors[*member].as_slice())
-        .collect();
+    let selected: Vec<&[f32]> = members.iter().map(|member| vectors[*member]).collect();
     let quantizer = Quantizer::train(&selected, request.dimension, request.bits)
         .map_err(|message| format!("List {}: {}", list, message))?;
+    let bytes = body_bytes(
+        request.dimension,
+        members.len(),
+        quantizer.code_bytes(),
+        FACTORS,
+    )?;
+    body.bytes.try_reserve_exact(bytes).map_err(|error| {
+        format!(
+            "Cannot hold the {} bytes of list {}: {}",
+            bytes, list, error
+        )
+    })?;
     for value in quantizer.center() {
         body.f32(*value);
     }
@@ -377,7 +493,7 @@ fn encode_list(
     let mut factors = [0.0f32; FACTORS];
     for member in members {
         quantizer
-            .encode(signs, &vectors[*member], &mut code, &mut factors)
+            .encode(signs, vectors[*member], &mut code, &mut factors)
             .map_err(|message| format!("List {}: {}", list, message))?;
         body.i32(positions[*member].0);
         body.i64(positions[*member].1);

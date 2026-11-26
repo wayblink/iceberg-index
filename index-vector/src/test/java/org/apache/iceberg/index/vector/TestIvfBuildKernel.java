@@ -224,7 +224,7 @@ class TestIvfBuildKernel {
     assertThat(built.entryCount())
         .as("the entries the native build read")
         .isEqualTo(entries.size());
-    assertThat(bytes(ByteBuffer.wrap(built.payload())))
+    assertThat(bytes(built.payload()))
         .as("%s: the payload built from the entry payloads as they are", quantizer)
         .isEqualTo(javaBytes);
   }

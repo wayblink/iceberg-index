@@ -167,7 +167,8 @@ impl Writer {
 
     /// Writes a string the way `DataOutputStream.writeUTF` does.
     pub fn modified_utf(&mut self, value: &str) -> Result<(), String> {
-        let mut encoded = Vec::with_capacity(value.len() + 2);
+        let length = modified_utf_len(value)?;
+        let mut encoded = Vec::with_capacity(length - 2);
         for unit in value.encode_utf16() {
             if (0x0001..=0x007F).contains(&unit) {
                 encoded.push(unit as u8);
@@ -182,18 +183,34 @@ impl Writer {
             }
         }
 
-        if encoded.len() > u16::MAX as usize {
-            return Err(format!(
-                "A string of {} bytes does not fit writeUTF's two-byte length",
-                encoded.len()
-            ));
-        }
-
         self.bytes
-            .extend_from_slice(&(encoded.len() as u16).to_be_bytes());
+            .extend_from_slice(&((encoded.len()) as u16).to_be_bytes());
         self.bytes.extend_from_slice(&encoded);
         Ok(())
     }
+}
+
+/// The bytes `writeUTF` spends on a string, its two-byte length prefix included.
+pub fn modified_utf_len(value: &str) -> Result<usize, String> {
+    let mut encoded = 0usize;
+    for unit in value.encode_utf16() {
+        encoded += if (0x0001..=0x007F).contains(&unit) {
+            1
+        } else if unit <= 0x07FF {
+            2
+        } else {
+            3
+        };
+    }
+
+    if encoded > u16::MAX as usize {
+        return Err(format!(
+            "A string of {} bytes does not fit writeUTF's two-byte length",
+            encoded
+        ));
+    }
+
+    Ok(2 + encoded)
 }
 
 #[cfg(test)]

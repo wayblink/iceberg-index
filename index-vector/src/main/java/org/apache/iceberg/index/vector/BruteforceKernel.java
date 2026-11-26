@@ -121,13 +121,19 @@ public final class BruteforceKernel implements VectorKernel, RetainedBytes {
       }
 
       out.writeInt(entries.size());
+      byte[] scratch = new byte[0];
       for (IndexEntry entry : entries) {
-        VectorPayloads.decodeVector(entry.payload(), dimension, "Entry");
+        ByteBuffer payload = entry.payloadView();
+        VectorPayloads.decodeVector(payload.duplicate(), dimension, "Entry");
         out.writeInt(dataFiles.indexOf(entry.dataFile()));
         out.writeLong(entry.rowPosition());
-        byte[] payload = entry.payload();
-        out.writeInt(payload.length);
-        out.write(payload);
+        if (scratch.length != payload.remaining()) {
+          scratch = new byte[payload.remaining()];
+        }
+
+        payload.get(scratch, 0, payload.remaining());
+        out.writeInt(scratch.length);
+        out.write(scratch);
       }
     } catch (IOException e) {
       throw new UncheckedIOException("Failed to encode vector index entries", e);

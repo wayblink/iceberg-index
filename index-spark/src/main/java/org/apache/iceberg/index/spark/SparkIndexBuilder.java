@@ -510,6 +510,8 @@ public final class SparkIndexBuilder {
                     groupEntries.add(IndexEntry.of(row.getString(0), row.getLong(1), row.getAs(2)));
                   }
 
+                  int entryRows = groupEntries.size();
+
                   String location =
                       indexLocation
                           + "/"
@@ -532,16 +534,19 @@ public final class SparkIndexBuilder {
                     built = adapter.encodeEntriesWithMemory(groupEntries);
                     kind = IndexFile.Kind.ENTRY_BEARING;
                   }
+                  // The payload no longer refers to the entries: a unit's entry payloads are most
+                  // of what the task holds, and the file write does not read them. Releasing them
+                  // here lets the collector reclaim the unit before the payload is copied out.
+                  groupEntries.clear();
                   IndexFileMemory memory = built.memory();
                   // Checked before the payload becomes one array: a file past the limit could be
                   // written, published, and then rejected by every query that reads it.
-                  IndexPayloadLimits.checkFits(
-                      built.payload().remaining(), groupEntries.size(), location);
+                  IndexPayloadLimits.checkFits(built.payload().remaining(), entryRows, location);
                   try {
                     writeIndexPayload(fileIO, location, adapter, kind, blobType, built);
                     if (memory != null) {
                       long fileBytes = fileIO.newInputFile(location).getLength();
-                      IndexPayloadLimits.checkFits(fileBytes, groupEntries.size(), location);
+                      IndexPayloadLimits.checkFits(fileBytes, entryRows, location);
                       memory = memory.toBuilder().fileBytes(fileBytes).build();
                     }
                   } catch (RuntimeException | Error e) {
@@ -550,20 +555,20 @@ public final class SparkIndexBuilder {
                   }
 
                   filesBuilt.add(1);
-                  rowsWritten.add(groupEntries.size());
+                  rowsWritten.add(entryRows);
                   LOG.info(
                       "Wrote index file {} of {}, {} of {} data files covered, {} rows, {} ms into "
                           + "the build",
                       filesBuilt.value(),
                       totalGroups,
                       covered.size(),
-                      groupEntries.isEmpty() ? 0 : dataFileCount(tasksByIndexFile, index),
-                      groupEntries.size(),
+                      entryRows == 0 ? 0 : dataFileCount(tasksByIndexFile, index),
+                      entryRows,
                       System.currentTimeMillis() - buildStartedMillis);
                   return List.of(
                           RowFactory.create(
                               location,
-                              (long) groupEntries.size(),
+                              (long) entryRows,
                               Lists.newArrayList(covered),
                               kind.name(),
                               blobType,

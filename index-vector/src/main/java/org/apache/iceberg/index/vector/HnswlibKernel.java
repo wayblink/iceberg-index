@@ -128,7 +128,7 @@ public final class HnswlibKernel implements VectorKernel {
       items.add(
           new VectorItem(
               (long) i,
-              VectorPayloads.decodeVector(materialized.get(i).payload(), dimension, "Entry")));
+              VectorPayloads.decodeVector(materialized.get(i).payloadView(), dimension, "Entry")));
     }
 
     // one thread stays on the serial path, so a build that does not ask for threads produces the

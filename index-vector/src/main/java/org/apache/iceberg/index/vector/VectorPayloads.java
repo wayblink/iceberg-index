@@ -137,7 +137,11 @@ final class VectorPayloads {
 
   static float[] decodeVector(byte[] payload, int dimension, String description) {
     Preconditions.checkNotNull(payload, "%s payload is null", description);
-    ByteBuffer buffer = ByteBuffer.wrap(payload);
+    return decodeVector(ByteBuffer.wrap(payload), dimension, description);
+  }
+
+  static float[] decodeVector(ByteBuffer buffer, int dimension, String description) {
+    Preconditions.checkNotNull(buffer, "%s payload is null", description);
     int version = buffer.getInt();
     Preconditions.checkArgument(
         version == VALUE_FORMAT_VERSION,
